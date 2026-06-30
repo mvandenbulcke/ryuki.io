@@ -840,6 +840,122 @@ async fn run_job(
                 )),
             ))
         }
+        "gmsa_expiry_scan" => {
+            // Safe-internal write (run-3): surface gMSA accounts whose managed-password rotation
+            // deadline (last_rotation_at + managed_password_interval_days) is within (or past) a
+            // 7-day window as deduped shift_queue work — mirrors certificate_expiry_scan. Reads
+            // gmsa_accounts, writes only shift_queue — NO gMSA mutation. The gMSA PASSWORD is never
+            // in this table, so every surfaced field is safe for the execute-tier queue.
+            #[derive(sqlx::FromRow)]
+            struct GmsaScanRow {
+                id: String,
+                name: String,
+                sam_account_name: String,
+                site: String,
+                status: String,
+                next_rotation: chrono::DateTime<chrono::Utc>,
+            }
+            // Predicate on the COMPUTED next_rotation (NOT the un-synced status column);
+            // `managed_password_interval_days > 0` keeps bad data (0/negative interval) from
+            // becoming permanent overdue noise (codex). The SQL predicate (DB NOW()) is a COARSE
+            // PREFILTER; the pure classifier (CP clock) is the AUTHORITATIVE actionability guard.
+            // The prefilter window is 8 days while the classifier window is 7, so the prefilter is
+            // a strict SUPERSET of the actionable set — even a ~1h DST calendar-vs-86.4Mms-day drift
+            // (if the DB ran off UTC) cannot push a 7-day-actionable row outside the 8-day prefilter,
+            // so no actionable row is ever missed; the classifier discards the 7–8 day rows as
+            // Current (codex).
+            let rows: Vec<GmsaScanRow> = sqlx::query_as(
+                "SELECT id::text, name, sam_account_name, site, status, \
+                        (last_rotation_at + managed_password_interval_days * INTERVAL '1 day') \
+                          AS next_rotation \
+                 FROM gmsa_accounts \
+                 WHERE status <> 'Revoked' AND managed_password_interval_days > 0 \
+                   AND last_rotation_at + managed_password_interval_days * INTERVAL '1 day' \
+                         <= NOW() + INTERVAL '8 days' \
+                 ORDER BY next_rotation",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let soon_window_ms: i64 = 7 * 86_400_000;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                let verdict = ryuki_engine::gmsa_lifecycle::classify_gmsa_expiry(
+                    row.next_rotation.timestamp_millis(),
+                    now_ms,
+                    soon_window_ms,
+                );
+                if !verdict.is_actionable() {
+                    continue;
+                }
+                let state = verdict.as_str();
+                // Overdue → P2 (security-hygiene degradation, not an outage like an expired cert);
+                // due-soon → P3.
+                let priority = if matches!(
+                    verdict,
+                    ryuki_engine::gmsa_lifecycle::GmsaExpiry::Overdue
+                ) {
+                    "P2"
+                } else {
+                    "P3"
+                };
+                let title = format!("gMSA rotation {state}: {}", row.name);
+                let description = format!(
+                    "gMSA '{}' ({}) at {} — managed-password rotation due {}. Verify AD-side \
+                     auto-rotation is occurring and refresh the control-plane record.",
+                    row.name,
+                    row.sam_account_name,
+                    row.site,
+                    row.next_rotation.to_rfc3339(),
+                );
+                let metadata = serde_json::json!({
+                    "source_ci_key": row.id,
+                    "name": row.name,
+                    "sam_account_name": row.sam_account_name,
+                    "site": row.site,
+                    "next_rotation": row.next_rotation.to_rfc3339(),
+                    "gmsa_status": row.status,
+                    "expiry_state": state,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::GMSA_EXPIRY_ITEM_TYPE,
+                    &row.id,
+                    &title,
+                    &description,
+                    priority,
+                    &metadata,
+                )
+                .await?;
+                // REFRESH the OPEN item to the CURRENT state so a due-soon item upgrades to overdue
+                // (and P3→P2) on a later scan — enqueue_if_absent's ON CONFLICT DO NOTHING would
+                // otherwise leave the first-seen label/priority stale (codex).
+                sqlx::query(
+                    "UPDATE shift_queue \
+                     SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
+                         updated_at = NOW() \
+                     WHERE item_type = 'gmsa-expiring' AND resolved = false \
+                       AND metadata->>'source_ci_key' = $1",
+                )
+                .bind(&row.id)
+                .bind(&title)
+                .bind(&description)
+                .bind(priority)
+                .bind(&metadata)
+                .execute(&mut **tx)
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "enqueued {enqueued} overdue/due-soon gMSA rotation(s)"
+                )),
+            ))
+        }
         "job_executions_prune" => {
             // Safe-internal write (run-3): bound the unbounded job_executions run history (a row
             // per tick — the 5-min connection_health_sweep alone is 288/day) by keeping the newest
@@ -3682,6 +3798,248 @@ mod db_tests {
         cleanup_cert(pool, &expired).await;
         cleanup_cert(pool, &expiring).await;
         cleanup_cert(pool, &healthy).await;
+    }
+
+    // ─── gmsa_expiry_scan (run-3) ───────────────────────────────────────────────
+
+    const GMSA_SCAN_SEED_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+    /// Seed a gMSA account whose next-rotation deadline = `last_rotation_at +
+    /// interval_days`. Returns the new id.
+    async fn seed_gmsa(
+        pool: &PgPool,
+        last_rotation_at: &str,
+        interval_days: i32,
+        status: &str,
+    ) -> String {
+        let name = format!("svc-test-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO gmsa_accounts \
+             (name, sam_account_name, dns_host_name, site, status, \
+              managed_password_interval_days, last_rotation_at) \
+             VALUES ($1, $2, $3, 'GBLON', $4, $5, $6::timestamptz) RETURNING id",
+        )
+        .bind(&name)
+        .bind(format!("{name}$"))
+        .bind(format!("{name}.corp.local"))
+        .bind(status)
+        .bind(interval_days)
+        .bind(last_rotation_at)
+        .fetch_one(pool)
+        .await
+        .expect("seed gmsa")
+        .to_string()
+    }
+
+    async fn open_gmsa_item(pool: &PgPool, gmsa_id: &str) -> Option<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT priority, metadata->>'expiry_state' FROM shift_queue \
+             WHERE item_type = 'gmsa-expiring' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(gmsa_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_gmsa(pool: &PgPool, gmsa_id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(gmsa_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM gmsa_accounts WHERE id = $1::uuid")
+            .bind(gmsa_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn gmsa_scan_enqueues_by_state_and_refreshes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // interval 30d: overdue (rotated 40d ago → next −10d), due-soon (rotated 25d ago →
+        // next +5d, within the 7d window), healthy (rotated 1d ago → next +29d).
+        let overdue_rot = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+        let duesoon_rot = (chrono::Utc::now() - chrono::Duration::days(25)).to_rfc3339();
+        let healthy_rot = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let overdue = seed_gmsa(pool, &overdue_rot, 30, "Active").await;
+        let duesoon = seed_gmsa(pool, &duesoon_rot, 30, "Active").await;
+        let healthy = seed_gmsa(pool, &healthy_rot, 30, "Active").await;
+
+        let run = |pool: &'static PgPool| async move {
+            let mut tx = pool.begin().await.unwrap();
+            let (status, _) = run_job(&mut tx, "gmsa_expiry_scan").await.unwrap();
+            assert_eq!(status, "succeeded");
+            tx.commit().await.unwrap();
+        };
+        run(pool).await;
+
+        // Overdue → P2/"overdue"; due-soon → P3/"due-soon"; far-future → none.
+        assert_eq!(
+            open_gmsa_item(pool, &overdue).await,
+            Some(("P2".into(), "overdue".into())),
+            "an overdue gMSA rotation is P2/overdue"
+        );
+        assert_eq!(
+            open_gmsa_item(pool, &duesoon).await,
+            Some(("P3".into(), "due-soon".into())),
+            "a due-soon gMSA rotation is P3/due-soon"
+        );
+        assert_eq!(
+            open_gmsa_item(pool, &healthy).await,
+            None,
+            "a not-yet-due gMSA is not surfaced"
+        );
+
+        // REFRESH: push the due-soon account's last_rotation deep into the past → next_rotation
+        // past → re-scan upgrades the SAME open item to overdue/P2 (no duplicate).
+        sqlx::query(
+            "UPDATE gmsa_accounts SET last_rotation_at = NOW() - INTERVAL '60 days' \
+             WHERE id = $1::uuid",
+        )
+        .bind(&duesoon)
+        .execute(pool)
+        .await
+        .unwrap();
+        run(pool).await;
+        assert_eq!(
+            open_gmsa_item(pool, &duesoon).await,
+            Some(("P2".into(), "overdue".into())),
+            "the open item upgraded due-soon → overdue (P3 → P2) on re-scan"
+        );
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue WHERE item_type = 'gmsa-expiring' \
+             AND resolved = false AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&duesoon)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1, "refresh upgrades in place — no duplicate item");
+
+        cleanup_gmsa(pool, &overdue).await;
+        cleanup_gmsa(pool, &duesoon).await;
+        cleanup_gmsa(pool, &healthy).await;
+    }
+
+    /// A Revoked account, or one with a non-positive (0 or negative) rotation
+    /// interval, is never surfaced — both excluded by the WHERE guards.
+    #[tokio::test]
+    async fn gmsa_scan_skips_revoked_and_nonpositive_interval() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        // All three are WAY overdue by the deadline, but excluded by the WHERE guards.
+        let revoked = seed_gmsa(pool, &long_ago, 30, "Revoked").await;
+        let zero_interval = seed_gmsa(pool, &long_ago, 0, "Active").await;
+        let negative_interval = seed_gmsa(pool, &long_ago, -5, "Active").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let (status, _) = run_job(&mut tx, "gmsa_expiry_scan").await.unwrap();
+        assert_eq!(status, "succeeded");
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            open_gmsa_item(pool, &revoked).await,
+            None,
+            "a Revoked account is decommissioned — never surfaced"
+        );
+        assert_eq!(
+            open_gmsa_item(pool, &zero_interval).await,
+            None,
+            "a 0-interval account is guarded out (no permanent overdue noise)"
+        );
+        assert_eq!(
+            open_gmsa_item(pool, &negative_interval).await,
+            None,
+            "a negative-interval account is guarded out by `> 0`"
+        );
+
+        cleanup_gmsa(pool, &revoked).await;
+        cleanup_gmsa(pool, &zero_interval).await;
+        cleanup_gmsa(pool, &negative_interval).await;
+    }
+
+    #[tokio::test]
+    async fn migration_134_is_idempotent_and_gmsa_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Seed idempotency (mirrors the migration's INSERT … ON CONFLICT DO NOTHING).
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'gMSA rotation expiry scan (all accounts)', 'gmsa_expiry_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(GMSA_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(GMSA_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "gMSA rotation expiry scan (all accounts)", "seed name");
+        assert_eq!(kind, "gmsa_expiry_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // Self-contained index (the local DB may be behind on migrations): create it with the
+        // SAME DDL the migration uses (IF NOT EXISTS → a no-op once the migration has applied),
+        // then prove it rejects a 2nd OPEN duplicate.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_gmsa_expiring \
+             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
+             WHERE resolved = false AND item_type = 'gmsa-expiring'",
+        )
+        .execute(pool)
+        .await
+        .expect("the gmsa-expiring partial unique index DDL is valid");
+
+        let key = format!("gmsa-idx-{}", uuid::Uuid::new_v4());
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('gmsa-expiring', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first gmsa-expiring item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('gmsa-expiring', 't2', 'd2', 'P3', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the gmsa-expiring index rejects a second OPEN duplicate"
+        );
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     // ---- run-3: job_executions retention prune ------------------------------

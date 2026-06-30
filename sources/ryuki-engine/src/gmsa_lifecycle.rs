@@ -249,6 +249,55 @@ pub fn get_expiring(accounts: &[GMSAAccount]) -> Vec<GMSAAccount> {
         .collect()
 }
 
+/// Where a gMSA's managed-password rotation deadline (`last_rotation_at +
+/// managed_password_interval_days`) sits relative to "now". The pure, clock-free
+/// mirror of [`CertificateExpiry`](crate::certificate_lifecycle::CertificateExpiry)
+/// used by the durable `gmsa_expiry_scan` so the decision is deterministic and the
+/// CP clock is the single "now" passed in explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmsaExpiry {
+    /// The rotation deadline is in the past — the managed password is overdue to
+    /// rotate (stale CP telemetry, or AD-side auto-rotation is not happening).
+    Overdue,
+    /// Within the soon-window of the rotation deadline — verify before it lapses.
+    DueSoon,
+    /// Not yet within the window — not actionable.
+    Current,
+}
+
+impl GmsaExpiry {
+    /// Only `Overdue` / `DueSoon` become queue work. Used as the post-SQL
+    /// clock-skew guard (the scan re-checks with the CP clock).
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, GmsaExpiry::Overdue | GmsaExpiry::DueSoon)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GmsaExpiry::Overdue => "overdue",
+            GmsaExpiry::DueSoon => "due-soon",
+            GmsaExpiry::Current => "current",
+        }
+    }
+}
+
+/// Classify a gMSA rotation deadline against an explicit `now` and soon-window
+/// (all unix-ms). `Overdue` once `now` reaches/passes the deadline; `DueSoon` once
+/// the deadline is within `soon_window_ms`; else `Current`. Pure — no clock access.
+pub fn classify_gmsa_expiry(
+    next_rotation_unix_ms: i64,
+    now_unix_ms: i64,
+    soon_window_ms: i64,
+) -> GmsaExpiry {
+    if next_rotation_unix_ms <= now_unix_ms {
+        GmsaExpiry::Overdue
+    } else if next_rotation_unix_ms <= now_unix_ms.saturating_add(soon_window_ms) {
+        GmsaExpiry::DueSoon
+    } else {
+        GmsaExpiry::Current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +516,46 @@ mod tests {
         assert_eq!(GMSAStatus::Expiring.to_string(), "Expiring");
         assert_eq!(GMSAStatus::Expired.to_string(), "Expired");
         assert_eq!(GMSAStatus::Revoked.to_string(), "Revoked");
+    }
+
+    // ─── classify_gmsa_expiry ───────────────────────────────────────────────────
+
+    #[test]
+    fn classify_gmsa_expiry_boundaries() {
+        let now = 1_000_000_000_000;
+        let window = 7 * 86_400_000; // 7 days in ms
+
+        // Deadline in the past → Overdue.
+        assert_eq!(
+            classify_gmsa_expiry(now - 1, now, window),
+            GmsaExpiry::Overdue
+        );
+        // Deadline exactly at now → Overdue (<=).
+        assert_eq!(classify_gmsa_expiry(now, now, window), GmsaExpiry::Overdue);
+        // Within the window → DueSoon.
+        assert_eq!(
+            classify_gmsa_expiry(now + window - 1, now, window),
+            GmsaExpiry::DueSoon
+        );
+        // Exactly at now + window → DueSoon (<=).
+        assert_eq!(
+            classify_gmsa_expiry(now + window, now, window),
+            GmsaExpiry::DueSoon
+        );
+        // Beyond the window → Current.
+        assert_eq!(
+            classify_gmsa_expiry(now + window + 1, now, window),
+            GmsaExpiry::Current
+        );
+    }
+
+    #[test]
+    fn gmsa_expiry_actionability_and_labels() {
+        assert!(GmsaExpiry::Overdue.is_actionable());
+        assert!(GmsaExpiry::DueSoon.is_actionable());
+        assert!(!GmsaExpiry::Current.is_actionable());
+        assert_eq!(GmsaExpiry::Overdue.as_str(), "overdue");
+        assert_eq!(GmsaExpiry::DueSoon.as_str(), "due-soon");
+        assert_eq!(GmsaExpiry::Current.as_str(), "current");
     }
 }

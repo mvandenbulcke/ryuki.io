@@ -53,6 +53,13 @@ pub const RECERTIFICATION_OVERDUE_ITEM_TYPE: &str = "recertification-overdue";
 /// REFRESHED each scan so an expiring-soon item upgrades to expired (+ P2→P1).
 pub const CERTIFICATE_EXPIRY_ITEM_TYPE: &str = "certificate-expiring";
 
+/// The OVERDUE/DUE-SOON gMSA password-rotation signal (run-3). A gMSA whose computed
+/// rotation deadline (`last_rotation_at + managed_password_interval_days`) is within
+/// (or past) the actionable window. `source_ci_key` is the bare gMSA id (a UUID,
+/// never reused). The open item is REFRESHED each scan so a due-soon item upgrades to
+/// overdue (+ P3→P2). Framed as "verify AD-side rotation", NOT manual rotation.
+pub const GMSA_EXPIRY_ITEM_TYPE: &str = "gmsa-expiring";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already
