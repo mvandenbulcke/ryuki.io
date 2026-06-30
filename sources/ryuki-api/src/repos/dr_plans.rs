@@ -49,6 +49,23 @@ fn decode_status(s: &str) -> Result<DrPlanStatus, String> {
         .map_err(|e| format!("unknown dr_plans status '{s}': {e}"))
 }
 
+/// Fetch the RAW rows for all DR plans with status 'active' or 'approved' for the
+/// overdue-scan job. The scan classifies each plan by comparing `next_test_due`
+/// against NOW() — only plans that COULD be executed (active/approved) are considered;
+/// draft/expired are excluded. Returns `DrPlanRow` (not the deserialized model) so the
+/// caller can `into_model()` PER ROW and skip a single corrupt `plan_json` without
+/// failing the whole scan (one malformed persisted row must not poison the fan-out for
+/// every healthy plan — mirrors restore_overdue_scan's per-row resilience).
+pub async fn active_plans_for_overdue_scan(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<DrPlanRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM dr_plans WHERE status IN ('active', 'approved') ORDER BY id"
+    ))
+    .fetch_all(executor)
+    .await
+}
+
 pub async fn insert(executor: impl sqlx::PgExecutor<'_>, plan: &DrPlan) -> Result<(), sqlx::Error> {
     let plan_json = serde_json::to_value(plan)
         .map_err(|e| sqlx::Error::Decode(format!("dr_plans: serialize failed: {e}").into()))?;

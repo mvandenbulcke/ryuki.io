@@ -484,6 +484,77 @@ async fn run_job(
                 )),
             ))
         }
+        "dr_test_overdue_scan" => {
+            // Safe-internal write (#58): READ dr_plans (active/approved) across all
+            // sites, flag plans whose next_test_due is in the PAST, and enqueue ONE
+            // deduped shift_queue item per overdue plan. Reads dr_plans and writes
+            // only our own shift_queue — NO provider/live/destructive call. All on
+            // `tx`, so a failure rolls back with this schedule's savepoint. `detail`
+            // is aggregate-only (counts, never per-plan ids) because it is surfaced
+            // via /api/ops/scheduler/executions.
+            let rows =
+                crate::repos::dr_plans::active_plans_for_overdue_scan(&mut **tx).await?;
+            let now = chrono::Utc::now();
+            let mut overdue: u64 = 0;
+            let mut enqueued: u64 = 0;
+            for row in rows {
+                // Fail-safe per-row: a single corrupt `plan_json` that won't
+                // deserialize to a DrPlan is SKIPPED, not propagated — one malformed
+                // persisted row must NOT abort the scan for every healthy plan (the
+                // corruption still surfaces on the DR read endpoints, which decode the
+                // same blob). Mirrors restore_overdue_scan's per-row resilience.
+                let Ok(plan) = row.into_model() else {
+                    continue;
+                };
+                // A blank id can't be a dedup key (enqueue_if_absent rejects it) and
+                // would otherwise abort this scan — skip it (mirrors restore's blank-key
+                // skip). The TEXT PK forbids NULL but not '' for a directly-imported row.
+                if plan.id.trim().is_empty() {
+                    continue;
+                }
+                // An unparseable/empty next_test_due on an otherwise-valid plan is
+                // SKIPPED for the same reason.
+                let Ok(due) = chrono::DateTime::parse_from_rfc3339(plan.next_test_due.trim())
+                else {
+                    continue;
+                };
+                if due.with_timezone(&chrono::Utc) > now {
+                    continue; // not yet due
+                }
+                overdue += 1;
+                let title = format!("DR test overdue: {}", plan.name);
+                let last = plan.last_tested.as_deref().unwrap_or("never");
+                let description = format!(
+                    "DR plan '{}' ({}) is overdue for a recoverability test (due {}, last tested {}). \
+                     Schedule a DR test to verify recoverability.",
+                    plan.name, plan.site, plan.next_test_due, last
+                );
+                // `source_ci_key` is the plan id — the enqueue_if_absent dedup predicate
+                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
+                // partial unique index (uq_shift_queue_open_dr_test_overdue) to agree.
+                let metadata = serde_json::json!({
+                    "source_ci_key": plan.id,
+                    "site": plan.site,
+                    "next_test_due": plan.next_test_due,
+                    "last_tested": plan.last_tested,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::DR_TEST_OVERDUE_ITEM_TYPE,
+                    &plan.id,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("{overdue} DR plan(s) overdue, {enqueued} enqueued")),
+            ))
+        }
         "secret_rotation_due_scan" => {
             // Safe-internal write (#7): READ secret rotation metadata across ALL sites
             // (platform-wide internal principal — not scoped), classify each with the
@@ -5352,5 +5423,230 @@ mod db_tests {
             .and_then(|s| s.split_once(" overdue, "))
             .and_then(|(_, f)| f.parse::<u64>().ok())
             .unwrap_or_else(|| panic!("unparseable combined detail: {detail:?}"))
+    }
+
+    // ---- #58 dr_test_overdue_scan ------------------------------------------
+
+    /// The migration-139-seeded dr_test_overdue_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (mirrors RESTORE_SCAN_SEED_ID pattern).
+    const DR_SCAN_SEED_ID: &str = "a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0";
+
+    /// Build a valid DrPlan JSON blob for use in dr_plans test fixtures.
+    fn dr_plan_json(id: &str, name: &str, site: &str, next_test_due: &str, last_tested: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "site": site,
+            "target_site": "GBLON",
+            "systems": ["sys-01"],
+            "rpo_minutes": 15,
+            "rto_minutes": 120,
+            "last_tested": last_tested,
+            "next_test_due": next_test_due,
+            "status": "active"
+        })
+    }
+
+    /// Seed a dr_plans row directly. `status` is the DB scalar column value
+    /// ('active', 'approved', 'draft', 'expired').
+    async fn seed_dr_plan(
+        pool: &PgPool,
+        id: &str,
+        name: &str,
+        site: &str,
+        status: &str,
+        next_test_due: &str,
+        last_tested: Option<&str>,
+    ) {
+        let plan_json = dr_plan_json(id, name, site, next_test_due, last_tested);
+        sqlx::query(
+            "INSERT INTO dr_plans (id, name, site, status, plan_json) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(site)
+        .bind(status)
+        .bind(plan_json)
+        .execute(pool)
+        .await
+        .expect("seed dr_plan");
+    }
+
+    /// Plant a guaranteed-due `dr_test_overdue_scan` schedule so a single tick
+    /// runs the scan. Disables the migration-seeded scan first so EXACTLY ONE is
+    /// due. Returns the planted schedule id for cleanup.
+    async fn seed_due_dr_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(DR_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-drtestscan-due-4f7";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test dr test scan', 'dr_test_overdue_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_dr_scan`] disabled.
+    async fn restore_migration_dr_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(DR_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN dr-test-overdue shift_queue items for a plan id.
+    async fn open_dr_overdue_count(pool: &PgPool, plan_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'dr-test-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(plan_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An overdue active plan enqueues exactly one item; a future-due plan does not.
+    /// A second run dedups: count stays at 1. The detail string is aggregate-only.
+    #[tokio::test]
+    async fn dr_test_overdue_scan_enqueues_overdue_plans() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let overdue_id = format!("drp-test-overdue-{suffix}");
+        let future_id = format!("drp-test-future-{suffix}");
+        let past = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+
+        seed_dr_plan(
+            pool,
+            &overdue_id,
+            &format!("DR overdue plan {suffix}"),
+            "DEFRA",
+            "active",
+            &past,
+            None,
+        )
+        .await;
+        seed_dr_plan(
+            pool,
+            &future_id,
+            &format!("DR future plan {suffix}"),
+            "GBLON",
+            "active",
+            &future,
+            None,
+        )
+        .await;
+
+        let sched_id = seed_due_dr_scan(pool).await;
+
+        // Cleanup shift_queue and job_executions BEFORE asserting (mirrors sibling
+        // tests' cleanup-before-assert discipline so prior fixture state does not
+        // leak into the count assertions).
+        sqlx::query(
+            "DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)",
+        )
+        .bind(&overdue_id)
+        .bind(&future_id)
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: overdue plan enqueued, future plan skipped.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted dr scan ran");
+        assert_eq!(
+            open_dr_overdue_count(pool, &overdue_id).await,
+            1,
+            "overdue plan gets exactly one open dr-test-overdue item"
+        );
+        assert_eq!(
+            open_dr_overdue_count(pool, &future_id).await,
+            0,
+            "future plan is not enqueued"
+        );
+
+        // Detail is aggregate-only: "<N> DR plan(s) overdue, <M> enqueued".
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'dr_test_overdue_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        // Verify it matches "<N> DR plan(s) overdue, <M> enqueued" with two
+        // bare count tokens and NO plan id or name.
+        let parsed = detail
+            .split_once(" DR plan(s) overdue, ")
+            .and_then(|(o, rest)| {
+                let m = rest.strip_suffix(" enqueued")?;
+                Some((o.parse::<u64>().ok()?, m.parse::<u64>().ok()?))
+            });
+        assert!(
+            parsed.is_some_and(|(o, e)| o >= 1 && e >= 1),
+            "detail must be '<N> DR plan(s) overdue, <M> enqueued': {detail:?}"
+        );
+
+        // Second tick: dedup holds — still exactly one open item.
+        let sched_id2 = seed_due_dr_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_dr_overdue_count(pool, &overdue_id).await,
+            1,
+            "a second tick does not duplicate the open item"
+        );
+
+        // Final cleanup.
+        sqlx::query(
+            "DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)",
+        )
+        .bind(&overdue_id)
+        .bind(&future_id)
+        .execute(pool)
+        .await
+        .ok();
+        for id in [&overdue_id, &future_id] {
+            sqlx::query("DELETE FROM dr_plans WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_dr_scan(pool).await;
     }
 }

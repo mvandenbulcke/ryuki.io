@@ -67,6 +67,12 @@ pub const GMSA_EXPIRY_ITEM_TYPE: &str = "gmsa-expiring";
 /// expired (+ P3→P2). Reuses the cert expiry classifier (same TLS-cert-expiry shape).
 pub const OOB_CERT_EXPIRY_ITEM_TYPE: &str = "oob-cert-expiring";
 
+/// The OVERDUE DR-test signal (#58). A DR plan (status 'active' or 'approved') whose
+/// `next_test_due` has passed. `source_ci_key` is the bare plan id (a TEXT PK, never
+/// reused). One deduped OPEN item per plan; re-enqueued after resolution if still
+/// overdue on the next daily scan (migration 139).
+pub const DR_TEST_OVERDUE_ITEM_TYPE: &str = "dr-test-overdue";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

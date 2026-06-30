@@ -101,6 +101,12 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// `backup_recency::classify_restore_recency`, and enqueues ONE deduped
 /// `shift_queue` work item per at-risk system — writes only to our own tables,
 /// NO provider/live/destructive call.
+///
+/// `dr_test_overdue_scan` (#58) also qualifies: it reads `dr_plans` (status
+/// 'active' or 'approved') across all sites, flags plans whose `next_test_due`
+/// is in the past, and enqueues ONE deduped `shift_queue` item per overdue
+/// plan — reads dr_plans, writes only shift_queue, NO provider/live/destructive
+/// call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
@@ -119,6 +125,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "connection_health_checks_prune"
                 | "check_results_prune"
                 | "shift_queue_prune"
+                | "dr_test_overdue_scan"
         )
 }
 
@@ -223,6 +230,8 @@ mod tests {
         assert!(!job_is_read_only("check_results_prune"));
         assert!(job_is_schedulable("shift_queue_prune"));
         assert!(!job_is_read_only("shift_queue_prune"));
+        assert!(job_is_schedulable("dr_test_overdue_scan"));
+        assert!(!job_is_read_only("dr_test_overdue_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));
