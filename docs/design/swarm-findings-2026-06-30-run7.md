@@ -29,8 +29,26 @@ each finder pipelined into a default-refute adversarial verifier.
   unchanged). rg confirmed this was the ONLY `self.X as uN` read-path cast (no siblings). codex review
   pending.
 
+## Schema-migration sweep (single targeted agent — the parallel swarm was auth-degraded)
+Ran a single Explore agent on schema/migration integrity (single agents stayed reliable while the
+parallel fan-out failed). 3 confirmed missing-index findings; codex reviewed the index DESIGN before
+implementation.
+- ✅ **Missing list-query indexes** — SHIPPED migration 138 (idx_requests_site_env_created_at;
+  idx_domain_events_to_status_occurred_id partial-expr; idx_agent_jobs_dead_lettered_updated_at
+  partial). The `requests` list (hottest authenticated read path) + its per-page COUNT(*), the
+  append-only `domain_events` alert feed, and the `agent_jobs` dead-letter admin list all full/large
+  scanned a growing table. Verified on a fresh DB: migration applies, all 3 indexes created with the
+  intended defs, and EXPLAIN (seqscan off) confirms each is USED (requests + agent_jobs = ordered
+  index scan no-sort; domain_events = bitmap scan of only the alert rows + a small sort, since a
+  multi-value `= ANY` can't be an ordered btree scan).
+- **Deferred (codex)**: (a) the `(status, created_at)` requests index — highest write-amplification
+  (status changes every transition), uncertain benefit → measure first (task_53bc69da). (b) the
+  OR-NULL predicate (`$n IS NULL OR col=$n`) in requests_list can defeat idx_requests_site_env on a
+  generic prepared plan; the real fix is dynamic SQL emitting only active predicates (task_02ed10ce).
+
 ## Not yet swept (run-8 — platform was unstable)
-concurrency-races, resilience-errors, schema-migration, protocol-contract, execution-agent-seam,
-portal-frontend. (A quick manual probe of scheduler.rs concurrency found only low-severity nuances —
-a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot causing ≤1-interval
-classification delay — neither compelling enough to action.)
+concurrency-races, resilience-errors, protocol-contract, execution-agent-seam, portal-frontend.
+(schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
+low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
+causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors
+single-agent attempt hit the same transient "opus temporarily unavailable" platform blip — retry.)
