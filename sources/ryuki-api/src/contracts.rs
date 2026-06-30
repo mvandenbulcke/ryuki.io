@@ -13413,7 +13413,7 @@ async fn admin_platform_settings_history(
     // Clamp the offset like the limit: an unclamped `usize as i64` wraps a huge
     // `?offset=` to NEGATIVE, which Postgres rejects (`OFFSET must not be negative`)
     // → a 500 instead of a clean read (codex correctness swarm).
-    let offset = params.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
+    let offset = clamp_offset_usize(params.offset.unwrap_or(0)) as i64;
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
         String,
@@ -14149,6 +14149,15 @@ fn status_404(id: &str) -> (StatusCode, Json<Value>) {
         StatusCode::NOT_FOUND,
         Json(json!({"error": format!("Request {id} not found")})),
     )
+}
+
+/// Clamp a `usize` pagination offset to `<= i64::MAX` so a subsequent `as i64`
+/// cast can never wrap NEGATIVE. A query like `?offset=18446744073709551615`
+/// (usize::MAX) would otherwise cast to a negative `i64`, which Postgres rejects
+/// (`OFFSET must not be negative`) → a 500 any caller could trigger. The clamped
+/// value stays a valid (huge) offset that simply yields an empty page. Pure.
+fn clamp_offset_usize(offset: usize) -> usize {
+    offset.min(i64::MAX as usize)
 }
 
 fn status_403() -> (StatusCode, Json<Value>) {
@@ -15204,7 +15213,8 @@ async fn requests_list(
     Query(params): Query<RequestListParams>,
 ) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let limit = params.limit.unwrap_or(50).min(100);
-    let offset = params.offset.unwrap_or(0);
+    // Clamp so the `as i64` SQL bind below (and the no-DB `.skip`) never wraps negative.
+    let offset = clamp_offset_usize(params.offset.unwrap_or(0));
     let sort_col = request_sort_column(params.sort.as_deref());
     let dir = request_sort_direction(params.direction.as_deref());
     // Blank filters are treated as "no filter".
@@ -18810,7 +18820,7 @@ async fn activity_audit_feed(
         ));
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
-    let offset = params.offset.unwrap_or(0) as i64;
+    let offset = clamp_offset_usize(params.offset.unwrap_or(0)) as i64;
     Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
 }
 
@@ -38426,6 +38436,28 @@ mod unit_tests {
             ryuki_engine::models::RequestStatus::Planned,
             "no cross-scope mutation occurred"
         );
+    }
+
+    /// run-5: a usize pagination offset above i64::MAX must clamp so the `as i64`
+    /// SQL bind never wraps negative (which Postgres rejects → 500). Guards the
+    /// requests_list / activity_audit_feed / settings-history offset binds.
+    #[test]
+    fn clamp_offset_usize_never_casts_negative() {
+        assert_eq!(clamp_offset_usize(0), 0);
+        assert_eq!(clamp_offset_usize(100), 100);
+        let max = i64::MAX as usize;
+        assert_eq!(clamp_offset_usize(max), max, "exactly i64::MAX is preserved");
+        // usize::MAX (and anything above i64::MAX) clamps to i64::MAX.
+        assert_eq!(clamp_offset_usize(usize::MAX), max);
+        assert!(
+            clamp_offset_usize(usize::MAX) as i64 >= 0,
+            "the clamped offset never casts to a negative i64"
+        );
+        // `max + 1` only exists on platforms where usize is wider than i64 (64-bit);
+        // guard with checked_add so the test itself is width-clean (codex).
+        if let Some(over) = max.checked_add(1) {
+            assert!(clamp_offset_usize(over) as i64 >= 0);
+        }
     }
 
     // ─── #17 slice 3: batch rework + fail (no-DB) ───
