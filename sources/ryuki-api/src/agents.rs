@@ -278,6 +278,7 @@ async fn authenticate_agent(headers: &HeaderMap, pool: &PgPool) -> ApiResult<Age
 /// stores its SHA-256 hash, and returns the plaintext token ONCE.
 /// A pending agent cannot poll for jobs until an admin approves it.
 pub async fn register_agent(
+    pv: ProtocolVersion,
     _headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> ApiResult<Json<RegisterResponse>> {
@@ -317,8 +318,8 @@ pub async fn register_agent(
     let capabilities_json = serde_json::to_value(&body.capabilities).map_err(db_err)?;
 
     let result = sqlx::query(
-        "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-         VALUES ($1, $2, $3, $4, $5, 'pending') \
+        "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status, protocol_version) \
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6) \
          ON CONFLICT DO NOTHING",
     )
     .bind(&body.agent_id)
@@ -326,6 +327,8 @@ pub async fn register_agent(
     .bind(&capabilities_json)
     .bind(public_key)
     .bind(&hash)
+    // BIGINT column: the wire version is u32, whose full range fits an i64 losslessly.
+    .bind(i64::from(pv.0))
     .execute(pool)
     .await
     .map_err(db_err)?;
@@ -542,7 +545,11 @@ pub async fn admin_revoke_agent(
 /// Pending job for this agent's platform using SELECT … FOR UPDATE SKIP LOCKED,
 /// then returns the full Job with its JobLease (including cp_nonce +
 /// fencing_token). Returns 204 when no Pending job is available.
-pub async fn poll_job(Path(agent_id): Path<String>, headers: HeaderMap) -> impl IntoResponse {
+pub async fn poll_job(
+    _pv: ProtocolVersion,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let pool = match get_db() {
         Some(p) => p,
         None => {
@@ -687,6 +694,7 @@ pub async fn poll_job(Path(agent_id): Path<String>, headers: HeaderMap) -> impl 
 /// Transitions Leased → Running. The caller must supply the fencing_token and
 /// attempt_id that match the current lease. A mismatch returns 409.
 pub async fn ack_job(
+    _pv: ProtocolVersion,
     Path((agent_id, job_id_str)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AckBody>,
@@ -856,6 +864,73 @@ fn redaction_policy_version_is_supported(v: &str) -> bool {
     ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS.contains(&v)
 }
 
+/// Closed-allowlist gate for the CP↔agent WIRE protocol version, mirroring
+/// [`redaction_policy_version_is_supported`]. Both the accept side here and the
+/// agent emit side reference the ONE `ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS`
+/// constant, so they cannot drift.
+fn protocol_version_is_supported(v: u32) -> bool {
+    ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&v)
+}
+
+/// Resolves the wire protocol version an agent request asserts via the
+/// `x-ryuki-protocol-version` header, FAIL-CLOSED:
+/// - more than one header value → 400 (ambiguous — a proxy-smuggling / drift smell)
+/// - present but not a `u32 > 0` → 400
+/// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
+///
+/// The resolved value is then ALWAYS checked against
+/// `SUPPORTED_PROTOCOL_VERSIONS`, so an absent header is a non-breaking backfill,
+/// NOT a bypass: the day `1` leaves the allowlist, an absent header is rejected
+/// too. Used by the [`ProtocolVersion`] extractor.
+fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
+    let mut values = headers
+        .get_all(ryuki_protocol::PROTOCOL_VERSION_HEADER)
+        .iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(bad_request(
+            "x-ryuki-protocol-version must not appear more than once",
+        ));
+    }
+    let version = match first {
+        None => ryuki_protocol::PROTOCOL_VERSION_LEGACY,
+        Some(v) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad_request("x-ryuki-protocol-version must be a positive integer"))?,
+    };
+    if !protocol_version_is_supported(version) {
+        return Err(bad_request(format!(
+            "unsupported protocol_version: {version} — this control plane supports {:?}",
+            ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS
+        )));
+    }
+    Ok(version)
+}
+
+/// Extractor that validates the `x-ryuki-protocol-version` header on every
+/// agent→CP request. Being a `FromRequestParts` extractor, it runs BEFORE the
+/// `Json` body extractor — so a version-incompatible agent (which would send a
+/// body this build can't deserialise once the schema moves) gets the clear
+/// [`resolve_protocol_version`] 400 instead of an opaque body-decode error. The
+/// inner `u32` is the resolved version (read by register/heartbeat to record the
+/// enrolment baseline; ignored by poll/ack/result, whose enforcement is the mere
+/// successful extraction).
+pub(crate) struct ProtocolVersion(u32);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ProtocolVersion {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        resolve_protocol_version(&parts.headers).map(ProtocolVersion)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/agents/{agent_id}/jobs/{job_id}/result
 // ---------------------------------------------------------------------------
@@ -868,6 +943,7 @@ fn redaction_policy_version_is_supported(v: &str) -> bool {
 /// ('Leased','Running')). A repeat POST with the same (job_id, attempt_id,
 /// result_id) returns idempotent 200.
 pub async fn post_job_result(
+    _pv: ProtocolVersion,
     Path((agent_id, job_id_str)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<ResultBody>,
@@ -1507,6 +1583,7 @@ fn parse_job_mode(mode_str: &str) -> ApiResult<JobMode> {
 ///
 /// Updates last_seen_at on the agent row. Optionally records the running job.
 pub async fn heartbeat(
+    pv: ProtocolVersion,
     Path(agent_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<HeartbeatBody>,
@@ -1518,11 +1595,17 @@ pub async fn heartbeat(
         return Err(forbidden("token does not match agent_id"));
     }
 
-    sqlx::query("UPDATE agents SET last_seen_at = NOW(), updated_at = NOW() WHERE id = $1")
-        .bind(agent.id)
-        .execute(pool)
-        .await
-        .map_err(db_err)?;
+    // Refresh the recorded protocol version from the live header so the stored
+    // baseline follows an in-place agent-binary upgrade (audit/observability
+    // only — the enforcing gate is the per-request extractor, not this row).
+    sqlx::query(
+        "UPDATE agents SET last_seen_at = NOW(), updated_at = NOW(), protocol_version = $2 WHERE id = $1",
+    )
+    .bind(agent.id)
+    .bind(i64::from(pv.0))
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
 
     tracing::debug!(
         agent_id = %agent_id,
@@ -2200,7 +2283,14 @@ pub async fn cp_public_key() -> impl IntoResponse {
     match cp_identity::cp_public_key_b64() {
         Some(pubkey) => (
             axum::http::StatusCode::OK,
-            Json(serde_json::json!({"public_key": pubkey})),
+            // Advertise the CP's wire protocol version alongside the key. The agent
+            // fetches this at startup and refuses to run against a CP whose version
+            // is outside its own SUPPORTED_PROTOCOL_VERSIONS — the CP→agent half of
+            // the compatibility handshake.
+            Json(serde_json::json!({
+                "public_key": pubkey,
+                "protocol_version": ryuki_protocol::PROTOCOL_VERSION,
+            })),
         )
             .into_response(),
         None => (
@@ -3951,6 +4041,128 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Wire protocol version — enforcement logic (the ProtocolVersion extractor
+    // delegates verbatim to resolve_protocol_version, so testing the helper
+    // covers the extractor's behaviour without constructing a request `Parts`).
+    // -----------------------------------------------------------------------
+
+    fn hdrs_with_version(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            ryuki_protocol::PROTOCOL_VERSION_HEADER,
+            value.parse().expect("valid header value"),
+        );
+        h
+    }
+
+    #[test]
+    fn protocol_version_absent_header_resolves_to_legacy() {
+        // No header at all → the legacy backfill (1), which is still allowlist-checked.
+        let v = resolve_protocol_version(&HeaderMap::new()).expect("absent header is accepted");
+        assert_eq!(v, ryuki_protocol::PROTOCOL_VERSION_LEGACY);
+    }
+
+    #[test]
+    fn protocol_version_explicit_supported_is_accepted() {
+        let v = resolve_protocol_version(&hdrs_with_version(
+            &ryuki_protocol::PROTOCOL_VERSION.to_string(),
+        ))
+        .expect("the current build's version must be accepted");
+        assert_eq!(v, ryuki_protocol::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_version_zero_is_rejected() {
+        // 0 is never a valid version (mirrors the DB CHECK (protocol_version > 0)).
+        let err = resolve_protocol_version(&hdrs_with_version("0"))
+            .expect_err("version 0 must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn protocol_version_non_integer_is_rejected() {
+        // Non-numeric, signed, fractional, empty/whitespace, and > u32::MAX values
+        // all fail the `u32 > 0` parse → fail-closed 400.
+        for bad in ["abc", "1.0", "-1", "", " ", "99999999999999999999"] {
+            let result = resolve_protocol_version(&hdrs_with_version(bad));
+            assert!(
+                matches!(result, Err((StatusCode::BAD_REQUEST, _))),
+                "a non-integer version {bad:?} must be rejected 400, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_version_unsupported_is_rejected_with_actionable_message() {
+        // A version outside SUPPORTED_PROTOCOL_VERSIONS → fail-closed 400 whose
+        // body names both what was sent and what the CP supports.
+        let unsupported = ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            + 1000;
+        let err = resolve_protocol_version(&hdrs_with_version(&unsupported.to_string()))
+            .expect_err("an unsupported version must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&format!("unsupported protocol_version: {unsupported}")),
+            "message must name the rejected version: {msg}"
+        );
+        assert!(
+            msg.contains("this control plane supports"),
+            "message must name the supported set: {msg}"
+        );
+    }
+
+    #[test]
+    fn protocol_version_duplicate_header_is_rejected() {
+        // Two header values is ambiguous (proxy smuggling / drift smell) → 400,
+        // never a silent "pick one".
+        let mut h = HeaderMap::new();
+        h.append(
+            ryuki_protocol::PROTOCOL_VERSION_HEADER,
+            "1".parse().unwrap(),
+        );
+        h.append(
+            ryuki_protocol::PROTOCOL_VERSION_HEADER,
+            "2".parse().unwrap(),
+        );
+        let err =
+            resolve_protocol_version(&h).expect_err("a duplicated version header must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn protocol_version_is_supported_tracks_the_allowlist() {
+        for &v in ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(protocol_version_is_supported(v));
+        }
+        assert!(!protocol_version_is_supported(0));
+        assert!(!protocol_version_is_supported(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn cp_public_key_advertises_protocol_version() {
+        // The CP→agent half of the handshake: the cp-public-key JSON must carry
+        // the CP's wire protocol version so the agent can refuse an incompatible CP.
+        ensure_test_cp_key();
+        let response = cp_public_key().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        use axum::body::to_bytes;
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("JSON body");
+        assert_eq!(
+            body.get("protocol_version").and_then(|v| v.as_u64()),
+            Some(u64::from(ryuki_protocol::PROTOCOL_VERSION)),
+            "cp-public-key must advertise the CP protocol version"
+        );
+    }
+
     #[test]
     fn agent_token_sha256_roundtrip() {
         let tok = generate_agent_token();
@@ -4350,6 +4562,7 @@ mod tests {
         // Malformed key -> 400 (rejected before any INSERT).
         let bad_id = format!("badkey-{}", Uuid::new_v4());
         let bad = register_agent(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
             HeaderMap::new(),
             Json(mk_body(bad_id.clone(), "not-a-valid-ed25519-key!!")),
         )
@@ -4372,6 +4585,7 @@ mod tests {
         let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("low-order point decodes");
         let weak_b64 = encode_verifying_key(&weak);
         let weak_resp = register_agent(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
             HeaderMap::new(),
             Json(mk_body(format!("weak-{}", Uuid::new_v4()), &weak_b64)),
         )
@@ -4385,13 +4599,61 @@ mod tests {
         let key = generate_keypair(&mut OsRng);
         let pubkey = encode_verifying_key(&key.verifying_key());
         let good_id = format!("goodkey-{}", Uuid::new_v4());
-        let ok = register_agent(HeaderMap::new(), Json(mk_body(good_id.clone(), &pubkey))).await;
+        let ok = register_agent(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            HeaderMap::new(),
+            Json(mk_body(good_id.clone(), &pubkey)),
+        )
+        .await;
         let Ok(Json(resp)) = &ok else {
             panic!("a valid public_key must register: {ok:?}");
         };
         assert_eq!(resp.agent_id, good_id, "the valid registration returns the agent id");
 
         cleanup_agent(pool, &good_id).await;
+    }
+
+    /// #run7 wire-contract: register_agent RECORDS the asserted wire protocol
+    /// version into agents.protocol_version (the audit/observability baseline; the
+    /// enforcing gate is the per-request extractor, not this row). Uses the
+    /// process-global get_db() handler pool, so serialize with the handler tests.
+    #[tokio::test]
+    async fn db_register_persists_protocol_version() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let key = generate_keypair(&mut OsRng);
+        let pubkey = encode_verifying_key(&key.verifying_key());
+        let agent_id = format!("protover-{}", Uuid::new_v4());
+
+        let ok = register_agent(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            HeaderMap::new(),
+            Json(RegisterBody {
+                agent_id: agent_id.clone(),
+                platform: "ci".to_string(),
+                capabilities: Capabilities::default(),
+                public_key: pubkey,
+            }),
+        )
+        .await;
+        assert!(ok.is_ok(), "a valid registration must succeed: {ok:?}");
+
+        let (stored,): (i64,) =
+            sqlx::query_as("SELECT protocol_version FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch protocol_version");
+        assert_eq!(
+            stored,
+            i64::from(ryuki_protocol::PROTOCOL_VERSION),
+            "register must persist the asserted protocol version"
+        );
+
+        cleanup_agent(pool, &agent_id).await;
     }
 
     // ── pending agent poll → 403 ─────────────────────────────────────────

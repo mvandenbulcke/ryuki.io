@@ -291,6 +291,52 @@ pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
 pub const SUPPORTED_REDACTION_POLICY_VERSIONS: &[&str] = &[REDACTION_POLICY_VERSION];
 
 // ---------------------------------------------------------------------------
+// Wire protocol version — the CP↔agent schema-compatibility marker
+// ---------------------------------------------------------------------------
+
+/// Monotonic version of the CP↔agent WIRE SCHEMA (the shapes in this module).
+///
+/// This is distinct from [`REDACTION_POLICY_VERSION`], which versions the
+/// redaction *ruleset*, not the wire schema. Bump this whenever a wire struct
+/// gains/loses/changes a field in a way an old peer could not parse compatibly,
+/// and add the new value to [`SUPPORTED_PROTOCOL_VERSIONS`].
+///
+/// **INVARIANT — this is a COMPATIBILITY MARKER ONLY.** It travels UNSIGNED, in
+/// the [`PROTOCOL_VERSION_HEADER`] transport header, so it can be read *before*
+/// body deserialisation and signature verification (it names *which* schema a
+/// payload is — burying it inside a signed struct would be circular). Because it
+/// is unsigned it MUST NEVER be used to select a signing domain, weaken result
+/// verification, or change the interpretation of any signed field. A future
+/// version that changes SIGNED bytes MUST bump the signing domain separator in
+/// `crypto` (or bind the version into the signed bytes at that point) — it must
+/// not lean on this header. The threat model is accidental drift, not forgery:
+/// a tampered header yields a version-mismatch *rejection* (denial), never a
+/// verification bypass, because every security-sensitive field stays signed.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The closed set of wire-protocol versions a peer will accept, gated
+/// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
+/// rollout that introduces version N, widen this to `&[N-1, N]` so a mixed fleet
+/// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
+/// (accepting agent requests) and the agent (accepting the CP's advertised
+/// version) reference this ONE constant, so emission and acceptance cannot drift.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1];
+
+/// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
+/// predates protocol versioning sends no header; it is, by definition, speaking
+/// the schema that existed before the field — version 1. The resolved value is
+/// STILL allowlist-checked against [`SUPPORTED_PROTOCOL_VERSIONS`], so this is a
+/// non-breaking backfill, not a bypass: the day `1` leaves the allowlist, an
+/// absent header is rejected too. Mirrors the `agents.protocol_version` column
+/// default.
+pub const PROTOCOL_VERSION_LEGACY: u32 = 1;
+
+/// Transport header carrying the sender's [`PROTOCOL_VERSION`] on every
+/// agent↔CP request (decimal `u32`). Lower-case so it matches `http::HeaderName`
+/// canonicalisation directly.
+pub const PROTOCOL_VERSION_HEADER: &str = "x-ryuki-protocol-version";
+
+// ---------------------------------------------------------------------------
 // SignedEnvelope — tamper-evident result binding
 // ---------------------------------------------------------------------------
 

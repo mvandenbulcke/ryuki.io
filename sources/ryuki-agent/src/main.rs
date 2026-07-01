@@ -26,8 +26,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ryuki_agent::{
-    client::CpClient, config::AgentConfig, executor::RunnerExecutor, identity::AgentIdentity,
-    live::pin_cp_key, live_exec::RunnerLiveExecutor, outbox::Outbox, run::run_loop,
+    client::{ClientError, CpClient},
+    config::AgentConfig,
+    executor::RunnerExecutor,
+    identity::AgentIdentity,
+    live::pin_cp_key,
+    live_exec::RunnerLiveExecutor,
+    outbox::Outbox,
+    run::run_loop,
 };
 use tracing::info;
 
@@ -106,6 +112,41 @@ async fn main() {
 
     // Build dependencies.
     let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &cfg.token);
+
+    // Wire protocol compatibility handshake — runs for EVERY agent, live or not
+    // (the CP→agent half of the version check; the CP-side extractor is the
+    // agent→CP half). A CONFIRMED version mismatch is fatal: the agent refuses to
+    // start rather than fail opaquely mid-job on a drifted wire schema. A
+    // network/HTTP failure fetching the version is NON-fatal (matches the lenient
+    // CP-key fetch below): we cannot confirm, so we warn and let the pull-loop —
+    // and the CP-side gate — remain the backstop.
+    match cp.ensure_cp_protocol_compatible().await {
+        Ok(cp_version) => info!(
+            cp_protocol_version = cp_version,
+            agent_protocol_version = ryuki_protocol::PROTOCOL_VERSION,
+            "CP wire protocol is compatible"
+        ),
+        Err(ClientError::IncompatibleProtocol {
+            cp_version,
+            supported,
+        }) => {
+            tracing::error!(
+                cp_protocol_version = cp_version,
+                supported = ?supported,
+                "control plane speaks an incompatible wire protocol version — \
+                 upgrade this agent; refusing to start"
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not confirm CP wire protocol compatibility (CP unreachable?) — \
+                 continuing; the CP will still reject an unsupported version per request"
+            );
+        }
+    }
+
     let executor = RunnerExecutor::new(Arc::clone(&identity));
     let live_exec = RunnerLiveExecutor::from_env();
 

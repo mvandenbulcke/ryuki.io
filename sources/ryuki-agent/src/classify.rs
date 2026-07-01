@@ -45,6 +45,11 @@ pub fn classify_client_error(err: &ClientError) -> RetryClass {
         ClientError::Reqwest(_) => RetryClass::Transient,
 
         ClientError::ErrorStatus { status, .. } => classify_status(*status),
+
+        // Cannot arise from result delivery (only the startup handshake returns
+        // it), but if one ever reached the outbox classifier it is a structural
+        // version mismatch that retrying cannot fix — quarantine it.
+        ClientError::IncompatibleProtocol { .. } => RetryClass::Permanent,
     }
 }
 
@@ -203,5 +208,17 @@ mod tests {
                 "status {status} expected {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn incompatible_protocol_is_permanent() {
+        // A version mismatch is structural — retrying can never fix it, so the
+        // classifier quarantines it (it never actually reaches this path from the
+        // delivery loop, but the mapping must be safe).
+        let err = ClientError::IncompatibleProtocol {
+            cp_version: 2,
+            supported: &[1],
+        };
+        assert_eq!(classify_client_error(&err), RetryClass::Permanent);
     }
 }

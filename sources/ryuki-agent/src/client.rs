@@ -78,6 +78,15 @@ pub enum ClientError {
     Reqwest(#[from] reqwest::Error),
     #[error("control plane returned {status}: {body}")]
     ErrorStatus { status: u16, body: String },
+    /// The CP advertises a wire protocol version this agent does not support.
+    /// The caller should refuse to start rather than risk silent schema drift.
+    #[error(
+        "control plane speaks wire protocol v{cp_version}, but this agent supports {supported:?} — upgrade required"
+    )]
+    IncompatibleProtocol {
+        cp_version: u32,
+        supported: &'static [u32],
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +106,36 @@ async fn require_2xx(resp: reqwest::Response) -> Result<reqwest::Response, Clien
         .await
         .unwrap_or_else(|_| "<unreadable>".to_owned());
     Err(ClientError::ErrorStatus { status: code, body })
+}
+
+/// Stamp the CP↔agent wire protocol version onto EVERY request (authed or not,
+/// incl. `register_new` and the cp-public-key fetch). Centralised here so no call
+/// site can forget it — the CP reads this header before deserialising the body and
+/// rejects an unsupported version with a clear error instead of an opaque 400.
+fn with_protocol_version(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    rb.header(
+        ryuki_protocol::PROTOCOL_VERSION_HEADER,
+        ryuki_protocol::PROTOCOL_VERSION.to_string(),
+    )
+}
+
+/// Extract the CP's advertised wire protocol version from a cp-public-key JSON
+/// body, FAIL-CLOSED. A CP predating version advertisement OMITS the field →
+/// [`ryuki_protocol::PROTOCOL_VERSION_LEGACY`]. A field that is PRESENT but not a
+/// valid `u32` (string, `null`, negative, fractional, or `> u32::MAX`) is NOT
+/// silently downgraded to legacy — it returns an error, so a garbled advertisement
+/// can never masquerade as a compatible v1 CP.
+fn parse_advertised_protocol_version(body: &serde_json::Value) -> Result<u32, ClientError> {
+    match body.get("protocol_version") {
+        None => Ok(ryuki_protocol::PROTOCOL_VERSION_LEGACY),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| ClientError::ErrorStatus {
+                status: 200,
+                body: format!("cp-public-key advertised an invalid protocol_version: {v}"),
+            }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +180,13 @@ impl CpClient {
         format!("Bearer {}", self.token)
     }
 
+    /// Attach both the bearer token and the wire protocol version header to a
+    /// request. Every authenticated call goes through this so neither header can
+    /// be omitted at an individual call site.
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        with_protocol_version(rb).header(header::AUTHORIZATION, self.auth_header())
+    }
+
     fn jobs_base_url(&self) -> String {
         format!("{}/api/agents/{}/jobs", self.base_url, self.agent_id)
     }
@@ -163,7 +209,10 @@ impl CpClient {
         let base_url = base_url.trim_end_matches('/');
         let url = format!("{}/api/agents/register", base_url);
         let http = Client::new();
-        let resp = http.post(&url).json(reg).send().await?;
+        let resp = with_protocol_version(http.post(&url))
+            .json(reg)
+            .send()
+            .await?;
         let resp = require_2xx(resp).await?;
         let body: RegisterResponse = resp.json().await?;
         Ok(body)
@@ -178,12 +227,7 @@ impl CpClient {
     /// Returns `None` on HTTP 204 (no job available), `Some(Job)` on 200.
     pub async fn poll(&self) -> Result<Option<Job>, ClientError> {
         let url = self.jobs_base_url();
-        let resp = self
-            .http
-            .get(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
-            .send()
-            .await?;
+        let resp = self.authed(self.http.get(&url)).send().await?;
 
         if resp.status() == StatusCode::NO_CONTENT {
             return Ok(None);
@@ -210,13 +254,7 @@ impl CpClient {
             attempt_id,
             fencing_token: fencing_token.into(),
         };
-        let resp = self
-            .http
-            .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
         require_2xx(resp).await?;
         Ok(())
     }
@@ -227,13 +265,7 @@ impl CpClient {
     pub async fn heartbeat(&self, running_job_id: Option<Uuid>) -> Result<(), ClientError> {
         let url = format!("{}/api/agents/{}/heartbeat", self.base_url, self.agent_id);
         let body = HeartbeatBody { running_job_id };
-        let resp = self
-            .http
-            .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
         require_2xx(resp).await?;
         Ok(())
     }
@@ -259,15 +291,10 @@ impl CpClient {
     /// Returns the raw base64 string (suitable for passing to `pin_cp_key`).
     pub async fn fetch_cp_public_key(&self) -> Result<String, ClientError> {
         let url = format!("{}/api/agents/cp-public-key", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            // Bearer token is harmless here (endpoint is unauthenticated), and
-            // sending it consistently avoids any future auth-policy change from
-            // silently breaking this call.
-            .header(header::AUTHORIZATION, self.auth_header())
-            .send()
-            .await?;
+        // Bearer token is harmless here (endpoint is unauthenticated), and sending
+        // it (plus the protocol-version header) consistently avoids any future
+        // auth-policy change from silently breaking this call.
+        let resp = self.authed(self.http.get(&url)).send().await?;
         let resp = require_2xx(resp).await?;
         let body: serde_json::Value = resp.json().await?;
         body.get("public_key")
@@ -277,6 +304,33 @@ impl CpClient {
                 status: 200,
                 body: "response missing 'public_key' field".to_owned(),
             })
+    }
+
+    /// GET /api/agents/cp-public-key — extract the CP's advertised wire protocol
+    /// version. A CP that predates version advertisement omits the field; per the
+    /// wire contract such a CP speaks [`ryuki_protocol::PROTOCOL_VERSION_LEGACY`].
+    pub async fn fetch_cp_protocol_version(&self) -> Result<u32, ClientError> {
+        let url = format!("{}/api/agents/cp-public-key", self.base_url);
+        let resp = self.authed(self.http.get(&url)).send().await?;
+        let resp = require_2xx(resp).await?;
+        let body: serde_json::Value = resp.json().await?;
+        parse_advertised_protocol_version(&body)
+    }
+
+    /// Confirm the CP speaks a wire protocol version this agent supports. Returns
+    /// the CP's version on success, or [`ClientError::IncompatibleProtocol`] when
+    /// it is outside [`ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS`] so the caller
+    /// can refuse to start. Fail-closed — this is the CP→agent half of the
+    /// compatibility handshake (the CP-side extractor is the agent→CP half).
+    pub async fn ensure_cp_protocol_compatible(&self) -> Result<u32, ClientError> {
+        let cp_version = self.fetch_cp_protocol_version().await?;
+        if !ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&cp_version) {
+            return Err(ClientError::IncompatibleProtocol {
+                cp_version,
+                supported: ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS,
+            });
+        }
+        Ok(cp_version)
     }
 
     /// POST /api/agents/{agent_id}/jobs/{job_id}/result
@@ -309,13 +363,7 @@ impl CpClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
         let url = format!("{}/{}/result", self.jobs_base_url(), job_id);
-        let resp = self
-            .http
-            .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
         let resp = require_2xx(resp).await?;
         let json: serde_json::Value = resp.json().await?;
         Ok(json)
@@ -345,6 +393,72 @@ mod tests {
         let client = CpClient::new("https://cp.example.com/", "defra-vcenter-01", "rya_tok");
         let expected = "https://cp.example.com/api/agents/defra-vcenter-01/jobs";
         assert_eq!(client.jobs_base_url(), expected);
+    }
+
+    #[test]
+    fn incompatible_protocol_error_names_both_versions() {
+        // The refuse-to-start error must tell the operator what the CP speaks and
+        // what this agent supports, so the fix (upgrade the agent) is obvious.
+        let err = ClientError::IncompatibleProtocol {
+            cp_version: 7,
+            supported: &[1, 2],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("v7"), "must name the CP version: {msg}");
+        assert!(msg.contains("[1, 2]"), "must name the supported set: {msg}");
+        assert!(
+            msg.contains("upgrade"),
+            "must state the remedy (upgrade): {msg}"
+        );
+    }
+
+    #[test]
+    fn protocol_version_header_name_is_the_shared_constant() {
+        // The client stamps the exact header the CP extractor reads — one constant,
+        // no drift.
+        assert_eq!(
+            ryuki_protocol::PROTOCOL_VERSION_HEADER,
+            "x-ryuki-protocol-version"
+        );
+        assert!(
+            ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn advertised_version_absent_field_is_legacy() {
+        // Only a COMPLETELY ABSENT field means "old CP" → legacy 1.
+        let body = serde_json::json!({ "public_key": "abc" });
+        assert_eq!(
+            parse_advertised_protocol_version(&body).unwrap(),
+            ryuki_protocol::PROTOCOL_VERSION_LEGACY
+        );
+    }
+
+    #[test]
+    fn advertised_version_valid_is_returned() {
+        let body = serde_json::json!({ "public_key": "abc", "protocol_version": 1 });
+        assert_eq!(parse_advertised_protocol_version(&body).unwrap(), 1);
+    }
+
+    #[test]
+    fn advertised_version_present_but_invalid_is_rejected_not_downgraded() {
+        // FAIL-CLOSED: a present-but-garbled value must NOT silently become legacy 1
+        // (which would falsely report the CP as compatible). Each of these is an error.
+        let invalid = [
+            serde_json::json!({ "protocol_version": "1" }), // string
+            serde_json::json!({ "protocol_version": null }), // null
+            serde_json::json!({ "protocol_version": -1 }),  // negative
+            serde_json::json!({ "protocol_version": 1.5 }), // fractional
+            serde_json::json!({ "protocol_version": true }), // bool
+            serde_json::json!({ "protocol_version": 4_294_967_296_u64 }), // > u32::MAX
+        ];
+        for body in invalid {
+            assert!(
+                parse_advertised_protocol_version(&body).is_err(),
+                "a present-but-invalid protocol_version must be an error, not legacy: {body}"
+            );
+        }
     }
 
     #[test]
