@@ -588,6 +588,28 @@ struct TfStepResult {
 ///
 /// `secret_names` and `cred_str` are used to inject `TF_VAR_<name>` env vars.
 /// Pass empty slices/string when no credential injection is needed.
+/// Map each secret var name to ITS OWN credential value, as `(TF_VAR_<name>, value)`
+/// pairs. `resolve_creds` joins the resolved values with `,` in `secret_names` order
+/// (the same encoding `credential_components` splits for scrubbing); this splits them
+/// back so `TF_VAR_<name_i>` receives `value_i`.
+///
+/// BUG FIXED: the previous code set `TF_VAR_<name> = <the whole joined string>` for EVERY
+/// name, so a multi-credential offering (e.g. an AWS provider needing access-key +
+/// secret-key) got ALL credentials concatenated into EVERY var — the provider would
+/// authenticate with garbage. Single-credential offerings happened to work (one value, no
+/// comma). A var with no matching component is simply left unset — terraform then fails
+/// closed on the missing required variable rather than authenticating with a wrong value.
+fn tf_var_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, String)> {
+    if secret_names.is_empty() || cred_str.is_empty() {
+        return Vec::new();
+    }
+    secret_names
+        .iter()
+        .zip(cred_str.split(','))
+        .map(|(name, value)| (format!("TF_VAR_{name}"), value.to_string()))
+        .collect()
+}
+
 fn run_tf_step(
     binary: &str,
     args: &[&str],
@@ -605,9 +627,8 @@ fn run_tf_step(
         .env("CHECKPOINT_DISABLE", "1")
         .env_remove("TF_LOG");
 
-    for name in secret_names {
-        let env_key = format!("TF_VAR_{name}");
-        cmd.env(&env_key, cred_str);
+    for (env_key, value) in tf_var_env_pairs(secret_names, cred_str) {
+        cmd.env(&env_key, value);
     }
 
     let output = run_command_with_timeout(cmd, LIVE_RUNNER_TIMEOUT)?;
@@ -1092,5 +1113,35 @@ esac
 
         // Fail-safe: non-JSON input is returned unchanged (never silently altered).
         assert_eq!(canonicalize_plan_json("not json".to_string()), "not json");
+    }
+
+    #[test]
+    fn tf_var_env_pairs_maps_each_name_to_its_own_credential() {
+        // Multi-credential (the bug): each var must get ITS OWN value, not the whole
+        // comma-joined string.
+        let names = vec![
+            "aws_access_key_id".to_string(),
+            "aws_secret_access_key".to_string(),
+        ];
+        assert_eq!(
+            tf_var_env_pairs(&names, "AKIAEXAMPLE,secretvalue"),
+            vec![
+                ("TF_VAR_aws_access_key_id".to_string(), "AKIAEXAMPLE".to_string()),
+                ("TF_VAR_aws_secret_access_key".to_string(), "secretvalue".to_string()),
+            ]
+        );
+        // Single credential still works.
+        assert_eq!(
+            tf_var_env_pairs(&["token".to_string()], "abc123"),
+            vec![("TF_VAR_token".to_string(), "abc123".to_string())]
+        );
+        // No names, or no creds → nothing injected.
+        assert!(tf_var_env_pairs(&[], "abc").is_empty());
+        assert!(tf_var_env_pairs(&["x".to_string()], "").is_empty());
+        // Fewer creds than names → the unmatched var is left unset (fail-closed).
+        assert_eq!(
+            tf_var_env_pairs(&["a".to_string(), "b".to_string()], "only-one"),
+            vec![("TF_VAR_a".to_string(), "only-one".to_string())]
+        );
     }
 }
