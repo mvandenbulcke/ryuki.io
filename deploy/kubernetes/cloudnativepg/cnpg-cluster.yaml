@@ -72,10 +72,17 @@ spec:
       destinationPath: s3://placeholder-bucket/
       endpointURL: https://placeholder-s3-endpoint.invalid
       s3Credentials:
-        accessKeyIdSecret:
+        # CNPG's barmanObjectStore.s3Credentials fields are `accessKeyId` /
+        # `secretAccessKey` (each a {name,key} secret reference) — NOT
+        # `accessKeyIdSecret` / `secretAccessKeySecret`. The wrong names fail
+        # `kubectl apply` against the CNPG CRD with a strict-decoding error
+        # ("unknown field ...accessKeyIdSecret"); verified end-to-end against
+        # CloudNativePG 1.24.1 (a real backup ran to an S3 object store only with
+        # these names).
+        accessKeyId:
           name: ryuki-platform-db-backup-s3
           key: access_key_id
-        secretAccessKeySecret:
+        secretAccessKey:
           name: ryuki-platform-db-backup-s3
           key: secret_access_key
       # Continuous WAL archiving — required for PITR. Compression keeps the

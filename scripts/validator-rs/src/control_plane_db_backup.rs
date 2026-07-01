@@ -163,6 +163,40 @@ fn validate_cluster_backup_target(root: &Path, errors: &mut Vec<String>) {
             "{CLUSTER_PATH} missing spec.backup.barmanObjectStore — ScheduledBackup has no target"
         ));
     }
+    // The s3Credentials sub-fields must use CNPG's REAL CRD field names —
+    // `accessKeyId` / `secretAccessKey` (each a {name,key} secret reference). The
+    // wrong names `accessKeyIdSecret` / `secretAccessKeySecret` pass a naive presence
+    // check but fail `kubectl apply` with a strict-decoding error ("unknown field"),
+    // so the whole backup path silently never deploys. Verified end-to-end against
+    // CloudNativePG 1.24.1 (a real backup ran to an S3 object store only with the
+    // correct names).
+    if let Some(s3) = doc
+        .get("spec")
+        .and_then(|s| s.get("backup"))
+        .and_then(|b| b.get("barmanObjectStore"))
+        .and_then(|o| o.get("s3Credentials"))
+    {
+        for bad in ["accessKeyIdSecret", "secretAccessKeySecret"] {
+            if s3.get(bad).is_some() {
+                errors.push(format!(
+                    "{CLUSTER_PATH} s3Credentials has invalid CNPG field '{bad}' — expected '{}' \
+                     (kubectl apply fails strict decoding otherwise)",
+                    bad.trim_end_matches("Secret")
+                ));
+            }
+        }
+        // Explicit key auth must use CNPG's field names, unless IAM-role auth is used.
+        let iam = s3.get("inheritFromIAMRole").and_then(Value::as_bool) == Some(true);
+        if !iam {
+            for field in ["accessKeyId", "secretAccessKey"] {
+                if s3.get(field).is_none() {
+                    errors.push(format!(
+                        "{CLUSTER_PATH} s3Credentials missing '{field}' (CNPG's field name)"
+                    ));
+                }
+            }
+        }
+    }
     // Retention reflects the RYUKI_RETENTION__* intent and bounds the PITR
     // window. In CNPG it lives on the Cluster, not the ScheduledBackup.
     match str_at(&doc, &["spec", "backup", "retentionPolicy"]) {
