@@ -62,9 +62,33 @@ pub struct EventRow {
 /// `LIMIT` only ever counts rows the principal may see — otherwise a scoped
 /// principal could get a short page when the DB's top-N included out-of-scope
 /// rows. The predicate mirrors `ryuki_engine::auth::scope_permits`: an EMPTY
-/// scope list is unrestricted (sees every value), and a NULL column (a
-/// platform-wide event) is visible to everyone. `limit` bounds the page; the
-/// `id` tiebreaker keeps ordering stable within an `occurred_at`.
+/// scope list is unrestricted on that axis, and a value the principal holds
+/// matches.
+///
+/// CROSS-SCOPE RULE (#2 fix). A NULL on an axis means "this event has NO value
+/// on that axis" — NOT "visible to everyone scoped on that axis". The old
+/// per-axis `IS NULL` clauses leaked a CONCRETE scope value across the OTHER
+/// axis, in BOTH directions:
+///   * SITE-ONLY events (concrete site, NULL environment — e.g. a decommission,
+///     or a site-scoped SLO/budget) reached an ENVIRONMENT-scoped principal: it
+///     is unrestricted on the site axis (empty `site_scope` ⇒ `cardinality = 0`)
+///     and matched `environment IS NULL`, so it saw every site's events.
+///   * ENV-ONLY events (NULL site, concrete environment — e.g. a cross-site
+///     SLO/budget) reached a SITE-scoped principal the same way via `site IS
+///     NULL`.
+///
+/// In both cases the mutating handlers fail CLOSED for that principal
+/// (`site_scope_guard_or_404`; or `multi_scope_permits`, which denies a scoped
+/// principal a row that is NULL on its scoped axis), so the feed was more
+/// permissive than the handler.
+///
+/// The fix is SYMMETRIC: a NULL axis is "platform-wide visible" only when the
+/// event is global on BOTH axes (`site IS NULL AND environment IS NULL`). So an
+/// event is visible iff, on each axis, the principal is unrestricted OR the
+/// event's CONCRETE value is in scope — or the event is genuinely global on both
+/// axes (the deliberate observability baseline everyone sees). No concrete
+/// out-of-scope value leaks across either axis. `limit` bounds the page; the `id`
+/// tiebreaker keeps ordering stable within an `occurred_at`.
 pub async fn list(
     pool: &sqlx::PgPool,
     event_type: Option<&str>,
@@ -79,8 +103,10 @@ pub async fn list(
          FROM domain_events \
          WHERE ($1::text IS NULL OR event_type = $1) \
            AND ($2::text IS NULL OR aggregate_id = $2) \
-           AND (cardinality($3::text[]) = 0 OR site IS NULL OR site = ANY($3)) \
-           AND (cardinality($4::text[]) = 0 OR environment IS NULL OR environment = ANY($4)) \
+           AND (cardinality($3::text[]) = 0 OR site = ANY($3) \
+                OR (site IS NULL AND environment IS NULL)) \
+           AND (cardinality($4::text[]) = 0 OR environment = ANY($4) \
+                OR (environment IS NULL AND site IS NULL)) \
          ORDER BY occurred_at DESC, id DESC \
          LIMIT $5",
     )
@@ -100,7 +126,11 @@ pub async fn list(
 /// recent-N page would return near-empty pages. The caller then applies the
 /// PRECISE per-aggregate rule via the engine classifier (dropping any spurious
 /// (aggregate, status) pair), so the coarse SQL filter and the per-aggregate
-/// labels cannot drift. Same scope semantics as [`list`].
+/// labels cannot drift. Same scope semantics as [`list`] — including the
+/// SYMMETRIC cross-scope rule: a NULL axis is platform-wide only when BOTH axes
+/// are NULL, so a site-only alert (a site-scoped SLO/budget breach) never leaks
+/// to an environment-scoped principal, and an env-only alert never leaks to a
+/// site-scoped one — matching the handlers that fail closed for each.
 pub async fn list_alerts(
     pool: &sqlx::PgPool,
     aggregate_id: Option<&str>,
@@ -115,8 +145,10 @@ pub async fn list_alerts(
          FROM domain_events \
          WHERE payload->>'to_status' = ANY($1) \
            AND ($2::text IS NULL OR aggregate_id = $2) \
-           AND (cardinality($3::text[]) = 0 OR site IS NULL OR site = ANY($3)) \
-           AND (cardinality($4::text[]) = 0 OR environment IS NULL OR environment = ANY($4)) \
+           AND (cardinality($3::text[]) = 0 OR site = ANY($3) \
+                OR (site IS NULL AND environment IS NULL)) \
+           AND (cardinality($4::text[]) = 0 OR environment = ANY($4) \
+                OR (environment IS NULL AND site IS NULL)) \
          ORDER BY occurred_at DESC, id DESC \
          LIMIT $5",
     )

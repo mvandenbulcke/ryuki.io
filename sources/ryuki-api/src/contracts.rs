@@ -18862,9 +18862,13 @@ struct EventsQuery {
 /// optional `event_type` / `aggregate_id` filters. Distinct from the audit feed:
 /// this is the operational stream other subsystems consume (alert generation,
 /// dashboards). Request-tier read, site/environment-scoped (#2): a scoped
-/// principal sees only its own scope's events plus platform-wide (NULL-scope)
-/// events; an environment-scoped principal still sees site-only-NULL events for
-/// its environment. Empty + `durable:false` when no DB is configured.
+/// principal sees only its own scope's events plus events that are platform-wide
+/// (NULL) on BOTH axes. The cross-scope rule is SYMMETRIC: a SITE-ONLY event
+/// (concrete site, NULL environment — e.g. a decommission) is NOT visible to an
+/// environment-scoped principal, and an ENV-ONLY event (NULL site, concrete
+/// environment) is NOT visible to a site-scoped one — in each case the mutating
+/// handlers fail closed for that principal, so the feed must not be more
+/// permissive. Empty + `durable:false` when no DB is configured.
 async fn events_list(
     AuthExtractor(session): AuthExtractor,
     Query(q): Query<EventsQuery>,
@@ -19065,9 +19069,23 @@ async fn ack_alert_one(
         .map_err(db_error)?
     {
         Some((site, environment)) => {
-            let site_ok = site.is_none() || scope_permits(&session.site_scope, site.as_deref());
-            let env_ok = environment.is_none()
-                || scope_permits(&session.environment_scope, environment.as_deref());
+            // #2 cross-scope fix: mirror domain_events::list_alerts EXACTLY, on BOTH
+            // axes. A NULL axis is platform-wide (ackable across the other axis) ONLY
+            // when the event is global on BOTH axes; otherwise a concrete value on one
+            // axis is reachable only by a principal in scope on that axis. We must NOT
+            // defer to `scope_permits(scope, None)`, which fail-opens on a missing
+            // value — that is precisely how an env-scoped principal could ack a
+            // site-only alert (or a site-scoped principal an env-only alert) the feed
+            // correctly hides. So a NULL axis passes only when the principal is
+            // unrestricted on it OR the other axis is ALSO NULL.
+            let site_ok = match site.as_deref() {
+                Some(s) => scope_permits(&session.site_scope, Some(s)),
+                None => session.site_scope.is_empty() || environment.is_none(),
+            };
+            let env_ok = match environment.as_deref() {
+                Some(env) => scope_permits(&session.environment_scope, Some(env)),
+                None => session.environment_scope.is_empty() || site.is_none(),
+            };
             if !(site_ok && env_ok) {
                 return Err(status_404(&event_id.to_string()));
             }
@@ -24004,6 +24022,31 @@ async fn decommission_quarantine(
     )
     .await
     .map_err(db_error)?;
+    // #11/#2: emit the operational domain event in the SAME tx as the audit row, so
+    // the destructive decommission lifecycle is queryable in /api/events. A
+    // decommission is SITE-ONLY — environment is NULL — and domain_events::list
+    // keeps such site-only events out of an environment-scoped principal's feed, in
+    // lock-step with site_scope_guard_or_404 above. `to_status` ("Quarantined") is
+    // NOT in event_alerts::alert_worthy_statuses(), so this is a non-alerting event.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.quarantined",
+            aggregate_type: "decommission",
+            aggregate_id: &quarantined.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&quarantined.status),
+                "server_name": &quarantined.server_name,
+                "site": &req.site,
+            }),
+        },
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&quarantined).unwrap_or_default()))
@@ -24047,6 +24090,27 @@ async fn decommission_execute(
                 "site": executed.site,
             }),
         ),
+    )
+    .await
+    .map_err(db_error)?;
+    // #11/#2: SITE-ONLY domain event in the audit tx — see decommission_quarantine.
+    // "Executed" is non-alerting (not in event_alerts::alert_worthy_statuses()).
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.executed",
+            aggregate_type: "decommission",
+            aggregate_id: &executed.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&executed.status),
+                "server_name": &executed.server_name,
+                "site": &req.site,
+            }),
+        },
     )
     .await
     .map_err(db_error)?;
@@ -24117,6 +24181,27 @@ async fn decommission_rollback(
                 "site": rolled_back.site,
             }),
         ),
+    )
+    .await
+    .map_err(db_error)?;
+    // #11/#2: SITE-ONLY domain event in the audit tx — see decommission_quarantine.
+    // "RolledBack" is non-alerting (not in event_alerts::alert_worthy_statuses()).
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.rolled_back",
+            aggregate_type: "decommission",
+            aggregate_id: &rolled_back.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&rolled_back.status),
+                "server_name": &rolled_back.server_name,
+                "site": &req.site,
+            }),
+        },
     )
     .await
     .map_err(db_error)?;
@@ -47196,6 +47281,278 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #2 cross-scope fix: a SITE-ONLY ALERT event (a site-scoped SLO breach — a
+    /// concrete site, NULL environment) obeys the same rule as decommission events,
+    /// across BOTH the read feeds and the ack path. A same-site principal sees it in
+    /// the events feed AND the alerts feed and may ACK it; an ENVIRONMENT-scoped
+    /// principal — which the SLO/budget mutating guards fail closed for — sees it in
+    /// NEITHER feed and gets a 404 on ack (no cross-scope read OR ack oracle). This
+    /// guards the SAME latent leak the decommission finding surfaced, in the existing
+    /// SLO/budget emitters. Isolated by a unique aggregate_id (domain_events is
+    /// append-only); the ack row count is asserted exactly (not just fetched).
+    #[tokio::test]
+    async fn site_only_slo_alert_is_hidden_from_env_scoped_principal() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // A DEFRA-site-only SLO breach: site set, environment NULL, alert-worthy.
+        let agg = format!("slo-siteonly-{}", Uuid::new_v4());
+        let event_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &agg,
+                site: Some("DEFRA"),
+                environment: None,
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "test-slo" }),
+            },
+        )
+        .await
+        .expect("insert site-only SLO breach");
+
+        let defra = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["DEFRA".into()];
+            s
+        };
+        let env_only = || {
+            let mut s = AuthSession::static_dry_run();
+            s.environment_scope = vec!["production".into()];
+            s
+        };
+        let aggq = |session| {
+            (
+                AuthExtractor(session),
+                Query(EventsQuery {
+                    event_type: None,
+                    aggregate_id: Some(agg.clone()),
+                    limit: Some(500),
+                }),
+            )
+        };
+
+        // --- events feed: same-site SEES exactly one; env-scoped sees none. ---
+        let (e, q) = aggq(defra());
+        let Json(defra_list) = events_list(e, q).await.expect("defra list");
+        assert_eq!(
+            defra_list["events"].as_array().unwrap().len(),
+            1,
+            "a same-site principal must see its site-only SLO event: {defra_list:?}"
+        );
+        let (e, q) = aggq(env_only());
+        let Json(env_list) = events_list(e, q).await.expect("env list");
+        assert_eq!(
+            env_list["events"].as_array().unwrap().len(),
+            0,
+            "an environment-scoped principal must NOT see a site-only SLO event: {env_list:?}"
+        );
+
+        // --- alerts feed: same rule, plus classification (an SLO breach is critical). ---
+        let (e, q) = aggq(defra());
+        let Json(defra_alerts) = events_alerts(e, q).await.expect("defra alerts");
+        let da = defra_alerts["alerts"].as_array().unwrap();
+        assert_eq!(
+            da.len(),
+            1,
+            "same-site principal must see the SLO breach alert"
+        );
+        assert_eq!(
+            da[0]["severity"],
+            json!("critical"),
+            "an SLO breach is critical"
+        );
+        let (e, q) = aggq(env_only());
+        let Json(env_alerts) = events_alerts(e, q).await.expect("env alerts");
+        assert_eq!(
+            env_alerts["alerts"].as_array().unwrap().len(),
+            0,
+            "an environment-scoped principal must NOT see a site-only SLO alert"
+        );
+
+        // --- ack path: must match feed visibility (same leak surface). ---
+        // Env-scoped principal cannot ACK what it cannot see → 404 (no ack oracle),
+        // and NO ack row may be written.
+        let env_ack = events_alert_ack(
+            AuthExtractor(env_only()),
+            Path(event_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(env_ack, Err((StatusCode::NOT_FOUND, _))),
+            "env-scoped ack of a site-only alert must 404: {env_ack:?}"
+        );
+        assert_eq!(
+            ack_count(pool, event_id).await,
+            0,
+            "no ack row may be written for the denied env-scoped principal"
+        );
+        // Same-site principal CAN ack it (exactly one ack row results).
+        let defra_ack = events_alert_ack(
+            AuthExtractor(defra()),
+            Path(event_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            defra_ack.is_ok(),
+            "same-site ack must succeed: {defra_ack:?}"
+        );
+        assert_eq!(
+            ack_count(pool, event_id).await,
+            1,
+            "exactly one ack row after the in-scope ack"
+        );
+
+        // Cleanup the mutable ack row; the append-only domain_events row is isolated
+        // by its unique aggregate_id and needs no cleanup.
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+            .bind(event_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #2 cross-scope fix — the REVERSE direction (symmetry). An ENV-ONLY alert (a
+    /// cross-site SLO breach: NULL site, concrete environment) must NOT leak to a
+    /// SITE-scoped principal, which `multi_scope_permits` denies the SLO/budget
+    /// handlers (a scoped axis cannot be honored by a row that is NULL on it). The
+    /// SAME principal still sees a GENUINELY-GLOBAL (both-NULL) alert — the
+    /// deliberate observability baseline — and the env-scoped owner still sees its
+    /// env-only alert. Isolated by unique aggregate_ids; ack rows asserted by count.
+    #[tokio::test]
+    async fn env_only_alert_is_hidden_from_site_scoped_principal_but_global_is_shared() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // An ENV-ONLY SLO breach (NULL site, env=production) and a GLOBAL one (both NULL).
+        let env_agg = format!("slo-envonly-{}", Uuid::new_v4());
+        let global_agg = format!("slo-global-{}", Uuid::new_v4());
+        let env_event = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &env_agg,
+                site: None,
+                environment: Some("production"),
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "env-slo" }),
+            },
+        )
+        .await
+        .expect("insert env-only SLO breach");
+        let global_event = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &global_agg,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "global-slo" }),
+            },
+        )
+        .await
+        .expect("insert global SLO breach");
+
+        let count_for = |session: AuthSession, agg: String| async move {
+            let Json(out) = events_list(
+                AuthExtractor(session),
+                Query(EventsQuery {
+                    event_type: None,
+                    aggregate_id: Some(agg),
+                    limit: Some(500),
+                }),
+            )
+            .await
+            .expect("events list");
+            out["events"].as_array().map(|a| a.len()).unwrap_or(0)
+        };
+        let site_scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["DEFRA".into()];
+            s
+        };
+        let env_scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.environment_scope = vec!["production".into()];
+            s
+        };
+
+        // SITE-scoped principal: does NOT see the env-only alert (reverse leak fixed)…
+        assert_eq!(
+            count_for(site_scoped(), env_agg.clone()).await,
+            0,
+            "a site-scoped principal must NOT see an env-only SLO alert"
+        );
+        // …but DOES see the genuinely-global (both-NULL) alert.
+        assert_eq!(
+            count_for(site_scoped(), global_agg.clone()).await,
+            1,
+            "a site-scoped principal must still see a global (both-NULL) alert"
+        );
+        // ENV-scoped owner sees its own env-only alert AND the global one.
+        assert_eq!(
+            count_for(env_scoped(), env_agg.clone()).await,
+            1,
+            "the env-scoped owner must see its env-only alert"
+        );
+        assert_eq!(
+            count_for(env_scoped(), global_agg.clone()).await,
+            1,
+            "the env-scoped principal must see the global alert"
+        );
+
+        // ack parity: the site-scoped principal cannot ack the env-only alert (404)
+        // but can ack the global one; no stray ack row for the denied attempt.
+        let denied = events_alert_ack(
+            AuthExtractor(site_scoped()),
+            Path(env_event),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "site-scoped ack of an env-only alert must 404: {denied:?}"
+        );
+        assert_eq!(
+            ack_count(pool, env_event).await,
+            0,
+            "no ack row for the denied attempt"
+        );
+        let allowed = events_alert_ack(
+            AuthExtractor(site_scoped()),
+            Path(global_event),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "site-scoped ack of a global alert must succeed: {allowed:?}"
+        );
+        assert_eq!(
+            ack_count(pool, global_event).await,
+            1,
+            "exactly one ack row for the global alert"
+        );
+
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = ANY($1)")
+            .bind(vec![env_event, global_event])
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     /// #8: degradation status reads from the DB (migration 025 seed), not the
     /// in-memory engine — so it survives restart. The component_status rows fold
     /// into AdapterComponentStatus correctly. Non-mutating.
@@ -58138,6 +58495,123 @@ mod server_decommission_db_tests {
             cleanup(pool, &id).await;
             panic!("verify failed");
         };
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Count the domain events one principal sees for a single aggregate id. The
+    /// feed is already filtered by `aggregate_id`, so the returned length is exact.
+    async fn events_seen(session: AuthSession, aggregate_id: &str) -> Vec<Value> {
+        let Json(out) = events_list(
+            AuthExtractor(session),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(aggregate_id.to_string()),
+                limit: Some(500),
+            }),
+        )
+        .await
+        .expect("events list");
+        out["events"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// #11/#2: the destructive decommission lifecycle (quarantine → execute) emits
+    /// SITE-ONLY domain events into /api/events, and those events honor the
+    /// site-only scope rule that the first attempt got wrong. A same-site principal
+    /// SEES them; a different-site principal and — critically — an ENVIRONMENT-scoped
+    /// principal (which `site_scope_guard_or_404` denies the handlers) see NONE. This
+    /// is the regression guard for the cross-scope leak that reverted attempt #1.
+    /// Events are isolated by the unique decommission id (domain_events is
+    /// append-only, so a DELETE cleanup would be a silent no-op); counts are exact.
+    #[tokio::test]
+    async fn decommission_lifecycle_emits_site_scoped_events() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a DEFRA decommission, then drive it: approve → quarantine → execute.
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+        let Json(_) = decommission_approve(
+            Path(id.clone()),
+            Extension(approver_session("evt-approver")),
+        )
+        .await
+        .expect("approve");
+        let Json(_) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("quarantine");
+        let Json(_) = decommission_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("execute");
+
+        // Unrestricted admin: exactly the two emitted events, correctly shaped as
+        // site-only (site=DEFRA, environment=NULL, aggregate_type=decommission).
+        let admin_events = events_seen(AuthSession::static_dry_run(), &id).await;
+        assert_eq!(
+            admin_events.len(),
+            2,
+            "quarantine + execute must each emit one event: {admin_events:?}"
+        );
+        assert!(
+            admin_events.iter().all(|e| e["aggregate_type"] == json!("decommission")
+                && e["site"] == json!("DEFRA")
+                && e["environment"].is_null()),
+            "decommission events must be site-only (site=DEFRA, environment=NULL): {admin_events:?}"
+        );
+        let types: Vec<&str> = admin_events
+            .iter()
+            .filter_map(|e| e["event_type"].as_str())
+            .collect();
+        assert!(
+            types.contains(&"decommission.quarantined") && types.contains(&"decommission.executed"),
+            "both lifecycle event types must be present: {types:?}"
+        );
+
+        // Same-site (DEFRA) principal SEES both events (guard is not over-broad).
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        assert_eq!(
+            events_seen(defra, &id).await.len(),
+            2,
+            "a DEFRA-scoped principal must see its own site's decommission events"
+        );
+
+        // Different-site (GBLON) principal sees NONE.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        assert_eq!(
+            events_seen(gblon, &id).await.len(),
+            0,
+            "another site must not see DEFRA decommission events"
+        );
+
+        // ENVIRONMENT-only-scoped principal sees NONE — the cross-scope leak fix.
+        // It is denied the decommission handlers (an env scope cannot be honored by
+        // a site-only resource → 404), so the feed must not be more permissive.
+        let mut env_only = AuthSession::static_dry_run();
+        env_only.environment_scope = vec!["production".into()];
+        assert_eq!(
+            events_seen(env_only, &id).await.len(),
+            0,
+            "an environment-scoped principal must NOT see site-only decommission events"
+        );
 
         cleanup(pool, &id).await;
     }
