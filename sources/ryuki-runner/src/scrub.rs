@@ -18,18 +18,19 @@
 /// are truncated with a suffix indicating the truncation.
 pub const MAX_LOG_BYTES: usize = 32 * 1024; // 32 KiB
 
-/// Scrub `secret_values` from `output`, then truncate to `MAX_LOG_BYTES`.
+/// Scrub `secret_values` from `output` WITHOUT truncating.
 ///
 /// Each secret value is replaced with `[REDACTED]`. Replacement is
-/// case-sensitive and applies to every occurrence.
+/// case-sensitive and applies to every occurrence. Use this when the full
+/// scrubbed text matters — notably the `terraform show -json` output whose
+/// SHA-256 is the live-apply plan-integrity digest: truncating it before
+/// digesting would let two plans that differ only past the truncation point
+/// collide, silently defeating the "apply only the approved plan" gate.
 ///
 /// # Arguments
 /// * `output` — raw captured stdout/stderr from the runner binary.
 /// * `secret_values` — slice of byte-string values to redact.
-///
-/// # Returns
-/// The scrubbed and truncated output as a `String`.
-pub fn scrub_output(output: &str, secret_values: &[&[u8]]) -> String {
+pub fn scrub(output: &str, secret_values: &[&[u8]]) -> String {
     let mut result = output.to_string();
     for secret in secret_values {
         if secret.is_empty() {
@@ -43,7 +44,19 @@ pub fn scrub_output(output: &str, secret_values: &[&[u8]]) -> String {
             }
         }
     }
-    truncate_log(&result)
+    result
+}
+
+/// Scrub `secret_values` from `output`, then truncate to `MAX_LOG_BYTES`.
+///
+/// This is the default for human-readable evidence logs (init/plan/apply
+/// console output), which are diagnostic and not integrity-bound. For the
+/// digest-bound `terraform show -json` output use [`scrub`] instead.
+///
+/// # Returns
+/// The scrubbed and truncated output as a `String`.
+pub fn scrub_output(output: &str, secret_values: &[&[u8]]) -> String {
+    truncate_log(&scrub(output, secret_values))
 }
 
 /// Truncate `log` to `MAX_LOG_BYTES`, appending a note if truncation occurred.
@@ -135,5 +148,27 @@ mod tests {
         let truncated = truncate_log(&log);
         assert!(truncated.len() < log.len());
         assert!(truncated.contains("[... output truncated at"));
+    }
+
+    #[test]
+    fn scrub_does_not_truncate_large_output() {
+        // The digest-bound show-json path relies on `scrub` returning the FULL
+        // text: a plan larger than MAX_LOG_BYTES must survive intact so its
+        // digest covers the whole plan, not just the first 32 KiB.
+        let big = "y".repeat(MAX_LOG_BYTES + 4096);
+        let scrubbed = scrub(&big, &[]);
+        assert_eq!(scrubbed.len(), big.len(), "scrub must not truncate");
+        assert!(!scrubbed.contains("truncated"));
+    }
+
+    #[test]
+    fn scrub_still_redacts_without_truncating() {
+        let secret = b"tail-secret-value";
+        let mut output = "z".repeat(MAX_LOG_BYTES);
+        output.push_str(" tail-secret-value");
+        let scrubbed = scrub(&output, &[secret.as_slice()]);
+        assert!(!scrubbed.contains("tail-secret-value"));
+        assert!(scrubbed.contains("[REDACTED]"));
+        assert!(scrubbed.len() > MAX_LOG_BYTES, "no truncation applied");
     }
 }

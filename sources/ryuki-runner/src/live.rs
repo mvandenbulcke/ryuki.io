@@ -108,7 +108,7 @@ pub struct LivePlanArtifacts {
 
 use super::{
     exec::run_command_with_timeout,
-    scrub::scrub_output,
+    scrub::{scrub, scrub_output, truncate_log},
     terraform::{
         apply_env_allowlist, combine_output, credential_components, pin_home_tmpdir_to_workspace,
         validate_offering_slug, validate_var_name,
@@ -225,21 +225,24 @@ pub fn run_live_apply(
 /// can collapse distinct high-precision JSON numbers to the same `f64`, which would let two
 /// plans that differ only in such a value canonicalize to the SAME digest — WEAKENING the
 /// gate. `RawValue` is lossless. The top-level keys are ordered by `BTreeMap`, which makes
-/// the output deterministic regardless of terraform's emission order. On any JSON parse
-/// failure the raw input is returned unchanged (fail-safe: never silently widen what would
-/// be applied — a malformed plan simply won't match a different approved digest).
-fn canonicalize_plan_json(raw: String) -> String {
+/// the output deterministic regardless of terraform's emission order.
+///
+/// Returns `None` when the input is not valid JSON. The caller treats that as a
+/// hard `Failed` (fail-closed): a non-canonical plan must never reach the digest
+/// layer, because digesting raw bytes would either be non-deterministic (the
+/// un-stripped `timestamp` differs on every re-plan, so every apply is refused)
+/// or — for output that was truncated before it arrived — collide across plans
+/// that differ only past the cut point.
+fn canonicalize_plan_json(raw: &str) -> Option<String> {
     use serde_json::value::RawValue;
     use std::collections::BTreeMap;
-    // Borrow of `raw` is confined to this block so `raw` is free for the fallback below.
-    let canonical = match serde_json::from_str::<BTreeMap<String, &RawValue>>(&raw) {
+    match serde_json::from_str::<BTreeMap<String, &RawValue>>(raw) {
         Ok(mut members) => {
             members.remove("timestamp");
             serde_json::to_string(&members).ok()
         }
         Err(_) => None,
-    };
-    canonical.unwrap_or(raw)
+    }
 }
 
 /// Core plan implementation.  `binary` is injectable for tests (e.g. `/bin/echo`).
@@ -322,7 +325,7 @@ pub(crate) fn live_terraform_plan(
         &plan.secret_var_names,
         &cred_str,
         &secret_refs,
-        plan.mode,
+        true,
     )?;
 
     if init_outcome.exit_code != Some(0) {
@@ -351,7 +354,7 @@ pub(crate) fn live_terraform_plan(
         &plan.secret_var_names,
         &cred_str,
         &secret_refs,
-        plan.mode,
+        true,
     )?;
 
     match plan_step.exit_code {
@@ -389,7 +392,7 @@ pub(crate) fn live_terraform_plan(
         &[], // no cred injection needed for show
         "",
         &secret_refs,
-        plan.mode,
+        false, // digest input — must NOT be truncated
     )?;
 
     if show_outcome.exit_code != Some(0) {
@@ -413,7 +416,29 @@ pub(crate) fn live_terraform_plan(
     // Canonicalize FIRST (strip terraform's non-deterministic `timestamp`) so a
     // LiveApply re-plan of identical config produces the SAME digest as the approved
     // LivePlan — without this the plan-integrity gate refuses every live apply.
-    let plan_json = canonicalize_plan_json(show_outcome.log);
+    // `show_outcome.log` is UNtruncated (step 3 passed `truncate=false`) so the
+    // digest covers the whole plan; unparseable JSON fails closed rather than
+    // digesting non-canonical bytes.
+    let plan_json = match canonicalize_plan_json(&show_outcome.log) {
+        Some(json) => json,
+        None => {
+            return Ok(LivePlanArtifacts {
+                outcome: RunOutcome {
+                    runner_kind: RunnerKind::Terraform,
+                    mode: plan.mode,
+                    status: RunStatus::Failed,
+                    summary: "terraform show produced non-canonical plan JSON — \
+                              refusing to derive a plan-integrity digest"
+                        .to_string(),
+                    // Truncate the (untruncated) show output for the failure log
+                    // only — it is diagnostic here, not a digest input.
+                    log: truncate_log(&show_outcome.log),
+                    exit_code: show_outcome.exit_code,
+                },
+                tfplan: vec![],
+            });
+        }
+    };
     let plan_summary = extract_plan_summary(&plan_step.log);
 
     Ok(LivePlanArtifacts {
@@ -506,7 +531,7 @@ pub(crate) fn live_terraform_apply(
         &plan.secret_var_names,
         &cred_str,
         &secret_refs,
-        plan.mode,
+        true,
     )?;
 
     if init_outcome.exit_code != Some(0) {
@@ -534,7 +559,7 @@ pub(crate) fn live_terraform_apply(
         &plan.secret_var_names,
         &cred_str,
         &secret_refs,
-        plan.mode,
+        true,
     )?;
 
     let (status, summary) = match apply_outcome.exit_code {
@@ -617,7 +642,7 @@ fn run_tf_step(
     secret_names: &[String],
     cred_str: &str,
     secret_refs: &[&[u8]],
-    _mode: RunMode,
+    truncate: bool,
 ) -> Result<TfStepResult, RunnerError> {
     let mut cmd = Command::new(binary);
     apply_env_allowlist(&mut cmd);
@@ -634,7 +659,16 @@ fn run_tf_step(
     let output = run_command_with_timeout(cmd, LIVE_RUNNER_TIMEOUT)?;
 
     let raw = combine_output(&output.stdout, &output.stderr);
-    let scrubbed = scrub_output(&raw, secret_refs);
+    // Human-readable diagnostic logs (init/plan/apply) are truncated to bound
+    // evidence size. The `terraform show -json` step passes `truncate=false`
+    // because its output is the plan-integrity digest input — truncating it
+    // would let two plans differing only past 32 KiB collide (see
+    // `live_terraform_plan` step 3).
+    let scrubbed = if truncate {
+        scrub_output(&raw, secret_refs)
+    } else {
+        scrub(&raw, secret_refs)
+    };
 
     Ok(TfStepResult {
         log: scrubbed,
@@ -864,8 +898,13 @@ mod tests {
         let shim = ws_probe.path().join("fake-tf-live-iac");
         // The shim writes a stub tfplan file on every invocation (in case this
         // invocation is the plan step) and exits 0.
-        std::fs::write(&shim, "#!/bin/sh\ntouch \"$PWD/tfplan\"\nls\nexit 0\n")
-            .expect("write shim");
+        // `show -json` must emit valid JSON — the digest layer now fails closed
+        // on non-canonical plan output. Other steps just list files and exit 0.
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$1\" = show ]; then echo '{\"format_version\":\"1.2\",\"resource_changes\":[]}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nls\nexit 0\n",
+        )
+        .expect("write shim");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1021,8 +1060,13 @@ esac
         let ws_probe = super::super::workspace::Workspace::new().expect("ws");
         let shim = ws_probe.path().join("fake-tf-backend-check");
         // Shim writes stub tfplan, lists files, exits 0 for all steps.
-        std::fs::write(&shim, "#!/bin/sh\ntouch \"$PWD/tfplan\"\nls\nexit 0\n")
-            .expect("write shim");
+        // `show -json` must emit valid JSON — the digest layer now fails closed
+        // on non-canonical plan output. Other steps just list files and exit 0.
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$1\" = show ]; then echo '{\"format_version\":\"1.2\",\"resource_changes\":[]}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nls\nexit 0\n",
+        )
+        .expect("write shim");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1076,22 +1120,35 @@ esac
         // top-level `timestamp` must canonicalize to the SAME bytes (equal digest).
         let plan_a = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:04Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}]}"#;
         let plan_b = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:06Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}]}"#;
-        let ca = canonicalize_plan_json(plan_a.to_string());
-        let cb = canonicalize_plan_json(plan_b.to_string());
-        assert_eq!(ca, cb, "plans differing only by timestamp must be equal after canonicalization");
-        assert!(!ca.contains("timestamp"), "timestamp must be stripped from the digest input");
-        assert!(ca.contains("resource_changes"), "semantic plan content must be preserved");
+        let ca = canonicalize_plan_json(plan_a).unwrap();
+        let cb = canonicalize_plan_json(plan_b).unwrap();
+        assert_eq!(
+            ca, cb,
+            "plans differing only by timestamp must be equal after canonicalization"
+        );
+        assert!(
+            !ca.contains("timestamp"),
+            "timestamp must be stripped from the digest input"
+        );
+        assert!(
+            ca.contains("resource_changes"),
+            "semantic plan content must be preserved"
+        );
 
         // Deterministic regardless of top-level key emission order (BTreeMap).
         let reordered = r#"{"resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}],"timestamp":"2026-07-01T09:00:00Z","format_version":"1.2"}"#;
-        assert_eq!(ca, canonicalize_plan_json(reordered.to_string()), "key order must not affect the digest");
+        assert_eq!(
+            ca,
+            canonicalize_plan_json(reordered).unwrap(),
+            "key order must not affect the digest"
+        );
 
         // A REAL plan change must still change the canonical form — the plan-integrity
         // guarantee is preserved (the gate must reject a plan that differs semantically).
         let plan_c = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:04Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["delete"]}}]}"#;
         assert_ne!(
             ca,
-            canonicalize_plan_json(plan_c.to_string()),
+            canonicalize_plan_json(plan_c).unwrap(),
             "a real change to resource_changes MUST change the digest input"
         );
 
@@ -1103,16 +1160,55 @@ esac
         // Both integers exceed u64::MAX (18446744073709551615), so a Value-based parser
         // without arbitrary_precision would parse BOTH as the same f64 (2^64) — collapsing
         // them. RawValue keeps the exact bytes, so the canonical forms differ.
-        let big_1 = r#"{"timestamp":"2026-07-01T05:30:04Z","planned_values":{"n":18446744073709551616}}"#;
-        let big_2 = r#"{"timestamp":"2026-07-01T05:30:06Z","planned_values":{"n":18446744073709551617}}"#;
+        let big_1 =
+            r#"{"timestamp":"2026-07-01T05:30:04Z","planned_values":{"n":18446744073709551616}}"#;
+        let big_2 =
+            r#"{"timestamp":"2026-07-01T05:30:06Z","planned_values":{"n":18446744073709551617}}"#;
         assert_ne!(
-            canonicalize_plan_json(big_1.to_string()),
-            canonicalize_plan_json(big_2.to_string()),
+            canonicalize_plan_json(big_1).unwrap(),
+            canonicalize_plan_json(big_2).unwrap(),
             "high-precision numeric differences MUST survive canonicalization (no f64 collapse)"
         );
 
-        // Fail-safe: non-JSON input is returned unchanged (never silently altered).
-        assert_eq!(canonicalize_plan_json("not json".to_string()), "not json");
+        // Fail-CLOSED: non-JSON input yields no digest (the caller returns Failed
+        // rather than digesting non-canonical bytes).
+        assert!(
+            canonicalize_plan_json("not json").is_none(),
+            "unparseable plan JSON must fail closed (no digest)"
+        );
+    }
+
+    #[test]
+    fn canonicalize_plan_json_covers_the_full_plan_past_32_kib() {
+        // Regression for the truncated-digest bug: two plans identical in their
+        // first 32 KiB but differing in a tail resource must canonicalize to
+        // DIFFERENT bytes. This only holds because the show output reaches
+        // `canonicalize_plan_json` UNtruncated (run_tf_step truncate=false).
+        let filler = "x".repeat(crate::scrub::MAX_LOG_BYTES);
+        let plan_a = format!(
+            r#"{{"timestamp":"2026-07-01T05:30:04Z","pad":"{filler}","tail":{{"address":"aws_instance.a","action":"create"}}}}"#
+        );
+        let plan_b = format!(
+            r#"{{"timestamp":"2026-07-01T05:30:06Z","pad":"{filler}","tail":{{"address":"aws_instance.b","action":"create"}}}}"#
+        );
+        assert!(plan_a.len() > crate::scrub::MAX_LOG_BYTES);
+        let ca = canonicalize_plan_json(&plan_a).unwrap();
+        let cb = canonicalize_plan_json(&plan_b).unwrap();
+        assert_ne!(
+            ca, cb,
+            "plans differing only past 32 KiB MUST produce different canonical digests"
+        );
+
+        // And a large plan differing ONLY by timestamp still canonicalizes equal
+        // (the availability half — every large live apply would otherwise refuse).
+        let plan_c = format!(
+            r#"{{"timestamp":"2026-07-01T23:59:59Z","pad":"{filler}","tail":{{"address":"aws_instance.a","action":"create"}}}}"#
+        );
+        assert_eq!(
+            ca,
+            canonicalize_plan_json(&plan_c).unwrap(),
+            "a large plan differing only by timestamp must remain digest-stable"
+        );
     }
 
     #[test]
@@ -1126,8 +1222,14 @@ esac
         assert_eq!(
             tf_var_env_pairs(&names, "AKIAEXAMPLE,secretvalue"),
             vec![
-                ("TF_VAR_aws_access_key_id".to_string(), "AKIAEXAMPLE".to_string()),
-                ("TF_VAR_aws_secret_access_key".to_string(), "secretvalue".to_string()),
+                (
+                    "TF_VAR_aws_access_key_id".to_string(),
+                    "AKIAEXAMPLE".to_string()
+                ),
+                (
+                    "TF_VAR_aws_secret_access_key".to_string(),
+                    "secretvalue".to_string()
+                ),
             ]
         );
         // Single credential still works.
