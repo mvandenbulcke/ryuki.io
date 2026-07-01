@@ -23661,7 +23661,7 @@ fn guard_body_scope_dual(
 /// the POST-LOAD guard for request-by-id reads: the scope value lives on the row,
 /// not the request. Pass the loaded values directly — they are non-nullable on
 /// `requests`, so the `scope_permits(None)=unconstrained` fail-open never applies.
-fn row_scope_permits(session: &AuthSession, site: &str, environment: &str) -> bool {
+pub(crate) fn row_scope_permits(session: &AuthSession, site: &str, environment: &str) -> bool {
     use ryuki_engine::auth::scope_permits;
     scope_permits(&session.site_scope, Some(site))
         && scope_permits(&session.environment_scope, Some(environment))
@@ -23670,7 +23670,7 @@ fn row_scope_permits(session: &AuthSession, site: &str, environment: &str) -> bo
 /// Post-load by-id scope guard that maps an out-of-scope row to the SAME 404 a
 /// missing row produces (#2) — so a by-id endpoint is never a cross-scope
 /// existence/enumeration oracle for a scoped principal.
-fn scope_guard_or_404(
+pub(crate) fn scope_guard_or_404(
     session: &AuthSession,
     site: &str,
     environment: &str,
@@ -23726,7 +23726,7 @@ fn nullable_site_scope_guard_or_404(
 /// True iff the principal is scoped on EITHER axis (has any non-blank site or
 /// environment scope). Used to skip an extra pre-load round-trip for the common
 /// unrestricted case while still fail-closing for any scoped principal (#2).
-fn is_scoped(session: &AuthSession) -> bool {
+pub(crate) fn is_scoped(session: &AuthSession) -> bool {
     session.site_scope.iter().any(|s| !s.trim().is_empty())
         || session
             .environment_scope
