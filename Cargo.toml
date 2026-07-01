@@ -47,7 +47,11 @@ ryuki-engine = { workspace = true }
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` (additive: adds `RawValue`, does not change number/Value behavior) lets the
+# live-plan digest canonicalizer strip terraform's non-deterministic top-level `timestamp`
+# WITHOUT reparsing numbers (which could collapse high-precision values and weaken the
+# plan-integrity gate). See ryuki-runner/src/live.rs::canonicalize_plan_json.
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 figment = { version = "0.10", features = ["env", "json", "toml"] }
 governor = { version = "0.7", default-features = false, features = ["std"] }

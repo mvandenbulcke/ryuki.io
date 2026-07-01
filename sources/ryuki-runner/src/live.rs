@@ -205,6 +205,43 @@ pub fn run_live_apply(
 // Internal implementations (take binary path for test injection)
 // ---------------------------------------------------------------------------
 
+/// Canonicalize `terraform show -json` output so its SHA-256 digest is DETERMINISTIC
+/// across re-plans of identical config.
+///
+/// `terraform show -json` embeds a top-level `"timestamp"` (the moment the plan was
+/// generated). Two `plan` runs of byte-identical config therefore produce different
+/// JSON and different digests. Because the LiveApply gate re-plans and compares its
+/// digest to the LivePlan's operator-approved digest, that non-determinism makes EVERY
+/// live apply refuse ("plan does not match approved plan") even when nothing changed —
+/// live-apply is unusable without this normalization.
+///
+/// We strip ONLY the top-level `timestamp` (which has no bearing on WHAT terraform will
+/// apply). Every semantic field — `resource_changes`, `planned_values`, `configuration`,
+/// `variables`, `output_changes`, … — stays in the digest, so the plan-integrity
+/// guarantee is fully preserved (a real change to the plan still changes the digest).
+///
+/// The values are kept as `RawValue` (their exact original JSON bytes) rather than parsed
+/// into `serde_json::Value`: reparsing numbers into `Value` (without `arbitrary_precision`)
+/// can collapse distinct high-precision JSON numbers to the same `f64`, which would let two
+/// plans that differ only in such a value canonicalize to the SAME digest — WEAKENING the
+/// gate. `RawValue` is lossless. The top-level keys are ordered by `BTreeMap`, which makes
+/// the output deterministic regardless of terraform's emission order. On any JSON parse
+/// failure the raw input is returned unchanged (fail-safe: never silently widen what would
+/// be applied — a malformed plan simply won't match a different approved digest).
+fn canonicalize_plan_json(raw: String) -> String {
+    use serde_json::value::RawValue;
+    use std::collections::BTreeMap;
+    // Borrow of `raw` is confined to this block so `raw` is free for the fallback below.
+    let canonical = match serde_json::from_str::<BTreeMap<String, &RawValue>>(&raw) {
+        Ok(mut members) => {
+            members.remove("timestamp");
+            serde_json::to_string(&members).ok()
+        }
+        Err(_) => None,
+    };
+    canonical.unwrap_or(raw)
+}
+
 /// Core plan implementation.  `binary` is injectable for tests (e.g. `/bin/echo`).
 ///
 /// Returns `Planned` ONLY when init exit==0, plan exit==0 or 2, and show
@@ -373,7 +410,10 @@ pub(crate) fn live_terraform_plan(
     }
 
     // The show output is the canonical plan JSON used for digest computation.
-    let plan_json = show_outcome.log;
+    // Canonicalize FIRST (strip terraform's non-deterministic `timestamp`) so a
+    // LiveApply re-plan of identical config produces the SAME digest as the approved
+    // LivePlan — without this the plan-integrity gate refuses every live apply.
+    let plan_json = canonicalize_plan_json(show_outcome.log);
     let plan_summary = extract_plan_summary(&plan_step.log);
 
     Ok(LivePlanArtifacts {
@@ -1007,5 +1047,50 @@ esac
     fn extract_apply_summary_finds_apply_complete() {
         let log = "...\nApply complete! Resources: 2 added, 0 changed, 0 destroyed.";
         assert!(extract_apply_summary(log).starts_with("Apply complete!"));
+    }
+
+    #[test]
+    fn canonicalize_plan_json_strips_timestamp_for_a_deterministic_digest() {
+        // Two identical plans that differ ONLY in terraform's non-deterministic
+        // top-level `timestamp` must canonicalize to the SAME bytes (equal digest).
+        let plan_a = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:04Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}]}"#;
+        let plan_b = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:06Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}]}"#;
+        let ca = canonicalize_plan_json(plan_a.to_string());
+        let cb = canonicalize_plan_json(plan_b.to_string());
+        assert_eq!(ca, cb, "plans differing only by timestamp must be equal after canonicalization");
+        assert!(!ca.contains("timestamp"), "timestamp must be stripped from the digest input");
+        assert!(ca.contains("resource_changes"), "semantic plan content must be preserved");
+
+        // Deterministic regardless of top-level key emission order (BTreeMap).
+        let reordered = r#"{"resource_changes":[{"address":"terraform_data.x","change":{"actions":["create"]}}],"timestamp":"2026-07-01T09:00:00Z","format_version":"1.2"}"#;
+        assert_eq!(ca, canonicalize_plan_json(reordered.to_string()), "key order must not affect the digest");
+
+        // A REAL plan change must still change the canonical form — the plan-integrity
+        // guarantee is preserved (the gate must reject a plan that differs semantically).
+        let plan_c = r#"{"format_version":"1.2","timestamp":"2026-07-01T05:30:04Z","resource_changes":[{"address":"terraform_data.x","change":{"actions":["delete"]}}]}"#;
+        assert_ne!(
+            ca,
+            canonicalize_plan_json(plan_c.to_string()),
+            "a real change to resource_changes MUST change the digest input"
+        );
+
+        // INTEGRITY / losslessness: two plans differing ONLY in a high-precision numeric
+        // value (beyond f64 exact range) MUST canonicalize DIFFERENTLY. A Value-based
+        // canonicalizer would collapse both to the same f64 → same digest → the gate would
+        // wrongly accept an apply whose planned value differs. RawValue preserves the exact
+        // bytes, so the digests differ (codex-flagged regression guard).
+        // Both integers exceed u64::MAX (18446744073709551615), so a Value-based parser
+        // without arbitrary_precision would parse BOTH as the same f64 (2^64) — collapsing
+        // them. RawValue keeps the exact bytes, so the canonical forms differ.
+        let big_1 = r#"{"timestamp":"2026-07-01T05:30:04Z","planned_values":{"n":18446744073709551616}}"#;
+        let big_2 = r#"{"timestamp":"2026-07-01T05:30:06Z","planned_values":{"n":18446744073709551617}}"#;
+        assert_ne!(
+            canonicalize_plan_json(big_1.to_string()),
+            canonicalize_plan_json(big_2.to_string()),
+            "high-precision numeric differences MUST survive canonicalization (no f64 collapse)"
+        );
+
+        // Fail-safe: non-JSON input is returned unchanged (never silently altered).
+        assert_eq!(canonicalize_plan_json("not json".to_string()), "not json");
     }
 }
