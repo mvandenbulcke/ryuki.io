@@ -9,9 +9,11 @@
 //! without duplicating the timeout/backoff arithmetic in each loop.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use sqlx::PgPool;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::time::{interval, MissedTickBehavior};
 
 /// Per-iteration timeout: 4x the interval, floor 300s — the same formula as
 /// `spawn_scheduler`'s `tick_timeout` in `scheduler.rs`. Generous (>= 10x the 30s
@@ -264,6 +266,264 @@ pub fn loop_liveness_payload(report: Vec<LoopStatus>) -> (u16, serde_json::Value
             "registered_count": report.len(),
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Wedge alerting — edge-triggered `background_loop.overdue` domain events.
+//
+// The health probe (`classify_loop_liveness`, `/api/platform/health/loops`) is
+// PULL-based: a wedged loop only shows as a 503 when someone asks. This monitor
+// makes the same in-memory liveness PUSH a queryable/acknowledgeable domain event
+// the moment a loop crosses its overdue threshold, and a (non-alerting) recovery
+// event when it comes back — so operators are PAGED, not just able to poll.
+//
+// Design (reviewed by GPT-5 Codex against the per-process semantics):
+//   * PER-REPLICA, NOT leader-gated. The heartbeat registry is in-memory and
+//     process-local; a wedge is a dead/hung tokio task on ONE process that no other
+//     replica can observe. So the monitor runs on every replica and emits for the
+//     loops it can actually see — exactly mirroring the per-process health probe.
+//     The 5 watched scans are themselves un-leader-gated, so this is consistent.
+//   * IN-MEMORY edge-trigger (the `alerted` set below), NO DB dedup. A restart
+//     re-seeds every loop's `last_success` to now (healthy) AND clears the alerted
+//     set together, so a restart re-arms cleanly instead of spuriously re-paging; a
+//     still-broken fresh process correctly re-pages after one full threshold. A
+//     leader change does not restart the process, so the edge state survives it.
+//   * ASYMMETRIC durability. `overdue` (critical) is AT-LEAST-ONCE: the alerted
+//     set advances only AFTER a successful insert, so a failed/aborted emit retries
+//     next tick (a duplicate is possible only on an unknown commit outcome — fine
+//     for a rare wedge; a LOST page would not be). `recovered` (non-alerting) is
+//     best-effort: re-arming is decoupled from its insert (see `rearm_recovered`),
+//     so losing a recovered event never masks a later real re-wedge.
+// ---------------------------------------------------------------------------
+
+/// Heartbeat registry name for the wedge monitor itself. The monitor is a
+/// registered loop, so the existing health probe is its watchdog-of-watchdog: a
+/// dead monitor cannot emit its own event, but it surfaces as a 503 on
+/// `/api/platform/health/loops` (and re-emits once it recovers).
+const LOOP_MONITOR_NAME: &str = "background_loop_monitor";
+
+/// This process's replica identity, stamped into every wedge event so two
+/// replicas independently observing the SAME loop name wedged produce
+/// distinguishable rows (the per-replica model is intentional — see the module
+/// note). Prefers an explicit `RYUKI_REPLICA_ID` (so deployments that treat the
+/// hostname as sensitive can supply a sanitized value), then `HOSTNAME` (the k8s
+/// pod name), then a `pid-<n>` fallback. Resolved once per process.
+static REPLICA_ID: LazyLock<String> = LazyLock::new(|| {
+    let from_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    from_env("RYUKI_REPLICA_ID")
+        .or_else(|| from_env("HOSTNAME"))
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+});
+
+/// The edge transitions between two monitor ticks: loops that JUST crossed into
+/// overdue, and loops that JUST recovered. `newly_overdue` carries the full
+/// `LoopLiveness` so the emitter can stamp age/interval/threshold into the
+/// payload; `newly_recovered` needs only the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopAlertTransitions {
+    pub newly_overdue: Vec<LoopLiveness>,
+    pub newly_recovered: Vec<&'static str>,
+}
+
+impl LoopAlertTransitions {
+    /// No edges this tick — the common case (nothing to emit).
+    pub fn is_empty(&self) -> bool {
+        self.newly_overdue.is_empty() && self.newly_recovered.is_empty()
+    }
+}
+
+/// PURE edge classifier. Given the current liveness snapshot and the set of loop
+/// names ALREADY reported overdue (as of the last successful tick), return the
+/// transitions to emit. Edge-triggered: a name still overdue AND already alerted
+/// is NOT re-reported; a freshly-overdue name IS; a previously-alerted name that
+/// is no longer overdue (or has vanished from the registry — which never happens,
+/// entries are append-only) recovers. Uses the SAME strict `age_secs >
+/// loop_overdue_threshold(interval)` rule as `classify_loop_liveness`, so the event
+/// and the health probe can never disagree about what "overdue" means. No clock,
+/// no IO — fully unit-testable. Output is sorted for deterministic emission order.
+pub fn classify_loop_alert_transitions(
+    entries: &[LoopLiveness],
+    already_alerted: &BTreeSet<&'static str>,
+) -> LoopAlertTransitions {
+    let is_overdue = |e: &LoopLiveness| e.age_secs > loop_overdue_threshold(e.interval_secs);
+
+    let mut newly_overdue: Vec<LoopLiveness> = entries
+        .iter()
+        .filter(|e| is_overdue(e) && !already_alerted.contains(e.name))
+        .cloned()
+        .collect();
+    newly_overdue.sort_by(|a, b| a.name.cmp(b.name));
+
+    let currently_overdue: BTreeSet<&'static str> =
+        entries.iter().filter(|e| is_overdue(e)).map(|e| e.name).collect();
+    let mut newly_recovered: Vec<&'static str> = already_alerted
+        .iter()
+        .filter(|name| !currently_overdue.contains(*name))
+        .copied()
+        .collect();
+    newly_recovered.sort_unstable();
+
+    LoopAlertTransitions {
+        newly_overdue,
+        newly_recovered,
+    }
+}
+
+/// Insert ONE `background_loop.{overdue,recovered}` domain event. `site`/`env` are
+/// NULL: a wedged loop is platform infrastructure with no site/env axis, so the
+/// event is platform-wide visible (NOT a B0 scope leak — there is no site to
+/// leak). `to_status` lives in the payload (there is no column) because the alert
+/// feed prefilters on `payload->>'to_status'`. Single-statement, so it takes a
+/// pooled connection directly.
+async fn emit_loop_event(
+    pool: &PgPool,
+    loop_name: &str,
+    event_type: &str,
+    to_status: &str,
+    overdue: Option<&LoopLiveness>,
+) -> Result<(), sqlx::Error> {
+    let mut payload = serde_json::json!({
+        "to_status": to_status,
+        "loop": loop_name,
+        "replica": REPLICA_ID.as_str(),
+    });
+    if let Some(e) = overdue {
+        payload["age_secs"] = serde_json::json!(e.age_secs);
+        payload["interval_secs"] = serde_json::json!(e.interval_secs);
+        payload["threshold_secs"] = serde_json::json!(loop_overdue_threshold(e.interval_secs));
+    }
+    crate::repos::domain_events::insert(
+        pool,
+        crate::repos::domain_events::NewEvent {
+            event_type,
+            aggregate_type: "background_loop",
+            aggregate_id: loop_name,
+            site: None,
+            environment: None,
+            actor: "system",
+            payload,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Re-arm overdue paging for recovered loops. PURE: drops every recovered loop
+/// from `alerted` UNCONDITIONALLY. Re-arming is driven by PHYSICAL recovery, never
+/// by whether the (best-effort, non-alerting) `recovered` event later emits — so a
+/// lost/aborted `recovered` insert can never keep a name in `alerted` and SUPPRESS
+/// a future real re-wedge's `overdue` page. (Without this decoupling, a loop that
+/// pages overdue, physically recovers, fails to emit `recovered`, then re-wedges
+/// would be silently masked — especially after an operator acked the first alert.)
+fn rearm_recovered(alerted: &mut BTreeSet<&'static str>, newly_recovered: &[&'static str]) {
+    for &name in newly_recovered {
+        alerted.remove(name);
+    }
+}
+
+/// Emit the tick's transitions with deliberately ASYMMETRIC durability:
+///
+/// * `overdue` (CRITICAL) is at-least-once. `alerted` advances ONLY after a
+///   successful insert, and `?` aborts the batch on failure, so the next tick
+///   re-derives and retries any un-emitted overdue edge. A duplicate is possible
+///   only when a committed insert's outcome is unknown (a mid-insert timeout
+///   abort) — acceptable for a rare wedge; a LOST page would not be.
+/// * `recovered` (non-alerting) is best-effort. Re-arming happens FIRST and
+///   synchronously (`rearm_recovered`, before any await, so it survives a dropped
+///   future), and the insert itself is allowed to fail — a missing `recovered`
+///   only leaves a dangling overdue in the feed, never a masked page.
+async fn emit_loop_transitions(
+    pool: &PgPool,
+    transitions: &LoopAlertTransitions,
+    alerted: &mut BTreeSet<&'static str>,
+) -> Result<(), sqlx::Error> {
+    // Re-arm BEFORE emitting (and before any await): the safety-critical step must
+    // not depend on the recovered insert succeeding.
+    rearm_recovered(alerted, &transitions.newly_recovered);
+    // Critical `overdue` pages go out FIRST so a hanging best-effort `recovered`
+    // insert can never delay a real page by a full iteration timeout.
+    for e in &transitions.newly_overdue {
+        emit_loop_event(pool, e.name, "background_loop.overdue", "overdue", Some(e)).await?;
+        alerted.insert(e.name);
+    }
+    for &name in &transitions.newly_recovered {
+        if let Err(e) =
+            emit_loop_event(pool, name, "background_loop.recovered", "recovered", None).await
+        {
+            tracing::warn!(
+                loop_name = name,
+                error = %e,
+                "background_loop.recovered emit failed; loop already re-armed (best-effort event lost)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Spawn the wedge monitor. Call once at startup, AFTER (or alongside) the loops
+/// it watches — registration order does not matter because every loop seeds a
+/// healthy baseline at register time. The monitor is itself registered, bounded,
+/// and backed-off exactly like the scans it watches, so a wedged monitor is caught
+/// by the same health probe. Runs until the runtime shuts down.
+pub fn spawn_loop_monitor(pool: PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        register_loop(LOOP_MONITOR_NAME, interval_secs);
+        let mut ticker = interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick (just started)
+        let timeout = iteration_timeout(interval_secs);
+        let mut consecutive_failures: u32 = 0;
+        // Loop names this process has already paged as overdue. Edge state — see
+        // the module note for why it is in-memory and per-process, not DB-backed.
+        let mut alerted: BTreeSet<&'static str> = BTreeSet::new();
+        loop {
+            ticker.tick().await;
+            let snapshot = loop_liveness();
+            let transitions = classify_loop_alert_transitions(&snapshot, &alerted);
+            // `emit_loop_transitions` is a no-op (instant Ok) when there are no
+            // edges, so the monitor still records a heartbeat every tick — keeping
+            // ITS OWN liveness fresh in the registry (the watchdog-of-watchdog).
+            match run_bounded(
+                timeout,
+                emit_loop_transitions(&pool, &transitions, &mut alerted),
+            )
+            .await
+            {
+                Ok(()) => {
+                    consecutive_failures = 0;
+                    record_loop_success(LOOP_MONITOR_NAME);
+                    if !transitions.is_empty() {
+                        tracing::warn!(
+                            newly_overdue = transitions.newly_overdue.len(),
+                            newly_recovered = transitions.newly_recovered.len(),
+                            "background-loop monitor emitted wedge transition events"
+                        );
+                    }
+                }
+                Err(err) => {
+                    let backoff = note_failure(&mut consecutive_failures);
+                    match err {
+                        IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "background-loop monitor emit failed; backing off (will retry edges)"
+                        ),
+                        IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "background-loop monitor exceeded its iteration timeout; backing off"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_secs(
+                        interval_secs.saturating_mul(backoff),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -553,5 +813,240 @@ mod tests {
             classify_loop_liveness(&fresh).health,
             DependencyHealth::Healthy
         );
+    }
+
+    // ── edge-triggered wedge transitions (pure) ──────────────────────────────
+
+    fn alerted(names: &[&'static str]) -> BTreeSet<&'static str> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn transitions_fire_overdue_once_then_stay_silent_until_recovery() {
+        // interval 30 ⇒ threshold 660. age 661 is overdue, 660 is not.
+        let wedged = [entry("scheduler", 30, threshold(30) + 1)];
+
+        // Tick 1: nothing alerted yet ⇒ a fresh overdue edge.
+        let t1 = classify_loop_alert_transitions(&wedged, &alerted(&[]));
+        assert_eq!(
+            t1.newly_overdue.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["scheduler"]
+        );
+        assert!(t1.newly_recovered.is_empty());
+
+        // Tick 2: already alerted AND still overdue ⇒ NO re-emit (edge-triggered).
+        let t2 = classify_loop_alert_transitions(&wedged, &alerted(&["scheduler"]));
+        assert!(
+            t2.is_empty(),
+            "a still-overdue, already-alerted loop must not re-page"
+        );
+
+        // Tick 3: the loop recovered (fresh age) while still in the alerted set ⇒
+        // a recovery edge, no new overdue.
+        let recovered = [entry("scheduler", 30, 5)];
+        let t3 = classify_loop_alert_transitions(&recovered, &alerted(&["scheduler"]));
+        assert_eq!(t3.newly_recovered, vec!["scheduler"]);
+        assert!(t3.newly_overdue.is_empty());
+    }
+
+    #[test]
+    fn transition_at_exact_threshold_is_not_overdue() {
+        // Strict `>`: exactly at the threshold is healthy, so no edge fires.
+        let at = [entry("loop30", 30, threshold(30))];
+        assert!(classify_loop_alert_transitions(&at, &alerted(&[])).is_empty());
+    }
+
+    #[test]
+    fn transition_overdue_on_the_very_first_tick_emits() {
+        // A loop that is already wedged the first time the monitor looks (empty
+        // alerted set) must still page — no "seen before" precondition.
+        let wedged = [entry("lease_expiry", 30, threshold(30) + 100)];
+        let t = classify_loop_alert_transitions(&wedged, &alerted(&[]));
+        assert_eq!(
+            t.newly_overdue.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["lease_expiry"]
+        );
+    }
+
+    #[test]
+    fn transitions_are_sorted_and_handle_mixed_edges() {
+        // zeta + alpha freshly overdue (unsorted input), gamma was alerted but is
+        // now fresh ⇒ recovered. Output must be name-sorted on both axes.
+        let entries = [
+            entry("zeta", 30, threshold(30) + 1),
+            entry("alpha", 30, threshold(30) + 1),
+            entry("gamma", 30, 5),
+        ];
+        let t = classify_loop_alert_transitions(&entries, &alerted(&["gamma"]));
+        assert_eq!(
+            t.newly_overdue.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(t.newly_recovered, vec!["gamma"]);
+    }
+
+    #[test]
+    fn alerted_loop_absent_from_snapshot_recovers() {
+        // Registry entries are append-only so this should never happen, but the
+        // classifier must treat a vanished alerted loop as recovered, not wedged.
+        let t = classify_loop_alert_transitions(&[], &alerted(&["ghost"]));
+        assert_eq!(t.newly_recovered, vec!["ghost"]);
+        assert!(t.newly_overdue.is_empty());
+    }
+
+    #[test]
+    fn all_fresh_with_empty_alerted_is_no_edges() {
+        let fresh = [entry("a", 30, 5), entry("b", 3600, 10)];
+        assert!(classify_loop_alert_transitions(&fresh, &alerted(&[])).is_empty());
+    }
+
+    #[test]
+    fn rearm_is_decoupled_so_a_re_wedge_re_pages_even_if_recovered_was_lost() {
+        // Regression for the masked-wedge bug: episode-1 overdue is paged, the loop
+        // physically recovers, but the `recovered` event is LOST (insert failed).
+        // Re-arming must STILL drop the loop from `alerted`, so a real episode-2
+        // wedge produces a fresh `overdue` page (not silently suppressed — which
+        // matters most if the operator already acked the episode-1 alert).
+        let mut state = alerted(&["scheduler"]); // episode 1 already paged
+
+        // Physical recovery this tick.
+        let recovered_snap = [entry("scheduler", 30, 5)];
+        let plan = classify_loop_alert_transitions(&recovered_snap, &state);
+        assert_eq!(plan.newly_recovered, vec!["scheduler"]);
+
+        // Re-arm runs UNCONDITIONALLY (models the recovered emit then failing).
+        rearm_recovered(&mut state, &plan.newly_recovered);
+        assert!(
+            state.is_empty(),
+            "a recovered loop is re-armed regardless of the recovered emit outcome"
+        );
+
+        // Episode 2: the loop wedges again before any successful recovered emit.
+        let rewedge = [entry("scheduler", 30, threshold(30) + 1)];
+        let plan2 = classify_loop_alert_transitions(&rewedge, &state);
+        assert_eq!(
+            plan2.newly_overdue.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec!["scheduler"],
+            "a real re-wedge must page again even if the prior recovered event was lost"
+        );
+    }
+
+    #[test]
+    fn rearm_only_touches_recovered_names() {
+        // Re-arming a recovered loop must not disturb an unrelated still-overdue
+        // loop's alerted membership.
+        let mut state = alerted(&["wedged", "recovered_one"]);
+        rearm_recovered(&mut state, &["recovered_one"]);
+        assert!(state.contains("wedged"), "still-wedged loop stays alerted");
+        assert!(!state.contains("recovered_one"), "recovered loop is re-armed");
+    }
+
+    #[test]
+    fn replica_id_is_non_empty_and_stable() {
+        // Resolves once per process; whatever the source, it must be a usable tag.
+        assert!(!REPLICA_ID.is_empty());
+        assert_eq!(REPLICA_ID.as_str(), REPLICA_ID.as_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-gated integration tests for the wedge-event emit path. Each SKIPS when
+// RYUKI_DATABASE_URL is unset. Proves the end-to-end alert/ack wiring the pure
+// classifier tests cannot reach.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod loop_monitor_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use crate::repos::domain_events;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but the DB connection failed");
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    fn alert_statuses() -> Vec<String> {
+        ryuki_engine::event_alerts::alert_worthy_statuses()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// An emitted `background_loop.overdue` surfaces in the alert feed's coarse
+    /// prefilter (`payload->>'to_status'`) AND is acknowledgeable; the paired
+    /// `recovered` event does NOT surface (it is non-alerting). This exercises the
+    /// real `domain_events` insert + `list_alerts` + `ack_alert` paths, which the
+    /// pure classifier tests cannot.
+    #[tokio::test]
+    async fn db_overdue_event_is_alertable_and_ackable_recovered_is_not() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let loop_name: &'static str =
+            Box::leak(format!("test-wedge-{}", uuid::Uuid::new_v4()).into_boxed_str());
+        let snapshot = LoopLiveness {
+            name: loop_name,
+            interval_secs: 30,
+            age_secs: 9999,
+        };
+
+        emit_loop_event(
+            pool,
+            loop_name,
+            "background_loop.overdue",
+            "overdue",
+            Some(&snapshot),
+        )
+        .await
+        .expect("emit overdue");
+        emit_loop_event(pool, loop_name, "background_loop.recovered", "recovered", None)
+            .await
+            .expect("emit recovered");
+
+        // The alert feed surfaces ONLY the overdue event for this loop.
+        let statuses = alert_statuses();
+        let alerts = domain_events::list_alerts(pool, Some(loop_name), &statuses, &[], &[], 50)
+            .await
+            .expect("list_alerts");
+        assert_eq!(alerts.len(), 1, "exactly the overdue event is alert-worthy");
+        let overdue = &alerts[0];
+        assert_eq!(overdue.aggregate_type, "background_loop");
+        assert_eq!(overdue.event_type, "background_loop.overdue");
+        assert_eq!(overdue.payload["to_status"], serde_json::json!("overdue"));
+        // interval 30 ⇒ threshold 2*300 + 2*30 = 660.
+        assert_eq!(overdue.payload["threshold_secs"], serde_json::json!(660));
+        assert!(overdue.site.is_none(), "platform-wide: no site");
+        assert!(overdue.environment.is_none(), "platform-wide: no environment");
+        assert!(
+            overdue.payload.get("replica").is_some(),
+            "replica identity is stamped for multi-replica disambiguation"
+        );
+
+        // It is ackable through the SAME alert-worthy gate the feed uses.
+        let acked =
+            domain_events::ack_alert(pool, overdue.id, "operator:test", Some("ack"), &statuses)
+                .await
+                .expect("ack_alert");
+        assert!(acked, "an alert-worthy overdue event is ackable");
+
+        // Cleanup: ack first (FK child), then both events.
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+            .bind(overdue.id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "DELETE FROM domain_events WHERE aggregate_type = 'background_loop' AND aggregate_id = $1",
+        )
+        .bind(loop_name)
+        .execute(pool)
+        .await
+        .ok();
     }
 }
