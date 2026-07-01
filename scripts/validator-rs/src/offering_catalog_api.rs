@@ -28,6 +28,23 @@ const REQUIRED_OFFERING_IDS: &[&str] = &[
     "vm-decommission-quarantine",
     "application-environment-retirement",
 ];
+/// Offerings SANCTIONED to carry `status: active` — their dry-run lifecycle is complete
+/// and an owner approved their activation. Every offering NOT in this list must stay
+/// `status: planned`. The two Retire offerings (vm-decommission-quarantine,
+/// application-environment-retirement) are deliberately held back: their scope is
+/// inherently destructive, so activation needs explicit owner confirmation.
+const ACTIVE_PERMITTED_OFFERINGS: &[&str] = &[
+    "windows-server-deployment",
+    "linux-server-deployment",
+    "request-preflight",
+    "controlled-restore-request",
+    "zabbix-onboarding",
+    "patch-wave-planning",
+    "cmdb-import",
+    "cmdb-update-export",
+    "operator-runbook-launch",
+    "platform-health-dashboard",
+];
 const REQUIRED_HYPERVISOR_LABELS: &[&str] = &["vCenter", "Hyper-V", "Proxmox"];
 const REQUIRED_HYPERVISOR_PERSONAS: &[&str] = &[
     "VMware administrator",
@@ -242,10 +259,22 @@ fn validate_catalog_value(catalog: &Value, errors: &mut Vec<String>) {
             errors,
             format!("{id} must require dry-run unless read-only health dashboard"),
         );
+        // Governance: an offering may be 'active' ONLY if it is in the sanctioned
+        // ACTIVE_PERMITTED_OFFERINGS allowlist (its dry-run lifecycle is complete and an
+        // owner approved its activation). Every other offering must remain 'planned'.
+        let status = offering.get("status").and_then(Value::as_str).unwrap_or("");
+        let status_ok = match status {
+            "active" => ACTIVE_PERMITTED_OFFERINGS.contains(&id),
+            "planned" => true,
+            _ => false,
+        };
         expect(
-            offering.get("status").and_then(Value::as_str) == Some("planned"),
+            status_ok,
             errors,
-            format!("{id} status must remain planned"),
+            format!(
+                "{id} status '{status}' invalid: only sanctioned offerings may be 'active', \
+                 all others must remain 'planned'"
+            ),
         );
         for field in OFFERING_FIELDS {
             expect(
@@ -1687,5 +1716,47 @@ mod tests {
         let mut errors = Vec::new();
         validate_offering_entry_fields(block, "windows-server-deployment", &mut errors);
         assert!(errors.iter().any(|error| error.contains("recipientEmail")));
+    }
+
+    #[test]
+    fn active_allowlist_holds_back_only_the_destructive_retire_offerings() {
+        // Governance policy: every canonical offering is sanctioned for activation
+        // EXCEPT the two inherently-destructive Retire offerings, which need explicit
+        // owner confirmation before they may carry status: active.
+        let held_back = ["vm-decommission-quarantine", "application-environment-retirement"];
+        for id in REQUIRED_OFFERING_IDS {
+            let should_be_sanctioned = !held_back.contains(id);
+            assert_eq!(
+                ACTIVE_PERMITTED_OFFERINGS.contains(id),
+                should_be_sanctioned,
+                "{id}: allowlist membership must match its (non-)destructive classification"
+            );
+        }
+        // No id outside the canonical offering set may sneak into the allowlist.
+        for id in ACTIVE_PERMITTED_OFFERINGS {
+            assert!(
+                REQUIRED_OFFERING_IDS.contains(id),
+                "{id} is sanctioned-active but is not a canonical offering"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_status_rule_allows_sanctioned_active_and_rejects_unsanctioned_active() {
+        // A sanctioned offering may be 'active' or 'planned'; an unsanctioned one may
+        // only be 'planned'; any other status value is rejected. This mirrors the inline
+        // governance check in validate_catalog_value.
+        let status_ok = |id: &str, status: &str| -> bool {
+            match status {
+                "active" => ACTIVE_PERMITTED_OFFERINGS.contains(&id),
+                "planned" => true,
+                _ => false,
+            }
+        };
+        assert!(status_ok("patch-wave-planning", "active"));
+        assert!(status_ok("patch-wave-planning", "planned"));
+        assert!(!status_ok("vm-decommission-quarantine", "active"));
+        assert!(status_ok("vm-decommission-quarantine", "planned"));
+        assert!(!status_ok("patch-wave-planning", "live"));
     }
 }

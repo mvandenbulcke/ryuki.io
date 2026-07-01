@@ -202,7 +202,7 @@ offerings:
       - Zabbix maintenance
       - Veeam backup state
       - Policy catalog
-    status: planned
+    status: active
   - id: controlled-restore-request
     title: Controlled restore request
     category: Protect
@@ -321,7 +321,7 @@ offerings:
       - Portal import mapper
       - Policy engine
       - CMDB mapping
-    status: planned
+    status: active
   - id: cmdb-update-export
     title: CMDB update export
     category: Operate
@@ -357,7 +357,7 @@ offerings:
       - CMDB mapping
       - Owner catalog
       - ServiceNow CMDB export
-    status: planned
+    status: active
   - id: operator-runbook-launch
     title: Operator runbook launcher
     category: Operate
@@ -395,7 +395,7 @@ offerings:
       - ServiceNow ticket context
       - Workers
       - Evidence service
-    status: planned
+    status: active
   - id: platform-health-dashboard
     title: Platform health dashboard
     category: Operate
@@ -428,7 +428,7 @@ offerings:
       - Logs
       - Metrics
       - Traces
-    status: planned
+    status: active
   - id: vm-decommission-quarantine
     title: VM decommission quarantine
     category: Retire

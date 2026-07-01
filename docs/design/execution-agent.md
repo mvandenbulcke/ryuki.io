@@ -109,6 +109,17 @@ client clock). On expiry:
   `ReconcileRequired`; an operator reconciles against Terraform state and
   explicitly re-dispatches or closes. This prevents a partial-apply-then-retry
   duplicate mutation.
+  - **Status: only the "closes" half is built.** A terminal non-Succeeded
+    LiveApply permanently consumes the request's single live-apply slot
+    (`idx_agent_jobs_unique_live_apply` spans ALL statuses; migration 057), so the
+    operator's in-place action is to **close** the request via `POST
+    /api/requests/{id}/fail`. There is **no in-place re-dispatch yet** — the
+    "explicitly re-dispatches" path is a **DEFERRED owner decision** (it overlaps
+    LiveRefused-recoverability / operator-re-approve and needs operator attestation
+    of post-apply state + a new signed grant + a fresh plan-vs-current check). Until
+    then, re-attempting a live-apply means starting a **fresh request** (a new
+    lifecycle re-planned/re-approved against the current state). The fail-closed
+    default is intentional; see `create_live_apply_job` and migration 057.
 
 **Lost results.** The agent writes a local run journal + the signed result to a
 **durable outbox before** posting, then retries the idempotent POST until the CP

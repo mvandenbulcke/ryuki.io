@@ -119,6 +119,12 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// refresh window (a STALE base image missing recent patches), and enqueues ONE
 /// deduped `shift_queue` item per stale image — reads golden_images, writes only
 /// shift_queue, NO provider/live/destructive call.
+///
+/// `noise_suppression_expiry_scan` (#61) also qualifies: it reads `noisy_triggers`
+/// in status 'Suppressed' whose `suppress_until` window has elapsed and flips them
+/// back to 'Active' (a suppression is a TIME-BOXED mute that must auto-revert) —
+/// an IN-PLACE update of our own `noisy_triggers` table, NO provider/live/
+/// destructive call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
@@ -140,6 +146,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "dr_test_overdue_scan"
                 | "patch_wave_overdue_scan"
                 | "golden_image_stale_scan"
+                | "noise_suppression_expiry_scan"
         )
 }
 
@@ -250,6 +257,8 @@ mod tests {
         assert!(!job_is_read_only("patch_wave_overdue_scan"));
         assert!(job_is_schedulable("golden_image_stale_scan"));
         assert!(!job_is_read_only("golden_image_stale_scan"));
+        assert!(job_is_schedulable("noise_suppression_expiry_scan"));
+        assert!(!job_is_read_only("noise_suppression_expiry_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));
@@ -267,6 +276,8 @@ mod tests {
         assert!(!job_is_schedulable("maintain_review_scan_live"));
         assert!(!job_is_schedulable("connection_health_sweep_live"));
         assert!(!job_is_schedulable("restore_overdue_scan_live"));
+        assert!(!job_is_schedulable("golden_image_stale_scan_live"));
+        assert!(!job_is_schedulable("noise_suppression_expiry_scan_live"));
         assert!(!job_is_schedulable(""));
     }
 }

@@ -3694,13 +3694,13 @@ async fn catalog_offerings() -> Json<Value> {
             {"id":"windows-server-deployment","title":"Windows server deployment","category":"Build","priority":"P0","persona":["Requester","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Provider-safe plan","Approval decisions","Lock record","Redacted execution log","Before/after inventory","Policy assignments","CMDB export package"],"integrationData":["vCenter","Hyper-V","Proxmox","Customization specs","gMSA worker","Veeam","Zabbix","ServiceNow CMDB export","Site catalog","Policy catalog"],"status":"active"},
             {"id":"linux-server-deployment","title":"Linux server deployment","category":"Build","priority":"P0","persona":["Requester","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","distribution","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Provider-safe plan","Approval decisions","Lock record","Redacted execution log","Before/after inventory","Policy assignments","CMDB export package"],"integrationData":["vCenter","Hyper-V","Proxmox","Ansible","Veeam","Zabbix","ServiceNow CMDB export","Site catalog","Policy catalog"],"status":"active"},
             {"id":"request-preflight","title":"Request preflight and readiness gate","category":"Build","priority":"P0","persona":["Requester","System engineer","Datacenter engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["requestedOffering","requester","owner","site","environment","criticality","capacityScope","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Failed rules","Remediation hints","Plan summary","Policy decision record"],"integrationData":["vCenter","Hyper-V","Proxmox","ServiceNow CMDB export","Zabbix","Veeam","AD OU map","Site catalog","Policy catalog"],"status":"active"},
-            {"id":"patch-wave-planning","title":"Patch wave planning","category":"Maintain","priority":"P0","persona":["System engineer","Service desk and operations","Application owner","Security and audit"],"requiredInputs":["patchCycle","siteScope","applicationScope","environmentScope","criticality","dependencyContext","maintenanceWindow","rebootPolicy","blackoutDates"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Wave plan summary","Risk notes","Approval decisions","Handover notes","Compliance state"],"integrationData":["ServiceNow patch policy export","CMDB graph","vCenter","Hyper-V","Proxmox","Zabbix maintenance","Veeam backup state","Policy catalog"],"status":"planned"},
+            {"id":"patch-wave-planning","title":"Patch wave planning","category":"Maintain","priority":"P0","persona":["System engineer","Service desk and operations","Application owner","Security and audit"],"requiredInputs":["patchCycle","siteScope","applicationScope","environmentScope","criticality","dependencyContext","maintenanceWindow","rebootPolicy","blackoutDates"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Wave plan summary","Risk notes","Approval decisions","Handover notes","Compliance state"],"integrationData":["ServiceNow patch policy export","CMDB graph","vCenter","Hyper-V","Proxmox","Zabbix maintenance","Veeam backup state","Policy catalog"],"status":"active"},
             {"id":"controlled-restore-request","title":"Controlled restore request","category":"Protect","priority":"P0","persona":["Requester","Backup administrator","Application owner","Security and audit"],"requiredInputs":["businessPurpose","requester","restoreType","sourceResource","restorePoint","targetSelection","owner","site","environment","verificationPlan","retentionNeed"],"approvals":["Datacenter Approver","Backup Operator","Application owner"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Restore plan summary","Approval decisions","Lock record","Redacted execution log","Verification result","Evidence references"],"integrationData":["Veeam","ServiceNow ticket context","Target VM or network","Application owner catalog","Evidence service"],"status":"active"},
             {"id":"zabbix-onboarding","title":"Zabbix onboarding","category":"Observe","priority":"P0","persona":["System engineer","Monitoring administrator","Application owner","Service desk and operations"],"requiredInputs":["requester","hostIdentity","owner","site","environment","hostGroup","templateProfile","proxyOrServer","alertGroup","maintenanceWindow"],"approvals":["Datacenter Approver","Monitoring Operator","Application owner"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Onboarding plan summary","Approval decisions","Redacted execution log","Before/after monitoring state","Zabbix reference"],"integrationData":["Zabbix","vCenter","Hyper-V","Proxmox","Site catalog","CMDB export","ServiceNow ticket context","Policy catalog"],"status":"active"},
-            {"id":"cmdb-import","title":"CMDB Excel import","category":"Operate","priority":"P0","persona":["Service desk and operations","Application owner","Security and audit","System engineer"],"requiredInputs":["requester","sourceFileReference","headerMapping","importScope","reviewer","validationMode"],"approvals":["Datacenter Approver","Auditor"],"dryRunRequired":true,"evidence":["File hash","Header mapping","Validation result","Accepted row count","Rejected rows","Import user","Evidence references"],"integrationData":["ServiceNow CMDB Excel export","Portal import mapper","Policy engine","CMDB mapping"],"status":"planned"},
-            {"id":"cmdb-update-export","title":"CMDB update export","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Application owner","Security and audit"],"requiredInputs":["requester","exportScope","changeReason","owner","reviewer","targetFormat","evidenceReferences"],"approvals":["Datacenter Approver","Application owner","Auditor"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Export package","Accepted/rejected rows","Reviewer approval","Evidence references"],"integrationData":["Portal inventory","Operation evidence","CMDB mapping","Owner catalog","ServiceNow CMDB export"],"status":"planned"},
-            {"id":"operator-runbook-launch","title":"Operator runbook launcher","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Backup administrator","Monitoring administrator","Security and audit"],"requiredInputs":["requester","runbookId","targetResource","ticketContext","operationScope","riskLevel","rollbackNotes"],"approvals":["Datacenter Approver","Service Desk"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Runbook plan summary","Approval decisions","Lock record","Redacted execution log","Child operation results","Handover notes"],"integrationData":["Runbook catalog","RBAC","ServiceNow ticket context","Workers","Evidence service"],"status":"planned"},
-            {"id":"platform-health-dashboard","title":"Platform health dashboard","category":"Operate","priority":"P0","persona":["Service desk and operations","Platform Admin","System engineer","Monitoring administrator","Security and audit"],"requiredInputs":["viewerContext","siteScope","componentScope","freshnessWindow"],"approvals":["Platform Admin"],"dryRunRequired":false,"evidence":["Health snapshot","Stale-data markers","Dependency status","Alert references","Dashboard timestamp"],"integrationData":["Kubernetes or VKS","CloudNativePG PostgreSQL","Queue or outbox","Zabbix","Logs","Metrics","Traces"],"status":"planned"},
+            {"id":"cmdb-import","title":"CMDB Excel import","category":"Operate","priority":"P0","persona":["Service desk and operations","Application owner","Security and audit","System engineer"],"requiredInputs":["requester","sourceFileReference","headerMapping","importScope","reviewer","validationMode"],"approvals":["Datacenter Approver","Auditor"],"dryRunRequired":true,"evidence":["File hash","Header mapping","Validation result","Accepted row count","Rejected rows","Import user","Evidence references"],"integrationData":["ServiceNow CMDB Excel export","Portal import mapper","Policy engine","CMDB mapping"],"status":"active"},
+            {"id":"cmdb-update-export","title":"CMDB update export","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Application owner","Security and audit"],"requiredInputs":["requester","exportScope","changeReason","owner","reviewer","targetFormat","evidenceReferences"],"approvals":["Datacenter Approver","Application owner","Auditor"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Export package","Accepted/rejected rows","Reviewer approval","Evidence references"],"integrationData":["Portal inventory","Operation evidence","CMDB mapping","Owner catalog","ServiceNow CMDB export"],"status":"active"},
+            {"id":"operator-runbook-launch","title":"Operator runbook launcher","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Backup administrator","Monitoring administrator","Security and audit"],"requiredInputs":["requester","runbookId","targetResource","ticketContext","operationScope","riskLevel","rollbackNotes"],"approvals":["Datacenter Approver","Service Desk"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Runbook plan summary","Approval decisions","Lock record","Redacted execution log","Child operation results","Handover notes"],"integrationData":["Runbook catalog","RBAC","ServiceNow ticket context","Workers","Evidence service"],"status":"active"},
+            {"id":"platform-health-dashboard","title":"Platform health dashboard","category":"Operate","priority":"P0","persona":["Service desk and operations","Platform Admin","System engineer","Monitoring administrator","Security and audit"],"requiredInputs":["viewerContext","siteScope","componentScope","freshnessWindow"],"approvals":["Platform Admin"],"dryRunRequired":false,"evidence":["Health snapshot","Stale-data markers","Dependency status","Alert references","Dashboard timestamp"],"integrationData":["Kubernetes or VKS","CloudNativePG PostgreSQL","Queue or outbox","Zabbix","Logs","Metrics","Traces"],"status":"active"},
             {"id":"vm-decommission-quarantine","title":"VM decommission quarantine","category":"Retire","priority":"P1","persona":["VMware administrator","Hyper-V administrator","Proxmox administrator","System engineer","Backup administrator","Monitoring administrator","Application owner","Security and audit"],"requiredInputs":["requester","targetResource","owner","site","environment","businessJustification","dependencyReview","backupRetentionNeed","quarantineWindow","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Backup Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Dependency review","Backup retention proof","Approval decisions","Quarantine plan","Redacted execution log","Monitoring disablement proof","CMDB closure export","Final evidence references"],"integrationData":["vCenter","Hyper-V","Proxmox","Veeam","Zabbix","ServiceNow CMDB export","DNS or IPAM workflow","Evidence service","Policy catalog"],"status":"planned"},
             {"id":"application-environment-retirement","title":"Application environment retirement","category":"Retire","priority":"P1","persona":["Application owner","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Security and audit"],"requiredInputs":["requester","application","environment","owner","serviceCriticality","dependencyGraph","dataRetentionNeed","backupRetentionNeed","accessClosureScope","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Auditor"],"dryRunRequired":true,"evidence":["Request payload summary","Relationship review","Data retention decision","Approval decisions","Retirement plan","Redacted execution log","Backup retention proof","CMDB relationship closure export","Final evidence references"],"integrationData":["CMDB graph","vCenter","Hyper-V","Proxmox","Veeam","Zabbix","ServiceNow CMDB export","Evidence service","Policy catalog"],"status":"planned"}
         ]
@@ -8661,10 +8661,13 @@ async fn patch_verify(
 }
 
 /// Produce the dry-run reboot-orchestration plan for a persisted wave. Like
-/// verify, this is evidence-only: it computes the staged reboot plan (backup
-/// verify -> drain -> per-server reboots -> post-checks, all simulated) and
-/// does NOT transition the wave. 503 without a database, 404 when the wave is
-/// absent, 409 when the engine rejects the wave (e.g. zero servers).
+/// verify, this is evidence-only: it computes the staged, BATCHED (rolling)
+/// reboot plan (backup verify -> per batch: drain-batch -> reboot-batch
+/// servers -> health-check-batch gate -> final fleet-wide check, all simulated)
+/// and does NOT transition the wave. Batch size comes from the wave's
+/// `reboot_batch_size` / `reboot_batch_percent` metadata (default: one server
+/// per batch). 503 without a database, 404 when the wave is absent, 409 when
+/// the engine rejects the wave (e.g. zero servers).
 async fn patch_reboot(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchActionRequest>,
@@ -15208,17 +15211,6 @@ fn request_sort_direction(direction: Option<&str>) -> &'static str {
     }
 }
 
-/// The shared WHERE clause for the request list — used by BOTH the page SELECT
-/// and the total COUNT so the two can never drift (a mismatched total would
-/// mislead pagination). Binds $1..$6 = status/site/environment/request_type/
-/// created_by/q(ILIKE); NULL = no filter on that column.
-const REQUESTS_LIST_WHERE: &str = "WHERE ($1::text IS NULL OR status = $1) \
-   AND ($2::text IS NULL OR site = $2) \
-   AND ($3::text IS NULL OR environment = $3) \
-   AND ($4::text IS NULL OR request_type = $4) \
-   AND ($5::text IS NULL OR created_by = $5) \
-   AND ($6::text IS NULL OR name ILIKE '%' || $6 || '%' ESCAPE '\\')";
-
 /// `X-Total-Count` header carrying the filtered total (before limit/offset) so a
 /// paginating client knows how many pages exist. #9: the body stays a bare array
 /// (backward-compatible with the portal consumer); the full `{items,total}`
@@ -15258,12 +15250,6 @@ async fn requests_list(
     let f_q = norm(&params.q);
 
     if let Some(pool) = get_db() {
-        // sort_col/dir are allowlisted constants (never client text); every
-        // value filter is a bound parameter, NULL = no filter on that column.
-        let sql = format!(
-            "SELECT {REQUEST_COLUMNS} FROM requests {REQUESTS_LIST_WHERE} \
-             ORDER BY {sort_col} {dir} LIMIT $7 OFFSET $8"
-        );
         // Escape LIKE metacharacters so `q` is a literal substring match, not a
         // wildcard pattern. The bound param keeps it injection-safe; ESCAPE '\'
         // makes the backslash the escape char. Order matters: escape '\' first.
@@ -15272,13 +15258,54 @@ async fn requests_list(
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         });
-        let rows: Vec<DbRequestRow> = sqlx::query_as(&sql)
-            .bind(&f_status)
-            .bind(&f_site)
-            .bind(&f_env)
-            .bind(&f_type)
-            .bind(&f_creator)
-            .bind(&f_q_like)
+        // Build the WHERE from ONLY the active filters, so the planner always sees
+        // a clean, sargable predicate (e.g. `site = $1 AND environment = $2`) and
+        // reliably uses idx_requests_site_env_created_at (migration 138). The old
+        // `($n IS NULL OR col = $n)` shape could fall back to a sequential scan
+        // under a GENERIC prepared plan (sqlx caches prepared statements),
+        // defeating that index even though a custom plan would have used it. Only
+        // allowlisted column names are ever formatted into the SQL; every value
+        // stays a BOUND parameter (`$n`), so this is injection-safe. After each
+        // push, `binds.len()` is that parameter's 1-based `$n` position.
+        let mut preds: Vec<String> = Vec::new();
+        let mut binds: Vec<&str> = Vec::new();
+        for (col, val) in [
+            ("status", &f_status),
+            ("site", &f_site),
+            ("environment", &f_env),
+            ("request_type", &f_type),
+            ("created_by", &f_creator),
+        ] {
+            if let Some(v) = val {
+                binds.push(v.as_str());
+                preds.push(format!("{col} = ${}", binds.len()));
+            }
+        }
+        if let Some(v) = &f_q_like {
+            binds.push(v.as_str());
+            preds.push(format!("name ILIKE '%' || ${} || '%' ESCAPE '\\'", binds.len()));
+        }
+        // Shared by the page SELECT and the COUNT so the two can never drift (a
+        // mismatched total would mislead pagination).
+        let where_sql = if preds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", preds.join(" AND "))
+        };
+
+        // sort_col/dir are allowlisted constants (never client text). LIMIT/OFFSET
+        // take the next two placeholders after the active filters.
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests {where_sql} \
+             ORDER BY {sort_col} {dir} LIMIT ${} OFFSET ${}",
+            binds.len() + 1,
+            binds.len() + 2,
+        );
+        let mut list_q = sqlx::query_as::<_, DbRequestRow>(&sql);
+        for b in &binds {
+            list_q = list_q.bind(*b);
+        }
+        let rows: Vec<DbRequestRow> = list_q
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch_all(pool)
@@ -15300,15 +15327,15 @@ async fn requests_list(
             })
             .collect();
         // Filtered total (same WHERE, no limit/offset) for pagination — exposed
-        // via X-Total-Count so the bare-array body stays backward-compatible.
-        let count_sql = format!("SELECT COUNT(*) FROM requests {REQUESTS_LIST_WHERE}");
-        let total: i64 = sqlx::query_scalar(&count_sql)
-            .bind(&f_status)
-            .bind(&f_site)
-            .bind(&f_env)
-            .bind(&f_type)
-            .bind(&f_creator)
-            .bind(&f_q_like)
+        // via X-Total-Count so the bare-array body stays backward-compatible. The
+        // identical active-only predicates mean the COUNT also uses
+        // idx_requests_site_env_created_at on the scoped path.
+        let count_sql = format!("SELECT COUNT(*) FROM requests {where_sql}");
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds {
+            count_q = count_q.bind(*b);
+        }
+        let total: i64 = count_q
             .fetch_one(pool)
             .await
             .unwrap_or(summaries.len() as i64);
@@ -18862,9 +18889,13 @@ struct EventsQuery {
 /// optional `event_type` / `aggregate_id` filters. Distinct from the audit feed:
 /// this is the operational stream other subsystems consume (alert generation,
 /// dashboards). Request-tier read, site/environment-scoped (#2): a scoped
-/// principal sees only its own scope's events plus platform-wide (NULL-scope)
-/// events; an environment-scoped principal still sees site-only-NULL events for
-/// its environment. Empty + `durable:false` when no DB is configured.
+/// principal sees only its own scope's events plus events that are platform-wide
+/// (NULL) on BOTH axes. The cross-scope rule is SYMMETRIC: a SITE-ONLY event
+/// (concrete site, NULL environment — e.g. a decommission) is NOT visible to an
+/// environment-scoped principal, and an ENV-ONLY event (NULL site, concrete
+/// environment) is NOT visible to a site-scoped one — in each case the mutating
+/// handlers fail closed for that principal, so the feed must not be more
+/// permissive. Empty + `durable:false` when no DB is configured.
 async fn events_list(
     AuthExtractor(session): AuthExtractor,
     Query(q): Query<EventsQuery>,
@@ -19065,9 +19096,23 @@ async fn ack_alert_one(
         .map_err(db_error)?
     {
         Some((site, environment)) => {
-            let site_ok = site.is_none() || scope_permits(&session.site_scope, site.as_deref());
-            let env_ok = environment.is_none()
-                || scope_permits(&session.environment_scope, environment.as_deref());
+            // #2 cross-scope fix: mirror domain_events::list_alerts EXACTLY, on BOTH
+            // axes. A NULL axis is platform-wide (ackable across the other axis) ONLY
+            // when the event is global on BOTH axes; otherwise a concrete value on one
+            // axis is reachable only by a principal in scope on that axis. We must NOT
+            // defer to `scope_permits(scope, None)`, which fail-opens on a missing
+            // value — that is precisely how an env-scoped principal could ack a
+            // site-only alert (or a site-scoped principal an env-only alert) the feed
+            // correctly hides. So a NULL axis passes only when the principal is
+            // unrestricted on it OR the other axis is ALSO NULL.
+            let site_ok = match site.as_deref() {
+                Some(s) => scope_permits(&session.site_scope, Some(s)),
+                None => session.site_scope.is_empty() || environment.is_none(),
+            };
+            let env_ok = match environment.as_deref() {
+                Some(env) => scope_permits(&session.environment_scope, Some(env)),
+                None => session.environment_scope.is_empty() || site.is_none(),
+            };
             if !(site_ok && env_ok) {
                 return Err(status_404(&event_id.to_string()));
             }
@@ -24004,6 +24049,31 @@ async fn decommission_quarantine(
     )
     .await
     .map_err(db_error)?;
+    // #11/#2: emit the operational domain event in the SAME tx as the audit row, so
+    // the destructive decommission lifecycle is queryable in /api/events. A
+    // decommission is SITE-ONLY — environment is NULL — and domain_events::list
+    // keeps such site-only events out of an environment-scoped principal's feed, in
+    // lock-step with site_scope_guard_or_404 above. `to_status` ("Quarantined") is
+    // NOT in event_alerts::alert_worthy_statuses(), so this is a non-alerting event.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.quarantined",
+            aggregate_type: "decommission",
+            aggregate_id: &quarantined.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&quarantined.status),
+                "server_name": &quarantined.server_name,
+                "site": &req.site,
+            }),
+        },
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&quarantined).unwrap_or_default()))
@@ -24047,6 +24117,27 @@ async fn decommission_execute(
                 "site": executed.site,
             }),
         ),
+    )
+    .await
+    .map_err(db_error)?;
+    // #11/#2: SITE-ONLY domain event in the audit tx — see decommission_quarantine.
+    // "Executed" is non-alerting (not in event_alerts::alert_worthy_statuses()).
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.executed",
+            aggregate_type: "decommission",
+            aggregate_id: &executed.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&executed.status),
+                "server_name": &executed.server_name,
+                "site": &req.site,
+            }),
+        },
     )
     .await
     .map_err(db_error)?;
@@ -24117,6 +24208,27 @@ async fn decommission_rollback(
                 "site": rolled_back.site,
             }),
         ),
+    )
+    .await
+    .map_err(db_error)?;
+    // #11/#2: SITE-ONLY domain event in the audit tx — see decommission_quarantine.
+    // "RolledBack" is non-alerting (not in event_alerts::alert_worthy_statuses()).
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "decommission.rolled_back",
+            aggregate_type: "decommission",
+            aggregate_id: &rolled_back.id,
+            site: Some(&req.site),
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": before,
+                "to_status": crate::repos::decommissions::status_str(&rolled_back.status),
+                "server_name": &rolled_back.server_name,
+                "site": &req.site,
+            }),
+        },
     )
     .await
     .map_err(db_error)?;
@@ -47196,6 +47308,278 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #2 cross-scope fix: a SITE-ONLY ALERT event (a site-scoped SLO breach — a
+    /// concrete site, NULL environment) obeys the same rule as decommission events,
+    /// across BOTH the read feeds and the ack path. A same-site principal sees it in
+    /// the events feed AND the alerts feed and may ACK it; an ENVIRONMENT-scoped
+    /// principal — which the SLO/budget mutating guards fail closed for — sees it in
+    /// NEITHER feed and gets a 404 on ack (no cross-scope read OR ack oracle). This
+    /// guards the SAME latent leak the decommission finding surfaced, in the existing
+    /// SLO/budget emitters. Isolated by a unique aggregate_id (domain_events is
+    /// append-only); the ack row count is asserted exactly (not just fetched).
+    #[tokio::test]
+    async fn site_only_slo_alert_is_hidden_from_env_scoped_principal() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // A DEFRA-site-only SLO breach: site set, environment NULL, alert-worthy.
+        let agg = format!("slo-siteonly-{}", Uuid::new_v4());
+        let event_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &agg,
+                site: Some("DEFRA"),
+                environment: None,
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "test-slo" }),
+            },
+        )
+        .await
+        .expect("insert site-only SLO breach");
+
+        let defra = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["DEFRA".into()];
+            s
+        };
+        let env_only = || {
+            let mut s = AuthSession::static_dry_run();
+            s.environment_scope = vec!["production".into()];
+            s
+        };
+        let aggq = |session| {
+            (
+                AuthExtractor(session),
+                Query(EventsQuery {
+                    event_type: None,
+                    aggregate_id: Some(agg.clone()),
+                    limit: Some(500),
+                }),
+            )
+        };
+
+        // --- events feed: same-site SEES exactly one; env-scoped sees none. ---
+        let (e, q) = aggq(defra());
+        let Json(defra_list) = events_list(e, q).await.expect("defra list");
+        assert_eq!(
+            defra_list["events"].as_array().unwrap().len(),
+            1,
+            "a same-site principal must see its site-only SLO event: {defra_list:?}"
+        );
+        let (e, q) = aggq(env_only());
+        let Json(env_list) = events_list(e, q).await.expect("env list");
+        assert_eq!(
+            env_list["events"].as_array().unwrap().len(),
+            0,
+            "an environment-scoped principal must NOT see a site-only SLO event: {env_list:?}"
+        );
+
+        // --- alerts feed: same rule, plus classification (an SLO breach is critical). ---
+        let (e, q) = aggq(defra());
+        let Json(defra_alerts) = events_alerts(e, q).await.expect("defra alerts");
+        let da = defra_alerts["alerts"].as_array().unwrap();
+        assert_eq!(
+            da.len(),
+            1,
+            "same-site principal must see the SLO breach alert"
+        );
+        assert_eq!(
+            da[0]["severity"],
+            json!("critical"),
+            "an SLO breach is critical"
+        );
+        let (e, q) = aggq(env_only());
+        let Json(env_alerts) = events_alerts(e, q).await.expect("env alerts");
+        assert_eq!(
+            env_alerts["alerts"].as_array().unwrap().len(),
+            0,
+            "an environment-scoped principal must NOT see a site-only SLO alert"
+        );
+
+        // --- ack path: must match feed visibility (same leak surface). ---
+        // Env-scoped principal cannot ACK what it cannot see → 404 (no ack oracle),
+        // and NO ack row may be written.
+        let env_ack = events_alert_ack(
+            AuthExtractor(env_only()),
+            Path(event_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(env_ack, Err((StatusCode::NOT_FOUND, _))),
+            "env-scoped ack of a site-only alert must 404: {env_ack:?}"
+        );
+        assert_eq!(
+            ack_count(pool, event_id).await,
+            0,
+            "no ack row may be written for the denied env-scoped principal"
+        );
+        // Same-site principal CAN ack it (exactly one ack row results).
+        let defra_ack = events_alert_ack(
+            AuthExtractor(defra()),
+            Path(event_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            defra_ack.is_ok(),
+            "same-site ack must succeed: {defra_ack:?}"
+        );
+        assert_eq!(
+            ack_count(pool, event_id).await,
+            1,
+            "exactly one ack row after the in-scope ack"
+        );
+
+        // Cleanup the mutable ack row; the append-only domain_events row is isolated
+        // by its unique aggregate_id and needs no cleanup.
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+            .bind(event_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #2 cross-scope fix — the REVERSE direction (symmetry). An ENV-ONLY alert (a
+    /// cross-site SLO breach: NULL site, concrete environment) must NOT leak to a
+    /// SITE-scoped principal, which `multi_scope_permits` denies the SLO/budget
+    /// handlers (a scoped axis cannot be honored by a row that is NULL on it). The
+    /// SAME principal still sees a GENUINELY-GLOBAL (both-NULL) alert — the
+    /// deliberate observability baseline — and the env-scoped owner still sees its
+    /// env-only alert. Isolated by unique aggregate_ids; ack rows asserted by count.
+    #[tokio::test]
+    async fn env_only_alert_is_hidden_from_site_scoped_principal_but_global_is_shared() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // An ENV-ONLY SLO breach (NULL site, env=production) and a GLOBAL one (both NULL).
+        let env_agg = format!("slo-envonly-{}", Uuid::new_v4());
+        let global_agg = format!("slo-global-{}", Uuid::new_v4());
+        let env_event = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &env_agg,
+                site: None,
+                environment: Some("production"),
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "env-slo" }),
+            },
+        )
+        .await
+        .expect("insert env-only SLO breach");
+        let global_event = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "slo.breach",
+                aggregate_type: "slo",
+                aggregate_id: &global_agg,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({ "to_status": "breached", "slo_name": "global-slo" }),
+            },
+        )
+        .await
+        .expect("insert global SLO breach");
+
+        let count_for = |session: AuthSession, agg: String| async move {
+            let Json(out) = events_list(
+                AuthExtractor(session),
+                Query(EventsQuery {
+                    event_type: None,
+                    aggregate_id: Some(agg),
+                    limit: Some(500),
+                }),
+            )
+            .await
+            .expect("events list");
+            out["events"].as_array().map(|a| a.len()).unwrap_or(0)
+        };
+        let site_scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["DEFRA".into()];
+            s
+        };
+        let env_scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.environment_scope = vec!["production".into()];
+            s
+        };
+
+        // SITE-scoped principal: does NOT see the env-only alert (reverse leak fixed)…
+        assert_eq!(
+            count_for(site_scoped(), env_agg.clone()).await,
+            0,
+            "a site-scoped principal must NOT see an env-only SLO alert"
+        );
+        // …but DOES see the genuinely-global (both-NULL) alert.
+        assert_eq!(
+            count_for(site_scoped(), global_agg.clone()).await,
+            1,
+            "a site-scoped principal must still see a global (both-NULL) alert"
+        );
+        // ENV-scoped owner sees its own env-only alert AND the global one.
+        assert_eq!(
+            count_for(env_scoped(), env_agg.clone()).await,
+            1,
+            "the env-scoped owner must see its env-only alert"
+        );
+        assert_eq!(
+            count_for(env_scoped(), global_agg.clone()).await,
+            1,
+            "the env-scoped principal must see the global alert"
+        );
+
+        // ack parity: the site-scoped principal cannot ack the env-only alert (404)
+        // but can ack the global one; no stray ack row for the denied attempt.
+        let denied = events_alert_ack(
+            AuthExtractor(site_scoped()),
+            Path(env_event),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "site-scoped ack of an env-only alert must 404: {denied:?}"
+        );
+        assert_eq!(
+            ack_count(pool, env_event).await,
+            0,
+            "no ack row for the denied attempt"
+        );
+        let allowed = events_alert_ack(
+            AuthExtractor(site_scoped()),
+            Path(global_event),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "site-scoped ack of a global alert must succeed: {allowed:?}"
+        );
+        assert_eq!(
+            ack_count(pool, global_event).await,
+            1,
+            "exactly one ack row for the global alert"
+        );
+
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = ANY($1)")
+            .bind(vec![env_event, global_event])
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     /// #8: degradation status reads from the DB (migration 025 seed), not the
     /// in-memory engine — so it survives restart. The component_status rows fold
     /// into AdapterComponentStatus correctly. Non-mutating.
@@ -58138,6 +58522,123 @@ mod server_decommission_db_tests {
             cleanup(pool, &id).await;
             panic!("verify failed");
         };
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Count the domain events one principal sees for a single aggregate id. The
+    /// feed is already filtered by `aggregate_id`, so the returned length is exact.
+    async fn events_seen(session: AuthSession, aggregate_id: &str) -> Vec<Value> {
+        let Json(out) = events_list(
+            AuthExtractor(session),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(aggregate_id.to_string()),
+                limit: Some(500),
+            }),
+        )
+        .await
+        .expect("events list");
+        out["events"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// #11/#2: the destructive decommission lifecycle (quarantine → execute) emits
+    /// SITE-ONLY domain events into /api/events, and those events honor the
+    /// site-only scope rule that the first attempt got wrong. A same-site principal
+    /// SEES them; a different-site principal and — critically — an ENVIRONMENT-scoped
+    /// principal (which `site_scope_guard_or_404` denies the handlers) see NONE. This
+    /// is the regression guard for the cross-scope leak that reverted attempt #1.
+    /// Events are isolated by the unique decommission id (domain_events is
+    /// append-only, so a DELETE cleanup would be a silent no-op); counts are exact.
+    #[tokio::test]
+    async fn decommission_lifecycle_emits_site_scoped_events() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a DEFRA decommission, then drive it: approve → quarantine → execute.
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+        let Json(_) = decommission_approve(
+            Path(id.clone()),
+            Extension(approver_session("evt-approver")),
+        )
+        .await
+        .expect("approve");
+        let Json(_) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("quarantine");
+        let Json(_) = decommission_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("execute");
+
+        // Unrestricted admin: exactly the two emitted events, correctly shaped as
+        // site-only (site=DEFRA, environment=NULL, aggregate_type=decommission).
+        let admin_events = events_seen(AuthSession::static_dry_run(), &id).await;
+        assert_eq!(
+            admin_events.len(),
+            2,
+            "quarantine + execute must each emit one event: {admin_events:?}"
+        );
+        assert!(
+            admin_events.iter().all(|e| e["aggregate_type"] == json!("decommission")
+                && e["site"] == json!("DEFRA")
+                && e["environment"].is_null()),
+            "decommission events must be site-only (site=DEFRA, environment=NULL): {admin_events:?}"
+        );
+        let types: Vec<&str> = admin_events
+            .iter()
+            .filter_map(|e| e["event_type"].as_str())
+            .collect();
+        assert!(
+            types.contains(&"decommission.quarantined") && types.contains(&"decommission.executed"),
+            "both lifecycle event types must be present: {types:?}"
+        );
+
+        // Same-site (DEFRA) principal SEES both events (guard is not over-broad).
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        assert_eq!(
+            events_seen(defra, &id).await.len(),
+            2,
+            "a DEFRA-scoped principal must see its own site's decommission events"
+        );
+
+        // Different-site (GBLON) principal sees NONE.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        assert_eq!(
+            events_seen(gblon, &id).await.len(),
+            0,
+            "another site must not see DEFRA decommission events"
+        );
+
+        // ENVIRONMENT-only-scoped principal sees NONE — the cross-scope leak fix.
+        // It is denied the decommission handlers (an env scope cannot be honored by
+        // a site-only resource → 404), so the feed must not be more permissive.
+        let mut env_only = AuthSession::static_dry_run();
+        env_only.environment_scope = vec!["production".into()];
+        assert_eq!(
+            events_seen(env_only, &id).await.len(),
+            0,
+            "an environment-scoped principal must NOT see site-only decommission events"
+        );
 
         cleanup(pool, &id).await;
     }

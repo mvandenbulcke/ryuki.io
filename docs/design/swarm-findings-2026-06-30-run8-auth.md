@@ -132,10 +132,12 @@ The deep-dive's two "high" findings were RE-VERIFIED as DELIBERATE DESIGN (not b
   consistent by design; the finder mis-compared it to execute. LEFT.
 
 ## Flagged (feature, not a bug — task)
-- orchestrate_reboot emits ONE drain stage for ALL servers + per-server reboots + ONE final health
-  check — no batched/rolling rollout with inter-batch health gates (the reboot-orchestration contract
-  mentions rebootBatches). For a real rolling reboot this is all-at-once. It's a dry-run PLAN today, so
-  this is a missing FEATURE (batched rollout plan), not a correctness bug.
+- ~~orchestrate_reboot emits ONE drain stage for ALL servers + per-server reboots + ONE final health
+  check — no batched/rolling rollout with inter-batch health gates~~ — DONE: orchestrate_reboot now
+  emits a per-batch drain -> reboot -> health-check-gate sequence with halt-on-unhealthy gates between
+  batches. Batch size comes from wave metadata (`reboot_batch_size` / `reboot_batch_percent`, default 1
+  server/batch); batch stages are tagged `plan_section=rebootBatches`. Still a dry-run PLAN (the halt is
+  a plan contract for the external executor, encoded via gate/proceed_to/depends_on metadata).
 - (minor) validate_patch_policy treats empty blackout_dates as INFO not FAIL — but it is NOT the
   authoritative path (validate_patch_wave re-implements checks inline); only an old test uses it. Low.
 

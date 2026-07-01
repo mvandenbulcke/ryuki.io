@@ -48,8 +48,12 @@ for the audit:
    operators not to paste). So the events feed shows required → resolved; the alert feed is not
    re-paged.
 7. Commit. Return `{ job_id, request_id, status: "Failed", resolved: true, note: "the parent request
-   remains Executing; fail or retry it separately" }` — `request_id` so the operator's next `/fail`
-   target is unambiguous (codex MINOR).
+   remains Executing; conclude it with POST /api/requests/{id}/fail. A live-apply cannot be retried
+   in place (its slot is permanently consumed); re-attempting requires a fresh request" }` —
+   `request_id` so the operator's next `/fail` target is unambiguous (codex MINOR). NOTE (run-7): the
+   note says **conclude with `/fail`**, NOT "retry" — there is no in-place live-apply retry (see
+   "Out of scope" below); the original "fail or retry it separately" wording overpromised a
+   capability that does not exist.
 
 ### Route
 `.route("/api/admin/agents/jobs/{job_id}/reconcile", post(admin_resolve_reconcile_required_job))` —
@@ -81,3 +85,14 @@ operator `reason` is operator-authored audit text, the correct place for it.
   the request-lifecycle that contracts.rs owns, so it warrants its own change.
 - A `Reconciled`-success terminal (vs `Failed`) — needs a migration + claims more than the CP can
   verify.
+- **Operator-gated live-apply RE-DISPATCH after reconcile (run-7 decision — DEFERRED owner
+  decision).** A terminal non-Succeeded LiveApply permanently consumes the request's single
+  live-apply slot (`idx_agent_jobs_unique_live_apply` spans ALL statuses; migration 057). So there is
+  NO in-place retry today: the only in-place exit is `/fail`, and re-attempting requires a fresh
+  request (a new lifecycle re-planned/re-approved against the CURRENT state). execution-agent.md §5's
+  "operator … explicitly re-dispatches" half is NOT built — it overlaps the LiveRefused-recoverability
+  / operator-re-approve decision and needs its own trust-model work (operator attestation that the
+  prior apply left a known state, a new signed grant, a fresh plan-vs-current check). Until the owner
+  decides, the contract is fail-closed: reconcile → `/fail` → fresh request. Do NOT narrow the index
+  predicate to non-terminal statuses to enable retries — that turns the no-double-apply invariant
+  fail-open.
