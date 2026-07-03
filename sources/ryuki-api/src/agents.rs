@@ -196,7 +196,7 @@ fn parse_agent_job_id(id: &str) -> ApiResult<Uuid> {
 pub const AGENT_TOKEN_PREFIX: &str = "rya_";
 
 fn generate_agent_token() -> String {
-    use rand::{RngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, RngCore};
     let mut bytes = [0u8; 32];
     // Use OsRng directly to match the rest of the auth/crypto surface (OIDC
     // state/nonce + the CP keypair). `thread_rng()` is also a CSPRNG, so this is a
@@ -301,8 +301,9 @@ pub async fn register_agent(
     // ingestion (agents.rs result path) — a silent per-slot DoS that only surfaces
     // AFTER approval. Storing the trimmed value also avoids a whitespace-laden key
     // that the result-side decode would then reject.
-    let vk = ryuki_protocol::crypto::decode_verifying_key(public_key)
-        .map_err(|_| bad_request("public_key must be a valid base64-encoded Ed25519 verifying key"))?;
+    let vk = ryuki_protocol::crypto::decode_verifying_key(public_key).map_err(|_| {
+        bad_request("public_key must be a valid base64-encoded Ed25519 verifying key")
+    })?;
     // Also reject WEAK (small-order) keys here: `decode_verifying_key` accepts them, but
     // result verification uses `verify_strict`, which rejects weak keys — so without this
     // check a weak key would register/approve yet never verify a result (the same DoS,
@@ -716,10 +717,15 @@ pub async fn ack_job(
     // longer clobber a stale ack into Running.
     // Scalar query returns the id if the UPDATE matched — used only for
     // is_some() check, so we query the scalar directly.
+    // `agent_id = $4` binds the transition to the AUTHENTICATED agent, so even a
+    // leaked attempt_id + fencing_token cannot be replayed by a different agent to
+    // drive another agent's job to Running (defense-in-depth on top of the
+    // fencing_token secret).
     let updated = sqlx::query_scalar::<_, Uuid>(
         "UPDATE agent_jobs \
          SET status = 'Running', updated_at = NOW() \
          WHERE id = $1 \
+           AND agent_id = $4 \
            AND status = 'Leased' \
            AND attempt_id = $2 \
            AND fencing_token = $3 \
@@ -729,6 +735,7 @@ pub async fn ack_job(
     .bind(job_id)
     .bind(body.attempt_id)
     .bind(&body.fencing_token)
+    .bind(&agent.agent_id)
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
@@ -742,12 +749,13 @@ pub async fn ack_job(
     // UPDATE matched 0 rows. Disambiguate: 404 vs 409.
     #[derive(sqlx::FromRow)]
     struct StatusRow {
+        agent_id: Option<String>,
         status: String,
         attempt_id: Option<Uuid>,
         lease_deadline: Option<chrono::DateTime<Utc>>,
     }
     let existing = sqlx::query_as::<_, StatusRow>(
-        "SELECT status, attempt_id, lease_deadline FROM agent_jobs WHERE id = $1",
+        "SELECT agent_id, status, attempt_id, lease_deadline FROM agent_jobs WHERE id = $1",
     )
     .bind(job_id)
     .fetch_optional(pool)
@@ -758,6 +766,19 @@ pub async fn ack_job(
         None => return Err(not_found(format!("job {} not found", job_id))),
         Some(r) => r,
     };
+
+    // ── Authorization BEFORE any status disclosure ───────────────────────────
+    //
+    // The UPDATE above can only match a job leased to THIS agent (it requires the
+    // caller's attempt_id + fencing_token, which another agent's lease does not
+    // share), so a 0-row UPDATE followed by a status-specific 409 would otherwise
+    // let any approved agent probe a job leased to a DIFFERENT agent and learn its
+    // existence + lifecycle state. Mirror `post_job_result`'s assignee guard: a
+    // non-assignee (or unassigned/Pending job, agent_id = NULL) is rejected 403
+    // before any state-dependent reason is built.
+    if row.agent_id.as_deref() != Some(&agent.agent_id) {
+        return Err(forbidden("job is not assigned to this agent"));
+    }
 
     // Build a clear rejection reason for the caller.
     let reason = if row.status != "Leased" {
@@ -1000,42 +1021,41 @@ async fn backlink_request_execution(
     // skew so it is visible. (We do NOT return Err: that would roll back the result
     // tx, and the agent's at-least-once retry would hit the same parse failure
     // forever — better to record the result + preserve history + surface the anomaly.)
-    let stages_json = match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(
-        stages_val.clone(),
-    ) {
-        Ok(mut stages) => {
-            if let Some(st) = stages.iter_mut().find(|s| s.name == "execute") {
-                st.status = if success {
-                    ryuki_engine::models::StageStatus::Completed
-                } else {
-                    ryuki_engine::models::StageStatus::Failed
-                };
-                st.completed_at = Some(now);
-                st.metadata
-                    .insert("agent_job_id".into(), job_id.to_string());
-                st.metadata
-                    .insert("result_status".into(), result_status_str.to_string());
-                st.metadata
-                    .insert("evidence_digest".into(), evidence_digest.to_string());
+    let stages_json =
+        match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(stages_val.clone()) {
+            Ok(mut stages) => {
+                if let Some(st) = stages.iter_mut().find(|s| s.name == "execute") {
+                    st.status = if success {
+                        ryuki_engine::models::StageStatus::Completed
+                    } else {
+                        ryuki_engine::models::StageStatus::Failed
+                    };
+                    st.completed_at = Some(now);
+                    st.metadata
+                        .insert("agent_job_id".into(), job_id.to_string());
+                    st.metadata
+                        .insert("result_status".into(), result_status_str.to_string());
+                    st.metadata
+                        .insert("evidence_digest".into(), evidence_digest.to_string());
+                }
+                // Serialization of a valid Vec<Stage> cannot realistically fail; if it
+                // somehow did, keep the original rather than wiping to [].
+                serde_json::to_value(&stages).unwrap_or(stages_val)
             }
-            // Serialization of a valid Vec<Stage> cannot realistically fail; if it
-            // somehow did, keep the original rather than wiping to [].
-            serde_json::to_value(&stages).unwrap_or(stages_val)
-        }
-        Err(error) => {
-            // Log the value-free error CATEGORY (Syntax/Data/Eof/Io), NOT the full
-            // serde Display — the Display can echo the offending value, and stages
-            // metadata/evidence may carry user-controlled strings.
-            tracing::warn!(
-                parse_error = ?error.classify(),
-                request_id = %request_id,
-                "request.stages could not be parsed into Vec<Stage> during execution \
-                 backlink; advancing status but preserving the existing stages JSONB \
-                 untouched (NOT wiping history)"
-            );
-            stages_val
-        }
-    };
+            Err(error) => {
+                // Log the value-free error CATEGORY (Syntax/Data/Eof/Io), NOT the full
+                // serde Display — the Display can echo the offending value, and stages
+                // metadata/evidence may carry user-controlled strings.
+                tracing::warn!(
+                    parse_error = ?error.classify(),
+                    request_id = %request_id,
+                    "request.stages could not be parsed into Vec<Stage> during execution \
+                     backlink; advancing status but preserving the existing stages JSONB \
+                     untouched (NOT wiping history)"
+                );
+                stages_val
+            }
+        };
     let (new_status, new_stage) = if success {
         ("verifying", "verify")
     } else {
@@ -2456,7 +2476,12 @@ pub async fn admin_approve_live_apply_job(
     if is_scoped(&session) {
         match site_env.as_ref() {
             Some((site, env)) if row_scope_permits(&session, site, env) => {}
-            _ => return Err(not_found(format!("request '{}' not found", body.request_id))),
+            _ => {
+                return Err(not_found(format!(
+                    "request '{}' not found",
+                    body.request_id
+                )))
+            }
         }
     }
     if let Some((site, _)) = site_env.as_ref() {
@@ -2795,12 +2820,18 @@ pub async fn admin_dead_lettered_jobs(
     let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
     let is_scoped_principal = is_scoped(&session);
     let rows: Vec<DeadLetteredJobView> = if is_scoped_principal {
-        let site_filter: Vec<String> = session.site_scope.iter()
+        let site_filter: Vec<String> = session
+            .site_scope
+            .iter()
             .filter(|s| !s.trim().is_empty())
-            .cloned().collect();
-        let env_filter: Vec<String> = session.environment_scope.iter()
+            .cloned()
+            .collect();
+        let env_filter: Vec<String> = session
+            .environment_scope
+            .iter()
             .filter(|s| !s.trim().is_empty())
-            .cloned().collect();
+            .cloned()
+            .collect();
         let site_restricted = !site_filter.is_empty();
         let env_restricted = !env_filter.is_empty();
         sqlx::query_as(
@@ -2811,7 +2842,7 @@ pub async fn admin_dead_lettered_jobs(
              WHERE aj.status = 'DeadLettered' \
                AND ($1 OR r.site = ANY($2)) \
                AND ($3 OR r.environment = ANY($4)) \
-             ORDER BY aj.updated_at DESC LIMIT 500"
+             ORDER BY aj.updated_at DESC LIMIT 500",
         )
         .bind(!site_restricted)
         .bind(&site_filter)
@@ -3355,7 +3386,9 @@ pub async fn admin_force_fail_job(
     Json(body): Json<ForceFailJobBody>,
 ) -> ApiResult<Json<Value>> {
     if !check_permission(&session, "admin") {
-        return Err(forbidden("admin permission is required to force-fail a job"));
+        return Err(forbidden(
+            "admin permission is required to force-fail a job",
+        ));
     }
     let reason = body.reason.trim();
     if reason.is_empty() {
@@ -3684,12 +3717,18 @@ pub async fn admin_agent_queue_depth(
     let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
     let is_scoped_principal = is_scoped(&session);
     let rows: Vec<QueueDepthRow> = if is_scoped_principal {
-        let site_filter: Vec<String> = session.site_scope.iter()
+        let site_filter: Vec<String> = session
+            .site_scope
+            .iter()
             .filter(|s| !s.trim().is_empty())
-            .cloned().collect();
-        let env_filter: Vec<String> = session.environment_scope.iter()
+            .cloned()
+            .collect();
+        let env_filter: Vec<String> = session
+            .environment_scope
+            .iter()
             .filter(|s| !s.trim().is_empty())
-            .cloned().collect();
+            .cloned()
+            .collect();
         let site_restricted = !site_filter.is_empty();
         let env_restricted = !env_filter.is_empty();
         sqlx::query_as(
@@ -3700,7 +3739,7 @@ pub async fn admin_agent_queue_depth(
              WHERE aj.status = 'Pending' \
                AND ($1 OR r.site = ANY($2)) \
                AND ($3 OR r.environment = ANY($4)) \
-             GROUP BY aj.platform ORDER BY aj.platform"
+             GROUP BY aj.platform ORDER BY aj.platform",
         )
         .bind(!site_restricted)
         .bind(&site_filter)
@@ -3884,7 +3923,9 @@ pub async fn admin_agent_job_get(
     Extension(session): Extension<AuthSession>,
 ) -> ApiResult<Json<Value>> {
     if !check_permission(&session, "admin") {
-        return Err(forbidden("admin permission is required to inspect an agent job"));
+        return Err(forbidden(
+            "admin permission is required to inspect an agent job",
+        ));
     }
     // Parse the id BEFORE get_db (codex) so a malformed id 404s even during a DB outage.
     let uid = Uuid::parse_str(&job_id)
@@ -4373,6 +4414,103 @@ mod tests {
         cleanup_agent(pool, &agent_id).await;
     }
 
+    /// A non-assignee agent acking a job leased to a DIFFERENT agent must get a
+    /// generic 403 — never a status-specific 409 that would disclose the job's
+    /// existence and lifecycle state to a token holder who is not the assignee.
+    #[tokio::test]
+    async fn db_ack_job_cross_agent_is_not_a_state_oracle() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("ci-ack-oracle-{}", Uuid::new_v4());
+        let assignee = format!("ack-assignee-{}", Uuid::new_v4());
+        let attacker = format!("ack-attacker-{}", Uuid::new_v4());
+        let assignee_token = seed_agent(pool, &assignee, &platform, "approved").await;
+        let attacker_token = seed_agent(pool, &attacker, &platform, "approved").await;
+
+        // Seed a job and lease it to the ASSIGNEE (attempt_id/fencing_token the
+        // attacker cannot know).
+        let job_id = seed_pending_job(pool, &platform).await;
+        let assignee_attempt = Uuid::new_v4();
+        let assignee_fencing = Uuid::new_v4().to_string();
+        sqlx::query(
+            "UPDATE agent_jobs \
+             SET status = 'Leased', agent_id = $1, attempt_id = $2, fencing_token = $3, \
+                 lease_deadline = NOW() + INTERVAL '5 minutes', updated_at = NOW() \
+             WHERE id = $4",
+        )
+        .bind(&assignee)
+        .bind(assignee_attempt)
+        .bind(&assignee_fencing)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("lease to assignee");
+
+        // The attacker acks the SAME job id with its own (wrong) fencing material.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {attacker_token}").parse().unwrap(),
+        );
+        let result = ack_job(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            Path((attacker.clone(), job_id.to_string())),
+            headers,
+            Json(AckBody {
+                attempt_id: Uuid::new_v4(),
+                fencing_token: Uuid::new_v4().to_string(),
+            }),
+        )
+        .await;
+
+        // Must be a generic 403 — NOT a 409 leaking status ('Leased'/attempt/lease).
+        match result {
+            Err((StatusCode::FORBIDDEN, body)) => {
+                let s = body.0.to_string();
+                assert!(
+                    !s.contains("Leased")
+                        && !s.contains("attempt_id")
+                        && !s.contains("lease has expired")
+                        && !s.contains("fencing_token mismatch"),
+                    "403 body must not disclose job state: {s}"
+                );
+            }
+            other => panic!("cross-agent ack must be 403 with no state disclosure: {other:?}"),
+        }
+
+        // The assignee's lease is untouched — a real ack still works.
+        let mut assignee_headers = HeaderMap::new();
+        assignee_headers.insert(
+            "Authorization",
+            format!("Bearer {assignee_token}").parse().unwrap(),
+        );
+        let ok = ack_job(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            Path((assignee.clone(), job_id.to_string())),
+            assignee_headers,
+            Json(AckBody {
+                attempt_id: assignee_attempt,
+                fencing_token: assignee_fencing.clone(),
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "assignee's genuine ack must still succeed: {ok:?}"
+        );
+
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_agent(pool, &assignee).await;
+        cleanup_agent(pool, &attacker).await;
+    }
+
     /// A pending agent can be revoked (deny enrollment); unknown agent → 404;
     /// re-revoke is idempotent (200, already_revoked).
     #[tokio::test]
@@ -4577,12 +4715,16 @@ mod tests {
                 .fetch_one(pool)
                 .await
                 .expect("query");
-        assert!(!bad_exists, "a rejected registration must NOT have inserted a row");
+        assert!(
+            !bad_exists,
+            "a rejected registration must NOT have inserted a row"
+        );
 
         // WEAK (small-order) key -> 400: it decodes fine but verify_strict would reject
         // it at result time, so registration must reject it too. The all-zeros encoding
         // (y = 0, sign 0) decompresses to a LOW-ORDER point, for which is_weak() is true.
-        let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("low-order point decodes");
+        let weak =
+            ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("low-order point decodes");
         let weak_b64 = encode_verifying_key(&weak);
         let weak_resp = register_agent(
             ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
@@ -4608,7 +4750,10 @@ mod tests {
         let Ok(Json(resp)) = &ok else {
             panic!("a valid public_key must register: {ok:?}");
         };
-        assert_eq!(resp.agent_id, good_id, "the valid registration returns the agent id");
+        assert_eq!(
+            resp.agent_id, good_id,
+            "the valid registration returns the agent id"
+        );
 
         cleanup_agent(pool, &good_id).await;
     }
@@ -9680,7 +9825,10 @@ mod tests {
             .ok();
         pool.close().await;
 
-        assert_eq!(status, "verifying", "status still advances on a success result");
+        assert_eq!(
+            status, "verifying",
+            "status still advances on a success result"
+        );
         assert_eq!(
             stages_after, corrupt,
             "unparseable stages are PRESERVED untouched, NOT wiped to []"
@@ -9889,7 +10037,11 @@ mod tests {
             req_status, "executing",
             "the parent request stays Executing (operator fails it separately)"
         );
-        assert_eq!(cancel_audit_count(pool, job).await, 1, "one cancel audit row");
+        assert_eq!(
+            cancel_audit_count(pool, job).await,
+            1,
+            "one cancel audit row"
+        );
         // The event uses the robust non-prefilter marker (codex B1).
         assert_eq!(
             cancelled_event_to_status(pool, job).await.as_deref(),
@@ -10092,8 +10244,15 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(req_status, "executing", "the parent request stays actionable");
-        assert_eq!(force_fail_audit_count(pool, job).await, 1, "one force-fail audit row");
+        assert_eq!(
+            req_status, "executing",
+            "the parent request stays actionable"
+        );
+        assert_eq!(
+            force_fail_audit_count(pool, job).await,
+            1,
+            "one force-fail audit row"
+        );
         assert_eq!(
             force_failed_event_to_status(pool, job).await.as_deref(),
             Some("admin-force-failed"),
@@ -10137,7 +10296,10 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(lp_status, "Failed", "a leased live-plan job force-fails to Failed");
+        assert_eq!(
+            lp_status, "Failed",
+            "a leased live-plan job force-fails to Failed"
+        );
 
         cleanup_dead_letter_events(pool, lp).await;
         cleanup_dead_letter_events(pool, job).await;
@@ -10241,7 +10403,10 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(job_status, "Leased", "a malformed-spec job is never mutated");
+        assert_eq!(
+            job_status, "Leased",
+            "a malformed-spec job is never mutated"
+        );
         assert_eq!(
             force_fail_audit_count(pool, job).await,
             0,
@@ -10279,7 +10444,10 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(la_status, "Leased", "the leased live-apply job is untouched");
+        assert_eq!(
+            la_status, "Leased",
+            "the leased live-apply job is untouched"
+        );
         assert_eq!(
             force_fail_audit_count(pool, la).await,
             0,
@@ -10380,10 +10548,12 @@ mod tests {
         .await
         .expect("seed sentinel-bearing job");
 
-        let Json(out) =
-            admin_agent_job_get(Path(job.to_string()), Extension(AuthSession::static_dry_run()))
-                .await
-                .expect("inspect must succeed");
+        let Json(out) = admin_agent_job_get(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("inspect must succeed");
         assert_eq!(out["job_id"], json!(job.to_string()));
         assert_eq!(out["status"], json!("Leased"));
         assert_eq!(out["mode"], json!("OfflineDryRun"));
@@ -10425,10 +10595,12 @@ mod tests {
             return;
         };
         let unknown = Uuid::new_v4();
-        let e =
-            admin_agent_job_get(Path(unknown.to_string()), Extension(AuthSession::static_dry_run()))
-                .await
-                .expect_err("unknown id is a 404");
+        let e = admin_agent_job_get(
+            Path(unknown.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect_err("unknown id is a 404");
         assert_eq!(e.0, StatusCode::NOT_FOUND);
         let d = admin_agent_job_get(Path(unknown.to_string()), Extension(non_admin_session()))
             .await
@@ -10637,7 +10809,14 @@ mod tests {
 
         // 1. Mint the ONE LiveApply job for this request.
         let job_id = create_live_apply_job(
-            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+            pool,
+            req,
+            &platform,
+            &spec,
+            &plan_digest,
+            "ops-alice",
+            grant_expiry,
+            &cp_key,
         )
         .await
         .expect("first live-apply mint must succeed");
@@ -10683,7 +10862,14 @@ mod tests {
         //    (Invalid "already approved"), NOT RequestConcluded. Catches a future
         //    "scope the index to non-terminal statuses" regression.
         let blocked_by_index = create_live_apply_job(
-            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+            pool,
+            req,
+            &platform,
+            &spec,
+            &plan_digest,
+            "ops-alice",
+            grant_expiry,
+            &cp_key,
         )
         .await;
         assert!(
@@ -10701,11 +10887,21 @@ mod tests {
 
         // 6. Now the concluded gate ALSO refuses — a DISTINCT branch from step 4.
         let blocked_by_gate = create_live_apply_job(
-            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+            pool,
+            req,
+            &platform,
+            &spec,
+            &plan_digest,
+            "ops-alice",
+            grant_expiry,
+            &cp_key,
         )
         .await;
         assert!(
-            matches!(blocked_by_gate, Err(CreateLiveApplyJobError::RequestConcluded)),
+            matches!(
+                blocked_by_gate,
+                Err(CreateLiveApplyJobError::RequestConcluded)
+            ),
             "after /fail the concluded-request gate refuses re-mint; got {blocked_by_gate:?}"
         );
 
@@ -11652,7 +11848,7 @@ mod tests {
             "INSERT INTO requests (id, request_type, status, stage, site, environment, \
              name, cpu, memory_gb, created_by) \
              VALUES ($1, 'server-deployment', 'executing', 'execute', $2, $3, \
-             'scope-test', 2, 4, 'test-user')"
+             'scope-test', 2, 4, 'test-user')",
         )
         .bind(id)
         .bind(site)
@@ -11679,16 +11875,20 @@ mod tests {
     #[tokio::test]
     async fn db_scope_requeue_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-{}", Uuid::new_v4().simple());
         // GBLON request; DEFRA-scoped admin
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_dead_lettered_job(pool, &platform, req).await;
         let scoped = scoped_admin_session("DEFRA");
-        let Err((status, _)) = admin_requeue_dead_lettered_job(
-            Path(job.to_string()),
-            Extension(scoped),
-        ).await else { panic!("out-of-scope requeue must 404"); };
+        let Err((status, _)) =
+            admin_requeue_dead_lettered_job(Path(job.to_string()), Extension(scoped)).await
+        else {
+            panic!("out-of-scope requeue must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(job_status_and_attempts(pool, job).await.0, "DeadLettered");
         cleanup_request_and_jobs(pool, req).await;
@@ -11697,17 +11897,17 @@ mod tests {
     #[tokio::test]
     async fn db_scope_requeue_in_scope_acts() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_dead_lettered_job(pool, &platform, req).await;
         let scoped = scoped_admin_session("GBLON");
-        let _ = admin_requeue_dead_lettered_job(
-            Path(job.to_string()),
-            Extension(scoped),
-        )
-        .await
-        .expect("in-scope requeue must succeed");
+        let _ = admin_requeue_dead_lettered_job(Path(job.to_string()), Extension(scoped))
+            .await
+            .expect("in-scope requeue must succeed");
         assert_eq!(job_status_and_attempts(pool, job).await.0, "Pending");
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11715,25 +11915,40 @@ mod tests {
     #[tokio::test]
     async fn db_scope_requeue_out_of_scope_wrong_status_is_404_not_409() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-{}", Uuid::new_v4().simple());
         // Concluded request; out-of-scope admin — must 404, not 409
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
-        sqlx::query("UPDATE requests SET status = 'failed' WHERE id = $1").bind(req).execute(pool).await.ok();
+        sqlx::query("UPDATE requests SET status = 'failed' WHERE id = $1")
+            .bind(req)
+            .execute(pool)
+            .await
+            .ok();
         let job = seed_dead_lettered_job(pool, &platform, req).await;
         let scoped = scoped_admin_session("DEFRA");
-        let Err((status, _)) = admin_requeue_dead_lettered_job(
-            Path(job.to_string()),
-            Extension(scoped),
-        ).await else { panic!("must 404 not 409"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "out-of-scope must 404, not 409");
+        let Err((status, _)) =
+            admin_requeue_dead_lettered_job(Path(job.to_string()), Extension(scoped)).await
+        else {
+            panic!("must 404 not 409");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "out-of-scope must 404, not 409"
+        );
         cleanup_request_and_jobs(pool, req).await;
     }
 
     #[tokio::test]
     async fn db_scope_force_fail_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-ff-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11742,8 +11957,14 @@ mod tests {
         let Err((status, _)) = admin_force_fail_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(ForceFailJobBody { reason: "scope test".into() }),
-        ).await else { panic!("out-of-scope force-fail must 404"); };
+            Json(ForceFailJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("out-of-scope force-fail must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11751,7 +11972,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_force_fail_out_of_scope_wrong_status_is_404_not_409() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-ff2-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11761,16 +11985,29 @@ mod tests {
         let Err((status, _)) = admin_force_fail_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(ForceFailJobBody { reason: "scope test".into() }),
-        ).await else { panic!("must 404 not 409"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "out-of-scope must 404, not 409");
+            Json(ForceFailJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("must 404 not 409");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "out-of-scope must 404, not 409"
+        );
         cleanup_request_and_jobs(pool, req).await;
     }
 
     #[tokio::test]
     async fn db_scope_reconcile_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-rec-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11779,8 +12016,14 @@ mod tests {
         let Err((status, _)) = admin_resolve_reconcile_required_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(ReconcileBody { reason: "scope test".into() }),
-        ).await else { panic!("out-of-scope reconcile must 404"); };
+            Json(ReconcileBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("out-of-scope reconcile must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11788,7 +12031,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_reconcile_out_of_scope_wrong_status_is_404_not_409() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-rec2-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11798,16 +12044,29 @@ mod tests {
         let Err((status, _)) = admin_resolve_reconcile_required_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(ReconcileBody { reason: "scope test".into() }),
-        ).await else { panic!("must 404 not 409"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "out-of-scope must 404, not 409");
+            Json(ReconcileBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("must 404 not 409");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "out-of-scope must 404, not 409"
+        );
         cleanup_request_and_jobs(pool, req).await;
     }
 
     #[tokio::test]
     async fn db_scope_cancel_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-cxl-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11816,8 +12075,14 @@ mod tests {
         let Err((status, _)) = admin_cancel_pending_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(CancelJobBody { reason: "scope test".into() }),
-        ).await else { panic!("out-of-scope cancel must 404"); };
+            Json(CancelJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("out-of-scope cancel must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11825,7 +12090,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_cancel_out_of_scope_wrong_status_is_404_not_409() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-cxl2-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11835,16 +12103,29 @@ mod tests {
         let Err((status, _)) = admin_cancel_pending_job(
             Path(job.to_string()),
             Extension(scoped),
-            Json(CancelJobBody { reason: "scope test".into() }),
-        ).await else { panic!("must 404 not 409"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "out-of-scope must 404, not 409");
+            Json(CancelJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("must 404 not 409");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "out-of-scope must 404, not 409"
+        );
         cleanup_request_and_jobs(pool, req).await;
     }
 
     #[tokio::test]
     async fn db_scope_priority_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-pri-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11854,7 +12135,11 @@ mod tests {
             Path(job.to_string()),
             Extension(scoped),
             Json(SetJobPriorityBody { priority: 5 }),
-        ).await else { panic!("out-of-scope priority must 404"); };
+        )
+        .await
+        else {
+            panic!("out-of-scope priority must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11862,7 +12147,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_priority_out_of_scope_wrong_status_is_404_not_409() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-pri2-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11873,24 +12161,36 @@ mod tests {
             Path(job.to_string()),
             Extension(scoped),
             Json(SetJobPriorityBody { priority: 5 }),
-        ).await else { panic!("must 404 not 409"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "out-of-scope must 404, not 409");
+        )
+        .await
+        else {
+            panic!("must 404 not 409");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "out-of-scope must 404, not 409"
+        );
         cleanup_request_and_jobs(pool, req).await;
     }
 
     #[tokio::test]
     async fn db_scope_job_result_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-res-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_job_in_status(pool, &platform, req, "Pending").await;
         let scoped = scoped_admin_session("DEFRA");
-        let Err((status, _)) = admin_agent_job_result(
-            Path(job.to_string()),
-            Extension(scoped),
-        ).await else { panic!("out-of-scope job result must 404"); };
+        let Err((status, _)) =
+            admin_agent_job_result(Path(job.to_string()), Extension(scoped)).await
+        else {
+            panic!("out-of-scope job result must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11898,16 +12198,19 @@ mod tests {
     #[tokio::test]
     async fn db_scope_job_get_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         ensure_cancelled_status_allowed(pool).await;
         let platform = format!("plt-scope-get-{}", Uuid::new_v4().simple());
         let req = seed_request_for_scope(pool, "GBLON", "production").await;
         let job = seed_job_in_status(pool, &platform, req, "Pending").await;
         let scoped = scoped_admin_session("DEFRA");
-        let Err((status, _)) = admin_agent_job_get(
-            Path(job.to_string()),
-            Extension(scoped),
-        ).await else { panic!("out-of-scope job get must 404"); };
+        let Err((status, _)) = admin_agent_job_get(Path(job.to_string()), Extension(scoped)).await
+        else {
+            panic!("out-of-scope job get must 404");
+        };
         assert_eq!(status, StatusCode::NOT_FOUND);
         cleanup_request_and_jobs(pool, req).await;
     }
@@ -11915,7 +12218,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_dead_lettered_scoped_sees_only_in_scope() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-dl-{}", Uuid::new_v4().simple());
         // Two requests: one in-scope (GBLON), one out-of-scope (DEFRA)
         let req_in = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11923,15 +12229,23 @@ mod tests {
         let job_in = seed_dead_lettered_job(pool, &platform, req_in).await;
         let job_out = seed_dead_lettered_job(pool, &platform, req_out).await;
         let scoped = scoped_admin_session("GBLON");
-        let Ok(Json(resp)) = admin_dead_lettered_jobs(Extension(scoped)).await
-        else { panic!("scoped list must succeed"); };
+        let Ok(Json(resp)) = admin_dead_lettered_jobs(Extension(scoped)).await else {
+            panic!("scoped list must succeed");
+        };
         let jobs = resp["dead_lettered_jobs"].as_array().expect("array");
-        let ids: Vec<String> = jobs.iter()
+        let ids: Vec<String> = jobs
+            .iter()
             .filter_map(|j| j["job_id"].as_str())
             .map(String::from)
             .collect();
-        assert!(ids.contains(&job_in.to_string()), "in-scope job must appear");
-        assert!(!ids.contains(&job_out.to_string()), "out-of-scope job must be hidden");
+        assert!(
+            ids.contains(&job_in.to_string()),
+            "in-scope job must appear"
+        );
+        assert!(
+            !ids.contains(&job_out.to_string()),
+            "out-of-scope job must be hidden"
+        );
         cleanup_request_and_jobs(pool, req_in).await;
         cleanup_request_and_jobs(pool, req_out).await;
     }
@@ -11939,16 +12253,23 @@ mod tests {
     #[tokio::test]
     async fn db_scope_dead_lettered_unrestricted_sees_all() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-dl2-{}", Uuid::new_v4().simple());
         let req_a = seed_request_for_scope(pool, "GBLON", "production").await;
         let req_b = seed_request_for_scope(pool, "DEFRA", "production").await;
         let job_a = seed_dead_lettered_job(pool, &platform, req_a).await;
         let job_b = seed_dead_lettered_job(pool, &platform, req_b).await;
-        let Ok(Json(resp)) = admin_dead_lettered_jobs(Extension(AuthSession::static_dry_run())).await
-        else { panic!("unrestricted list must succeed"); };
+        let Ok(Json(resp)) =
+            admin_dead_lettered_jobs(Extension(AuthSession::static_dry_run())).await
+        else {
+            panic!("unrestricted list must succeed");
+        };
         let jobs = resp["dead_lettered_jobs"].as_array().expect("array");
-        let ids: Vec<String> = jobs.iter()
+        let ids: Vec<String> = jobs
+            .iter()
             .filter_map(|j| j["job_id"].as_str())
             .map(String::from)
             .collect();
@@ -11961,7 +12282,10 @@ mod tests {
     #[tokio::test]
     async fn db_scope_queue_depth_scoped_sees_only_in_scope() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         // One platform, two pending jobs: one GBLON (in-scope), one DEFRA (out).
         let platform = format!("plt-scope-qd-{}", Uuid::new_v4().simple());
         let req_in = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -11969,8 +12293,9 @@ mod tests {
         let _job_in = seed_job_in_status(pool, &platform, req_in, "Pending").await;
         let _job_out = seed_job_in_status(pool, &platform, req_out, "Pending").await;
         let scoped = scoped_admin_session("GBLON");
-        let Ok(Json(resp)) = admin_agent_queue_depth(Extension(scoped)).await
-        else { panic!("scoped queue-depth must succeed"); };
+        let Ok(Json(resp)) = admin_agent_queue_depth(Extension(scoped)).await else {
+            panic!("scoped queue-depth must succeed");
+        };
         let queues = resp["queues"].as_array().expect("queues array");
         let mine = queues
             .iter()
@@ -11991,7 +12316,10 @@ mod tests {
         // scoped principal — it fails closed to the same 404 a missing job returns;
         // an unrestricted principal still surfaces the integrity 500.
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-ffm-{}", Uuid::new_v4().simple());
         // A Leased job whose stored spec is valid JSON but NOT a decodable JobSpec.
         let job_id: Uuid = sqlx::query_scalar(
@@ -12007,23 +12335,50 @@ mod tests {
         let Err((status, _)) = admin_force_fail_job(
             Path(job_id.to_string()),
             Extension(scoped),
-            Json(ForceFailJobBody { reason: "scope test".into() }),
-        ).await else { panic!("scoped malformed-spec force-fail must 404"); };
-        assert_eq!(status, StatusCode::NOT_FOUND, "scoped principal must not get a malformed-spec 500 oracle");
+            Json(ForceFailJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("scoped malformed-spec force-fail must 404");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "scoped principal must not get a malformed-spec 500 oracle"
+        );
         let Err((status_u, _)) = admin_force_fail_job(
             Path(job_id.to_string()),
             Extension(AuthSession::static_dry_run()),
-            Json(ForceFailJobBody { reason: "scope test".into() }),
-        ).await else { panic!("unrestricted malformed-spec force-fail must 500"); };
-        assert_eq!(status_u, StatusCode::INTERNAL_SERVER_ERROR, "unrestricted keeps the integrity 500");
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1").bind(job_id).execute(pool).await.ok();
+            Json(ForceFailJobBody {
+                reason: "scope test".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("unrestricted malformed-spec force-fail must 500");
+        };
+        assert_eq!(
+            status_u,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unrestricted keeps the integrity 500"
+        );
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     #[tokio::test]
     async fn db_scope_dead_lettered_env_only_narrows() {
         // codex: exercise the ENVIRONMENT-only bypass path (site unrestricted, env scoped).
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let platform = format!("plt-scope-dle-{}", Uuid::new_v4().simple());
         // Same site, different ENVIRONMENT.
         let req_prod = seed_request_for_scope(pool, "GBLON", "production").await;
@@ -12034,12 +12389,24 @@ mod tests {
         let mut scoped = scoped_admin_session("GBLON");
         scoped.site_scope = vec![];
         scoped.environment_scope = vec!["production".to_string()];
-        let Ok(Json(resp)) = admin_dead_lettered_jobs(Extension(scoped)).await
-        else { panic!("env-scoped list must succeed"); };
-        let ids: Vec<String> = resp["dead_lettered_jobs"].as_array().expect("array")
-            .iter().filter_map(|j| j["job_id"].as_str()).map(String::from).collect();
-        assert!(ids.contains(&job_prod.to_string()), "production job must appear");
-        assert!(!ids.contains(&job_dev.to_string()), "development job must be hidden (env-only scope)");
+        let Ok(Json(resp)) = admin_dead_lettered_jobs(Extension(scoped)).await else {
+            panic!("env-scoped list must succeed");
+        };
+        let ids: Vec<String> = resp["dead_lettered_jobs"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|j| j["job_id"].as_str())
+            .map(String::from)
+            .collect();
+        assert!(
+            ids.contains(&job_prod.to_string()),
+            "production job must appear"
+        );
+        assert!(
+            !ids.contains(&job_dev.to_string()),
+            "development job must be hidden (env-only scope)"
+        );
         cleanup_request_and_jobs(pool, req_prod).await;
         cleanup_request_and_jobs(pool, req_dev).await;
     }
@@ -12047,15 +12414,25 @@ mod tests {
     #[tokio::test]
     async fn db_scope_approve_agent_scoped_is_403() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let agent_id = format!("scope-approve-agent-{}", Uuid::new_v4().simple());
         let _ = seed_agent(pool, &agent_id, "ci", "pending").await;
         let scoped = scoped_admin_session("GBLON");
         let Err((status, _)) = admin_approve_agent(
             Path(agent_id.clone()),
             Extension(scoped),
-            Json(ApproveBody { platform: "ci".into(), capabilities: None }),
-        ).await else { panic!("scoped approve_agent must 403"); };
+            Json(ApproveBody {
+                platform: "ci".into(),
+                capabilities: None,
+            }),
+        )
+        .await
+        else {
+            panic!("scoped approve_agent must 403");
+        };
         assert_eq!(status, StatusCode::FORBIDDEN);
         cleanup_agent(pool, &agent_id).await;
     }
@@ -12063,14 +12440,17 @@ mod tests {
     #[tokio::test]
     async fn db_scope_revoke_agent_scoped_is_403() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let agent_id = format!("scope-revoke-agent-{}", Uuid::new_v4().simple());
         let _ = seed_agent(pool, &agent_id, "ci", "approved").await;
         let scoped = scoped_admin_session("GBLON");
-        let Err((status, _)) = admin_revoke_agent(
-            Path(agent_id.clone()),
-            Extension(scoped),
-        ).await else { panic!("scoped revoke_agent must 403"); };
+        let Err((status, _)) = admin_revoke_agent(Path(agent_id.clone()), Extension(scoped)).await
+        else {
+            panic!("scoped revoke_agent must 403");
+        };
         assert_eq!(status, StatusCode::FORBIDDEN);
         cleanup_agent(pool, &agent_id).await;
     }
@@ -12078,22 +12458,35 @@ mod tests {
     #[tokio::test]
     async fn db_scope_list_agents_scoped_is_403() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(_pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let scoped = scoped_admin_session("GBLON");
-        let Err((status, _)) = admin_list_agents(Extension(scoped)).await
-        else { panic!("scoped list_agents must 403"); };
+        let Err((status, _)) = admin_list_agents(Extension(scoped)).await else {
+            panic!("scoped list_agents must 403");
+        };
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn db_scope_agents_liveness_scoped_is_403() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = handler_pool_lenient().await else { eprintln!("SKIP: RYUKI_DATABASE_URL not set"); return; };
+        let Some(_pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
         let scoped = scoped_admin_session("GBLON");
         let Err((status, _)) = admin_agents_liveness(
             Extension(scoped),
-            Query(AgentLivenessQuery { offline_after_secs: None }),
-        ).await else { panic!("scoped agents_liveness must 403"); };
+            Query(AgentLivenessQuery {
+                offline_after_secs: None,
+            }),
+        )
+        .await
+        else {
+            panic!("scoped agents_liveness must 403");
+        };
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
