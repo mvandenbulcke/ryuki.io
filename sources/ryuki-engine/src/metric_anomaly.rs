@@ -68,16 +68,24 @@ const MAX_Z: f64 = 1000.0;
 /// than flagging everything). A point sitting exactly on the others' mean has
 /// z 0 and is never flagged.
 pub fn detect_anomalies(points: &[MetricPoint], z_threshold: f64) -> Vec<Anomaly> {
-    if points.len() < MIN_SAMPLES_FOR_DETECTION {
-        return Vec::new();
-    }
     if z_threshold <= 0.0 || !z_threshold.is_finite() {
         return Vec::new();
     }
-    let n = points.len() as f64;
-    let sum: f64 = points.iter().map(|p| p.value).sum();
-    let sum_sq: f64 = points.iter().map(|p| p.value * p.value).sum();
-    points
+    // Exclude non-finite samples (NaN / ±inf) from BOTH the baseline and the
+    // output. A single NaN otherwise poisons `sum`/`sum_sq` → every leave-one-out
+    // z is NaN → `z.abs() >= z_threshold` is false everywhere → anomaly detection
+    // is SILENTLY muted for the entire series (the real spike is missed). This
+    // mirrors the non-finite filtering `detect_waste` and `project_forward`
+    // already do. Ingest rejects non-finite values, so this is defense-in-depth
+    // against any non-ingest write path (float8 columns accept NaN).
+    let finite: Vec<&MetricPoint> = points.iter().filter(|p| p.value.is_finite()).collect();
+    if finite.len() < MIN_SAMPLES_FOR_DETECTION {
+        return Vec::new();
+    }
+    let n = finite.len() as f64;
+    let sum: f64 = finite.iter().map(|p| p.value).sum();
+    let sum_sq: f64 = finite.iter().map(|p| p.value * p.value).sum();
+    finite
         .iter()
         .filter_map(|p| {
             let x = p.value;
@@ -181,6 +189,49 @@ mod tests {
         assert_eq!(found.len(), 1, "exactly the spike is anomalous");
         assert_eq!(found[0].value, 100.0);
         assert!(found[0].z_score > 0.0, "a spike has a positive z-score");
+    }
+
+    #[test]
+    fn non_finite_sample_does_not_mute_detection() {
+        // Regression: a single NaN (or ±inf) sample used to poison sum/sum_sq so
+        // every z-score was NaN and the real 10→100 spike was silently missed.
+        // The NaN is excluded from the baseline and output; the spike is still found.
+        let series = pts(&[
+            (0.0, 10.0),
+            (1.0, 10.0),
+            (2.0, f64::NAN),
+            (3.0, 10.0),
+            (4.0, 100.0),
+        ]);
+        let found = detect_anomalies(&series, 1.5);
+        assert_eq!(
+            found.len(),
+            1,
+            "the spike must still be detected: {found:?}"
+        );
+        assert_eq!(found[0].value, 100.0);
+        assert!(
+            found[0].z_score.is_finite(),
+            "reported z-score must be finite"
+        );
+        // An infinity is likewise excluded (not treated as a giant spike).
+        let series_inf = pts(&[
+            (0.0, 10.0),
+            (1.0, 10.0),
+            (2.0, f64::INFINITY),
+            (3.0, 10.0),
+            (4.0, 100.0),
+        ]);
+        let found_inf = detect_anomalies(&series_inf, 1.5);
+        assert_eq!(found_inf.len(), 1);
+        assert_eq!(found_inf[0].value, 100.0);
+    }
+
+    #[test]
+    fn all_non_finite_yields_nothing() {
+        // After filtering, too few finite samples → no detection (no panic/NaN).
+        let series = pts(&[(0.0, f64::NAN), (1.0, f64::NAN), (2.0, 10.0)]);
+        assert!(detect_anomalies(&series, 1.5).is_empty());
     }
 
     #[test]
