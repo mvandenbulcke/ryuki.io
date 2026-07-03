@@ -110,11 +110,11 @@ pub fn ApprovalsList() -> impl IntoView {
                                                 let row_id = req.id.clone();
                                                 let button_id = req.id.clone();
                                                 let open_label = format!("Open request {}", req.id);
-                                                let display_id = if req.id.len() > 8 {
-                                                    req.id[..8].to_string()
-                                                } else {
-                                                    req.id.clone()
-                                                };
+                                                // Truncate by CHARACTERS, not bytes: a byte slice
+                                                // `req.id[..8]` panics (and freezes the WASM runtime)
+                                                // if a multi-byte char straddles byte 8.
+                                                let display_id: String =
+                                                    req.id.chars().take(8).collect();
                                                 let badge_class = status_badge_class(&req.status);
                                                 let status_text = status_label(&req.status);
                                                 let stage_text = req.stage.clone();
