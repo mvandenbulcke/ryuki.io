@@ -13,6 +13,59 @@ const SENSITIVE_KEY_PATTERNS: &[&str] = &[
     "auth",
 ];
 
+/// Keyword labels that indicate a secret when a *value* under a generic key
+/// (e.g. `execution_log`, `config`, `http_headers`) presents them as a
+/// field/assignment: the label immediately followed — tolerating surrounding
+/// quotes and whitespace — by a `:` or `=` delimiter. The delimiter scan in
+/// [`value_bears_secret`] handles every spelling (`password:`, `Password=`,
+/// `"password":`, `token = ...`) from ONE entry per label, fixing an earlier
+/// asymmetry where `Password=` (connection strings) and `token:` slipped through.
+const SENSITIVE_VALUE_LABELS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "secret_access_key",
+    "client_secret",
+    "token",
+    "session_token",
+    "api_key",
+    "apikey",
+    "api-key",
+    "x-api-key",
+];
+
+/// Secret-bearing value markers that need no delimiter — a full auth-scheme
+/// prefix carries the credential right after it. (`Authorization: Bearer <jwt>`
+/// / `Authorization: Basic <base64>` riding in a value under a generic key.)
+const SENSITIVE_VALUE_MARKERS: &[&str] = &["bearer ", "authorization: basic "];
+
+/// True if a lowercased evidence value looks like it carries a secret: either a
+/// standalone auth marker, or a known secret label immediately followed by a
+/// `:`/`=` delimiter (tolerating quotes/whitespace between them). Requiring the
+/// delimiter avoids redacting an incidental prose mention ("the password was
+/// rotated"); when in doubt this errs toward OVER-redaction, which is fail-safe
+/// for audit/evidence output (it never leaks, only hides).
+fn value_bears_secret(value_lower: &str) -> bool {
+    for marker in SENSITIVE_VALUE_MARKERS {
+        if value_lower.contains(marker) {
+            return true;
+        }
+    }
+    for label in SENSITIVE_VALUE_LABELS {
+        let mut rest = value_lower;
+        while let Some(pos) = rest.find(label) {
+            let after = &rest[pos + label.len()..];
+            let delim = after.trim_start_matches(['"', '\'', ' ', '\t']);
+            if delim.starts_with(':') || delim.starts_with('=') {
+                return true;
+            }
+            rest = &rest[pos + label.len()..];
+        }
+    }
+    false
+}
+
 pub fn collect_evidence(request: &Request) -> Result<EvidencePack, String> {
     let id = format!(
         "ev-{}",
@@ -121,16 +174,7 @@ pub fn should_redact(key: &str, value: &str) -> bool {
         }
     }
 
-    if value_lower.contains("password:")
-        || value_lower.contains("secret:")
-        || value_lower.contains("secret=")
-        || value_lower.contains("token=")
-        || value_lower.contains("api_key")
-        // HTTP Authorization bearer tokens (e.g. "Authorization: Bearer <jwt>")
-        // can ride in evidence values under a generic key like "execution_log"
-        // or "http_headers" — redact them by the token prefix, not just the key.
-        || value_lower.contains("bearer ")
-    {
+    if value_bears_secret(&value_lower) {
         return true;
     }
 
@@ -374,6 +418,51 @@ mod tests {
         assert!(
             !should_redact("status", "deployment ok, no credentials present"),
             "benign evidence must not be over-redacted"
+        );
+    }
+
+    #[test]
+    fn test_should_redact_covers_both_colon_and_equals_spellings() {
+        // Regression: `password=` (connection strings) and `token:` were NOT
+        // matched while `password:` and `token=` were — an asymmetric bypass that
+        // let the most common secret shape (a DB connection string) survive
+        // redaction of a generic-keyed value shared with audit reads.
+        // All values below are fake fixtures asserting redaction patterns are caught.
+        assert!(
+            should_redact("execution_log", "Server=db;Password=hunter2;"), // secret-scan-allow: fake fixture
+            "connection-string Password= must be redacted"
+        );
+        assert!(
+            should_redact("cmd", "psql --password=hunter2"), // secret-scan-allow: fake fixture
+            "flag-style --password= must be redacted"
+        );
+        assert!(
+            should_redact("http_headers", "X-Auth-Token: abc123"), // secret-scan-allow: fake fixture
+            "token: spelling must be redacted"
+        );
+        assert!(
+            should_redact("config", "api_token=abc123"), // secret-scan-allow: fake fixture
+            "token= spelling must be redacted"
+        );
+        // Symmetry sanity: the previously-working spellings still match.
+        assert!(should_redact("yaml", "password: hunter2")); // secret-scan-allow: fake fixture
+        assert!(should_redact("env", "SECRET_TOKEN=abc")); // secret-scan-allow: fake fixture
+        // Quoted-JSON, spaced, and additional label shapes (Codex-hardening).
+        assert!(should_redact("json", "{\"password\":\"hunter2\"}")); // secret-scan-allow: fake fixture
+        assert!(should_redact("json", "{'token' : 'abc'}")); // secret-scan-allow: fake fixture
+        assert!(should_redact("dsn", "pwd=hunter2")); // secret-scan-allow: fake fixture
+        assert!(should_redact("dsn", "passwd = hunter2")); // secret-scan-allow: fake fixture
+        assert!(should_redact("aws", "aws_secret_access_key=AKIA")); // secret-scan-allow: fake fixture
+        assert!(should_redact("hdr", "Authorization: Basic dXNlcjpwYXNz")); // secret-scan-allow: fake fixture
+        // A benign value that merely contains the word 'password' in prose,
+        // without a `:`/`=` delimiter, is NOT a value-pattern hit.
+        assert!(
+            !should_redact("note", "the password was rotated last week"),
+            "prose mention without a delimiter must not over-redact"
+        );
+        assert!(
+            !should_redact("log", "processing complete, no anomalies"),
+            "benign log line must not over-redact"
         );
     }
 
