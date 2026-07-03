@@ -1,0 +1,25 @@
+-- 144_domain_events_aggregate_index.sql — index the "events for one aggregate,
+-- newest first" lookup that the /api/events feed advertises (run/goal review
+-- finding; recurrence of the requests_list OR-NULL generic-plan class).
+--
+-- `domain_events` is append-only with DELETE/TRUNCATE blocked (migration 111) and
+-- has NO retention, so it grows without bound. The feed's `list` reads
+-- `WHERE aggregate_id = $n ... ORDER BY occurred_at DESC, id DESC LIMIT $k`, but
+-- the only aggregate index is `idx_domain_events_aggregate (aggregate_type,
+-- aggregate_id)` — it LEADS with aggregate_type, which the feed never binds, so an
+-- aggregate_id-only filter cannot use it and the planner walks `occurred_at DESC`
+-- row-by-row across the whole table until it collects LIMIT rows (worst case: the
+-- aggregate's events are old or absent). The repo `list` query is being rewritten
+-- to build a dynamic WHERE from only the ACTIVE filters (dropping the
+-- `($n IS NULL OR col = $n)` shape that degrades to a seq scan under a generic
+-- prepared plan), and this composite lets that clean `aggregate_id = $n` predicate
+-- seek to one aggregate and emit rows already in `occurred_at DESC, id DESC` order
+-- (no sort, bounded by LIMIT).
+--
+-- Additive + IF NOT EXISTS (re-application is a no-op). Built in-transaction (NOT
+-- CONCURRENTLY) per repo convention; see migration 138's deploy note — a plain
+-- CREATE INDEX takes a SHARE lock that blocks writes to domain_events until commit.
+-- At current table size the build is fast; once large, run in a maintenance window
+-- (or split into a CONCURRENTLY build outside a transaction).
+CREATE INDEX IF NOT EXISTS idx_domain_events_aggregate_id_occurred
+    ON domain_events (aggregate_id, occurred_at DESC, id DESC);

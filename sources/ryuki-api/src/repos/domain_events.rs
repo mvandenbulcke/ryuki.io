@@ -97,26 +97,70 @@ pub async fn list(
     env_scopes: &[String],
     limit: i64,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
-    sqlx::query_as(
+    // Build the WHERE from ONLY the active scalar filters. The old
+    // `($n::text IS NULL OR col = $n)` shape degrades to a sequential scan under
+    // a GENERIC prepared plan (sqlx caches prepared statements) — and
+    // domain_events is append-only with no retention (migration 111), so it grows
+    // without bound. A clean `aggregate_id = $n` predicate lets the planner seek
+    // via idx_domain_events_aggregate_id_occurred (migration 144); a clean
+    // `event_type = $n` uses idx_domain_events_type. The scope predicates are
+    // ALWAYS present (see the SYMMETRIC cross-scope rule documented above) and use
+    // bound `= ANY(array)` (not the OR-NULL scalar antipattern). Column names in
+    // the format strings are compile-time literals; every value is a BOUND
+    // parameter, so this is injection-safe.
+    let mut preds: Vec<String> = Vec::new();
+    let mut n = 0;
+    if event_type.is_some() {
+        n += 1;
+        preds.push(format!("event_type = ${n}"));
+    }
+    if aggregate_id.is_some() {
+        n += 1;
+        preds.push(format!("aggregate_id = ${n}"));
+    }
+    let site_pos = {
+        n += 1;
+        n
+    };
+    preds.push(format!(
+        "(cardinality(${site_pos}::text[]) = 0 OR site = ANY(${site_pos}) \
+         OR (site IS NULL AND environment IS NULL))"
+    ));
+    let env_pos = {
+        n += 1;
+        n
+    };
+    preds.push(format!(
+        "(cardinality(${env_pos}::text[]) = 0 OR environment = ANY(${env_pos}) \
+         OR (environment IS NULL AND site IS NULL))"
+    ));
+    let limit_pos = {
+        n += 1;
+        n
+    };
+    let sql = format!(
         "SELECT id, event_type, aggregate_type, aggregate_id, site, environment, actor, \
                 payload, occurred_at \
          FROM domain_events \
-         WHERE ($1::text IS NULL OR event_type = $1) \
-           AND ($2::text IS NULL OR aggregate_id = $2) \
-           AND (cardinality($3::text[]) = 0 OR site = ANY($3) \
-                OR (site IS NULL AND environment IS NULL)) \
-           AND (cardinality($4::text[]) = 0 OR environment = ANY($4) \
-                OR (environment IS NULL AND site IS NULL)) \
+         WHERE {} \
          ORDER BY occurred_at DESC, id DESC \
-         LIMIT $5",
-    )
-    .bind(event_type)
-    .bind(aggregate_id)
-    .bind(site_scopes)
-    .bind(env_scopes)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+         LIMIT ${limit_pos}",
+        preds.join(" AND ")
+    );
+
+    // Bind in the SAME order the placeholders were assigned above.
+    let mut q = sqlx::query_as::<_, EventRow>(&sql);
+    if let Some(et) = event_type {
+        q = q.bind(et);
+    }
+    if let Some(ag) = aggregate_id {
+        q = q.bind(ag);
+    }
+    q.bind(site_scopes)
+        .bind(env_scopes)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
 }
 
 /// List the alert-worthy slice of the stream (#11 slice 2a/2b): events whose
@@ -139,26 +183,57 @@ pub async fn list_alerts(
     env_scopes: &[String],
     limit: i64,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
-    sqlx::query_as(
+    // `to_status = ANY($1)` (the selective primary filter, served by the mig-138
+    // partial expression index) is ALWAYS present. `aggregate_id` is built
+    // dynamically — the old `($n::text IS NULL OR aggregate_id = $n)` shape had the
+    // same generic-plan seq-scan risk as `list`. Column literals are compile-time;
+    // all values are bound parameters.
+    let mut preds: Vec<String> = vec!["payload->>'to_status' = ANY($1)".to_string()];
+    let mut n = 1;
+    if aggregate_id.is_some() {
+        n += 1;
+        preds.push(format!("aggregate_id = ${n}"));
+    }
+    let site_pos = {
+        n += 1;
+        n
+    };
+    preds.push(format!(
+        "(cardinality(${site_pos}::text[]) = 0 OR site = ANY(${site_pos}) \
+         OR (site IS NULL AND environment IS NULL))"
+    ));
+    let env_pos = {
+        n += 1;
+        n
+    };
+    preds.push(format!(
+        "(cardinality(${env_pos}::text[]) = 0 OR environment = ANY(${env_pos}) \
+         OR (environment IS NULL AND site IS NULL))"
+    ));
+    let limit_pos = {
+        n += 1;
+        n
+    };
+    let sql = format!(
         "SELECT id, event_type, aggregate_type, aggregate_id, site, environment, actor, \
                 payload, occurred_at \
          FROM domain_events \
-         WHERE payload->>'to_status' = ANY($1) \
-           AND ($2::text IS NULL OR aggregate_id = $2) \
-           AND (cardinality($3::text[]) = 0 OR site = ANY($3) \
-                OR (site IS NULL AND environment IS NULL)) \
-           AND (cardinality($4::text[]) = 0 OR environment = ANY($4) \
-                OR (environment IS NULL AND site IS NULL)) \
+         WHERE {} \
          ORDER BY occurred_at DESC, id DESC \
-         LIMIT $5",
-    )
-    .bind(alert_statuses)
-    .bind(aggregate_id)
-    .bind(site_scopes)
-    .bind(env_scopes)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+         LIMIT ${limit_pos}",
+        preds.join(" AND ")
+    );
+
+    // Bind in the SAME order the placeholders were assigned above.
+    let mut q = sqlx::query_as::<_, EventRow>(&sql).bind(alert_statuses);
+    if let Some(ag) = aggregate_id {
+        q = q.bind(ag);
+    }
+    q.bind(site_scopes)
+        .bind(env_scopes)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
 }
 
 /// Acknowledge an alert event (#11 slice 2e): upsert the ack satellite keyed by
