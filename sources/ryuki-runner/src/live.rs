@@ -245,6 +245,44 @@ fn canonicalize_plan_json(raw: &str) -> Option<String> {
     }
 }
 
+/// Pre-execution policy gate (#11): refuse a LIVE run whose resolved IaC bundle
+/// contains constructs that are unsafe even under `plan`/`--check` — Terraform
+/// provisioners and `data "external"` (arbitrary code at plan time), Ansible
+/// `check_mode: false` / `raw` / `script`, or content the scanner cannot attribute.
+///
+/// Returns `Some(refusal outcome)` to short-circuit BEFORE any workspace, init,
+/// or provider contact, or `None` when the bundle is clean. The digest/tfplan are
+/// never produced for a refused bundle. `OfflineDryRun` is never gated (it
+/// configures no providers and touches nothing), so this is only invoked from the
+/// live paths. Modelled as `Failed` (the run did not proceed); the summary carries
+/// the policy version + the specific violations for evidence.
+pub(crate) fn iac_policy_refusal(
+    iac_files: &super::iac::IacBundle,
+    runner_kind: RunnerKind,
+    mode: RunMode,
+) -> Option<RunOutcome> {
+    let violations = ryuki_engine::iac_policy::evaluate_iac_bundle(iac_files.iter().copied());
+    if violations.is_empty() {
+        return None;
+    }
+    let detail = violations
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(RunOutcome {
+        runner_kind,
+        mode,
+        status: RunStatus::Failed,
+        summary: format!(
+            "POLICY-REFUSED ({}): unsafe IaC construct(s) forbidden before live execution: {detail}",
+            ryuki_engine::iac_policy::IAC_POLICY_VERSION
+        ),
+        log: String::new(),
+        exit_code: None,
+    })
+}
+
 /// Core plan implementation.  `binary` is injectable for tests (e.g. `/bin/echo`).
 ///
 /// Returns `Planned` ONLY when init exit==0, plan exit==0 or 2, and show
@@ -270,6 +308,14 @@ pub(crate) fn live_terraform_plan(
             plan.offering_id
         ))
     })?;
+
+    // #11 policy gate: refuse unsafe constructs BEFORE init/providers/plan.
+    if let Some(refusal) = iac_policy_refusal(&iac_files, RunnerKind::Terraform, plan.mode) {
+        return Ok(LivePlanArtifacts {
+            outcome: refusal,
+            tfplan: vec![],
+        });
+    }
 
     // Build secret components for scrubbing.
     let components = credential_components(creds.material.as_slice());
@@ -481,6 +527,11 @@ pub(crate) fn live_terraform_apply(
             plan.offering_id
         ))
     })?;
+
+    // #11 policy gate: refuse unsafe constructs BEFORE init/providers/apply.
+    if let Some(refusal) = iac_policy_refusal(&iac_files, RunnerKind::Terraform, plan.mode) {
+        return Ok(refusal);
+    }
 
     // Secret scrubbing components.
     let components = credential_components(creds.material.as_slice());
@@ -736,6 +787,106 @@ mod tests {
             vars: BTreeMap::new(),
             secret_var_names: vec![],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #11 IaC policy gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn iac_policy_refusal_none_for_clean_bundle() {
+        let clean: super::super::iac::IacBundle =
+            vec![("main.tf", "resource \"null_resource\" \"ok\" {}\n")];
+        assert!(
+            iac_policy_refusal(&clean, RunnerKind::Terraform, RunMode::Live).is_none(),
+            "a clean bundle must not be refused"
+        );
+    }
+
+    #[test]
+    fn iac_policy_refusal_blocks_provisioner_bundle() {
+        let dirty: super::super::iac::IacBundle = vec![(
+            "main.tf",
+            "resource \"null_resource\" \"x\" {\n  provisioner \"local-exec\" { command = \"id\" }\n}\n",
+        )];
+        let refusal = iac_policy_refusal(&dirty, RunnerKind::Terraform, RunMode::Live)
+            .expect("a provisioner bundle must be refused");
+        assert_eq!(refusal.status, RunStatus::Failed);
+        assert!(
+            refusal.summary.contains("POLICY-REFUSED"),
+            "refusal summary must be tagged: {}",
+            refusal.summary
+        );
+        assert!(
+            refusal.summary.contains("provisioner"),
+            "refusal summary must name the violation: {}",
+            refusal.summary
+        );
+        // Fail-closed: no plan/tfplan bytes are produced for a refused bundle.
+        assert!(refusal.log.is_empty());
+        assert!(refusal.exit_code.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-terraform end-to-end (skipped when the binary is absent)
+    // -----------------------------------------------------------------------
+
+    /// Drives the REAL `terraform` binary through the live PLAN path on the
+    /// provider-less `request-preflight` bundle (terraform_data only, no network,
+    /// no external infra). Validates, end-to-end on genuine terraform output:
+    /// (1) the #11 policy gate lets a clean bundle through (Planned, not
+    /// POLICY-REFUSED); (2) the slice-1 digest fix — the canonical digest input is
+    /// the FULL show-json with the non-deterministic top-level `timestamp`
+    /// stripped, so two re-plans of identical config produce an IDENTICAL digest
+    /// input (the property the live-apply gate relies on). Apply is not exercised
+    /// here: `terraform apply tfplan` needs plan and apply to share a durable
+    /// backend (state lineage), which is the operator-provided backend_config in
+    /// production, not a hermetic unit test.
+    #[test]
+    fn real_terraform_live_plan_e2e_is_deterministic_and_gate_clean() {
+        if !binary_available("terraform") {
+            eprintln!("SKIP: terraform binary not found");
+            return;
+        }
+        let plan = live_plan("request-preflight");
+        let a1 = live_terraform_plan("terraform", &plan, &dummy_creds(), None)
+            .expect("live plan must not error");
+        if a1.outcome.status == RunStatus::RunnerUnavailable {
+            eprintln!("SKIP: terraform reported unavailable");
+            return;
+        }
+        assert_eq!(
+            a1.outcome.status,
+            RunStatus::Planned,
+            "clean bundle must pass the gate and plan cleanly; summary: {}",
+            a1.outcome.summary
+        );
+        assert!(
+            !a1.outcome.summary.contains("POLICY-REFUSED"),
+            "clean bundle must not be policy-refused"
+        );
+        assert!(!a1.tfplan.is_empty(), "a saved tfplan must be produced");
+
+        // The digest input is the FULL canonical plan JSON (slice-1 fix).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&a1.outcome.log).expect("canonical plan JSON must parse");
+        assert!(
+            parsed.get("timestamp").is_none(),
+            "the non-deterministic top-level timestamp must be stripped"
+        );
+        assert!(
+            a1.outcome.log.contains("resource_changes"),
+            "semantic plan content must be preserved in the digest input"
+        );
+
+        // Determinism: a second identical plan yields the SAME canonical digest
+        // input despite terraform stamping a fresh timestamp each run.
+        let a2 = live_terraform_plan("terraform", &plan, &dummy_creds(), None)
+            .expect("second live plan must not error");
+        assert_eq!(
+            a1.outcome.log, a2.outcome.log,
+            "canonical digest input must be identical across re-plans of identical config"
+        );
     }
 
     // -----------------------------------------------------------------------

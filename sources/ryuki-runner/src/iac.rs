@@ -900,6 +900,31 @@ mod tests {
         }
     }
 
+    /// Conformance (#11): EVERY curated bundled offering must PASS the IaC policy
+    /// gate — the gate wired into the live runner would otherwise refuse to
+    /// deploy a sanctioned offering. This doubles as a guard against a future
+    /// template accidentally introducing a provisioner / unsafe Ansible task AND
+    /// against the gate over-matching a legitimate bundle.
+    #[test]
+    fn every_bundled_offering_passes_the_iac_policy_gate() {
+        for o in OFFERINGS {
+            let tf = ryuki_engine::iac_policy::evaluate_iac_bundle(o.terraform.iter().copied());
+            assert!(
+                tf.is_empty(),
+                "offering {} Terraform bundle tripped the policy gate: {:?}",
+                o.id,
+                tf
+            );
+            let ans = ryuki_engine::iac_policy::evaluate_iac_bundle(o.ansible.iter().copied());
+            assert!(
+                ans.is_empty(),
+                "offering {} Ansible bundle tripped the policy gate: {:?}",
+                o.id,
+                ans
+            );
+        }
+    }
+
     #[test]
     fn registry_preserves_legacy_wiring() {
         // The exact offering→runner wiring the resolver must keep.

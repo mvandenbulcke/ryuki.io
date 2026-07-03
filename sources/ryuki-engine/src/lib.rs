@@ -39,6 +39,7 @@ pub mod gmsa_lifecycle;
 pub mod hardware_lifecycle;
 pub mod hardware_readiness;
 pub mod health_monitor;
+pub mod iac_policy;
 pub mod image_factory;
 pub mod immutability_compliance;
 pub mod incident_context;

@@ -177,6 +177,13 @@ pub(crate) fn live_ansible_plan(
         ))
     })?;
 
+    // #11 policy gate: refuse unsafe playbook constructs BEFORE any --check run.
+    if let Some(refusal) =
+        crate::live::iac_policy_refusal(&iac_files, RunnerKind::Ansible, plan.mode)
+    {
+        return Ok(refusal);
+    }
+
     // Build secret components for scrubbing.
     let components = credential_components(creds.material.as_slice());
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
@@ -262,6 +269,13 @@ pub(crate) fn live_ansible_apply(
             plan.offering_id
         ))
     })?;
+
+    // #11 policy gate: refuse unsafe playbook constructs BEFORE any live apply.
+    if let Some(refusal) =
+        crate::live::iac_policy_refusal(&iac_files, RunnerKind::Ansible, plan.mode)
+    {
+        return Ok(refusal);
+    }
 
     // Secret scrubbing components.
     let components = credential_components(creds.material.as_slice());
