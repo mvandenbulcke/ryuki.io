@@ -196,6 +196,13 @@ pub fn get_active(site: &str) -> Vec<MaintenanceWindow> {
         .iter()
         .filter(|w| {
             w.site == site
+                // A Cancelled or Completed window is NOT active even if `now` still
+                // falls inside its scheduled span — mirrors check_conflicts_internal
+                // and get_upcoming. Without this, callers using "active maintenance"
+                // for change-freeze / alert-suppression keep suppressing after an
+                // operator cancels the window.
+                && w.status != MaintenanceWindowStatus::Cancelled
+                && w.status != MaintenanceWindowStatus::Completed
                 && match (parse_iso_time(&w.start_time), parse_iso_time(&w.end_time)) {
                     (Some(start), Some(end)) => now >= start && now <= end,
                     _ => false,
@@ -609,6 +616,54 @@ mod tests {
         // Error: empty reason.
         let err = validate_window_inputs("DEFRA", &start, &end, "   ", make_cis());
         assert!(err.unwrap_err().contains("reason cannot be empty"));
+    }
+
+    /// Regression: get_active must exclude Cancelled/Completed windows even when
+    /// `now` still falls inside their scheduled span — otherwise a cancelled
+    /// window keeps suppressing changes/alerts.
+    #[test]
+    fn test_get_active_excludes_cancelled_and_completed() {
+        let _guard = fresh_store();
+        let now = Utc::now();
+        let span_start = (now - Duration::hours(1)).to_rfc3339();
+        let span_end = (now + Duration::hours(1)).to_rfc3339();
+        let mk = |id: &str, status: MaintenanceWindowStatus| MaintenanceWindow {
+            id: id.into(),
+            site: "DEFRA".into(),
+            start_time: span_start.clone(),
+            end_time: span_end.clone(),
+            reason: "test".into(),
+            affected_cis: make_cis(),
+            status,
+            created_by: "tester".into(),
+            created_at: now.to_rfc3339(),
+            metadata: HashMap::new(),
+        };
+        {
+            let mut store = window_store().lock().unwrap();
+            store.push(mk("mw-planned", MaintenanceWindowStatus::Planned));
+            store.push(mk("mw-active", MaintenanceWindowStatus::Active));
+            store.push(mk("mw-cancelled", MaintenanceWindowStatus::Cancelled));
+            store.push(mk("mw-completed", MaintenanceWindowStatus::Completed));
+        }
+        let active = get_active("DEFRA");
+        let ids: Vec<&str> = active.iter().map(|w| w.id.as_str()).collect();
+        assert!(
+            ids.contains(&"mw-planned"),
+            "planned window in-span is active"
+        );
+        assert!(
+            ids.contains(&"mw-active"),
+            "active window in-span is active"
+        );
+        assert!(
+            !ids.contains(&"mw-cancelled"),
+            "a cancelled window must NOT be reported active: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"mw-completed"),
+            "a completed window must NOT be reported active: {ids:?}"
+        );
     }
 
     #[test]
