@@ -304,11 +304,18 @@ fn next_ip(subnet: &IpamSubnet, reservations: &[IpReservation]) -> Result<String
     let (addr, prefix) = parse_cidr(&subnet.cidr)?;
     // /31 and /32 have no conventional usable host range (matches usable_hosts -> 0).
     if prefix >= 31 {
-        return Err(format!("No allocatable IPs remain in subnet '{}'", subnet.id));
+        return Err(format!(
+            "No allocatable IPs remain in subnet '{}'",
+            subnet.id
+        ));
     }
     let host_bits = 32 - prefix; // prefix is 0..=30 here, so host_bits is 2..=32
     // Avoid an out-of-range shift for a /0 (host_bits == 32).
-    let mask: u32 = if host_bits >= 32 { 0 } else { u32::MAX << host_bits };
+    let mask: u32 = if host_bits >= 32 {
+        0
+    } else {
+        u32::MAX << host_bits
+    };
     let base = u32::from(addr) & mask; // network base (also normalises a non-aligned CIDR)
     let broadcast = base | !mask;
     // Usable hosts are the addresses strictly between network and broadcast.
@@ -1009,7 +1016,11 @@ mod tests {
 
         // /30 (10.0.0.0/30): usable .1/.2; gateway .1 -> only .2 is allocatable.
         let s30 = mk("10.0.0.0/30", "10.0.0.1");
-        assert_eq!(alloc(&s30, &[]).unwrap(), "10.0.0.2", "/30 allocates the lone .2");
+        assert_eq!(
+            alloc(&s30, &[]).unwrap(),
+            "10.0.0.2",
+            "/30 allocates the lone .2"
+        );
         // With .2 reserved, the /30 is exhausted (NOT a bogus out-of-range .3+).
         let r2 = IpReservation {
             id: "r".into(),
@@ -1021,12 +1032,18 @@ mod tests {
             reserved_at: "x".into(),
             expiry: "x".into(),
         };
-        assert!(alloc(&s30, std::slice::from_ref(&r2)).is_err(), "/30 with .2 taken is exhausted");
+        assert!(
+            alloc(&s30, std::slice::from_ref(&r2)).is_err(),
+            "/30 with .2 taken is exhausted"
+        );
 
         // /16: allocates within the subnet (network+1 skipping the gateway), in range.
         let s16 = mk("10.42.0.0/16", "10.42.0.1");
         let ip16 = alloc(&s16, &[]).unwrap();
-        assert_eq!(ip16, "10.42.0.2", "/16 first offered host is network+2 (gateway is +1)");
+        assert_eq!(
+            ip16, "10.42.0.2",
+            "/16 first offered host is network+2 (gateway is +1)"
+        );
     }
 
     #[test]

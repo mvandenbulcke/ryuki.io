@@ -354,8 +354,11 @@ pub fn classify_loop_alert_transitions(
         .collect();
     newly_overdue.sort_by(|a, b| a.name.cmp(b.name));
 
-    let currently_overdue: BTreeSet<&'static str> =
-        entries.iter().filter(|e| is_overdue(e)).map(|e| e.name).collect();
+    let currently_overdue: BTreeSet<&'static str> = entries
+        .iter()
+        .filter(|e| is_overdue(e))
+        .map(|e| e.name)
+        .collect();
     let mut newly_recovered: Vec<&'static str> = already_alerted
         .iter()
         .filter(|name| !currently_overdue.contains(*name))
@@ -516,10 +519,8 @@ pub fn spawn_loop_monitor(pool: PgPool, interval_secs: u64) {
                             "background-loop monitor exceeded its iteration timeout; backing off"
                         ),
                     }
-                    tokio::time::sleep(Duration::from_secs(
-                        interval_secs.saturating_mul(backoff),
-                    ))
-                    .await;
+                    tokio::time::sleep(Duration::from_secs(interval_secs.saturating_mul(backoff)))
+                        .await;
                 }
             }
         }
@@ -925,7 +926,11 @@ mod tests {
         let rewedge = [entry("scheduler", 30, threshold(30) + 1)];
         let plan2 = classify_loop_alert_transitions(&rewedge, &state);
         assert_eq!(
-            plan2.newly_overdue.iter().map(|e| e.name).collect::<Vec<_>>(),
+            plan2
+                .newly_overdue
+                .iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>(),
             vec!["scheduler"],
             "a real re-wedge must page again even if the prior recovered event was lost"
         );
@@ -938,7 +943,10 @@ mod tests {
         let mut state = alerted(&["wedged", "recovered_one"]);
         rearm_recovered(&mut state, &["recovered_one"]);
         assert!(state.contains("wedged"), "still-wedged loop stays alerted");
-        assert!(!state.contains("recovered_one"), "recovered loop is re-armed");
+        assert!(
+            !state.contains("recovered_one"),
+            "recovered loop is re-armed"
+        );
     }
 
     #[test]
@@ -1005,9 +1013,15 @@ mod loop_monitor_db_tests {
         )
         .await
         .expect("emit overdue");
-        emit_loop_event(pool, loop_name, "background_loop.recovered", "recovered", None)
-            .await
-            .expect("emit recovered");
+        emit_loop_event(
+            pool,
+            loop_name,
+            "background_loop.recovered",
+            "recovered",
+            None,
+        )
+        .await
+        .expect("emit recovered");
 
         // The alert feed surfaces ONLY the overdue event for this loop.
         let statuses = alert_statuses();
@@ -1022,7 +1036,10 @@ mod loop_monitor_db_tests {
         // interval 30 ⇒ threshold 2*300 + 2*30 = 660.
         assert_eq!(overdue.payload["threshold_secs"], serde_json::json!(660));
         assert!(overdue.site.is_none(), "platform-wide: no site");
-        assert!(overdue.environment.is_none(), "platform-wide: no environment");
+        assert!(
+            overdue.environment.is_none(),
+            "platform-wide: no environment"
+        );
         assert!(
             overdue.payload.get("replica").is_some(),
             "replica identity is stamped for multi-replica disambiguation"

@@ -4239,7 +4239,10 @@ pub mod integration_db_tests {
     }
 
     /// (cred_source, vendor_type, detail::text) of the single created audit row.
-    async fn created_audit(pool: &PgPool, conn_id: &str) -> (Option<String>, Option<String>, String) {
+    async fn created_audit(
+        pool: &PgPool,
+        conn_id: &str,
+    ) -> (Option<String>, Option<String>, String) {
         sqlx::query_as(
             "SELECT detail->>'cred_source', detail->>'vendor_type', detail::text FROM audit_log \
              WHERE action = 'integration.connection.created' \
@@ -4272,7 +4275,11 @@ pub mod integration_db_tests {
         );
 
         let (cred_source, vendor_type, detail_text) = created_audit(pool, &conn_id).await;
-        assert_eq!(cred_source.as_deref(), Some("db-encrypted"), "source TYPE recorded");
+        assert_eq!(
+            cred_source.as_deref(),
+            Some("db-encrypted"),
+            "source TYPE recorded"
+        );
         assert_eq!(vendor_type.as_deref(), Some("servicenow"));
         assert!(
             !detail_text.contains(&secret_plaintext),
@@ -4363,7 +4370,11 @@ pub mod integration_db_tests {
         .fetch_one(pool)
         .await
         .expect("one updated audit row");
-        assert_eq!(cred_rotated, Some(true), "secret rotation → cred_rotated true");
+        assert_eq!(
+            cred_rotated,
+            Some(true),
+            "secret rotation → cred_rotated true"
+        );
         assert!(
             !detail_text.contains(&new_secret),
             "the rotated secret must NEVER be in the audit detail"
@@ -4414,7 +4425,11 @@ pub mod integration_db_tests {
         .fetch_one(pool)
         .await
         .expect("one updated audit row");
-        assert_eq!(cred_rotated, Some(false), "plain update → cred_rotated false");
+        assert_eq!(
+            cred_rotated,
+            Some(false),
+            "plain update → cred_rotated false"
+        );
 
         cleanup_connection(pool, &conn_id).await;
     }
@@ -4476,7 +4491,10 @@ pub mod integration_db_tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(missing_count, 0, "an unknown-id set-expiry writes no audit row");
+        assert_eq!(
+            missing_count, 0,
+            "an unknown-id set-expiry writes no audit row"
+        );
 
         cleanup_connection(pool, &conn_id).await;
     }

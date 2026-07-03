@@ -15283,7 +15283,10 @@ async fn requests_list(
         }
         if let Some(v) = &f_q_like {
             binds.push(v.as_str());
-            preds.push(format!("name ILIKE '%' || ${} || '%' ESCAPE '\\'", binds.len()));
+            preds.push(format!(
+                "name ILIKE '%' || ${} || '%' ESCAPE '\\'",
+                binds.len()
+            ));
         }
         // Shared by the page SELECT and the COUNT so the two can never drift (a
         // mismatched total would mislead pagination).
@@ -15832,7 +15835,12 @@ async fn requests_validate(
     // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
     // out-of-scope request 404s exactly like a missing one, never a cross-scope
     // transition or an existence oracle. Unrestricted principals pass unchanged.
-    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
+    scope_guard_or_404(
+        &session,
+        &store[idx].site,
+        &store[idx].environment,
+        &request_id,
+    )?;
 
     let result = request_lifecycle::validate_request(&store[idx]).map_err(map_engine_error)?;
 
@@ -16667,7 +16675,12 @@ async fn requests_lock(
     // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
     // out-of-scope request 404s exactly like a missing one, never a cross-scope
     // transition or an existence oracle. Unrestricted principals pass unchanged.
-    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
+    scope_guard_or_404(
+        &session,
+        &store[idx].site,
+        &store[idx].environment,
+        &request_id,
+    )?;
 
     let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
 
@@ -16861,7 +16874,12 @@ async fn requests_execute(
     // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
     // out-of-scope request 404s exactly like a missing one, never a cross-scope
     // transition or an existence oracle. Unrestricted principals pass unchanged.
-    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
+    scope_guard_or_404(
+        &session,
+        &store[idx].site,
+        &store[idx].environment,
+        &request_id,
+    )?;
 
     let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
 
@@ -36109,8 +36127,14 @@ mod unit_tests {
             status: "Available".into(),
         };
         let eng = row.to_engine();
-        assert_eq!(eng.vlan_id, 1, "negative vlan clamps into range, not wraps to 65535");
-        assert_eq!(eng.total_ips, 0, "negative total_ips floors to 0, not wraps to a huge u32 (~4.29e9)");
+        assert_eq!(
+            eng.vlan_id, 1,
+            "negative vlan clamps into range, not wraps to 65535"
+        );
+        assert_eq!(
+            eng.total_ips, 0,
+            "negative total_ips floors to 0, not wraps to a huge u32 (~4.29e9)"
+        );
         assert_eq!(eng.used_ips, 0, "negative used_ips floors to 0");
         assert_eq!(eng.available_ips, 0, "i32::MIN available_ips floors to 0");
 
@@ -36124,7 +36148,12 @@ mod unit_tests {
         };
         let eng_ok = ok.to_engine();
         assert_eq!(
-            (eng_ok.vlan_id, eng_ok.total_ips, eng_ok.used_ips, eng_ok.available_ips),
+            (
+                eng_ok.vlan_id,
+                eng_ok.total_ips,
+                eng_ok.used_ips,
+                eng_ok.available_ips
+            ),
             (110, 254, 60, 194),
             "a valid row passes through the clamps unchanged"
         );
@@ -38785,7 +38814,11 @@ mod unit_tests {
         assert_eq!(clamp_offset_usize(0), 0);
         assert_eq!(clamp_offset_usize(100), 100);
         let max = i64::MAX as usize;
-        assert_eq!(clamp_offset_usize(max), max, "exactly i64::MAX is preserved");
+        assert_eq!(
+            clamp_offset_usize(max),
+            max,
+            "exactly i64::MAX is preserved"
+        );
         // usize::MAX (and anything above i64::MAX) clamps to i64::MAX.
         assert_eq!(clamp_offset_usize(usize::MAX), max);
         assert!(
@@ -42421,8 +42454,14 @@ mod db_lifecycle_tests {
 
         let Json(r1) = reserve("host-a").await.expect("reserve 1");
         let Json(r2) = reserve("host-b").await.expect("reserve 2");
-        let ip1 = r1["reservation"]["ip_address"].as_str().unwrap().to_string();
-        let ip2 = r2["reservation"]["ip_address"].as_str().unwrap().to_string();
+        let ip1 = r1["reservation"]["ip_address"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ip2 = r2["reservation"]["ip_address"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Cleanup before asserting.
         sqlx::query("DELETE FROM ip_reservations WHERE subnet_id = $1")
@@ -42518,14 +42557,20 @@ mod db_lifecycle_tests {
             .await
             .ok();
 
-        assert_eq!(before["source"], "database", "DB path, not the in-memory seed");
+        assert_eq!(
+            before["source"], "database",
+            "DB path, not the in-memory seed"
+        );
         assert_eq!(before["available_ips"], 254);
         assert_eq!(before["can_allocate"], true);
         assert_eq!(
             after["available_ips"], 252,
             "availability tracks live DB reservations, not the stale seed"
         );
-        assert_eq!(after["can_allocate"], true, "252 requested <= 252 available");
+        assert_eq!(
+            after["can_allocate"], true,
+            "252 requested <= 252 available"
+        );
         assert_eq!(
             over["can_allocate"], false,
             "253 requested > 252 available → cannot allocate"
@@ -42572,11 +42617,13 @@ mod db_lifecycle_tests {
         .expect("reserve");
         let res_id = r["reservation"]["id"].as_str().unwrap().to_string();
 
-        let Json(_) = ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id.clone()))
-            .await
-            .expect("first release");
-        let second =
-            ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id)).await;
+        let Json(_) = ipam_release_ip(
+            Extension(AuthSession::static_dry_run()),
+            Path(res_id.clone()),
+        )
+        .await
+        .expect("first release");
+        let second = ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id)).await;
 
         let available: i32 =
             sqlx::query_scalar("SELECT available_ips FROM ipam_subnets WHERE id = $1")
@@ -45143,9 +45190,11 @@ mod db_lifecycle_tests {
             "out-of-scope compliance_finding_get must 404: {scoped:?}"
         );
 
-        let open =
-            compliance_finding_get(AuthExtractor(AuthSession::static_dry_run()), Path(id.clone()))
-                .await;
+        let open = compliance_finding_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await;
         match open {
             Ok(Json(v)) => assert_eq!(
                 v["finding"]["id"].as_str(),
@@ -48006,14 +48055,20 @@ mod db_lifecycle_tests {
                 .find(|s| s.name == stage_name && s.status == StageStatus::Completed)
                 .unwrap_or_else(|| panic!("a Completed {stage_name} stage must be present"));
             assert!(
-                completed.completed_at.as_deref().is_some_and(|t| !t.is_empty()),
+                completed
+                    .completed_at
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty()),
                 "the Completed {stage_name} stage must persist a completed_at timestamp, got {:?}",
                 completed.completed_at
             );
             // The helper stamps started_at == completed_at (one instantaneous point);
             // assert both so a regression that drops either is caught.
             assert!(
-                completed.started_at.as_deref().is_some_and(|t| !t.is_empty()),
+                completed
+                    .started_at
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty()),
                 "the Completed {stage_name} stage must persist a started_at timestamp, got {:?}",
                 completed.started_at
             );
@@ -53111,7 +53166,10 @@ mod secrets_rotation_db_tests {
         .expect("query audit");
         cleanup_secret(pool, id).await;
 
-        assert!(res.is_ok(), "deregister of an expired secret must succeed: {res:?}");
+        assert!(
+            res.is_ok(),
+            "deregister of an expired secret must succeed: {res:?}"
+        );
         assert_eq!(
             from_status.as_deref(),
             Some("expired"),
@@ -64786,7 +64844,10 @@ mod runbook_executions_db_tests {
         use ryuki_engine::auth::AuthSession;
         let _serial = DB_TEST_SERIAL.lock().await;
         // Drift-tolerant connect: runbook_executions predates the local DB migration drift.
-        let Some(url) = std::env::var("RYUKI_DATABASE_URL").ok().filter(|u| !u.is_empty()) else {
+        let Some(url) = std::env::var("RYUKI_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };

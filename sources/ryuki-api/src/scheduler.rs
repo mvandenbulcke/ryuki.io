@@ -498,8 +498,7 @@ async fn run_job(
             // `tx`, so a failure rolls back with this schedule's savepoint. `detail`
             // is aggregate-only (counts, never per-plan ids) because it is surfaced
             // via /api/ops/scheduler/executions.
-            let rows =
-                crate::repos::dr_plans::active_plans_for_overdue_scan(&mut **tx).await?;
+            let rows = crate::repos::dr_plans::active_plans_for_overdue_scan(&mut **tx).await?;
             let now = chrono::Utc::now();
             let mut overdue: u64 = 0;
             let mut enqueued: u64 = 0;
@@ -625,7 +624,9 @@ async fn run_job(
             }
             Ok((
                 "succeeded".to_string(),
-                Some(format!("{overdue} patch wave(s) overdue, {enqueued} enqueued")),
+                Some(format!(
+                    "{overdue} patch wave(s) overdue, {enqueued} enqueued"
+                )),
             ))
         }
         "golden_image_stale_scan" => {
@@ -1166,14 +1167,12 @@ async fn run_job(
                 let state = verdict.as_str();
                 // Overdue → P2 (security-hygiene degradation, not an outage like an expired cert);
                 // due-soon → P3.
-                let priority = if matches!(
-                    verdict,
-                    ryuki_engine::gmsa_lifecycle::GmsaExpiry::Overdue
-                ) {
-                    "P2"
-                } else {
-                    "P3"
-                };
+                let priority =
+                    if matches!(verdict, ryuki_engine::gmsa_lifecycle::GmsaExpiry::Overdue) {
+                        "P2"
+                    } else {
+                        "P3"
+                    };
                 let title = format!("gMSA rotation {state}: {}", row.name);
                 let description = format!(
                     "gMSA '{}' ({}) at {} — managed-password rotation due {}. Verify AD-side \
@@ -4404,7 +4403,10 @@ mod db_tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(name, "gMSA rotation expiry scan (all accounts)", "seed name");
+        assert_eq!(
+            name, "gMSA rotation expiry scan (all accounts)",
+            "seed name"
+        );
         assert_eq!(kind, "gmsa_expiry_scan", "seed job_kind");
         assert_eq!(interval, 86400, "seed interval_secs (daily)");
         assert!(enabled, "seed ships enabled");
@@ -4687,8 +4689,8 @@ mod db_tests {
         seed_shift_item(pool, &old, true, "NOW() - INTERVAL '200 days'").await; // → pruned
         seed_shift_item(pool, &recent, true, "NOW() - INTERVAL '5 days'").await; // keep (recent)
         seed_shift_item(pool, &open, false, "NULL").await; // keep (OPEN = live work)
-        // A REOPENED item: resolved=false but with an OLD non-null resolved_at — the
-        // resolved=true predicate must still exclude it (codex).
+                                                           // A REOPENED item: resolved=false but with an OLD non-null resolved_at — the
+                                                           // resolved=true predicate must still exclude it (codex).
         seed_shift_item(pool, &reopened, false, "NOW() - INTERVAL '300 days'").await;
         seed_shift_item(pool, &nullres, true, "NULL").await; // keep (no age anchor)
 
@@ -5612,7 +5614,13 @@ mod db_tests {
     const DR_SCAN_SEED_ID: &str = "a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0";
 
     /// Build a valid DrPlan JSON blob for use in dr_plans test fixtures.
-    fn dr_plan_json(id: &str, name: &str, site: &str, next_test_due: &str, last_tested: Option<&str>) -> serde_json::Value {
+    fn dr_plan_json(
+        id: &str,
+        name: &str,
+        site: &str,
+        next_test_due: &str,
+        last_tested: Option<&str>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "name": name,
@@ -5743,14 +5751,12 @@ mod db_tests {
         // Cleanup shift_queue and job_executions BEFORE asserting (mirrors sibling
         // tests' cleanup-before-assert discipline so prior fixture state does not
         // leak into the count assertions).
-        sqlx::query(
-            "DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)",
-        )
-        .bind(&overdue_id)
-        .bind(&future_id)
-        .execute(pool)
-        .await
-        .ok();
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&overdue_id)
+            .bind(&future_id)
+            .execute(pool)
+            .await
+            .ok();
         sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
             .bind(&sched_id)
             .execute(pool)
@@ -5806,14 +5812,12 @@ mod db_tests {
         );
 
         // Final cleanup.
-        sqlx::query(
-            "DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)",
-        )
-        .bind(&overdue_id)
-        .bind(&future_id)
-        .execute(pool)
-        .await
-        .ok();
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&overdue_id)
+            .bind(&future_id)
+            .execute(pool)
+            .await
+            .ok();
         for id in [&overdue_id, &future_id] {
             sqlx::query("DELETE FROM dr_plans WHERE id = $1")
                 .bind(id)
@@ -6089,8 +6093,20 @@ mod db_tests {
         let stale_built = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
         let fresh_built = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
 
-        seed_golden_image(pool, &stale_id, &format!("stale-img-{suffix}"), &stale_built).await;
-        seed_golden_image(pool, &fresh_id, &format!("fresh-img-{suffix}"), &fresh_built).await;
+        seed_golden_image(
+            pool,
+            &stale_id,
+            &format!("stale-img-{suffix}"),
+            &stale_built,
+        )
+        .await;
+        seed_golden_image(
+            pool,
+            &fresh_id,
+            &format!("fresh-img-{suffix}"),
+            &fresh_built,
+        )
+        .await;
 
         let sched_id = seed_due_gimg_scan(pool).await;
 
