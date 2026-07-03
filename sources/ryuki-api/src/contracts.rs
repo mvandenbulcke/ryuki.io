@@ -9153,11 +9153,17 @@ async fn software_approve(
     }
 }
 
-async fn software_execute(Path(id): Path<String>) -> ApiResult {
+async fn software_execute(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // DB path: do NOT call execute_deployment() — it requires the row in
         // DEPLOYMENT_STORE which is not populated from DB after restart.
         // Build a minimal evidence payload inline and CAS-update the row.
+        // The execution is a privileged Approved→Executed transition, so — like
+        // software_verify — it writes a durable hash-chained audit row attributing
+        // it to the authenticated principal, atomically with the state change.
         let now = chrono::Utc::now();
         let evidence_json = serde_json::to_string(&serde_json::json!([{
             "step": "execute",
@@ -9166,6 +9172,7 @@ async fn software_execute(Path(id): Path<String>) -> ApiResult {
             "source": "database",
         }]))
         .unwrap_or_else(|_| "[]".into());
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
             "UPDATE software_deployments \
              SET status = 'Executed', executed_at = $2, \
@@ -9176,12 +9183,32 @@ async fn software_execute(Path(id): Path<String>) -> ApiResult {
         .bind(&id)
         .bind(now)
         .bind(evidence_json)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
         return match row {
-            Some(updated) => Ok(Json(updated.to_json())),
+            Some(updated) => {
+                // from_status is provably 'Approved' (the CAS predicate).
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &audit::security_audit(
+                        "software-execute",
+                        Some("Approved"),
+                        "executed",
+                        json!({ "deployment_id": &id }),
+                    ),
+                )
+                .await
+                .map_err(db_error)?;
+                tx.commit().await.map_err(db_error)?;
+                Ok(Json(updated.to_json()))
+            }
             None => {
+                // Explicitly release the transaction's connection (rollback, no
+                // mutation, no audit row) BEFORE the disambiguation SELECT — with a
+                // small pool (size 1) a still-held tx would starve that query.
+                drop(tx);
                 let exists: Option<(String,)> =
                     sqlx::query_as("SELECT status FROM software_deployments WHERE id = $1")
                         .bind(&id)
@@ -9250,7 +9277,10 @@ async fn software_verify(
                 })))
             }
             None => {
-                // tx drops here (rollback) — no mutation happened
+                // Explicitly release the tx's connection (rollback, no mutation)
+                // BEFORE the disambiguation SELECT — a still-held tx would starve
+                // that query on a pool of size 1.
+                drop(tx);
                 // Idempotent: already Verified → 200.
                 // Wrong state (incl. Completed) or missing → 409/404.
                 let exists: Option<(String,)> =
