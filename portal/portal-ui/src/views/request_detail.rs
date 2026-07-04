@@ -653,6 +653,25 @@ pub fn RequestDetail() -> impl IntoView {
         }
     });
 
+    // Disable every lifecycle button while ANY transition is in flight, so a
+    // double-click cannot double-POST — the second call would otherwise trip the
+    // API's lifecycle guard with a 409 whose message overwrites the success badge.
+    let any_action_pending = Memo::new(move |_| {
+        validate_action.pending().get()
+            || plan_action.pending().get()
+            || approve_action.pending().get()
+            || lock_action.pending().get()
+            || execute_action.pending().get()
+            || run_live_plan_action.pending().get()
+            || approve_live_apply_action.pending().get()
+            || verify_action.pending().get()
+            || protect_action.pending().get()
+            || publish_action.pending().get()
+            || retire_action.pending().get()
+            || reject_action.pending().get()
+            || cancel_action.pending().get()
+    });
+
     view! {
         <div class="request-detail-view">
             <Suspense fallback=move || {
@@ -1080,6 +1099,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                 view! {
                                                     <button
                                                         class=btn_class
+                                                        disabled=move || any_action_pending.get()
                                                         on:click=move |_| {
                                                             // Reason-bearing decisions open the confirm
                                                             // panel instead of dispatching immediately;
@@ -1124,6 +1144,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                         view! {
                                                             <button
                                                                 class="btn btn-secondary"
+                                                                disabled=move || any_action_pending.get()
                                                                 on:click=move |_| {
                                                                     run_live_plan_action.dispatch(id.clone());
                                                                 }
@@ -1150,6 +1171,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                             <button
                                                                 class="btn btn-secondary"
                                                                 class:btn-danger=move || apply_armed.get()
+                                                                disabled=move || any_action_pending.get()
                                                                 on:click=move |_| {
                                                                     // First click arms; the confirming
                                                                     // second click dispatches the live
@@ -1205,6 +1227,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                     <div class="reason-actions">
                                                         <button
                                                             class="btn btn-danger"
+                                                            disabled=move || any_action_pending.get()
                                                             on:click=move |_| {
                                                                 let reason = reason_text.get();
                                                                 if reason.trim().is_empty() {
