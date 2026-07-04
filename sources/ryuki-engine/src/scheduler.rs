@@ -125,6 +125,22 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// back to 'Active' (a suppression is a TIME-BOXED mute that must auto-revert) —
 /// an IN-PLACE update of our own `noisy_triggers` table, NO provider/live/
 /// destructive call.
+///
+/// `drift_recheck_dispatch_scan` (#31 slice 2b-2) is DIFFERENT from every kind
+/// above: it is the FIRST schedule that fans out into `agent_jobs`, i.e. it
+/// CREATES agent-executed work rather than only flagging/enqueueing/pruning our
+/// own tables. This is a real capability escalation from the flag-only
+/// safe-internal-write scans, so read the justification carefully before
+/// copying this pattern for a future scan: it is admitted here ONLY because the
+/// dispatched job is itself read-only against the target infrastructure — a
+/// `LivePlan` (`terraform plan` / `ansible --check`), never a `LiveApply`. The
+/// dispatch scan reads `requests` + `agent_jobs` to find operational deployments
+/// overdue for a drift re-check (reusing the same `is_drift_recheck_due` gate as
+/// `drift_recheck_overdue_scan`), derives a `LivePlan` `JobSpec` from the
+/// deployment's last successful `LiveApply` spec, and inserts ONE deduped
+/// `agent_jobs` row (guarded by `origin = 'drift_recheck'` + an open-job check —
+/// never stacks a second recheck while one is in flight). No `LiveApply` grant
+/// is ever minted or required; a live-mutating job kind must NOT be added here.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
@@ -150,6 +166,9 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 // #31 slice 1: reads requests+agent_jobs, writes only our own
                 // shift_queue — no live/provider call (safe-internal write).
                 | "drift_recheck_overdue_scan"
+                // #31 slice 2b-2: FIRST scan to create agent_jobs — dispatches a
+                // read-only LivePlan drift recheck (see doc comment above).
+                | "drift_recheck_dispatch_scan"
         )
 }
 
@@ -264,6 +283,8 @@ mod tests {
         assert!(!job_is_read_only("noise_suppression_expiry_scan"));
         assert!(job_is_schedulable("drift_recheck_overdue_scan"));
         assert!(!job_is_read_only("drift_recheck_overdue_scan"));
+        assert!(job_is_schedulable("drift_recheck_dispatch_scan"));
+        assert!(!job_is_read_only("drift_recheck_dispatch_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));

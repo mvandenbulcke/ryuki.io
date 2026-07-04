@@ -765,6 +765,99 @@ async fn run_job(
                 Some(format!("{overdue} deployment(s) overdue, {enqueued} enqueued")),
             ))
         }
+        "drift_recheck_dispatch_scan" => {
+            // #31 slice 2b-2 — the FIRST scan that CREATES an agent_job, a real
+            // capability escalation from every flag-only safe-internal-write scan
+            // above (which only enqueue our own shift_queue / mutate our own
+            // tables). What is dispatched is still read-only against the target
+            // infrastructure: a LivePlan (`terraform plan` / `ansible --check`),
+            // mirroring approve_live_apply's spec-derivation but in the opposite
+            // direction (LiveApply spec -> LivePlan spec, not LivePlan -> LiveApply).
+            // Reuses the SAME overdue gate as drift_recheck_overdue_scan
+            // (`is_drift_recheck_due` against GREATEST(last LiveApply,
+            // last_drift_check_at)) so the two scans agree on what counts as
+            // overdue. Dedups via `open_drift_recheck_job_exists` so an in-flight
+            // recheck is never stacked. The agent runs the dispatched job and the
+            // CP ingest (already shipped) classifies drift and resets
+            // `requests.last_drift_check_at`. All on `tx`, so a failure rolls back
+            // with this schedule's savepoint. `detail` is aggregate-only (counts,
+            // never per-request ids).
+            let interval = ryuki_engine::drift_scan::DRIFT_RECHECK_INTERVAL_DAYS;
+            // Compare against the DATABASE clock (see drift_recheck_overdue_scan).
+            let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT NOW()")
+                .fetch_one(&mut **tx)
+                .await?;
+            let rows =
+                crate::repos::drift_scan::operational_deployments_for_drift_recheck(&mut **tx)
+                    .await?;
+            let cap = ryuki_engine::drift_scan::DRIFT_RECHECK_DISPATCH_MAX_PER_TICK as u64;
+            let mut dispatched = 0u64;
+            let mut skipped_inflight = 0u64;
+            let mut deferred = 0u64;
+            let mut skipped_bad_spec = 0u64;
+            for row in &rows {
+                if !ryuki_engine::drift_scan::is_drift_recheck_due(row.last_verified, now, interval)
+                {
+                    continue;
+                }
+                // Dedup: never stack a second in-flight recheck for the same deployment.
+                if crate::repos::drift_scan::open_drift_recheck_job_exists(
+                    &mut **tx,
+                    row.request_id,
+                )
+                .await?
+                {
+                    skipped_inflight += 1;
+                    continue;
+                }
+                // Per-tick burst cap: once we've dispatched the cap, DEFER the rest
+                // of this run's overdue deployments to the next tick (they are not
+                // in-flight, so the next tick picks them up) rather than fanning out
+                // an unbounded number of agent jobs at once. Checked before deriving
+                // the spec so a large backlog doesn't do wasted work either.
+                if dispatched >= cap {
+                    deferred += 1;
+                    continue;
+                }
+                // Derive the LivePlan spec from the last LiveApply spec (mirror
+                // approve_live_apply). A malformed stored spec is SKIPPED
+                // (fail-safe), never aborts the scan.
+                let Ok(mut spec) =
+                    serde_json::from_value::<ryuki_protocol::JobSpec>(row.spec.clone())
+                else {
+                    skipped_bad_spec += 1;
+                    continue;
+                };
+                // Fail-safe: the derived recheck must target THIS request. A stored
+                // spec whose request_id disagrees with the job row is corrupt —
+                // never dispatch agent work bound to the wrong request (its result
+                // would backlink onto a different request on ingest).
+                if spec.request_id != row.request_id {
+                    skipped_bad_spec += 1;
+                    continue;
+                }
+                spec.mode = ryuki_protocol::JobMode::LivePlan;
+                let Ok(spec_json) = serde_json::to_value(&spec) else {
+                    skipped_bad_spec += 1;
+                    continue;
+                };
+                crate::repos::drift_scan::insert_drift_recheck_job(
+                    &mut **tx,
+                    row.request_id,
+                    &row.platform,
+                    &spec_json,
+                )
+                .await?;
+                dispatched += 1;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "{dispatched} drift-recheck(s) dispatched, {skipped_inflight} in-flight, \
+                     {deferred} deferred (per-tick cap {cap}), {skipped_bad_spec} bad-spec skipped"
+                )),
+            ))
+        }
         "noise_suppression_expiry_scan" => {
             // Safe-internal write (#61): a suppression is a TIME-BOXED mute — once its
             // `suppress_until` window elapses the trigger must return to the active board
@@ -6514,6 +6607,165 @@ mod db_tests {
             .await
             .ok();
         restore_migration_drift_scan(pool).await;
+    }
+
+    // ---- #31 slice 2b-2: drift_recheck_dispatch_scan -----------------------
+
+    /// The migration-148-seeded drift_recheck_dispatch_scan id. Tests disable it
+    /// so exactly ONE scan is due per tick (mirrors DRIFT_SCAN_SEED_ID).
+    const DRIFT_DISPATCH_SCAN_SEED_ID: &str = "e8d3a2c4-0031-4d31-8c31-e8d3a2c40148";
+
+    /// Seed a `LiveApply` agent_jobs row with a spec that DOES deserialize as a
+    /// [`ryuki_protocol::JobSpec`] (unlike [`seed_verified_agent_job`]'s `'{}'::jsonb`,
+    /// which the dispatch scan would reject as a bad spec). `offering_id`,
+    /// `iac_digest`, and `mode` mirror a real LiveApply spec closely enough for
+    /// deserialization + the mode-swap round-trip; the digest is 64 zeros (a valid
+    /// hex placeholder, not a real artifact digest).
+    async fn seed_liveapply_job_with_spec(pool: &PgPool, request_id: &str, completed_at_sql: &str) {
+        let spec = serde_json::json!({
+            "request_id": request_id,
+            "offering_id": "00000000-0000-0000-0000-000000000002",
+            "iac_ref": "linux-server-deployment@v1",
+            "iac_digest": "0".repeat(64),
+            "vars": {},
+            "mode": "live_apply",
+        });
+        let sql = format!(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, result_status, completed_at) \
+             VALUES ($1::uuid, 'ci-test', $2::jsonb, 'LiveApply', 'Succeeded', \
+                     'applied', {completed_at_sql})"
+        );
+        sqlx::query(&sql)
+            .bind(request_id)
+            .bind(&spec)
+            .execute(pool)
+            .await
+            .expect("seed liveapply job with valid spec");
+    }
+
+    /// Plant a guaranteed-due `drift_recheck_dispatch_scan` schedule. Disables the
+    /// migration-seeded scan first so EXACTLY ONE is due. Returns the planted id.
+    async fn seed_due_drift_dispatch_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(DRIFT_DISPATCH_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-driftdispatch-due-4f1";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test drift recheck dispatch scan', 'drift_recheck_dispatch_scan', \
+             86400, TRUE, NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_drift_dispatch_scan`] disabled.
+    async fn restore_migration_drift_dispatch_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(DRIFT_DISPATCH_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count open (Pending/Leased/Running) scheduler-dispatched drift-recheck
+    /// LivePlan jobs for a request id.
+    async fn open_drift_recheck_job_count(pool: &PgPool, request_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs \
+             WHERE request_id = $1::uuid AND origin = 'drift_recheck' AND mode = 'LivePlan' \
+               AND status = 'Pending'",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An operational deployment overdue for a drift re-check gets exactly one
+    /// dispatched LivePlan agent_job; a second tick does not stack a duplicate
+    /// while the first is still Pending.
+    #[tokio::test]
+    async fn drift_recheck_dispatch_scan_creates_liveplan_job() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        // 30 days ago > DRIFT_RECHECK_INTERVAL_DAYS (14) — overdue. No
+        // last_drift_check_at, so the LiveApply completion is the only signal.
+        seed_liveapply_job_with_spec(pool, &request_id, "NOW() - INTERVAL '30 days'").await;
+
+        let sched_id = seed_due_drift_dispatch_scan(pool).await;
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: exactly one LivePlan drift-recheck job is dispatched.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted dispatch scan ran");
+        assert_eq!(
+            open_drift_recheck_job_count(pool, &request_id).await,
+            1,
+            "an overdue operational deployment gets exactly one dispatched LivePlan job"
+        );
+
+        let spec_mode: String = sqlx::query_scalar(
+            "SELECT spec->>'mode' FROM agent_jobs \
+             WHERE request_id = $1::uuid AND origin = 'drift_recheck' AND mode = 'LivePlan'",
+        )
+        .bind(&request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            spec_mode, "live_plan",
+            "the dispatched job's spec JSONB mode must be swapped to live_plan"
+        );
+
+        // Second tick (re-seed the due schedule): the in-flight Pending job blocks
+        // a second dispatch — dedup holds.
+        let sched_id2 = seed_due_drift_dispatch_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_drift_recheck_job_count(pool, &request_id).await,
+            1,
+            "a second tick does not stack a duplicate while one recheck is in-flight"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_drift_dispatch_scan(pool).await;
     }
 
     // ---- #61 noise_suppression_expiry_scan ---------------------------------

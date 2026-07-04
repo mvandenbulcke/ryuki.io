@@ -23,6 +23,17 @@
 /// schedule's cadence without a code change.
 pub const DRIFT_RECHECK_INTERVAL_DAYS: i64 = 14;
 
+/// Maximum LivePlan drift-recheck jobs the dispatch scan (#31 slice 2b-2) will
+/// CREATE in a single tick. The dispatch scan is the first schedule that fans out
+/// into `agent_jobs`; without a cap, the first tick after enabling it (or after a
+/// large backlog accumulates) would enqueue one job per overdue deployment all at
+/// once, swamping the agent queue. Capping per tick bounds that burst — the
+/// remaining overdue deployments are picked up on subsequent ticks (the already-
+/// dispatched ones are skipped by the in-flight dedup), and the scan reports how
+/// many it deferred so the operator can raise this bound or the cadence if the
+/// backlog is genuinely large. NOT a silent truncation.
+pub const DRIFT_RECHECK_DISPATCH_MAX_PER_TICK: usize = 200;
+
 /// The `agent_jobs.origin` marker a scheduler-created drift-recheck LivePlan job carries (#31 slice 2).
 /// NULL origin = a normal operator/request-path job. The CP only classifies drift for jobs with this origin,
 /// so a normal operator plan (which is EXPECTED to show changes) never emits a spurious drift event.
