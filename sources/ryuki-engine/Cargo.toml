@@ -13,3 +13,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 strum = { version = "0.28.0", features = ["derive"] }
+# Inbound webhook HMAC-SHA256 verification (#18). All three are already resolved
+# in Cargo.lock (transitive) — declaring them direct adds no new supply-chain crate.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

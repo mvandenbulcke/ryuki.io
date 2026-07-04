@@ -2977,10 +2977,13 @@ name = "ryuki-engine"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
+ "hmac",
  "ryuki-core",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "strum",
  "thiserror 2.0.18",
  "uuid",

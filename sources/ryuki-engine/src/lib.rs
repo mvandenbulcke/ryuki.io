@@ -96,4 +96,5 @@ pub mod synthetic_health;
 pub mod vendor_catalog;
 pub mod vm_operations;
 pub mod vsan_esxi_lifecycle;
+pub mod webhook_receipt;
 pub mod zabbix_drift;
