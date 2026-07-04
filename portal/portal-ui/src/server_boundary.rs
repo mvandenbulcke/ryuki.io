@@ -779,6 +779,17 @@ impl PortalRouteStateSnapshot {
         snapshot.upstream_state = "live".to_string();
         snapshot.execution_authority_label = "Execution: live provider (gated)".to_string();
         snapshot.route_state = "live-shell-route".to_string();
+        // The freshness/scope labels inherited from static_dry_run() are FIXTURES
+        // (e.g. "Monitoring stale", "Site: Global"). Rendering them in live mode
+        // presents fabricated operational state as real — including a false
+        // staleness warning. Real freshness/scope is not yet wired to the API, so
+        // show explicit "not yet wired" placeholders instead of fake data.
+        snapshot.inventory_freshness_label = "Inventory freshness: not yet wired".to_string();
+        snapshot.backup_freshness_label = "Backup freshness: not yet wired".to_string();
+        snapshot.monitoring_freshness_label = "Monitoring freshness: not yet wired".to_string();
+        snapshot.site_scope_label = "Site: not yet wired".to_string();
+        snapshot.environment_scope_label = "Env: not yet wired".to_string();
+        snapshot.role_scope_label = "Role: not yet wired".to_string();
         snapshot.safe_summary = "Portal route state backed by the live platform API".to_string();
         Ok(snapshot)
     }
@@ -4183,6 +4194,33 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
+    }
+
+    #[test]
+    fn live_route_state_does_not_fabricate_freshness_or_scope() {
+        // Regression: live_provider() must NOT inherit static_dry_run()'s fixture
+        // freshness/scope labels (e.g. "Monitoring stale", "Site: Global"), which
+        // would render fabricated operational state — a false staleness warning —
+        // as if real. Until real freshness/scope is wired, show honest placeholders.
+        let snapshot = PortalRouteStateSnapshot::live_provider()
+            .expect("live route state snapshot must build");
+        for label in [
+            &snapshot.inventory_freshness_label,
+            &snapshot.backup_freshness_label,
+            &snapshot.monitoring_freshness_label,
+            &snapshot.site_scope_label,
+            &snapshot.environment_scope_label,
+            &snapshot.role_scope_label,
+        ] {
+            assert!(
+                label.contains("not yet wired"),
+                "live-mode label must be an honest placeholder, got: {label}"
+            );
+        }
+        assert!(
+            !snapshot.monitoring_freshness_label.contains("stale"),
+            "live mode must not show a fabricated staleness warning"
+        );
     }
 
     #[test]
