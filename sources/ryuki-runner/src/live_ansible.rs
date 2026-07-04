@@ -197,6 +197,7 @@ pub(crate) fn live_ansible_plan(
             summary: format!("runner unavailable: ansible-playbook binary not found at '{binary}'"),
             log: String::new(),
             exit_code: None,
+            post_apply: None,
         });
     }
 
@@ -241,6 +242,7 @@ pub(crate) fn live_ansible_plan(
         summary,
         log: scrubbed_log,
         exit_code: output.status.code(),
+        post_apply: None,
     })
 }
 
@@ -290,6 +292,7 @@ pub(crate) fn live_ansible_apply(
             summary: format!("runner unavailable: ansible-playbook binary not found at '{binary}'"),
             log: String::new(),
             exit_code: None,
+            post_apply: None,
         });
     }
 
@@ -334,6 +337,7 @@ pub(crate) fn live_ansible_apply(
         summary,
         log: scrubbed_log,
         exit_code: output.status.code(),
+        post_apply: None,
     })
 }
 

@@ -265,6 +265,7 @@ impl Runner for TerraformRunner {
                 ),
                 log: String::new(),
                 exit_code: None,
+                post_apply: None,
             });
         }
 
@@ -333,6 +334,7 @@ impl Runner for TerraformRunner {
                 ),
                 log: scrubbed,
                 exit_code: init_output.status.code(),
+                post_apply: None,
             });
         }
 
@@ -371,6 +373,7 @@ impl Runner for TerraformRunner {
                 ),
                 log: validate_log,
                 exit_code: validate_output.status.code(),
+                post_apply: None,
             });
         }
 
@@ -407,6 +410,7 @@ impl Runner for TerraformRunner {
                     summary: format!("terraform validate: {validate_summary}; plan timed out"),
                     log: validate_log,
                     exit_code: None,
+                    post_apply: None,
                 })
             }
             Err(other) => {
@@ -420,6 +424,7 @@ impl Runner for TerraformRunner {
                     ),
                     log: validate_log,
                     exit_code: None,
+                    post_apply: None,
                 })
             }
             Ok(plan_output) => {
@@ -443,6 +448,7 @@ impl Runner for TerraformRunner {
                             summary: plan_summary,
                             log: combined_log,
                             exit_code: plan_output.status.code(),
+                            post_apply: None,
                         })
                     }
                     _ => {
@@ -461,6 +467,7 @@ impl Runner for TerraformRunner {
                             ),
                             log: combined_log,
                             exit_code: Some(plan_exit),
+                            post_apply: None,
                         })
                     }
                 }

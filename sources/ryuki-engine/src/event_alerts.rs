@@ -29,14 +29,19 @@ impl AlertSeverity {
 /// A request reaching a NEGATIVE terminal state is operationally actionable: a
 /// `failed` request is a critical signal (execution broke), a `rejected` one a
 /// warning (an approver blocked it), and a `cancelled` one informational (a
-/// requester withdrew it). Every other transition (intake/validated/planned/
-/// approved/executing/verifying/completed/…) is normal flow and NOT an alert.
+/// requester withdrew it). `drift-detected` (#43) is a live apply that succeeded
+/// but whose post-apply re-plan still shows pending changes — real infrastructure
+/// did NOT converge to the approved plan; silent divergence is at least as severe
+/// as a loud failure, so it ranks Critical. Every other transition (intake/
+/// validated/planned/approved/executing/verifying/completed/…) is normal flow and
+/// NOT an alert (including `verified`, which is post-apply GOOD news).
 ///
 /// Keyed on `to_status` rather than the event type so it stays correct as new
 /// request event types are added — the outcome is what matters.
 pub fn severity_for_request_status(to_status: &str) -> Option<AlertSeverity> {
     match to_status {
         "failed" => Some(AlertSeverity::Critical),
+        "drift-detected" => Some(AlertSeverity::Critical),
         "rejected" => Some(AlertSeverity::Warning),
         "cancelled" => Some(AlertSeverity::Info),
         _ => None,
@@ -114,6 +119,7 @@ pub fn severity_for_background_loop_status(to_status: &str) -> Option<AlertSever
 pub fn alert_worthy_statuses() -> &'static [&'static str] {
     &[
         "failed",
+        "drift-detected",
         "rejected",
         "cancelled",
         "breached",
@@ -157,6 +163,11 @@ mod tests {
             severity_for_request_status("cancelled"),
             Some(AlertSeverity::Info)
         );
+        // #43: post-apply drift ranks with a failed request (silent divergence).
+        assert_eq!(
+            severity_for_request_status("drift-detected"),
+            Some(AlertSeverity::Critical)
+        );
     }
 
     #[test]
@@ -170,6 +181,8 @@ mod tests {
             "verifying",
             "completed",
             "operational",
+            // #43: a converged post-apply verification is GOOD news, not an alert.
+            "verified",
         ] {
             assert_eq!(severity_for_request_status(ok), None, "{ok} must not alert");
         }

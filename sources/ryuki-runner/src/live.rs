@@ -280,6 +280,7 @@ pub(crate) fn iac_policy_refusal(
         ),
         log: String::new(),
         exit_code: None,
+        post_apply: None,
     })
 }
 
@@ -334,6 +335,7 @@ pub(crate) fn live_terraform_plan(
                 summary: format!("runner unavailable: terraform binary not found at '{binary}'"),
                 log: String::new(),
                 exit_code: None,
+                post_apply: None,
             },
             tfplan: vec![],
         });
@@ -386,6 +388,7 @@ pub(crate) fn live_terraform_plan(
                 ),
                 log: init_outcome.log,
                 exit_code: init_outcome.exit_code,
+                post_apply: None,
             },
             tfplan: vec![],
         });
@@ -417,6 +420,7 @@ pub(crate) fn live_terraform_plan(
                     ),
                     log: plan_step.log,
                     exit_code: plan_step.exit_code,
+                    post_apply: None,
                 },
                 tfplan: vec![],
             });
@@ -453,6 +457,7 @@ pub(crate) fn live_terraform_plan(
                 ),
                 log: show_outcome.log,
                 exit_code: show_outcome.exit_code,
+                post_apply: None,
             },
             tfplan: vec![],
         });
@@ -480,6 +485,7 @@ pub(crate) fn live_terraform_plan(
                     // only — it is diagnostic here, not a digest input.
                     log: truncate_log(&show_outcome.log),
                     exit_code: show_outcome.exit_code,
+                    post_apply: None,
                 },
                 tfplan: vec![],
             });
@@ -495,6 +501,7 @@ pub(crate) fn live_terraform_plan(
             summary: plan_summary,
             log: plan_json,
             exit_code: show_outcome.exit_code,
+            post_apply: None,
         },
         tfplan: tfplan_bytes,
     })
@@ -549,6 +556,7 @@ pub(crate) fn live_terraform_apply(
             summary: format!("runner unavailable: terraform binary not found at '{binary}'"),
             log: String::new(),
             exit_code: None,
+            post_apply: None,
         });
     }
 
@@ -596,6 +604,7 @@ pub(crate) fn live_terraform_apply(
             ),
             log: init_outcome.log,
             exit_code: init_outcome.exit_code,
+            post_apply: None,
         });
     }
 
@@ -613,7 +622,7 @@ pub(crate) fn live_terraform_apply(
         true,
     )?;
 
-    let (status, summary) = match apply_outcome.exit_code {
+    let (status, summary, post_apply) = match apply_outcome.exit_code {
         Some(0) => {
             let base = extract_apply_summary(&apply_outcome.log);
             // #43 post-apply verification: re-plan in the SAME (post-apply)
@@ -621,8 +630,9 @@ pub(crate) fn live_terraform_apply(
             // "No changes"; a pending change is drift (the apply did not fully
             // take). This is ADVISORY — the apply already succeeded, so status
             // stays Applied and a re-plan failure never downgrades it; the verdict
-            // is surfaced in the summary for the CP to act on (transition to
-            // Verified / emit a drift event).
+            // is surfaced in the summary for humans AND carried as a structured
+            // field for the CP to act on (transition to Verified / emit a drift
+            // event) without string-parsing.
             let verdict = post_apply_verdict(
                 binary,
                 ws.path(),
@@ -633,11 +643,13 @@ pub(crate) fn live_terraform_apply(
             (
                 RunStatus::Applied,
                 format!("{base} | post-apply: {}", post_apply_label(verdict)),
+                Some(verdict),
             )
         }
         code => (
             RunStatus::Failed,
             format!("terraform apply failed (exit {})", code.unwrap_or(-1)),
+            None,
         ),
     };
 
@@ -648,6 +660,7 @@ pub(crate) fn live_terraform_apply(
         summary,
         log: apply_outcome.log,
         exit_code: apply_outcome.exit_code,
+        post_apply,
     })
 }
 

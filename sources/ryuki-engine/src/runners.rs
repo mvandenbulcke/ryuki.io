@@ -230,6 +230,11 @@ pub struct RunOutcome {
     pub log: String,
     /// Process exit code, if the binary was invoked.
     pub exit_code: Option<i32>,
+    /// #43 post-apply verification verdict. `Some` only for a live `terraform apply`
+    /// that ran the post-apply re-plan; `None` for every other outcome (dry-run,
+    /// plan, ansible, error paths). Rides in the serialized evidence to the CP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_apply: Option<crate::post_apply::PostApplyOutcome>,
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +566,7 @@ mod tests {
             summary: "Plan: +1 ~0 -0".to_string(),
             log: "Refreshing state...\nPlan: 1 to add.".to_string(),
             exit_code: Some(2),
+            post_apply: None,
         };
         let json = serde_json::to_string(&outcome).expect("serialize");
         let back: RunOutcome = serde_json::from_str(&json).expect("deserialize");

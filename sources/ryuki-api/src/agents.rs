@@ -865,6 +865,157 @@ fn map_result_status_to_job_status(s: &JobResultStatus) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// #43 post-apply verification: derive the runner's convergence verdict and map
+// it to a CP-internal terminal outcome + optional domain event.
+// ---------------------------------------------------------------------------
+
+/// Extract the post-apply verdict from the evidence bytes whose SHA-256 was
+/// verified against the SIGNED envelope in step 6. This MUST read `body.evidence`
+/// (the digest-covered bytes), NEVER `body.evidence_json` — the latter is an
+/// UNSIGNED convenience field, and trusting it would let a compromised agent
+/// forge a `verified` upgrade by pairing digest-matching `applied` evidence with
+/// a JSON blob claiming convergence. Fail-closed: any deserialize failure or an
+/// absent verdict yields `None`, so the CP never upgrades off uninterpretable
+/// evidence.
+fn post_apply_verdict_from_evidence(
+    evidence: &[u8],
+) -> Option<ryuki_engine::post_apply::PostApplyOutcome> {
+    serde_json::from_slice::<ryuki_engine::runners::RunOutcome>(evidence)
+        .ok()
+        .and_then(|o| o.post_apply)
+}
+
+/// The CP-internal terminal decision derived from a post-apply verdict: the
+/// `result_status` to record, the domain-event `to_status` the alert classifier
+/// keys on (`ryuki_engine::event_alerts::severity_for_request_status`), and the
+/// optional domain event type to emit.
+struct PostApplyIngest {
+    result_status: &'static str,
+    /// The event payload's `to_status` — the alert-classifier key. Distinct from
+    /// `result_status`: a drift event records result_status "applied" (the apply
+    /// DID succeed) but reports `to_status` "drift-detected" so it alerts.
+    to_status: &'static str,
+    event_type: Option<&'static str>,
+}
+
+/// Map a post-apply verdict to the CP-internal terminal `result_status`, the
+/// alert `to_status`, and the domain event to emit. Only meaningful on the
+/// `LiveApply` + `Applied` path. Fail-closed: `Inconclusive` / absent keeps
+/// `applied` and emits nothing — a request is NEVER marked `verified` off an
+/// uninterpretable or missing re-plan.
+fn resolve_post_apply_ingest(
+    verdict: Option<ryuki_engine::post_apply::PostApplyOutcome>,
+) -> PostApplyIngest {
+    use ryuki_engine::post_apply::{
+        PostApplyOutcome, EVENT_POST_APPLY_DRIFT, EVENT_POST_APPLY_VERIFIED,
+    };
+    match verdict {
+        // Converged — GOOD news; not alert-worthy (severity_for_request_status
+        // returns None for "verified").
+        Some(PostApplyOutcome::Verified) => PostApplyIngest {
+            result_status: "verified",
+            to_status: "verified",
+            event_type: Some(EVENT_POST_APPLY_VERIFIED),
+        },
+        // Apply succeeded but the re-plan still shows pending changes: the result
+        // stays "applied" (the apply DID run), but the event's "drift-detected"
+        // to_status makes it a Critical alert.
+        Some(PostApplyOutcome::DriftDetected) => PostApplyIngest {
+            result_status: "applied",
+            to_status: "drift-detected",
+            event_type: Some(EVENT_POST_APPLY_DRIFT),
+        },
+        _ => PostApplyIngest {
+            result_status: "applied",
+            to_status: "applied",
+            event_type: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod post_apply_ingest_tests {
+    use super::{post_apply_verdict_from_evidence, resolve_post_apply_ingest};
+    use ryuki_engine::event_alerts::{severity_for_request_status, AlertSeverity};
+    use ryuki_engine::post_apply::{
+        PostApplyOutcome, EVENT_POST_APPLY_DRIFT, EVENT_POST_APPLY_VERIFIED,
+    };
+    use ryuki_engine::runners::{RunMode, RunOutcome, RunStatus, RunnerKind};
+
+    fn evidence_with(verdict: Option<PostApplyOutcome>) -> Vec<u8> {
+        let outcome = RunOutcome {
+            runner_kind: RunnerKind::Terraform,
+            mode: RunMode::Live,
+            status: RunStatus::Applied,
+            summary: "Apply complete!".to_string(),
+            log: String::new(),
+            exit_code: Some(0),
+            post_apply: verdict,
+        };
+        serde_json::to_vec(&outcome).expect("serialize RunOutcome")
+    }
+
+    #[test]
+    fn verified_verdict_upgrades_and_emits_verified_event() {
+        let d = resolve_post_apply_ingest(Some(PostApplyOutcome::Verified));
+        assert_eq!(d.result_status, "verified");
+        assert_eq!(d.to_status, "verified");
+        assert_eq!(d.event_type, Some(EVENT_POST_APPLY_VERIFIED));
+        // A converged verify is GOOD news — it must NOT alert.
+        assert_eq!(severity_for_request_status(d.to_status), None);
+    }
+
+    #[test]
+    fn drift_verdict_stays_applied_and_emits_drift_event() {
+        let d = resolve_post_apply_ingest(Some(PostApplyOutcome::DriftDetected));
+        // The apply DID run, so the recorded result stays "applied"…
+        assert_eq!(d.result_status, "applied");
+        // …but the event's to_status must be the alert-worthy "drift-detected".
+        assert_eq!(d.to_status, "drift-detected");
+        assert_eq!(d.event_type, Some(EVENT_POST_APPLY_DRIFT));
+        // Cross-crate lock-step: the CP's chosen to_status MUST alert Critical in
+        // the engine classifier, or drift would silently never page an operator.
+        assert_eq!(
+            severity_for_request_status(d.to_status),
+            Some(AlertSeverity::Critical)
+        );
+    }
+
+    #[test]
+    fn inconclusive_and_absent_never_upgrade_and_emit_nothing() {
+        for v in [Some(PostApplyOutcome::Inconclusive), None] {
+            let d = resolve_post_apply_ingest(v);
+            assert_eq!(d.result_status, "applied", "must never upgrade off {v:?}");
+            assert_eq!(d.event_type, None, "must emit nothing for {v:?}");
+        }
+    }
+
+    #[test]
+    fn verdict_is_read_from_digested_evidence_bytes() {
+        let bytes = evidence_with(Some(PostApplyOutcome::Verified));
+        assert_eq!(
+            post_apply_verdict_from_evidence(&bytes),
+            Some(PostApplyOutcome::Verified)
+        );
+        let drift = evidence_with(Some(PostApplyOutcome::DriftDetected));
+        assert_eq!(
+            post_apply_verdict_from_evidence(&drift),
+            Some(PostApplyOutcome::DriftDetected)
+        );
+    }
+
+    #[test]
+    fn fail_closed_on_unparseable_or_absent_verdict() {
+        // Non-JSON / non-RunOutcome bytes → None (never a false verdict).
+        assert_eq!(post_apply_verdict_from_evidence(b"not json at all"), None);
+        assert_eq!(post_apply_verdict_from_evidence(b"{}"), None);
+        // A well-formed RunOutcome with no post_apply field → None.
+        let no_verdict = evidence_with(None);
+        assert_eq!(post_apply_verdict_from_evidence(&no_verdict), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // redaction_policy_version ingestion guard
 // ---------------------------------------------------------------------------
 
@@ -1462,6 +1613,29 @@ async fn post_job_result_with_pool(
     // expired, or already terminal.
     let new_job_status = map_result_status_to_job_status(&env.status);
     let result_status_str = result_status_label(&env.status);
+
+    // ── #43 post-apply verification verdict (LiveApply + Applied only) ────────
+    //
+    // A live apply only ASSERTS the intended state; the runner re-plans the same
+    // config immediately after apply to CONFIRM convergence (missing-feature #43).
+    // Derive that verdict from the DIGEST-VERIFIED evidence bytes (step 6 above),
+    // NOT the unsigned `body.evidence_json`, and map it to the CP-internal
+    // terminal result_status + a domain event. Fail-closed: an absent or
+    // uninterpretable verdict keeps the result "applied" and emits no event, so a
+    // job is never recorded "verified" off a re-plan the CP cannot confirm.
+    let post_apply_ingest =
+        if stored_mode == JobMode::LiveApply && env.status == JobResultStatus::Applied {
+            Some(resolve_post_apply_ingest(post_apply_verdict_from_evidence(
+                &body.evidence,
+            )))
+        } else {
+            None
+        };
+    let effective_result_status: &str = post_apply_ingest
+        .as_ref()
+        .map(|p| p.result_status)
+        .unwrap_or(result_status_str);
+
     let envelope_json = serde_json::to_value(env).map_err(db_err)?;
 
     // The terminal record and the parent-request backlink (slice 2) share ONE
@@ -1486,7 +1660,7 @@ async fn post_job_result_with_pool(
     )
     .bind(new_job_status)
     .bind(result.result_id)
-    .bind(result_status_str)
+    .bind(effective_result_status)
     .bind(&env.evidence_digest)
     .bind(&body.evidence_json)
     .bind(&envelope_json)
@@ -1507,25 +1681,71 @@ async fn post_job_result_with_pool(
             &mut tx,
             stored_spec.request_id,
             &env.status,
-            result_status_str,
+            effective_result_status,
             &env.evidence_digest,
             job_id,
         )
         .await
         .map_err(db_err)?;
+
+        // #43: emit the post-apply verification event (converged → verified,
+        // pending change → drift) in the SAME transaction as the terminal record,
+        // so an event never exists without the result it describes. The event is
+        // SCOPED to the request's own site/environment: a `request` aggregate with
+        // NULL/NULL axes is globally visible to every scoped principal (a cross-site
+        // leak of request/job/result ids), so we carry the request's scope. The
+        // `to_status` ("drift-detected"/"verified") is the alert-classifier key —
+        // drift alerts Critical, a converged verify does not.
+        if let Some(ingest) = &post_apply_ingest {
+            if let Some(event_type) = ingest.event_type {
+                // requests.site/environment are NOT NULL. If the request row is
+                // gone (e.g. a synthetic job with no parent), skip the event: it is
+                // a request-scoped signal with no request to scope to, and the
+                // terminal job record is already durable.
+                let scope: Option<(String, String)> =
+                    sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
+                        .bind(stored_spec.request_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                if let Some((site, environment)) = scope {
+                    let aggregate_id = stored_spec.request_id.to_string();
+                    crate::repos::domain_events::insert(
+                        &mut *tx,
+                        crate::repos::domain_events::NewEvent {
+                            event_type,
+                            aggregate_type: "request",
+                            aggregate_id: &aggregate_id,
+                            site: Some(&site),
+                            environment: Some(&environment),
+                            actor: "system",
+                            payload: json!({
+                                "job_id": job_id.to_string(),
+                                "result_id": result.result_id.to_string(),
+                                "result_status": ingest.result_status,
+                                "to_status": ingest.to_status,
+                            }),
+                        },
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
+            }
+        }
+
         tx.commit().await.map_err(db_err)?;
         tracing::info!(
             job_id = %job_id,
             agent_id = %agent_id,
             result_id = %result.result_id,
-            result_status = result_status_str,
+            result_status = effective_result_status,
             job_status = new_job_status,
             "job result recorded — terminal"
         );
         return Ok(Json(json!({
             "job_id": job_id,
             "result_id": result.result_id,
-            "result_status": result_status_str,
+            "result_status": effective_result_status,
             "job_status": new_job_status,
         })));
     }

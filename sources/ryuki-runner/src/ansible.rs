@@ -259,6 +259,7 @@ impl Runner for AnsibleRunner {
                 ),
                 log: String::new(),
                 exit_code: None,
+                post_apply: None,
             });
         }
 
@@ -370,6 +371,7 @@ impl Runner for AnsibleRunner {
             summary,
             log: scrubbed_log,
             exit_code: output.status.code(),
+            post_apply: None,
         })
     }
 }
