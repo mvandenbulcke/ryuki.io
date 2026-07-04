@@ -124,14 +124,31 @@ live-infra test (real terraform + a docker-provider apply/destroy). **24 commits
 - Housekeeping: `2633b13` rustfmt-normalize ryuki-api/engine/runner; `f412759`
   test-build repair.
 
-A **second** 5-agent adversarial pass (2026-07-04) over the session diff,
-scheduler/loops, live-exec lifecycle, engine math, and cross-cutting authz/data
-returned **0 new confirmed defects** — the review-and-fix loop is exhausted for
-the current surface. Remaining `[ ]` rows above are greenfield features (destroy
-mode #10, post-apply verify #43, drift-scan #31, multi-step orchestration #42,
-inbound webhooks #18, CMDB reconcile #27, AD adapter #28, DR failover #29, access
-recert #48, evidence blob store #60, OpenAPI #64, AI narrative #65), each best
-built in a focused SDD session. Open design call: `software_approve` SoD.
+The loop was then run to CONVERGENCE with three more adversarial passes:
+- **Pass 2** (session diff / scheduler+loops / live-exec lifecycle / engine math /
+  authz+data): **0** new confirmed defects.
+- **Pass 3** (protocol crypto / ryuki-core / ~19 engine domains / integration.rs /
+  deploy manifests): **7** confirmed — `ea033b2` secrets-rotation TTL overflow
+  panic; `aa86852` outbox parent-dir fsync (crash durability); `6589e10` the
+  secret-scan's own quoted-secret blind spot; and the highest-value find of the
+  session, `9f43803` **integration.rs cross-scope BAC** — the integration adapter
+  had ZERO site-scope enforcement, so a scoped admin token could read / enumerate /
+  mutate / credential-test ANY other site's connections; now guarded across all 8
+  by-id handlers, all 3 list surfaces, the write-side create/update, and error
+  hygiene (3 Codex rounds).
+- **Pass 4** (migrations SQL / remaining ~40 engine modules / runner IaC + tf-ansible
+  arg construction / portal server-boundary): **1** confirmed — `73697c1` the same
+  chrono `+Days` overflow class in `dns_ipam::build_reservation` (IPAM reserve TTL).
+
+Marginal finding rate tapered 0 → 7 → 1 (the last a known-class repeat), so the
+review-and-fix loop is **converged/exhausted** for the current surface (~16 distinct
+defects fixed, **31 commits** `bab5c13..73697c1`). Remaining `[ ]` rows above are
+greenfield features (destroy mode #10, post-apply verify #43, drift-scan #31,
+multi-step orchestration #42, inbound webhooks #18, CMDB reconcile #27, AD adapter
+#28, DR failover #29, access recert #48, evidence blob store #60, OpenAPI #64, AI
+narrative #65), each best built in a focused SDD session. Open design call:
+`software_approve` SoD. Recurring class to watch in new code: chrono
+`+Days`/`+Duration` on a caller-supplied count — bound it (36_500) + checked_add.
 
 ## Swarm review (2026-06-25)
 
