@@ -4170,7 +4170,9 @@ pub mod integration_db_tests {
 
         // Read back through the REDACTED feed (newest-first; the just-recorded row
         // is near the top).
-        let feed = audit::audit_feed(Some(pool), 200, 0).await;
+        let feed = audit::audit_feed(Some(pool), 200, 0)
+            .await
+            .expect("audit_feed");
         let entry = feed["entries"]
             .as_array()
             .expect("entries array")
@@ -4512,7 +4514,9 @@ pub mod integration_db_tests {
         };
         let conn_id = create_conn_via_handler("vault", "", "secret/data/redact").await;
 
-        let feed = audit::audit_feed(Some(pool), 200, 0).await;
+        let feed = audit::audit_feed(Some(pool), 200, 0)
+            .await
+            .expect("audit_feed");
         let entry = feed["entries"]
             .as_array()
             .expect("entries array")

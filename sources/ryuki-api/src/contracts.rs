@@ -18484,15 +18484,22 @@ async fn requests_audit(
         ));
     }
     // #2: serve the REAL trail ONLY when the request is proven in-scope. A
-    // not-found request, an out-of-scope request, AND a scope-lookup error all
-    // fail CLOSED to the SAME empty (unknown-shaped) trail — so the audit
-    // endpoint is never a cross-scope existence oracle, and a transient lookup
-    // error can never fall through to serving unverified audit data.
+    // not-found request AND an out-of-scope request fail CLOSED to the SAME empty
+    // (unknown-shaped) trail — so the audit endpoint is never a cross-scope
+    // existence oracle. A transient scope-lookup DB error, by contrast, returns
+    // 5xx (not a false-empty trail): a 5xx is request-independent, so it leaks
+    // nothing about existence/scope, and — like the trail read itself — a
+    // compliance audit read must never report a DB failure as "no records".
     match request_site_env(&request_id).await {
-        Ok(Some((site, environment))) if row_scope_permits(&session, &site, &environment) => Ok(
-            Json(audit::audit_trail_for_request(get_db(), &request_id).await),
-        ),
-        _ => Ok(Json(audit::empty_request_trail(get_db(), &request_id))),
+        Ok(Some((site, environment))) if row_scope_permits(&session, &site, &environment) => {
+            Ok(Json(
+                audit::audit_trail_for_request(get_db(), &request_id)
+                    .await
+                    .map_err(db_error)?,
+            ))
+        }
+        Err(e) => Err(db_error(e)),
+        Ok(_) => Ok(Json(audit::empty_request_trail(get_db(), &request_id))),
     }
 }
 
@@ -18896,7 +18903,9 @@ async fn request_evidence_pack(
     }
 
     // Durable, actor-attributed audit trail for the request.
-    let trail = audit::audit_trail_for_request(get_db(), &request_id).await;
+    let trail = audit::audit_trail_for_request(get_db(), &request_id)
+        .await
+        .map_err(db_error)?;
     let durable = trail
         .get("durable")
         .and_then(Value::as_bool)
@@ -18948,7 +18957,11 @@ async fn activity_audit_feed(
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
     let offset = clamp_offset_usize(params.offset.unwrap_or(0)) as i64;
-    Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
+    Ok(Json(
+        audit::audit_feed(get_db(), limit, offset)
+            .await
+            .map_err(db_error)?,
+    ))
 }
 
 /// Query params for the operational event feed (#11).

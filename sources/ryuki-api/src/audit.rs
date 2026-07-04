@@ -392,17 +392,26 @@ pub async fn record_denied(pool: Option<&PgPool>, session: &AuthSession, record:
 
 /// Read the ordered audit trail for a request. DB-backed when available
 /// (durable: true); otherwise serves the process-local store (durable: false).
-pub async fn audit_trail_for_request(pool: Option<&PgPool>, request_id: &str) -> Value {
+///
+/// A DB read error is PROPAGATED (`Err`), never swallowed into an empty trail:
+/// this is a compliance-grade read, so an auditor must see a 5xx on a transient
+/// DB failure rather than a `200 {entries: []}` that falsely reads as "no audit
+/// records". An unparseable `request_id` is NOT an error — it yields an empty
+/// trail (the no-oracle unknown-request shape).
+pub async fn audit_trail_for_request(
+    pool: Option<&PgPool>,
+    request_id: &str,
+) -> Result<Value, sqlx::Error> {
     if let Some(pool) = pool {
         let request_uuid = match uuid::Uuid::parse_str(request_id) {
             Ok(uuid) => uuid,
             Err(_) => {
-                return json!({
+                return Ok(json!({
                     "durable": true,
                     "source": "database",
                     "request_id": request_id,
                     "entries": [],
-                });
+                }));
             }
         };
 
@@ -414,16 +423,15 @@ pub async fn audit_trail_for_request(pool: Option<&PgPool>, request_id: &str) ->
         )
         .bind(request_uuid)
         .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+        .await?;
 
         let entries: Vec<Value> = rows.iter().map(AuditLogRow::to_json).collect();
-        return json!({
+        return Ok(json!({
             "durable": true,
             "source": "database",
             "request_id": request_id,
             "entries": entries,
-        });
+        }));
     }
 
     let store = audit_store().lock().await;
@@ -432,12 +440,12 @@ pub async fn audit_trail_for_request(pool: Option<&PgPool>, request_id: &str) ->
         .filter(|e| e.request_id.as_deref() == Some(request_id))
         .map(AuditEntry::to_json)
         .collect();
-    json!({
+    Ok(json!({
         "durable": false,
         "source": "dry-run",
         "request_id": request_id,
         "entries": entries,
-    })
+    }))
 }
 
 /// The EMPTY trail shape `audit_trail_for_request` returns for a request with no
@@ -458,8 +466,14 @@ pub fn empty_request_trail(pool: Option<&PgPool>, request_id: &str) -> Value {
 /// when available (durable: true); otherwise serves the process-local store
 /// (durable: false). `limit` is clamped by the caller. Returns the same entry
 /// shape as `audit_trail_for_request` plus pagination + total metadata.
-pub async fn audit_feed(pool: Option<&PgPool>, limit: i64, offset: i64) -> Value {
+pub async fn audit_feed(
+    pool: Option<&PgPool>,
+    limit: i64,
+    offset: i64,
+) -> Result<Value, sqlx::Error> {
     if let Some(pool) = pool {
+        // Propagate DB errors (never swallow into an empty feed) — a compliance
+        // audit read must surface a 5xx on failure, not a false "no records".
         let rows = sqlx::query_as::<_, AuditLogRow>(
             "SELECT id, occurred_at, request_id, actor_principal, actor_display, actor_roles, \
                     provider_mode, action, from_stage, to_stage, from_status, to_status, \
@@ -469,21 +483,19 @@ pub async fn audit_feed(pool: Option<&PgPool>, limit: i64, offset: i64) -> Value
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+        .await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
             .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+            .await?;
         let entries: Vec<Value> = rows.iter().map(AuditLogRow::to_json).collect();
-        return json!({
+        return Ok(json!({
             "durable": true,
             "source": "database",
             "limit": limit,
             "offset": offset,
             "total": total,
             "entries": entries,
-        });
+        }));
     }
 
     // No-DB / dry-run mode: serve the process-local store newest-first.
@@ -496,14 +508,14 @@ pub async fn audit_feed(pool: Option<&PgPool>, limit: i64, offset: i64) -> Value
         .take(limit.max(0) as usize)
         .map(AuditEntry::to_json)
         .collect();
-    json!({
+    Ok(json!({
         "durable": false,
         "source": "dry-run",
         "limit": limit,
         "offset": offset,
         "total": total,
         "entries": entries,
-    })
+    }))
 }
 
 #[derive(sqlx::FromRow)]
