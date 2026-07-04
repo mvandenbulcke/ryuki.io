@@ -65,6 +65,12 @@ pub fn AgentListView() -> impl IntoView {
     let (action_feedback, set_action_feedback) = create_signal(String::new());
     #[allow(deprecated)]
     let (action_class, set_action_class) = create_signal("badge neutral");
+    // Two-click arm guard for per-agent "Revoke" (terminal, irreversible). Holds
+    // the agent_id awaiting a confirming second click, so a lone misclick can't
+    // revoke an approved execution agent. Keyed by id so only the armed row's
+    // button shows the confirm state.
+    #[allow(deprecated)]
+    let (revoke_armed, set_revoke_armed) = create_signal::<Option<String>>(None);
 
     // Approve a pending enrollment. The agent's currently displayed platform is
     // re-affirmed as the authoritative value; on success the list is refetched
@@ -305,6 +311,8 @@ pub fn AgentListView() -> impl IntoView {
                                                                         let approve_platform = approve_platform
                                                                             .clone();
                                                                         let revoke_id = revoke_id.clone();
+                                                                        let revoke_id_for_label = revoke_id
+                                                                            .clone();
                                                                         view! {
                                                                             <div class="agent-actions">
                                                                                 {is_pending
@@ -332,10 +340,31 @@ pub fn AgentListView() -> impl IntoView {
                                                                                     type="button"
                                                                                     class="btn btn-danger"
                                                                                     on:click=move |_| {
-                                                                                        revoke_action.dispatch(revoke_id.clone());
+                                                                                        // Terminal, irreversible — require a
+                                                                                        // confirming second click on THIS row.
+                                                                                        if revoke_armed.get().as_deref()
+                                                                                            == Some(revoke_id.as_str())
+                                                                                        {
+                                                                                            set_revoke_armed.set(None);
+                                                                                            revoke_action
+                                                                                                .dispatch(revoke_id.clone());
+                                                                                        } else {
+                                                                                            set_revoke_armed
+                                                                                                .set(Some(revoke_id.clone()));
+                                                                                        }
                                                                                     }
                                                                                 >
-                                                                                    "Revoke"
+                                                                                    {move || {
+                                                                                        if revoke_armed.get().as_deref()
+                                                                                            == Some(
+                                                                                                revoke_id_for_label.as_str(),
+                                                                                            )
+                                                                                        {
+                                                                                            "Confirm revoke"
+                                                                                        } else {
+                                                                                            "Revoke"
+                                                                                        }
+                                                                                    }}
                                                                                 </button>
                                                                             </div>
                                                                         }
