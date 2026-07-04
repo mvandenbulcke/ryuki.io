@@ -171,6 +171,23 @@ impl Outbox {
             source: e,
         })?;
 
+        // fsync the CONTAINING DIRECTORY too: sync_all() on the file persists its
+        // contents but not necessarily its directory ENTRY, so a hard crash could
+        // lose a freshly-created result the module's contract promises survives.
+        // (Unix; directory fsync is the standard crash-durability step. On other
+        // platforms this is skipped — the agent targets Unix hosts.)
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(&self.dir).map_err(|e| OutboxError::Io {
+                path: self.dir.display().to_string(),
+                source: e,
+            })?;
+            dir.sync_all().map_err(|e| OutboxError::Io {
+                path: self.dir.display().to_string(),
+                source: e,
+            })?;
+        }
+
         Ok(())
     }
 
