@@ -100,6 +100,39 @@ implementing **all 66**. This file tracks execution.
 _Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`.
 `[x]` shipped · `[~]` partial (core shipped; follow-up tracked) · `[ ]` not started._
 
+## Goal-session review + hardening (2026-07-03/04)
+
+A Fable 5 goal-session ran a 5-agent adversarial review (api / engine / live-exec
+/ db / portal), fixed every confirmed finding, shipped missing-feature **#11**
+(pre-dispatch IaC policy gate, above), browser-verified the portal, and did a
+live-infra test (real terraform + a docker-provider apply/destroy). **24 commits**
+(`bab5c13..6268f26`), each GPT-5.5 Codex (xhigh/high) reviewed and pushed:
+
+- **Live-exec integrity:** `aee5b3e` full-plan digest (32 KiB-truncation hole);
+  `f163f2b` `ack_job` cross-agent state oracle; `5ddc5be` `software_execute`
+  audit attribution + tx-release.
+- **Secret/compliance:** `d00eb14` `should_redact` `Password=` asymmetry;
+  `ab25d76` audit reads propagate DB errors (no false-empty 200).
+- **Correctness:** `4bc3d4c` `domain_events` dynamic WHERE + idx (mig 144);
+  `a4ad803` `maintenance_calendar.get_active`; `ac4c0bc`+`0ffdbd6` anomaly
+  non-finite/overflow; `67abf56` noise-suppression resurrection.
+- **Portal:** `7538ded` id-slice WASM panic; `4023ad8` fail-closed session
+  fallback; `fab04c5` no fabricated live-context freshness; `ff6fce8` stale-panel
+  reset on nav; `8680de5` bell refetch; `8400cc3` double-click-disable;
+  `3da4be8`/`7af40ad`/`6268f26` two-click confirm for Approve&apply / Retire /
+  agent Revoke.
+- Housekeeping: `2633b13` rustfmt-normalize ryuki-api/engine/runner; `f412759`
+  test-build repair.
+
+A **second** 5-agent adversarial pass (2026-07-04) over the session diff,
+scheduler/loops, live-exec lifecycle, engine math, and cross-cutting authz/data
+returned **0 new confirmed defects** — the review-and-fix loop is exhausted for
+the current surface. Remaining `[ ]` rows above are greenfield features (destroy
+mode #10, post-apply verify #43, drift-scan #31, multi-step orchestration #42,
+inbound webhooks #18, CMDB reconcile #27, AD adapter #28, DR failover #29, access
+recert #48, evidence blob store #60, OpenAPI #64, AI narrative #65), each best
+built in a focused SDD session. Open design call: `software_approve` SoD.
+
 ## Swarm review (2026-06-25)
 
 After the clean/additive items above were shipped, a 61-agent multi-lens swarm
