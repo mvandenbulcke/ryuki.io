@@ -26,6 +26,7 @@ pub mod degradation;
 pub mod domain_events;
 pub mod dr_plans;
 pub mod dr_test_runs;
+pub mod drift_scan;
 pub mod file_share_ntfs;
 pub mod firewall_rule_sets;
 pub mod firmware_lifecycle;

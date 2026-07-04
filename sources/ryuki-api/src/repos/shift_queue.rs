@@ -85,6 +85,13 @@ pub const PATCH_WAVE_OVERDUE_ITEM_TYPE: &str = "patch-wave-overdue";
 /// after resolution if still stale on the next daily scan (migration 141).
 pub const GOLDEN_IMAGE_STALE_ITEM_TYPE: &str = "golden-image-stale";
 
+/// The OVERDUE drift-recheck signal (#31 slice 1). An 'operational' deployment whose most
+/// recent successful live-apply verification (agent_jobs.result_status in 'applied'/'verified')
+/// is older than ryuki_engine::drift_scan::DRIFT_RECHECK_INTERVAL_DAYS. `source_ci_key` is the
+/// bare request id (a UUID). One deduped OPEN item per request; re-enqueued after resolution if
+/// still overdue on the next daily scan (migration 145).
+pub const DRIFT_RECHECK_OVERDUE_ITEM_TYPE: &str = "drift-recheck-overdue";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

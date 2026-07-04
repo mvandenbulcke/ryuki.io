@@ -689,6 +689,82 @@ async fn run_job(
                 )),
             ))
         }
+        "drift_recheck_overdue_scan" => {
+            // Safe-internal write (#31 slice 1): READ every operational deployment
+            // that has run against live infra (agent_jobs.result_status
+            // 'applied'/'verified'), then apply the PURE engine gate
+            // `is_drift_recheck_due` per deployment to flag those overdue for a drift
+            // re-check, enqueueing ONE deduped shift_queue item each. Keeping the
+            // overdue DECISION in the unit-tested engine core (not SQL) means the
+            // predicate that gates production is the one the tests exercise — incl.
+            // the clock-skew fail-safe. Reads requests + agent_jobs, writes only our
+            // own shift_queue — NO live/provider call. All on `tx`, so a failure
+            // rolls back with this schedule's savepoint. `detail` is aggregate-only
+            // (counts, never per-request ids) — surfaced via /api/ops/scheduler/executions.
+            let interval = ryuki_engine::drift_scan::DRIFT_RECHECK_INTERVAL_DAYS;
+            // Compare against the DATABASE clock, not the app host's: `completed_at`
+            // is a DB timestamp, so reading NOW() from the same tx keeps the age
+            // computation apples-to-apples and immune to app-host clock skew (which
+            // could otherwise flag every fresh deployment overdue at once).
+            let now: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT NOW()").fetch_one(&mut **tx).await?;
+            let rows = crate::repos::drift_scan::operational_deployments_for_drift_recheck(
+                &mut **tx,
+            )
+            .await?;
+            let mut overdue: u64 = 0;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                // Pure engine gate: only deployments at least the interval unverified
+                // are overdue (a future last_verified from clock skew is never due).
+                if !ryuki_engine::drift_scan::is_drift_recheck_due(row.last_verified, now, interval)
+                {
+                    continue;
+                }
+                let request_id = row.request_id.to_string();
+                // A blank id can't be a dedup key (enqueue_if_absent rejects it) — skip it.
+                if request_id.trim().is_empty() {
+                    continue;
+                }
+                overdue += 1;
+                let age_days = (now - row.last_verified).num_days();
+                let priority =
+                    ryuki_engine::drift_scan::drift_recheck_priority(age_days, interval);
+                let title = format!("Drift re-check overdue: request {request_id}");
+                let description = format!(
+                    "Operational deployment {request_id} ({} / {}) has not had a successful \
+                     live-apply verification in {age_days} days — over the {interval}-day drift \
+                     re-check interval. Re-plan to confirm it still matches its approved \
+                     configuration.",
+                    row.site, row.environment
+                );
+                // `source_ci_key` is the request id — the enqueue_if_absent dedup predicate
+                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
+                // partial unique index (uq_shift_queue_open_drift_recheck_overdue) to agree.
+                let metadata = serde_json::json!({
+                    "source_ci_key": request_id,
+                    "site": row.site,
+                    "environment": row.environment,
+                    "last_verified": row.last_verified.to_rfc3339(),
+                    "age_days": age_days,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::DRIFT_RECHECK_OVERDUE_ITEM_TYPE,
+                    &request_id,
+                    &title,
+                    &description,
+                    priority,
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("{overdue} deployment(s) overdue, {enqueued} enqueued")),
+            ))
+        }
         "noise_suppression_expiry_scan" => {
             // Safe-internal write (#61): a suppression is a TIME-BOXED mute — once its
             // `suppress_until` window elapses the trigger must return to the active board
@@ -6190,6 +6266,188 @@ mod db_tests {
             .await
             .ok();
         restore_migration_gimg_scan(pool).await;
+    }
+
+    // ---- #31 slice 1: drift_recheck_overdue_scan ---------------------------
+
+    /// The migration-145-seeded drift_recheck_overdue_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (mirrors GIMG_SCAN_SEED_ID pattern).
+    const DRIFT_SCAN_SEED_ID: &str = "d71f7c1c-0031-4d31-8c31-d71f7c1c0031";
+
+    /// Seed an 'operational' request, mirroring seed_maintain_request's NOT NULL
+    /// columns (request_type, status, stage, site, environment, name, created_by).
+    async fn seed_operational_request(pool: &PgPool, site: &str, environment: &str) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO requests \
+             (request_type, status, stage, site, environment, name, created_by) \
+             VALUES ('server-deployment', 'operational', 'operational', $1, $2, \
+                     'drift-recheck-test', 'system') \
+             RETURNING id::text",
+        )
+        .bind(site)
+        .bind(environment)
+        .fetch_one(pool)
+        .await
+        .expect("seed operational request")
+    }
+
+    /// Seed a successful (verified) agent_jobs row for `request_id`, completed
+    /// `completed_at` in the past. Mirrors the agent_jobs NOT NULL columns
+    /// (request_id, platform, spec, mode) used elsewhere in this file.
+    async fn seed_verified_agent_job(pool: &PgPool, request_id: &str, completed_at_sql: &str) {
+        let sql = format!(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, result_status, completed_at) \
+             VALUES ($1::uuid, 'ci-test', '{{}}'::jsonb, 'LiveApply', 'Succeeded', \
+                     'applied', {completed_at_sql})"
+        );
+        sqlx::query(&sql)
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .expect("seed verified agent_job");
+    }
+
+    /// Plant a guaranteed-due `drift_recheck_overdue_scan` schedule. Disables the
+    /// migration-seeded scan first so EXACTLY ONE is due. Returns the planted id.
+    async fn seed_due_drift_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(DRIFT_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-driftscan-due-9c2";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test drift recheck scan', 'drift_recheck_overdue_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_drift_scan`] disabled.
+    async fn restore_migration_drift_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(DRIFT_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN drift-recheck-overdue shift_queue items for a request id.
+    async fn open_drift_recheck_count(pool: &PgPool, request_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'drift-recheck-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An operational deployment whose most recent successful verification is older
+    /// than the interval enqueues exactly one item. A second run dedups.
+    #[tokio::test]
+    async fn drift_recheck_overdue_scan_enqueues_overdue_deployments() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        // 30 days ago > DRIFT_RECHECK_INTERVAL_DAYS (14) — overdue.
+        seed_verified_agent_job(pool, &request_id, "NOW() - INTERVAL '30 days'").await;
+
+        let sched_id = seed_due_drift_scan(pool).await;
+
+        // Cleanup shift_queue + job_executions BEFORE asserting.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: the overdue deployment is enqueued exactly once.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted drift recheck scan ran");
+        assert_eq!(
+            open_drift_recheck_count(pool, &request_id).await,
+            1,
+            "an overdue operational deployment gets exactly one open drift-recheck-overdue item"
+        );
+
+        // Detail is aggregate-only: "<N> deployment(s) overdue, <M> enqueued".
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'drift_recheck_overdue_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let parsed = detail
+            .split_once(" deployment(s) overdue, ")
+            .and_then(|(o, rest)| {
+                let m = rest.strip_suffix(" enqueued")?;
+                Some((o.parse::<u64>().ok()?, m.parse::<u64>().ok()?))
+            });
+        assert!(
+            parsed.is_some_and(|(o, e)| o >= 1 && e >= 1),
+            "detail must be '<N> deployment(s) overdue, <M> enqueued': {detail:?}"
+        );
+
+        // Second tick: dedup holds — still exactly one open item.
+        let sched_id2 = seed_due_drift_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_drift_recheck_count(pool, &request_id).await,
+            1,
+            "a second tick does not duplicate the open item"
+        );
+
+        // Final cleanup.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_drift_scan(pool).await;
     }
 
     // ---- #61 noise_suppression_expiry_scan ---------------------------------

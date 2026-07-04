@@ -147,6 +147,9 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "patch_wave_overdue_scan"
                 | "golden_image_stale_scan"
                 | "noise_suppression_expiry_scan"
+                // #31 slice 1: reads requests+agent_jobs, writes only our own
+                // shift_queue — no live/provider call (safe-internal write).
+                | "drift_recheck_overdue_scan"
         )
 }
 
@@ -259,6 +262,8 @@ mod tests {
         assert!(!job_is_read_only("golden_image_stale_scan"));
         assert!(job_is_schedulable("noise_suppression_expiry_scan"));
         assert!(!job_is_read_only("noise_suppression_expiry_scan"));
+        assert!(job_is_schedulable("drift_recheck_overdue_scan"));
+        assert!(!job_is_read_only("drift_recheck_overdue_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));
