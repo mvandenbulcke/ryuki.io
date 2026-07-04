@@ -334,6 +334,13 @@ pub fn get_secret(id: &str) -> Result<Value, String> {
 /// durably; the static `register_secret` below calls it then pushes to the
 /// in-process fallback. Keeping id/timestamp minting here means DB mode and the
 /// no-DB demo register identical secrets.
+/// Upper bound on a rotation interval (~100 years), mirroring
+/// `certificate_lifecycle::MAX_CERTIFICATE_VALIDITY_DAYS`. Without it, an
+/// unbounded caller-supplied `interval_days` makes `now + Days::new(interval_days)`
+/// PANIC (`chrono` "DateTime + Days out of range") — reachable from the register
+/// handler, which passes the raw JSON `intervalDays`.
+pub const MAX_ROTATION_INTERVAL_DAYS: u64 = 36_500;
+
 pub fn build_secret(
     name: &str,
     secret_type: &str,
@@ -353,6 +360,13 @@ pub fn build_secret(
     }
     if site.trim().is_empty() {
         return Err("site cannot be empty".into());
+    }
+    // Reject only the OVERFLOW risk (large intervals). 0 is allowed: it means
+    // "due immediately" and does not overflow `now + Days::new(0)`.
+    if interval_days > MAX_ROTATION_INTERVAL_DAYS {
+        return Err(format!(
+            "rotation_interval_days must be at most {MAX_ROTATION_INTERVAL_DAYS}"
+        ));
     }
 
     let parsed_type = parse_secret_type(secret_type)?;
@@ -387,7 +401,12 @@ pub fn next_rotation_due_from(last_rotated: &str, interval_days: u64) -> String 
     let base = chrono::DateTime::parse_from_rfc3339(last_rotated)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
-    (base + Days::new(interval_days)).to_rfc3339()
+    // Overflow-safe: an out-of-range interval (e.g. a legacy stored secret from
+    // before MAX_ROTATION_INTERVAL_DAYS was enforced) falls back to `base` — which
+    // reads as immediately-due (a safe surface for rotation) rather than panicking.
+    base.checked_add_days(Days::new(interval_days))
+        .unwrap_or(base)
+        .to_rfc3339()
 }
 
 /// PURE: produce the rotated secret state AND its completed rotation run, given
@@ -402,7 +421,11 @@ pub fn rotate_secret_record(
     let updated = ManagedSecret {
         status: SecretStatus::Active,
         last_rotated: completed_at.to_rfc3339(),
-        next_rotation_due: (completed_at + Days::new(secret.rotation_interval_days)).to_rfc3339(),
+        // Overflow-safe (a legacy secret's interval may predate the bound).
+        next_rotation_due: completed_at
+            .checked_add_days(Days::new(secret.rotation_interval_days))
+            .unwrap_or(completed_at)
+            .to_rfc3339(),
         ..secret.clone()
     };
     let run = RotationRun {
@@ -804,6 +827,33 @@ mod tests {
 
         // validation rejects empties.
         assert!(build_secret("", "token", "p", 30, "o", "S").is_err());
+    }
+
+    #[test]
+    fn build_secret_rejects_overflowing_interval_no_panic() {
+        // Regression: an unbounded interval_days used to PANIC in `now + Days::new`.
+        // Over-max and u64::MAX must be rejected as Err (never panic).
+        for bad in [MAX_ROTATION_INTERVAL_DAYS + 1, u64::MAX] {
+            assert!(
+                build_secret("s", "token", "kv/p", bad, "o", "DEFRA").is_err(),
+                "interval_days {bad} must be rejected"
+            );
+        }
+        // Boundary max is accepted; 0 ("due immediately") is still allowed.
+        assert!(
+            build_secret(
+                "s",
+                "token",
+                "kv/p",
+                MAX_ROTATION_INTERVAL_DAYS,
+                "o",
+                "DEFRA"
+            )
+            .is_ok()
+        );
+        assert!(build_secret("s", "token", "kv/p", 0, "o", "DEFRA").is_ok());
+        // next_rotation_due_from must not panic on an out-of-range legacy interval.
+        let _ = next_rotation_due_from("2026-01-01T00:00:00+00:00", u64::MAX);
     }
 
     #[test]
