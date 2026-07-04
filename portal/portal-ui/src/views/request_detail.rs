@@ -307,6 +307,12 @@ pub fn RequestDetail() -> impl IntoView {
     let (reason_text, set_reason_text) = create_signal(String::new());
     #[allow(deprecated)]
     let (reason_error, set_reason_error) = create_signal(String::new());
+    // Two-click arm guard for "Approve & apply" — that button mints a CP-signed
+    // LiveApply grant and triggers a real terraform apply, so a single misclick
+    // must not fire it. `true` means the button is armed (awaiting a confirming
+    // second click).
+    #[allow(deprecated)]
+    let (apply_armed, set_apply_armed) = create_signal(false);
 
     // Reset transient per-request UI state whenever the routed request id changes.
     // leptos_router reuses this component across /requests/:id navigations, so a
@@ -321,6 +327,7 @@ pub fn RequestDetail() -> impl IntoView {
         set_pending_reason_action.set(None);
         set_reason_text.set(String::new());
         set_reason_error.set(String::new());
+        set_apply_armed.set(false);
     });
 
     let validate_action = Action::new(move |id: &String| {
@@ -1142,12 +1149,28 @@ pub fn RequestDetail() -> impl IntoView {
                                                         view! {
                                                             <button
                                                                 class="btn btn-secondary"
+                                                                class:btn-danger=move || apply_armed.get()
                                                                 on:click=move |_| {
-                                                                    approve_live_apply_action
-                                                                        .dispatch(id.clone());
+                                                                    // First click arms; the confirming
+                                                                    // second click dispatches the live
+                                                                    // apply. A lone misclick never fires
+                                                                    // a real terraform apply.
+                                                                    if apply_armed.get() {
+                                                                        approve_live_apply_action
+                                                                            .dispatch(id.clone());
+                                                                        set_apply_armed.set(false);
+                                                                    } else {
+                                                                        set_apply_armed.set(true);
+                                                                    }
                                                                 }
                                                             >
-                                                                "Approve & apply"
+                                                                {move || {
+                                                                    if apply_armed.get() {
+                                                                        "Confirm — apply live changes"
+                                                                    } else {
+                                                                        "Approve & apply"
+                                                                    }
+                                                                }}
                                                             </button>
                                                         }
                                                     }
