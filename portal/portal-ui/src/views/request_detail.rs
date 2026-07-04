@@ -313,6 +313,10 @@ pub fn RequestDetail() -> impl IntoView {
     // second click).
     #[allow(deprecated)]
     let (apply_armed, set_apply_armed) = create_signal(false);
+    // Two-click arm guard for "Retire" — the governed, irreversible end-of-life
+    // transition — so a single misclick can't retire a request.
+    #[allow(deprecated)]
+    let (retire_armed, set_retire_armed) = create_signal(false);
 
     // Reset transient per-request UI state whenever the routed request id changes.
     // leptos_router reuses this component across /requests/:id navigations, so a
@@ -328,6 +332,7 @@ pub fn RequestDetail() -> impl IntoView {
         set_reason_text.set(String::new());
         set_reason_error.set(String::new());
         set_apply_armed.set(false);
+        set_retire_armed.set(false);
     });
 
     let validate_action = Action::new(move |id: &String| {
@@ -1095,10 +1100,15 @@ pub fn RequestDetail() -> impl IntoView {
                                                 let btn_class = action_button_class(action);
                                                 let needs_reason = action_requires_reason(action);
                                                 let action = action.clone();
+                                                let action_for_label = action.clone();
+                                                let action_for_class = action.clone();
                                                 let id = request_id_for_action.clone();
                                                 view! {
                                                     <button
                                                         class=btn_class
+                                                        class:btn-danger=move || {
+                                                            action_for_class == "retire" && retire_armed.get()
+                                                        }
                                                         disabled=move || any_action_pending.get()
                                                         on:click=move |_| {
                                                             // Reason-bearing decisions open the confirm
@@ -1110,6 +1120,21 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 set_pending_reason_action.set(Some(action.clone()));
                                                                 return;
                                                             }
+                                                            // "Retire" is the irreversible end-of-life
+                                                            // transition — require a confirming second
+                                                            // click so a lone misclick can't retire.
+                                                            if action == "retire" {
+                                                                if retire_armed.get() {
+                                                                    set_retire_armed.set(false);
+                                                                    retire_action.dispatch(id.clone());
+                                                                } else {
+                                                                    set_retire_armed.set(true);
+                                                                }
+                                                                return;
+                                                            }
+                                                            // Any other action cancels a pending
+                                                            // retire arm before dispatching.
+                                                            set_retire_armed.set(false);
                                                             match action.as_str() {
                                                                 "validate" => { validate_action.dispatch(id.clone()); }
                                                                 "plan" => { plan_action.dispatch(id.clone()); }
@@ -1119,12 +1144,17 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 "verify" => { verify_action.dispatch(id.clone()); }
                                                                 "protect" => { protect_action.dispatch(id.clone()); }
                                                                 "publish" => { publish_action.dispatch(id.clone()); }
-                                                                "retire" => { retire_action.dispatch(id.clone()); }
                                                                 _ => {}
                                                             }
                                                         }
                                                     >
-                                                        {label}
+                                                        {move || {
+                                                            if action_for_label == "retire" && retire_armed.get() {
+                                                                "Confirm retire".to_string()
+                                                            } else {
+                                                                label.to_string()
+                                                            }
+                                                        }}
                                                     </button>
                                                 }
                                             })
