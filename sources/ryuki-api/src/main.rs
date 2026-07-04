@@ -11,6 +11,7 @@ pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod idempotency;
+mod inbound_webhooks;
 mod integration;
 mod oidc_callback;
 mod repos;
@@ -1807,6 +1808,15 @@ async fn main() {
         // Agent-token endpoints bypass human auth_middleware entirely (they
         // authenticate via authenticate_agent / the rya_ bearer token).
         .merge(agents::agent_routes())
+        // #18 slice 2b: the inbound webhook RECEIVER is a PUBLIC endpoint with NO
+        // human session — it authenticates only via the HMAC signature over the
+        // raw body (see inbound_webhooks module docs). Merged here, BEFORE
+        // human_gated_app, so it bypasses auth_middleware entirely, same as
+        // agent_routes() above. It still inherits every layer applied to `app`
+        // below (body-limit / rate-limit / concurrency / timeout), since those
+        // wrap the OUTER router — that is the DoS protection for a pre-auth,
+        // publicly reachable endpoint.
+        .merge(inbound_webhooks::routes())
         // Human-session routes (includes admin_approve + all existing routes).
         .merge(human_gated_app)
         .fallback(not_found)
