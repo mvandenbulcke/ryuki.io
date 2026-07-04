@@ -10913,19 +10913,40 @@ async fn noise_suppress(
                 ));
             }
         }
+        // A zero-length suppression is already expired when written, so the
+        // expiry scan would immediately revert it — reject it up front (400).
+        if body.duration_minutes == 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "suppression duration must be at least 1 minute"})),
+            ));
+        }
         let now = chrono::Utc::now();
-        let suppress_until = now
+        // Reject an overflowing duration instead of clamping to `now` (which would
+        // mint an already-expired suppression the scan immediately reverts).
+        let suppress_until = match now
             .checked_add_signed(chrono::Duration::minutes(body.duration_minutes as i64))
-            .unwrap_or(now);
+        {
+            Some(t) => t,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "suppression duration overflows the supported range"})),
+                ));
+            }
+        };
         // Atomic compare-and-set inside a tx so the audit row is written
         // atomically with the suppression (#7). The CAS UPDATE still guards
         // against double-apply; the tx is rolled back (no audit) on 404/409.
+        // Only Active/UnderReview triggers are suppressible: suppressing a
+        // Resolved trigger would let the expiry scan flip it back to Active,
+        // resurrecting a closed trigger.
         let mut tx = pool.begin().await.map_err(db_error)?;
         let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
             "UPDATE noisy_triggers \
              SET status = 'Suppressed', suppress_until = $1, suppress_reason = $2, \
                  updated_at = $3 \
-             WHERE id = $4 AND status <> 'Suppressed' \
+             WHERE id = $4 AND status IN ('Active', 'UnderReview') \
              RETURNING {NOISE_COLUMNS}"
         ))
         .bind(suppress_until)
@@ -10952,9 +10973,9 @@ async fn noise_suppress(
             tx.commit().await.map_err(db_error)?;
             return Ok(Json(noise_row_to_json(&r)));
         }
-        // 0 rows returned — either the trigger doesn't exist, or it's already
-        // Suppressed. Roll back (no audit row written) and disambiguate via a
-        // read on the pool.
+        // 0 rows returned — the trigger doesn't exist, is already Suppressed, or
+        // is in a non-suppressible terminal state (Resolved). Roll back (no audit
+        // row written) and disambiguate via a read on the pool.
         drop(tx);
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM noisy_triggers WHERE id = $1")
@@ -10967,9 +10988,17 @@ async fn noise_suppress(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Trigger not found: {}", id)})),
             )),
-            Some(_) => Err((
+            Some("Suppressed") => Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "Trigger is already suppressed"})),
+            )),
+            Some(status) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "cannot suppress a trigger in status '{status}' (only Active/UnderReview)"
+                    )
+                })),
             )),
         }
     } else {

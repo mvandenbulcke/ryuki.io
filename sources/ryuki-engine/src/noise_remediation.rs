@@ -210,20 +210,42 @@ pub fn suppress_trigger(
     duration_minutes: u32,
     reason: &str,
 ) -> Result<NoisyTrigger, String> {
+    // A zero-length suppression is already expired the moment it is written, so
+    // the noise_suppression_expiry_scan would immediately revert it — reject it
+    // rather than mint a no-op suppression.
+    if duration_minutes == 0 {
+        return Err("suppression duration must be at least 1 minute".into());
+    }
     let mut store = noise_store().lock().map_err(|e| e.to_string())?;
     let trigger = store
         .iter_mut()
         .find(|t| t.id == trigger_id)
         .ok_or_else(|| format!("Trigger not found: {}", trigger_id))?;
 
+    // Keep the specific already-suppressed message (matches the DB path).
     if trigger.status == NoiseStatus::Suppressed {
         return Err("Trigger is already suppressed".into());
     }
+    // Only an Active or UnderReview trigger may be suppressed. Suppressing a
+    // Resolved trigger is the resurrection bug: the expiry scan reverts an
+    // expired Suppressed row to Active, so a Resolved trigger would silently
+    // reopen onto the active board.
+    if !matches!(
+        trigger.status,
+        NoiseStatus::Active | NoiseStatus::UnderReview
+    ) {
+        return Err(format!(
+            "cannot suppress a trigger in status {} (only Active/UnderReview)",
+            trigger.status
+        ));
+    }
 
+    // Reject an overflowing duration rather than silently minting an already-
+    // expired (now-clamped) suppression that the scan would immediately revert.
     let until = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::minutes(duration_minutes as i64))
         .map(|t| t.to_rfc3339())
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        .ok_or_else(|| "suppression duration overflows the supported time range".to_string())?;
 
     trigger.status = NoiseStatus::Suppressed;
     trigger.suppress_until = Some(until);
@@ -374,6 +396,27 @@ mod tests {
     #[test]
     fn test_suppress_already_suppressed_fails() {
         assert!(suppress_trigger("noise-004", 60, "already suppressed").is_err());
+    }
+
+    #[test]
+    fn test_suppress_resolved_trigger_fails() {
+        // noise-005 is seeded Resolved. Suppressing it would let the expiry scan
+        // later flip it to Active — resurrecting a closed trigger. Must be rejected.
+        let err = suppress_trigger("noise-005", 60, "should not resurrect").unwrap_err();
+        assert!(
+            err.contains("cannot suppress"),
+            "resolved trigger must not be suppressible: {err}"
+        );
+    }
+
+    #[test]
+    fn test_suppress_zero_duration_fails() {
+        // A 0-minute suppression is already expired when written → rejected.
+        let err = suppress_trigger("noise-002", 0, "instant").unwrap_err();
+        assert!(
+            err.contains("at least 1 minute"),
+            "zero-duration suppression must be rejected: {err}"
+        );
     }
 
     #[test]
