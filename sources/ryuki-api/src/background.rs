@@ -1052,18 +1052,14 @@ mod loop_monitor_db_tests {
                 .expect("ack_alert");
         assert!(acked, "an alert-worthy overdue event is ackable");
 
-        // Cleanup: ack first (FK child), then both events.
-        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
-            .bind(overdue.id)
-            .execute(pool)
-            .await
-            .ok();
-        sqlx::query(
-            "DELETE FROM domain_events WHERE aggregate_type = 'background_loop' AND aggregate_id = $1",
-        )
-        .bind(loop_name)
-        .execute(pool)
-        .await
-        .ok();
+        // Cleanup: `domain_events` is append-only — DELETE/TRUNCATE are blocked by
+        // a trigger (migration 111), so the old cleanup's `DELETE FROM
+        // domain_events` ALWAYS failed silently (`.ok()`), and — worse — it first
+        // deleted the ack, leaving a permanent UNACKED overdue alert in the shared
+        // dev DB's live /api/events/alerts feed on every run. The events cannot be
+        // pruned here, so instead we LEAVE the ack in place: the residual event
+        // (uniquely named `test-wedge-<uuid>`) stays ACKNOWLEDGED and therefore
+        // never surfaces as an actionable alert. (A fully residue-free run needs a
+        // throwaway DB rather than the shared dev pool — tracked separately.)
     }
 }

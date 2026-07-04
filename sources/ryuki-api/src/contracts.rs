@@ -58090,7 +58090,12 @@ mod software_deployment_db_tests {
         assert_eq!(approved["approved_by"], "test-approver");
 
         // Execute.
-        let Ok(Json(_executed)) = software_execute(Path(id.clone())).await else {
+        let Ok(Json(_executed)) = software_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_deployment(pool, &id).await;
             panic!("execute failed");
         };
@@ -58224,7 +58229,12 @@ mod software_deployment_db_tests {
         assert_eq!(approved["approved_by"], "db-approver");
 
         // Execute.
-        let Ok(Json(_executed)) = software_execute(Path(id.clone())).await else {
+        let Ok(Json(_executed)) = software_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_deployment(pool, &id).await;
             panic!("execute on direct-insert row must succeed");
         };
