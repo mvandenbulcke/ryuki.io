@@ -23,6 +23,11 @@
 /// schedule's cadence without a code change.
 pub const DRIFT_RECHECK_INTERVAL_DAYS: i64 = 14;
 
+/// The `agent_jobs.origin` marker a scheduler-created drift-recheck LivePlan job carries (#31 slice 2).
+/// NULL origin = a normal operator/request-path job. The CP only classifies drift for jobs with this origin,
+/// so a normal operator plan (which is EXPECTED to show changes) never emits a spurious drift event.
+pub const DRIFT_RECHECK_JOB_ORIGIN: &str = "drift_recheck";
+
 /// Is an operational deployment due for a drift re-check? True when the last
 /// successful live verification is at least `interval_days` old.
 ///

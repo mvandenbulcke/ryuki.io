@@ -63,6 +63,11 @@ pub const EVENT_POST_APPLY_VERIFIED: &str = "request.post-apply-verified";
 /// changes — an alert-worthy signal that the apply did not fully take.
 pub const EVENT_POST_APPLY_DRIFT: &str = "request.post-apply-drift";
 
+/// Domain-event type for drift found by the SCHEDULED re-check (#31), as opposed to the immediate
+/// post-apply re-plan ([`EVENT_POST_APPLY_DRIFT`]). Distinct type for audit/UX clarity; both carry
+/// payload to_status "drift-detected" so they share the same Critical alert classification.
+pub const EVENT_SCHEDULED_DRIFT_DETECTED: &str = "request.scheduled-drift-detected";
+
 /// Parse the terraform "no changes" / "Plan: … to add, … to change, … to
 /// destroy." summary the runner extracts. Returns `None` when the line is not a
 /// recognizable terraform plan summary.

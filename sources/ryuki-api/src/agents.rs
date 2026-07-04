@@ -1016,6 +1016,118 @@ mod post_apply_ingest_tests {
 }
 
 // ---------------------------------------------------------------------------
+// #31 slice 2: SCHEDULED drift-recheck classification (distinct from #43's
+// immediate post-apply re-plan above). A scheduler-created LivePlan job whose
+// `agent_jobs.origin` marks it as a drift-recheck is classified for drift off
+// its DIGEST-VERIFIED plan bytes; a normal operator LivePlan (origin NULL) is
+// EXPECTED to show changes and must never emit this event.
+// ---------------------------------------------------------------------------
+
+/// #31 slice 2: does this result warrant a SCHEDULED-drift event? Only a drift-recheck-origin
+/// LivePlan (JobMode::LivePlan + JobResultStatus::Planned + origin == DRIFT_RECHECK_JOB_ORIGIN)
+/// whose DIGEST-VERIFIED plan bytes classify as DriftDetected emits. Verified/Inconclusive/any
+/// other mode/status/origin => None (fail-closed: never alert off an unclear or operator plan).
+fn resolve_scheduled_drift_event(
+    mode: JobMode,
+    status: JobResultStatus,
+    origin: Option<&str>,
+    evidence: &[u8],
+) -> Option<&'static str> {
+    use ryuki_engine::post_apply::{
+        classify_plan_json, PostApplyOutcome, EVENT_SCHEDULED_DRIFT_DETECTED,
+    };
+    if mode != JobMode::LivePlan || status != JobResultStatus::Planned {
+        return None;
+    }
+    if origin != Some(ryuki_engine::drift_scan::DRIFT_RECHECK_JOB_ORIGIN) {
+        return None;
+    }
+    match classify_plan_json(evidence) {
+        PostApplyOutcome::DriftDetected => Some(EVENT_SCHEDULED_DRIFT_DETECTED),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod resolve_scheduled_drift_tests {
+    use super::resolve_scheduled_drift_event;
+    use ryuki_engine::drift_scan::DRIFT_RECHECK_JOB_ORIGIN;
+    use ryuki_engine::event_alerts::{severity_for_request_status, AlertSeverity};
+    use ryuki_engine::post_apply::EVENT_SCHEDULED_DRIFT_DETECTED;
+    use ryuki_protocol::{JobMode, JobResultStatus};
+
+    fn plan_with_actions(actions: &str) -> Vec<u8> {
+        format!(r#"{{"resource_changes":[{{"change":{{"actions":{actions}}}}}]}}"#).into_bytes()
+    }
+
+    #[test]
+    fn drift_recheck_plan_with_mutation_emits_scheduled_drift_event() {
+        let evidence = plan_with_actions(r#"["update"]"#);
+        let event = resolve_scheduled_drift_event(
+            JobMode::LivePlan,
+            JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+            &evidence,
+        );
+        assert_eq!(event, Some(EVENT_SCHEDULED_DRIFT_DETECTED));
+        // Cross-crate lock-step: the emitted event's to_status must alert Critical,
+        // or scheduled drift would silently never page an operator.
+        assert_eq!(
+            severity_for_request_status("drift-detected"),
+            Some(AlertSeverity::Critical)
+        );
+    }
+
+    #[test]
+    fn drift_recheck_plan_with_only_no_op_emits_nothing() {
+        let evidence = plan_with_actions(r#"["no-op"]"#);
+        let event = resolve_scheduled_drift_event(
+            JobMode::LivePlan,
+            JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+            &evidence,
+        );
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn unparseable_evidence_is_fail_closed_to_none() {
+        let event = resolve_scheduled_drift_event(
+            JobMode::LivePlan,
+            JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+            b"not json",
+        );
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn operator_plan_with_no_origin_never_emits() {
+        // MUST NOT emit for operator plans, even with mutating actions.
+        let evidence = plan_with_actions(r#"["update"]"#);
+        let event = resolve_scheduled_drift_event(
+            JobMode::LivePlan,
+            JobResultStatus::Planned,
+            None,
+            &evidence,
+        );
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn live_apply_with_drift_recheck_origin_never_emits() {
+        let evidence = plan_with_actions(r#"["update"]"#);
+        let event = resolve_scheduled_drift_event(
+            JobMode::LiveApply,
+            JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+            &evidence,
+        );
+        assert_eq!(event, None);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // redaction_policy_version ingestion guard
 // ---------------------------------------------------------------------------
 
@@ -1275,12 +1387,15 @@ async fn post_job_result_with_pool(
         result_status: Option<String>,
         evidence_digest: Option<String>,
         completed_at: Option<chrono::DateTime<Utc>>,
+        // #31 slice 2: the scheduler-set marker distinguishing a drift-recheck
+        // LivePlan job (Some("drift_recheck")) from a normal operator job (None).
+        origin: Option<String>,
     }
 
     let row = sqlx::query_as::<_, JobForResult>(
         "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
          platform, request_id, live_context, \
-         result_id, result_status, evidence_digest, completed_at \
+         result_id, result_status, evidence_digest, completed_at, origin \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(job_id)
@@ -1730,6 +1845,50 @@ async fn post_job_result_with_pool(
                     .await
                     .map_err(db_err)?;
                 }
+            }
+        }
+
+        // #31 slice 2: emit the SCHEDULED drift-recheck event in the SAME
+        // transaction as the terminal record, mirroring the #43 block above.
+        // result_status for a LivePlan drift-recheck stays "planned" — this is a
+        // detection-only signal (unlike LiveApply's Applied->verified upgrade),
+        // so only the event is emitted, never a result_status change.
+        if let Some(event_type) = resolve_scheduled_drift_event(
+            stored_mode.clone(),
+            env.status.clone(),
+            row.origin.as_deref(),
+            &body.evidence,
+        ) {
+            // requests.site/environment are NOT NULL. If the request row is gone
+            // (e.g. a synthetic job with no parent), skip the event: it is a
+            // request-scoped signal with no request to scope to, and the terminal
+            // job record is already durable.
+            let scope: Option<(String, String)> =
+                sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
+                    .bind(stored_spec.request_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            if let Some((site, environment)) = scope {
+                let aggregate_id = stored_spec.request_id.to_string();
+                crate::repos::domain_events::insert(
+                    &mut *tx,
+                    crate::repos::domain_events::NewEvent {
+                        event_type,
+                        aggregate_type: "request",
+                        aggregate_id: &aggregate_id,
+                        site: Some(&site),
+                        environment: Some(&environment),
+                        actor: "system",
+                        payload: json!({
+                            "job_id": job_id.to_string(),
+                            "result_id": result.result_id.to_string(),
+                            "to_status": "drift-detected",
+                        }),
+                    },
+                )
+                .await
+                .map_err(db_err)?;
             }
         }
 
