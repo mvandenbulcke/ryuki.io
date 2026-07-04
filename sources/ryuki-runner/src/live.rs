@@ -614,10 +614,27 @@ pub(crate) fn live_terraform_apply(
     )?;
 
     let (status, summary) = match apply_outcome.exit_code {
-        Some(0) => (
-            RunStatus::Applied,
-            extract_apply_summary(&apply_outcome.log),
-        ),
+        Some(0) => {
+            let base = extract_apply_summary(&apply_outcome.log);
+            // #43 post-apply verification: re-plan in the SAME (post-apply)
+            // workspace and classify convergence. A converged apply re-plans to
+            // "No changes"; a pending change is drift (the apply did not fully
+            // take). This is ADVISORY — the apply already succeeded, so status
+            // stays Applied and a re-plan failure never downgrades it; the verdict
+            // is surfaced in the summary for the CP to act on (transition to
+            // Verified / emit a drift event).
+            let verdict = post_apply_verdict(
+                binary,
+                ws.path(),
+                &plan.secret_var_names,
+                &cred_str,
+                &secret_refs,
+            );
+            (
+                RunStatus::Applied,
+                format!("{base} | post-apply: {}", post_apply_label(verdict)),
+            )
+        }
         code => (
             RunStatus::Failed,
             format!("terraform apply failed (exit {})", code.unwrap_or(-1)),
@@ -632,6 +649,43 @@ pub(crate) fn live_terraform_apply(
         log: apply_outcome.log,
         exit_code: apply_outcome.exit_code,
     })
+}
+
+/// Run a post-apply `terraform plan` in the applied workspace and classify
+/// convergence via the pure engine core. A plan that cannot run (non-zero exit,
+/// spawn error) yields `Inconclusive` — never a false `Verified`. `terraform
+/// plan` (no `-detailed-exitcode`) exits 0 whether or not changes are pending, so
+/// the verdict is read from the plan SUMMARY, not the exit code.
+fn post_apply_verdict(
+    binary: &str,
+    ws_path: &std::path::Path,
+    secret_names: &[String],
+    cred_str: &str,
+    secret_refs: &[&[u8]],
+) -> ryuki_engine::post_apply::PostApplyOutcome {
+    use ryuki_engine::post_apply::{classify_post_apply, PostApplyOutcome};
+    match run_tf_step(
+        binary,
+        &["plan", "-input=false", "-no-color"],
+        ws_path,
+        secret_names,
+        cred_str,
+        secret_refs,
+        true,
+    ) {
+        Ok(re) if re.exit_code == Some(0) => classify_post_apply(&extract_plan_summary(&re.log)),
+        _ => PostApplyOutcome::Inconclusive,
+    }
+}
+
+/// Human-readable label for a post-apply verdict, folded into the apply summary.
+fn post_apply_label(verdict: ryuki_engine::post_apply::PostApplyOutcome) -> &'static str {
+    use ryuki_engine::post_apply::PostApplyOutcome;
+    match verdict {
+        PostApplyOutcome::Verified => "verified (converged)",
+        PostApplyOutcome::DriftDetected => "drift detected",
+        PostApplyOutcome::Inconclusive => "inconclusive",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1253,74 @@ esac
             "apply shim exits 0 → Applied; got: {:?} log: {}",
             outcome.status,
             outcome.log
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #43 post-apply verification: the post-apply re-plan verdict is folded into
+    // the apply summary (Applied either way; verdict is advisory).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_folds_post_apply_verdict_into_summary() {
+        // A shim whose post-apply `plan` output is parameterized by env so one
+        // helper drives both the converged (verified) and drift verdicts.
+        let build = |plan_output: &str, tag: &str| {
+            let ws_probe = super::super::workspace::Workspace::new().expect("ws");
+            let shim = ws_probe.path().join(format!("fake-tf-postapply-{tag}"));
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  version|init) exit 0 ;;\n  apply) echo 'Apply complete! Resources: 1 added, 0 changed, 0 destroyed.'; exit 0 ;;\n  plan) echo '{plan_output}'; exit 0 ;;\n  *) exit 0 ;;\nesac\n"
+                ),
+            )
+            .expect("write shim");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            let plan = live_plan("patch-maintenance");
+            let out = live_terraform_apply(
+                &shim.to_string_lossy(),
+                &plan,
+                &dummy_creds(),
+                None,
+                b"fake-tfplan",
+            )
+            .expect("apply must not error");
+            (
+                ws_probe, // keep the tempdir alive until asserts run
+                out,
+            )
+        };
+
+        // Converged: the post-apply re-plan reports no changes → verified.
+        let (_ws, verified) = build(
+            "No changes. Your infrastructure matches the configuration.",
+            "ok",
+        );
+        assert_eq!(verified.status, RunStatus::Applied);
+        assert!(
+            verified
+                .summary
+                .contains("post-apply: verified (converged)"),
+            "converged re-plan must verify: {}",
+            verified.summary
+        );
+
+        // Pending change: the post-apply re-plan still wants a change → drift.
+        let (_ws2, drift) = build("Plan: 1 to add, 0 to change, 0 to destroy.", "drift");
+        assert_eq!(
+            drift.status,
+            RunStatus::Applied,
+            "post-apply drift is advisory — the apply still succeeded"
+        );
+        assert!(
+            drift.summary.contains("post-apply: drift detected"),
+            "pending-change re-plan must flag drift: {}",
+            drift.summary
         );
     }
 
