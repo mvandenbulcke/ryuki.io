@@ -653,6 +653,11 @@ pub fn get_subnet(id: &str) -> Result<Value, String> {
 /// static `reserve_ip` below calls it then mutates the in-process fallback
 /// store. Keeping the id/IP/timestamp construction here means DB mode and the
 /// no-DB demo mint identical reservations.
+/// Upper bound on an IP-reservation TTL (~100 years), mirroring
+/// `secrets_rotation::MAX_ROTATION_INTERVAL_DAYS`. Guards the expiry arithmetic in
+/// [`build_reservation`] against a chrono `DateTime + Days` overflow panic.
+pub const MAX_RESERVATION_TTL_DAYS: u64 = 36_500;
+
 pub fn build_reservation(
     subnet: &IpamSubnet,
     existing: &[IpReservation],
@@ -670,11 +675,28 @@ pub fn build_reservation(
     if reserved_by.trim().is_empty() {
         return Err("reserved_by cannot be empty".into());
     }
+    // Reject an oversized TTL BEFORE the expiry arithmetic below: an unbounded
+    // caller-supplied ttl_days makes `Utc::now() + Days::new(ttl_days)` PANIC
+    // (chrono "DateTime + Days out of range") — a request-driven DoS via
+    // POST /api/network/ipam/reserve. Mirrors secrets_rotation's
+    // MAX_ROTATION_INTERVAL_DAYS and certificate_lifecycle's cap. 0 is allowed
+    // (expires immediately; cannot overflow).
+    if ttl_days > MAX_RESERVATION_TTL_DAYS {
+        return Err(format!(
+            "ttl_days must be at most {MAX_RESERVATION_TTL_DAYS}"
+        ));
+    }
     if subnet.available_ips == 0 {
         return Err(format!("Subnet '{}' has no available IPs", subnet.id));
     }
 
     let ip_address = next_ip(subnet, existing)?;
+    // Belt-and-suspenders: the cap above already keeps this in range, but use the
+    // checked variant so no arithmetic path can panic.
+    let expiry = Utc::now()
+        .checked_add_days(Days::new(ttl_days))
+        .ok_or_else(|| "ttl_days too large".to_string())?
+        .to_rfc3339();
     Ok(IpReservation {
         id: format!(
             "res-{}-{}",
@@ -691,7 +713,7 @@ pub fn build_reservation(
         purpose: purpose.to_string(),
         reserved_by: reserved_by.to_string(),
         reserved_at: now_iso(),
-        expiry: (Utc::now() + Days::new(ttl_days)).to_rfc3339(),
+        expiry,
     })
 }
 
@@ -983,6 +1005,19 @@ mod tests {
             ..subnet.clone()
         };
         assert!(build_reservation(&exhausted, &existing, "h", "p", "t", 7).is_err());
+
+        // Regression: an oversized ttl_days used to PANIC in `Utc::now() + Days::new`.
+        // Over-max and u64::MAX must be rejected as Err (never panic); 0 is allowed.
+        for bad in [MAX_RESERVATION_TTL_DAYS + 1, u64::MAX] {
+            assert!(
+                build_reservation(&subnet, &existing, "h", "p", "t", bad).is_err(),
+                "ttl_days {bad} must be rejected, not panic"
+            );
+        }
+        assert!(build_reservation(&subnet, &existing, "h", "p", "t", 0).is_ok());
+        assert!(
+            build_reservation(&subnet, &existing, "h", "p", "t", MAX_RESERVATION_TTL_DAYS).is_ok()
+        );
     }
 
     /// next_ip (via build_reservation) honors the REAL CIDR prefix — it never returns
