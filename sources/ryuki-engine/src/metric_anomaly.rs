@@ -71,14 +71,19 @@ pub fn detect_anomalies(points: &[MetricPoint], z_threshold: f64) -> Vec<Anomaly
     if z_threshold <= 0.0 || !z_threshold.is_finite() {
         return Vec::new();
     }
-    // Exclude non-finite samples (NaN / ±inf) from BOTH the baseline and the
-    // output. A single NaN otherwise poisons `sum`/`sum_sq` → every leave-one-out
-    // z is NaN → `z.abs() >= z_threshold` is false everywhere → anomaly detection
-    // is SILENTLY muted for the entire series (the real spike is missed). This
-    // mirrors the non-finite filtering `detect_waste` and `project_forward`
-    // already do. Ingest rejects non-finite values, so this is defense-in-depth
-    // against any non-ingest write path (float8 columns accept NaN).
-    let finite: Vec<&MetricPoint> = points.iter().filter(|p| p.value.is_finite()).collect();
+    // Exclude any sample that would poison the running totals from BOTH the
+    // baseline and the output: NaN / ±inf, AND a finite value so extreme that its
+    // SQUARE overflows to ±inf (|v| ≳ 1.34e154). Either kind otherwise makes
+    // `sum`/`sum_sq` non-finite → every leave-one-out z is NaN/inf →
+    // `z.abs() >= z_threshold` is false everywhere → anomaly detection is SILENTLY
+    // muted for the entire series (the real spike is missed). Checking
+    // `(v*v).is_finite()` covers both the value and its square in one predicate.
+    // Ingest rejects non-finite values, so this is defense-in-depth against any
+    // non-ingest write path (float8 columns accept NaN and any finite magnitude).
+    let finite: Vec<&MetricPoint> = points
+        .iter()
+        .filter(|p| p.value.is_finite() && (p.value * p.value).is_finite())
+        .collect();
     if finite.len() < MIN_SAMPLES_FOR_DETECTION {
         return Vec::new();
     }
@@ -232,6 +237,28 @@ mod tests {
         // After filtering, too few finite samples → no detection (no panic/NaN).
         let series = pts(&[(0.0, f64::NAN), (1.0, f64::NAN), (2.0, 10.0)]);
         assert!(detect_anomalies(&series, 1.5).is_empty());
+    }
+
+    #[test]
+    fn square_overflowing_value_does_not_mute_detection() {
+        // A finite value whose SQUARE overflows to +inf (1e200² = inf) would poison
+        // sum_sq and mute the whole series. It must be excluded like a non-finite,
+        // leaving the real 10→100 spike detectable.
+        let series = pts(&[
+            (0.0, 10.0),
+            (1.0, 10.0),
+            (2.0, 1e200),
+            (3.0, 10.0),
+            (4.0, 100.0),
+        ]);
+        let found = detect_anomalies(&series, 1.5);
+        assert_eq!(
+            found.len(),
+            1,
+            "the spike must still be detected: {found:?}"
+        );
+        assert_eq!(found[0].value, 100.0);
+        assert!(found[0].z_score.is_finite());
     }
 
     #[test]
