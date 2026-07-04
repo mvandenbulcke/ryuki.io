@@ -531,7 +531,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use ryuki_engine::auth::{check_permission, AuthSession};
+use ryuki_engine::auth::{check_permission, resolve_scope_filter, AuthSession, ScopeFilter};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
@@ -546,6 +546,46 @@ fn require_admin(session: &AuthSession) -> Result<(), (StatusCode, Json<Value>)>
     }
 }
 
+/// Post-load, site-only, NULLABLE-site scope guard for a connection (#2). Maps an
+/// out-of-scope connection (or a NULL-site connection for a scoped principal) to
+/// the SAME 404 a missing id produces, so a scoped admin token cannot read or act
+/// on another site's connection. Mirrors contracts::nullable_site_scope_guard_or_404.
+fn connection_scope_guard(
+    session: &AuthSession,
+    site_scope: Option<&str>,
+    id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if !crate::contracts::is_scoped(session) {
+        return Ok(()); // unrestricted principal
+    }
+    match site_scope {
+        // environment axis is N/A for a connection, so pass "" (row_scope_permits
+        // requires the principal be unrestricted on env, i.e. an env-scoped
+        // principal fails closed — matching site_scope_guard_or_404).
+        Some(s) if crate::contracts::row_scope_permits(session, s, "") => Ok(()),
+        _ => Err(integration_not_found(id)),
+    }
+}
+
+/// A SCOPED caller may only create/update to a site WITHIN its scope — never a
+/// foreign site, never NULL (platform-wide); env-scoped fails closed. Returns 403
+/// (caller supplied an out-of-scope value = forbidden write, not a hidden resource).
+fn validate_body_site_scope(
+    session: &AuthSession,
+    site_scope: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if !crate::contracts::is_scoped(session) {
+        return Ok(());
+    }
+    match site_scope {
+        Some(s) if crate::contracts::row_scope_permits(session, s, "") => Ok(()),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "site_scope is outside your authorized scope"})),
+        )),
+    }
+}
+
 /// POST /api/integrations — create a connection.
 /// For db-encrypted source: encrypts `inline_secret` server-side; discards plaintext;
 /// response never includes the secret.
@@ -554,6 +594,11 @@ pub async fn integration_create(
     Json(body): Json<CreateConnectionRequest>,
 ) -> ApiResult {
     require_admin(&session)?;
+
+    // #2 (write-side): a scoped caller may only create a connection WITHIN its own
+    // site scope — never a foreign site, never NULL (platform-wide). Enforced BEFORE
+    // any write and BEFORE credential encryption, covering both db and in-memory paths.
+    validate_body_site_scope(&session, body.site_scope.as_deref())?;
 
     let source =
         CredentialSource::parse(&body.credential_source).map_err(|e| integration_400(&e))?;
@@ -827,6 +872,42 @@ pub async fn integration_list(
 ) -> ApiResult {
     require_admin(&session)?;
 
+    // #2: a connection is a SITE-ONLY resource — it has no environment axis. An
+    // env-scoped principal therefore cannot be satisfied and must fail closed to an
+    // EMPTY list (mirrors the by-id 404 for such a principal), not fall through to
+    // the site-only resolve below which ignores the environment axis entirely.
+    let env_scoped = session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if env_scoped {
+        let source = if get_db().is_some() {
+            "database"
+        } else {
+            "in-memory"
+        };
+        return Ok(Json(json!({
+            "source": source,
+            "connections": [],
+            "count": 0,
+        })));
+    }
+
+    // #2: resolve the EFFECTIVE site filter — a scoped admin that omits ?site is
+    // narrowed to its own scope (never falls through to an all-sites read), and a
+    // foreign ?site is a 403. `None` survives only for an unrestricted principal.
+    // NULL-site (platform-wide) rows match no concrete filter, so they stay
+    // visible only to unrestricted principals — same rule as connection_scope_guard.
+    let effective_site = match resolve_scope_filter(&session.site_scope, q.site.as_deref()) {
+        ScopeFilter::Deny => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "requested site is outside your authorized scope"})),
+            ));
+        }
+        ScopeFilter::Allow(v) => v,
+    };
+
     if let Some(pool) = get_db() {
         let rows: Vec<IntegrationConnectionRow> = sqlx::query_as(&format!(
             "SELECT {CONN_COLUMNS} FROM integration_connections \
@@ -834,7 +915,7 @@ pub async fn integration_list(
              ORDER BY created_at DESC"
         ))
         .bind(q.vendor_type.as_deref().unwrap_or(""))
-        .bind(q.site.as_deref().unwrap_or(""))
+        .bind(effective_site.as_deref().unwrap_or(""))
         .fetch_all(pool)
         .await
         .map_err(db_err)?;
@@ -851,9 +932,11 @@ pub async fn integration_list(
         })));
     }
 
+    // In-memory fallback: `None` site means all-sites, which is correct only for
+    // an unrestricted principal — effective_site is Some(..) for any scoped one.
     let conns = ryuki_engine::integration_connections::list_connections(
         q.vendor_type.as_deref(),
-        q.site.as_deref(),
+        effective_site.as_deref(),
     );
     let json_list: Vec<Value> = conns
         .iter()
@@ -882,19 +965,27 @@ pub async fn integration_get(
         .await
         .map_err(db_err)?;
         return match row {
-            Some(r) => Ok(Json(json!({
-                "source": "database",
-                "connection": IntegrationConnectionRow::to_json(&r.into_connection()),
-            }))),
+            Some(r) => {
+                // #2: an out-of-scope connection 404s exactly like a missing one.
+                connection_scope_guard(&session, r.site_scope.as_deref(), &id)?;
+                Ok(Json(json!({
+                    "source": "database",
+                    "connection": IntegrationConnectionRow::to_json(&r.into_connection()),
+                })))
+            }
             None => Err(integration_not_found(&id)),
         };
     }
 
     match ryuki_engine::integration_connections::get_connection(&id) {
-        Some(conn) => Ok(Json(json!({
-            "source": "in-memory",
-            "connection": IntegrationConnectionRow::to_json(&conn),
-        }))),
+        Some(conn) => {
+            // #2: an out-of-scope connection 404s exactly like a missing one.
+            connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+            Ok(Json(json!({
+                "source": "in-memory",
+                "connection": IntegrationConnectionRow::to_json(&conn),
+            })))
+        }
         None => Err(integration_not_found(&id)),
     }
 }
@@ -920,6 +1011,10 @@ pub async fn integration_update(
         let mut conn = row
             .ok_or_else(|| integration_not_found(&id))?
             .into_connection();
+
+        // #2: guard on the LOADED row's site_scope (not the body's) BEFORE applying
+        // any update — an out-of-scope id must be indistinguishable from a missing one.
+        connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
 
         // HARDENING-1: forbid changing credential_source on update.
         // Changing source types creates edge cases (e.g. a db-encrypted row
@@ -963,6 +1058,12 @@ pub async fn integration_update(
             }
         }
         // For db-encrypted: silently ignore any body.credential_ref — it is discarded.
+
+        // #2 (write-side): the RESULTING site_scope must also be within the caller's
+        // scope — a scoped caller cannot MOVE a connection out of scope or to NULL
+        // (platform-wide). Checked after the body is applied to `conn` and BEFORE
+        // either write branch below.
+        validate_body_site_scope(&session, conn.site_scope.as_deref())?;
 
         // HARDENING-2: wrap db-encrypted secret update + connection update in a
         // single transaction so no partial write is possible if either statement fails.
@@ -1150,6 +1251,23 @@ pub async fn integration_delete(
 
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_err)?;
+        // #2: for a scoped principal, pre-read the row's site_scope (locked, same tx)
+        // and guard BEFORE the DELETE — an out-of-scope delete must 404 WITHOUT
+        // deleting. Skipped for unrestricted principals so the DELETE..RETURNING
+        // below stays their single round-trip.
+        if crate::contracts::is_scoped(&session) {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT site_scope FROM integration_connections WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some((site_scope,)) = row else {
+                return Err(integration_not_found(&id));
+            };
+            connection_scope_guard(&session, site_scope.as_deref(), &id)?;
+        }
         // RETURNING the deleted row's non-secret identity for the audit detail; None
         // (unknown id) rolls back the empty tx → 404 with no audit row.
         let deleted: Option<(String, Option<String>)> = sqlx::query_as(
@@ -1171,6 +1289,11 @@ pub async fn integration_delete(
     }
 
     // No DB: remove-and-return atomically (one lock — no TOCTOU between read + remove).
+    // #2: scope-check FIRST so an out-of-scope delete 404s WITHOUT deleting (the
+    // pre-read is a separate lock acquisition — acceptable for the no-DB fallback).
+    if let Some(conn) = ryuki_engine::integration_connections::get_connection(&id) {
+        connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+    }
     match ryuki_engine::integration_connections::delete_connection_returning(&id) {
         Some(conn) => {
             audit::record_audit_local(&session, &audit_for(conn.vendor_type, conn.site_scope))
@@ -1204,6 +1327,10 @@ pub async fn integration_test(
             .ok_or_else(|| integration_not_found(&id))?
     };
 
+    // #2: guard BEFORE resolve_credentials — a scoped admin must never trigger
+    // resolution/decryption of another site's credentials (finding #3).
+    connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+
     // Attempt credential resolution — the ResolvedCredentials is dropped immediately
     // after use and zeroized. Never included in the response.
     let pool_ref = get_db();
@@ -1214,6 +1341,18 @@ pub async fn integration_test(
         Ok(_creds) => {
             // _creds is Zeroizing — dropped here, memory wiped.
             ("resolved", "credentials resolved successfully".to_string())
+        }
+        // CredError::Db wraps a RAW sqlx error string whose text can leak
+        // SQL/column/constraint internals — log it server-side and return a
+        // GENERIC message (same discipline as db_err). The other variants carry
+        // curated, secret-free messages that stay actionable for the admin caller.
+        Err(CredError::Db(e)) => {
+            tracing::error!(
+                error = %e,
+                connection_id = %id,
+                "integration test credential resolution db error"
+            );
+            ("error", "credential resolution failed".to_string())
         }
         Err(e) => ("error", e.to_string()),
     };
@@ -1344,15 +1483,18 @@ pub async fn integration_health_history(
     };
     // Confirm the connection exists, so an unknown id is a 404 (not an
     // empty-history 200 that looks like a healthy-but-unchecked connection).
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1")
+    let exists: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1")
             .bind(&id)
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-    if exists.is_none() {
+    let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
-    }
+    };
+    // #2: an out-of-scope connection's health history must 404 like a missing one,
+    // so a scoped admin cannot read another site's probe timeline.
+    connection_scope_guard(&session, site_scope.as_deref(), &id)?;
     let rows: Vec<HealthCheckRow> = sqlx::query_as(
         "SELECT id, checked_at, endpoint_status, credential_status, message \
          FROM connection_health_checks WHERE connection_id = $1 \
@@ -1476,6 +1618,21 @@ pub async fn integration_set_credential_expiry(
     // row commit together in one tx (mirrors DELETE); a 404 rolls back the empty tx
     // with no audit row.
     let mut tx = pool.begin().await.map_err(db_err)?;
+    // #2: for a scoped principal, pre-read the row's site_scope (locked, same tx)
+    // and guard BEFORE the UPDATE — an out-of-scope id 404s without mutating.
+    if crate::contracts::is_scoped(&session) {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT site_scope FROM integration_connections WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((site_scope,)) = row else {
+            return Err(integration_not_found(&id));
+        };
+        connection_scope_guard(&session, site_scope.as_deref(), &id)?;
+    }
     let updated: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
         "UPDATE integration_connections SET credential_expires_at = $1 \
          WHERE id = $2 RETURNING id, credential_expires_at",
@@ -1533,6 +1690,34 @@ pub async fn integration_expiring_credentials(
         return Err(integration_400("within_days must be between 1 and 3650"));
     }
 
+    // #2: this is a fleet-wide scan of connection credential metadata — it must be
+    // scoped like every other read. A connection is a SITE-ONLY resource, so:
+    //   - env-scoped principal  -> empty (cannot be satisfied on the site axis);
+    //   - otherwise resolve the site filter (no ?site param here, so requested=None):
+    //       unrestricted -> Allow(None) (all sites, incl. NULL platform-wide),
+    //       one scope     -> Allow(Some(scope)) (narrow to it),
+    //       many scopes   -> Deny (cannot express a set in one filter) -> 403.
+    let env_scoped = session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if env_scoped {
+        return Ok(Json(json!({
+            "within_days": within_days,
+            "count": 0,
+            "items": [],
+        })));
+    }
+    let effective_site = match resolve_scope_filter(&session.site_scope, None) {
+        ScopeFilter::Deny => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "requested site is outside your authorized scope"})),
+            ));
+        }
+        ScopeFilter::Allow(v) => v,
+    };
+
     let Some(pool) = get_db() else {
         return Ok(Json(json!({
             "within_days": within_days,
@@ -1546,14 +1731,20 @@ pub async fn integration_expiring_credentials(
     let cutoff = now + chrono::Duration::days(within_days);
 
     // IS NOT NULL is implied by the `<=` comparison (NULL compares to nothing),
-    // but stated for clarity and to match the partial index predicate.
+    // but stated for clarity and to match the partial index predicate. The
+    // `($2 = '' OR site_scope = $2)` clause narrows a scoped principal to its own
+    // site; `$2 = ''` (unrestricted) matches all rows including NULL-site ones,
+    // while a concrete `$2` never matches a NULL site — so a scoped caller never
+    // sees another site's or a platform-wide row.
     let rows: Vec<ExpiringCredentialRow> = sqlx::query_as(
         "SELECT id, name, vendor_type, credential_expires_at \
          FROM integration_connections \
          WHERE credential_expires_at IS NOT NULL AND credential_expires_at <= $1 \
+           AND ($2 = '' OR site_scope = $2) \
          ORDER BY credential_expires_at ASC LIMIT 500",
     )
     .bind(cutoff)
+    .bind(effective_site.as_deref().unwrap_or(""))
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
@@ -1668,15 +1859,17 @@ pub async fn integration_circuit_get(
         return Ok(Json(body));
     };
 
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1")
+    let exists: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1")
             .bind(&id)
             .fetch_optional(pool)
             .await
             .map_err(db_err)?;
-    if exists.is_none() {
+    let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
-    }
+    };
+    // #2: an out-of-scope connection's breaker must 404 like a missing one.
+    connection_scope_guard(&session, site_scope.as_deref(), &id)?;
 
     let now_unix: i64 = sqlx::query_scalar(DB_NOW_UNIX)
         .fetch_one(pool)
@@ -1731,18 +1924,49 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
     require_admin(&session)?;
     let cfg = BreakerConfig::DEFAULT;
 
+    // #2: a breaker is keyed on a connection, a SITE-ONLY resource. An env-scoped
+    // principal fails closed to empty (mirrors the connection list + by-id guard);
+    // otherwise resolve the effective site filter so a scoped admin sees ONLY its
+    // own site's breakers and never enumerates another site's connection_ids/state.
+    let env_scoped = session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if env_scoped {
+        let source = if get_db().is_some() { "db" } else { "no-db" };
+        return Ok(Json(json!({ "source": source, "breakers": [] })));
+    }
+    let effective_site = match resolve_scope_filter(&session.site_scope, None) {
+        ScopeFilter::Deny => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "requested scope is ambiguous; name an in-scope site"})),
+            ));
+        }
+        ScopeFilter::Allow(v) => v,
+    };
+
     let Some(pool) = get_db() else {
         // No DB: no durable breaker state exists to report.
         return Ok(Json(json!({ "source": "no-db", "breakers": [] })));
     };
 
     // Explicit state allow-list (defense beyond the mig-106 CHECK) so no unknown
-    // state can enter the actionable list.
+    // state can enter the actionable list. JOIN the parent connection so the
+    // site-scope filter applies: unrestricted (`''`) matches all rows incl.
+    // platform-wide NULL-site connections; a scoped caller binds its concrete site,
+    // and `ic.site_scope = 'GBLON'` never matches a NULL-site connection — so a
+    // scoped caller never sees another site's or a platform-wide breaker.
     let rows: Vec<BreakerListRow> = sqlx::query_as(
-        "SELECT connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix \
-         FROM circuit_breakers WHERE state IN ('open', 'half_open') \
-         ORDER BY opened_at_unix DESC NULLS LAST, connection_id",
+        "SELECT cb.connection_id, cb.state, cb.consecutive_failures, cb.consecutive_successes, \
+                cb.opened_at_unix \
+         FROM circuit_breakers cb \
+         JOIN integration_connections ic ON ic.id = cb.connection_id \
+         WHERE cb.state IN ('open', 'half_open') \
+           AND ($1 = '' OR ic.site_scope = $1) \
+         ORDER BY cb.opened_at_unix DESC NULLS LAST, cb.connection_id",
     )
+    .bind(effective_site.as_deref().unwrap_or(""))
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
@@ -1794,15 +2018,18 @@ pub async fn integration_circuit_record(
     let mut tx = pool.begin().await.map_err(db_err)?;
     // Lock the parent connection: serializes concurrent record() for this
     // connection AND yields a clean 404 for an unknown one. tx rolls back on drop.
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1 FOR UPDATE")
+    let exists: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE")
             .bind(&id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-    if exists.is_none() {
+    let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
-    }
+    };
+    // #2: an out-of-scope connection's breaker must 404 like a missing one — and
+    // never accept a recorded outcome. tx rolls back on drop, nothing persists.
+    connection_scope_guard(&session, site_scope.as_deref(), &id)?;
 
     // DB clock inside the tx — shared across workers (no local-clock skew on the
     // persisted opened_at_unix / cooldown).
@@ -1867,15 +2094,18 @@ pub async fn integration_circuit_reset(
     };
 
     let mut tx = pool.begin().await.map_err(db_err)?;
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1 FOR UPDATE")
+    let exists: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE")
             .bind(&id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-    if exists.is_none() {
+    let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
-    }
+    };
+    // #2: an out-of-scope connection's breaker must 404 like a missing one — and
+    // never be reset. tx rolls back on drop, nothing is cleared.
+    connection_scope_guard(&session, site_scope.as_deref(), &id)?;
     // Absence of a row IS the healthy default, so a reset just clears it. DELETE …
     // RETURNING the prior state so the audit reflects what was ACTUALLY reset: a row
     // can be persisted as 'closed' (a healthy upsert), so the mere existence of a row
