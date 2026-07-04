@@ -2617,7 +2617,7 @@ mod tests {
     #[test]
     fn test_oidc_client_secret_not_serialized() {
         let mut config = RyukiConfig::default();
-        config.oidc.client_secret = "super-secret".into();
+        config.oidc.client_secret = "super-secret".into(); // secret-scan-allow: test fixture (asserts non-leak)
         let serialized = serde_json::to_string(&config.oidc).unwrap();
         assert!(
             !serialized.contains("super-secret"),
@@ -2632,7 +2632,7 @@ mod tests {
     #[test]
     fn test_oidc_client_secret_not_in_debug() {
         let config = OidcConfig {
-            client_secret: "super-secret".into(),
+            client_secret: "super-secret".into(), // secret-scan-allow: test fixture (asserts non-leak)
             ..OidcConfig::default()
         };
         let dbg = format!("{config:?}");

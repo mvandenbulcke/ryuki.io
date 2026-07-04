@@ -819,7 +819,7 @@ mod oidc_callback_db_tests {
             cfg.oidc.enabled = true;
             cfg.oidc.issuer = TEST_ISS.to_string();
             cfg.oidc.client_id = TEST_AUD.to_string();
-            cfg.oidc.client_secret = "test-secret".to_string();
+            cfg.oidc.client_secret = "test-secret".to_string(); // secret-scan-allow: test fixture
             cfg.oidc.redirect_uri = "http://localhost:8080/api/auth/oidc/callback".to_string();
             cfg.oidc.roles_claim = "roles".to_string();
             // init_with_config panics if called twice; we guard it with the

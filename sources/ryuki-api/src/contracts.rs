@@ -37663,7 +37663,7 @@ mod unit_tests {
             Extension(std::sync::Arc::new(LocalLoginThrottle::default())),
             Json(LocalLoginRequest {
                 username: "admin".into(),
-                password: "placeholder-pass-1".into(),
+                password: "placeholder-pass-1".into(), // secret-scan-allow: test placeholder
             }),
         )
         .await

@@ -22,7 +22,7 @@ patterns=(
   'xox[baprs]-[0-9A-Za-z-]+'
   'gh[pousr]_[0-9A-Za-z_]{36,255}'
   'AIza[0-9A-Za-z_-]{35}'
-  '(?i)(password|passwd|pwd|client_secret|secret_key|access_token|refresh_token|bearer)[[:space:]]*[:=][[:space:]]*[^[:space:]"'\''`]{8,}'
+  '(?i)(password|passwd|pwd|client_secret|secret_key|access_token|refresh_token|bearer)[[:space:]]*[:=][[:space:]]*["'\''`]?[^[:space:]"'\''`]{8,}'
   'ryk_[A-Za-z0-9_-]{20,}'
 )
 

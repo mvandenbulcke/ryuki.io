@@ -5,7 +5,7 @@ services:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: ryuki
-      POSTGRES_PASSWORD: "ryuki_dev"
+      POSTGRES_PASSWORD: "ryuki_dev" # secret-scan-allow: local dev-only default, not a production secret
       POSTGRES_DB: ryuki_platform
     ports:
       - "5432:5432"
