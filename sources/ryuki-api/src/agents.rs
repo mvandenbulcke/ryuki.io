@@ -1023,10 +1023,22 @@ mod post_apply_ingest_tests {
 // EXPECTED to show changes and must never emit this event.
 // ---------------------------------------------------------------------------
 
+/// Is this job result a SCHEDULED drift-recheck re-plan — a LivePlan job the
+/// scheduler created with `origin='drift_recheck'`, reporting a completed plan?
+/// Both the drift classification (below) AND the cadence reset (#31 slice 2b:
+/// advancing the deployment's `last_drift_check_at`) key on this. A NORMAL operator
+/// LivePlan (origin NULL) is neither — it is expected to show changes and must never
+/// drive a drift event or reset the drift-recheck clock.
+fn is_drift_recheck_replan(mode: &JobMode, status: &JobResultStatus, origin: Option<&str>) -> bool {
+    *mode == JobMode::LivePlan
+        && *status == JobResultStatus::Planned
+        && origin == Some(ryuki_engine::drift_scan::DRIFT_RECHECK_JOB_ORIGIN)
+}
+
 /// #31 slice 2: does this result warrant a SCHEDULED-drift event? Only a drift-recheck-origin
-/// LivePlan (JobMode::LivePlan + JobResultStatus::Planned + origin == DRIFT_RECHECK_JOB_ORIGIN)
-/// whose DIGEST-VERIFIED plan bytes classify as DriftDetected emits. Verified/Inconclusive/any
-/// other mode/status/origin => None (fail-closed: never alert off an unclear or operator plan).
+/// LivePlan (see [`is_drift_recheck_replan`]) whose DIGEST-VERIFIED plan bytes classify as
+/// DriftDetected emits. Verified/Inconclusive/any other mode/status/origin => None (fail-closed:
+/// never alert off an unclear or operator plan).
 fn resolve_scheduled_drift_event(
     mode: JobMode,
     status: JobResultStatus,
@@ -1036,10 +1048,7 @@ fn resolve_scheduled_drift_event(
     use ryuki_engine::post_apply::{
         classify_plan_json, PostApplyOutcome, EVENT_SCHEDULED_DRIFT_DETECTED,
     };
-    if mode != JobMode::LivePlan || status != JobResultStatus::Planned {
-        return None;
-    }
-    if origin != Some(ryuki_engine::drift_scan::DRIFT_RECHECK_JOB_ORIGIN) {
+    if !is_drift_recheck_replan(&mode, &status, origin) {
         return None;
     }
     match classify_plan_json(evidence) {
@@ -1050,7 +1059,7 @@ fn resolve_scheduled_drift_event(
 
 #[cfg(test)]
 mod resolve_scheduled_drift_tests {
-    use super::resolve_scheduled_drift_event;
+    use super::{is_drift_recheck_replan, resolve_scheduled_drift_event};
     use ryuki_engine::drift_scan::DRIFT_RECHECK_JOB_ORIGIN;
     use ryuki_engine::event_alerts::{severity_for_request_status, AlertSeverity};
     use ryuki_engine::post_apply::EVENT_SCHEDULED_DRIFT_DETECTED;
@@ -1058,6 +1067,33 @@ mod resolve_scheduled_drift_tests {
 
     fn plan_with_actions(actions: &str) -> Vec<u8> {
         format!(r#"{{"resource_changes":[{{"change":{{"actions":{actions}}}}}]}}"#).into_bytes()
+    }
+
+    #[test]
+    fn is_drift_recheck_replan_gates_on_mode_status_and_origin() {
+        // The one true positive: a scheduler-origin LivePlan reporting a completed plan.
+        assert!(is_drift_recheck_replan(
+            &JobMode::LivePlan,
+            &JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+        ));
+        // Operator plan (no origin) — must NOT reset the clock or classify drift.
+        assert!(!is_drift_recheck_replan(
+            &JobMode::LivePlan,
+            &JobResultStatus::Planned,
+            None,
+        ));
+        // Wrong mode / wrong status.
+        assert!(!is_drift_recheck_replan(
+            &JobMode::LiveApply,
+            &JobResultStatus::Planned,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+        ));
+        assert!(!is_drift_recheck_replan(
+            &JobMode::LivePlan,
+            &JobResultStatus::Applied,
+            Some(DRIFT_RECHECK_JOB_ORIGIN),
+        ));
     }
 
     #[test]
@@ -1889,6 +1925,28 @@ async fn post_job_result_with_pool(
                 )
                 .await
                 .map_err(db_err)?;
+            }
+        }
+
+        // #31 slice 2b: a drift-recheck re-plan that produced a USABLE verdict
+        // (converged OR drift) is a fresh verification against live infra — advance
+        // the deployment's last_drift_check_at so the overdue scan does not
+        // re-flag/re-dispatch it until the next interval. Without this, a LivePlan
+        // never touches the last-LiveApply timestamp the overdue scan keys on, so an
+        // operational deployment would be re-checked every day forever until a real
+        // apply. Both a clean and a drift verdict reset the clock (a drift verdict is
+        // separately surfaced as the alert event above). An INCONCLUSIVE plan
+        // (unparseable / non-terraform evidence) is NOT a completed check: leave the
+        // clock so the next scan retries, rather than suppressing rechecks for a full
+        // interval off uninterpretable evidence (fail-safe, mirroring classify_plan_json).
+        if is_drift_recheck_replan(&stored_mode, &env.status, row.origin.as_deref()) {
+            let verdict = ryuki_engine::post_apply::classify_plan_json(&body.evidence);
+            if verdict != ryuki_engine::post_apply::PostApplyOutcome::Inconclusive {
+                sqlx::query("UPDATE requests SET last_drift_check_at = NOW() WHERE id = $1")
+                    .bind(stored_spec.request_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
             }
         }
 

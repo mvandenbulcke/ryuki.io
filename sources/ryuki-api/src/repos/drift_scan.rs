@@ -12,8 +12,13 @@ pub struct DriftRecheckCandidate {
     pub request_id: uuid::Uuid,
     pub site: String,
     pub environment: String,
-    /// The MOST RECENT successful live-apply verification: `agent_jobs.completed_at`
-    /// where `result_status` is 'applied' or 'verified'.
+    /// When this deployment was last verified against live infra: the GREATEST of
+    /// its most recent successful live-APPLY (`agent_jobs.completed_at` where
+    /// `result_status` is 'applied'/'verified') and its last completed drift
+    /// re-check (`requests.last_drift_check_at`, #31 slice 2b). Taking the later of
+    /// the two means a completed re-check RESETS the overdue clock — otherwise a
+    /// LivePlan re-check (which never advances the LiveApply timestamp) would leave
+    /// the deployment perpetually overdue and re-checked every scan.
     pub last_verified: chrono::DateTime<chrono::Utc>,
 }
 
@@ -36,7 +41,7 @@ pub async fn operational_deployments_for_drift_recheck<'e>(
 ) -> Result<Vec<DriftRecheckCandidate>, sqlx::Error> {
     sqlx::query_as::<_, DriftRecheckCandidate>(
         "SELECT r.id AS request_id, r.site, r.environment, \
-                MAX(j.completed_at) AS last_verified \
+                GREATEST(MAX(j.completed_at), MAX(r.last_drift_check_at)) AS last_verified \
          FROM requests r \
          JOIN agent_jobs j ON j.request_id = r.id \
          WHERE r.status = 'operational' \

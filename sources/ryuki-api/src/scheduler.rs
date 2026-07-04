@@ -6450,6 +6450,72 @@ mod db_tests {
         restore_migration_drift_scan(pool).await;
     }
 
+    /// #31 slice 2b cadence reset: a deployment with a RECENT last_drift_check_at is
+    /// NOT flagged overdue even if its last LiveApply is ancient — a completed
+    /// re-check resets the overdue clock (GREATEST(last apply, last_drift_check_at)).
+    #[tokio::test]
+    async fn recent_drift_check_resets_the_overdue_clock() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        // A 60-day-old apply WOULD be overdue on its own (interval is 14 days)...
+        seed_verified_agent_job(pool, &request_id, "NOW() - INTERVAL '60 days'").await;
+        // ...but a drift re-check 2 days ago reset the clock.
+        sqlx::query(
+            "UPDATE requests SET last_drift_check_at = NOW() - INTERVAL '2 days' WHERE id = $1::uuid",
+        )
+        .bind(&request_id)
+        .execute(pool)
+        .await
+        .expect("set last_drift_check_at");
+
+        let sched_id = seed_due_drift_scan(pool).await;
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_drift_recheck_count(pool, &request_id).await,
+            0,
+            "a deployment re-checked 2 days ago must NOT be flagged overdue despite a 60-day-old apply"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1::uuid")
+            .bind(&request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_drift_scan(pool).await;
+    }
+
     // ---- #61 noise_suppression_expiry_scan ---------------------------------
 
     /// The migration-142-seeded noise_suppression_expiry_scan id. Tests disable it

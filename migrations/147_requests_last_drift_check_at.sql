@@ -1,0 +1,13 @@
+-- 147_requests_last_drift_check_at.sql — record when a deployment was last drift-checked (#31 slice 2b).
+--
+-- The overdue drift-recheck scan (#31 slice 1) keys "last verified" on the most recent successful
+-- LiveApply (agent_jobs.completed_at). But a scheduled drift RE-CHECK is a LivePlan, which never
+-- advances that timestamp — so once an operational deployment crosses the interval it would be
+-- re-flagged (and, once dispatch lands, re-dispatched) every scan forever until a real apply.
+--
+-- This nullable column closes that cadence-reset loop: the control plane sets it to NOW() whenever
+-- a drift-recheck LivePlan result is ingested (clean OR drift), and the overdue scan takes
+-- GREATEST(last LiveApply, last_drift_check_at) as "last verified". A completed re-check therefore
+-- resets the clock. Nullable + no default so every existing INSERT INTO requests still works and a
+-- never-rechecked deployment simply falls back to its LiveApply time.
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS last_drift_check_at TIMESTAMPTZ;
