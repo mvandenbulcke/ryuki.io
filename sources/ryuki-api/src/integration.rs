@@ -411,6 +411,24 @@ pub struct ListConnectionsQuery {
     pub site: Option<String>,
 }
 
+// #18 slice 2a: dedicated inbound-webhook signing secret. This is DISTINCT from
+// credential_ref (the outbound credential we use to CALL the vendor) — the vendor
+// signs INBOUND webhooks with a secret configured in ITS system, so it must be
+// provisioned and stored separately. No #[derive(Debug)] — carries the plaintext
+// secret; custom Debug redacts it, mirroring CreateConnectionRequest.
+#[derive(Deserialize)]
+pub struct SetWebhookSecretRequest {
+    pub webhook_secret: String,
+}
+
+impl std::fmt::Debug for SetWebhookSecretRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetWebhookSecretRequest")
+            .field("webhook_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -1222,6 +1240,223 @@ pub async fn integration_update(
     }
 
     Err(integration_500("updates require a database connection"))
+}
+
+/// POST /api/integrations/{id}/webhook-secret — provision or rotate the connection's
+/// DEDICATED inbound-webhook signing secret (#18 slice 2a).
+///
+/// This is a SEPARATE secret from `credential_ref`: `credential_ref` is what we use to
+/// CALL the vendor (outbound), while `webhook_secret_ref` is what the vendor uses to
+/// SIGN webhooks it sends to us (inbound) — the two are configured independently in
+/// the vendor's system and must never be conflated or reused.
+///
+/// Mirrors `integration_update`'s db-encrypted secret-write path: same guards, same
+/// single-transaction update-or-insert, same audit-in-tx. NEVER echoes the secret back.
+pub async fn set_webhook_secret(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+    Json(body): Json<SetWebhookSecretRequest>,
+) -> ApiResult {
+    require_admin(&session)?;
+
+    let pool = get_db().ok_or_else(|| integration_500("updates require a database connection"))?;
+
+    // Fetch the current row (for the scope guard and the existing webhook_secret_ref).
+    let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
+        "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let conn = row
+        .ok_or_else(|| integration_not_found(&id))?
+        .into_connection();
+
+    // #2: guard on the LOADED row's site_scope — an out-of-scope id must be
+    // indistinguishable from a missing one (no oracle).
+    connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+
+    if body.webhook_secret.trim().is_empty() {
+        return Err(integration_400("webhook_secret must not be empty"));
+    }
+
+    let (ciphertext, nonce, key_id) = encrypt_secret(&conn.id, body.webhook_secret.as_bytes())
+        .map_err(|e| integration_500(&e.to_string()))?;
+
+    let now = now_iso();
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // Read the current webhook_secret_ref INSIDE the tx with FOR UPDATE. This locks
+    // the connection row so concurrent set_webhook_secret calls on the same
+    // connection SERIALIZE — otherwise the read-decide-(insert|update) below is a
+    // TOCTOU race in which two callers both take the insert branch and orphan a
+    // live, never-referenced secret row (integration_secrets has no unique
+    // constraint on connection_id). It also re-confirms the connection still exists
+    // in this tx: if it was deleted between the scope-guard load above and now, fail
+    // closed with the same no-oracle 404 rather than committing an audit row (and a
+    // dangling secret) for a vanished connection — the same guard integration_update
+    // uses via its RETURNING check.
+    let (locked_site_scope, existing_ref): (Option<String>, Option<String>) =
+        match sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT site_scope, webhook_secret_ref FROM integration_connections \
+             WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&conn.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        {
+            Some(row) => row,
+            None => {
+                tx.rollback().await.ok();
+                return Err(integration_not_found(&id));
+            }
+        };
+
+    // Re-run the scope guard on the LOCKED, current site_scope. The pre-tx scope
+    // check above raced against a possible site reassignment (integration_update can
+    // move a connection between sites): without this, a site-scoped admin could
+    // provision a webhook secret on a connection that has since moved OUT of their
+    // scope — a cross-scope authz gap that becomes forgery once the receiver handler
+    // lands. The FOR UPDATE lock pins site_scope for the rest of this tx, so
+    // re-checking it here closes the window.
+    if let Err(e) = connection_scope_guard(&session, locked_site_scope.as_deref(), &id) {
+        tx.rollback().await.ok();
+        return Err(e);
+    }
+
+    // Same anti-row-swap scoping as integration_update / resolve_credentials:
+    // the UPDATE is scoped to (id, connection_id) so a stale/foreign ref can never
+    // overwrite another connection's secret row.
+    let rows_updated: u64 = if let Some(ref secret_id) = existing_ref {
+        sqlx::query(
+            "UPDATE integration_secrets \
+             SET ciphertext=$1, nonce=$2, key_id=$3, updated_at=$4 \
+             WHERE id=$5 AND connection_id=$6",
+        )
+        .bind(&ciphertext)
+        .bind(&nonce)
+        .bind(&key_id)
+        .bind(&now)
+        .bind(secret_id)
+        .bind(&conn.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+    } else {
+        0
+    };
+
+    let webhook_secret_ref = if rows_updated == 0 {
+        // No existing row owned by this connection (first provision, or a stale/NULL
+        // ref) — mint a fresh server-owned id and insert. NEVER caller-supplied.
+        let new_secret_id = format!("is-wh-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO integration_secrets \
+             (id, connection_id, ciphertext, nonce, key_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(&new_secret_id)
+        .bind(&conn.id)
+        .bind(&ciphertext)
+        .bind(&nonce)
+        .bind(&key_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            "UPDATE integration_connections SET webhook_secret_ref=$1, updated_at=$2 WHERE id=$3",
+        )
+        .bind(&new_secret_id)
+        .bind(&now)
+        .bind(&conn.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        new_secret_id
+    } else {
+        sqlx::query("UPDATE integration_connections SET updated_at=$1 WHERE id=$2")
+            .bind(&now)
+            .bind(&conn.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        existing_ref.expect("rows_updated > 0 implies existing_ref was Some")
+    };
+
+    // Audit in the SAME tx as the mutation — NEVER logs the secret, only the ref id.
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "integration.set_webhook_secret",
+            None,
+            "configured",
+            json!({
+                "connection_id": conn.id,
+                "webhook_secret_ref": webhook_secret_ref,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    Ok(Json(json!({"status": "ok"})))
+}
+
+/// Resolve the DEDICATED inbound-webhook signing secret for `connection_id`, if one
+/// is configured. Read counterpart of [`set_webhook_secret`] for the (later) receiver
+/// handler slice.
+///
+/// Returns `Ok(None)` when no webhook secret is configured (NULL `webhook_secret_ref`)
+/// OR when the ref points at a row that no longer exists — both are treated as
+/// "unconfigured" so the caller fails closed (401) rather than erroring. Uses the same
+/// anti-row-swap scoping as `resolve_credentials`' FIX-2: the secret lookup is scoped
+/// to `(id, connection_id)`, so a foreign ref can never resolve another connection's
+/// secret.
+// Not yet called from non-test production code: the auth-bypass receiver handler that
+// will call this is a SEPARATE follow-up slice (#18 slice 2b). Exercised by the
+// `integration_db_tests` db tests today; `--all-targets` clippy compiles the bin target
+// on its own (without the #[cfg(test)] module in scope), so it flags this as dead
+// without the allow. Remove this attribute once the receiver slice lands.
+#[allow(dead_code)]
+pub async fn resolve_webhook_secret(
+    pool: &sqlx::PgPool,
+    connection_id: &str,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, CredError> {
+    let webhook_secret_ref: Option<String> =
+        sqlx::query_scalar("SELECT webhook_secret_ref FROM integration_connections WHERE id = $1")
+            .bind(connection_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| CredError::Db(e.to_string()))?
+            .flatten();
+    let Some(secret_ref) = webhook_secret_ref else {
+        return Ok(None);
+    };
+
+    let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT ciphertext, nonce FROM integration_secrets \
+         WHERE id = $1 AND connection_id = $2",
+    )
+    .bind(&secret_ref)
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| CredError::Db(e.to_string()))?;
+    let Some((ciphertext, nonce)) = row else {
+        // A non-null ref with no matching row: treat as unconfigured, not an error.
+        return Ok(None);
+    };
+
+    let plaintext = decrypt_secret(connection_id, &ciphertext, &nonce)?;
+    Ok(Some(plaintext))
 }
 
 /// DELETE /api/integrations/{id} — delete connection (cascades to integration_secrets).
@@ -2205,6 +2440,10 @@ pub fn routes() -> axum::Router {
         .route("/api/integrations/{id}", get(integration_get))
         .route("/api/integrations/{id}", put(integration_update))
         .route("/api/integrations/{id}", delete(integration_delete))
+        .route(
+            "/api/integrations/{id}/webhook-secret",
+            post(set_webhook_secret),
+        )
         .route("/api/integrations/{id}/test", post(integration_test))
         .route(
             "/api/integrations/{id}/health",
@@ -2296,6 +2535,235 @@ pub mod integration_db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// Insert a minimal db-encrypted-source connection row for webhook-secret tests.
+    /// The outbound credential_source/credential_ref are irrelevant to these tests
+    /// (webhook_secret_ref is an independent column) but a value is required by the
+    /// NOT NULL / CHECK constraints on integration_connections.
+    async fn insert_test_connection(pool: &PgPool, id: &str) {
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              status, readiness, execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 'webhook-secret-test', 'https://x.example', \
+                     'vault', 'p', 'configured', 'configured', 'static-dry-run', \
+                     'sys', $2, $2)",
+        )
+        .bind(id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert connection");
+    }
+
+    /// #18 slice 2a: provisioning a webhook secret on a fresh connection creates
+    /// exactly one integration_secrets row and points webhook_secret_ref at it;
+    /// resolve_webhook_secret returns the exact plaintext bytes.
+    #[tokio::test]
+    async fn set_webhook_secret_provisions_and_resolves() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-{}", uuid::Uuid::new_v4());
+        insert_test_connection(&pool, &conn_id).await;
+
+        // No webhook secret configured yet -> None (fail-closed downstream).
+        let before = resolve_webhook_secret(&pool, &conn_id)
+            .await
+            .expect("resolve must not error for an unconfigured secret");
+        assert!(
+            before.is_none(),
+            "a connection with NULL webhook_secret_ref must resolve to None"
+        );
+
+        let plaintext = b"webhook-signing-secret-v1";
+        let now = now_iso();
+        let mut tx = pool.begin().await.expect("begin tx");
+        let (ciphertext, nonce, key_id) =
+            encrypt_secret(&conn_id, plaintext).expect("encrypt must succeed");
+        let secret_id = format!("is-wh-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO integration_secrets \
+             (id, connection_id, ciphertext, nonce, key_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(&secret_id)
+        .bind(&conn_id)
+        .bind(&ciphertext)
+        .bind(&nonce)
+        .bind(&key_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .expect("insert webhook secret row");
+        sqlx::query(
+            "UPDATE integration_connections SET webhook_secret_ref=$1, updated_at=$2 WHERE id=$3",
+        )
+        .bind(&secret_id)
+        .bind(&now)
+        .bind(&conn_id)
+        .execute(&mut *tx)
+        .await
+        .expect("set webhook_secret_ref");
+        tx.commit().await.expect("commit tx");
+
+        let secret_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_secrets WHERE connection_id = $1")
+                .bind(&conn_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            secret_count, 1,
+            "exactly one integration_secrets row for the webhook secret"
+        );
+
+        let resolved = resolve_webhook_secret(&pool, &conn_id)
+            .await
+            .expect("resolve must succeed")
+            .expect("a webhook secret was configured");
+        assert_eq!(
+            resolved.to_vec(),
+            plaintext.to_vec(),
+            "resolved plaintext must match what was provisioned"
+        );
+
+        cleanup_connection(&pool, &conn_id).await;
+    }
+
+    /// #18 slice 2a: rotating an already-configured webhook secret updates the
+    /// EXISTING integration_secrets row in place (still exactly one row for that
+    /// ref) rather than leaking an orphan, and resolve returns the NEW plaintext.
+    #[tokio::test]
+    async fn set_webhook_secret_rotate_updates_in_place() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-rotate-{}", uuid::Uuid::new_v4());
+        insert_test_connection(&pool, &conn_id).await;
+
+        // Provision v1 (mirrors the handler's first-provision insert path).
+        let plaintext_v1 = b"webhook-signing-secret-v1";
+        let now = now_iso();
+        let (ct1, nonce1, kid1) = encrypt_secret(&conn_id, plaintext_v1).unwrap();
+        let secret_id = format!("is-wh-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO integration_secrets \
+             (id, connection_id, ciphertext, nonce, key_id, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(&secret_id)
+        .bind(&conn_id)
+        .bind(&ct1)
+        .bind(&nonce1)
+        .bind(&kid1)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert v1 webhook secret");
+        sqlx::query(
+            "UPDATE integration_connections SET webhook_secret_ref=$1, updated_at=$2 WHERE id=$3",
+        )
+        .bind(&secret_id)
+        .bind(&now)
+        .bind(&conn_id)
+        .execute(&pool)
+        .await
+        .expect("set webhook_secret_ref v1");
+
+        // Rotate to v2 (mirrors the handler's UPDATE-in-place path when a ref exists).
+        let plaintext_v2 = b"webhook-signing-secret-v2-rotated";
+        let (ct2, nonce2, kid2) = encrypt_secret(&conn_id, plaintext_v2).unwrap();
+        let rotate_now = chrono::Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.expect("begin tx");
+        let rows_updated: u64 = sqlx::query(
+            "UPDATE integration_secrets \
+             SET ciphertext=$1, nonce=$2, key_id=$3, updated_at=$4 \
+             WHERE id=$5 AND connection_id=$6",
+        )
+        .bind(&ct2)
+        .bind(&nonce2)
+        .bind(&kid2)
+        .bind(&rotate_now)
+        .bind(&secret_id)
+        .bind(&conn_id)
+        .execute(&mut *tx)
+        .await
+        .expect("rotate webhook secret")
+        .rows_affected();
+        assert_eq!(rows_updated, 1, "rotation must update exactly one row");
+        sqlx::query("UPDATE integration_connections SET updated_at=$1 WHERE id=$2")
+            .bind(&rotate_now)
+            .bind(&conn_id)
+            .execute(&mut *tx)
+            .await
+            .expect("touch connection updated_at");
+        tx.commit().await.expect("commit rotate tx");
+
+        let secret_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_secrets WHERE connection_id = $1")
+                .bind(&conn_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            secret_count, 1,
+            "rotation must still leave exactly one webhook secret row for this connection"
+        );
+
+        let resolved = resolve_webhook_secret(&pool, &conn_id)
+            .await
+            .expect("resolve must succeed")
+            .expect("a webhook secret is configured");
+        assert_eq!(
+            resolved.to_vec(),
+            plaintext_v2.to_vec(),
+            "resolve must return the NEW (rotated) plaintext"
+        );
+        assert_ne!(
+            resolved.to_vec(),
+            plaintext_v1.to_vec(),
+            "resolve must not return the stale plaintext after rotation"
+        );
+
+        cleanup_connection(&pool, &conn_id).await;
+    }
+
+    /// #18 slice 2a: a connection with a NULL webhook_secret_ref resolves to None
+    /// (fail-closed for the later receiver handler), not an error.
+    #[tokio::test]
+    async fn resolve_webhook_secret_none_when_unconfigured() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+
+        let conn_id = format!("ic-webhook-none-{}", uuid::Uuid::new_v4());
+        insert_test_connection(&pool, &conn_id).await;
+
+        let resolved = resolve_webhook_secret(&pool, &conn_id)
+            .await
+            .expect("resolve must not error for a NULL ref");
+        assert!(
+            resolved.is_none(),
+            "NULL webhook_secret_ref must resolve to None, not an error"
+        );
+
+        cleanup_connection(&pool, &conn_id).await;
     }
 
     /// #19: a connection's health-check history rows persist and cascade-delete
