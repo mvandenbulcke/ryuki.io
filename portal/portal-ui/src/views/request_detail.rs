@@ -308,6 +308,21 @@ pub fn RequestDetail() -> impl IntoView {
     #[allow(deprecated)]
     let (reason_error, set_reason_error) = create_signal(String::new());
 
+    // Reset transient per-request UI state whenever the routed request id changes.
+    // leptos_router reuses this component across /requests/:id navigations, so a
+    // stale feedback badge — or, worse, an OPEN reject/cancel reason panel whose
+    // Confirm would then dispatch against the NEW request id — must be cleared on
+    // navigation. The effect depends ONLY on request_id (not the signals it sets),
+    // so it fires once per navigation with no feedback loop.
+    Effect::new(move |_| {
+        request_id.track();
+        set_action_feedback.set(String::new());
+        set_action_class.set("badge neutral");
+        set_pending_reason_action.set(None);
+        set_reason_text.set(String::new());
+        set_reason_error.set(String::new());
+    });
+
     let validate_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Validating...".to_string());
