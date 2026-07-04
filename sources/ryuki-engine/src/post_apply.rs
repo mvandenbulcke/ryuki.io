@@ -118,6 +118,66 @@ pub fn classify_post_apply(replan_summary: &str) -> PostApplyOutcome {
     }
 }
 
+/// Classify a terraform `show -json` plan DOCUMENT into a convergence verdict.
+///
+/// This is the JSON-native counterpart to [`classify_post_apply`] (which reads the
+/// human "Plan: …" summary line). It exists for the SCHEDULED drift re-check (#31):
+/// a `LivePlan` result's digest-verified evidence bytes are the canonical
+/// `terraform show -json` document, NOT a serialized `RunOutcome`, so the summary
+/// string is only in the UNSIGNED `evidence_json`. Reading the verdict from
+/// `resource_changes` here lets the control plane classify scheduled drift off the
+/// SAME cryptographically verified bytes whose digest matched the signed envelope —
+/// preserving the #43 "never decide off unsigned evidence" discipline.
+///
+/// A resource change whose `change.actions` contains any MUTATING action ⇒
+/// [`PostApplyOutcome::DriftDetected`] (the live resource no longer matches the
+/// applied config). Only terraform's `no-op` and `read` (data-source refresh) are
+/// treated as non-mutating; EVERY other action — `create`/`update`/`delete`, the
+/// `forget` of a `removed` block, or any future/unknown action string — counts as
+/// drift. Erring toward drift is the SAFE polarity: a spurious drift alert costs an
+/// operator a look, whereas silently verifying an unrecognized action would MISS
+/// real drift. All-`no-op`/`read` (or an empty `resource_changes`) ⇒
+/// [`PostApplyOutcome::Verified`]. Bytes that are not a parseable plan document (no
+/// JSON, no `resource_changes` array, or a change entry without an `actions` array)
+/// ⇒ [`PostApplyOutcome::Inconclusive`] (fail-closed — never a false `Verified` off
+/// an uninterpretable plan).
+pub fn classify_plan_json(plan_json: &[u8]) -> PostApplyOutcome {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(plan_json) else {
+        return PostApplyOutcome::Inconclusive;
+    };
+    let Some(changes) = doc.get("resource_changes").and_then(|v| v.as_array()) else {
+        // A terraform plan document always carries a `resource_changes` array
+        // (possibly empty). Its absence means this is not a plan document we can
+        // trust to mean "converged" — fail closed.
+        return PostApplyOutcome::Inconclusive;
+    };
+    let mut any_mutation = false;
+    for rc in changes {
+        let Some(actions) = rc
+            .get("change")
+            .and_then(|c| c.get("actions"))
+            .and_then(|a| a.as_array())
+        else {
+            // A resource_change without a parseable actions array is malformed —
+            // do not silently treat it as converged.
+            return PostApplyOutcome::Inconclusive;
+        };
+        for action in actions {
+            // Non-mutating actions ONLY: "no-op" and "read". Anything else (incl.
+            // "forget" and any future action) is a pending change ⇒ drift.
+            match action.as_str() {
+                Some("no-op") | Some("read") => {}
+                _ => any_mutation = true,
+            }
+        }
+    }
+    if any_mutation {
+        PostApplyOutcome::DriftDetected
+    } else {
+        PostApplyOutcome::Verified
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +239,82 @@ mod tests {
         assert!(PostApplyOutcome::Verified.is_verified());
         assert!(!PostApplyOutcome::DriftDetected.is_verified());
         assert!(!PostApplyOutcome::Inconclusive.is_verified());
+    }
+
+    // -- classify_plan_json (#31 scheduled drift, JSON-native over verified bytes) --
+
+    #[test]
+    fn plan_json_no_changes_is_verified() {
+        // Empty resource_changes and all-no-op both mean converged.
+        assert_eq!(
+            classify_plan_json(br#"{"resource_changes":[]}"#),
+            PostApplyOutcome::Verified
+        );
+        let all_noop = br#"{"resource_changes":[
+            {"address":"a","change":{"actions":["no-op"]}},
+            {"address":"b","change":{"actions":["read"]}}
+        ]}"#;
+        assert_eq!(classify_plan_json(all_noop), PostApplyOutcome::Verified);
+    }
+
+    #[test]
+    fn plan_json_any_mutation_is_drift() {
+        for actions in [
+            r#"["create"]"#,
+            r#"["update"]"#,
+            r#"["delete"]"#,
+            // Replace is emitted as a delete+create pair.
+            r#"["delete","create"]"#,
+        ] {
+            let doc = format!(r#"{{"resource_changes":[{{"change":{{"actions":{actions}}}}}]}}"#);
+            assert_eq!(
+                classify_plan_json(doc.as_bytes()),
+                PostApplyOutcome::DriftDetected,
+                "actions {actions} must be drift"
+            );
+        }
+        // One mutating change among no-ops is still drift.
+        let mixed = br#"{"resource_changes":[
+            {"change":{"actions":["no-op"]}},
+            {"change":{"actions":["update"]}}
+        ]}"#;
+        assert_eq!(classify_plan_json(mixed), PostApplyOutcome::DriftDetected);
+    }
+
+    #[test]
+    fn plan_json_forget_or_unknown_action_is_drift_not_verified() {
+        // Fail-safe polarity: anything that is NOT no-op/read is a pending change —
+        // "forget" (removed blocks) and any future/unknown action must count as
+        // drift, never silently Verified.
+        for actions in [r#"["forget"]"#, r#"["some-future-action"]"#] {
+            let doc = format!(r#"{{"resource_changes":[{{"change":{{"actions":{actions}}}}}]}}"#);
+            assert_eq!(
+                classify_plan_json(doc.as_bytes()),
+                PostApplyOutcome::DriftDetected,
+                "unrecognized action {actions} must be drift, not verified"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_json_unparseable_is_inconclusive_not_verified() {
+        for bytes in [
+            &b""[..],
+            &b"not json"[..],
+            // Missing the resource_changes array entirely.
+            &br#"{"format_version":"1.2"}"#[..],
+            // A change entry with no actions array is malformed.
+            &br#"{"resource_changes":[{"change":{}}]}"#[..],
+        ] {
+            let outcome = classify_plan_json(bytes);
+            assert_eq!(
+                outcome,
+                PostApplyOutcome::Inconclusive,
+                "must be inconclusive for {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert!(!outcome.is_verified());
+        }
     }
 
     #[test]
