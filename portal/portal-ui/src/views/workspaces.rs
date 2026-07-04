@@ -14,8 +14,8 @@ use crate::api_client::{
     secret_references_resource, ApiResource,
 };
 use crate::models::{
-    audit_gate_fallbacks, audit_workflow_fallbacks, auth_session_fallback,
-    catalog_contract_fallbacks, catalog_readiness_fallbacks, condense_timestamp,
+    audit_gate_fallbacks, audit_workflow_fallbacks, catalog_contract_fallbacks,
+    catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session,
     normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
     rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
     AdminTokenSummary, AuditEventRow, AuthSession, CmdbActionResult, CreateTokenPayload,
@@ -59,7 +59,7 @@ fn resource_api_path<T>(resource: ApiResource<T>) -> &'static str {
 fn WorkspaceSummaryCards(#[prop(optional)] only: Option<&'static str>) -> impl IntoView {
     // Real session roles arrive through context from the auth gate; the
     // labeled synthetic fallback only covers out-of-gate renders.
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
 
     // On an individual workspace tab a single summary card renders; the
     // multi-column grid would leave it half-width with an empty cell beside it,
@@ -190,7 +190,7 @@ pub fn RequestsWorkspaceView() -> impl IntoView {
 /// a directly-navigated route hides the list from non-approvers.
 #[component]
 pub fn ApprovalsWorkspaceView() -> impl IntoView {
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let can_approve = session_can(&auth_session, "approve");
 
     view! {
@@ -317,7 +317,7 @@ pub fn AdminWorkspaceView() -> impl IntoView {
     // gated again on the `admin` capability so non-admins never see or act on
     // them even if the route is reached (defense in depth — the upstream API is
     // the authoritative gate, this prevents rendering the controls at all).
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let is_admin = session_can(&auth_session, "admin");
 
     view! {
@@ -342,7 +342,7 @@ pub fn AdminWorkspaceView() -> impl IntoView {
 /// PR-A ships the structural wiring; the functional list/form comes in PR-B.
 #[component]
 pub fn IntegrationsWorkspaceView() -> impl IntoView {
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let is_admin = session_can(&auth_session, "admin");
 
     view! {
@@ -371,7 +371,7 @@ pub fn IntegrationsWorkspaceView() -> impl IntoView {
 /// Admin-gated (PlatformAdmin only), mirroring `IntegrationsWorkspaceView`.
 #[component]
 pub fn AgentsWorkspaceView() -> impl IntoView {
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let is_admin = session_can(&auth_session, "admin");
 
     view! {
@@ -1139,7 +1139,7 @@ fn cmdb_action_feedback(result: &CmdbActionResult) -> (&'static str, String) {
 
 #[component]
 fn CmdbWorkspaceDetail() -> impl IntoView {
-    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let is_admin = session_can(&auth_session, "admin");
 
     let snapshot =
