@@ -60,7 +60,7 @@ implementing **all 66**. This file tracks execution.
 | 28 | [ ] | Active Directory / Entra integration adapter | Integ | L | H | — |
 | 29 | [ ] | DR failover orchestration (runbook-driven) | Resil | L | H | — |
 | 30 | [x] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
-| 31 | [ ] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | ✓ |
+| 31 | [x] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | `02ab45f`/`688561d`/`c86fb0b`/`06fbf03`/`6d8339a` — overdue-flag scan → classify_plan_json → CP drift event → cadence reset → scheduler dispatches read-only LivePlan rechecks (first agent_job-creating scan; mig 145-148). Reuses #43 machinery. Codex-xhigh reviewed, live-DB verified |
 | 32 | [x] | Per-notification mark-read + deep-link | Portal | S | M | — |
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
 | 34 | [x] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
@@ -72,7 +72,7 @@ implementing **all 66**. This file tracks execution.
 | 40 | [x] | Scheduled/recurring synthetic health checks | Observ | S | M | `715f126` — durable scheduler runs synthetic_health_run (first safe-internal-write kind: job_is_schedulable allowlist); hourly seed (mig 116) + tx-aware result writes |
 | 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
-| 43 | [ ] | Post-apply verification (re-plan → Verified) | Exec | M | M | — |
+| 43 | [x] | Post-apply verification (re-plan → Verified) | Exec | M | M | `349b152`/`e5c7b52`/`2f5ee2b` — engine classifier (post_apply.rs) → runner re-plan verdict in RunOutcome → CP derives verdict from digest-verified evidence, transitions Applied→Verified + emits scoped request.post-apply-drift (Critical). All Codex-xhigh reviewed |
 | 44 | [x] | Agent liveness sweep + offline detection | Exec | M | M | ALREADY DONE — spawn_agent_offline_scan (main.rs, 60s/180s) + agent_offline_scan_once emits agent.offline/agent.online on state transitions, deduped via offline_alerted (mig 114), with notifications + to_status warning alert. (A durable-scheduler port was scoped but abandoned as redundant — codex plan-review caught the existing emitter.) |
 | 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
 | 46 | [x] | Chargeback / showback cost allocation | AIOps | M | M | — |
