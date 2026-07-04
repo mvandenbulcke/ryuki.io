@@ -58,6 +58,20 @@ pub fn NotificationBell() -> impl IntoView {
         }
     });
 
+    // Refetch on panel open. Both resources are keyed on `()` and otherwise only
+    // refetch after the user's own mark-read actions, so a notification that
+    // arrived after page load would never appear and the badge would stay frozen
+    // for the whole session. Refetching each time the panel opens picks up new
+    // notifications on demand. (The effect depends only on panel_open, not on the
+    // resource values, so there is no refetch loop; a background badge poll is a
+    // possible follow-up.)
+    Effect::new(move |_| {
+        if panel_open.get() {
+            unread.refetch();
+            list.refetch();
+        }
+    });
+
     let on_toggle = move |_| set_panel_open.update(|open| *open = !*open);
     let on_mark_all = move |_| {
         mark_all.dispatch(());
