@@ -1,14 +1,25 @@
-//! Hand-maintained OpenAPI 3.1 document for the AGENT-PROTOCOL endpoints.
+//! Hand-maintained OpenAPI 3.1 document for three route groups:
 //!
-//! This is the machine-readable surface external agents integrate against
-//! (`sources/ryuki-api/src/agents.rs::agent_routes()`). It is a PURE data
-//! builder — no IO, no DB, no axum state — so it is trivially unit-testable
-//! and cannot drift from reality silently: [`crate::agents::AGENT_ROUTE_PATHS`]
-//! is cross-checked against this document's `paths` in the test module below.
+//!   1. AGENT-PROTOCOL endpoints — the machine-readable surface external
+//!      agents integrate against (`sources/ryuki-api/src/agents.rs::agent_routes()`),
+//!      cross-checked against [`crate::agents::AGENT_ROUTE_PATHS`].
+//!   2. PUBLIC endpoints — the no-auth surface (health/readiness probes +
+//!      pre-login bootstrap reads), cross-checked against
+//!      [`crate::PUBLIC_ROUTE_PATHS`].
+//!   3. OPS-READ endpoints — a bounded, read-only operational surface (events/
+//!      alerts feed, scheduler introspection) gated behind a session +
+//!      permission tier, cross-checked against
+//!      [`crate::contracts::OPS_READ_ROUTE_PATHS`].
+//!
+//! This is a PURE data builder — no IO, no DB, no axum state — so it is
+//! trivially unit-testable and cannot drift from reality silently: the test
+//! module below asserts `paths` equals the exact union of all three
+//! source-of-truth constants.
 //!
 //! Deliberately hand-transcribed (NOT generated via utoipa/schemars): no new
 //! dependency, no annotations on existing handlers/types. Keep this in sync
-//! by hand whenever `agents.rs` or `ryuki-protocol/src/types.rs` change shape.
+//! by hand whenever `agents.rs`, `main.rs`, `contracts.rs`, or
+//! `ryuki-protocol/src/types.rs` change shape.
 
 use serde_json::{json, Value};
 
@@ -20,12 +31,15 @@ pub fn openapi_document() -> Value {
         "info": {
             "title": "Ryuki Agent Protocol API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Machine-readable contract for the CP↔agent wire protocol \
-                (registration, job polling/lease, ack, result submission, heartbeat). \
-                All endpoints except `cp-public-key` require an agent bearer token \
-                (`Authorization: Bearer rya_...`). Every request MAY carry the \
-                `x-ryuki-protocol-version` header; an absent header is treated as \
-                legacy version 1."
+            "description": "Machine-readable contract for three route groups. (1) The \
+                CP↔agent wire protocol (registration, job polling/lease, ack, result \
+                submission, heartbeat): all endpoints except `cp-public-key` require an \
+                agent bearer token (`Authorization: Bearer rya_...`), and every request \
+                MAY carry the `x-ryuki-protocol-version` header (absent => legacy version \
+                1). (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
+                bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts \
+                feed, scheduler introspection) that requires an operator session and a \
+                permission tier, documented for operational tooling, not external agents."
         },
         "servers": [
             { "url": "/", "description": "Same-origin control plane" }
@@ -38,6 +52,15 @@ pub fn openapi_document() -> Value {
                     "bearerFormat": "rya_<hex>",
                     "description": "Agent-issued bearer token returned once by \
                         POST /api/agents/register. Sent as `Authorization: Bearer rya_...`."
+                },
+                "apiSessionHeader": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Ryuki-Session-Id",
+                    "description": "Operator session identifier for the ops-read surface. \
+                        `Authorization: Bearer <session-uuid>` and the `ryuki_session` cookie \
+                        are alternate carriers of the same session; any one of the three is \
+                        sufficient."
                 }
             },
             "parameters": {
@@ -314,6 +337,255 @@ pub fn openapi_document() -> Value {
                     "properties": {
                         "error": { "type": "string" }
                     }
+                },
+                "ProblemDetails": {
+                    "type": "object",
+                    "description": "RFC 9457-shaped error body returned by the public infra \
+                        probes (`/health`, `/ready`) on failure.",
+                    "required": ["error", "message"],
+                    "properties": {
+                        "error": { "type": "string", "example": "DATABASE_UNAVAILABLE" },
+                        "message": { "type": "string" },
+                        "detail": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        }
+                    }
+                },
+                "HealthResponse": {
+                    "type": "object",
+                    "description": "Liveness probe result. `status` is `degraded` (still 200) \
+                        when the database is disconnected or hard config validation fails.",
+                    "required": ["status", "database", "config", "auth_mode", "rate_limit_enabled"],
+                    "properties": {
+                        "status": { "type": "string", "enum": ["healthy", "degraded"] },
+                        "database": {
+                            "type": "object",
+                            "required": ["connected", "provider"],
+                            "properties": {
+                                "connected": { "type": "boolean" },
+                                "provider": { "type": "string" }
+                            }
+                        },
+                        "config": {
+                            "type": "object",
+                            "required": ["valid", "errors", "warnings"],
+                            "properties": {
+                                "valid": { "type": "boolean" },
+                                "errors": { "type": "array", "items": { "type": "string" } },
+                                "warnings": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "auth_mode": { "type": "string" },
+                        "rate_limit_enabled": { "type": "boolean" }
+                    }
+                },
+                "ReadyResponse": {
+                    "type": "object",
+                    "description": "Readiness probe result. Returned only on success (200); \
+                        failure returns a 503 ProblemDetails instead (DRAINING, \
+                        READINESS_CHECK_FAILED, CONFIG_INVALID, DATABASE_UNAVAILABLE, and \
+                        related database-unusable/migration codes).",
+                    "required": ["status"],
+                    "properties": {
+                        "status": { "type": "string", "example": "ready" }
+                    },
+                    "additionalProperties": true
+                },
+                "AuthStatusResponse": {
+                    "type": "object",
+                    "required": ["tenant_configured", "client_configured", "enabled", "instance"],
+                    "properties": {
+                        "tenant_configured": { "type": "boolean" },
+                        "client_configured": { "type": "boolean" },
+                        "enabled": { "type": "boolean" },
+                        "instance": { "type": "string" }
+                    }
+                },
+                "AuthSession": {
+                    "type": "object",
+                    "description": "The resolved session for the caller. `site_scope` / \
+                        `environment_scope` are omitted entirely when empty (unscoped \
+                        principal), not sent as empty arrays.",
+                    "required": ["user_id", "display_name", "roles", "token_valid", "provider_mode"],
+                    "properties": {
+                        "user_id": { "type": "string" },
+                        "display_name": { "type": "string" },
+                        "roles": { "type": "array", "items": { "type": "string" } },
+                        "token_valid": { "type": "boolean" },
+                        "provider_mode": { "type": "string" },
+                        "site_scope": { "type": "array", "items": { "type": "string" } },
+                        "environment_scope": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "RbacRole": {
+                    "type": "object",
+                    "required": ["name", "description", "permissions"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "permissions": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "PlatformSummaryResponse": {
+                    "type": "object",
+                    "required": [
+                        "productName", "lifecycleStages", "components", "guardrails",
+                        "browserIsolation", "localAuthorization"
+                    ],
+                    "properties": {
+                        "productName": { "type": "string" },
+                        "lifecycleStages": {
+                            "type": "array",
+                            "description": "Ordered lifecycle stage descriptors.",
+                            "items": { "type": "object" }
+                        },
+                        "components": {
+                            "type": "array",
+                            "description": "Platform component descriptors.",
+                            "items": { "type": "object" }
+                        },
+                        "guardrails": {
+                            "type": "array",
+                            "description": "Guardrail descriptors.",
+                            "items": { "type": "object" }
+                        },
+                        "browserIsolation": { "type": "boolean" },
+                        "localAuthorization": {
+                            "type": "object",
+                            "required": [
+                                "authenticationMode", "configuredForProduction",
+                                "entraGroupsConfigured", "roleHeader", "requiredProductionProvider"
+                            ],
+                            "properties": {
+                                "authenticationMode": { "type": "string" },
+                                "configuredForProduction": { "type": "boolean" },
+                                "entraGroupsConfigured": { "type": "boolean" },
+                                "roleHeader": { "type": "string" },
+                                "requiredProductionProvider": { "type": "string" }
+                            }
+                        }
+                    }
+                },
+                "ScheduleView": {
+                    "type": "object",
+                    "required": ["id", "name", "job_kind", "interval_secs", "enabled", "next_run_at"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "job_kind": { "type": "string" },
+                        "interval_secs": { "type": "integer", "format": "int64" },
+                        "enabled": { "type": "boolean" },
+                        "next_run_at": { "type": "string", "format": "date-time" },
+                        "last_run_at": {
+                            "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }]
+                        }
+                    }
+                },
+                "SchedulerSchedulesResponse": {
+                    "type": "object",
+                    "required": ["schedules", "durable"],
+                    "properties": {
+                        "schedules": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleView" } },
+                        "durable": { "type": "boolean", "description": "False when no database is configured (empty list)." }
+                    }
+                },
+                "ExecutionView": {
+                    "type": "object",
+                    "required": ["id", "schedule_id", "job_kind", "status", "started_at"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "schedule_id": { "type": "string" },
+                        "job_kind": { "type": "string" },
+                        "status": { "type": "string" },
+                        "detail": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "started_at": { "type": "string", "format": "date-time" },
+                        "finished_at": {
+                            "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }]
+                        }
+                    }
+                },
+                "SchedulerExecutionsResponse": {
+                    "type": "object",
+                    "required": ["executions", "durable"],
+                    "properties": {
+                        "executions": { "type": "array", "items": { "$ref": "#/components/schemas/ExecutionView" } },
+                        "durable": { "type": "boolean", "description": "False when no database is configured (empty list)." }
+                    }
+                },
+                "EventItem": {
+                    "type": "object",
+                    "required": ["id", "event_type", "aggregate_type", "aggregate_id", "actor", "payload", "occurred_at"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "event_type": { "type": "string" },
+                        "aggregate_type": { "type": "string" },
+                        "aggregate_id": { "type": "string" },
+                        "site": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "environment": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "actor": { "type": "string" },
+                        "payload": {
+                            "description": "The event's structured payload — an arbitrary JSON value \
+                                (the column is a serde_json::Value); conventionally a JSON object but \
+                                NOT type-constrained, so an untyped schema (per OpenAPI 3.1, any type)."
+                        },
+                        "occurred_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "EventsResponse": {
+                    "type": "object",
+                    "required": ["events", "durable"],
+                    "properties": {
+                        "events": { "type": "array", "items": { "$ref": "#/components/schemas/EventItem" } },
+                        "durable": { "type": "boolean", "description": "False when no database is configured (empty list)." }
+                    }
+                },
+                "AlertItem": {
+                    "type": "object",
+                    "required": [
+                        "id", "event_type", "aggregate_type", "aggregate_id", "actor",
+                        "severity", "payload", "occurred_at", "acknowledged"
+                    ],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "event_type": { "type": "string" },
+                        "aggregate_type": { "type": "string" },
+                        "aggregate_id": { "type": "string" },
+                        "site": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "environment": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "actor": { "type": "string" },
+                        "severity": { "type": "string", "example": "critical" },
+                        "payload": {
+                            "description": "The event's structured payload — an arbitrary JSON value \
+                                (the column is a serde_json::Value); conventionally a JSON object but \
+                                NOT type-constrained, so an untyped schema (per OpenAPI 3.1, any type)."
+                        },
+                        "occurred_at": { "type": "string", "format": "date-time" },
+                        "acknowledged": { "type": "boolean" },
+                        "acknowledged_by": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
+                        },
+                        "acknowledged_at": {
+                            "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }]
+                        }
+                    }
+                },
+                "AlertsResponse": {
+                    "type": "object",
+                    "required": ["alerts", "durable"],
+                    "properties": {
+                        "alerts": { "type": "array", "items": { "$ref": "#/components/schemas/AlertItem" } },
+                        "durable": { "type": "boolean", "description": "False when no database is configured (empty list)." }
+                    }
                 }
             }
         },
@@ -539,6 +811,283 @@ pub fn openapi_document() -> Value {
                         }
                     }
                 }
+            },
+            "/health": {
+                "get": {
+                    "summary": "Liveness probe",
+                    "description": "Unauthenticated. Always 200 unless `?simulate=error` is \
+                        passed, which forces a 503 ProblemDetails for testing the error \
+                        contract. `status` is `degraded` (still 200) when the database is \
+                        disconnected or hard config validation fails.",
+                    "operationId": "health",
+                    "tags": ["public"],
+                    "security": [],
+                    "parameters": [
+                        {
+                            "name": "simulate",
+                            "in": "query",
+                            "required": false,
+                            "description": "Set to `error` to force a 503 ProblemDetails response.",
+                            "schema": { "type": "string", "enum": ["error"] }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Health check result (healthy or degraded).",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
+                        },
+                        "503": {
+                            "description": "Simulated failure via `?simulate=error`.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProblemDetails" } } }
+                        }
+                    }
+                }
+            },
+            "/ready": {
+                "get": {
+                    "summary": "Readiness probe",
+                    "description": "Unauthenticated. Returns 200 only when the server is not \
+                        draining, hard config validation passes, and the database is reachable \
+                        with migrations applied. `?simulate=error` forces a 503 ProblemDetails \
+                        for testing the error contract.",
+                    "operationId": "ready",
+                    "tags": ["public"],
+                    "security": [],
+                    "parameters": [
+                        {
+                            "name": "simulate",
+                            "in": "query",
+                            "required": false,
+                            "description": "Set to `error` to force a 503 ProblemDetails response.",
+                            "schema": { "type": "string", "enum": ["error"] }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Server is ready to accept traffic.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReadyResponse" } } }
+                        },
+                        "503": {
+                            "description": "Not ready: draining, simulated failure, invalid \
+                                config, or the database is unavailable/unusable/mid-migration.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProblemDetails" } } }
+                        }
+                    }
+                }
+            },
+            "/api/auth/status": {
+                "get": {
+                    "summary": "Report whether Entra ID SSO is configured",
+                    "description": "Unauthenticated pre-login read — the sign-in page's bootstrap.",
+                    "operationId": "authStatus",
+                    "tags": ["public"],
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "Entra ID configuration presence.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthStatusResponse" } } }
+                        }
+                    }
+                }
+            },
+            "/api/auth/session": {
+                "get": {
+                    "summary": "Read the caller's resolved session",
+                    "description": "Unauthenticated route (exempt from the session-required \
+                        gate) so the portal can probe its own auth state pre-login; an \
+                        unauthenticated caller gets back an unverified/anonymous session shape, \
+                        not a 401.",
+                    "operationId": "authSession",
+                    "tags": ["public"],
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "The resolved (or unverified/anonymous) session.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthSession" } } }
+                        }
+                    }
+                }
+            },
+            "/api/auth/roles": {
+                "get": {
+                    "summary": "List the platform's RBAC roles",
+                    "description": "Unauthenticated — role/permission names are not secret; the \
+                        sign-in page uses this to describe access levels before login.",
+                    "operationId": "authRoles",
+                    "tags": ["public"],
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "All configured RBAC roles.",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RbacRole" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/platform/summary": {
+                "get": {
+                    "summary": "Read platform branding/mode metadata",
+                    "description": "Unauthenticated pre-login read — the sign-in page's \
+                        bootstrap for choosing sign-in copy (authenticationMode). Non-sensitive \
+                        branding/mode metadata only: no request data, secrets, tenant ids, or \
+                        network values.",
+                    "operationId": "platformSummary",
+                    "tags": ["public"],
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "Platform summary.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PlatformSummaryResponse" } } }
+                        }
+                    }
+                }
+            },
+            "/api/ops/scheduler/schedules": {
+                "get": {
+                    "summary": "List the durable scheduler's registered recurring jobs",
+                    "description": "Requires an operator session and the `execute` permission \
+                        tier. Read-only. Returns an empty list with `durable: false` when no \
+                        database is configured.",
+                    "operationId": "opsSchedulerSchedules",
+                    "tags": ["ops-read"],
+                    "security": [{ "apiSessionHeader": [] }],
+                    "responses": {
+                        "200": {
+                            "description": "The registered schedules.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulerSchedulesResponse" } } }
+                        },
+                        "401": {
+                            "description": "Missing/invalid session.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
+                        "403": {
+                            "description": "Session lacks the `execute` permission tier.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        }
+                    }
+                }
+            },
+            "/api/ops/scheduler/executions": {
+                "get": {
+                    "summary": "List recent durable-scheduler job runs",
+                    "description": "Requires an operator session and the `execute` permission \
+                        tier. Read-only. Returns an empty list with `durable: false` when no \
+                        database is configured.",
+                    "operationId": "opsSchedulerExecutions",
+                    "tags": ["ops-read"],
+                    "security": [{ "apiSessionHeader": [] }],
+                    "responses": {
+                        "200": {
+                            "description": "Recent job executions.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulerExecutionsResponse" } } }
+                        },
+                        "401": {
+                            "description": "Missing/invalid session.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
+                        "403": {
+                            "description": "Session lacks the `execute` permission tier.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        }
+                    }
+                }
+            },
+            "/api/events": {
+                "get": {
+                    "summary": "Read the operational domain-event feed",
+                    "description": "Requires an operator session and the `request` (or higher, \
+                        e.g. `audit`) permission tier. Newest first, site/environment-scoped: a \
+                        scoped principal sees only its own scope's events plus platform-wide \
+                        (NULL on both axes) events. Returns an empty list with `durable: false` \
+                        when no database is configured.",
+                    "operationId": "opsEvents",
+                    "tags": ["ops-read"],
+                    "security": [{ "apiSessionHeader": [] }],
+                    "parameters": [
+                        {
+                            "name": "event_type",
+                            "in": "query",
+                            "required": false,
+                            "description": "Filter to one dotted event type, e.g. `request.approve`.",
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "aggregate_id",
+                            "in": "query",
+                            "required": false,
+                            "description": "Filter to one aggregate's history (e.g. a request id).",
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "description": "Page size. Default 50, clamped to 1..500.",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "The event feed page.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventsResponse" } } }
+                        },
+                        "401": {
+                            "description": "Missing/invalid session.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
+                        "403": {
+                            "description": "Session lacks the required permission tier.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        }
+                    }
+                }
+            },
+            "/api/events/alerts": {
+                "get": {
+                    "summary": "Read the alert-worthy slice of the domain-event feed",
+                    "description": "Requires an operator session and the `request` (or higher, \
+                        e.g. `audit`) permission tier. Same scoping as `/api/events`, filtered to \
+                        events the alert classifier flags (request reaching a negative terminal \
+                        state), annotated with severity and acknowledgement state. Returns an \
+                        empty list with `durable: false` when no database is configured.",
+                    "operationId": "opsEventsAlerts",
+                    "tags": ["ops-read"],
+                    "security": [{ "apiSessionHeader": [] }],
+                    "parameters": [
+                        {
+                            "name": "aggregate_id",
+                            "in": "query",
+                            "required": false,
+                            "description": "Filter to one aggregate's history (e.g. a request id).",
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "description": "Page size. Default 50, clamped to 1..500.",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "The alert feed page.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AlertsResponse" } } }
+                        },
+                        "401": {
+                            "description": "Missing/invalid session.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
+                        "403": {
+                            "description": "Session lacks the required permission tier.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        }
+                    }
+                }
             }
         }
     })
@@ -552,6 +1101,7 @@ pub async fn openapi_json() -> axum::Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::openapi_document;
+    use serde_json::Value;
     use std::collections::BTreeSet;
 
     #[test]
@@ -584,22 +1134,17 @@ mod tests {
             doc["components"]["securitySchemes"]["agentBearer"].is_object(),
             "components.securitySchemes.agentBearer must be present"
         );
+        assert!(
+            doc["components"]["securitySchemes"]["apiSessionHeader"].is_object(),
+            "components.securitySchemes.apiSessionHeader must be present"
+        );
     }
 
-    #[test]
-    fn all_six_agent_paths_are_documented_with_the_right_method() {
-        let doc = openapi_document();
+    /// Asserts every (METHOD, path) pair in `expected` is present in `doc.paths`
+    /// with the right method. Shared helper for the three per-group coverage
+    /// tests below.
+    fn assert_all_documented(doc: &Value, expected: &[(&str, &str)]) {
         let paths = doc["paths"].as_object().expect("paths must be an object");
-
-        let expected: &[(&str, &str)] = &[
-            ("POST", "/api/agents/register"),
-            ("GET", "/api/agents/cp-public-key"),
-            ("GET", "/api/agents/{agent_id}/jobs"),
-            ("POST", "/api/agents/{agent_id}/jobs/{job_id}/ack"),
-            ("POST", "/api/agents/{agent_id}/jobs/{job_id}/result"),
-            ("POST", "/api/agents/{agent_id}/heartbeat"),
-        ];
-
         for (method, path) in expected {
             let item = paths
                 .get(*path)
@@ -612,11 +1157,36 @@ mod tests {
         }
     }
 
-    /// DRIFT GUARD: the set of (method, path) pairs documented here must equal
-    /// `crate::agents::AGENT_ROUTE_PATHS` exactly. Adding or removing an agent
-    /// route without updating this spec fails this test.
     #[test]
-    fn documented_paths_match_agent_route_paths_exactly() {
+    fn all_six_agent_paths_are_documented_with_the_right_method() {
+        let doc = openapi_document();
+        assert_all_documented(&doc, crate::agents::AGENT_ROUTE_PATHS);
+    }
+
+    #[test]
+    fn all_public_paths_are_documented_with_the_right_method() {
+        let doc = openapi_document();
+        assert_all_documented(&doc, crate::PUBLIC_ROUTE_PATHS);
+    }
+
+    #[test]
+    fn all_ops_read_paths_are_documented_with_the_right_method() {
+        let doc = openapi_document();
+        assert_all_documented(&doc, crate::contracts::OPS_READ_ROUTE_PATHS);
+    }
+
+    /// DRIFT GUARD: the full set of (method, path) pairs documented here must
+    /// equal the UNION of `crate::agents::AGENT_ROUTE_PATHS`,
+    /// `crate::PUBLIC_ROUTE_PATHS`, and `crate::contracts::OPS_READ_ROUTE_PATHS`
+    /// EXACTLY — no missing, no extra. Adding or removing a route in any of the
+    /// three groups without updating this spec (or vice versa) fails this test.
+    ///
+    /// `GET /api/agents/openapi.json` (this document's own meta route) is
+    /// intentionally NOT part of any of the three constants and NOT listed in
+    /// `paths` — it describes the document, it is not part of the surface the
+    /// document describes.
+    #[test]
+    fn documented_paths_match_the_union_of_all_route_path_constants_exactly() {
         let doc = openapi_document();
         let paths = doc["paths"].as_object().expect("paths must be an object");
 
@@ -637,13 +1207,16 @@ mod tests {
 
         let source_of_truth: BTreeSet<(String, String)> = crate::agents::AGENT_ROUTE_PATHS
             .iter()
+            .chain(crate::PUBLIC_ROUTE_PATHS.iter())
+            .chain(crate::contracts::OPS_READ_ROUTE_PATHS.iter())
             .map(|(method, path)| (method.to_string(), path.to_string()))
             .collect();
 
         assert_eq!(
             documented, source_of_truth,
-            "openapi.rs paths and crate::agents::AGENT_ROUTE_PATHS have drifted apart \
-             (left = documented in openapi.rs, right = AGENT_ROUTE_PATHS)"
+            "openapi.rs paths and the union of AGENT_ROUTE_PATHS + PUBLIC_ROUTE_PATHS + \
+             OPS_READ_ROUTE_PATHS have drifted apart \
+             (left = documented in openapi.rs, right = union of route-path constants)"
         );
     }
 }

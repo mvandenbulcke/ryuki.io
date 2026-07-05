@@ -19948,6 +19948,21 @@ async fn scheduler_executions(AuthExtractor(session): AuthExtractor) -> ApiResul
     }
 }
 
+/// Source of truth for the bounded READ-ONLY operational surface documented
+/// in `openapi.rs` (missing-feature #64, ops-read slice). Cross-checked by
+/// `openapi.rs`'s drift-guard tests: adding or removing one of these GET
+/// routes without updating the OpenAPI document (or vice versa) fails those
+/// tests. All four require a session (`X-Ryuki-Session-Id` / bearer / cookie)
+/// plus the `execute` or `request`/`audit` permission tier enforced inside
+/// each handler above — this list only tracks path shape, not authz tier.
+#[allow(dead_code)]
+pub const OPS_READ_ROUTE_PATHS: &[(&str, &str)] = &[
+    ("GET", "/api/events"),
+    ("GET", "/api/events/alerts"),
+    ("GET", "/api/ops/scheduler/schedules"),
+    ("GET", "/api/ops/scheduler/executions"),
+];
+
 // ─── Metric history + forecasting handlers (#34) ───
 
 /// Body for recording one metric sample. `observed_at` is optional (defaults to

@@ -396,6 +396,23 @@ fn is_unsafe_method(method: &Method) -> bool {
     )
 }
 
+/// Source of truth for the PUBLIC (no-auth) surface documented in
+/// `openapi.rs`. Cross-checked by `openapi.rs`'s drift-guard tests: adding or
+/// removing a public route here without updating the OpenAPI document (or
+/// vice versa) fails those tests. Kept separate from `is_auth_exempt_path`'s
+/// `matches!` (which also exempts the auth POSTs / OIDC routes that are NOT
+/// part of the documented public OpenAPI surface) so the doc's scope stays
+/// intentionally narrower than the full exemption list.
+#[allow(dead_code)]
+pub const PUBLIC_ROUTE_PATHS: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/ready"),
+    ("GET", "/api/auth/status"),
+    ("GET", "/api/auth/session"),
+    ("GET", "/api/auth/roles"),
+    ("GET", "/api/platform/summary"),
+];
+
 fn is_auth_exempt_path(path: &str) -> bool {
     // Exempt = reachable WITHOUT a resolved session. Two groups:
     //   1. the 4 auth POSTs (login/logout x2) — login mints a session,
