@@ -93,7 +93,7 @@ implementing **all 66**. This file tracks execution.
 | 61 | [x] | On-call / escalation contact registry | Observ | M | M | — |
 | 62 | [~] | audit_log retention / partitioning / archival | Resil | M | M | ✓ |
 | 63 | [x] | Observability deploy wiring | Roadmap | M | M | ✓ |
-| 64 | [ ] | OpenAPI / machine-readable API spec | Roadmap | M | M | ✓ |
+| 64 | [~] | OpenAPI / machine-readable API spec | Roadmap | M | M | `21241af` — OpenAPI 3.1 spec for the 6 agent-protocol endpoints served at public GET /api/agents/openapi.json, hand-maintained (no utoipa dep), with a drift-guard test (documented paths == AGENT_ROUTE_PATHS). Follow-ups: full human/admin API surface + utoipa/schemars annotation-driven sync + a Swagger-UI viewer |
 | 65 | [ ] | Optional gated AI narrative adapter | AIOps | M | M | — |
 | 66 | [x] | Release engineering (versioning/tags/changelog) | Roadmap | M | M | ✓ |
 
