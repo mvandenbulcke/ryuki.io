@@ -36,6 +36,7 @@ pub mod hardware_assets;
 pub mod immutability_compliance;
 pub mod incident_contexts;
 pub mod integration_connections;
+pub mod job_steps;
 pub mod linux_deployment_requests;
 pub mod load_balancer;
 pub mod log_forwarders;

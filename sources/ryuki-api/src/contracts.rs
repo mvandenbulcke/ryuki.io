@@ -16821,46 +16821,14 @@ async fn requests_execute(
         let request = db_row_to_request(&current, &request_id);
 
         // AWX-style dispatch: transition Locked -> Executing (execute stage
-        // In-Progress) and enqueue an agent_job (in the resolved mode) that an
-        // execution agent will run. The agent's signed result completes the stage
-        // and advances the request (see the post_job_result backlink). The
-        // status CAS, the agent_jobs INSERT, and the audit row are written in
-        // ONE transaction, so a dispatched request always has its job and a
+        // In-Progress) and enqueue the agent_job(s) (in the resolved mode) that
+        // an execution agent will run. The agent's signed result completes the
+        // stage and advances the request (see the post_job_result backlink).
+        // The status CAS and job materialization are written in ONE
+        // transaction, so a dispatched request always has its job(s) and a
         // job always has a dispatched request.
         let executing = request_lifecycle::begin_execution(&request).map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&executing.stages).unwrap_or_else(|_| json!([]));
-
-        // Dry-run job spec from the request. iac_digest is the SHA-256 of the
-        // offering's approved embedded IaC bundle (Terraform + Ansible) — the
-        // agent recomputes it and refuses to run a bundle that does not match
-        // (see RunnerExecutor::execute). Offerings with no embedded IaC keep the
-        // legacy all-zero stub (the agent treats that as "nothing to verify").
-        // vars are generated from the request's logical inputs by the offering's
-        // binding (server-deployment offerings map name/cpu/memory_gb/… onto the
-        // module's Terraform variables; everything else falls back to raw
-        // metadata passthrough). Secret-valued vars are never produced here.
-        let offering = ryuki_runner::iac::resolve_offering_id(&request);
-        let iac_digest =
-            ryuki_runner::iac::offering_iac_digest(&offering).unwrap_or_else(|| "0".repeat(64));
-        let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
-            offering_id: &offering,
-            request_id: &request.id,
-            name: &current.name,
-            site: &request.site,
-            environment: &request.environment,
-            cpu: u32::try_from(current.cpu).unwrap_or(0),
-            memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
-            metadata: &request.metadata,
-        });
-        let spec = ryuki_protocol::JobSpec {
-            request_id: uid,
-            offering_id: Uuid::new_v4(),
-            iac_ref: offering,
-            iac_digest,
-            vars,
-            mode,
-        };
-        let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let platform = request.site.clone();
 
         let mut tx = pool.begin().await.map_err(db_error)?;
@@ -16879,49 +16847,97 @@ async fn requests_execute(
             tx.rollback().await.ok();
             return Err(transition_conflict_409(&request_id));
         };
-        let job_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
-        )
-        .bind(uid)
-        .bind(&platform)
-        .bind(&spec_json)
-        .bind(mode_label)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        audit::record_audit_tx(
-            &mut tx,
-            &session,
-            &AuditRecord {
-                action: "request.execute",
-                request_id: Some(&request_id),
-                from_status: Some(&current.status),
-                to_status: &row.status,
-                from_stage: Some(&current.stage),
-                to_stage: "execute",
-                detail: json!({
-                    "agent_job_id": job_id,
-                    "mode": mode_label,
-                    "platform": platform.clone(),
-                }),
-                outcome: "dispatched",
-            },
-        )
-        .await
-        .map_err(db_error)?;
+
+        let outcome = match materialize_execution(&mut tx, uid, &request, &current, mode).await {
+            Ok(outcome) => outcome,
+            Err(MaterializeError::InvalidPlan) => {
+                tx.rollback().await.ok();
+                return Err(status_400("invalid step plan"));
+            }
+            Err(MaterializeError::ModeNotSupportedForStepPlan) => {
+                tx.rollback().await.ok();
+                return Err(status_400(
+                    "multi-step requests support offline-dry-run mode only",
+                ));
+            }
+            Err(MaterializeError::Db(e)) => {
+                tx.rollback().await.ok();
+                return Err(db_error(e));
+            }
+        };
+
+        match &outcome {
+            MaterializeOutcome::SingleJob { job_id } => {
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &AuditRecord {
+                        action: "request.execute",
+                        request_id: Some(&request_id),
+                        from_status: Some(&current.status),
+                        to_status: &row.status,
+                        from_stage: Some(&current.stage),
+                        to_stage: "execute",
+                        detail: json!({
+                            "agent_job_id": job_id,
+                            "mode": mode_label,
+                            "platform": platform.clone(),
+                        }),
+                        outcome: "dispatched",
+                    },
+                )
+                .await
+                .map_err(db_error)?;
+            }
+            MaterializeOutcome::StepJobs { job_ids } => {
+                // Aggregate-only audit detail: how many steps were dispatched,
+                // never per-step secrets/vars.
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &AuditRecord {
+                        action: "request.execute",
+                        request_id: Some(&request_id),
+                        from_status: Some(&current.status),
+                        to_status: &row.status,
+                        from_stage: Some(&current.stage),
+                        to_stage: "execute",
+                        detail: json!({
+                            "steps_dispatched": job_ids.len(),
+                            "mode": "OfflineDryRun",
+                            "platform": platform.clone(),
+                        }),
+                        outcome: "dispatched",
+                    },
+                )
+                .await
+                .map_err(db_error)?;
+            }
+        }
         tx.commit().await.map_err(db_error)?;
 
-        return Ok(Json(json!({
-            "request_id": request_id,
-            "agent_job_id": job_id,
-            "status": row.status,
-            "stage": "execute",
-            "mode": mode_label,
-            "platform": platform,
-            "source": "database",
-            "note": "dispatched to execution agent",
-        })));
+        return Ok(Json(match outcome {
+            MaterializeOutcome::SingleJob { job_id } => json!({
+                "request_id": request_id,
+                "agent_job_id": job_id,
+                "status": row.status,
+                "stage": "execute",
+                "mode": mode_label,
+                "platform": platform,
+                "source": "database",
+                "note": "dispatched to execution agent",
+            }),
+            MaterializeOutcome::StepJobs { job_ids } => json!({
+                "request_id": request_id,
+                "agent_job_ids": job_ids,
+                "status": row.status,
+                "stage": "execute",
+                "mode": "OfflineDryRun",
+                "platform": platform,
+                "source": "database",
+                "note": "multi-step plan: initial ready step(s) dispatched to execution agent",
+            }),
+        }));
     }
 
     let mut store = request_store().lock().await;
@@ -16959,6 +16975,525 @@ async fn requests_execute(
     .await;
 
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
+}
+
+/// Result of materializing a request's execution: either today's single job
+/// (no step plan / empty plan) or the initial ready step job(s) of a
+/// multi-step plan (#42 slice 2a).
+#[derive(Debug)]
+enum MaterializeOutcome {
+    SingleJob { job_id: Uuid },
+    StepJobs { job_ids: Vec<Uuid> },
+}
+
+/// Why materialization failed.
+#[derive(Debug)]
+enum MaterializeError {
+    /// The persisted step plan is malformed (`validate_plan` rejected it).
+    /// Never surfaced with engine internals — the caller maps this to a
+    /// generic 400.
+    InvalidPlan,
+    /// A non-OfflineDryRun mode (e.g. admin-gated `?mode=live-plan`) was
+    /// requested for a multi-step-plan request. The dispatcher only emits
+    /// OfflineDryRun step jobs (per-step live planning is slice 2b), so this
+    /// is rejected rather than silently downgraded. Caller maps to a 400.
+    ModeNotSupportedForStepPlan,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for MaterializeError {
+    fn from(e: sqlx::Error) -> Self {
+        MaterializeError::Db(e)
+    }
+}
+
+/// Materialize the agent_job(s) for a request that just transitioned to
+/// Executing, INSIDE the caller's transaction (`tx`). If the request has no
+/// persisted step plan (`job_steps` is empty), this is EXACTLY today's
+/// single-job behavior: one `JobSpec` built from the request's own offering,
+/// dispatched in the caller-resolved `mode` (which may be OfflineDryRun or the
+/// admin-gated LivePlan). If the request HAS a step plan, this dispatches
+/// ONLY the plan's initially-ready steps (#42 slice 2a) — always as
+/// `OfflineDryRun` jobs (see [`build_step_job_spec`]; next-step dispatch on
+/// step-success is slice 2b, not here). `current` is the pre-transition row
+/// (used for the single-job spec's vars, mirroring the historical behavior).
+async fn materialize_execution(
+    tx: &mut sqlx::PgConnection,
+    request_id: Uuid,
+    request: &ryuki_engine::models::Request,
+    current: &DbRequestRow,
+    mode: ryuki_protocol::JobMode,
+) -> Result<MaterializeOutcome, MaterializeError> {
+    let plan = crate::repos::job_steps::load_plan(&mut *tx, request_id).await?;
+
+    if plan.is_empty() {
+        // Today's exact single-job behavior — unaffected by step-plan support.
+        let offering = ryuki_runner::iac::resolve_offering_id(request);
+        let iac_digest =
+            ryuki_runner::iac::offering_iac_digest(&offering).unwrap_or_else(|| "0".repeat(64));
+        let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+            offering_id: &offering,
+            request_id: &request.id,
+            name: &current.name,
+            site: &request.site,
+            environment: &request.environment,
+            cpu: u32::try_from(current.cpu).unwrap_or(0),
+            memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+            metadata: &request.metadata,
+        });
+        let mode_label = match mode {
+            ryuki_protocol::JobMode::OfflineDryRun => "OfflineDryRun",
+            ryuki_protocol::JobMode::LivePlan => "LivePlan",
+            ryuki_protocol::JobMode::LiveApply => "LiveApply",
+        };
+        let spec = ryuki_protocol::JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: offering,
+            iac_digest,
+            vars,
+            mode,
+        };
+        let spec_json = serde_json::to_value(&spec).unwrap_or_default();
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(&request.site)
+        .bind(&spec_json)
+        .bind(mode_label)
+        .fetch_one(&mut *tx)
+        .await?;
+        return Ok(MaterializeOutcome::SingleJob { job_id });
+    }
+
+    // Multi-step dispatch only emits OfflineDryRun step jobs (see
+    // build_step_job_spec). Rather than SILENTLY downgrading an admin's
+    // ?mode=live-plan request to OfflineDryRun and returning 200 OK — a
+    // least-surprise violation — reject any non-OfflineDryRun mode explicitly.
+    // Per-step live planning is slice 2b; LiveApply is unreachable here
+    // (it is minted only by requests_approve_live_apply -> create_live_apply_job).
+    if !matches!(mode, ryuki_protocol::JobMode::OfflineDryRun) {
+        return Err(MaterializeError::ModeNotSupportedForStepPlan);
+    }
+
+    // Multi-step request: hydrate the pure engine's Step shape and validate
+    // defensively before dispatching anything. A malformed persisted plan
+    // (should never happen if authored via insert_plan, but this is the last
+    // gate before dispatch) rolls back rather than dispatching a request that
+    // can never complete.
+    let orchestration_steps: Vec<ryuki_engine::job_orchestration::Step> =
+        plan.iter().map(|row| row.to_orchestration_step()).collect();
+    ryuki_engine::job_orchestration::validate_plan(&orchestration_steps)
+        .map_err(|_| MaterializeError::InvalidPlan)?;
+    let ready_keys = ryuki_engine::job_orchestration::ready_steps(&orchestration_steps);
+
+    let mut job_ids = Vec::with_capacity(ready_keys.len());
+    for key in &ready_keys {
+        let step = plan
+            .iter()
+            .find(|row| &row.step_key == key)
+            .expect("ready_steps only returns keys present in the input plan");
+        let spec = build_step_job_spec(request_id, &step.iac_ref, request, current);
+        let spec_json = serde_json::to_value(&spec).unwrap_or_default();
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(&request.site)
+        .bind(&spec_json)
+        .bind("OfflineDryRun")
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
+        job_ids.push(job_id);
+    }
+
+    Ok(MaterializeOutcome::StepJobs { job_ids })
+}
+
+/// Build the `JobSpec` for one multi-step-plan step. HARD-CODES
+/// `mode = OfflineDryRun` — the multi-step dispatcher has no path to
+/// LiveApply (that requires an admin-gated, CP-signed approval grant minted
+/// via `create_live_apply_job`, off a prior LivePlan) and must never create
+/// one. A unit test asserts this fn always yields `OfflineDryRun`.
+fn build_step_job_spec(
+    request_id: Uuid,
+    step_iac_ref: &str,
+    request: &ryuki_engine::models::Request,
+    current: &DbRequestRow,
+) -> ryuki_protocol::JobSpec {
+    let iac_digest =
+        ryuki_runner::iac::offering_iac_digest(step_iac_ref).unwrap_or_else(|| "0".repeat(64));
+    let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+        offering_id: step_iac_ref,
+        request_id: &request.id,
+        name: &current.name,
+        site: &request.site,
+        environment: &request.environment,
+        cpu: u32::try_from(current.cpu).unwrap_or(0),
+        memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+        metadata: &request.metadata,
+    });
+    ryuki_protocol::JobSpec {
+        request_id,
+        offering_id: Uuid::new_v4(),
+        iac_ref: step_iac_ref.to_string(),
+        iac_digest,
+        vars,
+        mode: ryuki_protocol::JobMode::OfflineDryRun,
+    }
+}
+
+#[cfg(test)]
+mod step_materialization_unit_tests {
+    use super::*;
+
+    fn sample_request() -> ryuki_engine::models::Request {
+        ryuki_engine::models::Request {
+            id: Uuid::new_v4().to_string(),
+            offering_id: "server-deployment".to_string(),
+            request_type: ryuki_engine::models::RequestType::ServerDeployment,
+            status: ryuki_engine::models::RequestStatus::Executing,
+            requester: "requester-unit".to_string(),
+            owner: "owner-unit".to_string(),
+            site: "DEFRA".to_string(),
+            environment: "production".to_string(),
+            criticality: "standard".to_string(),
+            stages: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            dry_run_required: true,
+            approval_route: Vec::new(),
+            evidence_manifest_id: None,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    fn sample_current_row(request: &ryuki_engine::models::Request) -> DbRequestRow {
+        DbRequestRow {
+            id: Uuid::parse_str(&request.id).unwrap_or_else(|_| Uuid::new_v4()),
+            request_type: "server-deployment".to_string(),
+            status: "executing".to_string(),
+            stage: "execute".to_string(),
+            site: request.site.clone(),
+            environment: request.environment.clone(),
+            name: "unit-test-step".to_string(),
+            cpu: 2,
+            memory_gb: 4,
+            justification: None,
+            created_by: Some("requester-unit".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            payload: json!({}),
+            stages: json!([]),
+            approval_route: json!([]),
+            plan: Value::Null,
+            validation_results: Value::Null,
+            criticality: "standard".to_string(),
+            required_approval_roles: 1,
+            requester: Some("requester-unit".to_string()),
+            owner: Some("owner-unit".to_string()),
+            evidence_manifest_id: None,
+        }
+    }
+
+    /// SAFETY INVARIANT (#42 slice 2a): the multi-step dispatcher's per-step
+    /// spec builder must NEVER be able to produce a LiveApply job — that path
+    /// requires an admin-gated, CP-signed approval grant
+    /// (`create_live_apply_job`) off a prior LivePlan, which the multi-step
+    /// dispatcher has no access to. Assert the hard-coded mode across several
+    /// distinct iac_refs (including offerings with no embedded IaC bundle, the
+    /// all-zero-digest fallback path).
+    #[test]
+    fn build_step_job_spec_always_yields_offline_dry_run() {
+        let request = sample_request();
+        let current = sample_current_row(&request);
+        for iac_ref in [
+            "linux-server-deployment",
+            "windows-server-deployment",
+            "patch-maintenance",
+            "an-offering-with-no-embedded-iac-bundle",
+        ] {
+            let spec = build_step_job_spec(Uuid::new_v4(), iac_ref, &request, &current);
+            assert_eq!(
+                spec.mode,
+                ryuki_protocol::JobMode::OfflineDryRun,
+                "step spec for iac_ref={iac_ref} must always be OfflineDryRun"
+            );
+            assert_eq!(spec.iac_ref, iac_ref);
+        }
+    }
+}
+
+#[cfg(test)]
+mod step_materialization_db_tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    /// Connects a small fresh pool to the test database, or returns None to
+    /// SKIP (mirrors every other local `test_pool` in this file — CI-valid
+    /// without `RYUKI_DATABASE_URL`).
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .ok()?;
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations run");
+        Some(pool)
+    }
+
+    /// Seeds one `locked` request row directly (mirrors
+    /// `agents::db_backlink_advances_executing_request`'s raw-SQL seeding
+    /// pattern), returns its id.
+    async fn seed_locked_request(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', 'locked', 'lock', 'DEFRA', 'production', 'step-plan-db-test', 2, 4, 'requester-db')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed locked request");
+        id
+    }
+
+    async fn cleanup_request(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM audit_log WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Loads the request row + reconstructs the engine `Request`, the same
+    /// shape `requests_execute` builds before calling `materialize_execution`.
+    async fn load_request(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (DbRequestRow, ryuki_engine::models::Request) {
+        let row: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("load request row");
+        let request = db_row_to_request(&row, &id.to_string());
+        (row, request)
+    }
+
+    /// #42 slice 2a: a request with a persisted 3-step plan (a; b depends_on
+    /// [a]; c depends_on [a,b], all Pending) materializes EXACTLY the initial
+    /// ready step ('a') as one OfflineDryRun agent_job, marks job_steps['a']
+    /// Running with the agent_job back-link set, and leaves b/c Pending — the
+    /// next-step dispatch on step-success is slice 2b, not this slice.
+    #[tokio::test]
+    async fn multi_step_plan_materializes_only_initial_ready_step() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_locked_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+                (
+                    "c",
+                    vec!["a".to_string(), "b".to_string()],
+                    "linux-server-deployment",
+                ),
+            ],
+        )
+        .await
+        .expect("seed 3-step plan");
+
+        let (current, request) = load_request(&pool, id).await;
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let outcome = materialize_execution(
+            &mut tx,
+            id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::OfflineDryRun,
+        )
+        .await
+        .expect("materialize succeeds");
+        tx.commit().await.expect("commit tx");
+
+        let job_ids = match outcome {
+            MaterializeOutcome::StepJobs { job_ids } => job_ids,
+            MaterializeOutcome::SingleJob { .. } => {
+                panic!("a request with a non-empty step plan must NOT take the single-job path")
+            }
+        };
+        assert_eq!(job_ids.len(), 1, "only step 'a' is initially ready");
+
+        let plan = crate::repos::job_steps::load_plan(&pool, id)
+            .await
+            .expect("load plan");
+        let a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let b = plan.iter().find(|s| s.step_key == "b").expect("step b");
+        let c = plan.iter().find(|s| s.step_key == "c").expect("step c");
+        assert_eq!(a.request_id, id, "row carries the owning request_id");
+        assert_eq!(a.status, "Running", "ready step 'a' must be Running");
+        assert_eq!(
+            a.agent_job_id,
+            Some(job_ids[0]),
+            "step 'a' must back-link to the dispatched agent_job"
+        );
+        assert_eq!(b.status, "Pending", "step 'b' blocked on 'a' stays Pending");
+        assert_eq!(
+            c.status, "Pending",
+            "step 'c' blocked on 'a','b' stays Pending"
+        );
+
+        let spec: serde_json::Value =
+            sqlx::query_scalar("SELECT spec FROM agent_jobs WHERE id = $1")
+                .bind(job_ids[0])
+                .fetch_one(&pool)
+                .await
+                .expect("load dispatched job spec");
+        assert_eq!(
+            spec["mode"], "offline_dry_run",
+            "the dispatched step job must be OfflineDryRun"
+        );
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
+    /// A request with NO persisted `job_steps` plan materializes EXACTLY
+    /// today's single agent_job — unaffected by step-plan support — and
+    /// creates no `job_steps` rows.
+    #[tokio::test]
+    async fn no_plan_materializes_single_job_unaffected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_locked_request(&pool).await;
+        let (current, request) = load_request(&pool, id).await;
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let outcome = materialize_execution(
+            &mut tx,
+            id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::OfflineDryRun,
+        )
+        .await
+        .expect("materialize succeeds");
+        tx.commit().await.expect("commit tx");
+
+        match outcome {
+            MaterializeOutcome::SingleJob { .. } => {}
+            MaterializeOutcome::StepJobs { .. } => {
+                panic!("a request with no step plan must take the single-job path")
+            }
+        }
+
+        let job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("count jobs");
+        assert_eq!(job_count, 1, "exactly one agent_job for a no-plan request");
+
+        let step_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_steps WHERE request_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("count steps");
+        assert_eq!(step_count, 0, "no job_steps rows for a no-plan request");
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice 2a: a multi-step-plan request executed with a non-OfflineDryRun
+    /// mode (e.g. admin-gated `?mode=live-plan`) is REJECTED, not silently
+    /// downgraded — and nothing is dispatched. Per-step live planning is slice
+    /// 2b.
+    #[tokio::test]
+    async fn multi_step_plan_rejects_non_offline_mode() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_locked_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            id,
+            &[("a", vec![], "linux-server-deployment")],
+        )
+        .await
+        .expect("seed 1-step plan");
+        drop(conn);
+
+        let (current, request) = load_request(&pool, id).await;
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let err = materialize_execution(
+            &mut tx,
+            id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::LivePlan,
+        )
+        .await
+        .expect_err("live-plan must be rejected for a step-plan request");
+        assert!(
+            matches!(err, MaterializeError::ModeNotSupportedForStepPlan),
+            "expected ModeNotSupportedForStepPlan, got {err:?}"
+        );
+        tx.rollback().await.expect("rollback tx");
+
+        let job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("count jobs");
+        assert_eq!(
+            job_count, 0,
+            "a rejected multi-step request dispatches nothing"
+        );
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
 }
 
 async fn requests_verify(
