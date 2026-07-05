@@ -1317,54 +1317,37 @@ pub async fn post_job_result(
     post_job_result_with_pool(agent_id, job_id_str, headers, body, pool).await
 }
 
-/// Backlink an agent's terminal result onto the parent request (AWX bridge
-/// slice 2). When a dispatched request is still `executing`, mark its execute
-/// stage Completed (success) or Failed, record a pointer to the agent job, and
-/// advance the request (`executing` -> `verifying` on success, otherwise
-/// `-> failed`) — in the SAME transaction as the job's terminal record.
+/// Enrich the `execute` stage with the agent result, PRESERVING the existing
+/// history, and CAS-advance the request out of `executing` — the single-job
+/// (no step plan) request-advance authority, and also the terminal move for a
+/// multi-step request once its plan is fully resolved (all steps `Succeeded`,
+/// or any step `Failed`; #42 slice 2b). `stages_val` is the request's raw
+/// `stages` JSONB, read by the caller BEFORE any plan branching.
 ///
-/// Best-effort and CAS-guarded: a request that is missing (e.g. synthetic test
-/// jobs) or no longer `executing` is left untouched, so this never fails the
-/// result POST.
-async fn backlink_request_execution(
+/// Critically, a parse failure must NOT wipe the stages: the old
+/// `unwrap_or_default()` turned an undeserializable `requests.stages` (e.g. a
+/// Stage schema skew) into an empty vec, and the UPDATE below then wrote
+/// `stages = '[]'`, destroying the intake/plan/approve/lock history and breaking
+/// every later stage-gate check. On a parse failure we instead advance the
+/// request status but write the ORIGINAL stages JSONB back untouched, and log the
+/// skew so it is visible. (We do NOT return Err: that would roll back the result
+/// tx, and the agent's at-least-once retry would hit the same parse failure
+/// forever — better to record the result + preserve history + surface the anomaly.)
+///
+/// CAS-guarded: only advances if the request is still `executing` (a
+/// concurrent transition wins harmlessly — the job result is already durably
+/// recorded).
+async fn advance_request_out_of_executing(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: uuid::Uuid,
-    status: &JobResultStatus,
+    stages_val: serde_json::Value,
+    success: bool,
+    job_id: uuid::Uuid,
     result_status_str: &str,
     evidence_digest: &str,
-    job_id: uuid::Uuid,
 ) -> Result<(), sqlx::Error> {
-    let row: Option<(String, serde_json::Value)> =
-        sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
-            .bind(request_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some((req_status, stages_val)) = row else {
-        return Ok(());
-    };
-    if req_status != "executing" {
-        return Ok(());
-    }
-
-    let success = matches!(
-        status,
-        JobResultStatus::CheckOk
-            | JobResultStatus::Planned
-            | JobResultStatus::Applied
-            | JobResultStatus::Verified
-    );
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Enrich the `execute` stage with the agent result, PRESERVING the existing
-    // history. Critically, a parse failure must NOT wipe the stages: the old
-    // `unwrap_or_default()` turned an undeserializable `requests.stages` (e.g. a
-    // Stage schema skew) into an empty vec, and the UPDATE below then wrote
-    // `stages = '[]'`, destroying the intake/plan/approve/lock history and breaking
-    // every later stage-gate check. On a parse failure we instead advance the
-    // request status but write the ORIGINAL stages JSONB back untouched, and log the
-    // skew so it is visible. (We do NOT return Err: that would roll back the result
-    // tx, and the agent's at-least-once retry would hit the same parse failure
-    // forever — better to record the result + preserve history + surface the anomaly.)
     let stages_json =
         match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(stages_val.clone()) {
             Ok(mut stages) => {
@@ -1418,6 +1401,159 @@ async fn backlink_request_execution(
     .bind(request_id)
     .execute(&mut **tx)
     .await?;
+
+    Ok(())
+}
+
+/// Backlink an agent's terminal result onto the parent request (AWX bridge
+/// slice 2 / #42 slice 2b). When a dispatched request is still `executing`:
+///
+/// - **No step plan** (`job_steps` empty): today's single-job behavior —
+///   advance the request directly (`executing` -> `verifying` on success,
+///   otherwise `-> failed`).
+/// - **Step plan present**: mark the step linked to this job
+///   `Succeeded`/`Failed`. On step failure, fail the request immediately (a
+///   partially-executed multi-step plan does not get to "succeed"). On step
+///   success: if EVERY step is now `Succeeded`, advance the request to
+///   `verifying`; if any OTHER step already failed, fail the request; else
+///   the plan is mid-flight — dispatch the plan's newly-ready steps and leave
+///   the request `executing`.
+///
+/// All of this runs in the SAME transaction as the job's terminal record: a
+/// request is never advanced without its follow-on jobs, nor are jobs marked
+/// without their request-level effect landing.
+///
+/// Best-effort and CAS-guarded: a request that is missing (e.g. synthetic test
+/// jobs) or no longer `executing` is left untouched, so this never fails the
+/// result POST.
+async fn backlink_request_execution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: uuid::Uuid,
+    status: &JobResultStatus,
+    result_status_str: &str,
+    evidence_digest: &str,
+    job_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((req_status, stages_val)) = row else {
+        return Ok(());
+    };
+    if req_status != "executing" {
+        return Ok(());
+    }
+
+    let success = matches!(
+        status,
+        JobResultStatus::CheckOk
+            | JobResultStatus::Planned
+            | JobResultStatus::Applied
+            | JobResultStatus::Verified
+    );
+
+    // Lock the request's job_steps rows (if any) BEFORE branching on plan
+    // shape/status, in deterministic step_key order — this serializes two
+    // step-jobs of the SAME request completing concurrently (separate result
+    // POSTs / separate transactions) so readiness and completion are decided
+    // against a consistent, race-free view of the plan.
+    let plan = crate::repos::job_steps::load_plan_for_update(tx, request_id).await?;
+
+    if plan.is_empty() {
+        // Today's exact single-job path — unaffected by step-plan support.
+        return advance_request_out_of_executing(
+            tx,
+            request_id,
+            stages_val,
+            success,
+            job_id,
+            result_status_str,
+            evidence_digest,
+        )
+        .await;
+    }
+
+    // Multi-step request.
+    let Some(step) = plan.iter().find(|s| s.agent_job_id == Some(job_id)) else {
+        // Anomaly: a plan-request completing a job that isn't a linked step. The
+        // job result is already durably recorded; do NOT advance the request
+        // (never advance a multi-step request off a non-step signal). Log skew.
+        tracing::warn!(
+            request_id = %request_id,
+            %job_id,
+            "multi-step request: completed job is not a linked step; not advancing"
+        );
+        return Ok(());
+    };
+
+    if !success {
+        crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
+        // Reconcile any sibling step still in-flight (Running — e.g. a parallel
+        // step already dispatched by another completion) to Failed in this
+        // same tx, so no dispatched step is stranded non-terminal under the
+        // failing request.
+        crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
+        return advance_request_out_of_executing(
+            tx,
+            request_id,
+            stages_val,
+            false,
+            job_id,
+            result_status_str,
+            evidence_digest,
+        )
+        .await;
+    }
+
+    crate::repos::job_steps::mark_status(&mut **tx, step.id, "Succeeded").await?;
+    // Rows are already locked by load_plan_for_update above; a plain re-load
+    // is sufficient (and avoids re-taking FOR UPDATE mid-transaction).
+    let plan2 = crate::repos::job_steps::load_plan(&mut **tx, request_id).await?;
+
+    if plan2.iter().any(|s| s.status == "Failed") {
+        // A prior step in this plan already failed — fail the request, and
+        // reconcile any still-in-flight (Running) sibling to Failed so no
+        // dispatched step is stranded non-terminal under a terminal request.
+        crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
+        return advance_request_out_of_executing(
+            tx,
+            request_id,
+            stages_val,
+            false,
+            job_id,
+            result_status_str,
+            evidence_digest,
+        )
+        .await;
+    }
+
+    if plan2.iter().all(|s| s.status == "Succeeded") {
+        // Final step succeeded — the whole plan is done.
+        return advance_request_out_of_executing(
+            tx,
+            request_id,
+            stages_val,
+            true,
+            job_id,
+            result_status_str,
+            evidence_digest,
+        )
+        .await;
+    }
+
+    // Mid-flight: dispatch newly-ready steps, KEEP the request `executing`,
+    // and do NOT touch stages/status.
+    let current: crate::contracts::DbRequestRow = sqlx::query_as(&format!(
+        "SELECT {} FROM requests WHERE id = $1",
+        crate::contracts::REQUEST_COLUMNS
+    ))
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let request_model = crate::contracts::db_row_to_request(&current, &request_id.to_string());
+    crate::contracts::dispatch_ready_steps(tx, &request_model, &current, &plan2).await?;
 
     Ok(())
 }
@@ -10647,6 +10783,543 @@ mod tests {
             stages_after, corrupt,
             "unparseable stages are PRESERVED untouched, NOT wiped to []"
         );
+    }
+
+    // ── #42 slice 2b: next-step dispatch on step success/failure ─────────────
+
+    /// Seeds an `executing` request row (mirrors
+    /// `db_backlink_advances_executing_request`'s raw-SQL seeding pattern),
+    /// returns its id.
+    async fn seed_executing_request(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let stages = serde_json::json!([{
+            "name": "execute", "status": "InProgress",
+            "started_at": null, "completed_at": null,
+            "evidence": [], "metadata": {}
+        }]);
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'step-2b-test', 'executing', 'execute', $2::jsonb)",
+        )
+        .bind(id)
+        .bind(&stages)
+        .execute(pool)
+        .await
+        .expect("insert executing request");
+        id
+    }
+
+    /// Dispatch a step: insert a synthetic `agent_jobs` row and link it via
+    /// `job_steps::mark_running`, exactly as `dispatch_ready_steps` would.
+    /// Returns the minted `agent_jobs.id`.
+    async fn dispatch_step_job(pool: &PgPool, request_id: Uuid, step_id: Uuid) -> Uuid {
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'OfflineDryRun') RETURNING id",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert synthetic agent_job");
+        crate::repos::job_steps::mark_running(pool, step_id, job_id)
+            .await
+            .expect("mark_running");
+        job_id
+    }
+
+    async fn cleanup_step_2b_request(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Chain a -> b: completing 'a' dispatches 'b' and keeps the request
+    /// `executing`; completing 'b' (the final step) advances the request to
+    /// `verifying`.
+    #[tokio::test]
+    async fn db_step2b_chain_dispatches_next_and_completes() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2-step plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_step_job(&pool, req_id, step_a.id).await;
+
+        // Complete 'a' with success.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_a,
+        )
+        .await
+        .expect("backlink a");
+        tx.commit().await.unwrap();
+
+        let status_mid: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_mid, "executing",
+            "request stays executing while 'b' is still pending"
+        );
+
+        let plan_mid = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan mid");
+        let a_mid = plan_mid.iter().find(|s| s.step_key == "a").unwrap();
+        let b_mid = plan_mid.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_mid.status, "Succeeded", "a marked Succeeded");
+        assert_eq!(b_mid.status, "Running", "b dispatched (now Running)");
+        let job_b = b_mid
+            .agent_job_id
+            .expect("b must have a dispatched agent_job");
+
+        // Complete 'b' (the final step) with success.
+        let mut tx2 = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx2,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_b,
+        )
+        .await
+        .expect("backlink b");
+        tx2.commit().await.unwrap();
+
+        let status_final: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_final, "verifying",
+            "request advances to verifying once ALL steps succeeded"
+        );
+
+        let plan_final = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan final");
+        for s in &plan_final {
+            assert_eq!(
+                s.status, "Succeeded",
+                "step {} must be Succeeded",
+                s.step_key
+            );
+        }
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// Chain a -> b: a step FAILURE fails the request immediately and does
+    /// NOT dispatch downstream steps.
+    #[tokio::test]
+    async fn db_step2b_failure_fails_request_without_dispatching_next() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2-step plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_step_job(&pool, req_id, step_a.id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            "failed",
+            "deadbeefdeadbeef",
+            job_a,
+        )
+        .await
+        .expect("backlink a failure");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "a step failure fails the request");
+
+        let plan_after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = plan_after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = plan_after.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_after.status, "Failed", "a marked Failed");
+        assert_eq!(
+            b_after.status, "Pending",
+            "b is NEVER dispatched once the request has failed"
+        );
+        assert!(
+            b_after.agent_job_id.is_none(),
+            "b must have no dispatched agent_job"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// Diamond a -> {b, c} -> d: completing 'a' dispatches both 'b' and 'c';
+    /// completing only 'b' must NOT dispatch 'd' (c is still Running);
+    /// completing 'c' then dispatches 'd'; completing 'd' finishes the
+    /// request.
+    #[tokio::test]
+    async fn db_step2b_diamond_waits_for_all_parents() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+                ("c", vec!["a".to_string()], "linux-server-deployment"),
+                (
+                    "d",
+                    vec!["b".to_string(), "c".to_string()],
+                    "linux-server-deployment",
+                ),
+            ],
+        )
+        .await
+        .expect("seed diamond plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_step_job(&pool, req_id, step_a.id).await;
+
+        // Complete 'a' -> both 'b' and 'c' become ready and are dispatched.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_a,
+        )
+        .await
+        .expect("backlink a");
+        tx.commit().await.unwrap();
+
+        let plan_after_a = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after a");
+        let b1 = plan_after_a.iter().find(|s| s.step_key == "b").unwrap();
+        let c1 = plan_after_a.iter().find(|s| s.step_key == "c").unwrap();
+        let d1 = plan_after_a.iter().find(|s| s.step_key == "d").unwrap();
+        assert_eq!(b1.status, "Running", "b dispatched after a succeeds");
+        assert_eq!(c1.status, "Running", "c dispatched after a succeeds");
+        assert_eq!(d1.status, "Pending", "d not ready yet (b,c pending)");
+        let job_b = b1.agent_job_id.expect("b has a dispatched job");
+        let job_c = c1.agent_job_id.expect("c has a dispatched job");
+
+        // Complete only 'b' -> 'd' must NOT be dispatched (c still Running).
+        let mut tx2 = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx2,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_b,
+        )
+        .await
+        .expect("backlink b");
+        tx2.commit().await.unwrap();
+
+        let status_after_b: String =
+            sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status_after_b, "executing",
+            "request stays executing (c still running, d not ready)"
+        );
+        let plan_after_b = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after b");
+        let d_after_b = plan_after_b.iter().find(|s| s.step_key == "d").unwrap();
+        assert_eq!(
+            d_after_b.status, "Pending",
+            "d must NOT dispatch while c is still Running"
+        );
+        assert!(
+            d_after_b.agent_job_id.is_none(),
+            "d must have no dispatched agent_job yet"
+        );
+
+        // Complete 'c' -> now 'd' becomes ready and is dispatched.
+        let mut tx3 = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx3,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_c,
+        )
+        .await
+        .expect("backlink c");
+        tx3.commit().await.unwrap();
+
+        let plan_after_c = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after c");
+        let d_after_c = plan_after_c.iter().find(|s| s.step_key == "d").unwrap();
+        assert_eq!(
+            d_after_c.status, "Running",
+            "d dispatched once both b and c have succeeded"
+        );
+        let job_d = d_after_c.agent_job_id.expect("d has a dispatched job");
+
+        let status_after_c: String =
+            sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status_after_c, "executing",
+            "request still executing while d runs"
+        );
+
+        // Complete 'd' -> whole plan done, request -> verifying.
+        let mut tx4 = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx4,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            job_d,
+        )
+        .await
+        .expect("backlink d");
+        tx4.commit().await.unwrap();
+
+        let status_final: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_final, "verifying",
+            "request advances to verifying once the whole diamond plan succeeded"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// No-plan single job (today's behavior, unchanged): a request with NO
+    /// `job_steps` rows advances directly via the single-job path.
+    #[tokio::test]
+    async fn db_step2b_no_plan_single_job_unaffected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        // No job_steps rows are inserted for this request.
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("backlink no-plan");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "verifying",
+            "a no-plan request advances directly to verifying (today's unchanged behavior)"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// Concurrency reconciliation: independent roots 'a' and 'b', with 'c'
+    /// depending only on 'b'. Completing 'b' (success) dispatches 'c' while the
+    /// request is still executing; THEN 'a' fails. The failing request must
+    /// reconcile the freshly-dispatched, in-flight 'c' to Failed rather than
+    /// leaving it stranded Running under a terminal request. (Regression for
+    /// the #42 slice-2b concurrency finding.)
+    #[tokio::test]
+    async fn db_step2b_failure_reconciles_inflight_dispatched_step() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec![], "linux-server-deployment"),
+                ("c", vec!["b".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed a/b roots + c depends on b");
+        drop(conn);
+
+        // Both independent roots are initially ready and dispatched.
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let step_b = plan.iter().find(|s| s.step_key == "b").expect("step b");
+        let job_a = dispatch_step_job(&pool, req_id, step_a.id).await;
+        let job_b = dispatch_step_job(&pool, req_id, step_b.id).await;
+
+        // 'b' succeeds -> 'c' becomes ready and is dispatched; request stays executing.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "b0",
+            job_b,
+        )
+        .await
+        .expect("backlink b success");
+        tx.commit().await.unwrap();
+
+        let mid = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan mid-flight");
+        let c_mid = mid.iter().find(|s| s.step_key == "c").expect("step c");
+        assert_eq!(c_mid.status, "Running", "b's success dispatched c");
+        assert!(
+            c_mid.agent_job_id.is_some(),
+            "c was dispatched an agent_job"
+        );
+        let status_mid: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_mid, "executing",
+            "request still executing (a in-flight)"
+        );
+
+        // 'a' fails -> request fails; the in-flight 'c' must be reconciled to Failed.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            "failed",
+            "a0",
+            job_a,
+        )
+        .await
+        .expect("backlink a failure");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "a's failure fails the request");
+
+        let after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = after.iter().find(|s| s.step_key == "b").unwrap();
+        let c_after = after.iter().find(|s| s.step_key == "c").unwrap();
+        assert_eq!(a_after.status, "Failed", "a marked Failed");
+        assert_eq!(b_after.status, "Succeeded", "b's success is preserved");
+        assert_eq!(
+            c_after.status, "Failed",
+            "the in-flight dispatched c is reconciled to Failed, not stranded Running"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
     }
 
     // ── #23 follow-up: dead-lettered job list + requeue ──────────────────────

@@ -2678,42 +2678,42 @@ struct CreateRequest {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct DbRequestRow {
-    id: Uuid,
-    request_type: String,
-    status: String,
-    stage: String,
-    site: String,
-    environment: String,
-    name: String,
-    cpu: i32,
-    memory_gb: i32,
-    justification: Option<String>,
-    created_by: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct DbRequestRow {
+    pub(crate) id: Uuid,
+    pub(crate) request_type: String,
+    pub(crate) status: String,
+    pub(crate) stage: String,
+    pub(crate) site: String,
+    pub(crate) environment: String,
+    pub(crate) name: String,
+    pub(crate) cpu: i32,
+    pub(crate) memory_gb: i32,
+    pub(crate) justification: Option<String>,
+    pub(crate) created_by: Option<String>,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
     // ── Durable lifecycle state (migration 047) ──
     // payload is authoritative for all 14 request types; the cpu/memory_gb
     // scalars above are a denormalized server-deployment convenience copy.
-    payload: serde_json::Value,
+    pub(crate) payload: serde_json::Value,
     // serde of Vec<Stage>: the REAL persisted lifecycle history (no longer
     // fabricated in db_row_to_request).
-    stages: serde_json::Value,
+    pub(crate) stages: serde_json::Value,
     // serde of Vec<String> (the engine approval_route field).
-    approval_route: serde_json::Value,
+    pub(crate) approval_route: serde_json::Value,
     // serde of the produced plan stages (Vec<Stage>) or null until planned.
-    plan: serde_json::Value,
+    pub(crate) plan: serde_json::Value,
     // serde of the last ValidationResult or null.
-    validation_results: serde_json::Value,
-    criticality: String,
+    pub(crate) validation_results: serde_json::Value,
+    pub(crate) criticality: String,
     // #4: number of DISTINCT approving roles required before Planned->Approved.
     // DEFAULT 1 (migration 118) preserves single-approval semantics; raised above
     // 1 by a deferred policy source, a request holds at Planned until the quorum
     // is met (apply_approval_decision_audited enforces it).
-    required_approval_roles: i32,
-    requester: Option<String>,
-    owner: Option<String>,
-    evidence_manifest_id: Option<String>,
+    pub(crate) required_approval_roles: i32,
+    pub(crate) requester: Option<String>,
+    pub(crate) owner: Option<String>,
+    pub(crate) evidence_manifest_id: Option<String>,
 }
 
 /// The full `requests` column list shared by every `SELECT`/`RETURNING` that
@@ -2721,7 +2721,8 @@ struct DbRequestRow {
 /// place and the column order stays in lockstep with the struct's `FromRow`
 /// (sqlx::query_as matches by position for the tuple-less struct case via name,
 /// but a single source of truth keeps all ~10 sites identical).
-const REQUEST_COLUMNS: &str = "id, request_type, status, stage, site, environment, name, cpu, \
+pub(crate) const REQUEST_COLUMNS: &str =
+    "id, request_type, status, stage, site, environment, name, cpu, \
      memory_gb, justification, created_by, created_at, updated_at, payload, stages, \
      approval_route, plan, validation_results, criticality, required_approval_roles, requester, \
      owner, evidence_manifest_id";
@@ -14969,7 +14970,10 @@ fn payload_to_metadata(payload: &serde_json::Value) -> std::collections::HashMap
 /// now run against genuine persisted history, which is exactly why every
 /// transition MUST persist its engine-produced stages back (see
 /// apply_transition_audited / the per-handler artifacts).
-fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::models::Request {
+pub(crate) fn db_row_to_request(
+    row: &DbRequestRow,
+    request_id: &str,
+) -> ryuki_engine::models::Request {
     use ryuki_engine::models::{Request, Stage};
     Request {
         id: request_id.to_string(),
@@ -17087,6 +17091,34 @@ async fn materialize_execution(
         plan.iter().map(|row| row.to_orchestration_step()).collect();
     ryuki_engine::job_orchestration::validate_plan(&orchestration_steps)
         .map_err(|_| MaterializeError::InvalidPlan)?;
+
+    let job_ids = dispatch_ready_steps(tx, request, current, &plan).await?;
+
+    Ok(MaterializeOutcome::StepJobs { job_ids })
+}
+
+/// Dispatch a plan's newly-ready steps as `OfflineDryRun` `agent_jobs`,
+/// INSIDE the caller's transaction/connection. Shared by
+/// [`materialize_execution`] (a request's INITIAL ready steps, #42 slice 2a)
+/// and the step-success backlink (next-ready-step dispatch on step success,
+/// #42 slice 2b). Readiness is computed fresh from `plan` — the caller is
+/// responsible for the plan reflecting the latest step statuses (e.g. having
+/// just marked a step `Succeeded`) and, for the concurrent multi-writer case,
+/// for having locked the plan's rows (see
+/// `repos::job_steps::load_plan_for_update`) so two step completions for the
+/// same request cannot race each other's readiness computation.
+///
+/// Every dispatched step job is `OfflineDryRun` ONLY — see
+/// [`build_step_job_spec`]; there is no path from here to `LiveApply`.
+pub(crate) async fn dispatch_ready_steps(
+    tx: &mut sqlx::PgConnection,
+    request: &ryuki_engine::models::Request,
+    current: &DbRequestRow,
+    plan: &[crate::repos::job_steps::JobStepRow],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let request_id = current.id;
+    let orchestration_steps: Vec<ryuki_engine::job_orchestration::Step> =
+        plan.iter().map(|row| row.to_orchestration_step()).collect();
     let ready_keys = ryuki_engine::job_orchestration::ready_steps(&orchestration_steps);
 
     let mut job_ids = Vec::with_capacity(ready_keys.len());
@@ -17111,7 +17143,7 @@ async fn materialize_execution(
         job_ids.push(job_id);
     }
 
-    Ok(MaterializeOutcome::StepJobs { job_ids })
+    Ok(job_ids)
 }
 
 /// Build the `JobSpec` for one multi-step-plan step. HARD-CODES

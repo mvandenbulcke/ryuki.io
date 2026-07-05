@@ -113,3 +113,94 @@ where
     .await?;
     Ok(())
 }
+
+/// Load a request's full step plan WITH a row lock (`FOR UPDATE`), ordered by
+/// `step_key` for a deterministic lock-acquisition order (avoids deadlock
+/// when two step completions for the SAME request are processed by
+/// concurrent transactions — both always acquire the plan's row locks in the
+/// same order).
+///
+/// This is the #42 slice 2b concurrency primitive: the step-success backlink
+/// takes this lock BEFORE reading step statuses to decide readiness/
+/// completion, so two step-jobs completing concurrently for one request
+/// serialize on the plan rather than racing (no double-dispatch of a
+/// newly-ready step, no missed final-step transition).
+pub async fn load_plan_for_update(
+    executor: &mut sqlx::PgConnection,
+    request_id: Uuid,
+) -> Result<Vec<JobStepRow>, sqlx::Error> {
+    sqlx::query_as::<_, JobStepRow>(
+        "SELECT id, request_id, step_key, depends_on, iac_ref, status, agent_job_id \
+         FROM job_steps WHERE request_id = $1 ORDER BY step_key FOR UPDATE",
+    )
+    .bind(request_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// Look up the step (if any) that a dispatched `agent_jobs.id` is linked to.
+/// The step-success backlink resolves this via its already-locked plan
+/// (`plan.iter().find(...)`) rather than a second query, so this is not
+/// currently called; kept as the direct by-job-id lookup primitive for
+/// callers that have not already loaded the plan.
+#[allow(dead_code)]
+pub async fn step_for_job<'e, E>(
+    executor: E,
+    job_id: Uuid,
+) -> Result<Option<JobStepRow>, sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, JobStepRow>(
+        "SELECT id, request_id, step_key, depends_on, iac_ref, status, agent_job_id \
+         FROM job_steps WHERE agent_job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Set a step's status directly (e.g. `Succeeded`/`Failed` on step
+/// completion). Does NOT touch `agent_job_id` — that link is established once,
+/// at dispatch time, by [`mark_running`].
+pub async fn mark_status<'e, E>(executor: E, step_id: Uuid, status: &str) -> Result<(), sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query("UPDATE job_steps SET status = $2, updated_at = NOW() WHERE id = $1")
+        .bind(step_id)
+        .bind(status)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Reconcile a failing request's plan: mark every still-in-flight (`Running`,
+/// i.e. dispatched-but-not-yet-terminal) step `Failed`. Leaves `Pending` steps
+/// (never dispatched — honestly "never started"), `Succeeded`, and
+/// already-`Failed` steps untouched. Returns the number of rows swept.
+///
+/// This closes a concurrency gap in #42 slice 2b: when independent parallel
+/// steps complete in separate transactions, one sibling's success can dispatch
+/// a downstream step (flipping it `Running`) just before another sibling's
+/// failure fails the request. Without this sweep, that freshly-dispatched
+/// step's row would be stranded `Running` forever — its eventual result hits
+/// the backlink's `status != 'executing'` early-guard and is silently
+/// swallowed. Sweeping in-flight steps to `Failed` in the SAME transaction as
+/// the request-fail keeps the plan's terminal state consistent with the
+/// request's. (Only `Running` is swept, not `Pending`: a never-dispatched step
+/// under a failed request is inert and its `Pending` status truthfully records
+/// that it never ran.)
+pub async fn fail_inflight_steps<'e, E>(executor: E, request_id: Uuid) -> Result<u64, sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        "UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
+         WHERE request_id = $1 AND status = 'Running'",
+    )
+    .bind(request_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
