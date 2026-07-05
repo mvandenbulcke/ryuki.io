@@ -13868,12 +13868,25 @@ async fn admin_tokens_create(
     ))
 }
 
+/// Shared query params for admin list endpoints that had NO query params
+/// before #14 (admin_tokens_list, admin_sessions_list). All-optional so a
+/// request with no query string still deserializes — non-breaking at the
+/// HTTP layer. Named distinctly from the pre-existing `PaginationParams`
+/// (usize-typed, used elsewhere) since these bind directly as `i64` sqlx
+/// params for LIMIT/OFFSET.
+#[derive(Debug, Deserialize)]
+struct AdminListPage {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 /// GET /api/admin/tokens — list token metadata with the hash REDACTED. Reads
 /// are not gated by the central ROUTE_PERMISSIONS table this wave, so the
 /// handler enforces the admin gate explicitly (these reads expose token
 /// metadata).
 async fn admin_tokens_list(
     AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     require_admin_permission(&session)?;
 
@@ -13881,20 +13894,43 @@ async fn admin_tokens_list(
         return Err(api_token_db_required());
     };
 
+    // #14: bound the result set so a large token inventory can't return an
+    // unbounded page. Generous default cap keeps current seed-scale
+    // deployments unaffected.
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
+
     let rows: Vec<TokenListRow> = map_api_token_result(
         sqlx::query_as::<_, TokenListRow>(
             "SELECT id, name, owner_principal, roles, site_scope, environment_scope, \
                     token_valid, created_at, expires_at, last_used_at, revoked_at \
-             FROM api_tokens ORDER BY created_at DESC",
+             FROM api_tokens ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await,
         "list",
     )?;
 
+    // Filtered total (same WHERE — none here — no limit/offset) so pagination
+    // reflects the whole set consistently with the paged query.
+    let total: i64 = map_api_token_result(
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
+            .fetch_one(pool)
+            .await,
+        "list-count",
+    )?;
+
     let tokens: Vec<Value> = rows.into_iter().map(token_row_to_json).collect();
 
-    Ok(Json(json!({ "tokens": tokens })))
+    Ok(Json(json!({
+        "tokens": tokens,
+        "count": tokens.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 /// The secret-safe JSON projection of one API token row, SHARED by the list and
@@ -14026,6 +14062,7 @@ struct SessionListRow {
 /// GET /api/admin/sessions — list active (non-expired) browser sessions.
 async fn admin_sessions_list(
     AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     require_admin_permission(&session)?;
 
@@ -14033,14 +14070,32 @@ async fn admin_sessions_list(
         return Err(api_token_db_required());
     };
 
+    // #14: bound the result set so a large active-session set can't return an
+    // unbounded page. Generous default cap keeps current seed-scale
+    // deployments unaffected.
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
+
     let rows: Vec<SessionListRow> = map_api_token_result(
         sqlx::query_as::<_, SessionListRow>(
             "SELECT id, user_id, display_name, roles, provider, created_at, expires_at \
-             FROM sessions WHERE expires_at > NOW() ORDER BY created_at DESC",
+             FROM sessions WHERE expires_at > NOW() ORDER BY created_at DESC, id DESC \
+             LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await,
         "list-sessions",
+    )?;
+
+    // Filtered total (same WHERE, no limit/offset) so pagination reflects the
+    // filtered (active-only) set rather than the whole table.
+    let total: i64 = map_api_token_result(
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > NOW()")
+            .fetch_one(pool)
+            .await,
+        "list-sessions-count",
     )?;
 
     let sessions: Vec<Value> = rows
@@ -14058,7 +14113,13 @@ async fn admin_sessions_list(
         })
         .collect();
 
-    Ok(Json(json!({ "sessions": sessions })))
+    Ok(Json(json!({
+        "sessions": sessions,
+        "count": sessions.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 /// GET /api/admin/sessions/{id} — fetch a single browser session by id for
@@ -34371,6 +34432,8 @@ struct SecretsListQuery {
     site: Option<String>,
     #[serde(rename = "secretType")]
     secret_type: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -34521,6 +34584,10 @@ async fn secrets_list(
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
     let secret_type = q.secret_type.as_deref().unwrap_or("");
+    // #14: bound the result set so a large datacenter can't return an unbounded
+    // page. Generous default cap keeps current seed-scale deployments unaffected.
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     if let Some(pool) = get_db() {
         // Normalize the optional type filter through the engine parser, then
         // compare against the stored serde string.
@@ -34534,24 +34601,54 @@ async fn secrets_list(
         let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
              WHERE ($1 = '' OR site = $1) AND ($2 = '' OR secret_type = $2) \
-             ORDER BY site, id"
+             ORDER BY site, id LIMIT $3 OFFSET $4"
         ))
         .bind(site)
         .bind(&type_col)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
         let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
+        // Filtered total (same WHERE, no limit/offset) so pagination reflects the
+        // filtered set rather than the whole table.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM managed_secrets \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR secret_type = $2)",
+        )
+        .bind(site)
+        .bind(&type_col)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "dry_run": true,
             "count": secrets.len(),
             "secrets": secrets,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
-    secrets_rotation::list_secrets(site, secret_type)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    // No-DB fallback: the process-local engine store. Best-effort pagination —
+    // slice the in-memory vec the same way the DB path slices rows.
+    let mut result = secrets_rotation::list_secrets(site, secret_type)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let secrets = result["secrets"].as_array().cloned().unwrap_or_default();
+    let total = secrets.len() as i64;
+    let page: Vec<Value> = secrets
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    result["count"] = json!(page.len());
+    result["secrets"] = json!(page);
+    result["total"] = json!(total);
+    result["limit"] = json!(limit);
+    result["offset"] = json!(offset);
+    Ok(Json(result))
 }
 async fn secrets_register(
     AuthExtractor(session): AuthExtractor,
@@ -38948,7 +39045,15 @@ mod unit_tests {
     async fn test_admin_tokens_list_rejects_non_admin() {
         let mut session = AuthSession::static_dry_run();
         session.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
-        let Err((status, _)) = admin_tokens_list(AuthExtractor(session)).await else {
+        let Err((status, _)) = admin_tokens_list(
+            AuthExtractor(session),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        else {
             panic!("auditor must be forbidden from listing tokens");
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -54821,6 +54926,93 @@ mod secrets_rotation_db_tests {
         assert_eq!(got["secret"]["name"], "dbtest-registered-secret");
         assert_eq!(got["secret"]["site"], "DBTEST-REG");
     }
+
+    /// #14 (batch 2): secrets_list is bounded by limit/offset and reports a
+    /// filtered `total` that stays stable across pages, without breaking the
+    /// existing `{source, dry_run, count, secrets}` shape (fields only ADDED).
+    /// Mirrors the batch-1 dns/ipam/firewall pagination tests.
+    #[tokio::test]
+    async fn secrets_list_paginates_and_reports_filtered_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("PGTEST-{suffix}");
+        let other_site = format!("PGTEST-OTHER-{suffix}");
+        let mut ids: Vec<String> = Vec::new();
+        // 5 secrets in the target site + 2 in another, to prove the site filter
+        // narrows `total` to only the matching site.
+        for i in 0..5 {
+            let id = format!("secret-pg-{suffix}-{i}");
+            seed_secret(pool, &id, &site, "2026-12-31T00:00:00+00:00").await;
+            ids.push(id);
+        }
+        for i in 0..2 {
+            let id = format!("secret-pg-other-{suffix}-{i}");
+            seed_secret(pool, &id, &other_site, "2026-12-31T00:00:00+00:00").await;
+            ids.push(id);
+        }
+
+        let session = || AuthExtractor(AuthSession::static_dry_run());
+        let list = |limit: i64, offset: i64, site: String| {
+            secrets_list(
+                session(),
+                Query(SecretsListQuery {
+                    site: Some(site),
+                    secret_type: None,
+                    limit: Some(limit),
+                    offset: Some(offset),
+                }),
+            )
+        };
+
+        let Json(page0) = list(2, 0, site.clone()).await.expect("page0");
+        assert_eq!(page0["secrets"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], 5);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = list(2, 2, site.clone()).await.expect("page1");
+        assert_eq!(page1["secrets"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["total"], 5, "total must stay stable across pages");
+
+        let Json(page2) = list(2, 4, site.clone()).await.expect("page2");
+        assert_eq!(
+            page2["secrets"].as_array().unwrap().len(),
+            1,
+            "last page holds the remainder"
+        );
+        assert_eq!(page2["total"], 5);
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<String> = page0["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let ids1: Vec<String> = page1["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // The site filter narrows `total` — it must NOT count the other site.
+        let Json(other) = list(500, 0, other_site.clone()).await.expect("other site");
+        assert_eq!(other["total"], 2);
+
+        for id in ids {
+            cleanup_secret(pool, &id).await;
+        }
+    }
 }
 
 // ─── DB-gated integration tests for access-recertification persistence ────────
@@ -68400,5 +68592,338 @@ mod dr_test_runs_db_tests {
 
         cleanup_run(pool, &run_id).await;
         cleanup_plan(pool, &plan_id).await;
+    }
+}
+
+// ─── #14 (batch 2): DB-gated pagination tests for admin_tokens_list and
+// admin_sessions_list ──────────────────────────────────────────────────────
+//
+// Both endpoints are admin-only (require_admin_permission) and previously took
+// NO query params / returned an unbounded result set. Each test SKIPS when
+// RYUKI_DATABASE_URL is unset. Run with:
+//   RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api admin_tokens_sessions_pagination_db_tests
+#[cfg(test)]
+mod admin_tokens_sessions_pagination_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    /// An authenticated admin caller — `static_dry_run()` already carries
+    /// `PlatformAdmin`, which holds the `admin` permission (see
+    /// `check_permission`), so it satisfies `require_admin_permission` as-is.
+    fn admin_session() -> AuthSession {
+        AuthSession::static_dry_run()
+    }
+
+    fn page_params(limit: i64, offset: i64) -> Query<AdminListPage> {
+        Query(AdminListPage {
+            limit: Some(limit),
+            offset: Some(offset),
+        })
+    }
+
+    /// #14 (batch 2): admin_tokens_list is bounded by limit/offset and reports
+    /// a filtered `total`, without breaking the existing `{tokens}` shape
+    /// (fields only ADDED: count/total/limit/offset).
+    #[tokio::test]
+    async fn admin_tokens_list_paginates_and_reports_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("pg-token-owner-{suffix}");
+        let mut ids: Vec<Uuid> = Vec::new();
+        // 5 tokens owned by this test's unique owner, so the pre-existing table
+        // contents (if any) never affect the page-slicing assertions below —
+        // only the delta between two calls does.
+        for i in 0..5 {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO api_tokens (name, owner_principal, token_hash, roles) \
+                 VALUES ($1, $2, $3, $4) RETURNING id",
+            )
+            .bind(format!("pg-token-{suffix}-{i}"))
+            .bind(&owner)
+            .bind(format!("hash-{suffix}-{i}"))
+            .bind(vec!["PlatformAdmin".to_string()])
+            .fetch_one(pool)
+            .await
+            .expect("seed api_token");
+            ids.push(id);
+        }
+
+        let total_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
+            .fetch_one(pool)
+            .await
+            .expect("count api_tokens before");
+
+        let Json(page0) = admin_tokens_list(AuthExtractor(admin_session()), page_params(2, 0))
+            .await
+            .expect("page0");
+        assert_eq!(page0["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], total_before);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = admin_tokens_list(AuthExtractor(admin_session()), page_params(2, 2))
+            .await
+            .expect("page1");
+        assert_eq!(page1["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            page1["total"], total_before,
+            "total must stay stable across pages"
+        );
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<String> = page0["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let ids1: Vec<String> = page1["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // A page big enough to cover all 5 seeded rows must contain every one
+        // of this test's own tokens (owner is unique to this run).
+        let Json(all) = admin_tokens_list(
+            AuthExtractor(admin_session()),
+            page_params(total_before.max(1000), 0),
+        )
+        .await
+        .expect("full page");
+        let all_ids: Vec<String> = all["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        for id in &ids {
+            assert!(
+                all_ids.contains(&id.to_string()),
+                "seeded token {id} must appear in the full listing"
+            );
+        }
+
+        for id in ids {
+            sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// #14 (batch 2): admin_tokens_list uses a UNIQUE tie-breaker (id) after
+    /// `created_at`, so LIMIT/OFFSET pages are stable even when rows share an
+    /// identical `created_at`. Without the tie-breaker, Postgres may order tied
+    /// rows differently between the full query and each paged query, so a
+    /// concatenation of pages could overlap or skip rows. Here five tokens are
+    /// seeded with the SAME created_at; the paged slices must equal the
+    /// corresponding slices of the full ordering.
+    #[tokio::test]
+    async fn admin_tokens_list_pages_stable_under_tied_created_at() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner = format!("pg-tie-owner-{suffix}");
+        let mut ids: Vec<Uuid> = Vec::new();
+        for i in 0..5 {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO api_tokens (name, owner_principal, token_hash, roles, created_at) \
+                 VALUES ($1, $2, $3, $4, $5::timestamptz) RETURNING id",
+            )
+            .bind(format!("pg-tie-{suffix}-{i}"))
+            .bind(&owner)
+            .bind(format!("hash-tie-{suffix}-{i}"))
+            .bind(vec!["PlatformAdmin".to_string()])
+            // Identical created_at across all five rows -> forces the tie the
+            // id tie-breaker must resolve deterministically.
+            .bind("2999-01-01T00:00:00Z")
+            .fetch_one(pool)
+            .await
+            .expect("seed tied api_token");
+            ids.push(id);
+        }
+
+        let ids_of = |v: &Value| -> Vec<String> {
+            v["tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Full ordering (large page) and the two leading paged slices.
+        let Json(full) = admin_tokens_list(AuthExtractor(admin_session()), page_params(1000, 0))
+            .await
+            .expect("full");
+        let Json(p0) = admin_tokens_list(AuthExtractor(admin_session()), page_params(2, 0))
+            .await
+            .expect("p0");
+        let Json(p1) = admin_tokens_list(AuthExtractor(admin_session()), page_params(2, 2))
+            .await
+            .expect("p1");
+
+        let full_ids = ids_of(&full);
+        assert_eq!(
+            ids_of(&p0),
+            full_ids[0..2].to_vec(),
+            "page 0 must equal the first slice of the full ordering (stable tie-break)"
+        );
+        assert_eq!(
+            ids_of(&p1),
+            full_ids[2..4].to_vec(),
+            "page 1 must equal the next slice of the full ordering (no overlap/skip under ties)"
+        );
+
+        for id in ids {
+            sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// #14 (batch 2): admin_sessions_list is bounded by limit/offset and
+    /// reports a filtered (active-only) `total`, without breaking the existing
+    /// `{sessions}` shape (fields only ADDED: count/total/limit/offset).
+    #[tokio::test]
+    async fn admin_sessions_list_paginates_and_reports_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let mut ids: Vec<Uuid> = Vec::new();
+        // 5 sessions with expires_at in the FUTURE so they pass the handler's
+        // `expires_at > NOW()` filter.
+        for i in 0..5 {
+            let user_id = format!("pg-session-user-{suffix}-{i}");
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO sessions (user_id, display_name, roles, expires_at) \
+                 VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour') RETURNING id",
+            )
+            .bind(&user_id)
+            .bind(format!("PG Test User {i}"))
+            .bind(vec!["PlatformAdmin".to_string()])
+            .fetch_one(pool)
+            .await
+            .expect("seed session");
+            ids.push(id);
+        }
+        // One EXPIRED session — must never count toward `total` (the filter is
+        // `expires_at > NOW()`).
+        let expired_user = format!("pg-session-expired-{suffix}");
+        let expired_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sessions (user_id, display_name, roles, expires_at) \
+             VALUES ($1, $2, $3, NOW() - INTERVAL '1 hour') RETURNING id",
+        )
+        .bind(&expired_user)
+        .bind("PG Test Expired User")
+        .bind(vec!["PlatformAdmin".to_string()])
+        .fetch_one(pool)
+        .await
+        .expect("seed expired session");
+        ids.push(expired_id);
+
+        let total_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > NOW()")
+                .fetch_one(pool)
+                .await
+                .expect("count active sessions before");
+
+        let Json(page0) = admin_sessions_list(AuthExtractor(admin_session()), page_params(2, 0))
+            .await
+            .expect("page0");
+        assert_eq!(page0["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], total_before);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = admin_sessions_list(AuthExtractor(admin_session()), page_params(2, 2))
+            .await
+            .expect("page1");
+        assert_eq!(page1["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            page1["total"], total_before,
+            "total must stay stable across pages"
+        );
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<String> = page0["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let ids1: Vec<String> = page1["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // The expired session must never appear in a full listing — the
+        // `expires_at > NOW()` filter narrows `total`, and the fetched page.
+        let Json(all) = admin_sessions_list(
+            AuthExtractor(admin_session()),
+            page_params(total_before.max(1000), 0),
+        )
+        .await
+        .expect("full page");
+        let all_ids: Vec<String> = all["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !all_ids.contains(&expired_id.to_string()),
+            "expired session must not be listed"
+        );
+        for id in ids.iter().filter(|id| **id != expired_id) {
+            assert!(
+                all_ids.contains(&id.to_string()),
+                "seeded active session {id} must appear in the full listing"
+            );
+        }
+
+        for id in ids {
+            sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
     }
 }
