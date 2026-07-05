@@ -56,7 +56,7 @@ implementing **all 66**. This file tracks execution.
 | 24 | [x] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
 | 25 | [x] | SLO / error-budget tracking | Observ | M | H | — |
 | 26 | [x] | CP database backup/restore + DR runbook | Roadmap | M | H | ✓ |
-| 27 | [ ] | Bidirectional CMDB reconciliation + drift | Integ | L | H | ✓ |
+| 27 | [~] | Bidirectional CMDB reconciliation + drift | Integ | L | H | `393caad`/`ee98640` — the "+ drift" half: pure detect_attribute_drift (owner/site/environment/criticality divergence for CIs matched in both sources) wired into the live cmdb_run_reconciliation endpoint (real platform inventory today). Follow-ups (external-gated): live CMDB fetch (import_cmdb_records is still demo data) + write-back to resolve drift |
 | 28 | [ ] | Active Directory / Entra integration adapter | Integ | L | H | — |
 | 29 | [ ] | DR failover orchestration (runbook-driven) | Resil | L | H | — |
 | 30 | [x] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
