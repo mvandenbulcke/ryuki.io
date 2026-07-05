@@ -14,6 +14,7 @@ mod idempotency;
 mod inbound_webhooks;
 mod integration;
 mod oidc_callback;
+mod openapi;
 mod repos;
 mod scheduler;
 

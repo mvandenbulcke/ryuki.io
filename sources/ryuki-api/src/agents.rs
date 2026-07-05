@@ -2864,7 +2864,35 @@ pub fn agent_routes() -> Router {
             post(post_job_result),
         )
         .route("/api/agents/{agent_id}/heartbeat", post(heartbeat))
+        .route(
+            "/api/agents/openapi.json",
+            axum::routing::get(crate::openapi::openapi_json),
+        )
 }
+
+/// Drift-guard source of truth: the (method, path) pairs of every AGENT-PROTOCOL
+/// endpoint documented in `crate::openapi::openapi_document()`. Cross-checked
+/// exactly (no missing, no extra) by `openapi.rs`'s
+/// `documented_paths_match_agent_route_paths_exactly` test, so adding or
+/// removing an agent route without updating the OpenAPI spec fails CI.
+///
+/// KEEP IN SYNC with the routes registered in [`agent_routes`] above AND with
+/// the `paths` documented in `openapi_document()`. Deliberately does NOT
+/// include `/api/agents/openapi.json` itself — that route is meta (it serves
+/// this very document), not an agent-protocol endpoint.
+///
+/// `ryuki-api` is a binary crate (no lib target), so this `pub` constant is
+/// only ever read from `openapi.rs`'s `#[cfg(test)]` drift-guard test — never
+/// from non-test code. That makes it legitimately dead in a release build.
+#[allow(dead_code)]
+pub const AGENT_ROUTE_PATHS: &[(&str, &str)] = &[
+    ("POST", "/api/agents/register"),
+    ("GET", "/api/agents/cp-public-key"),
+    ("GET", "/api/agents/{agent_id}/jobs"),
+    ("POST", "/api/agents/{agent_id}/jobs/{job_id}/ack"),
+    ("POST", "/api/agents/{agent_id}/jobs/{job_id}/result"),
+    ("POST", "/api/agents/{agent_id}/heartbeat"),
+];
 
 // ---------------------------------------------------------------------------
 // POST /api/admin/agents/live-apply-jobs — operator live-apply approval
