@@ -197,6 +197,81 @@ pub fn reconcile_cmdb(
     Ok(results)
 }
 
+/// One attribute of a CI that DIVERGES between the platform inventory and the CMDB.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttributeDrift {
+    /// The diverging field name (e.g. "owner", "environment").
+    pub field: String,
+    /// The value the platform inventory holds.
+    pub platform_value: String,
+    /// The value the CMDB holds for the same field.
+    pub cmdb_value: String,
+}
+
+/// Attribute-level drift for a single CI present in BOTH sources (matched by name).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CiDrift {
+    pub ci_name: String,
+    pub drifts: Vec<AttributeDrift>,
+}
+
+/// Detect attribute-level drift for CIs present in BOTH the platform inventory and
+/// the CMDB, matched by name (`InventoryItem.name` == `CmdbRecord.ci_name`).
+///
+/// This is the "+ drift" half of "bidirectional CMDB reconciliation + drift" (#27):
+/// [`reconcile_cmdb`] reports PRESENCE gaps but treats every matched CI as
+/// "reconciled (present in both)" — it never checks whether the two systems of
+/// record actually AGREE on that CI's attributes. A matched CI whose owner / site /
+/// environment / criticality disagree between the platform and the CMDB is real
+/// drift that must be surfaced, not silently passed. Only the four fields BOTH
+/// models carry are compared (exact, case-sensitive); a matched CI with no
+/// divergence is omitted from the result. Unmatched CIs (present in only one
+/// source) are NOT drift — that is presence reconciliation, [`reconcile_cmdb`]'s job.
+///
+/// Pure / no-IO, so the reconciliation decision is fully unit-testable without a
+/// live CMDB. The live CMDB fetch + any write-back to resolve the drift are external
+/// integration wiring layered on this core.
+pub fn detect_attribute_drift(platform: &[InventoryItem], cmdb: &[CmdbRecord]) -> Vec<CiDrift> {
+    let by_name: HashMap<&str, &CmdbRecord> =
+        cmdb.iter().map(|r| (r.ci_name.as_str(), r)).collect();
+    let mut out: Vec<CiDrift> = Vec::new();
+    for item in platform {
+        let Some(rec) = by_name.get(item.name.as_str()) else {
+            continue; // present only in the platform — a presence gap, not drift
+        };
+        let comparisons: [(&str, &str, &str); 4] = [
+            ("owner", item.owner.as_str(), rec.owner.as_str()),
+            ("site", item.site.as_str(), rec.site.as_str()),
+            (
+                "environment",
+                item.environment.as_str(),
+                rec.environment.as_str(),
+            ),
+            (
+                "criticality",
+                item.criticality.as_str(),
+                rec.criticality.as_str(),
+            ),
+        ];
+        let drifts: Vec<AttributeDrift> = comparisons
+            .into_iter()
+            .filter(|(_, pv, cv)| pv != cv)
+            .map(|(field, pv, cv)| AttributeDrift {
+                field: field.to_string(),
+                platform_value: pv.to_string(),
+                cmdb_value: cv.to_string(),
+            })
+            .collect();
+        if !drifts.is_empty() {
+            out.push(CiDrift {
+                ci_name: item.name.clone(),
+                drifts,
+            });
+        }
+    }
+    out
+}
+
 pub fn export_cmdb(records: &[CmdbRecord], format: &str) -> Result<String, String> {
     if records.is_empty() {
         return Err("No CMDB records to export".into());
@@ -360,5 +435,96 @@ mod tests {
         }];
         let results = reconcile_cmdb(&platform, &cmdb).unwrap();
         assert!(results.iter().any(|r| r.contains("reconciled")));
+    }
+
+    // ---- #27 attribute-drift detection (the "+ drift" half) ----
+
+    fn inv(name: &str, owner: &str, site: &str, env: &str, crit: &str) -> InventoryItem {
+        InventoryItem {
+            id: format!("inv-{name}"),
+            name: name.into(),
+            item_type: InventoryType::Server,
+            owner: owner.into(),
+            site: site.into(),
+            environment: env.into(),
+            criticality: crit.into(),
+            last_synced: "2026-01-01T00:00:00Z".into(),
+            source: "vmware".into(),
+            stale: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn rec(name: &str, owner: &str, site: &str, env: &str, crit: &str) -> CmdbRecord {
+        CmdbRecord {
+            ci_id: format!("ci-{name}"),
+            ci_name: name.into(),
+            ci_type: "Windows Server".into(),
+            site: site.into(),
+            environment: env.into(),
+            owner: owner.into(),
+            support_group: "wintel".into(),
+            criticality: crit.into(),
+            attributes: HashMap::new(),
+            relationships: Vec::new(),
+            import_status: ImportStatus::Accepted,
+            validation_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn drift_detected_for_matched_ci_with_divergent_attributes() {
+        // Same name, but owner + environment disagree between platform and CMDB.
+        let platform = vec![inv("srv-01", "team-a", "DEFRA", "production", "high")];
+        let cmdb = vec![rec("srv-01", "team-b", "DEFRA", "staging", "high")];
+        let drift = detect_attribute_drift(&platform, &cmdb);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].ci_name, "srv-01");
+        let fields: Vec<&str> = drift[0].drifts.iter().map(|d| d.field.as_str()).collect();
+        assert!(fields.contains(&"owner"));
+        assert!(fields.contains(&"environment"));
+        assert!(!fields.contains(&"site"));
+        assert!(!fields.contains(&"criticality"));
+        let owner = drift[0].drifts.iter().find(|d| d.field == "owner").unwrap();
+        assert_eq!(owner.platform_value, "team-a");
+        assert_eq!(owner.cmdb_value, "team-b");
+    }
+
+    #[test]
+    fn no_drift_when_matched_ci_attributes_agree() {
+        let platform = vec![inv("srv-01", "team-a", "DEFRA", "production", "high")];
+        let cmdb = vec![rec("srv-01", "team-a", "DEFRA", "production", "high")];
+        assert!(detect_attribute_drift(&platform, &cmdb).is_empty());
+    }
+
+    #[test]
+    fn unmatched_cis_are_not_drift() {
+        // Present only in the platform (no CMDB match) — a presence gap, not drift.
+        let platform = vec![inv(
+            "srv-only-platform",
+            "team-a",
+            "DEFRA",
+            "production",
+            "high",
+        )];
+        let cmdb = vec![rec("srv-only-cmdb", "team-b", "GBLON", "staging", "low")];
+        assert!(detect_attribute_drift(&platform, &cmdb).is_empty());
+    }
+
+    #[test]
+    fn only_drifted_matched_cis_are_reported() {
+        let platform = vec![
+            inv("srv-clean", "team-a", "DEFRA", "production", "high"),
+            inv("srv-drift", "team-a", "DEFRA", "production", "high"),
+        ];
+        let cmdb = vec![
+            rec("srv-clean", "team-a", "DEFRA", "production", "high"), // identical → no drift
+            rec("srv-drift", "team-a", "GBLON", "production", "high"), // site diverges
+        ];
+        let drift = detect_attribute_drift(&platform, &cmdb);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].ci_name, "srv-drift");
+        assert_eq!(drift[0].drifts.len(), 1);
+        assert_eq!(drift[0].drifts[0].field, "site");
     }
 }
