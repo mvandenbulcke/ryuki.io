@@ -28363,9 +28363,17 @@ async fn cmdb_run_reconciliation() -> Result<Json<Value>, (StatusCode, Json<Valu
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     let cmdb_records = cmdb_engine::import_cmdb_records("cmdb-excel-export")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
-    cmdb_engine::reconcile_cmdb(&inventory, &cmdb_records)
-        .map(|results| Json(json!({"source": "dry-run", "reconciliation_results": results})))
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let results = cmdb_engine::reconcile_cmdb(&inventory, &cmdb_records)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    // #27 "+ drift": presence reconciliation (results, above) never checks whether a
+    // CI present in BOTH sources actually AGREES — surface attribute-level divergence
+    // (owner/site/environment/criticality) for matched CIs alongside the presence gaps.
+    let attribute_drift = cmdb_engine::detect_attribute_drift(&inventory, &cmdb_records);
+    Ok(Json(json!({
+        "source": "dry-run",
+        "reconciliation_results": results,
+        "attribute_drift": attribute_drift,
+    })))
 }
 
 async fn cmdb_export_records(
