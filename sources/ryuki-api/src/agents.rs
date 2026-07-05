@@ -865,6 +865,51 @@ fn map_result_status_to_job_status(s: &JobResultStatus) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// #60 slice 2: write-side evidence offload.
+//
+// Large evidence bloats the hot, frequently-updated `agent_jobs` row. Evidence
+// over `ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES`
+// is offloaded to the content-addressed `evidence_blobs` table (keyed by the
+// ALREADY-VERIFIED `evidence_digest` — step 6 above guarantees
+// `sha256_hex(&body.evidence) == env.evidence_digest` before this is ever
+// called), and only a small reference is stored inline in place of the full
+// `evidence_json`. Small evidence is unaffected — it keeps flowing through as
+// the agent-submitted `evidence_json` exactly as before.
+// ---------------------------------------------------------------------------
+
+/// Reference stored inline in `agent_jobs.evidence_json` when the raw evidence
+/// was offloaded to `evidence_blobs`. Deliberately small and DOES NOT include
+/// the raw evidence — the read side (resolving this reference back to bytes)
+/// is a separate, design-gated slice.
+fn evidence_blob_reference(digest: &str, size_bytes: usize) -> Value {
+    json!({
+        "_evidence_blob_digest": digest,
+        "_evidence_size_bytes": size_bytes,
+    })
+}
+
+/// Decide what to persist in `agent_jobs.evidence_json` for this result: the
+/// original agent-submitted `evidence_json` when evidence is small enough to
+/// stay inline, or a small digest reference when it is large enough to
+/// offload. Pure and side-effect-free so the offload threshold decision is
+/// unit-testable without a DB. `offload` is the caller's already-computed
+/// [`ryuki_engine::evidence_store::EvidenceStorage::is_offloaded`] result —
+/// passed in rather than recomputed so the handler and the persisted
+/// `evidence_blobs` INSERT can never disagree on the decision.
+fn compute_evidence_json_for_storage(
+    offload: bool,
+    evidence_len: usize,
+    evidence_digest: &str,
+    evidence_json: &Option<Value>,
+) -> Option<Value> {
+    if offload {
+        Some(evidence_blob_reference(evidence_digest, evidence_len))
+    } else {
+        evidence_json.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #43 post-apply verification: derive the runner's convergence verdict and map
 // it to a CP-internal terminal outcome + optional domain event.
 // ---------------------------------------------------------------------------
@@ -1789,10 +1834,44 @@ async fn post_job_result_with_pool(
 
     let envelope_json = serde_json::to_value(env).map_err(db_err)?;
 
+    // #60 slice 2: decide inline-vs-offload for THIS result's evidence. Pure
+    // decision — see `compute_evidence_json_for_storage` above.
+    let offload_evidence = ryuki_engine::evidence_store::decide_evidence_storage(
+        body.evidence.len(),
+        ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES,
+    )
+    .is_offloaded();
+    let evidence_json_for_storage = compute_evidence_json_for_storage(
+        offload_evidence,
+        body.evidence.len(),
+        &env.evidence_digest,
+        &body.evidence_json,
+    );
+
     // The terminal record and the parent-request backlink (slice 2) share ONE
     // transaction: a job that records its result also advances its request, and
     // vice versa — never one without the other.
     let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // #60 slice 2: persist the raw evidence bytes BEFORE the terminal UPDATE,
+    // in the SAME transaction, so a stored offload reference can never point
+    // at a missing blob. Content-addressed by the already-verified digest
+    // (step 6) — identical evidence across jobs dedups via ON CONFLICT DO
+    // NOTHING instead of storing duplicate copies.
+    if offload_evidence {
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO NOTHING",
+        )
+        .bind(&env.evidence_digest)
+        .bind(&body.evidence)
+        .bind(body.evidence.len() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+
     let updated = sqlx::query_scalar::<_, uuid::Uuid>(
         "UPDATE agent_jobs \
          SET status = $1, \
@@ -1813,7 +1892,7 @@ async fn post_job_result_with_pool(
     .bind(result.result_id)
     .bind(effective_result_status)
     .bind(&env.evidence_digest)
-    .bind(&body.evidence_json)
+    .bind(&evidence_json_for_storage)
     .bind(&envelope_json)
     .bind(job_id)
     .bind(result.attempt_id)
@@ -4657,6 +4736,37 @@ mod tests {
         assert_ne!(a, b, "tokens must be unique");
     }
 
+    // ── #60 slice 2: write-side evidence offload decision (pure, no DB) ─────
+
+    #[test]
+    fn evidence_json_for_storage_stays_inline_under_threshold() {
+        let submitted = Some(json!({"ok": true}));
+        let stored = compute_evidence_json_for_storage(false, 10, "deadbeef", &submitted);
+        assert_eq!(
+            stored, submitted,
+            "small evidence must keep the agent-submitted evidence_json inline"
+        );
+    }
+
+    #[test]
+    fn evidence_json_for_storage_becomes_a_reference_when_offloaded() {
+        let submitted = Some(json!({"ignored": "because offloaded"}));
+        let stored = compute_evidence_json_for_storage(true, 70_000, "deadbeef", &submitted);
+        let stored = stored.expect("offloaded result must still store a reference");
+        assert_eq!(
+            stored["_evidence_blob_digest"], "deadbeef",
+            "reference must carry the verified digest"
+        );
+        assert_eq!(
+            stored["_evidence_size_bytes"], 70_000,
+            "reference must carry the evidence size"
+        );
+        assert!(
+            stored.get("ignored").is_none(),
+            "the reference must NOT leak the raw agent-submitted evidence_json"
+        );
+    }
+
     // ── #44 agent liveness — auth + bounds (run before any pool access) ──
 
     #[tokio::test]
@@ -6647,6 +6757,245 @@ mod tests {
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── #60 slice 2: write-side evidence offload (DB) ────────────────────────
+
+    async fn read_evidence_json(pool: &PgPool, job_id: Uuid) -> Option<serde_json::Value> {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT evidence_json FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read evidence_json")
+    }
+
+    async fn count_evidence_blobs(pool: &PgPool, digest: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM evidence_blobs WHERE digest = $1")
+            .bind(digest)
+            .fetch_one(pool)
+            .await
+            .expect("count evidence_blobs")
+    }
+
+    async fn cleanup_evidence_blob(pool: &PgPool, digest: &str) {
+        sqlx::query("DELETE FROM evidence_blobs WHERE digest = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn db_large_evidence_offloads_to_blob_store() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("offload-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        // Strictly above DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES (64 KiB).
+        let evidence =
+            vec![b'x'; ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES + 1];
+        let evidence_digest = proto_sha256(&evidence);
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            &evidence,
+            JobResultStatus::CheckOk,
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: Some(json!({"raw": "this must not end up inline"})),
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "large-evidence ingest must succeed: {:?}",
+            resp.err()
+        );
+
+        // The blob row exists, keyed by the verified digest.
+        assert_eq!(
+            count_evidence_blobs(&pool, &evidence_digest).await,
+            1,
+            "large evidence must be persisted in evidence_blobs keyed by its digest"
+        );
+
+        // The inline evidence_json is a small reference, not the raw payload.
+        let stored = read_evidence_json(&pool, job_row.id)
+            .await
+            .expect("offloaded evidence must still store a reference");
+        assert_eq!(stored["_evidence_blob_digest"], evidence_digest);
+        assert_eq!(
+            stored["_evidence_size_bytes"],
+            evidence.len() as i64,
+            "reference must record the evidence size"
+        );
+        assert!(
+            stored.get("raw").is_none(),
+            "offloaded evidence_json must not carry the agent-submitted structured evidence"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        cleanup_evidence_blob(&pool, &evidence_digest).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_small_evidence_stays_inline_no_blob_row() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("inline-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"tiny evidence, well under the threshold";
+        let evidence_digest = proto_sha256(evidence);
+        let submitted_evidence_json = json!({"summary": "check passed"});
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: Some(submitted_evidence_json.clone()),
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "small-evidence ingest must succeed: {:?}",
+            resp.err()
+        );
+
+        assert_eq!(
+            count_evidence_blobs(&pool, &evidence_digest).await,
+            0,
+            "small evidence must NOT be offloaded to evidence_blobs"
+        );
+        let stored = read_evidence_json(&pool, job_row.id).await;
+        assert_eq!(
+            stored,
+            Some(submitted_evidence_json),
+            "small evidence must keep the agent-submitted evidence_json inline unchanged"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_identical_evidence_dedups_to_one_blob_row() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let evidence =
+            vec![b'd'; ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES + 1];
+        let evidence_digest = proto_sha256(&evidence);
+
+        // Two separate jobs, two separate agents, IDENTICAL evidence bytes.
+        for suffix in ["a", "b"] {
+            let agent_id = format!("dedup-agent-{suffix}-{}", Uuid::new_v4());
+            let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+            let _job_id = seed_pending_job(&pool, &platform).await;
+            let (attempt_id, fencing, nonce, gen, job_row) =
+                lease_job(&pool, &platform, &agent_id).await;
+            ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+            let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+            let (job_result, evidence_bytes) = make_job_result(
+                &agent_id,
+                &platform,
+                &job_row,
+                attempt_id,
+                &nonce,
+                gen as u64,
+                &key,
+                &spec,
+                &evidence,
+                JobResultStatus::CheckOk,
+            );
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            let resp = post_job_result_with_pool(
+                agent_id.clone(),
+                job_row.id.to_string(),
+                hdrs,
+                ResultBody {
+                    job_result,
+                    evidence: evidence_bytes,
+                    evidence_json: None,
+                },
+                &pool,
+            )
+            .await;
+            assert!(
+                resp.is_ok(),
+                "ingest {suffix} must succeed: {:?}",
+                resp.err()
+            );
+            cleanup_jobs_for_platform(&pool, &platform).await;
+            cleanup_agent(&pool, &agent_id).await;
+        }
+
+        assert_eq!(
+            count_evidence_blobs(&pool, &evidence_digest).await,
+            1,
+            "identical evidence across two jobs must dedup to exactly one blob row"
+        );
+
+        cleanup_evidence_blob(&pool, &evidence_digest).await;
         pool.close().await;
     }
 
