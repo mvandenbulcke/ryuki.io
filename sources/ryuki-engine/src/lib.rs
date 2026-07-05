@@ -32,6 +32,7 @@ pub mod drift_scan;
 pub mod emergency_change;
 pub mod event_alerts;
 pub mod evidence_pipeline;
+pub mod evidence_store;
 pub mod feature_flag;
 pub mod file_share_ntfs;
 pub mod firewall_rules;
