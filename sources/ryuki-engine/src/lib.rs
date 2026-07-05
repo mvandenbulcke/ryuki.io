@@ -47,6 +47,7 @@ pub mod incident_context;
 pub mod incident_readiness;
 pub mod integration_connections;
 pub mod inventory_sync;
+pub mod job_orchestration;
 pub mod knowledge_suggestion;
 pub mod legal_hold;
 pub mod linux_deployment;
