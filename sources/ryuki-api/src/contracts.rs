@@ -30701,6 +30701,8 @@ struct DnsListQuery {
     site: Option<String>,
     #[serde(rename = "recordType")]
     record_type: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -30732,6 +30734,8 @@ struct IpamAvailabilityQuery {
 #[allow(dead_code)]
 struct IpamSiteQuery {
     site: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 /// Parses a persisted subnet `status` string back into the engine enum. The
@@ -30884,28 +30888,62 @@ async fn dns_records_list(
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
     let record_type = q.record_type.as_deref().unwrap_or("");
+    // #14: bound the result set so a large datacenter can't return an unbounded
+    // page. Generous default cap keeps current seed-scale deployments unaffected.
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     // Durable path: read from the DB (authoritative, survives restart).
     if let Some(pool) = get_db() {
         let rows: Vec<DnsRecordRow> = sqlx::query_as(&format!(
             "SELECT {DNS_COLUMNS} FROM dns_records \
-             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR record_type = $2) ORDER BY id"
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR record_type = $2) ORDER BY id \
+             LIMIT $3 OFFSET $4"
         ))
         .bind(site)
         .bind(record_type)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
         let records: Vec<Value> = rows.iter().map(DnsRecordRow::to_json).collect();
+        // Filtered total (same WHERE, no limit/offset) so pagination reflects the
+        // filtered set rather than the whole table.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dns_records \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR record_type = $2)",
+        )
+        .bind(site)
+        .bind(record_type)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "records": records,
             "count": records.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
-    // No-DB fallback: the process-local engine store.
-    dns_ipam::list_dns_records(site, record_type)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    // No-DB fallback: the process-local engine store. Best-effort pagination —
+    // slice the in-memory vec the same way the DB path slices rows.
+    let mut result = dns_ipam::list_dns_records(site, record_type)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let records = result["records"].as_array().cloned().unwrap_or_default();
+    let total = records.len() as i64;
+    let page: Vec<Value> = records
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    result["count"] = json!(page.len());
+    result["records"] = json!(page);
+    result["total"] = json!(total);
+    result["limit"] = json!(limit);
+    result["offset"] = json!(offset);
+    Ok(Json(result))
 }
 async fn dns_record_create(
     AuthExtractor(session): AuthExtractor,
@@ -31143,12 +31181,18 @@ async fn ipam_subnets_list(
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
+    // #14: bound the result set so a large datacenter can't return an unbounded
+    // page. Generous default cap keeps current seed-scale deployments unaffected.
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     if let Some(pool) = get_db() {
         let rows: Vec<IpamSubnetRow> = sqlx::query_as(&format!(
             "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets \
-             WHERE ($1 = '' OR site = $1) ORDER BY site, id"
+             WHERE ($1 = '' OR site = $1) ORDER BY site, id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
@@ -31156,15 +31200,40 @@ async fn ipam_subnets_list(
             .iter()
             .map(|row| subnet_list_entry(&row.to_engine()))
             .collect();
+        // Filtered total (same WHERE, no limit/offset) so pagination reflects the
+        // filtered set rather than the whole table.
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ipam_subnets WHERE ($1 = '' OR site = $1)")
+                .bind(site)
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "subnets": subnets,
             "count": subnets.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
-    dns_ipam::list_subnets(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    // No-DB fallback: the process-local engine store. Best-effort pagination —
+    // slice the in-memory vec the same way the DB path slices rows.
+    let mut result = dns_ipam::list_subnets(site)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let subnets = result["subnets"].as_array().cloned().unwrap_or_default();
+    let total = subnets.len() as i64;
+    let page: Vec<Value> = subnets
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    result["count"] = json!(page.len());
+    result["subnets"] = json!(page);
+    result["total"] = json!(total);
+    result["limit"] = json!(limit);
+    result["offset"] = json!(offset);
+    Ok(Json(result))
 }
 async fn ipam_subnet_get(
     AuthExtractor(session): AuthExtractor,
@@ -31765,6 +31834,8 @@ async fn dns_ipam_contract() -> Json<Value> {
 struct FwListQuery {
     site: Option<String>,
     direction: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -31865,27 +31936,61 @@ async fn firewall_rules_list(
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
     let direction = q.direction.as_deref().unwrap_or("");
+    // #14: bound the result set so a large datacenter can't return an unbounded
+    // page. Generous default cap keeps current seed-scale deployments unaffected.
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     if let Some(pool) = get_db() {
         let rows: Vec<FirewallRuleRow> = sqlx::query_as(&format!(
             "SELECT {FIREWALL_COLUMNS} FROM firewall_rules \
              WHERE ($1 = '' OR site = $1) AND ($2 = '' OR direction = $2) \
-             ORDER BY site, priority, id"
+             ORDER BY site, priority, id LIMIT $3 OFFSET $4"
         ))
         .bind(site)
         .bind(direction)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
         let rules: Vec<Value> = rows.iter().map(FirewallRuleRow::to_json).collect();
+        // Filtered total (same WHERE, no limit/offset) so pagination reflects the
+        // filtered set rather than the whole table.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_rules \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR direction = $2)",
+        )
+        .bind(site)
+        .bind(direction)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "rules": rules,
             "count": rules.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
-    firewall_rules::list_rules(site, direction)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    // No-DB fallback: the process-local engine store. Best-effort pagination —
+    // slice the in-memory vec the same way the DB path slices rows.
+    let mut result = firewall_rules::list_rules(site, direction)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let rules = result["rules"].as_array().cloned().unwrap_or_default();
+    let total = rules.len() as i64;
+    let page: Vec<Value> = rules
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    result["count"] = json!(page.len());
+    result["rules"] = json!(page);
+    result["total"] = json!(total);
+    result["limit"] = json!(limit);
+    result["offset"] = json!(offset);
+    Ok(Json(result))
 }
 async fn firewall_rule_create(
     Extension(session): Extension<AuthSession>,
@@ -41308,6 +41413,8 @@ mod unit_tests {
             AuthExtractor(scoped_session(&["GBLON"], &[])),
             Query(IpamSiteQuery {
                 site: Some("DEFRA".into()),
+                limit: None,
+                offset: None,
             }),
         )
         .await
@@ -51008,6 +51115,256 @@ mod dns_records_db_tests {
             .await
             .ok();
     }
+
+    /// #14: dns_records_list is bounded by limit/offset and reports a filtered
+    /// `total` that stays stable across pages, without breaking the existing
+    /// `{source, records, count}` shape (fields are only ADDED).
+    #[tokio::test]
+    async fn dns_records_list_paginates_and_reports_filtered_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("PGTEST-{suffix}");
+        let other_site = format!("PGTEST-OTHER-{suffix}");
+        let mut ids: Vec<String> = Vec::new();
+        // 5 rows in the target site + 2 rows in another site, to prove the site
+        // filter narrows `total` to only the matching site.
+        for i in 0..5 {
+            let id = format!("dns-pg-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO dns_records ({DNS_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            ))
+            .bind(&id)
+            .bind(format!("host{i}"))
+            .bind("A")
+            .bind("10.0.0.1")
+            .bind("pg.test")
+            .bind(3600_i32)
+            .bind(&site)
+            .bind("Active")
+            .execute(pool)
+            .await
+            .expect("seed dns record");
+            ids.push(id);
+        }
+        for i in 0..2 {
+            let id = format!("dns-pg-other-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO dns_records ({DNS_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            ))
+            .bind(&id)
+            .bind(format!("otherhost{i}"))
+            .bind("A")
+            .bind("10.0.0.2")
+            .bind("pg.test")
+            .bind(3600_i32)
+            .bind(&other_site)
+            .bind("Active")
+            .execute(pool)
+            .await
+            .expect("seed dns record (other site)");
+            ids.push(id);
+        }
+
+        let session = || AuthExtractor(AuthSession::static_dry_run());
+        let list = |limit: i64, offset: i64, site: String| {
+            dns_records_list(
+                session(),
+                Query(DnsListQuery {
+                    site: Some(site),
+                    record_type: None,
+                    limit: Some(limit),
+                    offset: Some(offset),
+                }),
+            )
+        };
+
+        let Json(page0) = list(2, 0, site.clone()).await.expect("page0");
+        assert_eq!(page0["records"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], 5);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = list(2, 2, site.clone()).await.expect("page1");
+        assert_eq!(page1["records"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["total"], 5, "total must stay stable across pages");
+
+        let Json(page2) = list(2, 4, site.clone()).await.expect("page2");
+        assert_eq!(
+            page2["records"].as_array().unwrap().len(),
+            1,
+            "last page holds the remainder"
+        );
+        assert_eq!(page2["total"], 5);
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<&str> = page0["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        let ids1: Vec<&str> = page1["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // The site filter narrows `total` — it must NOT count the other site.
+        let Json(other) = list(500, 0, other_site.clone()).await.expect("other site");
+        assert_eq!(other["total"], 2);
+
+        for id in ids {
+            sqlx::query("DELETE FROM dns_records WHERE id = $1")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod ipam_subnets_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// #14: ipam_subnets_list pages via limit/offset and reports a filtered
+    /// total. Mirrors dns_records_list_paginates_and_reports_filtered_total —
+    /// the two handlers share an identical pagination shape.
+    #[tokio::test]
+    async fn ipam_subnets_list_paginates_and_reports_filtered_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("PGTEST-{suffix}");
+        let other_site = format!("PGTEST-OTHER-{suffix}");
+        let mut ids: Vec<String> = Vec::new();
+        // 5 subnets in the target site + 2 in another, to prove the site filter
+        // narrows `total` to only the matching site.
+        for i in 0..5 {
+            let id = format!("subnet-pg-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO ipam_subnets ({IPAM_SUBNET_COLUMNS}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            ))
+            .bind(&id)
+            .bind(format!("10.{i}.0.0/24"))
+            .bind(format!("10.{i}.0.1"))
+            .bind(100_i32 + i)
+            .bind(&site)
+            .bind(256_i32)
+            .bind(0_i32)
+            .bind(256_i32)
+            .bind("Available")
+            .execute(pool)
+            .await
+            .expect("seed ipam subnet");
+            ids.push(id);
+        }
+        for i in 0..2 {
+            let id = format!("subnet-pg-other-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO ipam_subnets ({IPAM_SUBNET_COLUMNS}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            ))
+            .bind(&id)
+            .bind(format!("172.16.{i}.0/24"))
+            .bind(format!("172.16.{i}.1"))
+            .bind(200_i32 + i)
+            .bind(&other_site)
+            .bind(256_i32)
+            .bind(0_i32)
+            .bind(256_i32)
+            .bind("Available")
+            .execute(pool)
+            .await
+            .expect("seed ipam subnet (other site)");
+            ids.push(id);
+        }
+
+        let session = || AuthExtractor(AuthSession::static_dry_run());
+        let list = |limit: i64, offset: i64, site: String| {
+            ipam_subnets_list(
+                session(),
+                Query(IpamSiteQuery {
+                    site: Some(site),
+                    limit: Some(limit),
+                    offset: Some(offset),
+                }),
+            )
+        };
+
+        let Json(page0) = list(2, 0, site.clone()).await.expect("page0");
+        assert_eq!(page0["subnets"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], 5);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = list(2, 2, site.clone()).await.expect("page1");
+        assert_eq!(page1["subnets"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["total"], 5, "total must stay stable across pages");
+
+        let Json(page2) = list(2, 4, site.clone()).await.expect("page2");
+        assert_eq!(
+            page2["subnets"].as_array().unwrap().len(),
+            1,
+            "last page holds the remainder"
+        );
+        assert_eq!(page2["total"], 5);
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<&str> = page0["subnets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["subnet"]["id"].as_str().unwrap())
+            .collect();
+        let ids1: Vec<&str> = page1["subnets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["subnet"]["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // The site filter narrows `total` — it must NOT count the other site.
+        let Json(other) = list(500, 0, other_site.clone()).await.expect("other site");
+        assert_eq!(other["total"], 2);
+
+        for id in ids {
+            sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -58167,6 +58524,138 @@ mod firewall_rules_db_tests {
             .await
             .unwrap_or(0);
         assert_eq!(count, 0, "row must be absent from DB after delete");
+    }
+
+    /// #14: firewall_rules_list is bounded by limit/offset and reports a
+    /// filtered `total` that stays stable across pages, without breaking the
+    /// existing `{source, rules, count}` shape (fields are only ADDED).
+    #[tokio::test]
+    async fn firewall_rules_list_paginates_and_reports_filtered_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let site = format!("PGTEST-{suffix}");
+        let other_site = format!("PGTEST-OTHER-{suffix}");
+        let mut ids: Vec<String> = Vec::new();
+        // 5 rows in the target site + 2 rows in another site, to prove the site
+        // filter narrows `total` to only the matching site.
+        for i in 0..5 {
+            let id = format!("fw-pg-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO firewall_rules ({FIREWALL_COLUMNS}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+            ))
+            .bind(&id)
+            .bind(format!("pg-rule-{i}"))
+            .bind("10.0.0.1")
+            .bind("any")
+            .bind("10.0.0.2")
+            .bind("any")
+            .bind("tcp")
+            .bind("allow")
+            .bind("inbound")
+            .bind(i * 10)
+            .bind(&site)
+            .bind("Active")
+            .bind("pg-test-actor")
+            .bind("2026-01-01T00:00:00Z")
+            .bind("p14 pagination test rule")
+            .execute(pool)
+            .await
+            .expect("seed firewall rule");
+            ids.push(id);
+        }
+        for i in 0..2 {
+            let id = format!("fw-pg-other-{suffix}-{i}");
+            sqlx::query(&format!(
+                "INSERT INTO firewall_rules ({FIREWALL_COLUMNS}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+            ))
+            .bind(&id)
+            .bind(format!("pg-rule-other-{i}"))
+            .bind("10.0.0.1")
+            .bind("any")
+            .bind("10.0.0.2")
+            .bind("any")
+            .bind("tcp")
+            .bind("allow")
+            .bind("inbound")
+            .bind(i * 10)
+            .bind(&other_site)
+            .bind("Active")
+            .bind("pg-test-actor")
+            .bind("2026-01-01T00:00:00Z")
+            .bind("p14 pagination test rule (other site)")
+            .execute(pool)
+            .await
+            .expect("seed firewall rule (other site)");
+            ids.push(id);
+        }
+
+        let session = || AuthExtractor(AuthSession::static_dry_run());
+        let list = |limit: i64, offset: i64, site: String| {
+            firewall_rules_list(
+                session(),
+                Query(FwListQuery {
+                    site: Some(site),
+                    direction: None,
+                    limit: Some(limit),
+                    offset: Some(offset),
+                }),
+            )
+        };
+
+        let Json(page0) = list(2, 0, site.clone()).await.expect("page0");
+        assert_eq!(page0["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(page0["count"], 2);
+        assert_eq!(page0["total"], 5);
+        assert_eq!(page0["limit"], 2);
+        assert_eq!(page0["offset"], 0);
+
+        let Json(page1) = list(2, 2, site.clone()).await.expect("page1");
+        assert_eq!(page1["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["total"], 5, "total must stay stable across pages");
+
+        let Json(page2) = list(2, 4, site.clone()).await.expect("page2");
+        assert_eq!(
+            page2["rules"].as_array().unwrap().len(),
+            1,
+            "last page holds the remainder"
+        );
+        assert_eq!(page2["total"], 5);
+
+        // Pages 0 and 1 must not overlap (offset actually advances).
+        let ids0: Vec<&str> = page0["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        let ids1: Vec<&str> = page1["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
+
+        // The site filter narrows `total` — it must NOT count the other site.
+        let Json(other) = list(500, 0, other_site.clone()).await.expect("other site");
+        assert_eq!(other["total"], 2);
+
+        for id in ids {
+            sqlx::query("DELETE FROM firewall_rules WHERE id = $1")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .ok();
+        }
     }
 }
 
