@@ -3049,9 +3049,14 @@ pub async fn create_live_apply_job(
     // hits this conflict: the request's single LiveApply slot is permanently
     // consumed and a re-attempt requires a fresh request (see the fn doc).
     let id: Option<Uuid> = sqlx::query_scalar(
+        // The ON CONFLICT arbiter predicate must MATCH the partial unique index
+        // exactly. Mig 153 narrowed that index to `... AND step_scoped = FALSE`
+        // (so step-scoped per-step LiveApply jobs are exempt), so this single-
+        // job insert — which leaves step_scoped at its FALSE default — must
+        // carry the same `step_scoped = FALSE` predicate here to infer it.
         "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context) \
          VALUES ($1, $2, $3, 'LiveApply', $4::jsonb) \
-         ON CONFLICT (request_id) WHERE mode = 'LiveApply' DO NOTHING \
+         ON CONFLICT (request_id) WHERE mode = 'LiveApply' AND step_scoped = FALSE DO NOTHING \
          RETURNING id",
     )
     .bind(request_id)
@@ -3076,6 +3081,131 @@ pub async fn create_live_apply_job(
         "LiveApply job enqueued with CP-signed grant"
     );
     Ok(id)
+}
+
+/// Mint a CP-signed, STEP-SCOPED LiveApply grant + `agent_jobs` row for ONE
+/// step of a multi-step request (#42 live-apply slice B1b), on the caller's
+/// transaction `tx`.
+///
+/// Unlike [`create_live_apply_job`] (the single-job path — at most one
+/// LiveApply per request), this:
+///   * binds the grant to the specific dispatched step job via
+///     `VerifiedLiveContext.step_job_id` (slice A) — the job id is generated
+///     client-side so it can be signed INTO the grant before the INSERT, and an
+///     agent/CP verifier refuses the grant on any other job id; and
+///   * marks the row `step_scoped = TRUE` so it is EXEMPT from the
+///     request-level one-live-apply uniqueness (mig 153) — a request carries
+///     one such job per step.
+///
+/// Per-step no-double-apply is the CALLER's responsibility: the approval
+/// endpoint (slice B1b-2) flips the step `AwaitingApproval -> Applying` under a
+/// `FOR UPDATE` lock in the SAME transaction as this mint, so a step is
+/// approved (and its grant minted) exactly once. This fn keeps the same
+/// fail-closed grant validation and concluded-request guard as the single-job
+/// path so it is a safe minting choke point on its own; it does NOT re-check
+/// the step's status (that is the endpoint's lock-guarded job).
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_step_live_apply_job(
+    tx: &mut sqlx::PgConnection,
+    request_id: Uuid,
+    platform: &str,
+    spec: &JobSpec,
+    approved_plan_digest: &str,
+    approver: &str,
+    expiry: DateTime<Utc>,
+    cp_key: &ed25519_dalek::SigningKey,
+) -> Result<Uuid, CreateLiveApplyJobError> {
+    validate_live_apply_params(spec, request_id).map_err(CreateLiveApplyJobError::Invalid)?;
+
+    // Fail closed: never mint a live-apply grant for a CONCLUDED request. Lock
+    // the request row so it cannot conclude between this check and the INSERT
+    // (same TOCTOU guard as the single-job path). The caller runs this inside
+    // its own transaction, so the lock is held until that transaction commits.
+    let req_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(request_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match req_status {
+        None => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "request not found; cannot mint a live-apply grant",
+            ));
+        }
+        Some(status) if crate::contracts::db_status_to_request_status(&status).is_concluded() => {
+            return Err(CreateLiveApplyJobError::RequestConcluded);
+        }
+        Some(_) => {}
+    }
+
+    // Validate grant fields before signing (a signed grant is authoritative).
+    if approved_plan_digest.len() != 64
+        || !approved_plan_digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approved_plan_digest must be a 64-character SHA-256 hex string",
+        ));
+    }
+    if approver.trim().is_empty() {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approver must not be empty",
+        ));
+    }
+    let now = Utc::now();
+    if expiry <= now {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry must be in the future",
+        ));
+    }
+    if expiry > now + chrono::Duration::hours(MAX_GRANT_TTL_HOURS) {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry exceeds the maximum allowed TTL",
+        ));
+    }
+
+    // Generate the job id client-side so it can be bound INTO the grant
+    // (step_job_id) before signing — the whole point of the step-scoped grant.
+    let job_id = Uuid::new_v4();
+    let unsigned_grant = VerifiedLiveContext {
+        request_id,
+        approved_plan_digest: approved_plan_digest.to_string(),
+        approver: approver.to_string(),
+        expiry,
+        step_job_id: Some(job_id),
+        signature: String::new(),
+    };
+    let signed_grant = sign_vlc(unsigned_grant, cp_key);
+
+    let spec_json = serde_json::to_value(spec).expect("JobSpec serialisation is infallible");
+    let grant_json = serde_json::to_value(&signed_grant)
+        .expect("VerifiedLiveContext serialisation is infallible");
+
+    // step_scoped = TRUE exempts this row from the request-level one-live-apply
+    // unique index (mig 153), so each step of a request gets its own. No
+    // ON CONFLICT: per-step single-approval is enforced by the caller's
+    // AwaitingApproval->Applying lock, and the client-generated id is unique.
+    sqlx::query(
+        "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, step_scoped, live_context) \
+         VALUES ($1, $2, $3, $4, 'LiveApply', TRUE, $5::jsonb)",
+    )
+    .bind(job_id)
+    .bind(request_id)
+    .bind(platform)
+    .bind(&spec_json)
+    .bind(&grant_json)
+    .execute(&mut *tx)
+    .await?;
+
+    tracing::info!(
+        job_id = %job_id,
+        request_id = %request_id,
+        platform = %platform,
+        approver = %approver,
+        approved_plan_digest = %approved_plan_digest,
+        "step-scoped LiveApply job enqueued with CP-signed grant"
+    );
+    Ok(job_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -10237,6 +10367,130 @@ mod tests {
         assert_eq!(db.status, "LiveRefused");
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// #42 live-apply slice B1b: `create_step_live_apply_job` mints a
+    /// step-scoped grant bound to the dispatched job id (verifies against the
+    /// CP key), marks the row `step_scoped=TRUE`, and — unlike the single-job
+    /// path — lets MULTIPLE step LiveApply jobs coexist for ONE request (the
+    /// mig-153 unique-index exemption). Proves the per-step minting foundation
+    /// before the approval endpoint (B1b-2) wires it.
+    #[tokio::test]
+    async fn db_b1b_step_live_apply_mint_binds_step_and_coexists() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use ryuki_protocol::crypto::verify_vlc;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let cp_vk = cp_key.verifying_key();
+        let request_id = Uuid::new_v4();
+        let platform = format!("b1b-plt-{}", &Uuid::new_v4().to_string()[..8]);
+        let digest = proto_sha256(b"step-approved-plan");
+
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'b1b-step-live', 'executing', 'execute', '[]'::jsonb)",
+        )
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .expect("seed executing request");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        // Mint TWO step-scoped LiveApply grants for the SAME request — this is
+        // the case the single-job unique index would have rejected.
+        let mut tx = pool.begin().await.unwrap();
+        let job1 = create_step_live_apply_job(
+            &mut tx,
+            request_id,
+            &platform,
+            &spec,
+            &digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await
+        .expect("first step grant mints");
+        let job2 = create_step_live_apply_job(
+            &mut tx,
+            request_id,
+            &platform,
+            &spec,
+            &digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await
+        .expect("second step grant coexists (mig-153 exemption)");
+        tx.commit().await.unwrap();
+        assert_ne!(job1, job2, "each step gets a distinct job id");
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            step_scoped: bool,
+            live_context: Option<sqlx::types::Json<VerifiedLiveContext>>,
+        }
+        for jid in [job1, job2] {
+            let row: Row =
+                sqlx::query_as("SELECT step_scoped, live_context FROM agent_jobs WHERE id = $1")
+                    .bind(jid)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load minted job");
+            assert!(row.step_scoped, "step LiveApply job must be step_scoped");
+            let grant = row.live_context.expect("grant present").0;
+            assert!(
+                verify_vlc(&grant, &cp_vk).is_ok(),
+                "grant signature verifies"
+            );
+            assert_eq!(
+                grant.step_job_id,
+                Some(jid),
+                "grant is bound to THIS step's dispatched job id"
+            );
+            assert_eq!(
+                grant.approved_plan_digest, digest,
+                "grant carries the digest"
+            );
+        }
+
+        // Both coexist under one request — the exemption works.
+        let live_apply_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_apply_count, 2,
+            "two step LiveApply jobs coexist for one request"
+        );
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(request_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
+            .execute(&pool)
+            .await
+            .ok();
         pool.close().await;
     }
 
