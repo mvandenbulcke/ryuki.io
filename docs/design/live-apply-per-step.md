@@ -1,6 +1,11 @@
 # Live-apply per step (#42 follow-up)
 
-Status: **design — awaiting owner review of the teardown state machine before slice B2 is built.**
+Status: **B1 (forward per-step live) SHIPPED end-to-end** — slice A (step-scoped grant)
+`0620824`, B1a (LivePlan dispatch → AwaitingApproval) `a870f23`, B1b-1 (step-grant mint +
+index exemption) `1fac8f9`, B1b-2 (per-step approval endpoint + LiveApply backlink) `869e711`,
+all GPT-5.5-Codex-xhigh reviewed. **B2 (auto compensating teardown / `LiveDestroy`) is NOT built
+— awaiting owner review of the teardown state machine below.** C (real-infra apply) is
+operator-only.
 
 This extends the multi-step orchestration engine (#42 slices 1–3, complete) so that
 a request's steps can be applied to **real** infrastructure one at a time, each gated
