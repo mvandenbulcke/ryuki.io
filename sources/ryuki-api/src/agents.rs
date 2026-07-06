@@ -1906,6 +1906,27 @@ async fn post_job_result_with_pool(
                     ));
                 }
 
+                // #42 slice A: if the grant is STEP-SCOPED (step_job_id is
+                // Some), it may only be accepted for THIS specific dispatched
+                // job. This is the CP-side mirror of the agent's own gate in
+                // ryuki-agent::live::evaluate_live_execution — defense in
+                // depth, so the binding is enforced independently on both
+                // sides rather than trusting the agent alone to refuse a
+                // mismatched grant. Like the request_id check above (and
+                // unlike the expiry check below), this is an IDENTITY
+                // invariant, not a time-window concern, so it runs
+                // unconditionally — including on an idempotent replay of an
+                // already-recorded result. A `None` step_job_id is the
+                // legacy/whole-request grant and is UNCHANGED: this check is
+                // a no-op for it.
+                if let Some(bound_id) = grant.step_job_id {
+                    if bound_id != job_id {
+                        return Err(bad_request(
+                            "approval grant is bound to a different step job",
+                        ));
+                    }
+                }
+
                 // The grant must not be expired AT APPLY TIME. Expiry gates the
                 // actual application, which only happens while the job is still
                 // Leased/Running (the atomic UPDATE below records the result exactly
@@ -2902,12 +2923,16 @@ pub async fn create_live_apply_job(
         ));
     }
 
-    // Build and sign the VerifiedLiveContext grant.
+    // Build and sign the VerifiedLiveContext grant. This whole-request path
+    // mints a legacy/single-job grant (step_job_id: None) — #42 slice B adds
+    // the per-step minting path that sets step_job_id: Some(..); this
+    // function's contract is unchanged by slice A.
     let unsigned_grant = VerifiedLiveContext {
         request_id,
         approved_plan_digest: approved_plan_digest.to_string(),
         approver: approver.to_string(),
         expiry,
+        step_job_id: None,
         signature: String::new(),
     };
     let signed_grant = sign_vlc(unsigned_grant, cp_key);
@@ -8864,6 +8889,7 @@ mod tests {
             approved_plan_digest: approved_plan_digest.to_string(),
             approver: "ops-test".to_string(),
             expiry: grant_expiry,
+            step_job_id: None,
             signature: String::new(),
         };
         let grant = sign_vlc(unsigned, signing_key);
@@ -9682,6 +9708,7 @@ mod tests {
                 approved_plan_digest: digest.clone(),
                 approver: "ops-test".to_string(),
                 expiry: Utc::now() - Duration::hours(1),
+                step_job_id: None,
                 signature: String::new(),
             },
             &ensure_test_cp_key(),

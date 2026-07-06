@@ -172,6 +172,11 @@ pub fn openapi_document() -> Value {
                         "approved_plan_digest": { "type": "string" },
                         "approver": { "type": "string" },
                         "expiry": { "type": "string", "format": "date-time" },
+                        "step_job_id": {
+                            "type": "string",
+                            "format": "uuid",
+                            "description": "Present only for a step-scoped grant (#42 slice A): binds this grant to ONE specific dispatched step job id, preventing replay across steps or across a re-dispatch of the same step. Absent (not null) for a legacy/whole-request grant — the pre-existing single-job trust model, unchanged."
+                        },
                         "signature": { "type": "string", "description": "Base64-encoded Ed25519 signature." }
                     }
                 },

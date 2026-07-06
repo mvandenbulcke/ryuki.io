@@ -116,8 +116,14 @@ pub enum LiveDecision {
 ///   2. `job.live_context` is `Some(grant)`
 ///   3. `verify_vlc(grant, cp_verifying_key)` succeeds
 ///   4. `grant.request_id == job.spec.request_id`
-///   5. `grant.expiry > Utc::now()`
-///   6. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
+///   5. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
+///      `bound_id == job.id` — a step-scoped grant only authorises the ONE
+///      dispatched step job it was minted for, preventing replay across
+///      steps and across re-dispatches (a re-dispatch mints a fresh job id).
+///      `None` is the legacy/whole-request grant and is UNCHANGED: this check
+///      is skipped entirely.
+///   6. `grant.expiry > Utc::now()`
+///   7. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 ///
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
@@ -182,12 +188,34 @@ fn evaluate_live_apply(
         return LiveDecision::Refused("grant is for a different request".to_owned());
     }
 
-    // Check 5: the grant must not be expired.
+    // Check 5 (#42 slice A): if the grant is STEP-SCOPED (step_job_id is
+    // Some), it may only be used against the ONE dispatched step job it was
+    // minted for. This closes two replay windows a whole-request grant does
+    // not defend against on its own:
+    //   - cross-step replay: a grant approved for step N's plan could
+    //     otherwise be presented alongside step M's job and would still pass
+    //     checks 1-4 (same request_id) and, if the plan digests happened to
+    //     match, check 7 too.
+    //   - re-dispatch replay: if step N's job is re-dispatched (lease expiry,
+    //     agent crash, etc.), the CP mints a NEW agent_jobs row with a NEW
+    //     job id for the same logical step. A grant bound to the OLD job id
+    //     must not authorise the NEW dispatch — re-approval is required.
+    // A `None` step_job_id is the pre-existing single-job grant and this
+    // check is a no-op for it — behaviour is completely unchanged.
+    if let Some(bound_id) = grant.step_job_id {
+        if bound_id != job.id {
+            return LiveDecision::Refused(
+                "live-apply grant is bound to a different step job".to_owned(),
+            );
+        }
+    }
+
+    // Check 6: the grant must not be expired.
     if grant.expiry <= Utc::now() {
         return LiveDecision::Refused("grant has expired".to_owned());
     }
 
-    // Check 6: plan-then-apply — the plan the agent just produced must match
+    // Check 7: plan-then-apply — the plan the agent just produced must match
     // the plan an operator reviewed and the CP signed off on.
     match replanned_plan_digest {
         None => LiveDecision::Refused("no plan digest available".to_owned()),
@@ -253,7 +281,9 @@ mod tests {
     }
 
     /// Build a valid, signed [`VerifiedLiveContext`] grant for `request_id`
-    /// using `cp_sk`.  The grant is valid for 1 hour from now.
+    /// using `cp_sk`.  The grant is valid for 1 hour from now.  `step_job_id`
+    /// is `None` — a legacy/whole-request grant (unchanged single-job trust
+    /// model). Use [`make_valid_step_grant`] for a step-scoped grant.
     fn make_valid_grant(
         cp_sk: &ed25519_dalek::SigningKey,
         request_id: Uuid,
@@ -264,13 +294,49 @@ mod tests {
             approved_plan_digest: approved_plan_digest.to_owned(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
+            step_job_id: None,
+            signature: String::new(),
+        };
+        sign_vlc(unsigned, cp_sk)
+    }
+
+    /// Build a valid, signed [`VerifiedLiveContext`] grant bound to
+    /// `step_job_id` — #42 slice A's step-scoped grant. Otherwise identical to
+    /// [`make_valid_grant`].
+    fn make_valid_step_grant(
+        cp_sk: &ed25519_dalek::SigningKey,
+        request_id: Uuid,
+        approved_plan_digest: &str,
+        step_job_id: Uuid,
+    ) -> VerifiedLiveContext {
+        let unsigned = VerifiedLiveContext {
+            request_id,
+            approved_plan_digest: approved_plan_digest.to_owned(),
+            approver: "ops-alice".to_owned(),
+            expiry: Utc::now() + Duration::hours(1),
+            step_job_id: Some(step_job_id),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
     }
 
     /// Build a [`Job`] with the given mode, request_id, and optional grant.
+    /// The job's own `id` is a fresh random UUID — use [`make_job_with_id`]
+    /// when the test needs to control (or later assert against) the job id,
+    /// e.g. for #42 slice A step-scoped grant binding tests.
     fn make_job(mode: JobMode, request_id: Uuid, live_context: Option<VerifiedLiveContext>) -> Job {
+        make_job_with_id(Uuid::new_v4(), mode, request_id, live_context)
+    }
+
+    /// Build a [`Job`] with an explicit `id`, mode, request_id, and optional
+    /// grant. See [`make_job`] for the common case where the id doesn't
+    /// matter to the test.
+    fn make_job_with_id(
+        id: Uuid,
+        mode: JobMode,
+        request_id: Uuid,
+        live_context: Option<VerifiedLiveContext>,
+    ) -> Job {
         let spec = JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -280,7 +346,7 @@ mod tests {
             mode,
         };
         Job {
-            id: Uuid::new_v4(),
+            id,
             platform: "defra".to_owned(),
             spec,
             status: JobStatus::Running,
@@ -410,6 +476,7 @@ mod tests {
             approved_plan_digest: plan_digest.clone(),
             approver: "attacker".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
+            step_job_id: None,
             signature: String::new(),
         };
         let forged_grant = sign_vlc(unsigned, &attacker_sk);
@@ -450,6 +517,7 @@ mod tests {
             approved_plan_digest: plan_digest.clone(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() - Duration::seconds(1), // in the past
+            step_job_id: None,
             signature: String::new(),
         };
         let expired_grant = sign_vlc(unsigned, &cp_sk);
@@ -489,6 +557,75 @@ mod tests {
             LiveDecision::Refused(
                 "the plan the agent produced does not match the approved plan".to_owned()
             ),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply — #42 slice A: step-scoped grant binding
+    // -----------------------------------------------------------------------
+
+    /// A step-scoped grant (`step_job_id: Some(bound_id)`) whose `bound_id`
+    /// matches the leased job's own `id` must Proceed (all other checks
+    /// passing) — the happy path for the new binding.
+    #[test]
+    fn live_apply_step_grant_matching_job_id_proceeds() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let step_job_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let grant = make_valid_step_grant(&cp_sk, request_id, &plan_digest, step_job_id);
+        let job = make_job_with_id(step_job_id, JobMode::LiveApply, request_id, Some(grant));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Proceed,
+            "a step grant bound to the leased job's own id must Proceed"
+        );
+    }
+
+    /// A step-scoped grant bound to a DIFFERENT job id than the one actually
+    /// leased must Refuse — this is the replay defence: neither a
+    /// cross-step nor a re-dispatched (new job id) presentation of the grant
+    /// can be used.
+    #[test]
+    fn live_apply_step_grant_wrong_job_id_refused() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let bound_step_job_id = Uuid::new_v4();
+        let actual_leased_job_id = Uuid::new_v4(); // deliberately different
+        assert_ne!(bound_step_job_id, actual_leased_job_id);
+        let plan_digest = sha256_hex(b"the-plan");
+        let grant = make_valid_step_grant(&cp_sk, request_id, &plan_digest, bound_step_job_id);
+        let job = make_job_with_id(
+            actual_leased_job_id,
+            JobMode::LiveApply,
+            request_id,
+            Some(grant),
+        );
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Refused("live-apply grant is bound to a different step job".to_owned()),
+        );
+    }
+
+    /// A `step_job_id: None` grant (the legacy/whole-request grant) is
+    /// UNCHANGED by this slice: it Proceeds regardless of which job id it is
+    /// presented alongside, exactly as it did before `step_job_id` existed.
+    #[test]
+    fn live_apply_none_step_job_id_unaffected_by_job_id() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest);
+        assert_eq!(grant.step_job_id, None);
+        // Use an arbitrary job id — a None grant must not care what it is.
+        let job = make_job_with_id(Uuid::new_v4(), JobMode::LiveApply, request_id, Some(grant));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Proceed,
+            "a None step_job_id grant must Proceed regardless of the job's id (unchanged behavior)"
         );
     }
 

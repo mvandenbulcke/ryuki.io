@@ -258,6 +258,7 @@ mod tests {
             approved_plan_digest: "abc123".to_string(),
             approver: "ops-test".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
+            step_job_id: None,
             signature: String::new(),
         };
         let signed = sign_vlc(unsigned, &key);

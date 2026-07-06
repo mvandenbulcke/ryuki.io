@@ -27,7 +27,25 @@
 //!    precision); `Uuid` as its hyphenated string; `JobMode` / `JobStatus` as
 //!    their `serde_json`-style snake_case label strings; `Option<String>` uses
 //!    a 1-byte presence tag (0x00 absent, 0x01 present) followed by the
-//!    length-prefixed value when present.
+//!    length-prefixed value when present (see `write_opt_str`).
+//!
+//! 6. **Additive-optional fields (backward compatibility)** — `Option<Uuid>`
+//!    fields added to an EXISTING signed type after its first release (e.g.
+//!    `VerifiedLiveContext::step_job_id`, #42 slice A) use an ASYMMETRIC
+//!    encoding instead of the presence-tag scheme in (5): `None` contributes
+//!    ZERO bytes; `Some` contributes `0x01 || length-prefixed value` (see
+//!    `write_opt_uuid`). This is deliberate and different from `Option<String>`
+//!    fields that were part of the type's ORIGINAL signable set (which use the
+//!    symmetric presence tag and, if added later, pair with a domain-separator
+//!    bump instead — see `SignedEnvelope::approved_plan_digest` / the `v1`→`v2`
+//!    bump). The asymmetric encoding exists SPECIFICALLY so that a value of
+//!    `None` reproduces byte-for-byte the exact signing bytes that existed
+//!    before the field was added, without any domain bump — i.e. it is the
+//!    mechanism for extending an already-deployed signed type in a way that
+//!    keeps every previously-issued signature (with the old, implicit `None`)
+//!    verifying unchanged. Only use this pattern when that exact backward-
+//!    compatibility guarantee is the explicit goal; a symmetric presence tag
+//!    is preferred for any field present in a type's ORIGINAL release.
 //!
 //! The same function is used by **both** signer and verifier — it is the
 //! single source of truth for the canonical representation.
@@ -93,6 +111,40 @@ fn write_opt_str(buf: &mut Vec<u8>, value: &Option<String>) {
             buf.push(0x01);
             write_str(buf, s);
         }
+    }
+}
+
+/// Append an `Option<Uuid>` to the VLC signing buffer using an
+/// ASYMMETRIC encoding that is DELIBERATELY DIFFERENT from
+/// [`write_opt_str`]'s presence-tag scheme:
+///
+///   `None`    → appends NOTHING (zero bytes).
+///   `Some(u)` → `0x01 || u64_le(len) || hyphenated-uuid-bytes`.
+///
+/// This is the load-bearing trick that makes `step_job_id: None` grants sign
+/// to EXACTLY the same bytes as a `VerifiedLiveContext` built before this
+/// field existed: `signing_bytes_vlc` calls this fn last, so when the value
+/// is `None` the function is a no-op and the buffer produced is
+/// byte-for-byte what the pre-`step_job_id` code produced for the same
+/// `request_id`/`approved_plan_digest`/`approver`/`expiry`. A real presence
+/// tag (like [`write_opt_str`] uses for `SignedEnvelope::approved_plan_digest`)
+/// would append a `0x00` byte even when absent, which changes the signed
+/// bytes for every existing grant and breaks byte-for-byte backward
+/// compatibility — that trade-off is fine for `SignedEnvelope` (that field
+/// was introduced together with a `ryuki-v1` → `ryuki-v2` domain-separator
+/// bump, so old v1 signatures are recognised as a DIFFERENT domain rather
+/// than silently reinterpreted) but is NOT acceptable here: slice A's
+/// contract is "existing single-job grants verify unchanged," with no domain
+/// bump. `Some(u)` still starts with `0x01` (never `0x00`), so a byte stream
+/// that ends in a `Some` value can never be confused with one that ends
+/// after `expiry` with no step_job_id field at all — the two cases are
+/// distinguished by length, and no valid `Some` encoding is a prefix of the
+/// `None` (empty) encoding.
+#[inline]
+fn write_opt_uuid(buf: &mut Vec<u8>, value: &Option<uuid::Uuid>) {
+    if let Some(u) = value {
+        buf.push(0x01);
+        write_str(buf, &u.hyphenated().to_string());
     }
 }
 
@@ -208,7 +260,17 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// Returns the canonical bytes for a [`VerifiedLiveContext`].
 ///
 /// Field order (fixed):
-/// domain, request_id, approved_plan_digest, approver, expiry.
+/// domain, request_id, approved_plan_digest, approver, expiry, step_job_id.
+///
+/// **Backward compatibility (#42 slice A):** `step_job_id` is appended via
+/// [`write_opt_uuid`], which contributes ZERO bytes when the value is `None`.
+/// A grant with `step_job_id: None` therefore produces the EXACT SAME bytes
+/// as a `VerifiedLiveContext` built before this field existed — no domain
+/// separator bump was needed, and every pre-existing single-job grant's
+/// signature still verifies unchanged. A grant with `step_job_id: Some(id)`
+/// appends extra signed bytes, so it is bound to that id (see
+/// `write_opt_uuid` for why this asymmetric encoding, rather than a normal
+/// presence tag, is required to hit the byte-identical goal for `None`).
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -217,6 +279,7 @@ pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     write_str(&mut buf, &ctx.approved_plan_digest);
     write_str(&mut buf, &ctx.approver);
     write_str(&mut buf, &datetime_bytes(&ctx.expiry));
+    write_opt_uuid(&mut buf, &ctx.step_job_id);
 
     buf
 }
@@ -333,6 +396,7 @@ mod tests {
             approved_plan_digest: sha256_hex(b"plan-bytes"),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
+            step_job_id: None,
             signature: String::new(),
         };
         sign_vlc(unsigned, key)
@@ -736,6 +800,162 @@ mod tests {
     #[test]
     fn tamper_vlc_expiry_fails() {
         tamper_vlc!(expiry, Utc::now() + chrono::Duration::hours(999));
+    }
+
+    // -----------------------------------------------------------------------
+    // #42 slice A — step_job_id backward compatibility
+    // -----------------------------------------------------------------------
+
+    /// REGRESSION (backward-compat): a `step_job_id: None` grant's canonical
+    /// signing bytes are BYTE-FOR-BYTE identical to what `signing_bytes_vlc`
+    /// produced before `step_job_id` existed. This is proven by hand-encoding
+    /// the pre-`step_job_id` byte layout (domain, request_id,
+    /// approved_plan_digest, approver, expiry — nothing else) and asserting
+    /// `signing_bytes_vlc` on a `None` grant matches it exactly. If this test
+    /// ever fails, every LiveApply grant issued before this change stops
+    /// verifying — that is the single most important invariant in this slice.
+    #[test]
+    fn vlc_none_step_job_id_signing_bytes_match_pre_field_baseline() {
+        let request_id = Uuid::new_v4();
+        let approved_plan_digest = sha256_hex(b"plan-bytes");
+        let approver = "ops-alice".to_string();
+        let expiry = Utc::now() + chrono::Duration::hours(1);
+
+        let vlc = VerifiedLiveContext {
+            request_id,
+            approved_plan_digest: approved_plan_digest.clone(),
+            approver: approver.clone(),
+            expiry,
+            step_job_id: None,
+            signature: String::new(),
+        };
+
+        // Hand-rolled baseline using the SAME primitives, but WITHOUT ever
+        // touching step_job_id — this is exactly what signing_bytes_vlc did
+        // before this field was introduced.
+        let mut baseline: Vec<u8> = Vec::new();
+        write_bytes(&mut baseline, b"ryuki-v1/verified-live-context");
+        write_str(&mut baseline, &request_id.hyphenated().to_string());
+        write_str(&mut baseline, &approved_plan_digest);
+        write_str(&mut baseline, &approver);
+        write_str(&mut baseline, &datetime_bytes(&expiry));
+
+        assert_eq!(
+            signing_bytes_vlc(&vlc),
+            baseline,
+            "a None step_job_id must not change the signed bytes at all"
+        );
+    }
+
+    /// REGRESSION (backward-compat, wire format): a `step_job_id: None` grant
+    /// serialises to JSON with NO `step_job_id` key present at all (absent,
+    /// not `null`) — proving `#[serde(skip_serializing_if = "Option::is_none")]`
+    /// is wired correctly. This is the JSON-level half of the backward-compat
+    /// proof; the byte-level half is
+    /// `vlc_none_step_job_id_signing_bytes_match_pre_field_baseline` above.
+    #[test]
+    fn vlc_none_step_job_id_omitted_from_json() {
+        let key = generate_keypair(&mut OsRng);
+        let vlc = make_vlc(&key);
+        assert_eq!(vlc.step_job_id, None);
+
+        let json = serde_json::to_string(&vlc).expect("serialise");
+        assert!(
+            !json.contains("step_job_id"),
+            "step_job_id key must be entirely absent from JSON when None, got: {json}"
+        );
+
+        // And it still verifies — signing/verifying a None-step_job_id grant
+        // is unaffected by the new field's presence in the struct.
+        let vk = key.verifying_key();
+        assert!(
+            verify_vlc(&vlc, &vk).is_ok(),
+            "a None step_job_id grant must still verify"
+        );
+    }
+
+    /// A grant with `step_job_id: Some(id)` signs and verifies successfully —
+    /// the new field does not break the happy path for step-scoped grants.
+    #[test]
+    fn vlc_some_step_job_id_signs_and_verifies() {
+        let key = generate_keypair(&mut OsRng);
+        let step_job_id = Uuid::new_v4();
+        let unsigned = VerifiedLiveContext {
+            request_id: Uuid::new_v4(),
+            approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approver: "ops-alice".to_string(),
+            expiry: Utc::now() + chrono::Duration::hours(1),
+            step_job_id: Some(step_job_id),
+            signature: String::new(),
+        };
+        let vlc = sign_vlc(unsigned, &key);
+        let vk = key.verifying_key();
+        assert!(
+            verify_vlc(&vlc, &vk).is_ok(),
+            "a Some(step_job_id) grant must verify with a matching signature"
+        );
+
+        // And the JSON DOES carry the key when Some.
+        let json = serde_json::to_string(&vlc).expect("serialise");
+        assert!(
+            json.contains("step_job_id"),
+            "step_job_id key must be present in JSON when Some, got: {json}"
+        );
+    }
+
+    /// TAMPER: the signature covers `step_job_id`. Signing a grant bound to
+    /// step A, then swapping in a DIFFERENT step id B before verification,
+    /// must fail — this is what prevents a step-scoped grant from being
+    /// replayed against a different step job.
+    #[test]
+    fn tamper_vlc_step_job_id_fails() {
+        let key = generate_keypair(&mut OsRng);
+        let step_a = Uuid::new_v4();
+        let step_b = Uuid::new_v4();
+        assert_ne!(step_a, step_b);
+
+        let unsigned = VerifiedLiveContext {
+            request_id: Uuid::new_v4(),
+            approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approver: "ops-alice".to_string(),
+            expiry: Utc::now() + chrono::Duration::hours(1),
+            step_job_id: Some(step_a),
+            signature: String::new(),
+        };
+        let mut vlc = sign_vlc(unsigned, &key);
+        vlc.step_job_id = Some(step_b); // tamper AFTER signing
+        let vk = key.verifying_key();
+        assert!(
+            verify_vlc(&vlc, &vk).is_err(),
+            "swapping step_job_id after signing must invalidate the signature"
+        );
+    }
+
+    /// TAMPER: stripping step_job_id entirely (Some -> None) after signing
+    /// must also fail — an attacker cannot downgrade a step-scoped grant into
+    /// an (apparently) unbound legacy grant by dropping the field, because
+    /// doing so changes the signed bytes (Some contributes bytes; None
+    /// contributes none).
+    #[test]
+    fn tamper_vlc_step_job_id_stripped_fails() {
+        let key = generate_keypair(&mut OsRng);
+        let step_a = Uuid::new_v4();
+
+        let unsigned = VerifiedLiveContext {
+            request_id: Uuid::new_v4(),
+            approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approver: "ops-alice".to_string(),
+            expiry: Utc::now() + chrono::Duration::hours(1),
+            step_job_id: Some(step_a),
+            signature: String::new(),
+        };
+        let mut vlc = sign_vlc(unsigned, &key);
+        vlc.step_job_id = None; // tamper: attempt to strip the binding
+        let vk = key.verifying_key();
+        assert!(
+            verify_vlc(&vlc, &vk).is_err(),
+            "stripping step_job_id after signing must invalidate the signature"
+        );
     }
 
     // -----------------------------------------------------------------------

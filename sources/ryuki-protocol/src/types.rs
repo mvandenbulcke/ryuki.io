@@ -250,7 +250,7 @@ pub struct JobResult {
 /// The agent verifies this against the CP's own public key before executing.
 ///
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
-/// `request_id, approved_plan_digest, approver, expiry (RFC 3339)`
+/// `request_id, approved_plan_digest, approver, expiry (RFC 3339), step_job_id`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
@@ -262,6 +262,26 @@ pub struct VerifiedLiveContext {
     pub approver: String,
     /// Grant expiry (CP DB time).  The agent MUST reject an expired grant.
     pub expiry: DateTime<Utc>,
+    /// Binds this grant to ONE specific dispatched step job (`Job::id`), so it
+    /// cannot be replayed against a different step or against a later
+    /// re-dispatch of the same step (a re-dispatch mints a new job id).
+    ///
+    /// `None` means the grant is a legacy/whole-request grant (the original,
+    /// single-job trust model) — behaviourally unchanged from before this
+    /// field existed.  `Some(id)` means the grant is valid ONLY when applied
+    /// against the job whose `Job::id == id`.
+    ///
+    /// **Backward compatibility (CRITICAL):** `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` means a `None` value is omitted entirely from the
+    /// JSON representation — the key is absent, not `null`. Combined with
+    /// `#[serde(default)]` for deserialisation, a grant minted with
+    /// `step_job_id: None` produces byte-identical canonical signing bytes
+    /// (see `signing_bytes_vlc`) and byte-identical wire JSON to a grant built
+    /// before this field existed. Every pre-existing single-job grant
+    /// therefore continues to sign/verify exactly as it did before this
+    /// change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_job_id: Option<Uuid>,
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
     /// above.  Produced by `sign_vlc`; verified by `verify_vlc`.
     pub signature: String,
