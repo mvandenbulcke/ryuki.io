@@ -15000,10 +15000,11 @@ fn completed_request_stage(
 }
 
 /// Payload/intake keys mirrored into `Request::metadata` for the resolver layer
-/// (e.g. OS-based offering discrimination). Deliberately narrow: only these keys
-/// are copied so the serialized `Request.metadata` surface is NOT broadened with
-/// arbitrary intake fields. Keep in sync with the no-DB create path.
-const METADATA_ALLOWLIST: &[&str] = &["operating_system"];
+/// (e.g. OS-based offering discrimination, #42 slice 3's composite-offering
+/// flag). Deliberately narrow: only these keys are copied so the serialized
+/// `Request.metadata` surface is NOT broadened with arbitrary intake fields.
+/// Keep in sync with the no-DB create path.
+const METADATA_ALLOWLIST: &[&str] = &["operating_system", "deployment_profile"];
 
 /// Extract the allowlisted string-valued keys from a request's payload JSONB
 /// into a `HashMap<String, String>` suitable for `Request::metadata`.
@@ -15240,6 +15241,54 @@ async fn requests_create(
         .map_err(db_error)?;
 
         let request_id = row.id.to_string();
+
+        // #42 slice 3: materialize the offering's multi-step plan, IN THE SAME
+        // TRANSACTION as the request INSERT above, so the request and its plan
+        // commit atomically — a plan never exists without its request, nor a
+        // managed request without its plan. `request.metadata` already carries
+        // the allowlisted intake fields (populated above), so the resolver sees
+        // the same `deployment_profile`/`operating_system` inputs the DB row
+        // does. An empty template (every offering except the composite
+        // "managed-server-onboarding") leaves today's exact single-job creation
+        // unchanged — no job_steps rows, nothing else below runs.
+        let offering = ryuki_runner::iac::resolve_offering_id(&request);
+        let template = ryuki_runner::iac::offering_step_template(&offering);
+        let mut steps_planned: usize = 0;
+        if !template.is_empty() {
+            let steps: Vec<(&str, Vec<String>, &str)> = template
+                .iter()
+                .map(|t| {
+                    (
+                        t.key,
+                        t.depends_on.iter().map(|d| d.to_string()).collect(),
+                        t.iac_ref,
+                    )
+                })
+                .collect();
+            // Defensive: a malformed offering template is a server bug, never a
+            // silently-accepted bad plan — reject with 500 (transaction rolls
+            // back, so no half-created request/plan is ever persisted).
+            let engine_steps: Vec<ryuki_engine::job_orchestration::Step> = steps
+                .iter()
+                .map(
+                    |(key, depends_on, _)| ryuki_engine::job_orchestration::Step {
+                        key: (*key).to_string(),
+                        depends_on: depends_on.clone(),
+                        status: ryuki_engine::job_orchestration::StepStatus::Pending,
+                    },
+                )
+                .collect();
+            ryuki_engine::job_orchestration::validate_plan(&engine_steps).map_err(|e| {
+                db_error(sqlx::Error::Protocol(format!(
+                    "offering {offering} has a malformed step template: {e:?}"
+                )))
+            })?;
+            crate::repos::job_steps::insert_plan(&mut tx, row.id, &steps)
+                .await
+                .map_err(db_error)?;
+            steps_planned = steps.len();
+        }
+
         audit::record_audit_tx(
             &mut tx,
             &session,
@@ -15250,7 +15299,14 @@ async fn requests_create(
                 to_status: &row.status,
                 from_stage: None,
                 to_stage: &row.stage,
-                detail: json!({}),
+                // Preserve the historical `{}` detail for a normal (no-plan)
+                // create — audit reads are externally visible, so only annotate
+                // when a multi-step plan was actually materialized.
+                detail: if steps_planned == 0 {
+                    json!({})
+                } else {
+                    json!({ "steps_planned": steps_planned })
+                },
                 outcome: "applied",
             },
         )
@@ -15830,6 +15886,25 @@ async fn requests_get(
         // Vec<Stage> and receives the same treatment.
         let sanitized_stages = sanitize_stages_for_portal(&row.stages);
         let sanitized_plan = sanitize_stages_for_portal(&row.plan);
+        // #42 slice 3: surface the request's multi-step orchestration plan (if
+        // any) so an approver can see it BEFORE approving — an empty plan (every
+        // offering except the composite "managed-server-onboarding") returns
+        // `[]`, purely additive over every existing response key. Only the
+        // fields an approver needs (step_key/depends_on/iac_ref/status); the
+        // dispatched agent_job_id is an internal back-link, not exposed here.
+        let steps_json: Vec<Value> = crate::repos::job_steps::load_plan(pool, uid)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "step_key": s.step_key,
+                    "depends_on": s.depends_on,
+                    "iac_ref": s.iac_ref,
+                    "status": s.status,
+                })
+            })
+            .collect();
         return Ok(Json(json!({
             "request_id": row.id.to_string(),
             "request_type": row.request_type,
@@ -15852,7 +15927,8 @@ async fn requests_get(
             "criticality": row.criticality,
             "requester": row.requester,
             "owner": row.owner,
-            "evidence_manifest_id": row.evidence_manifest_id
+            "evidence_manifest_id": row.evidence_manifest_id,
+            "steps": steps_json
         })));
     }
 
@@ -17586,6 +17662,401 @@ mod step_materialization_db_tests {
 
         cleanup_request(&pool, id).await;
         pool.close().await;
+    }
+}
+
+/// #42 slice 3: offering-template-derived multi-step plan AUTHORING — a
+/// managed-onboarding request materializes its 3-step plan atomically with the
+/// request row at creation, a normal request stays single-job, the plan is
+/// visible pre-approval via `requests_get`, and a plan'd request can never be
+/// single-live-applied.
+#[cfg(test)]
+mod step_authoring_db_tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    /// `requests_create`/`requests_get` gate their DB path on the process-global
+    /// `crate::database::get_db()` pool (a `OnceLock`), NOT on any locally-built
+    /// `sqlx::PgPool` — a locally-connected pool would leave the handlers
+    /// silently falling through to the no-DB (in-memory) path. This mirrors
+    /// `db_lifecycle_tests::global_pool` (the pattern every test that drives
+    /// `requests_create` through the real handler must use).
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn admin_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
+    fn create_body(name: &str, deployment_profile: Option<&str>) -> CreateRequest {
+        let mut fields = std::collections::BTreeMap::new();
+        if let Some(profile) = deployment_profile {
+            fields.insert("deployment_profile".to_string(), profile.to_string());
+        }
+        CreateRequest {
+            request_type: "server-deployment".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            name: format!("step-authoring-{name}"),
+            cpu: 4,
+            memory_gb: 8,
+            justification: "#42 slice 3 step-authoring db test".into(),
+            fields,
+        }
+    }
+
+    /// job_steps has a NOT NULL FK to requests(id) with no CASCADE, so children
+    /// must be deleted before the request row (mirrors
+    /// `step_materialization_db_tests::cleanup_request`).
+    async fn cleanup_request(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM audit_log WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM request_approval_decisions WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Creating a ServerDeployment request with `deployment_profile:
+    /// managed-onboarding` materializes EXACTLY the 3-step managed-onboarding
+    /// plan (preflight/deploy/monitor, deps as designed, all Pending) linked to
+    /// the new request id — atomically with the request row (both are visible
+    /// immediately after `requests_create` returns, since it commits one tx).
+    #[tokio::test]
+    async fn managed_onboarding_create_materializes_three_step_plan() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let admin = admin_session("step-author-managed");
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("managed", Some("managed-onboarding"))),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let plan = crate::repos::job_steps::load_plan(pool, id)
+            .await
+            .expect("load plan");
+        assert_eq!(plan.len(), 3, "managed-onboarding must materialize 3 steps");
+
+        let preflight = plan
+            .iter()
+            .find(|s| s.step_key == "preflight")
+            .expect("preflight step");
+        let deploy = plan
+            .iter()
+            .find(|s| s.step_key == "deploy")
+            .expect("deploy step");
+        let monitor = plan
+            .iter()
+            .find(|s| s.step_key == "monitor")
+            .expect("monitor step");
+
+        assert_eq!(preflight.depends_on, Vec::<String>::new());
+        assert_eq!(deploy.depends_on, vec!["preflight".to_string()]);
+        assert_eq!(monitor.depends_on, vec!["deploy".to_string()]);
+        assert_eq!(preflight.iac_ref, "request-preflight");
+        assert_eq!(deploy.iac_ref, "linux-server-deployment");
+        assert_eq!(monitor.iac_ref, "zabbix-onboarding");
+        for step in &plan {
+            assert_eq!(
+                step.status, "Pending",
+                "{} must start Pending",
+                step.step_key
+            );
+            assert_eq!(step.request_id, id);
+        }
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// Creating a NORMAL ServerDeployment (no `deployment_profile`) materializes
+    /// ZERO job_steps rows — the single-job path is unaffected.
+    #[tokio::test]
+    async fn normal_server_deployment_create_materializes_zero_steps() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let admin = admin_session("step-author-normal");
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("normal", None)),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let plan = crate::repos::job_steps::load_plan(pool, id)
+            .await
+            .expect("load plan");
+        assert!(
+            plan.is_empty(),
+            "a normal request must have no job_steps rows"
+        );
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// `requests_get` on a managed-onboarding request returns a `steps` array
+    /// of length 3 with the right keys/deps; on a normal request it returns
+    /// `steps: []`. Purely additive — every existing key stays present.
+    #[tokio::test]
+    async fn requests_get_surfaces_steps_pre_approval() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let admin = admin_session("step-author-get");
+        let p = |s: &str| Path(s.to_string());
+
+        let Ok(Json(managed)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("get-managed", Some("managed-onboarding"))),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let managed_id_str = managed["id"].as_str().expect("id").to_string();
+        let managed_id = Uuid::parse_str(&managed_id_str).expect("uuid");
+
+        // Pre-approval: the request has not been validated/planned/approved yet,
+        // but its steps are already visible.
+        let Ok(Json(managed_view)) =
+            requests_get(AuthExtractor(admin.clone()), p(&managed_id_str)).await
+        else {
+            panic!("get must succeed");
+        };
+        let steps = managed_view["steps"].as_array().expect("steps array");
+        assert_eq!(
+            steps.len(),
+            3,
+            "managed request exposes 3 steps pre-approval"
+        );
+        let keys: Vec<&str> = steps
+            .iter()
+            .map(|s| s["step_key"].as_str().expect("step_key"))
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["deploy", "monitor", "preflight"],
+            "load_plan orders by step_key"
+        );
+        let deploy = steps
+            .iter()
+            .find(|s| s["step_key"] == "deploy")
+            .expect("deploy entry");
+        assert_eq!(deploy["depends_on"], json!(["preflight"]));
+        assert_eq!(deploy["iac_ref"], json!("linux-server-deployment"));
+        assert_eq!(deploy["status"], json!("Pending"));
+        // Existing keys must still be present (purely additive).
+        assert!(managed_view.get("request_id").is_some());
+        assert!(managed_view.get("payload").is_some());
+
+        let Ok(Json(normal)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("get-normal", None)),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let normal_id_str = normal["id"].as_str().expect("id").to_string();
+        let normal_id = Uuid::parse_str(&normal_id_str).expect("uuid");
+        let Ok(Json(normal_view)) =
+            requests_get(AuthExtractor(admin.clone()), p(&normal_id_str)).await
+        else {
+            panic!("get must succeed");
+        };
+        assert_eq!(
+            normal_view["steps"],
+            json!([]),
+            "a normal request has steps: []"
+        );
+
+        cleanup_request(pool, managed_id).await;
+        cleanup_request(pool, normal_id).await;
+    }
+
+    /// The live-apply guard: a request WITH a job_steps plan is REJECTED at the
+    /// live-apply mint point (`create_live_apply_job`, the shared choke point
+    /// behind both `requests_approve_live_apply` and the admin endpoint), and
+    /// NO agent_job is minted.
+    #[tokio::test]
+    async fn live_apply_mint_rejects_a_stepped_request() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+        let admin = admin_session("step-author-la-guard");
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("la-guard", Some("managed-onboarding"))),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        // Directly exercise the shared minting choke point (this is what
+        // requests_approve_live_apply delegates to once it has a completed
+        // plan+grant; the guard fires before any of that machinery matters).
+        let cp_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let spec = ryuki_protocol::JobSpec {
+            request_id: id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: Default::default(),
+            mode: ryuki_protocol::JobMode::LiveApply,
+        };
+        let digest = "a".repeat(64);
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        let result = crate::agents::create_live_apply_job(
+            pool,
+            id,
+            "DEFRA",
+            &spec,
+            &digest,
+            admin.user_id.as_str(),
+            expiry,
+            &cp_key,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::agents::CreateLiveApplyJobError::HasStepPlan)
+            ),
+            "a stepped request must be rejected with HasStepPlan, got {result:?}"
+        );
+
+        let la_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count LiveApply");
+        assert_eq!(
+            la_count, 0,
+            "no LiveApply job is minted for a stepped request"
+        );
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// A normal (no-plan) request is unaffected by the guard: the mint proceeds
+    /// to success (it fails later only for reasons unrelated to job_steps).
+    #[tokio::test]
+    async fn live_apply_mint_unaffected_for_a_normal_request() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+        let admin = admin_session("step-author-la-normal");
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("la-normal", None)),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let cp_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let spec = ryuki_protocol::JobSpec {
+            request_id: id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: Default::default(),
+            mode: ryuki_protocol::JobMode::LiveApply,
+        };
+        let digest = "a".repeat(64);
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        let result = crate::agents::create_live_apply_job(
+            pool,
+            id,
+            "DEFRA",
+            &spec,
+            &digest,
+            admin.user_id.as_str(),
+            expiry,
+            &cp_key,
+        )
+        .await;
+        assert!(
+            !matches!(
+                result,
+                Err(crate::agents::CreateLiveApplyJobError::HasStepPlan)
+            ),
+            "a normal request must never be rejected as HasStepPlan, got {result:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "a normal request's live-apply mint must succeed: {result:?}"
+        );
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, id).await;
     }
 }
 

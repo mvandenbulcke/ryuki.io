@@ -2745,6 +2745,14 @@ pub enum CreateLiveApplyJobError {
     /// live-apply grant must never be minted against it. Maps to 409 Conflict.
     #[error("request has concluded; a live-apply grant cannot be minted")]
     RequestConcluded,
+    /// #42 slice 3: the request has a persisted `job_steps` multi-step
+    /// orchestration plan. Such a request is executed STEP-BY-STEP by the
+    /// orchestration engine (per-step OfflineDryRun jobs, never a single
+    /// LiveApply) — minting a single-shot LiveApply grant for it would bypass
+    /// its step plan AND the OfflineDryRun-only invariant those steps rely on.
+    /// Maps to 409 Conflict.
+    #[error("multi-step requests are executed step-by-step and do not support single live-apply")]
+    HasStepPlan,
     /// A database error occurred while enqueuing the job.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -2849,6 +2857,21 @@ pub async fn create_live_apply_job(
             return Err(CreateLiveApplyJobError::RequestConcluded);
         }
         Some(_) => {}
+    }
+
+    // #42 slice 3: never mint a single-shot LiveApply grant for a request that
+    // has a persisted multi-step `job_steps` plan — it must be driven step-by-
+    // step by the orchestration engine instead (completes the OfflineDryRun-only
+    // invariant from slice 2a: a multi-step request can never reach a live
+    // execution mode via this separate, single-job grant path). Checked on the
+    // SAME locked transaction as the concluded-status check above, so this is
+    // the single shared minting choke point for BOTH the request-scoped
+    // approval endpoint and the operator admin endpoint.
+    let has_step_plan = !crate::repos::job_steps::load_plan(&mut *tx, request_id)
+        .await?
+        .is_empty();
+    if has_step_plan {
+        return Err(CreateLiveApplyJobError::HasStepPlan);
     }
 
     // Validate the grant fields before signing — a signed grant is authoritative,
@@ -3092,6 +3115,9 @@ pub async fn approve_live_apply_with(
         CreateLiveApplyJobError::RequestConcluded => {
             conflict("request has concluded; a live-apply grant cannot be minted")
         }
+        CreateLiveApplyJobError::HasStepPlan => conflict(
+            "multi-step requests are executed step-by-step and do not support single live-apply",
+        ),
         CreateLiveApplyJobError::Db(db_e) => db_err(db_e),
     })?;
 

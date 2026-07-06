@@ -53,13 +53,13 @@ impl JobStepRow {
 }
 
 /// Author a request's step plan: one row per `(step_key, depends_on, iac_ref)`,
-/// all starting `Pending`. This is the slice-2a AUTHORING seam — called
-/// directly by tests today; a future POST endpoint will call the same
-/// function. Takes a concrete `&mut PgConnection` (rather than a generic
-/// `impl PgExecutor`) so it can be re-borrowed across the per-step INSERTs in
-/// the loop — callers pass `&mut *tx` to author the plan inside the same
-/// transaction as the request's creation/validation.
-#[cfg_attr(not(test), allow(dead_code))]
+/// all starting `Pending`. This is the AUTHORING seam: `requests_create`
+/// (#42 slice 3) calls it inside the same transaction as the request INSERT,
+/// for any offering whose `offering_step_template` is non-empty. Takes a
+/// concrete `&mut PgConnection` (rather than a generic `impl PgExecutor`) so
+/// it can be re-borrowed across the per-step INSERTs in the loop — callers
+/// pass `&mut *tx` to author the plan inside the same transaction as the
+/// request's creation/validation.
 pub async fn insert_plan(
     executor: &mut sqlx::PgConnection,
     request_id: Uuid,

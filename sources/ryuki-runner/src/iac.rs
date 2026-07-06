@@ -136,13 +136,19 @@ fn lookup(offering_id: &str) -> Option<&'static OfferingIac> {
     OFFERINGS.iter().find(|o| o.id == offering_id)
 }
 
-/// Resolve the effective offering ID for a request, applying OS-based
-/// discrimination for `server-deployment` and name normalization for
-/// `controlled-restore`.
+/// Resolve the effective offering ID for a request, applying the composite
+/// managed-onboarding override, OS-based discrimination for
+/// `server-deployment`, and name normalization for `controlled-restore`.
 ///
 /// This is the single place where `request_type` (plus optional
-/// `metadata["operating_system"]`) maps to a catalog offering_id:
+/// `metadata["operating_system"]`/`metadata["deployment_profile"]`) maps to a
+/// catalog offering_id:
 ///
+/// - `"server-deployment"` + metadata `deployment_profile` ==
+///   `"managed-onboarding"` → `"managed-server-onboarding"` (the composite,
+///   multi-step offering; see [`offering_step_template`]). Checked BEFORE the
+///   OS discrimination below, so a managed-onboarding request never falls
+///   through to a single-job offering.
 /// - `"server-deployment"` + metadata `operating_system` containing "windows"
 ///   (case-insensitive) → `"windows-server-deployment"`
 /// - `"server-deployment"` + any other non-empty OS → `"linux-server-deployment"`
@@ -155,6 +161,14 @@ pub fn resolve_offering_id(request: &ryuki_engine::models::Request) -> String {
     let request_type = request.request_type.to_string();
     match request_type.as_str() {
         "server-deployment" => {
+            if request
+                .metadata
+                .get("deployment_profile")
+                .map(String::as_str)
+                == Some("managed-onboarding")
+            {
+                return "managed-server-onboarding".to_string();
+            }
             match request.metadata.get("operating_system").map(String::as_str) {
                 Some(os) if !os.trim().is_empty() => {
                     if os.to_ascii_lowercase().contains("windows") {
@@ -169,6 +183,64 @@ pub fn resolve_offering_id(request: &ryuki_engine::models::Request) -> String {
         }
         "controlled-restore" => "controlled-restore-request".to_string(),
         _ => request.offering_id.clone(),
+    }
+}
+
+/// One step of an offering's static multi-step plan TEMPLATE (see
+/// [`offering_step_template`]). Distinct from `ryuki_engine::job_orchestration
+/// ::Step`: a `StepTemplate` is the offering-authored blueprint (no status —
+/// every step always starts `Pending`), while `Step` is the per-request
+/// runtime state the orchestration engine reads back. `iac_ref` is a REAL
+/// entry in the [`OFFERINGS`] registry (each step dispatches its own job off
+/// its own IaC) — never the composite offering's own id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepTemplate {
+    /// Stable per-plan step key (e.g. "preflight"). Unique within a template.
+    pub key: &'static str,
+    /// Keys of the steps that must SUCCEED before this step may dispatch.
+    pub depends_on: &'static [&'static str],
+    /// The `OFFERINGS` registry id this step's own job dispatches against.
+    pub iac_ref: &'static str,
+}
+
+/// The step plan template for the composite `"managed-server-onboarding"`
+/// offering: preflight check → Linux deployment → monitoring onboarding, each
+/// depending on the previous step's success.
+const MANAGED_SERVER_ONBOARDING_TEMPLATE: &[StepTemplate] = &[
+    StepTemplate {
+        key: "preflight",
+        depends_on: &[],
+        iac_ref: "request-preflight",
+    },
+    StepTemplate {
+        key: "deploy",
+        depends_on: &["preflight"],
+        iac_ref: "linux-server-deployment",
+    },
+    StepTemplate {
+        key: "monitor",
+        depends_on: &["deploy"],
+        iac_ref: "zabbix-onboarding",
+    },
+];
+
+/// Resolve an offering's static multi-step plan template.
+///
+/// Returns a NON-EMPTY template only for the composite offering id
+/// `"managed-server-onboarding"`. Every other offering id (including all
+/// offerings actually present in the [`OFFERINGS`] IaC registry) returns
+/// `&[]`, so a caller that materializes a plan only for a non-empty template
+/// leaves every other offering exactly single-job — ZERO behavior change.
+///
+/// Note: `"managed-server-onboarding"` is deliberately NOT an [`OFFERINGS`]
+/// registry entry — it never dispatches its OWN IaC. A multi-step request
+/// dispatches one job per STEP, each against that step's own `iac_ref` (which
+/// ARE real registry offerings). `offering_iac_digest("managed-server-onboarding")`
+/// returning `None` is expected and is never consulted on the multi-step path.
+pub fn offering_step_template(offering_id: &str) -> &'static [StepTemplate] {
+    match offering_id {
+        "managed-server-onboarding" => MANAGED_SERVER_ONBOARDING_TEMPLATE,
+        _ => &[],
     }
 }
 
@@ -458,6 +530,124 @@ mod tests {
             "patch-maintenance",
             "patch-maintenance must pass through unchanged (1:1)"
         );
+    }
+
+    #[test]
+    fn resolve_offering_id_managed_onboarding_flag_maps_to_composite() {
+        let mut req = make_server_deployment_request(Some("Ubuntu 22.04 LTS"));
+        req.metadata.insert(
+            "deployment_profile".to_string(),
+            "managed-onboarding".to_string(),
+        );
+        assert_eq!(
+            resolve_offering_id(&req),
+            "managed-server-onboarding",
+            "deployment_profile=managed-onboarding must map to the composite offering, \
+             overriding the OS-based discrimination"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_normal_server_deployment_unchanged_by_managed_onboarding_check() {
+        // No deployment_profile flag at all — today's exact linux/windows/unmapped
+        // behavior must be preserved.
+        let req = make_server_deployment_request(Some("Ubuntu 22.04 LTS"));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "linux-server-deployment",
+            "a normal server-deployment (no deployment_profile) must be unaffected"
+        );
+        let req_windows = make_server_deployment_request(Some("Windows Server 2022"));
+        assert_eq!(
+            resolve_offering_id(&req_windows),
+            "windows-server-deployment"
+        );
+        let req_unmapped = make_server_deployment_request(None);
+        assert_eq!(resolve_offering_id(&req_unmapped), "server-deployment");
+    }
+
+    // -------------------------------------------------------------------------
+    // offering_step_template tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn offering_step_template_empty_for_normal_offerings() {
+        for id in [
+            "patch-maintenance",
+            "request-preflight",
+            "zabbix-onboarding",
+            "linux-server-deployment",
+            "windows-server-deployment",
+            "controlled-restore-request",
+            "server-deployment",
+            "unknown-offering",
+        ] {
+            assert!(
+                offering_step_template(id).is_empty(),
+                "offering {id} must keep the single-job path (empty template)"
+            );
+        }
+    }
+
+    #[test]
+    fn offering_step_template_managed_onboarding_has_three_steps() {
+        let template = offering_step_template("managed-server-onboarding");
+        assert_eq!(
+            template.len(),
+            3,
+            "managed-server-onboarding must have exactly 3 steps"
+        );
+        let keys: Vec<&str> = template.iter().map(|s| s.key).collect();
+        assert_eq!(keys, vec!["preflight", "deploy", "monitor"]);
+    }
+
+    #[test]
+    fn offering_step_template_managed_onboarding_is_a_valid_dag() {
+        let template = offering_step_template("managed-server-onboarding");
+        let steps: Vec<ryuki_engine::job_orchestration::Step> = template
+            .iter()
+            .map(|t| ryuki_engine::job_orchestration::Step {
+                key: t.key.to_string(),
+                depends_on: t.depends_on.iter().map(|d| d.to_string()).collect(),
+                status: ryuki_engine::job_orchestration::StepStatus::Pending,
+            })
+            .collect();
+        assert_eq!(
+            ryuki_engine::job_orchestration::validate_plan(&steps),
+            Ok(()),
+            "the managed-server-onboarding template must be a well-formed DAG"
+        );
+    }
+
+    #[test]
+    fn offering_step_template_managed_onboarding_steps_resolve_to_real_offerings() {
+        let template = offering_step_template("managed-server-onboarding");
+        for step in template {
+            assert!(
+                lookup(step.iac_ref).is_some(),
+                "step {} references iac_ref {} which is not in the OFFERINGS registry",
+                step.key,
+                step.iac_ref
+            );
+            assert!(
+                offering_iac_digest(step.iac_ref).is_some(),
+                "step {} iac_ref {} must have embedded IaC (a non-None digest)",
+                step.key,
+                step.iac_ref
+            );
+        }
+    }
+
+    #[test]
+    fn managed_server_onboarding_is_not_in_the_offerings_registry() {
+        // The composite offering dispatches per-step IaC, never its own — it is
+        // deliberately absent from OFFERINGS, and offering_iac_digest for it
+        // returns None (never hit on the multi-step path).
+        assert!(
+            lookup("managed-server-onboarding").is_none(),
+            "the composite offering must NOT be a registry entry"
+        );
+        assert!(offering_iac_digest("managed-server-onboarding").is_none());
     }
 
     // -------------------------------------------------------------------------
