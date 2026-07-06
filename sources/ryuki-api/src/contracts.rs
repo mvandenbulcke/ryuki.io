@@ -16998,7 +16998,8 @@ async fn requests_execute(
             Err(MaterializeError::ModeNotSupportedForStepPlan) => {
                 tx.rollback().await.ok();
                 return Err(status_400(
-                    "multi-step requests support offline-dry-run mode only",
+                    "multi-step requests do not support live-apply mode; \
+                     per-step live-apply approval is not yet available",
                 ));
             }
             Err(MaterializeError::Db(e)) => {
@@ -17134,10 +17135,12 @@ enum MaterializeError {
     /// Never surfaced with engine internals — the caller maps this to a
     /// generic 400.
     InvalidPlan,
-    /// A non-OfflineDryRun mode (e.g. admin-gated `?mode=live-plan`) was
-    /// requested for a multi-step-plan request. The dispatcher only emits
-    /// OfflineDryRun step jobs (per-step live planning is slice 2b), so this
-    /// is rejected rather than silently downgraded. Caller maps to a 400.
+    /// `LiveApply` (only) was requested for a multi-step-plan request. The
+    /// dispatcher can emit `OfflineDryRun` or `LivePlan` step jobs (#42 slice
+    /// B1a), but never `LiveApply` — that requires a per-step, CP-signed
+    /// approval grant minted via the (not-yet-built, slice B1b) approval
+    /// endpoint, off a step's own recorded LivePlan digest. Rather than
+    /// silently downgrading, this is rejected. Caller maps to a 400.
     ModeNotSupportedForStepPlan,
     Db(sqlx::Error),
 }
@@ -17154,10 +17157,14 @@ impl From<sqlx::Error> for MaterializeError {
 /// single-job behavior: one `JobSpec` built from the request's own offering,
 /// dispatched in the caller-resolved `mode` (which may be OfflineDryRun or the
 /// admin-gated LivePlan). If the request HAS a step plan, this dispatches
-/// ONLY the plan's initially-ready steps (#42 slice 2a) — always as
-/// `OfflineDryRun` jobs (see [`build_step_job_spec`]; next-step dispatch on
-/// step-success is slice 2b, not here). `current` is the pre-transition row
-/// (used for the single-job spec's vars, mirroring the historical behavior).
+/// ONLY the plan's initially-ready steps (#42 slice 2a) — as `OfflineDryRun`
+/// OR `LivePlan` step jobs per the caller-resolved `mode` (#42 slice B1a; see
+/// [`build_step_job_spec`]). `LiveApply` is still rejected for step plans
+/// (see [`MaterializeError::ModeNotSupportedForStepPlan`]) — per-step
+/// LiveApply dispatch requires a step-scoped approval grant that does not
+/// exist yet (slice B1b). Next-ready-step dispatch on step-success is slice
+/// 2b/B1a's backlink, not here. `current` is the pre-transition row (used
+/// for the single-job spec's vars, mirroring the historical behavior).
 async fn materialize_execution(
     tx: &mut sqlx::PgConnection,
     request_id: Uuid,
@@ -17182,11 +17189,7 @@ async fn materialize_execution(
             memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
             metadata: &request.metadata,
         });
-        let mode_label = match mode {
-            ryuki_protocol::JobMode::OfflineDryRun => "OfflineDryRun",
-            ryuki_protocol::JobMode::LivePlan => "LivePlan",
-            ryuki_protocol::JobMode::LiveApply => "LiveApply",
-        };
+        let mode_label = job_mode_label(&mode);
         let spec = ryuki_protocol::JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -17209,13 +17212,14 @@ async fn materialize_execution(
         return Ok(MaterializeOutcome::SingleJob { job_id });
     }
 
-    // Multi-step dispatch only emits OfflineDryRun step jobs (see
-    // build_step_job_spec). Rather than SILENTLY downgrading an admin's
-    // ?mode=live-plan request to OfflineDryRun and returning 200 OK — a
-    // least-surprise violation — reject any non-OfflineDryRun mode explicitly.
-    // Per-step live planning is slice 2b; LiveApply is unreachable here
-    // (it is minted only by requests_approve_live_apply -> create_live_apply_job).
-    if !matches!(mode, ryuki_protocol::JobMode::OfflineDryRun) {
+    // Multi-step dispatch emits OfflineDryRun OR LivePlan step jobs (see
+    // build_step_job_spec; #42 slice B1a). LiveApply is the ONLY mode
+    // rejected here — per-step LiveApply dispatch requires a step-scoped,
+    // CP-signed approval grant minted off a step's own recorded LivePlan
+    // digest (slice B1b's approval endpoint, which does not exist yet).
+    // Rather than SILENTLY downgrading an admin's ?mode=live-apply request —
+    // a least-surprise violation — reject it explicitly.
+    if matches!(mode, ryuki_protocol::JobMode::LiveApply) {
         return Err(MaterializeError::ModeNotSupportedForStepPlan);
     }
 
@@ -17229,34 +17233,41 @@ async fn materialize_execution(
     ryuki_engine::job_orchestration::validate_plan(&orchestration_steps)
         .map_err(|_| MaterializeError::InvalidPlan)?;
 
-    let job_ids = dispatch_ready_steps(tx, request, current, &plan).await?;
+    let job_ids = dispatch_ready_steps(tx, request, current, &plan, mode).await?;
 
     Ok(MaterializeOutcome::StepJobs { job_ids })
 }
 
-/// Dispatch a plan's newly-ready steps as `OfflineDryRun` `agent_jobs`,
+/// Dispatch a plan's newly-ready steps as `agent_jobs` in the given `mode`,
 /// INSIDE the caller's transaction/connection. Shared by
-/// [`materialize_execution`] (a request's INITIAL ready steps, #42 slice 2a)
-/// and the step-success backlink (next-ready-step dispatch on step success,
-/// #42 slice 2b). Readiness is computed fresh from `plan` — the caller is
-/// responsible for the plan reflecting the latest step statuses (e.g. having
-/// just marked a step `Succeeded`) and, for the concurrent multi-writer case,
-/// for having locked the plan's rows (see
-/// `repos::job_steps::load_plan_for_update`) so two step completions for the
-/// same request cannot race each other's readiness computation.
+/// [`materialize_execution`] (a request's INITIAL ready steps, #42 slice 2a;
+/// `mode` is `OfflineDryRun` or `LivePlan`) and the step-success backlink
+/// (next-ready-step dispatch on step success, #42 slice 2b — always called
+/// with `OfflineDryRun`, since `LivePlan` step success withholds downstream
+/// dispatch entirely; see `backlink_request_execution`). Readiness is
+/// computed fresh from `plan` — the caller is responsible for the plan
+/// reflecting the latest step statuses (e.g. having just marked a step
+/// `Succeeded`) and, for the concurrent multi-writer case, for having locked
+/// the plan's rows (see `repos::job_steps::load_plan_for_update`) so two step
+/// completions for the same request cannot race each other's readiness
+/// computation.
 ///
-/// Every dispatched step job is `OfflineDryRun` ONLY — see
-/// [`build_step_job_spec`]; there is no path from here to `LiveApply`.
+/// `mode` is caller-resolved and MUST NEVER be `LiveApply` — see
+/// [`build_step_job_spec`], which defensively clamps against that mode
+/// regardless. Each dispatched step is marked `Running` (`OfflineDryRun`) or
+/// `Planning` (`LivePlan`) via the matching `repos::job_steps` fn.
 pub(crate) async fn dispatch_ready_steps(
     tx: &mut sqlx::PgConnection,
     request: &ryuki_engine::models::Request,
     current: &DbRequestRow,
     plan: &[crate::repos::job_steps::JobStepRow],
+    mode: ryuki_protocol::JobMode,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
     let request_id = current.id;
     let orchestration_steps: Vec<ryuki_engine::job_orchestration::Step> =
         plan.iter().map(|row| row.to_orchestration_step()).collect();
     let ready_keys = ryuki_engine::job_orchestration::ready_steps(&orchestration_steps);
+    let mode_label = job_mode_label(&mode);
 
     let mut job_ids = Vec::with_capacity(ready_keys.len());
     for key in &ready_keys {
@@ -17264,7 +17275,7 @@ pub(crate) async fn dispatch_ready_steps(
             .iter()
             .find(|row| &row.step_key == key)
             .expect("ready_steps only returns keys present in the input plan");
-        let spec = build_step_job_spec(request_id, &step.iac_ref, request, current);
+        let spec = build_step_job_spec(request_id, &step.iac_ref, request, current, mode.clone());
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
@@ -17273,27 +17284,80 @@ pub(crate) async fn dispatch_ready_steps(
         .bind(request_id)
         .bind(&request.site)
         .bind(&spec_json)
-        .bind("OfflineDryRun")
+        .bind(mode_label)
         .fetch_one(&mut *tx)
         .await?;
-        crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
+        match mode {
+            ryuki_protocol::JobMode::LivePlan => {
+                crate::repos::job_steps::mark_planning(&mut *tx, step.id, job_id).await?;
+            }
+            ryuki_protocol::JobMode::OfflineDryRun => {
+                crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
+            }
+            ryuki_protocol::JobMode::LiveApply => {
+                // Unreachable in practice: this fn is only ever called with
+                // OfflineDryRun (backlink mid-flight dispatch, and
+                // materialize_execution) or LivePlan (materialize_execution's
+                // initial dispatch, #42 slice B1a) — LiveApply step dispatch
+                // requires a step-scoped approval grant (slice B1b) that no
+                // caller of this fn has access to mint. Debug-assert loudly
+                // rather than silently dispatching a live-mutating step job.
+                debug_assert!(
+                    false,
+                    "dispatch_ready_steps must never be called with LiveApply"
+                );
+                crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
+            }
+        }
         job_ids.push(job_id);
     }
 
     Ok(job_ids)
 }
 
-/// Build the `JobSpec` for one multi-step-plan step. HARD-CODES
-/// `mode = OfflineDryRun` — the multi-step dispatcher has no path to
-/// LiveApply (that requires an admin-gated, CP-signed approval grant minted
-/// via `create_live_apply_job`, off a prior LivePlan) and must never create
-/// one. A unit test asserts this fn always yields `OfflineDryRun`.
+/// The DB `agent_jobs.mode` TEXT label for a `JobMode`. Shared by every
+/// dispatch call site (single-job `materialize_execution` branch,
+/// `dispatch_ready_steps`) so the mode->label mapping is defined exactly
+/// once.
+fn job_mode_label(mode: &ryuki_protocol::JobMode) -> &'static str {
+    match mode {
+        ryuki_protocol::JobMode::OfflineDryRun => "OfflineDryRun",
+        ryuki_protocol::JobMode::LivePlan => "LivePlan",
+        ryuki_protocol::JobMode::LiveApply => "LiveApply",
+    }
+}
+
+/// Build the `JobSpec` for one multi-step-plan step, in the caller-resolved
+/// `mode` (#42 slice B1a: `OfflineDryRun` or `LivePlan`). NEVER yields
+/// `LiveApply` — the multi-step dispatcher has no path to it (that requires
+/// a per-step, CP-signed approval grant minted off a step's own recorded
+/// LivePlan digest via the slice-B1b approval endpoint, which does not exist
+/// yet) and must never create one. If ever called with `LiveApply` (should
+/// be unreachable — every caller of this fn is itself gated to
+/// `OfflineDryRun`/`LivePlan`), this defensively clamps to `OfflineDryRun` and
+/// logs loudly, rather than either panicking (a `debug_assert!` here would
+/// make the clamp itself untestable in a debug/test build, since it would
+/// always fire first) or minting a live-mutating spec. A unit test asserts
+/// both the OfflineDryRun/LivePlan passthrough and the LiveApply clamp.
 fn build_step_job_spec(
     request_id: Uuid,
     step_iac_ref: &str,
     request: &ryuki_engine::models::Request,
     current: &DbRequestRow,
+    mode: ryuki_protocol::JobMode,
 ) -> ryuki_protocol::JobSpec {
+    let effective_mode = if matches!(mode, ryuki_protocol::JobMode::LiveApply) {
+        // Fail-safe clamp; should be unreachable in production (every caller
+        // is itself gated to OfflineDryRun/LivePlan) — log loudly rather than
+        // silently downgrading, so a genuine future misuse is never missed.
+        tracing::error!(
+            "build_step_job_spec called with LiveApply (should be unreachable); \
+             clamping to OfflineDryRun rather than minting a live-mutating step spec"
+        );
+        ryuki_protocol::JobMode::OfflineDryRun
+    } else {
+        mode
+    };
     let iac_digest =
         ryuki_runner::iac::offering_iac_digest(step_iac_ref).unwrap_or_else(|| "0".repeat(64));
     let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
@@ -17312,7 +17376,7 @@ fn build_step_job_spec(
         iac_ref: step_iac_ref.to_string(),
         iac_digest,
         vars,
-        mode: ryuki_protocol::JobMode::OfflineDryRun,
+        mode: effective_mode,
     }
 }
 
@@ -17369,15 +17433,14 @@ mod step_materialization_unit_tests {
         }
     }
 
-    /// SAFETY INVARIANT (#42 slice 2a): the multi-step dispatcher's per-step
-    /// spec builder must NEVER be able to produce a LiveApply job — that path
-    /// requires an admin-gated, CP-signed approval grant
-    /// (`create_live_apply_job`) off a prior LivePlan, which the multi-step
-    /// dispatcher has no access to. Assert the hard-coded mode across several
-    /// distinct iac_refs (including offerings with no embedded IaC bundle, the
-    /// all-zero-digest fallback path).
+    /// #42 slice B1a: the multi-step dispatcher's per-step spec builder
+    /// passes through the caller-resolved mode faithfully for both
+    /// `OfflineDryRun` and `LivePlan` — it no longer hard-codes
+    /// `OfflineDryRun`. Assert across several distinct iac_refs (including
+    /// offerings with no embedded IaC bundle, the all-zero-digest fallback
+    /// path).
     #[test]
-    fn build_step_job_spec_always_yields_offline_dry_run() {
+    fn build_step_job_spec_passes_through_offline_dry_run_and_live_plan() {
         let request = sample_request();
         let current = sample_current_row(&request);
         for iac_ref in [
@@ -17386,13 +17449,55 @@ mod step_materialization_unit_tests {
             "patch-maintenance",
             "an-offering-with-no-embedded-iac-bundle",
         ] {
-            let spec = build_step_job_spec(Uuid::new_v4(), iac_ref, &request, &current);
+            for mode in [
+                ryuki_protocol::JobMode::OfflineDryRun,
+                ryuki_protocol::JobMode::LivePlan,
+            ] {
+                let spec =
+                    build_step_job_spec(Uuid::new_v4(), iac_ref, &request, &current, mode.clone());
+                assert_eq!(
+                    spec.mode, mode,
+                    "step spec for iac_ref={iac_ref} must pass through mode={mode:?}"
+                );
+                assert_eq!(spec.iac_ref, iac_ref);
+            }
+        }
+    }
+
+    /// SAFETY INVARIANT (#42 slice B1a): the multi-step dispatcher's per-step
+    /// spec builder must NEVER be able to produce a LiveApply job — that path
+    /// requires a per-step, CP-signed approval grant minted off a step's own
+    /// recorded LivePlan digest (the slice-B1b approval endpoint, which does
+    /// not exist yet), which this fn has no access to. If ever called with
+    /// LiveApply (should be unreachable in production), it must clamp to
+    /// OfflineDryRun rather than yield LiveApply.
+    #[test]
+    fn build_step_job_spec_never_yields_live_apply() {
+        let request = sample_request();
+        let current = sample_current_row(&request);
+        for iac_ref in [
+            "linux-server-deployment",
+            "windows-server-deployment",
+            "patch-maintenance",
+            "an-offering-with-no-embedded-iac-bundle",
+        ] {
+            let spec = build_step_job_spec(
+                Uuid::new_v4(),
+                iac_ref,
+                &request,
+                &current,
+                ryuki_protocol::JobMode::LiveApply,
+            );
+            assert_ne!(
+                spec.mode,
+                ryuki_protocol::JobMode::LiveApply,
+                "step spec for iac_ref={iac_ref} must never be LiveApply, even if called with it"
+            );
             assert_eq!(
                 spec.mode,
                 ryuki_protocol::JobMode::OfflineDryRun,
-                "step spec for iac_ref={iac_ref} must always be OfflineDryRun"
+                "the LiveApply clamp fallback is OfflineDryRun"
             );
-            assert_eq!(spec.iac_ref, iac_ref);
         }
     }
 }
@@ -17610,12 +17715,116 @@ mod step_materialization_db_tests {
         pool.close().await;
     }
 
-    /// #42 slice 2a: a multi-step-plan request executed with a non-OfflineDryRun
-    /// mode (e.g. admin-gated `?mode=live-plan`) is REJECTED, not silently
-    /// downgraded — and nothing is dispatched. Per-step live planning is slice
-    /// 2b.
+    /// #42 slice B1a: a step-plan request executed with `mode=LivePlan`
+    /// dispatches its initial ready step(s) as `LivePlan` agent_jobs, with
+    /// `job_steps.status = 'Planning'` (not `Running`, which is the
+    /// OfflineDryRun-only status). Mirrors
+    /// `multi_step_plan_materializes_only_initial_ready_step` exactly, just
+    /// asserting the LivePlan-shaped outcome instead.
     #[tokio::test]
-    async fn multi_step_plan_rejects_non_offline_mode() {
+    async fn multi_step_plan_live_mode_dispatches_planning_step() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_locked_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+                (
+                    "c",
+                    vec!["a".to_string(), "b".to_string()],
+                    "linux-server-deployment",
+                ),
+            ],
+        )
+        .await
+        .expect("seed 3-step plan");
+
+        let (current, request) = load_request(&pool, id).await;
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let outcome = materialize_execution(
+            &mut tx,
+            id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::LivePlan,
+        )
+        .await
+        .expect("materialize succeeds in LivePlan mode");
+        tx.commit().await.expect("commit tx");
+
+        let job_ids = match outcome {
+            MaterializeOutcome::StepJobs { job_ids } => job_ids,
+            MaterializeOutcome::SingleJob { .. } => {
+                panic!("a request with a non-empty step plan must NOT take the single-job path")
+            }
+        };
+        assert_eq!(job_ids.len(), 1, "only step 'a' is initially ready");
+
+        let plan = crate::repos::job_steps::load_plan(&pool, id)
+            .await
+            .expect("load plan");
+        let a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let b = plan.iter().find(|s| s.step_key == "b").expect("step b");
+        let c = plan.iter().find(|s| s.step_key == "c").expect("step c");
+        assert_eq!(
+            a.status, "Planning",
+            "ready step 'a' dispatched in LivePlan mode must be Planning, not Running"
+        );
+        assert_eq!(
+            a.agent_job_id,
+            Some(job_ids[0]),
+            "step 'a' must back-link to the dispatched agent_job"
+        );
+        assert_eq!(
+            a.live_plan_digest, None,
+            "no digest is recorded at dispatch time — only on LivePlan success"
+        );
+        assert_eq!(b.status, "Pending", "step 'b' blocked on 'a' stays Pending");
+        assert_eq!(
+            c.status, "Pending",
+            "step 'c' blocked on 'a','b' stays Pending"
+        );
+
+        let mode_col: String = sqlx::query_scalar("SELECT mode FROM agent_jobs WHERE id = $1")
+            .bind(job_ids[0])
+            .fetch_one(&pool)
+            .await
+            .expect("load dispatched job mode column");
+        assert_eq!(
+            mode_col, "LivePlan",
+            "the dispatched step job's agent_jobs.mode column must be LivePlan"
+        );
+
+        let spec: serde_json::Value =
+            sqlx::query_scalar("SELECT spec FROM agent_jobs WHERE id = $1")
+                .bind(job_ids[0])
+                .fetch_one(&pool)
+                .await
+                .expect("load dispatched job spec");
+        assert_eq!(
+            spec["mode"], "live_plan",
+            "the dispatched step job's embedded spec must carry mode=live_plan"
+        );
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice B1a: a step-plan request executed with `mode=LiveApply` is
+    /// REJECTED, not silently downgraded — and nothing is dispatched.
+    /// `LivePlan` is now ACCEPTED for step plans (see
+    /// `multi_step_plan_live_mode_dispatches_planning_step`); only `LiveApply`
+    /// remains rejected here, since per-step LiveApply dispatch requires a
+    /// step-scoped approval grant that does not exist yet (slice B1b).
+    #[tokio::test]
+    async fn multi_step_plan_rejects_live_apply_mode() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -17639,10 +17848,10 @@ mod step_materialization_db_tests {
             id,
             &request,
             &current,
-            ryuki_protocol::JobMode::LivePlan,
+            ryuki_protocol::JobMode::LiveApply,
         )
         .await
-        .expect_err("live-plan must be rejected for a step-plan request");
+        .expect_err("live-apply must be rejected for a step-plan request");
         assert!(
             matches!(err, MaterializeError::ModeNotSupportedForStepPlan),
             "expected ModeNotSupportedForStepPlan, got {err:?}"

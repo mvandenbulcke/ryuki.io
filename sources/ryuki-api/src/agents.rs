@@ -1406,18 +1406,37 @@ async fn advance_request_out_of_executing(
 }
 
 /// Backlink an agent's terminal result onto the parent request (AWX bridge
-/// slice 2 / #42 slice 2b). When a dispatched request is still `executing`:
+/// slice 2 / #42 slice 2b, extended by slice B1a). When a dispatched request
+/// is still `executing`:
 ///
 /// - **No step plan** (`job_steps` empty): today's single-job behavior —
 ///   advance the request directly (`executing` -> `verifying` on success,
 ///   otherwise `-> failed`).
-/// - **Step plan present**: mark the step linked to this job
+/// - **Step plan present, completing job's `mode == OfflineDryRun`**:
+///   UNCHANGED #42 slice 2b behavior. Mark the step linked to this job
 ///   `Succeeded`/`Failed`. On step failure, fail the request immediately (a
 ///   partially-executed multi-step plan does not get to "succeed"). On step
 ///   success: if EVERY step is now `Succeeded`, advance the request to
 ///   `verifying`; if any OTHER step already failed, fail the request; else
 ///   the plan is mid-flight — dispatch the plan's newly-ready steps and leave
 ///   the request `executing`.
+/// - **Step plan present, completing job's `mode == LivePlan`** (#42 slice
+///   B1a — the forward per-step live path's human-gated pause point): on
+///   success, mark the step `AwaitingApproval` and record the LivePlan's
+///   `evidence_digest` onto `job_steps.live_plan_digest` — mirroring exactly
+///   how `requests_approve_live_apply` already re-derives the same field for
+///   the single-job live path. Downstream steps are NOT dispatched and the
+///   request is NOT advanced (stays `executing`): a step's LivePlan
+///   succeeding only means it is ready for an OPERATOR to review and approve
+///   its real apply (slice B1b's approval endpoint) — the plan does not
+///   progress on its own. On failure, the step fails and the request fails,
+///   exactly like the OfflineDryRun failure path (no teardown logic yet —
+///   that is slice B2).
+/// - **Step plan present, completing job's `mode == LiveApply`**: not
+///   reachable in slice B1a (no LiveApply step jobs are ever dispatched
+///   yet — slice B1b mints and dispatches those). Handled as a safe,
+///   non-panicking no-op so an unreachable branch can never crash production
+///   if hit before B1b ships.
 ///
 /// All of this runs in the SAME transaction as the job's terminal record: a
 /// request is never advanced without its follow-on jobs, nor are jobs marked
@@ -1430,10 +1449,36 @@ async fn backlink_request_execution(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: uuid::Uuid,
     status: &JobResultStatus,
+    mode: &JobMode,
     result_status_str: &str,
     evidence_digest: &str,
     job_id: uuid::Uuid,
 ) -> Result<(), sqlx::Error> {
+    let success = matches!(
+        status,
+        JobResultStatus::CheckOk
+            | JobResultStatus::Planned
+            | JobResultStatus::Applied
+            | JobResultStatus::Verified
+    );
+
+    // Lock the request's job_steps rows (if any) FIRST, in deterministic
+    // step_key order — this serializes two step-jobs of the SAME request
+    // completing concurrently (separate result POSTs / separate transactions)
+    // so readiness and completion are decided against a consistent, race-free
+    // view of the plan.
+    let plan = crate::repos::job_steps::load_plan_for_update(tx, request_id).await?;
+
+    // Read the request status/stages AFTER acquiring the plan lock, never
+    // before. A concurrent sibling step-job that FAILS this request (and sweeps
+    // this step to Failed via fail_inflight_steps) commits — releasing the lock
+    // — before we can acquire it; a status read taken BEFORE the lock could be a
+    // stale `executing` that then let this (now late) completion rewrite an
+    // already-swept step to AwaitingApproval/Succeeded under a terminal request
+    // (a TOCTOU that would silently undo the reconcile). Reading here, under the
+    // lock, sees the sibling's committed terminal status and we bail. (The
+    // empty-plan / single-job path locks no rows, but its advance is
+    // CAS-guarded on status='executing', so it is race-safe on its own.)
     let row: Option<(String, serde_json::Value)> =
         sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
             .bind(request_id)
@@ -1445,21 +1490,6 @@ async fn backlink_request_execution(
     if req_status != "executing" {
         return Ok(());
     }
-
-    let success = matches!(
-        status,
-        JobResultStatus::CheckOk
-            | JobResultStatus::Planned
-            | JobResultStatus::Applied
-            | JobResultStatus::Verified
-    );
-
-    // Lock the request's job_steps rows (if any) BEFORE branching on plan
-    // shape/status, in deterministic step_key order — this serializes two
-    // step-jobs of the SAME request completing concurrently (separate result
-    // POSTs / separate transactions) so readiness and completion are decided
-    // against a consistent, race-free view of the plan.
-    let plan = crate::repos::job_steps::load_plan_for_update(tx, request_id).await?;
 
     if plan.is_empty() {
         // Today's exact single-job path — unaffected by step-plan support.
@@ -1487,6 +1517,61 @@ async fn backlink_request_execution(
         );
         return Ok(());
     };
+
+    match mode {
+        // #42 slice B1a: a step's LivePlan completing is the forward
+        // per-step live path's human-gated pause point — success parks the
+        // step at AwaitingApproval for an operator (slice B1b's approval
+        // endpoint) rather than auto-advancing anything; failure fails the
+        // request exactly like OfflineDryRun's failure path (no teardown
+        // yet — that is slice B2).
+        JobMode::LivePlan => {
+            if !success {
+                crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
+                crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    false,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            // Success: record the plan digest and move to AwaitingApproval.
+            // Do NOT dispatch downstream steps and do NOT advance the
+            // request — it stays `executing` until an operator approves this
+            // step's live apply (slice B1b).
+            crate::repos::job_steps::record_live_plan_digest(&mut **tx, step.id, evidence_digest)
+                .await?;
+            return Ok(());
+        }
+        // Not reachable in slice B1a: no LiveApply step jobs are ever
+        // dispatched yet (that requires the slice-B1b approval endpoint to
+        // mint a step-scoped grant and dispatch the LiveApply job). Guard
+        // defensively rather than let a hypothetical future/misrouted call
+        // panic in production — log loudly and no-op, leaving the step and
+        // request untouched (the job's own terminal record is already
+        // durably written by the caller regardless of this backlink).
+        //
+        // TODO(b1b): step-scoped LiveApply result handling lands with the
+        // approval endpoint.
+        JobMode::LiveApply => {
+            tracing::warn!(
+                request_id = %request_id,
+                %job_id,
+                step_key = %step.step_key,
+                "multi-step request: unexpected LiveApply step-job completion \
+                 in slice B1a (no LiveApply step dispatch exists yet); not advancing"
+            );
+            return Ok(());
+        }
+        // #42 slice 2b: UNCHANGED existing behavior.
+        JobMode::OfflineDryRun => {}
+    }
 
     if !success {
         crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
@@ -1544,7 +1629,9 @@ async fn backlink_request_execution(
     }
 
     // Mid-flight: dispatch newly-ready steps, KEEP the request `executing`,
-    // and do NOT touch stages/status.
+    // and do NOT touch stages/status. Always OfflineDryRun here — a LivePlan
+    // step success never reaches this point (it returns early above without
+    // dispatching downstream steps).
     let current: crate::contracts::DbRequestRow = sqlx::query_as(&format!(
         "SELECT {} FROM requests WHERE id = $1",
         crate::contracts::REQUEST_COLUMNS
@@ -1553,7 +1640,14 @@ async fn backlink_request_execution(
     .fetch_one(&mut **tx)
     .await?;
     let request_model = crate::contracts::db_row_to_request(&current, &request_id.to_string());
-    crate::contracts::dispatch_ready_steps(tx, &request_model, &current, &plan2).await?;
+    crate::contracts::dispatch_ready_steps(
+        tx,
+        &request_model,
+        &current,
+        &plan2,
+        JobMode::OfflineDryRun,
+    )
+    .await?;
 
     Ok(())
 }
@@ -2068,6 +2162,7 @@ async fn post_job_result_with_pool(
             &mut tx,
             stored_spec.request_id,
             &env.status,
+            &stored_mode,
             effective_result_status,
             &env.evidence_digest,
             job_id,
@@ -10719,6 +10814,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             Uuid::new_v4(),
@@ -10757,6 +10853,7 @@ mod tests {
             &mut tx2,
             req_id,
             &JobResultStatus::Failed,
+            &JobMode::OfflineDryRun,
             "failed",
             "x",
             Uuid::new_v4(),
@@ -10807,6 +10904,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             Uuid::new_v4(),
@@ -10880,6 +10978,26 @@ mod tests {
         job_id
     }
 
+    /// #42 slice B1a: dispatch a step as a LivePlan job — mirrors
+    /// `dispatch_step_job` exactly, but inserts `mode='LivePlan'` and links
+    /// via `job_steps::mark_planning` (not `mark_running`), exactly as
+    /// `dispatch_ready_steps` would for a LivePlan-mode plan. Returns the
+    /// minted `agent_jobs.id`.
+    async fn dispatch_liveplan_step_job(pool: &PgPool, request_id: Uuid, step_id: Uuid) -> Uuid {
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LivePlan') RETURNING id",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("insert synthetic LivePlan agent_job");
+        crate::repos::job_steps::mark_planning(pool, step_id, job_id)
+            .await
+            .expect("mark_planning");
+        job_id
+    }
+
     async fn cleanup_step_2b_request(pool: &PgPool, id: Uuid) {
         sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
             .bind(id)
@@ -10933,6 +11051,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_a,
@@ -10968,6 +11087,7 @@ mod tests {
             &mut tx2,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_b,
@@ -11034,6 +11154,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Failed,
+            &JobMode::OfflineDryRun,
             "failed",
             "deadbeefdeadbeef",
             job_a,
@@ -11062,6 +11183,314 @@ mod tests {
         assert!(
             b_after.agent_job_id.is_none(),
             "b must have no dispatched agent_job"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    // ── #42 slice B1a: LivePlan step success/failure ──────────────────────
+
+    /// A step's LivePlan succeeding parks it at AwaitingApproval with its
+    /// digest recorded — it does NOT dispatch the next step and does NOT
+    /// advance the request out of `executing`. This is the forward per-step
+    /// live path's human-gated pause point (see
+    /// docs/design/live-apply-per-step.md): a downstream step's plan cannot
+    /// be computed until an operator has approved and applied this one
+    /// (slice B1b), so nothing here proceeds on its own.
+    #[tokio::test]
+    async fn db_step_liveplan_success_awaits_approval_without_dispatching() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2-step plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_liveplan_step_job(&pool, req_id, step_a.id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            &JobMode::LivePlan,
+            "planned",
+            "livedigest-a",
+            job_a,
+        )
+        .await
+        .expect("backlink a liveplan success");
+        tx.commit().await.unwrap();
+
+        let plan_after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = plan_after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = plan_after.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(
+            a_after.status, "AwaitingApproval",
+            "a's successful LivePlan parks it at AwaitingApproval"
+        );
+        assert_eq!(
+            a_after.live_plan_digest.as_deref(),
+            Some("livedigest-a"),
+            "a's live_plan_digest is recorded from the LivePlan result's evidence_digest"
+        );
+        assert_eq!(
+            b_after.status, "Pending",
+            "b must NOT be dispatched on a's LivePlan success — B1a withholds downstream dispatch"
+        );
+        assert!(
+            b_after.agent_job_id.is_none(),
+            "b must have no dispatched agent_job"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "executing",
+            "the request stays executing — a LivePlan success never advances it"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// A step's LivePlan failing fails the step and the request, exactly like
+    /// the existing OfflineDryRun failure path (no teardown logic — that is
+    /// slice B2).
+    #[tokio::test]
+    async fn db_step_liveplan_failure_fails_request() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2-step plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_liveplan_step_job(&pool, req_id, step_a.id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LivePlan,
+            "failed",
+            "livedigest-a-failed",
+            job_a,
+        )
+        .await
+        .expect("backlink a liveplan failure");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "a's LivePlan failure fails the request");
+
+        let plan_after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = plan_after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = plan_after.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_after.status, "Failed", "a marked Failed");
+        assert_eq!(
+            a_after.live_plan_digest, None,
+            "no digest is recorded on a LivePlan failure"
+        );
+        assert_eq!(
+            b_after.status, "Pending",
+            "b is NEVER dispatched once the request has failed"
+        );
+        assert!(
+            b_after.agent_job_id.is_none(),
+            "b must have no dispatched agent_job"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice B1a: when a LivePlan step fails while an INDEPENDENT sibling
+    /// step is still in-flight (`Planning`), the failing request must reconcile
+    /// that sibling to `Failed` too — not leave it stranded `Planning`. This
+    /// exercises `fail_inflight_steps` sweeping `Planning` (not just `Running`,
+    /// which was slice 2b's OfflineDryRun-only case). The current linear
+    /// offering template can't produce concurrent `Planning` steps, but the
+    /// dispatch path allows a multi-root live plan, so the reconciliation must
+    /// be correct regardless.
+    #[tokio::test]
+    async fn db_step_liveplan_failure_reconciles_planning_sibling() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        // Two INDEPENDENT roots — both are initially ready and both get a
+        // LivePlan job dispatched (status Planning).
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec![], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2 independent roots");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let step_b = plan.iter().find(|s| s.step_key == "b").expect("step b");
+        let job_a = dispatch_liveplan_step_job(&pool, req_id, step_a.id).await;
+        let _job_b = dispatch_liveplan_step_job(&pool, req_id, step_b.id).await;
+
+        // 'a' fails while 'b' is still Planning (in-flight LivePlan).
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LivePlan,
+            "failed",
+            "livedigest-a-failed",
+            job_a,
+        )
+        .await
+        .expect("backlink a liveplan failure");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "a's LivePlan failure fails the request");
+
+        let after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = after.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_after.status, "Failed", "a marked Failed");
+        assert_eq!(
+            b_after.status, "Failed",
+            "the in-flight Planning sibling b is reconciled to Failed, not stranded Planning"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice B1a (TOCTOU regression): a LivePlan step success that arrives
+    /// AFTER a concurrent sibling failure has already failed the request and
+    /// swept this step to `Failed` must NOT resurrect the step to
+    /// `AwaitingApproval`. Simulates the post-lock state the losing transaction
+    /// would observe (request already `failed`, step already `Failed`) and
+    /// asserts the backlink no-ops. Guards both fix layers: the post-lock
+    /// request-status re-read (bails on non-`executing`) and the
+    /// `record_live_plan_digest` `WHERE status = 'Planning'` predicate.
+    #[tokio::test]
+    async fn db_step_liveplan_success_under_failed_request_does_not_resurrect() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[("a", vec![], "linux-server-deployment")],
+        )
+        .await
+        .expect("seed 1-step plan");
+        drop(conn);
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan");
+        let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
+        let job_a = dispatch_liveplan_step_job(&pool, req_id, step_a.id).await;
+
+        // Simulate the race outcome the losing tx would see post-lock: a sibling
+        // failure already failed the request and swept step 'a' to Failed.
+        sqlx::query("UPDATE requests SET status = 'failed' WHERE id = $1")
+            .bind(req_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::repos::job_steps::mark_status(&pool, step_a.id, "Failed")
+            .await
+            .unwrap();
+
+        // The late LivePlan success must be a no-op — no resurrection.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            &JobMode::LivePlan,
+            "planned",
+            "late-digest",
+            job_a,
+        )
+        .await
+        .expect("backlink late liveplan success");
+        tx.commit().await.unwrap();
+
+        let after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .expect("load plan after");
+        let a_after = after.iter().find(|s| s.step_key == "a").unwrap();
+        assert_eq!(
+            a_after.status, "Failed",
+            "a late LivePlan success under a failed request must NOT resurrect the swept step"
+        );
+        assert_eq!(
+            a_after.live_plan_digest, None,
+            "no digest is recorded for a swept step"
         );
 
         cleanup_step_2b_request(&pool, req_id).await;
@@ -11110,6 +11539,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_a,
@@ -11136,6 +11566,7 @@ mod tests {
             &mut tx2,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_b,
@@ -11173,6 +11604,7 @@ mod tests {
             &mut tx3,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_c,
@@ -11208,6 +11640,7 @@ mod tests {
             &mut tx4,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             job_d,
@@ -11246,6 +11679,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "deadbeefdeadbeef",
             Uuid::new_v4(),
@@ -11310,6 +11744,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
+            &JobMode::OfflineDryRun,
             "planned",
             "b0",
             job_b,
@@ -11343,6 +11778,7 @@ mod tests {
             &mut tx,
             req_id,
             &JobResultStatus::Failed,
+            &JobMode::OfflineDryRun,
             "failed",
             "a0",
             job_a,
