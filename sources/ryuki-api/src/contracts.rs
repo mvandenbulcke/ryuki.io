@@ -17485,17 +17485,19 @@ pub(crate) async fn dispatch_ready_steps(
             ryuki_protocol::JobMode::OfflineDryRun => {
                 crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
             }
-            ryuki_protocol::JobMode::LiveApply => {
+            ryuki_protocol::JobMode::LiveApply | ryuki_protocol::JobMode::LiveDestroy => {
                 // Unreachable in practice: this fn is only ever called with
                 // OfflineDryRun (backlink mid-flight dispatch, and
                 // materialize_execution) or LivePlan (materialize_execution's
-                // initial dispatch, #42 slice B1a) — LiveApply step dispatch
-                // requires a step-scoped approval grant (slice B1b) that no
-                // caller of this fn has access to mint. Debug-assert loudly
-                // rather than silently dispatching a live-mutating step job.
+                // initial dispatch, #42 slice B1a). LiveApply step dispatch
+                // requires a step-scoped approval grant (slice B1b) minted by
+                // the approval endpoint, and LiveDestroy jobs are minted by the
+                // teardown orchestrator (slice B2-2) — neither goes through this
+                // dispatcher. Debug-assert loudly rather than silently
+                // dispatching a live-mutating step job.
                 debug_assert!(
                     false,
-                    "dispatch_ready_steps must never be called with LiveApply"
+                    "dispatch_ready_steps must never be called with a live-mutating mode"
                 );
                 crate::repos::job_steps::mark_running(&mut *tx, step.id, job_id).await?;
             }
@@ -17515,6 +17517,7 @@ fn job_mode_label(mode: &ryuki_protocol::JobMode) -> &'static str {
         ryuki_protocol::JobMode::OfflineDryRun => "OfflineDryRun",
         ryuki_protocol::JobMode::LivePlan => "LivePlan",
         ryuki_protocol::JobMode::LiveApply => "LiveApply",
+        ryuki_protocol::JobMode::LiveDestroy => "LiveDestroy",
     }
 }
 

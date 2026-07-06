@@ -1631,6 +1631,24 @@ async fn backlink_request_execution(
             .await?;
             return Ok(());
         }
+        // #42 slice B2: a step's LiveDestroy (teardown) result. The CP-side
+        // teardown ORCHESTRATION that mints these jobs and interprets their
+        // results (mark the step ToreDown on success, or halt to
+        // PartiallyAppliedNeedsOperator on a teardown failure) is slice B2-2.
+        // B2-1 only lands the protocol mode + trust gate + result verifier, and
+        // does not mint LiveDestroy jobs — so none reach this backlink yet.
+        // Guard defensively (log + no-op) rather than let a hypothetical/
+        // misrouted LiveDestroy result advance a request off the teardown path.
+        JobMode::LiveDestroy => {
+            tracing::warn!(
+                request_id = %request_id,
+                %job_id,
+                step_key = %step.step_key,
+                "multi-step request: LiveDestroy step result received but teardown \
+                 orchestration is not yet wired (#42 slice B2-2); not advancing"
+            );
+            return Ok(());
+        }
         // #42 slice 2b: UNCHANGED existing behavior.
         JobMode::OfflineDryRun => {}
     }
@@ -1987,12 +2005,20 @@ async fn post_job_result_with_pool(
     // Non-live modes (OfflineDryRun / LivePlan) must NOT carry approved_plan_digest.
     // `stored_mode` was parsed in Fix 3 above (no second parse needed).
     match stored_mode {
-        JobMode::LiveApply => {
-            // A LiveRefused result is the agent reporting it DECLINED to apply
+        JobMode::LiveApply | JobMode::LiveDestroy => {
+            // #42 B2: LiveApply and LiveDestroy share IDENTICAL grant rigor —
+            // a CP-signed, request-bound, step-bound, unexpired VerifiedLiveContext,
+            // verified here independently of the agent (defense in depth). They
+            // differ ONLY on the plan digest: LiveApply enforces plan-then-apply
+            // (the envelope digest must equal the approved plan), while LiveDestroy
+            // carries NO digest — a destroy removes the step's own applied state,
+            // so there is nothing to match.
+            let is_apply = matches!(stored_mode, JobMode::LiveApply);
+            // A LiveRefused result is the agent reporting it DECLINED to act
             // (missing/invalid grant, plan divergence, or no --allow-live). Record
             // the refusal WITHOUT the grant checks — the refusal may be BECAUSE the
             // grant was unusable, and declining is always safe (no mutation
-            // happened). It must carry no approved_plan_digest (no plan applied).
+            // happened). It must carry no approved_plan_digest (nothing applied).
             if env.status == JobResultStatus::LiveRefused {
                 if env.approved_plan_digest.is_some() {
                     return Err(bad_request(
@@ -2036,21 +2062,32 @@ async fn post_job_result_with_pool(
                 verify_vlc(&grant, &cp_vk)
                     .map_err(|_| bad_request("approval grant signature is invalid"))?;
 
-                // The agent's signed envelope MUST carry the applied plan digest.
-                let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
-                    bad_request(
-                        "LiveApply result must include approved_plan_digest in the signed envelope",
-                    )
-                })?;
-
-                // EQUALITY: the applied plan digest must match the APPROVED plan
-                // digest. The digest is a public hash (not a secret), so a plain
-                // comparison is appropriate.
-                if env_digest != grant.approved_plan_digest {
-                    return Err(bad_request(
-                        "approved_plan_digest does not match the approved grant — \
-                     refusing to record an unapproved plan",
-                    ));
+                // Plan-then-apply digest — the ONLY place LiveApply and
+                // LiveDestroy diverge:
+                if is_apply {
+                    // LiveApply: the agent's signed envelope MUST carry the
+                    // applied plan digest, and it MUST equal the APPROVED plan
+                    // digest. The digest is a public hash (not a secret), so a
+                    // plain comparison is appropriate.
+                    let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
+                        bad_request(
+                            "LiveApply result must include approved_plan_digest in the signed envelope",
+                        )
+                    })?;
+                    if env_digest != grant.approved_plan_digest {
+                        return Err(bad_request(
+                            "approved_plan_digest does not match the approved grant — \
+                         refusing to record an unapproved plan",
+                        ));
+                    }
+                } else {
+                    // LiveDestroy: no approved plan to match — the result must
+                    // NOT carry a digest at all.
+                    if env.approved_plan_digest.is_some() {
+                        return Err(bad_request(
+                            "LiveDestroy result must not include approved_plan_digest",
+                        ));
+                    }
                 }
 
                 // The grant must be for THIS job's request (defends against a grant
@@ -2062,24 +2099,31 @@ async fn post_job_result_with_pool(
                     ));
                 }
 
-                // #42 slice A: if the grant is STEP-SCOPED (step_job_id is
-                // Some), it may only be accepted for THIS specific dispatched
-                // job. This is the CP-side mirror of the agent's own gate in
-                // ryuki-agent::live::evaluate_live_execution — defense in
-                // depth, so the binding is enforced independently on both
-                // sides rather than trusting the agent alone to refuse a
-                // mismatched grant. Like the request_id check above (and
-                // unlike the expiry check below), this is an IDENTITY
-                // invariant, not a time-window concern, so it runs
-                // unconditionally — including on an idempotent replay of an
-                // already-recorded result. A `None` step_job_id is the
-                // legacy/whole-request grant and is UNCHANGED: this check is
-                // a no-op for it.
-                if let Some(bound_id) = grant.step_job_id {
-                    if bound_id != job_id {
+                // #42 slice A / B2: the grant's step binding (CP-side mirror of
+                // the agent's own gate — defense in depth). A step-scoped grant
+                // (`step_job_id: Some`) is accepted ONLY for THIS dispatched job.
+                // Like the request_id check (and unlike expiry), this is an
+                // IDENTITY invariant, enforced unconditionally including on an
+                // idempotent replay.
+                //
+                // For LiveApply a `None` (legacy whole-request) grant is allowed
+                // — UNCHANGED. For LiveDestroy a `None` grant is REJECTED: a VLC
+                // signature does not bind the grant's purpose/mode, so a valid
+                // request-scoped LiveApply grant could otherwise authorise a
+                // LiveDestroy for the same request (which has no digest gate).
+                // LiveDestroy's safety bound IS the step binding, so it must be
+                // present.
+                match grant.step_job_id {
+                    Some(bound_id) if bound_id != job_id => {
                         return Err(bad_request(
                             "approval grant is bound to a different step job",
                         ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !is_apply {
+                            return Err(bad_request("LiveDestroy requires a step-bound grant"));
+                        }
                     }
                 }
 
@@ -3962,9 +4006,10 @@ pub async fn admin_requeue_dead_lettered_job(
         .map_err(|_| conflict("job spec is malformed; cannot requeue"))?;
     match spec.mode {
         JobMode::OfflineDryRun | JobMode::LivePlan => {}
-        JobMode::LiveApply => {
+        JobMode::LiveApply | JobMode::LiveDestroy => {
             return Err(conflict(
-                "a LiveApply job cannot be requeued (it reconciles, it does not redispatch)",
+                "a live-mutating job (LiveApply/LiveDestroy) cannot be requeued \
+                 (it reconciles, it does not redispatch)",
             ));
         }
     }
@@ -4488,10 +4533,11 @@ pub async fn admin_force_fail_job(
     // (it would be a compile error here, forcing a deliberate safety decision) — codex.
     match spec.mode {
         JobMode::OfflineDryRun | JobMode::LivePlan => {}
-        JobMode::LiveApply => {
+        JobMode::LiveApply | JobMode::LiveDestroy => {
             return Err(conflict(
-                "a leased live-apply job must go through the lease-expiry / reconcile path to \
-                 protect real infrastructure; it cannot be force-failed"
+                "a leased live-mutating job (LiveApply/LiveDestroy) must go through the \
+                 lease-expiry / reconcile path to protect real infrastructure; it cannot \
+                 be force-failed"
                     .to_string(),
             ));
         }
@@ -12667,6 +12713,7 @@ mod tests {
             JobMode::OfflineDryRun => "OfflineDryRun",
             JobMode::LivePlan => "LivePlan",
             JobMode::LiveApply => "LiveApply",
+            JobMode::LiveDestroy => "LiveDestroy",
         };
         let spec = dead_letter_spec(request_id, mode);
         let spec_json = serde_json::to_value(&spec).expect("spec serialises");

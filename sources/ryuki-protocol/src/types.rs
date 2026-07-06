@@ -10,17 +10,27 @@ use uuid::Uuid;
 // Job execution mode
 // ---------------------------------------------------------------------------
 
-/// The three execution modes.  The agent MUST NOT elevate the mode on its own.
+/// The execution modes.  The agent MUST NOT elevate the mode on its own.
 ///
 /// - `OfflineDryRun` — no platform access; validate + plan without providers.
 /// - `LivePlan`     — reads live state (`terraform plan` / `ansible --check`).
 /// - `LiveApply`    — mutates.  Requires a CP-signed `VerifiedLiveContext`.
+/// - `LiveDestroy`  — DESTROYS a step's applied resources (`terraform destroy`).
+///   Requires a CP-signed, step-bound `VerifiedLiveContext`, exactly like
+///   `LiveApply`. Used only by #42's auto compensating teardown: when a step
+///   of a multi-step live request fails after earlier steps applied, the CP
+///   mints a LiveDestroy job per already-applied step (in reverse dependency
+///   order) to roll it back. Unlike `LiveApply` there is no plan-then-apply
+///   digest match — a destroy removes the step's own isolated workspace state
+///   (its bound), not a pre-approved plan; the grant's step-job binding +
+///   signature + expiry + `--allow-live` are the gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobMode {
     OfflineDryRun,
     LivePlan,
     LiveApply,
+    LiveDestroy,
 }
 
 // ---------------------------------------------------------------------------

@@ -203,7 +203,10 @@ pub fn build_signed_result(
     // LiveApply + Applied MUST carry a plan digest: the CP equality-checks it
     // against the grant's approved_plan_digest (step 8 live-apply gate).
     let envelope_plan_digest = match &job.spec.mode {
-        JobMode::OfflineDryRun | JobMode::LivePlan => {
+        // LiveDestroy carries NO approved_plan_digest (#42 B2): a destroy has no
+        // plan-then-apply match — it removes the step's own applied state — so
+        // its result must not include a digest, same as the non-apply modes.
+        JobMode::OfflineDryRun | JobMode::LivePlan | JobMode::LiveDestroy => {
             if approved_plan_digest.is_some() {
                 return Err(ResultError::PlanDigestOnNonLive {
                     mode: job.spec.mode.clone(),

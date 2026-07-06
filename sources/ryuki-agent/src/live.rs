@@ -152,7 +152,101 @@ pub fn evaluate_live_execution(
         JobMode::LiveApply => {
             evaluate_live_apply(job, cp_verifying_key, allow_live, replanned_plan_digest)
         }
+
+        // LiveDestroy also mutates (it DESTROYS the step's applied resources for
+        // #42's auto compensating teardown). It requires the SAME step-bound,
+        // CP-signed grant as LiveApply (checks 1-6), but has NO plan-then-apply
+        // digest match (check 7): a destroy removes the step's own isolated
+        // workspace state, not a pre-approved plan. `replanned_plan_digest` is
+        // therefore irrelevant here.
+        JobMode::LiveDestroy => evaluate_live_destroy(job, cp_verifying_key, allow_live),
     }
+}
+
+/// Shared grant checks for the mutating live modes (`LiveApply` /
+/// `LiveDestroy`) — checks 1-6, in strict order; the first failure returns a
+/// `Refused` decision. Returns the verified grant so the caller can apply its
+/// mode-specific final check (LiveApply's plan-then-apply digest match, check
+/// 7). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
+/// signature, request binding, step binding, and expiry.
+fn verify_live_grant<'g>(
+    job: &'g Job,
+    cp_verifying_key: &VerifyingKey,
+    allow_live: bool,
+    mode: &str,
+    require_step_bound: bool,
+) -> Result<&'g ryuki_protocol::VerifiedLiveContext, LiveDecision> {
+    // Check 1: operator must explicitly enable live execution.
+    if !allow_live {
+        return Err(LiveDecision::Refused(format!(
+            "{mode} requires --allow-live"
+        )));
+    }
+
+    // Check 2: the job MUST carry a CP-signed grant.
+    let grant = match job.live_context.as_ref() {
+        Some(g) => g,
+        None => {
+            return Err(LiveDecision::Refused(format!(
+                "{mode} requires a control-plane grant"
+            )));
+        }
+    };
+
+    // Check 3: the grant's signature must verify against the PINNED CP key.
+    // This is the agent's independent trust check — it does NOT trust the bare
+    // `mode` field or the grant fields without cryptographic proof.
+    if verify_vlc(grant, cp_verifying_key).is_err() {
+        return Err(LiveDecision::Refused(
+            "grant signature is not from the control plane".to_owned(),
+        ));
+    }
+
+    // Check 4: the grant must be for THIS job's request.
+    if grant.request_id != job.spec.request_id {
+        return Err(LiveDecision::Refused(
+            "grant is for a different request".to_owned(),
+        ));
+    }
+
+    // Check 5 (#42 slice A / B2): the grant's step binding.
+    //
+    // A step-scoped grant (`step_job_id: Some`) may only be used against the ONE
+    // dispatched step job it was minted for — closing cross-step replay (a grant
+    // for step N presented alongside step M's job) and re-dispatch replay (a
+    // re-dispatched step gets a fresh job id; a grant bound to the OLD id must
+    // not authorise it).
+    //
+    // `require_step_bound` (LiveDestroy, #42 B2) additionally REJECTS a legacy
+    // `None` grant. LiveApply tolerates `None` for backward compatibility with
+    // whole-request single-job grants — but a VLC signature does NOT bind the
+    // grant's purpose/mode, so a valid request-scoped `None` grant minted for a
+    // LiveApply could otherwise be presented against a LiveDestroy job for the
+    // same request and pass every other check (a destroy has no digest gate).
+    // LiveDestroy's safety bound IS the step binding, so an unbound grant must
+    // never authorise a destroy.
+    match grant.step_job_id {
+        Some(bound_id) if bound_id != job.id => {
+            return Err(LiveDecision::Refused(
+                "grant is bound to a different step job".to_owned(),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            if require_step_bound {
+                return Err(LiveDecision::Refused(format!(
+                    "{mode} requires a step-bound grant"
+                )));
+            }
+        }
+    }
+
+    // Check 6: the grant must not be expired.
+    if grant.expiry <= Utc::now() {
+        return Err(LiveDecision::Refused("grant has expired".to_owned()));
+    }
+
+    Ok(grant)
 }
 
 /// Inner decision function for `LiveApply` — extracted to keep the match arm
@@ -163,57 +257,12 @@ fn evaluate_live_apply(
     allow_live: bool,
     replanned_plan_digest: Option<&str>,
 ) -> LiveDecision {
-    // Check 1: operator must explicitly enable live execution.
-    if !allow_live {
-        return LiveDecision::Refused("LiveApply requires --allow-live".to_owned());
-    }
-
-    // Check 2: the job MUST carry a CP-signed grant.
-    let grant = match job.live_context.as_ref() {
-        Some(g) => g,
-        None => {
-            return LiveDecision::Refused("LiveApply requires a control-plane grant".to_owned());
-        }
+    // Checks 1-6: the shared grant rigor. LiveApply tolerates a legacy
+    // whole-request (`None`) grant, so require_step_bound = false.
+    let grant = match verify_live_grant(job, cp_verifying_key, allow_live, "LiveApply", false) {
+        Ok(g) => g,
+        Err(refused) => return refused,
     };
-
-    // Check 3: the grant's signature must verify against the PINNED CP key.
-    // This is the agent's independent trust check — it does NOT trust the bare
-    // `mode` field or the grant fields without cryptographic proof.
-    if verify_vlc(grant, cp_verifying_key).is_err() {
-        return LiveDecision::Refused("grant signature is not from the control plane".to_owned());
-    }
-
-    // Check 4: the grant must be for THIS job's request.
-    if grant.request_id != job.spec.request_id {
-        return LiveDecision::Refused("grant is for a different request".to_owned());
-    }
-
-    // Check 5 (#42 slice A): if the grant is STEP-SCOPED (step_job_id is
-    // Some), it may only be used against the ONE dispatched step job it was
-    // minted for. This closes two replay windows a whole-request grant does
-    // not defend against on its own:
-    //   - cross-step replay: a grant approved for step N's plan could
-    //     otherwise be presented alongside step M's job and would still pass
-    //     checks 1-4 (same request_id) and, if the plan digests happened to
-    //     match, check 7 too.
-    //   - re-dispatch replay: if step N's job is re-dispatched (lease expiry,
-    //     agent crash, etc.), the CP mints a NEW agent_jobs row with a NEW
-    //     job id for the same logical step. A grant bound to the OLD job id
-    //     must not authorise the NEW dispatch — re-approval is required.
-    // A `None` step_job_id is the pre-existing single-job grant and this
-    // check is a no-op for it — behaviour is completely unchanged.
-    if let Some(bound_id) = grant.step_job_id {
-        if bound_id != job.id {
-            return LiveDecision::Refused(
-                "live-apply grant is bound to a different step job".to_owned(),
-            );
-        }
-    }
-
-    // Check 6: the grant must not be expired.
-    if grant.expiry <= Utc::now() {
-        return LiveDecision::Refused("grant has expired".to_owned());
-    }
 
     // Check 7: plan-then-apply — the plan the agent just produced must match
     // the plan an operator reviewed and the CP signed off on.
@@ -228,6 +277,27 @@ fn evaluate_live_apply(
                 )
             }
         }
+    }
+}
+
+/// Inner decision function for `LiveDestroy` (#42 auto compensating teardown).
+/// Applies the SAME step-bound, CP-signed grant checks as `LiveApply` (checks
+/// 1-6 via [`verify_live_grant`]), but NOT the plan-then-apply digest match
+/// (check 7): a destroy removes the step's OWN isolated `terraform` workspace
+/// state — that isolation is the bound — rather than applying a pre-approved
+/// plan, so there is no approved-plan digest to compare against. The grant is
+/// still step-scoped (it authorises destroying exactly the resources THIS step
+/// applied), signature-verified, request-bound, and expiry-checked.
+fn evaluate_live_destroy(
+    job: &Job,
+    cp_verifying_key: &VerifyingKey,
+    allow_live: bool,
+) -> LiveDecision {
+    // require_step_bound = true: a destroy's safety bound IS the step binding,
+    // so an unbound (legacy whole-request) grant must never authorise it.
+    match verify_live_grant(job, cp_verifying_key, allow_live, "LiveDestroy", true) {
+        Ok(_) => LiveDecision::Proceed,
+        Err(refused) => refused,
     }
 }
 
@@ -605,7 +675,88 @@ mod tests {
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
-            LiveDecision::Refused("live-apply grant is bound to a different step job".to_owned()),
+            LiveDecision::Refused("grant is bound to a different step job".to_owned()),
+        );
+    }
+
+    // -- #42 slice B2-1: LiveDestroy gate -----------------------------------
+
+    /// LiveDestroy proceeds under a valid step-bound grant WITHOUT any
+    /// replanned plan digest — a destroy removes the step's own applied state,
+    /// so there is no plan-then-apply digest to match (the key difference from
+    /// LiveApply). It still requires --allow-live, a CP-signed grant, the right
+    /// request, the right step-job binding, and an unexpired grant.
+    #[test]
+    fn live_destroy_valid_step_grant_proceeds_without_digest() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), job_id);
+        let job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, Some(grant));
+
+        // No plan digest supplied — LiveDestroy must still Proceed.
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, None),
+            LiveDecision::Proceed,
+        );
+    }
+
+    /// A LiveDestroy grant bound to a DIFFERENT step job is refused (the same
+    /// step-binding rigor as LiveApply).
+    #[test]
+    fn live_destroy_step_grant_wrong_job_id_refused() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let bound = Uuid::new_v4();
+        let leased = Uuid::new_v4();
+        assert_ne!(bound, leased);
+        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), bound);
+        let job = make_job_with_id(leased, JobMode::LiveDestroy, request_id, Some(grant));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, None),
+            LiveDecision::Refused("grant is bound to a different step job".to_owned()),
+        );
+    }
+
+    /// LiveDestroy requires --allow-live.
+    #[test]
+    fn live_destroy_refused_allow_live_false() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), job_id);
+        let job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, Some(grant));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, false, None),
+            LiveDecision::Refused("LiveDestroy requires --allow-live".to_owned()),
+        );
+    }
+
+    /// SECURITY (#42 B2, Codex finding): a LiveDestroy must be refused if the
+    /// grant is UNBOUND (`step_job_id: None`, a legacy whole-request grant).
+    /// LiveApply tolerates such grants for backward compatibility, but a VLC
+    /// signature does not bind a grant's purpose/mode — so a valid request-
+    /// scoped LiveApply grant must NOT be reusable to authorise a destroy (which
+    /// has no digest gate). The step binding is LiveDestroy's safety bound.
+    #[test]
+    fn live_destroy_unbound_grant_refused() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        // make_valid_grant mints an UNBOUND grant (step_job_id: None) for the
+        // request — exactly a legacy whole-request LiveApply grant.
+        let grant = make_valid_grant(&cp_sk, request_id, &sha256_hex(b"plan"));
+        let job = make_job_with_id(
+            Uuid::new_v4(),
+            JobMode::LiveDestroy,
+            request_id,
+            Some(grant),
+        );
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, None),
+            LiveDecision::Refused("LiveDestroy requires a step-bound grant".to_owned()),
         );
     }
 

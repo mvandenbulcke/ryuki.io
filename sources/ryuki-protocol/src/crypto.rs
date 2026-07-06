@@ -160,6 +160,7 @@ fn mode_label(mode: &JobMode) -> &'static str {
         JobMode::OfflineDryRun => "offline_dry_run",
         JobMode::LivePlan => "live_plan",
         JobMode::LiveApply => "live_apply",
+        JobMode::LiveDestroy => "live_destroy",
     }
 }
 

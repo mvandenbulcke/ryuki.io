@@ -192,6 +192,21 @@ pub async fn process_job_live(
             )));
         }
 
+        // -- LiveDestroy ----------------------------------------------------
+        // #42 slice B2-1: the LiveDestroy protocol mode + trust gate
+        // (evaluate_live_destroy) are in place, but the agent's terraform-
+        // destroy EXECUTION is slice B2-3 (it needs a real provider backend to
+        // build + validate, like LiveApply's real apply). Until then, refuse
+        // cleanly so the CP records a terminal LiveRefused rather than the job
+        // sitting Running. The gate itself is unit-tested directly; the CP-side
+        // teardown orchestration that would mint these jobs is slice B2-2.
+        JobMode::LiveDestroy => {
+            let reason =
+                "LiveDestroy execution is not yet implemented on this agent (#42 slice B2-3)";
+            warn!(job_id = %job.id, "LiveDestroy received but execution is not yet wired (B2-3)");
+            build_refused_result(identity, agent_id, job, reason)?
+        }
+
         // -- LivePlan -------------------------------------------------------
         JobMode::LivePlan => {
             // Gate: allow_live only (no grant, no digest needed for plan).
@@ -666,7 +681,7 @@ pub async fn run_loop(
                     JobMode::OfflineDryRun => {
                         process_job(client, executor, identity, agent_id, outbox, &job).await
                     }
-                    JobMode::LivePlan | JobMode::LiveApply => {
+                    JobMode::LivePlan | JobMode::LiveApply | JobMode::LiveDestroy => {
                         process_job_live(
                             client,
                             live_exec,
