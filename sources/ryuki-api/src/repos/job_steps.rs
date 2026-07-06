@@ -41,34 +41,28 @@ pub struct JobStepRow {
 
 impl JobStepRow {
     /// Map this row onto the pure engine's `Step` shape for `validate_plan` /
-    /// `ready_steps`. An unrecognized `status` value (schema skew) maps
-    /// fail-safe to `Failed` — a step orchestration doesn't understand must
-    /// block its dependents rather than silently be treated as ready.
+    /// `ready_steps`. The pure engine only knows Pending/Running/Succeeded/
+    /// Failed; the live-path statuses map onto that four-state model by their
+    /// READINESS meaning:
     ///
-    /// #42 slice B1a: the new live-path statuses (`Planning`,
-    /// `AwaitingApproval`, `Applying`, `Applied`) are intentionally NOT part
-    /// of the pure engine's `StepStatus` enum and fall into this same
-    /// fail-safe-to-`Failed` arm. This is safe for THIS slice specifically
-    /// because nothing in B1a's code paths calls `ready_steps`/`validate_plan`
-    /// on a plan containing a step in one of these statuses in a way that
-    /// would incorrectly fail a healthy in-flight plan: `dispatch_ready_steps`
-    /// and `materialize_execution` only run readiness over an all-`Pending`
-    /// plan (initial dispatch) or an `OfflineDryRun` mid-flight plan
-    /// (slice 2b's backlink dispatch), and a `LivePlan` step reaching
-    /// `AwaitingApproval` never triggers a `dispatch_ready_steps` call in
-    /// B1a (downstream dispatch on LivePlan success is explicitly withheld —
-    /// see `backlink_request_execution`). NOTE FOR B1b: once the approval
-    /// endpoint needs to compute readiness over a plan that legitimately has
-    /// an `AwaitingApproval` step sitting mid-plan, mapping it to `Failed`
-    /// here would be WRONG (it would look like a terminal failure to
-    /// `ready_steps`, not a step correctly parked awaiting an operator). This
-    /// mapping will need to distinguish "in-flight-but-not-done" from
-    /// "actually failed" before B1b starts calling readiness over live plans.
+    ///   * `Applied` (a step's live apply succeeded) → `Succeeded`. This is the
+    ///     load-bearing #42 slice B1b mapping: a live-applied step is DONE, so
+    ///     `ready_steps` must let its dependents proceed. (A dependent's own
+    ///     LivePlan can only be computed once its dependency is really applied.)
+    ///   * `Planning` / `AwaitingApproval` / `Applying` → `Running`. These are
+    ///     in-flight (dispatched-but-not-done) live states: NOT ready to
+    ///     dispatch a dependent (dep isn't `Succeeded`), and NOT a terminal
+    ///     failure. `AwaitingApproval` in particular is a step correctly PARKED
+    ///     on an operator — treating it as `Failed` (the old B1a fail-safe)
+    ///     would make `ready_steps` see a healthy mid-flight plan as failed.
+    ///   * anything else, incl. `Failed` and any unrecognized/schema-skew value
+    ///     → `Failed` (fail-safe: a status the orchestration doesn't understand
+    ///     must block its dependents rather than be treated as ready).
     pub fn to_orchestration_step(&self) -> Step {
         let status = match self.status.as_str() {
             "Pending" => StepStatus::Pending,
-            "Running" => StepStatus::Running,
-            "Succeeded" => StepStatus::Succeeded,
+            "Running" | "Planning" | "AwaitingApproval" | "Applying" => StepStatus::Running,
+            "Succeeded" | "Applied" => StepStatus::Succeeded,
             _ => StepStatus::Failed,
         };
         Step {
@@ -164,6 +158,31 @@ where
     Ok(())
 }
 
+/// Approve a step's live apply: move it `AwaitingApproval -> Applying` and
+/// record the dispatched LiveApply `agent_jobs` row, guarded so it only fires
+/// for a step genuinely still `AwaitingApproval` (#42 slice B1b). Returns the
+/// number of rows affected — the approval endpoint asserts it is 1, so a
+/// concurrent second approval (whose row is no longer `AwaitingApproval`)
+/// updates zero rows and is rejected rather than minting a second grant.
+pub async fn mark_applying<'e, E>(
+    executor: E,
+    step_id: Uuid,
+    agent_job_id: Uuid,
+) -> Result<u64, sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        "UPDATE job_steps SET status = 'Applying', agent_job_id = $2, updated_at = NOW() \
+         WHERE id = $1 AND status = 'AwaitingApproval'",
+    )
+    .bind(step_id)
+    .bind(agent_job_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Record a step's successful LivePlan result: move it to `AwaitingApproval`
 /// and stamp the plan's `evidence_digest` in one statement (#42 slice B1a).
 /// This is the step-scoped analogue of what `requests_approve_live_apply`
@@ -221,6 +240,29 @@ pub async fn load_plan_for_update(
     .await
 }
 
+/// Load ONE step of a request by its `step_key`, WITH a row lock (`FOR
+/// UPDATE`). The per-step approval endpoint (#42 slice B1b) uses this to
+/// serialize concurrent approvals of the SAME step: it locks the row, checks
+/// the step is still `AwaitingApproval`, mints the grant, and flips it to
+/// `Applying` — all under this lock, so a racing second approval blocks and
+/// then sees `Applying` (no double-mint).
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn load_step_for_update(
+    executor: &mut sqlx::PgConnection,
+    request_id: Uuid,
+    step_key: &str,
+) -> Result<Option<JobStepRow>, sqlx::Error> {
+    sqlx::query_as::<_, JobStepRow>(
+        "SELECT id, request_id, step_key, depends_on, iac_ref, status, agent_job_id, live_plan_digest \
+         FROM job_steps WHERE request_id = $1 AND step_key = $2 FOR UPDATE",
+    )
+    .bind(request_id)
+    .bind(step_key)
+    .fetch_all(executor)
+    .await
+    .map(|mut v| v.pop())
+}
+
 /// Look up the step (if any) that a dispatched `agent_jobs.id` is linked to.
 /// The step-success backlink resolves this via its already-locked plan
 /// (`plan.iter().find(...)`) rather than a second query, so this is not
@@ -260,8 +302,9 @@ where
 
 /// Reconcile a failing request's plan: mark every still-in-flight step
 /// `Failed`. An in-flight step is one with a dispatched agent_job that has not
-/// yet returned a terminal result — `Running` (an OfflineDryRun step, #42 2b)
-/// OR `Planning` (a LivePlan step whose plan job is in flight, #42 B1a). Leaves
+/// yet returned a terminal result — `Running` (an OfflineDryRun step, #42 2b),
+/// `Planning` (a LivePlan step whose plan job is in flight, #42 B1a), OR
+/// `Applying` (a LiveApply step whose apply job is in flight, #42 B1b). Leaves
 /// `Pending` steps (never dispatched — honestly "never started"), `Succeeded`,
 /// `Applied`, `AwaitingApproval` (parked on an operator, no live op running),
 /// and already-`Failed` steps untouched. Returns the number of rows swept.
@@ -282,7 +325,7 @@ where
 {
     let result = sqlx::query(
         "UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
-         WHERE request_id = $1 AND status IN ('Running', 'Planning')",
+         WHERE request_id = $1 AND status IN ('Running', 'Planning', 'Applying')",
     )
     .bind(request_id)
     .execute(executor)

@@ -156,6 +156,10 @@ pub fn routes() -> Router {
             post(requests_approve_live_apply),
         )
         .route(
+            "/api/requests/{id}/steps/{step_key}/approve-live-apply",
+            post(requests_step_approve_live_apply),
+        )
+        .route(
             "/api/requests/{id}/execution-job",
             get(requests_execution_job),
         )
@@ -15792,6 +15796,193 @@ async fn requests_approve_live_apply(
     // the CP-signed grant + inserts the LiveApply job; the agent verifies the
     // grant independently before applying.
     crate::agents::approve_live_apply_with(pool, cp_key, session.user_id.as_str(), &body).await
+}
+
+/// POST /api/requests/{id}/steps/{step_key}/approve-live-apply — approve ONE
+/// step's live apply in a multi-step request (#42 live-apply slice B1b).
+///
+/// Admin-gated + site-scoped, with separation of duties: the requester may not
+/// approve their own live apply (owner decision). The step must be parked at
+/// `AwaitingApproval` (its LivePlan ran and recorded a plan digest). This mints
+/// a step-scoped, CP-signed grant bound to a fresh LiveApply job
+/// (`VerifiedLiveContext.step_job_id`, slice A) off the step's OWN recorded
+/// plan digest, flips the step `AwaitingApproval -> Applying` under a row lock
+/// (single-approval), and dispatches the LiveApply job — all in one
+/// transaction. The agent verifies the grant (step-job binding + plan-then-
+/// apply digest) before applying; the CP re-verifies on result ingest.
+async fn requests_step_approve_live_apply(
+    Path((request_id, step_key)): Path<(String, String)>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "admin") {
+        record_transition_denied(&session, &request_id, "request.step.approve-live-apply").await;
+        return Err(status_403());
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+
+    // Load the request for scope + SoD + status. Scope guard FIRST so an
+    // out-of-scope admin gets a 404 (no existence oracle) before any 409 below.
+    let current: DbRequestRow = sqlx::query_as(&format!(
+        "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+    ))
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&request_id))?;
+    scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+
+    // Separation of duties: the requester must not approve their own live apply.
+    if current.requester.as_deref() == Some(session.user_id.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "separation of duties: the requester cannot approve their own live apply"
+            })),
+        ));
+    }
+    // A step live apply only happens while the request is executing.
+    if current.status != "executing" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "request is '{}', not executing; cannot approve a step live apply",
+                    current.status
+                )
+            })),
+        ));
+    }
+    // #10: never mint a live grant for a degraded/unreachable site.
+    enforce_site_operational(pool, &current.site).await?;
+
+    let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "control plane is not configured to sign grants"})),
+        )
+    })?;
+    let request_model = db_row_to_request(&current, &request_id);
+
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // Lock the step row; it must be parked AwaitingApproval with a digest.
+    let step = crate::repos::job_steps::load_step_for_update(&mut tx, uid, &step_key)
+        .await
+        .map_err(db_error)?;
+    let Some(step) = step else {
+        tx.rollback().await.ok();
+        return Err(status_404(&format!("{request_id}/steps/{step_key}")));
+    };
+    if step.status != "AwaitingApproval" {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("step '{step_key}' is '{}', not awaiting-approval", step.status)
+            })),
+        ));
+    }
+    let Some(digest) = step.live_plan_digest.clone() else {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("step '{step_key}' has no recorded live-plan digest to approve")
+            })),
+        ));
+    };
+
+    // Build the step's LiveApply spec directly (NOT via build_step_job_spec,
+    // which deliberately clamps LiveApply -> OfflineDryRun for the dispatcher).
+    let iac_digest =
+        ryuki_runner::iac::offering_iac_digest(&step.iac_ref).unwrap_or_else(|| "0".repeat(64));
+    let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+        offering_id: &step.iac_ref,
+        request_id: &request_model.id,
+        name: &current.name,
+        site: &current.site,
+        environment: &current.environment,
+        cpu: u32::try_from(current.cpu).unwrap_or(0),
+        memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+        metadata: &request_model.metadata,
+    });
+    let spec = ryuki_protocol::JobSpec {
+        request_id: uid,
+        offering_id: Uuid::new_v4(),
+        iac_ref: step.iac_ref.clone(),
+        iac_digest,
+        vars,
+        mode: ryuki_protocol::JobMode::LiveApply,
+    };
+
+    // Mint the step-scoped CP-signed grant + LiveApply job (slice B1b-1).
+    let job_id = crate::agents::create_step_live_apply_job(
+        &mut tx,
+        uid,
+        &current.site,
+        &spec,
+        &digest,
+        session.user_id.as_str(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        cp_key,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::agents::CreateLiveApplyJobError::RequestConcluded => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "request has concluded; cannot approve a step live apply"})),
+        ),
+        crate::agents::CreateLiveApplyJobError::HasStepPlan => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "unexpected single-job guard on a step mint"})),
+        ),
+        crate::agents::CreateLiveApplyJobError::Invalid(m) => status_400(m),
+        crate::agents::CreateLiveApplyJobError::Db(err) => db_error(err),
+    })?;
+
+    // Flip AwaitingApproval -> Applying + back-link the LiveApply job, guarded
+    // on the step still being AwaitingApproval (defense-in-depth under the row
+    // lock we already hold). rows_affected != 1 means a concurrent approval won.
+    let affected = crate::repos::job_steps::mark_applying(&mut *tx, step.id, job_id)
+        .await
+        .map_err(db_error)?;
+    if affected != 1 {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("step '{step_key}' was concurrently approved")
+            })),
+        ));
+    }
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &AuditRecord {
+            action: "request.step.approve-live-apply",
+            request_id: Some(&request_id),
+            from_status: Some(&current.status),
+            to_status: &current.status,
+            from_stage: Some(&current.stage),
+            to_stage: &current.stage,
+            detail: json!({ "step_key": step_key, "agent_job_id": job_id }),
+            outcome: "approved",
+        },
+    )
+    .await
+    .map_err(db_error)?;
+
+    tx.commit().await.map_err(db_error)?;
+
+    Ok(Json(json!({
+        "request_id": request_id,
+        "step_key": step_key,
+        "agent_job_id": job_id,
+        "status": "Applying",
+        "note": "step live-apply approved; dispatched to execution agent",
+    })))
 }
 
 /// GET /api/requests/{id}/execution-job — the execution-agent job dispatched
@@ -49891,6 +50082,157 @@ mod db_lifecycle_tests {
             .await
             .ok();
         cleanup_request(pool, id).await;
+    }
+
+    /// #42 live-apply slice B1b: the per-step approval endpoint. Seeds an
+    /// executing request with a step parked at AwaitingApproval (its LivePlan
+    /// digest recorded) and asserts an admin (!= requester) approval mints a
+    /// step-scoped LiveApply job and flips the step to Applying with the job
+    /// back-linked.
+    async fn seed_b1b_step_request(pool: &PgPool, status: &str, requester: &str) -> (Uuid, Uuid) {
+        let req_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by, requester) \
+             VALUES ($1, 'server-deployment', 'executing', 'execute', 'DEFRA', 'production', 'b1b-step', 2, 4, $2, $2)",
+        )
+        .bind(req_id)
+        .bind(requester)
+        .execute(pool)
+        .await
+        .expect("seed executing request");
+        let step_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO job_steps (request_id, step_key, depends_on, iac_ref, status, live_plan_digest) \
+             VALUES ($1, 'a', '{}', 'linux-server-deployment', $2, $3) RETURNING id",
+        )
+        .bind(req_id)
+        .bind(status)
+        .bind("a".repeat(64))
+        .fetch_one(pool)
+        .await
+        .expect("seed step");
+        (req_id, step_id)
+    }
+
+    #[tokio::test]
+    async fn db_b1b_step_approve_mints_and_applies() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let (req_id, step_id) =
+            seed_b1b_step_request(pool, "AwaitingApproval", "orig-requester").await;
+
+        let admin = admin_session("step-approver");
+        let Json(resp) = requests_step_approve_live_apply(
+            Path((req_id.to_string(), "a".to_string())),
+            AuthExtractor(admin),
+        )
+        .await
+        .expect("step approval succeeds");
+        assert_eq!(resp["status"], "Applying");
+        let job_id = Uuid::parse_str(resp["agent_job_id"].as_str().unwrap()).unwrap();
+
+        // Step flipped Applying + back-linked to the minted job.
+        let (st, linked): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status, agent_job_id FROM job_steps WHERE id = $1")
+                .bind(step_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(st, "Applying");
+        assert_eq!(linked, Some(job_id));
+
+        // A step-scoped LiveApply job was minted.
+        let (mode, step_scoped): (String, bool) =
+            sqlx::query_as("SELECT mode, step_scoped FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "LiveApply");
+        assert!(step_scoped, "the minted job is step-scoped");
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(req_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(req_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, req_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_b1b_step_approve_sod_rejects_requester() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let (req_id, _step_id) =
+            seed_b1b_step_request(pool, "AwaitingApproval", "self-approver").await;
+
+        // Approver == requester -> 403 (separation of duties).
+        let Err((st, _)) = requests_step_approve_live_apply(
+            Path((req_id.to_string(), "a".to_string())),
+            AuthExtractor(admin_session("self-approver")),
+        )
+        .await
+        else {
+            panic!("expected SoD 403");
+        };
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // No LiveApply job minted.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(req_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "SoD rejection mints nothing");
+
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(req_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, req_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_b1b_step_approve_not_awaiting_rejects() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        // Step is still Planning (its LivePlan hasn't completed) -> not approvable.
+        let (req_id, _step_id) = seed_b1b_step_request(pool, "Planning", "orig-requester").await;
+
+        let Err((st, _)) = requests_step_approve_live_apply(
+            Path((req_id.to_string(), "a".to_string())),
+            AuthExtractor(admin_session("step-approver")),
+        )
+        .await
+        else {
+            panic!("expected 409 for a non-AwaitingApproval step");
+        };
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        sqlx::query("DELETE FROM job_steps WHERE request_id = $1")
+            .bind(req_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, req_id).await;
     }
 
     /// The normalized approval ledger gets exactly ONE row per approving role,

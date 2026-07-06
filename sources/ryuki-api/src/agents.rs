@@ -1550,23 +1550,85 @@ async fn backlink_request_execution(
             return Ok(());
         }
         // Not reachable in slice B1a: no LiveApply step jobs are ever
-        // dispatched yet (that requires the slice-B1b approval endpoint to
-        // mint a step-scoped grant and dispatch the LiveApply job). Guard
-        // defensively rather than let a hypothetical future/misrouted call
-        // panic in production — log loudly and no-op, leaving the step and
-        // request untouched (the job's own terminal record is already
-        // durably written by the caller regardless of this backlink).
-        //
-        // TODO(b1b): step-scoped LiveApply result handling lands with the
-        // approval endpoint.
+        // #42 slice B1b: a step's LiveApply result (its real infrastructure
+        // apply). On success the step is `Applied`; when every step is applied
+        // the request advances to `verifying`, otherwise the steps this apply
+        // just unblocked are dispatched as LivePlan (each parks at
+        // AwaitingApproval for its own per-step operator approval). On failure
+        // the step and request fail. (Auto compensating teardown of
+        // already-applied steps is slice B2 — deliberately NOT here; B1b fails
+        // the request like every other failure path, leaving applied steps for
+        // the operator until the teardown state machine is approved.)
         JobMode::LiveApply => {
-            tracing::warn!(
-                request_id = %request_id,
-                %job_id,
-                step_key = %step.step_key,
-                "multi-step request: unexpected LiveApply step-job completion \
-                 in slice B1a (no LiveApply step dispatch exists yet); not advancing"
-            );
+            if !success {
+                crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
+                crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    false,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            crate::repos::job_steps::mark_status(&mut **tx, step.id, "Applied").await?;
+            let plan2 = crate::repos::job_steps::load_plan(&mut **tx, request_id).await?;
+
+            if plan2.iter().any(|s| s.status == "Failed") {
+                crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    false,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            if plan2
+                .iter()
+                .all(|s| s.status == "Applied" || s.status == "Succeeded")
+            {
+                // Every step has landed — the whole live plan is applied.
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    true,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            // Mid-flight: dispatch the newly-ready steps as LivePlan (they will
+            // each park at AwaitingApproval for their own approval). Keep the
+            // request `executing`; do NOT touch stages/status.
+            let current: crate::contracts::DbRequestRow = sqlx::query_as(&format!(
+                "SELECT {} FROM requests WHERE id = $1",
+                crate::contracts::REQUEST_COLUMNS
+            ))
+            .bind(request_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            let request_model =
+                crate::contracts::db_row_to_request(&current, &request_id.to_string());
+            crate::contracts::dispatch_ready_steps(
+                tx,
+                &request_model,
+                &current,
+                &plan2,
+                JobMode::LivePlan,
+            )
+            .await?;
             return Ok(());
         }
         // #42 slice 2b: UNCHANGED existing behavior.
@@ -11745,6 +11807,217 @@ mod tests {
         assert_eq!(
             a_after.live_plan_digest, None,
             "no digest is recorded for a swept step"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice B1b: the forward live chain through the backlink. Chain a->b,
+    /// both applied one at a time: completing a's LiveApply marks a `Applied`
+    /// and dispatches b as `LivePlan` (b parks for its own approval), keeping
+    /// the request executing; completing b's LiveApply (once dispatched) marks
+    /// b `Applied` and — all steps now applied — advances the request to
+    /// `verifying`.
+    #[tokio::test]
+    async fn db_step_liveapply_success_applies_and_chains_to_verifying() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed a->b chain");
+        drop(conn);
+
+        // 'a' has been approved and is Applying with a dispatched LiveApply job.
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        let step_a = plan.iter().find(|s| s.step_key == "a").unwrap();
+        let job_a: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE id = $1")
+            .bind(step_a.id)
+            .bind(job_a)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // a's LiveApply succeeds -> a Applied, b dispatched as LivePlan, still executing.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Applied,
+            &JobMode::LiveApply,
+            "applied",
+            "a-applied-digest",
+            job_a,
+        )
+        .await
+        .expect("backlink a liveapply");
+        tx.commit().await.unwrap();
+
+        let mid = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        let a_mid = mid.iter().find(|s| s.step_key == "a").unwrap();
+        let b_mid = mid.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_mid.status, "Applied", "a is applied");
+        assert_eq!(
+            b_mid.status, "Planning",
+            "b dispatched as LivePlan after a applied"
+        );
+        let status_mid: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status_mid, "executing", "request stays executing mid-chain");
+
+        // b's LivePlan -> AwaitingApproval, then approved -> Applying, then LiveApply -> Applied.
+        let job_b: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE step_key = 'b' AND request_id = $1")
+            .bind(req_id)
+            .bind(job_b)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Applied,
+            &JobMode::LiveApply,
+            "applied",
+            "b-applied-digest",
+            job_b,
+        )
+        .await
+        .expect("backlink b liveapply");
+        tx.commit().await.unwrap();
+
+        let status_final: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_final, "verifying",
+            "all steps applied -> request advances to verifying"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 slice B1b (Codex finding): when a LiveApply step fails while an
+    /// INDEPENDENT sibling is still `Applying` (its live apply in flight), the
+    /// failing request must reconcile that sibling to `Failed` too — not leave
+    /// it stranded `Applying`. Exercises `fail_inflight_steps` sweeping
+    /// `Applying` (the B1b in-flight live-apply state), the analogue of the
+    /// `Planning` sweep for LivePlan.
+    #[tokio::test]
+    async fn db_step_liveapply_failure_reconciles_applying_sibling() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec![], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed 2 independent roots");
+        drop(conn);
+
+        // Both roots have been approved and are Applying (LiveApply in flight).
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        let step_a = plan.iter().find(|s| s.step_key == "a").unwrap();
+        let step_b = plan.iter().find(|s| s.step_key == "b").unwrap();
+        let mut job_ids = Vec::new();
+        for step in [step_a, step_b] {
+            let jid: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+                 VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+            )
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 WHERE id = $1",
+            )
+            .bind(step.id)
+            .bind(jid)
+            .execute(&pool)
+            .await
+            .unwrap();
+            job_ids.push(jid);
+        }
+
+        // a's LiveApply fails while b is still Applying.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveApply,
+            "failed",
+            "a-apply-failed",
+            job_ids[0],
+        )
+        .await
+        .expect("backlink a liveapply failure");
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "a's live-apply failure fails the request");
+        let after = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        let a_after = after.iter().find(|s| s.step_key == "a").unwrap();
+        let b_after = after.iter().find(|s| s.step_key == "b").unwrap();
+        assert_eq!(a_after.status, "Failed", "a marked Failed");
+        assert_eq!(
+            b_after.status, "Failed",
+            "the in-flight Applying sibling b is reconciled to Failed, not stranded"
         );
 
         cleanup_step_2b_request(&pool, req_id).await;
