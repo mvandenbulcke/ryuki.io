@@ -1067,6 +1067,7 @@ mod tests {
             approved_plan_digest: approved_plan_digest.to_owned(),
             approver: "ops-test".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
+            step_job_id: None,
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
