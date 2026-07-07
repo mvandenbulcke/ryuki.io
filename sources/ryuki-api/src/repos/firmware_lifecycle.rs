@@ -121,23 +121,50 @@ impl FirmwareExceptionRow {
 
 // ─── Read functions ───────────────────────────────────────────────────────────
 
-/// List all firmware records, optionally filtered by site.
-pub async fn list_devices(pool: &PgPool, site: &str) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
+/// List firmware records (optionally site-filtered), bounded to one
+/// `LIMIT`/`OFFSET` page (#14). `ORDER BY id` is a unique key, so the page is a
+/// stable cut.
+pub async fn list_devices(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
     let rows: Vec<FirmwareRecordRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {RECORD_COLUMNS} FROM firmware_records ORDER BY id"
+            "SELECT {RECORD_COLUMNS} FROM firmware_records ORDER BY id LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {RECORD_COLUMNS} FROM firmware_records WHERE site = $1 ORDER BY id"
+            "SELECT {RECORD_COLUMNS} FROM firmware_records \
+             WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count firmware records (optionally site-filtered) — the pagination total for
+/// [`list_devices`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count_devices(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM firmware_records")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM firmware_records WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Get a single firmware record by TEXT id. Returns `Ok(None)` when absent.
@@ -390,8 +417,26 @@ mod firmware_lifecycle_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let devices = list_devices(&pool, "").await.expect("list_devices failed");
+        let devices = list_devices(&pool, "", 1000, 0)
+            .await
+            .expect("list_devices failed");
         assert_eq!(devices.len(), 9, "migration 071 seeds 9 firmware records");
+        assert_eq!(
+            count_devices(&pool, "").await.expect("count_devices"),
+            9,
+            "#14: count_devices matches the full unpaged set"
+        );
+
+        // #14 pagination: LIMIT bounds the page and OFFSET advances it; the
+        // `ORDER BY id` tie-breaker keeps the two pages disjoint and stable.
+        let page1 = list_devices(&pool, "", 4, 0).await.expect("page1");
+        let page2 = list_devices(&pool, "", 4, 4).await.expect("page2");
+        assert_eq!(page1.len(), 4, "LIMIT 4 bounds the first page");
+        assert_eq!(page2.len(), 4, "second full page of 4 (9 seeded)");
+        assert!(
+            page1.iter().all(|d| page2.iter().all(|e| e.id != d.id)),
+            "offset page is disjoint from the first (stable id order)"
+        );
     }
 
     #[tokio::test]

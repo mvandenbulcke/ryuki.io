@@ -30752,6 +30752,9 @@ async fn runbook_contract() -> Json<Value> {
 #[allow(dead_code)]
 struct FirmwareDeviceQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30771,15 +30774,24 @@ async fn firmware_devices_list(
     // #2: scoped-site read ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
     let site = site_scoped.as_str();
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = params.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
     match get_db() {
         Some(pool) => {
-            let devices = crate::repos::firmware_lifecycle::list_devices(pool, site)
+            let devices = crate::repos::firmware_lifecycle::list_devices(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?;
+            let total = crate::repos::firmware_lifecycle::count_devices(pool, site)
                 .await
                 .map_err(db_error)?;
             Ok(Json(json!({
                 "source": "live",
                 "site": if site.is_empty() { Value::Null } else { json!(site) },
                 "count": devices.len(),
+                "total": total,
+                "limit": limit,
+                "offset": offset,
                 "devices": devices
             })))
         }
@@ -30787,6 +30799,9 @@ async fn firmware_devices_list(
             "source": "dry-run",
             "site": if site.is_empty() { Value::Null } else { json!(site) },
             "count": 0,
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
             "devices": []
         }))),
     }
@@ -33556,6 +33571,9 @@ async fn firewall_contract() -> Json<Value> {
 #[allow(dead_code)]
 struct StorageSiteQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -33589,6 +33607,17 @@ struct StorageCapacityRequest {
     requested_gb: u64,
 }
 
+/// #14: inject pagination metadata — `total` (full filtered count) plus the
+/// echoed `limit`/`offset` — into a list response object produced by a pure
+/// engine formatter. No-op if `resp` is not a JSON object.
+fn add_page_meta(resp: &mut Value, total: i64, limit: i64, offset: i64) {
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("total".into(), json!(total));
+        obj.insert("limit".into(), json!(limit));
+        obj.insert("offset".into(), json!(offset));
+    }
+}
+
 async fn storage_volumes_list(
     AuthExtractor(session): AuthExtractor,
     Query(q): Query<StorageSiteQuery>,
@@ -33596,15 +33625,23 @@ async fn storage_volumes_list(
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let volumes = match get_db() {
-        Some(pool) => crate::repos::storage_provisioning::list_volumes(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (volumes, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::storage_provisioning::list_volumes(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::storage_provisioning::count_volumes(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    Ok(Json(ryuki_engine::storage_provisioning::list_volumes(
-        site, &volumes,
-    )))
+    let mut resp = ryuki_engine::storage_provisioning::list_volumes(site, &volumes);
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 async fn storage_volume_provision(
     AuthExtractor(session): AuthExtractor,
@@ -33809,15 +33846,23 @@ async fn storage_arrays_list(
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let arrays = match get_db() {
-        Some(pool) => crate::repos::storage_provisioning::list_arrays(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (arrays, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::storage_provisioning::list_arrays(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::storage_provisioning::count_arrays(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    Ok(Json(ryuki_engine::storage_provisioning::list_arrays(
-        site, &arrays,
-    )))
+    let mut resp = ryuki_engine::storage_provisioning::list_arrays(site, &arrays);
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 async fn storage_array_get(
     AuthExtractor(session): AuthExtractor,
@@ -42477,6 +42522,8 @@ mod unit_tests {
             AuthExtractor(scoped_session(&["GBLON"], &[])),
             Query(StorageSiteQuery {
                 site: Some("DEFRA".into()),
+                limit: None,
+                offset: None,
             }),
         )
         .await
@@ -42487,7 +42534,11 @@ mod unit_tests {
         // environment-scoped principal is denied (these lists are site-only).
         let err = storage_volumes_list(
             AuthExtractor(scoped_session(&[], &["production"])),
-            Query(StorageSiteQuery { site: None }),
+            Query(StorageSiteQuery {
+                site: None,
+                limit: None,
+                offset: None,
+            }),
         )
         .await
         .expect_err("an environment-scoped principal must be 403");

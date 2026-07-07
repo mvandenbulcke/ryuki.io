@@ -195,22 +195,49 @@ pub enum ExtendOutcome {
 
 // ─── Read functions ───────────────────────────────────────────────────────────
 
-pub async fn list_volumes(pool: &PgPool, site: &str) -> Result<Vec<StorageVolume>, sqlx::Error> {
+/// List volumes (optionally site-filtered), bounded to one `LIMIT`/`OFFSET`
+/// page (#14). `ORDER BY id` is a unique key, so the page is a stable cut.
+pub async fn list_volumes(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<StorageVolume>, sqlx::Error> {
     let rows: Vec<StorageVolumeRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {VOLUME_COLUMNS} FROM storage_volumes ORDER BY id"
+            "SELECT {VOLUME_COLUMNS} FROM storage_volumes ORDER BY id LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {VOLUME_COLUMNS} FROM storage_volumes WHERE site = $1 ORDER BY id"
+            "SELECT {VOLUME_COLUMNS} FROM storage_volumes \
+             WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count volumes (optionally site-filtered) — the pagination total for
+/// [`list_volumes`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count_volumes(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage_volumes")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage_volumes WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 pub async fn get_volume(pool: &PgPool, id: &str) -> Result<Option<StorageVolume>, sqlx::Error> {
@@ -223,22 +250,49 @@ pub async fn get_volume(pool: &PgPool, id: &str) -> Result<Option<StorageVolume>
     row.map(|r| r.into_model()).transpose()
 }
 
-pub async fn list_arrays(pool: &PgPool, site: &str) -> Result<Vec<StorageArray>, sqlx::Error> {
+/// List arrays (optionally site-filtered), bounded to one `LIMIT`/`OFFSET`
+/// page (#14). `ORDER BY id` is a unique key, so the page is a stable cut.
+pub async fn list_arrays(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<StorageArray>, sqlx::Error> {
     let rows: Vec<StorageArrayRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {ARRAY_COLUMNS} FROM storage_arrays ORDER BY id"
+            "SELECT {ARRAY_COLUMNS} FROM storage_arrays ORDER BY id LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {ARRAY_COLUMNS} FROM storage_arrays WHERE site = $1 ORDER BY id"
+            "SELECT {ARRAY_COLUMNS} FROM storage_arrays \
+             WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count arrays (optionally site-filtered) — the pagination total for
+/// [`list_arrays`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count_arrays(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage_arrays")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage_arrays WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 pub async fn get_array(pool: &PgPool, id: &str) -> Result<Option<StorageArray>, sqlx::Error> {
@@ -642,15 +696,36 @@ mod storage_provisioning_db_tests {
         let Some(db) = test_pool().await else {
             return;
         };
-        let all = list_volumes(&db, "")
+        let all = list_volumes(&db, "", 1000, 0)
             .await
             .expect("list_volumes all failed");
         assert!(all.len() >= 6, "migration 080 seeds 6 volumes");
+        assert_eq!(
+            count_volumes(&db, "").await.expect("count_volumes all"),
+            all.len() as i64,
+            "#14: count_volumes matches the full unpaged set"
+        );
 
-        let defra = list_volumes(&db, "DEFRA")
+        let defra = list_volumes(&db, "DEFRA", 1000, 0)
             .await
             .expect("list_volumes DEFRA failed");
         assert_eq!(defra.len(), 2, "DEFRA has 2 seeded volumes");
+        assert_eq!(
+            count_volumes(&db, "DEFRA").await.expect("count_volumes DEFRA"),
+            2,
+            "#14: site-filtered count matches the site page"
+        );
+
+        // #14 pagination: LIMIT bounds the page; OFFSET advances it; the
+        // `ORDER BY id` tie-breaker makes the two pages disjoint and stable.
+        let page1 = list_volumes(&db, "", 3, 0).await.expect("page1");
+        let page2 = list_volumes(&db, "", 3, 3).await.expect("page2");
+        assert_eq!(page1.len(), 3, "LIMIT 3 bounds the first page");
+        assert!(!page2.is_empty() && page2.len() <= 3, "second page continues");
+        assert!(
+            page1.iter().all(|v| page2.iter().all(|w| w.id != v.id)),
+            "offset page is disjoint from the first (stable id order)"
+        );
     }
 
     #[tokio::test]
@@ -678,13 +753,27 @@ mod storage_provisioning_db_tests {
         let Some(db) = test_pool().await else {
             return;
         };
-        let all = list_arrays(&db, "").await.expect("list_arrays all failed");
+        let all = list_arrays(&db, "", 1000, 0)
+            .await
+            .expect("list_arrays all failed");
         assert!(all.len() >= 3, "migration 080 seeds 3 arrays");
+        assert_eq!(
+            count_arrays(&db, "").await.expect("count_arrays all"),
+            all.len() as i64,
+            "#14: count_arrays matches the full unpaged set"
+        );
 
-        let gblon = list_arrays(&db, "GBLON")
+        let gblon = list_arrays(&db, "GBLON", 1000, 0)
             .await
             .expect("list_arrays GBLON failed");
         assert_eq!(gblon.len(), 1, "GBLON has 1 seeded array");
+
+        // #14 pagination: a LIMIT-1 page returns one row and OFFSET advances.
+        let a0 = list_arrays(&db, "", 1, 0).await.expect("array page0");
+        let a1 = list_arrays(&db, "", 1, 1).await.expect("array page1");
+        assert_eq!(a0.len(), 1, "LIMIT 1 bounds the page");
+        assert_eq!(a1.len(), 1, "OFFSET 1 still returns a row (>=3 seeded)");
+        assert_ne!(a0[0].id, a1[0].id, "offset advances past the first row");
     }
 
     #[tokio::test]
