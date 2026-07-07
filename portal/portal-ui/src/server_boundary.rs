@@ -1,3 +1,11 @@
+// This module is the portal's server-fn boundary. Leptos `#[server]` macros expand
+// into functions whose signatures a fn-level `#[allow]` cannot reach (the lint fires
+// on the macro-generated code, so an attribute placed either before or after the
+// `#[server]` attribute is ineffective). Suppress `too_many_arguments` module-wide:
+// these server fns legitimately mirror multi-field query/form inputs (e.g. a paginated
+// list endpoint's filter set), and the arg count is inherent to the HTTP contract.
+#![allow(clippy::too_many_arguments)]
+
 use crate::api::{
     activity_audit_feed_path, activity_operation_queue_path, admin_agents_path,
     admin_feature_flag_governance_path, admin_platform_settings_path,
@@ -2306,7 +2314,6 @@ fn paginate_in_memory(full: Vec<RequestSummary>, offset: u32, page_size: u32) ->
 /// appended only after validation and carries solely allowlist-validated keys
 /// and percent-encoded values (see `RequestListQuery::to_query_string`), so no
 /// caller input ever reaches the upstream unescaped.
-#[allow(clippy::too_many_arguments)]
 #[server(prefix = "/portal/api", endpoint = "request-list-data")]
 pub async fn get_request_list(
     status: Option<String>,
