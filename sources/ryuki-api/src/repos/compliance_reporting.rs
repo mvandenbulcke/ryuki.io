@@ -549,15 +549,21 @@ pub async fn list_findings(
     pool: &PgPool,
     site: &str,
     severity: &str,
+    limit: i64,
+    offset: i64,
 ) -> Result<Vec<Value>, sqlx::Error> {
-    // JOIN findings with reports to include site/framework_id context.
+    // JOIN findings with reports to include site/framework_id context. Bounded to
+    // one LIMIT/OFFSET page (#14); `ORDER BY f.id` is the finding PK, a unique
+    // tie-breaker, so paging is stable.
     let rows: Vec<FindingRow> = match (site.is_empty(), severity.is_empty()) {
         (true, true) => sqlx::query_as(
             "SELECT f.id, f.report_id, f.control_id, f.severity, f.description, f.remediation, f.status \
              FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
-             ORDER BY f.id",
+             ORDER BY f.id LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?,
         (false, true) => sqlx::query_as(
@@ -565,9 +571,11 @@ pub async fn list_findings(
              FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE r.site = $1 \
-             ORDER BY f.id",
+             ORDER BY f.id LIMIT $2 OFFSET $3",
         )
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?,
         (true, false) => sqlx::query_as(
@@ -575,9 +583,11 @@ pub async fn list_findings(
              FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE f.severity = $1 \
-             ORDER BY f.id",
+             ORDER BY f.id LIMIT $2 OFFSET $3",
         )
         .bind(severity)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?,
         (false, false) => sqlx::query_as(
@@ -585,10 +595,12 @@ pub async fn list_findings(
              FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE r.site = $1 AND f.severity = $2 \
-             ORDER BY f.id",
+             ORDER BY f.id LIMIT $3 OFFSET $4",
         )
         .bind(site)
         .bind(severity)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?,
     };
@@ -635,6 +647,46 @@ pub async fn list_findings(
     }
 
     Ok(result)
+}
+
+/// Count findings (optionally site/severity-filtered) — the pagination total for
+/// [`list_findings`], using the SAME JOIN + `WHERE` so the count matches the
+/// paged set.
+pub async fn count_findings(pool: &PgPool, site: &str, severity: &str) -> Result<i64, sqlx::Error> {
+    let count: i64 = match (site.is_empty(), severity.is_empty()) {
+        (true, true) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compliance_findings f \
+             JOIN compliance_reports r ON r.id = f.report_id",
+        )
+        .fetch_one(pool)
+        .await?,
+        (false, true) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compliance_findings f \
+             JOIN compliance_reports r ON r.id = f.report_id \
+             WHERE r.site = $1",
+        )
+        .bind(site)
+        .fetch_one(pool)
+        .await?,
+        (true, false) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compliance_findings f \
+             JOIN compliance_reports r ON r.id = f.report_id \
+             WHERE f.severity = $1",
+        )
+        .bind(severity)
+        .fetch_one(pool)
+        .await?,
+        (false, false) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compliance_findings f \
+             JOIN compliance_reports r ON r.id = f.report_id \
+             WHERE r.site = $1 AND f.severity = $2",
+        )
+        .bind(site)
+        .bind(severity)
+        .fetch_one(pool)
+        .await?,
+    };
+    Ok(count)
 }
 
 /// Atomically resolve a finding — UPDATE...RETURNING.
@@ -978,6 +1030,54 @@ mod compliance_reporting_db_tests {
             r.findings.len() >= 2,
             "expected >=2 findings on cr-defra-pci-001, got {}",
             r.findings.len()
+        );
+    }
+
+    /// #14 pagination: `list_findings` bounds to a LIMIT/OFFSET page over the
+    /// findings-JOIN-reports query, `count_findings` returns the full filtered
+    /// total (SAME JOIN + WHERE), and the unique `ORDER BY f.id` keeps offset
+    /// pages disjoint.
+    #[tokio::test]
+    async fn test_list_findings_pagination() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let total = count_findings(&pool, "", "").await.expect("count_findings");
+        let all = list_findings(&pool, "", "", 1000, 0)
+            .await
+            .expect("list_findings all");
+        assert_eq!(
+            all.len() as i64,
+            total,
+            "#14: count_findings matches the full unpaged set"
+        );
+        assert!(total >= 3, "expected >=3 seeded findings, got {total}");
+
+        // LIMIT bounds the page; OFFSET advances it disjointly (stable f.id).
+        let page1 = list_findings(&pool, "", "", 2, 0)
+            .await
+            .expect("findings page1");
+        let page2 = list_findings(&pool, "", "", 2, 2)
+            .await
+            .expect("findings page2");
+        assert_eq!(page1.len(), 2, "LIMIT 2 bounds the first page");
+        assert!(!page2.is_empty(), "second page continues (>=3 findings)");
+        assert!(
+            page2.iter().all(|v| !page1.contains(v)),
+            "offset page is disjoint from the first (stable f.id order)"
+        );
+
+        // count is filtered by the SAME site predicate as the page.
+        let defra_total = count_findings(&pool, "DEFRA", "")
+            .await
+            .expect("count DEFRA");
+        let defra = list_findings(&pool, "DEFRA", "", 1000, 0)
+            .await
+            .expect("list DEFRA");
+        assert_eq!(
+            defra.len() as i64,
+            defra_total,
+            "#14: site-filtered count matches the site page"
         );
     }
 

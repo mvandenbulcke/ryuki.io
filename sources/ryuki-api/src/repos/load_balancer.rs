@@ -222,22 +222,44 @@ pub async fn load_pool_with_members_pub(
 pub async fn list_virtual_servers(
     pool: &PgPool,
     site: &str,
+    limit: i64,
+    offset: i64,
 ) -> Result<Vec<LbVirtualServer>, sqlx::Error> {
     let rows: Vec<LbVirtualServerRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {VS_COLUMNS} FROM lb_virtual_servers ORDER BY id"
+            "SELECT {VS_COLUMNS} FROM lb_virtual_servers ORDER BY id LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {VS_COLUMNS} FROM lb_virtual_servers WHERE site = $1 ORDER BY id"
+            "SELECT {VS_COLUMNS} FROM lb_virtual_servers \
+             WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count virtual servers (optionally site-filtered) — the pagination total for
+/// [`list_virtual_servers`], using the SAME `WHERE` so it matches the page.
+pub async fn count_virtual_servers(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM lb_virtual_servers")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM lb_virtual_servers WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Get a single virtual server by id. Returns Ok(None) when absent.
@@ -643,16 +665,32 @@ mod load_balancer_db_tests {
             return;
         };
         // All sites
-        let vss = list_virtual_servers(&db, "")
+        let vss = list_virtual_servers(&db, "", 1000, 0)
             .await
             .expect("list_virtual_servers failed");
         assert!(vss.len() >= 4, "migration 072 seeds 4 virtual servers");
+        assert_eq!(
+            count_virtual_servers(&db, "").await.expect("count_vs all"),
+            vss.len() as i64,
+            "#14: count_virtual_servers matches the full unpaged set"
+        );
 
         // Filtered by DEFRA
-        let defra = list_virtual_servers(&db, "DEFRA")
+        let defra = list_virtual_servers(&db, "DEFRA", 1000, 0)
             .await
             .expect("list_virtual_servers DEFRA failed");
         assert_eq!(defra.len(), 2, "DEFRA has 2 seeded virtual servers");
+
+        // #14 pagination: LIMIT bounds the page; OFFSET advances it disjointly
+        // under the unique `ORDER BY id`.
+        let page1 = list_virtual_servers(&db, "", 2, 0).await.expect("vs page1");
+        let page2 = list_virtual_servers(&db, "", 2, 2).await.expect("vs page2");
+        assert_eq!(page1.len(), 2, "LIMIT 2 bounds the first page");
+        assert!(!page2.is_empty(), "second page continues (>=4 seeded)");
+        assert!(
+            page1.iter().all(|v| page2.iter().all(|w| w.id != v.id)),
+            "offset page is disjoint from the first (stable id order)"
+        );
 
         // Members aggregated: get one VS with pool to verify member count
         let (vs, pool) = get_virtual_server_with_pool(&db, "vs-defra-web")

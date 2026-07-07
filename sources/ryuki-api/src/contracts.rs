@@ -33571,7 +33571,15 @@ async fn firewall_contract() -> Json<Value> {
 #[allow(dead_code)]
 struct StorageSiteQuery {
     site: Option<String>,
-    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+}
+
+/// #14: the LIST endpoints' query — site + pagination. Kept SEPARATE from the
+/// site-only `StorageSiteQuery` so the non-list storage handler that shares it
+/// doesn't start rejecting a malformed `?limit=` it never used.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct StorageListQuery {
+    site: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -33620,7 +33628,7 @@ fn add_page_meta(resp: &mut Value, total: i64, limit: i64, offset: i64) {
 
 async fn storage_volumes_list(
     AuthExtractor(session): AuthExtractor,
-    Query(q): Query<StorageSiteQuery>,
+    Query(q): Query<StorageListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
@@ -33841,7 +33849,7 @@ async fn storage_volume_retire(
 }
 async fn storage_arrays_list(
     AuthExtractor(session): AuthExtractor,
-    Query(q): Query<StorageSiteQuery>,
+    Query(q): Query<StorageListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
@@ -34121,6 +34129,17 @@ async fn storage_contract() -> Json<Value> {
 struct K8sSiteQuery {
     site: Option<String>,
 }
+
+/// #14: the LIST endpoint's query — site + pagination. Kept SEPARATE from the
+/// site-only `K8sSiteQuery` so the aggregate handlers (cluster utilization, k8s
+/// summary) don't start rejecting a malformed `?limit=` they never used.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct K8sListQuery {
+    site: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct K8sProvisionRequest {
@@ -34148,21 +34167,28 @@ struct K8sValidateRequest {
 
 async fn k8s_namespaces_list(
     AuthExtractor(session): AuthExtractor,
-    Query(q): Query<K8sSiteQuery>,
+    Query(q): Query<K8sListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let namespaces = match get_db() {
-        Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (namespaces, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::container_namespace::list_namespaces_page(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::container_namespace::count_namespaces(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    Ok(Json(container_namespace::list_namespaces(
-        site,
-        &namespaces,
-    )))
+    let mut resp = container_namespace::list_namespaces(site, &namespaces);
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 async fn k8s_namespace_provision(
     AuthExtractor(session): AuthExtractor,
@@ -34994,6 +35020,9 @@ struct ComplianceReportGenerateRequest {
 struct ComplianceFindingsQuery {
     site: Option<String>,
     severity: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -35242,21 +35271,31 @@ async fn compliance_findings_list(
     if !severity.is_empty() {
         compliance_reporting::parse_severity(severity).map_err(|e| status_400(&e))?;
     }
-    let findings = match get_db() {
-        Some(pool) => crate::repos::compliance_reporting::list_findings(pool, site, severity)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (findings, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::compliance_reporting::list_findings(pool, site, severity, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::compliance_reporting::count_findings(pool, site, severity)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    let source = if findings.is_empty() {
-        "static-seed"
-    } else {
-        "db"
-    };
+    // Source reflects whether the DB holds matching findings at all (total),
+    // NOT just this page — an out-of-range page on real data is still "db".
+    let source = if total > 0 { "db" } else { "static-seed" };
     Ok(Json(json!({
         "source": source,
         "site": site,
         "severity": severity,
+        "count": findings.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "findings": findings
     })))
 }
@@ -36432,6 +36471,17 @@ async fn secrets_contract() -> Json<Value> {
 struct LbSiteQuery {
     site: Option<String>,
 }
+
+/// #14: the LIST endpoint's query — site + pagination. Kept SEPARATE from the
+/// site-only `LbSiteQuery` so `lb_status` doesn't start rejecting a malformed
+/// `?limit=` it never used.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LbListQuery {
+    site: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LbProvisionRequest {
@@ -36460,20 +36510,29 @@ struct LbValidateVipRequest {
 
 async fn lb_vs_list(
     AuthExtractor(session): AuthExtractor,
-    Query(q): Query<LbSiteQuery>,
+    Query(q): Query<LbListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let vss = match get_db() {
-        Some(pool) => crate::repos::load_balancer::list_virtual_servers(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => vec![],
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (vss, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::load_balancer::list_virtual_servers(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::load_balancer::count_virtual_servers(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    load_balancer::list_virtual_servers(site, &vss)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let mut resp = load_balancer::list_virtual_servers(site, &vss)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 async fn lb_provision(
     AuthExtractor(session): AuthExtractor,
@@ -42520,7 +42579,7 @@ mod unit_tests {
         // representative (all 9 share enforce_site_scope).
         let err = storage_volumes_list(
             AuthExtractor(scoped_session(&["GBLON"], &[])),
-            Query(StorageSiteQuery {
+            Query(StorageListQuery {
                 site: Some("DEFRA".into()),
                 limit: None,
                 offset: None,
@@ -42534,7 +42593,7 @@ mod unit_tests {
         // environment-scoped principal is denied (these lists are site-only).
         let err = storage_volumes_list(
             AuthExtractor(scoped_session(&[], &["production"])),
-            Query(StorageSiteQuery {
+            Query(StorageListQuery {
                 site: None,
                 limit: None,
                 offset: None,

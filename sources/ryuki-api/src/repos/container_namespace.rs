@@ -230,6 +230,9 @@ impl ContainerRequestRow {
 
 // ─── Read functions ───────────────────────────────────────────────────────────
 
+/// List ALL namespaces (optionally site-filtered). Used by the aggregate
+/// endpoints (cluster utilization, k8s summary) that must see every namespace;
+/// the paginated list endpoint uses [`list_namespaces_page`] instead.
 pub async fn list_namespaces(pool: &PgPool, site: &str) -> Result<Vec<K8sNamespace>, sqlx::Error> {
     let rows: Vec<K8sNamespaceRow> = if site.is_empty() {
         sqlx::query_as(&format!(
@@ -246,6 +249,53 @@ pub async fn list_namespaces(pool: &PgPool, site: &str) -> Result<Vec<K8sNamespa
         .await?
     };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// List namespaces (optionally site-filtered) bounded to one `LIMIT`/`OFFSET`
+/// page (#14). `ORDER BY id` is a unique key, so the page is a stable cut. A
+/// SEPARATE fn from [`list_namespaces`] because the aggregate callers need the
+/// full set — only the list endpoint pages.
+pub async fn list_namespaces_page(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<K8sNamespace>, sqlx::Error> {
+    let rows: Vec<K8sNamespaceRow> = if site.is_empty() {
+        sqlx::query_as(&format!(
+            "SELECT {NS_COLUMNS} FROM k8s_namespaces ORDER BY id LIMIT $1 OFFSET $2"
+        ))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "SELECT {NS_COLUMNS} FROM k8s_namespaces \
+             WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
+        ))
+        .bind(site)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count namespaces (optionally site-filtered) — the pagination total for
+/// [`list_namespaces_page`], using the SAME `WHERE` so the count matches the page.
+pub async fn count_namespaces(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM k8s_namespaces")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM k8s_namespaces WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 pub async fn get_namespace(pool: &PgPool, id: &str) -> Result<Option<K8sNamespace>, sqlx::Error> {
@@ -529,6 +579,11 @@ mod container_namespace_db_tests {
             "migration 081 seeds 6 namespaces, got {}",
             all.len()
         );
+        assert_eq!(
+            count_namespaces(&db, "").await.expect("count_namespaces all"),
+            all.len() as i64,
+            "#14: count_namespaces matches the full unpaged set"
+        );
 
         let defra = list_namespaces(&db, "DEFRA")
             .await
@@ -539,6 +594,17 @@ mod container_namespace_db_tests {
             .await
             .expect("list_namespaces FRPAR failed");
         assert_eq!(frpar.len(), 2, "FRPAR has 2 seeded namespaces");
+
+        // #14 pagination: LIMIT bounds the page; OFFSET advances it disjointly
+        // under the unique `ORDER BY id`.
+        let page1 = list_namespaces_page(&db, "", 3, 0).await.expect("page1");
+        let page2 = list_namespaces_page(&db, "", 3, 3).await.expect("page2");
+        assert_eq!(page1.len(), 3, "LIMIT 3 bounds the first page");
+        assert!(!page2.is_empty(), "second page continues (>=6 seeded)");
+        assert!(
+            page1.iter().all(|n| page2.iter().all(|m| m.id != n.id)),
+            "offset page is disjoint from the first (stable id order)"
+        );
     }
 
     #[tokio::test]
