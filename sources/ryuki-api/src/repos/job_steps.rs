@@ -61,8 +61,17 @@ impl JobStepRow {
     pub fn to_orchestration_step(&self) -> Step {
         let status = match self.status.as_str() {
             "Pending" => StepStatus::Pending,
-            "Running" | "Planning" | "AwaitingApproval" | "Applying" => StepStatus::Running,
+            // In-flight (dispatched, not terminal): forward live/dry-run states
+            // plus `TearingDown` (a LiveDestroy in flight, #42 B2).
+            "Running" | "Planning" | "AwaitingApproval" | "Applying" | "TearingDown" => {
+                StepStatus::Running
+            }
             "Succeeded" | "Applied" => StepStatus::Succeeded,
+            // `ToreDown` (a rolled-back step) is terminal-but-NOT-succeeded — it
+            // must never satisfy a forward dependency, so it maps to `Failed`
+            // alongside the real failure/unknown cases. (Forward readiness is
+            // never computed during teardown anyway; this keeps the mapping
+            // total and safe.)
             _ => StepStatus::Failed,
         };
         Step {
@@ -300,6 +309,29 @@ where
     Ok(())
 }
 
+/// Move an `Applied` step to `TearingDown` and record the dispatched
+/// LiveDestroy `agent_jobs` row (#42 slice B2-2). Guarded on the step still
+/// being `Applied` so a step is torn down at most once; returns the rows
+/// affected (the teardown dispatcher asserts 1).
+pub async fn mark_tearing_down<'e, E>(
+    executor: E,
+    step_id: Uuid,
+    agent_job_id: Uuid,
+) -> Result<u64, sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2, updated_at = NOW() \
+         WHERE id = $1 AND status = 'Applied'",
+    )
+    .bind(step_id)
+    .bind(agent_job_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Reconcile a failing request's plan: mark every still-in-flight step
 /// `Failed`. An in-flight step is one with a dispatched agent_job that has not
 /// yet returned a terminal result — `Running` (an OfflineDryRun step, #42 2b),
@@ -323,9 +355,56 @@ pub async fn fail_inflight_steps<'e, E>(executor: E, request_id: Uuid) -> Result
 where
     E: PgExecutor<'e>,
 {
+    // Sweep the in-flight steps to `Failed` AND, in the SAME statement, cancel any still
+    // `Pending` agent_job linked to a swept step. The cancel closes the #42 B2-2 approval-
+    // vs-failure race: a step-approval that commits microseconds before this sweep leaves a
+    // freshly dispatched `Pending` LiveApply job whose step is now `Failed`. Without cancelling
+    // it, that job stays leaseable (`poll_job` filters only by platform + `status = 'Pending'`,
+    // not request/step state) and could later apply live infra OUTSIDE the rollback's coverage.
+    // `Leased`/`Running` jobs are deliberately left to the lease-expiry reconcile path — they
+    // may have already touched infra, so they need operator reconciliation, not a silent cancel.
+    // The returned count is the number of swept STEPS (identical to the old rows_affected).
+    let swept: i64 = sqlx::query_scalar(
+        "WITH swept AS ( \
+             UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
+             WHERE request_id = $1 AND status IN ('Running', 'Planning', 'Applying') \
+             RETURNING agent_job_id \
+         ), cancelled AS ( \
+             UPDATE agent_jobs SET status = 'Cancelled', updated_at = NOW() \
+             WHERE id IN (SELECT agent_job_id FROM swept WHERE agent_job_id IS NOT NULL) \
+               AND status = 'Pending' \
+             RETURNING id \
+         ) \
+         SELECT count(*) FROM swept",
+    )
+    .bind(request_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(u64::try_from(swept).unwrap_or(0))
+}
+
+/// Sweep any steps parked `AwaitingApproval` to `Failed` (#42 slice B2-2).
+///
+/// Unlike [`fail_inflight_steps`], which deliberately leaves `AwaitingApproval`
+/// alone during a normal request-fail (the request then leaves `executing`, so
+/// the approval endpoint's `status == executing` guard already blocks approval),
+/// a request that begins AUTO COMPENSATING TEARDOWN intentionally STAYS
+/// `executing` while its `LiveDestroy` jobs run. That leaves the approval
+/// endpoint reachable, so a still-parked `AwaitingApproval` step could be
+/// approved into a fresh `LiveApply` AFTER rollback started — minting live infra
+/// the teardown will not clean up, possibly after its dependency was destroyed.
+/// Failing those parked steps up front (in the same transaction that starts the
+/// teardown) removes anything left to approve. Returns the rows swept.
+pub async fn fail_awaiting_approval_steps<'e, E>(
+    executor: E,
+    request_id: Uuid,
+) -> Result<u64, sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
     let result = sqlx::query(
         "UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
-         WHERE request_id = $1 AND status IN ('Running', 'Planning', 'Applying')",
+         WHERE request_id = $1 AND status = 'AwaitingApproval'",
     )
     .bind(request_id)
     .execute(executor)

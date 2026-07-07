@@ -1,11 +1,17 @@
 # Live-apply per step (#42 follow-up)
 
-Status: **B1 (forward per-step live) SHIPPED end-to-end** — slice A (step-scoped grant)
-`0620824`, B1a (LivePlan dispatch → AwaitingApproval) `a870f23`, B1b-1 (step-grant mint +
-index exemption) `1fac8f9`, B1b-2 (per-step approval endpoint + LiveApply backlink) `869e711`,
-all GPT-5.5-Codex-xhigh reviewed. **B2 (auto compensating teardown / `LiveDestroy`) is NOT built
-— awaiting owner review of the teardown state machine below.** C (real-infra apply) is
-operator-only.
+Status: **B1 (forward per-step live) + B2 (auto compensating teardown, CP orchestration)
+SHIPPED end-to-end** — B1: slice A (step-scoped grant) `0620824`, B1a (LivePlan dispatch →
+AwaitingApproval) `a870f23`, B1b-1 (step-grant mint + index exemption) `1fac8f9`, B1b-2 (per-step
+approval endpoint + LiveApply backlink) `869e711`. B2: B2-1 (`LiveDestroy` mode + agent gate + CP
+verifier, step-bound-grant required) `9ff9e22`, B2-2 (CP auto-teardown orchestration — reverse
+dependency-order `LiveDestroy` cascade, teardown-failure and lease-expiry halts, and the
+rollback-safety guards: sweep parked `AwaitingApproval` on teardown entry, block step approval
+mid-rollback, non-cancellable teardown jobs, and cancel the `Pending` linked job of any swept
+in-flight step). All GPT-5.5-Codex-xhigh reviewed. **B2-3 (agent-side `terraform destroy`
+execution) + C (real per-step apply) are operator-gated — they need real provider infra and are
+not CI-validatable; until B2-3 the agent `LiveRefuse`s a `LiveDestroy` job, which routes through
+the teardown-failure halt.**
 
 This extends the multi-step orchestration engine (#42 slices 1–3, complete) so that
 a request's steps can be applied to **real** infrastructure one at a time, each gated
@@ -113,19 +119,24 @@ Triggered when any step's `LivePlan` or `LiveApply` fails while ≥1 step is alr
 
 ## Slice split
 
-- **B1 — forward per-step live (CI-testable).** New step statuses + a `live_plan_digest`
-  column; step LivePlan dispatch; the `AwaitingApproval` state; the
+- **B1 — forward per-step live (CI-testable). ✅ SHIPPED.** New step statuses + a
+  `live_plan_digest` column; step LivePlan dispatch; the `AwaitingApproval` state; the
   `POST /api/requests/{id}/steps/{key}/approve-live-apply` endpoint that mints a step-scoped
   grant (slice A) + dispatches LiveApply; backlink verifies the step LiveApply result and
   advances. Replaces the slice-3 `HasStepPlan` guard with step-aware minting. Tested with
   simulated agent results (no real infra).
-- **B2 — auto compensating teardown (CI-testable orchestration).** `LiveDestroy` mode; the
-  reverse-order teardown cascade; the `PartiallyAppliedNeedsOperator` halt on teardown
-  failure. CP orchestration + decision logic tested with simulated results.
-- **C — real per-step apply/destroy (operator-only, not CI-validatable).** A deployed agent
-  with `--allow-live`, real provider credentials, and a durable state backend actually
-  planning/applying/destroying each step against real infrastructure. Delivered as an
-  operator runbook; the owner validates it in their environment.
+- **B2 — auto compensating teardown (CI-testable orchestration). ✅ SHIPPED (B2-1 + B2-2).**
+  `LiveDestroy` mode + agent gate + CP verifier (B2-1); the reverse dependency-order teardown
+  cascade, the teardown-failure and lease-expiry halts (`PartiallyAppliedNeedsOperator`), and
+  the rollback-safety guards — sweep parked `AwaitingApproval` on teardown entry, block step
+  approval mid-rollback, non-cancellable teardown jobs, and cancel the `Pending` linked job of
+  any swept in-flight step (B2-2). CP orchestration + decision logic tested with simulated
+  results.
+- **B2-3 / C — real per-step apply/destroy (operator-only, not CI-validatable). ⏳ owner-gated.**
+  A deployed agent with `--allow-live`, real provider credentials, and a durable state backend
+  actually planning/applying/destroying each step against real infrastructure. Until then the
+  agent `LiveRefuse`s a `LiveDestroy` job (routing through the B2-2 teardown-failure halt).
+  Delivered as an operator runbook; the owner validates it in their environment.
 
 ## Invariants carried from the existing live path
 

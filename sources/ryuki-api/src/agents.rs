@@ -1405,6 +1405,71 @@ async fn advance_request_out_of_executing(
     Ok(())
 }
 
+/// Fail a multi-step request, rolling back any already-`Applied` steps first
+/// (#42 slice B2-2 auto compensating teardown). Called AFTER the failing step
+/// is marked `Failed` and `fail_inflight_steps` has swept in-flight siblings.
+///
+/// If any step is still `Applied`, the applied steps are destroyed in reverse
+/// dependency order: this dispatches the currently ready-to-teardown ones as
+/// `LiveDestroy` jobs and KEEPS the request `executing` (so their results route
+/// back through this backlink, marking each `ToreDown` and unblocking the next);
+/// the request only reaches `failed` once every applied step is rolled back (or
+/// a teardown itself fails — see the LiveDestroy result branch). If NOTHING is
+/// applied, this is a plain immediate failure (today's behavior).
+async fn fail_request_with_teardown(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: uuid::Uuid,
+    stages_val: serde_json::Value,
+    job_id: uuid::Uuid,
+    result_status_str: &str,
+    evidence_digest: &str,
+) -> Result<(), sqlx::Error> {
+    // A failing / rolling-back request must not leave any step parked for
+    // operator approval: while teardown keeps the request `executing`, an
+    // AwaitingApproval step could otherwise still be approved into a NEW
+    // LiveApply (minting live infra after rollback began). Fail them up front,
+    // in this same transaction. (Pending steps are inert — a never-dispatched
+    // step under a failing request truthfully never ran — so they are left as
+    // is, mirroring `fail_inflight_steps`.)
+    crate::repos::job_steps::fail_awaiting_approval_steps(&mut **tx, request_id).await?;
+
+    let plan = crate::repos::job_steps::load_plan(&mut **tx, request_id).await?;
+    if plan.iter().any(|s| s.status == "Applied") {
+        // Roll back the applied steps. Keep the request `executing` while the
+        // teardown LiveDestroy jobs are in flight.
+        let current: crate::contracts::DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {} FROM requests WHERE id = $1",
+            crate::contracts::REQUEST_COLUMNS
+        ))
+        .bind(request_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let request_model = crate::contracts::db_row_to_request(&current, &request_id.to_string());
+        crate::contracts::dispatch_teardown_steps(tx, &request_model, &current, &plan).await?;
+        return Ok(());
+    }
+    if plan.iter().any(|s| s.status == "TearingDown") {
+        // A rollback is ALREADY in flight (e.g. a late straggler step-result
+        // failing while the applied steps are mid-teardown). Do NOT plain-fail
+        // the request — that would flip it out of `executing` and cause the
+        // in-flight LiveDestroy results to be ignored by the status guard,
+        // stranding the rollback. Leave the teardown to complete; its final
+        // LiveDestroy result advances the request to `failed`.
+        return Ok(());
+    }
+    // Nothing applied and nothing tearing down — plain failure.
+    advance_request_out_of_executing(
+        tx,
+        request_id,
+        stages_val,
+        false,
+        job_id,
+        result_status_str,
+        evidence_digest,
+    )
+    .await
+}
+
 /// Backlink an agent's terminal result onto the parent request (AWX bridge
 /// slice 2 / #42 slice 2b, extended by slice B1a). When a dispatched request
 /// is still `executing`:
@@ -1529,11 +1594,11 @@ async fn backlink_request_execution(
             if !success {
                 crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
                 crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
-                return advance_request_out_of_executing(
+                // #42 B2-2: roll back any already-applied steps before failing.
+                return fail_request_with_teardown(
                     tx,
                     request_id,
                     stages_val,
-                    false,
                     job_id,
                     result_status_str,
                     evidence_digest,
@@ -1563,11 +1628,11 @@ async fn backlink_request_execution(
             if !success {
                 crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
                 crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
-                return advance_request_out_of_executing(
+                // #42 B2-2: roll back any already-applied steps before failing.
+                return fail_request_with_teardown(
                     tx,
                     request_id,
                     stages_val,
-                    false,
                     job_id,
                     result_status_str,
                     evidence_digest,
@@ -1580,11 +1645,12 @@ async fn backlink_request_execution(
 
             if plan2.iter().any(|s| s.status == "Failed") {
                 crate::repos::job_steps::fail_inflight_steps(&mut **tx, request_id).await?;
-                return advance_request_out_of_executing(
+                // #42 B2-2: a sibling already failed — roll back the applied
+                // steps (including this one) before failing the request.
+                return fail_request_with_teardown(
                     tx,
                     request_id,
                     stages_val,
-                    false,
                     job_id,
                     result_status_str,
                     evidence_digest,
@@ -1632,21 +1698,63 @@ async fn backlink_request_execution(
             return Ok(());
         }
         // #42 slice B2: a step's LiveDestroy (teardown) result. The CP-side
-        // teardown ORCHESTRATION that mints these jobs and interprets their
-        // results (mark the step ToreDown on success, or halt to
-        // PartiallyAppliedNeedsOperator on a teardown failure) is slice B2-2.
-        // B2-1 only lands the protocol mode + trust gate + result verifier, and
-        // does not mint LiveDestroy jobs — so none reach this backlink yet.
-        // Guard defensively (log + no-op) rather than let a hypothetical/
-        // misrouted LiveDestroy result advance a request off the teardown path.
+        // #42 slice B2-2: a step's LiveDestroy (teardown) result.
         JobMode::LiveDestroy => {
-            tracing::warn!(
-                request_id = %request_id,
-                %job_id,
-                step_key = %step.step_key,
-                "multi-step request: LiveDestroy step result received but teardown \
-                 orchestration is not yet wired (#42 slice B2-2); not advancing"
-            );
+            if !success {
+                // The destroy ITSELF failed — HALT the rollback (no thrash).
+                // Mark this step Failed and fail the request; the remaining
+                // Applied/TearingDown steps are deliberately LEFT intact for an
+                // operator (PartiallyAppliedNeedsOperator — under a failed
+                // request, the surviving Applied/TearingDown step statuses ARE
+                // the "needs operator" signal). Do NOT dispatch more teardown.
+                crate::repos::job_steps::mark_status(&mut **tx, step.id, "Failed").await?;
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    false,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            // The step's resources were destroyed — mark it ToreDown.
+            crate::repos::job_steps::mark_status(&mut **tx, step.id, "ToreDown").await?;
+            let plan2 = crate::repos::job_steps::load_plan(&mut **tx, request_id).await?;
+
+            // Clean rollback is complete once nothing is Applied or TearingDown.
+            let rollback_done = !plan2
+                .iter()
+                .any(|s| s.status == "Applied" || s.status == "TearingDown");
+            if rollback_done {
+                // Every applied step rolled back — the request fails cleanly.
+                return advance_request_out_of_executing(
+                    tx,
+                    request_id,
+                    stages_val,
+                    false,
+                    job_id,
+                    result_status_str,
+                    evidence_digest,
+                )
+                .await;
+            }
+
+            // Dispatch the steps this teardown just unblocked (their last
+            // Applied/TearingDown dependent is now ToreDown). Keep the request
+            // `executing` while the rollback continues.
+            let current: crate::contracts::DbRequestRow = sqlx::query_as(&format!(
+                "SELECT {} FROM requests WHERE id = $1",
+                crate::contracts::REQUEST_COLUMNS
+            ))
+            .bind(request_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            let request_model =
+                crate::contracts::db_row_to_request(&current, &request_id.to_string());
+            crate::contracts::dispatch_teardown_steps(tx, &request_model, &current, &plan2).await?;
             return Ok(());
         }
         // #42 slice 2b: UNCHANGED existing behavior.
@@ -2466,6 +2574,7 @@ fn parse_job_mode(mode_str: &str) -> ApiResult<JobMode> {
         "OfflineDryRun" => Ok(JobMode::OfflineDryRun),
         "LivePlan" => Ok(JobMode::LivePlan),
         "LiveApply" => Ok(JobMode::LiveApply),
+        "LiveDestroy" => Ok(JobMode::LiveDestroy),
         other => Err(bad_request(format!(
             "unknown job mode in database: {}",
             other
@@ -2671,18 +2780,80 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
     }
     let reconcile = reconciled.len() as u64;
 
+    // 4. LiveDestroy (#42 B2-2): an expired teardown lease HALTS the rollback.
+    //    An agent that died mid-destroy may have partially torn down real infra,
+    //    so this is operator recovery, never auto-retry (like LiveApply). Mark
+    //    the job ReconcileRequired, fail the step it was tearing down, and fail
+    //    the request — leaving any remaining Applied/TearingDown steps as the
+    //    needs-operator signal (rather than leaving the rollback stuck with the
+    //    step TearingDown and the request executing forever).
+    #[derive(sqlx::FromRow)]
+    struct ExpiredDestroyRow {
+        id: Uuid,
+        request_id: Uuid,
+        platform: String,
+    }
+    let expired_destroys: Vec<ExpiredDestroyRow> = sqlx::query_as(
+        "UPDATE agent_jobs SET status = 'ReconcileRequired', updated_at = NOW() \
+         WHERE status IN ('Leased', 'Running') AND mode = 'LiveDestroy' \
+           AND lease_deadline < NOW() \
+         RETURNING id, request_id, platform",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for job in &expired_destroys {
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
+             WHERE agent_job_id = $1 AND status = 'TearingDown'",
+        )
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE requests SET status = 'failed', updated_at = NOW() \
+             WHERE id = $1 AND status = 'executing'",
+        )
+        .bind(job.request_id)
+        .execute(&mut *tx)
+        .await?;
+        let job_id_str = job.id.to_string();
+        let request_id_str = job.request_id.to_string();
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: "job.reconcile_required",
+                aggregate_type: "agent_job",
+                aggregate_id: &job_id_str,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({
+                    "to_status": "reconcile-required",
+                    "platform": &job.platform,
+                    "mode": "LiveDestroy",
+                    "request_id": &request_id_str,
+                    "note": "live-destroy (teardown) lease expired mid-run; rollback halted, \
+                             operator reconciliation required",
+                }),
+            },
+        )
+        .await?;
+    }
+    let destroy_reconcile = expired_destroys.len() as u64;
+
     tx.commit().await?;
 
-    if dead_count + redispatched + reconcile > 0 {
+    if dead_count + redispatched + reconcile + destroy_reconcile > 0 {
         tracing::info!(
             redispatched,
             reconcile_required = reconcile,
+            destroy_reconcile_required = destroy_reconcile,
             dead_lettered = dead_count,
             "agent lease expiry sweep"
         );
     }
 
-    Ok(dead_count + redispatched + reconcile)
+    Ok(dead_count + redispatched + reconcile + destroy_reconcile)
 }
 
 // ---------------------------------------------------------------------------
@@ -3210,9 +3381,13 @@ pub async fn create_live_apply_job(
 /// fail-closed grant validation and concluded-request guard as the single-job
 /// path so it is a safe minting choke point on its own; it does NOT re-check
 /// the step's status (that is the endpoint's lock-guarded job).
+/// (#42 slice B2) the same mint serves LiveApply (per-step approval, B1b-2) AND
+/// LiveDestroy (auto compensating teardown, B2-2) — both are step-scoped,
+/// grant-bound, live-mutating step jobs that differ only in `spec.mode`. The
+/// caller sets the mode; this fn accepts either and rejects anything else.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
-pub async fn create_step_live_apply_job(
+pub async fn create_step_live_job(
     tx: &mut sqlx::PgConnection,
     request_id: Uuid,
     platform: &str,
@@ -3222,7 +3397,18 @@ pub async fn create_step_live_apply_job(
     expiry: DateTime<Utc>,
     cp_key: &ed25519_dalek::SigningKey,
 ) -> Result<Uuid, CreateLiveApplyJobError> {
-    validate_live_apply_params(spec, request_id).map_err(CreateLiveApplyJobError::Invalid)?;
+    // A step live job must be LiveApply or LiveDestroy (both step-scoped,
+    // grant-bound, live-mutating), and its spec must be for THIS request.
+    if !matches!(spec.mode, JobMode::LiveApply | JobMode::LiveDestroy) {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "create_step_live_job requires a LiveApply or LiveDestroy spec",
+        ));
+    }
+    if spec.request_id != request_id {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "spec.request_id must equal the supplied request_id",
+        ));
+    }
 
     // Fail closed: never mint a live-apply grant for a CONCLUDED request. Lock
     // the request row so it cannot conclude between this check and the INSERT
@@ -3287,18 +3473,28 @@ pub async fn create_step_live_apply_job(
     let grant_json = serde_json::to_value(&signed_grant)
         .expect("VerifiedLiveContext serialisation is infallible");
 
+    // The DB `mode` column MUST equal the spec's mode — the agent signs the
+    // spec's mode into its result envelope, and result ingest (step 8) compares
+    // the envelope against this column. A LiveDestroy job stored as 'LiveApply'
+    // would have its (correctly LiveDestroy) result rejected, stalling the
+    // rollback. (spec.mode was validated to LiveApply|LiveDestroy above.)
+    let mode_label = match spec.mode {
+        JobMode::LiveDestroy => "LiveDestroy",
+        _ => "LiveApply",
+    };
     // step_scoped = TRUE exempts this row from the request-level one-live-apply
     // unique index (mig 153), so each step of a request gets its own. No
     // ON CONFLICT: per-step single-approval is enforced by the caller's
     // AwaitingApproval->Applying lock, and the client-generated id is unique.
     sqlx::query(
         "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, step_scoped, live_context) \
-         VALUES ($1, $2, $3, $4, 'LiveApply', TRUE, $5::jsonb)",
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6::jsonb)",
     )
     .bind(job_id)
     .bind(request_id)
     .bind(platform)
     .bind(&spec_json)
+    .bind(mode_label)
     .bind(&grant_json)
     .execute(&mut *tx)
     .await?;
@@ -4338,12 +4534,18 @@ pub async fn admin_cancel_pending_job(
         }
     }
 
-    // CAS: only a Pending job cancels. RETURNING request_id + platform for the audit/event/
-    // response. A job leased concurrently → 0 rows → 409 (poll won the race); a concurrent
-    // double-cancel → the second sees 'Cancelled' → 409.
+    // CAS: only a Pending, non-teardown job cancels. RETURNING request_id + platform for
+    // the audit/event/response. A job leased concurrently → 0 rows → 409 (poll won the
+    // race); a concurrent double-cancel → the second sees 'Cancelled' → 409.
+    //
+    // #42 B2-2: a `LiveDestroy` (auto-teardown) job is deliberately EXCLUDED. Cancelling a
+    // still-Pending teardown job would leave its step `TearingDown` and the request
+    // `executing` with no result ever arriving and no lease to expire — a permanent wedge
+    // (the "keep executing while TearingDown" rollback branch would never resolve). Teardown
+    // is an automated rollback and is not operator-cancellable.
     let updated: Option<(String, String)> = sqlx::query_as(
         "UPDATE agent_jobs SET status = 'Cancelled', updated_at = NOW() \
-         WHERE id = $1 AND status = 'Pending' \
+         WHERE id = $1 AND status = 'Pending' AND mode <> 'LiveDestroy' \
          RETURNING request_id::text, platform",
     )
     .bind(uid)
@@ -4351,16 +4553,21 @@ pub async fn admin_cancel_pending_job(
     .await
     .map_err(db_err)?;
     let Some((request_id, platform)) = updated else {
-        // Distinguish not-found (404) from wrong-status (409) with a clean re-read.
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+        // Distinguish not-found (404), a protected teardown job (409), and wrong-status
+        // (409) with a clean re-read of both status and mode.
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT status, mode FROM agent_jobs WHERE id = $1")
                 .bind(uid)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err)?;
         return match existing {
             None => Err(not_found(format!("agent job '{job_id}' not found"))),
-            Some(status) => Err(conflict(format!(
+            Some((status, mode)) if mode == "LiveDestroy" => Err(conflict(format!(
+                "job is a LiveDestroy auto-teardown job (status '{status}'); teardown jobs \
+                 are part of an automated rollback and cannot be cancelled"
+            ))),
+            Some((status, _)) => Err(conflict(format!(
                 "job is in status '{status}'; only Pending jobs can be cancelled"
             ))),
         };
@@ -10478,7 +10685,7 @@ mod tests {
         pool.close().await;
     }
 
-    /// #42 live-apply slice B1b: `create_step_live_apply_job` mints a
+    /// #42 live-apply slice B1b: `create_step_live_job` mints a
     /// step-scoped grant bound to the dispatched job id (verifies against the
     /// CP key), marks the row `step_scoped=TRUE`, and — unlike the single-job
     /// path — lets MULTIPLE step LiveApply jobs coexist for ONE request (the
@@ -10520,7 +10727,7 @@ mod tests {
         // Mint TWO step-scoped LiveApply grants for the SAME request — this is
         // the case the single-job unique index would have rejected.
         let mut tx = pool.begin().await.unwrap();
-        let job1 = create_step_live_apply_job(
+        let job1 = create_step_live_job(
             &mut tx,
             request_id,
             &platform,
@@ -10532,7 +10739,7 @@ mod tests {
         )
         .await
         .expect("first step grant mints");
-        let job2 = create_step_live_apply_job(
+        let job2 = create_step_live_job(
             &mut tx,
             request_id,
             &platform,
@@ -12070,6 +12277,607 @@ mod tests {
         pool.close().await;
     }
 
+    // ── #42 slice B2-2: auto compensating teardown ──────────────────────────
+
+    /// Seed an executing request whose chain a->b->c has a,b `Applied` and c
+    /// `Applying` (a LiveApply job in flight). Returns (req_id, c's job id).
+    async fn seed_teardown_chain(pool: &PgPool) -> (Uuid, Uuid) {
+        let req_id = seed_executing_request(pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+                ("c", vec!["b".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        // a, b applied (with a recorded plan digest); c applying.
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applied', live_plan_digest = $2 \
+             WHERE request_id = $1 AND step_key IN ('a', 'b')",
+        )
+        .bind(req_id)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        let job_c: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'c'",
+        )
+        .bind(req_id)
+        .bind(job_c)
+        .execute(pool)
+        .await
+        .unwrap();
+        (req_id, job_c)
+    }
+
+    async fn step_of<'a>(
+        plan: &'a [crate::repos::job_steps::JobStepRow],
+        key: &str,
+    ) -> &'a crate::repos::job_steps::JobStepRow {
+        plan.iter().find(|s| s.step_key == key).expect("step")
+    }
+
+    /// A live step failing with earlier applied steps triggers auto teardown:
+    /// the applied steps are destroyed in REVERSE dependency order (b before a),
+    /// one at a time, and the request only reaches `failed` once everything is
+    /// rolled back.
+    #[tokio::test]
+    async fn db_b2_teardown_reverse_order_and_completes() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+
+        // c's LiveApply fails -> teardown begins. b (its only Applied dependent
+        // is now Failed c) is ready first; a is NOT (b still Applied).
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveApply,
+            "failed",
+            "c-apply-failed",
+            job_c,
+        )
+        .await
+        .expect("backlink c failure");
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(step_of(&plan, "c").await.status, "Failed");
+        assert_eq!(
+            step_of(&plan, "b").await.status,
+            "TearingDown",
+            "b is torn down first (reverse order)"
+        );
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "Applied",
+            "a waits until its dependent b is torn down"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "executing",
+            "request stays executing during teardown"
+        );
+
+        // b's LiveDestroy succeeds -> b ToreDown, a now ready -> a TearingDown.
+        let job_b = step_of(&plan, "b").await.agent_job_id.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Applied,
+            &JobMode::LiveDestroy,
+            "applied",
+            "b-destroyed",
+            job_b,
+        )
+        .await
+        .expect("backlink b destroy");
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(step_of(&plan, "b").await.status, "ToreDown");
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "TearingDown",
+            "a is torn down after b"
+        );
+
+        // a's LiveDestroy succeeds -> a ToreDown, nothing left -> request failed.
+        let job_a = step_of(&plan, "a").await.agent_job_id.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Applied,
+            &JobMode::LiveDestroy,
+            "applied",
+            "a-destroyed",
+            job_a,
+        )
+        .await
+        .expect("backlink a destroy");
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(step_of(&plan, "a").await.status, "ToreDown");
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "request fails cleanly once every applied step is rolled back"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// A teardown that ITSELF fails halts the rollback: the request fails and
+    /// the remaining applied steps are left intact for an operator (no thrash).
+    #[tokio::test]
+    async fn db_b2_teardown_failure_halts() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+
+        // c fails -> b starts tearing down.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveApply,
+            "failed",
+            "c-apply-failed",
+            job_c,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        let job_b = step_of(&plan, "b").await.agent_job_id.unwrap();
+
+        // b's LiveDestroy FAILS -> halt: request failed, a left Applied.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveDestroy,
+            "failed",
+            "b-destroy-failed",
+            job_b,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_of(&plan, "b").await.status,
+            "Failed",
+            "failed teardown -> step Failed"
+        );
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "Applied",
+            "a is LEFT intact for an operator (no further teardown dispatched)"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "the request fails (needs-operator via surviving Applied step)"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 B2-2 (Codex finding #3): a late straggler failure that reaches
+    /// `fail_request_with_teardown` while a rollback is ALREADY in flight (a step
+    /// is `TearingDown` and NOTHING is `Applied`) must NOT plain-fail the request
+    /// out of `executing`. Flipping it out of `executing` would make the in-flight
+    /// `LiveDestroy` results be dropped by the backlink status guard, stranding
+    /// the rollback forever. The request stays `executing` so teardown finishes.
+    #[tokio::test]
+    async fn db_b2_teardown_late_failure_keeps_executing() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec!["a".to_string()], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        // Rollback in flight: 'a' is TearingDown (its LiveDestroy dispatched),
+        // 'b' already Failed. Nothing is Applied.
+        let job_a: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveDestroy', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'a'",
+        )
+        .bind(req_id)
+        .bind(job_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Failed' WHERE request_id = $1 AND step_key = 'b'",
+        )
+        .bind(req_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A late straggler failure reaches the teardown-aware fail path.
+        let mut tx = pool.begin().await.unwrap();
+        fail_request_with_teardown(
+            &mut tx,
+            req_id,
+            serde_json::json!([]),
+            job_a,
+            "failed",
+            "late-straggler",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "executing",
+            "a straggler failure must NOT strand the in-flight rollback"
+        );
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "TearingDown",
+            "the in-flight teardown step is left to complete"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 B2-2 (Codex finding #4): if a `LiveDestroy` (teardown) job's lease
+    /// expires mid-run (the agent died after possibly touching real infra), the
+    /// lease-expiry sweep must HALT the rollback — mark the teardown step `Failed`
+    /// and the request `failed`, and move the job to `ReconcileRequired` — rather
+    /// than leaving the step `TearingDown` and the request `executing` forever.
+    #[tokio::test]
+    async fn db_b2_destroy_lease_expiry_halts_rollback() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[("a", vec![], "linux-server-deployment")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        // 'a' is TearingDown behind a LiveDestroy job whose lease already expired.
+        let job_a: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs \
+                 (request_id, platform, spec, mode, step_scoped, status, lease_deadline) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveDestroy', TRUE, 'Leased', \
+                     NOW() - make_interval(secs => 60)) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'a'",
+        )
+        .bind(req_id)
+        .bind(job_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        expire_leases(&pool).await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "Failed",
+            "the stuck teardown step is halted to Failed"
+        );
+        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(req_status, "failed", "the request is failed (needs operator)");
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_status, "ReconcileRequired",
+            "the expired destroy job needs operator reconciliation"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 B2-2 (Codex finding #1): when auto teardown begins, any step still parked
+    /// `AwaitingApproval` is swept to `Failed`. Teardown keeps the request `executing`
+    /// (so LiveDestroy results route back), which leaves the step-approval endpoint
+    /// reachable; a still-parked step could otherwise be approved into a fresh `LiveApply`
+    /// after rollback started. Failing the parked step removes anything left to approve.
+    #[tokio::test]
+    async fn db_b2_teardown_sweeps_awaiting_approval() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        // Three INDEPENDENT steps: 'a' applied, 'b' parked awaiting operator approval,
+        // 'c' a live apply in flight.
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec![], "linux-server-deployment"),
+                ("c", vec![], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applied', live_plan_digest = $2 \
+             WHERE request_id = $1 AND step_key = 'a'",
+        )
+        .bind(req_id)
+        .bind("a".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'AwaitingApproval', live_plan_digest = $2 \
+             WHERE request_id = $1 AND step_key = 'b'",
+        )
+        .bind(req_id)
+        .bind("b".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let job_c: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'c'",
+        )
+        .bind(req_id)
+        .bind(job_c)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 'c' fails -> teardown begins (a is Applied) and the request stays executing.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveApply,
+            "failed",
+            "c-apply-failed",
+            job_c,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_of(&plan, "b").await.status,
+            "Failed",
+            "the parked AwaitingApproval step is swept -> nothing left to approve mid-rollback"
+        );
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "TearingDown",
+            "the applied step is being rolled back"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "executing", "teardown keeps the request executing");
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
+    /// #42 B2-2 (Codex round-3): when `fail_inflight_steps` sweeps an in-flight step to
+    /// `Failed`, it also cancels that step's still-`Pending` linked agent_job. This closes the
+    /// residual approval-vs-failure race: a step-approval that commits just before the sweep
+    /// leaves a freshly dispatched `Pending` LiveApply job whose step is now `Failed`; without
+    /// cancelling it, the job stays leaseable and could apply live infra outside rollback
+    /// coverage. A `Leased`/`Running` linked job is instead LEFT for the lease-expiry reconcile
+    /// path (it may already have touched infra).
+    #[tokio::test]
+    async fn db_b2_fail_inflight_cancels_pending_linked_job() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req_id,
+            &[
+                ("a", vec![], "linux-server-deployment"),
+                ("b", vec![], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        // 'a' Applying behind a still-`Pending` LiveApply (the approval-race orphan shape).
+        let job_a: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', 'Pending', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'a'",
+        )
+        .bind(req_id)
+        .bind(job_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 'b' Applying behind a `Leased` job — must be LEFT for lease-expiry reconcile.
+        let job_b: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', 'Leased', TRUE) RETURNING id",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'b'",
+        )
+        .bind(req_id)
+        .bind(job_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let swept = crate::repos::job_steps::fail_inflight_steps(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(swept, 2, "both Applying steps are swept to Failed");
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(step_of(&plan, "a").await.status, "Failed");
+        assert_eq!(step_of(&plan, "b").await.status, "Failed");
+        let a_job: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_job, "Cancelled",
+            "the Pending orphan is cancelled -> no longer leaseable"
+        );
+        let b_job: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            b_job, "Leased",
+            "a Leased job is left for lease-expiry reconcile, not silently cancelled"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
     /// Diamond a -> {b, c} -> d: completing 'a' dispatches both 'b' and 'c';
     /// completing only 'b' must NOT dispatch 'd' (c is still Running);
     /// completing 'c' then dispatches 'd'; completing 'd' finishes the
@@ -12497,6 +13305,24 @@ mod tests {
         .expect("widen agent_jobs status CHECK to admit 'Cancelled'");
     }
 
+    /// Ensure the `agent_jobs` mode CHECK admits `'LiveDestroy'` (mig 155), self-applied with
+    /// the SAME DDL as the migration so the teardown-cancel test can insert a LiveDestroy job
+    /// on a behind-migrations local DB; on CI the migration already did this, so the guarded
+    /// DROP/ADD is an idempotent re-apply (a superset — existing modes still allowed).
+    async fn ensure_live_destroy_mode_allowed(pool: &PgPool) {
+        sqlx::query("ALTER TABLE agent_jobs DROP CONSTRAINT IF EXISTS agent_jobs_mode_check")
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "ALTER TABLE agent_jobs ADD CONSTRAINT agent_jobs_mode_check \
+             CHECK (mode IN ('OfflineDryRun','LivePlan','LiveApply','LiveDestroy'))",
+        )
+        .execute(pool)
+        .await
+        .expect("widen agent_jobs mode CHECK to admit 'LiveDestroy'");
+    }
+
     /// Seed an agent job in a given status (Pending / Leased) for the cancel tests.
     async fn seed_job_in_status(
         pool: &PgPool,
@@ -12657,6 +13483,63 @@ mod tests {
             cancel_audit_count(pool, job).await,
             0,
             "a wrong-status cancel writes no audit row"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// #42 B2-2 (Codex finding #2): a Pending `LiveDestroy` (auto-teardown) job must NOT be
+    /// operator-cancellable. Cancelling it would strand its step `TearingDown` and the request
+    /// `executing` with no result ever arriving and no lease to expire — a permanent rollback
+    /// wedge. The cancel is rejected (409), the job is left Pending, and no audit row is written.
+    #[tokio::test]
+    async fn cancel_pending_live_destroy_rejected_409() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        ensure_live_destroy_mode_allowed(pool).await;
+        let platform = format!("plt-cxl-destroy-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let spec = dead_letter_spec(req, JobMode::LiveDestroy);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        let job: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, $2, $3, 'LiveDestroy', 'Pending', TRUE) RETURNING id",
+        )
+        .bind(req)
+        .bind(&platform)
+        .bind(&spec_json)
+        .fetch_one(pool)
+        .await
+        .expect("seed pending LiveDestroy job");
+
+        let err = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(CancelJobBody {
+                reason: "operator tries to cancel a teardown".into(),
+            }),
+        )
+        .await
+        .expect_err("a Pending LiveDestroy teardown job is not cancellable");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_status, "Pending",
+            "the teardown job is left intact to run (or expire), not cancelled"
+        );
+        assert_eq!(
+            cancel_audit_count(pool, job).await,
+            0,
+            "a rejected teardown cancel writes no audit row"
         );
 
         cleanup_jobs_for_platform(pool, &platform).await;

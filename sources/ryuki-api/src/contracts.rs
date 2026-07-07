@@ -15883,6 +15883,30 @@ async fn requests_step_approve_live_apply(
             })),
         ));
     }
+    // #42 B2-2: refuse to approve NEW live work once the request has begun
+    // failing / rolling back. Auto compensating teardown keeps the request
+    // `executing` while its LiveDestroy jobs run, so the `executing` guard above
+    // is not enough — any Failed/TearingDown/ToreDown step means teardown is
+    // underway, and a fresh LiveApply here would create infra the rollback will
+    // not clean up (and whose dependency may already be destroyed). The teardown
+    // path also sweeps AwaitingApproval steps to Failed, so a step reaching this
+    // point after rollback started is normally already caught above; this is the
+    // defense-in-depth plan-wide check for the approval-vs-failure race.
+    let plan = crate::repos::job_steps::load_plan(&mut *tx, uid)
+        .await
+        .map_err(db_error)?;
+    if plan
+        .iter()
+        .any(|s| matches!(s.status.as_str(), "Failed" | "TearingDown" | "ToreDown"))
+    {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "request is rolling back (a step has failed); cannot approve a step live apply"
+            })),
+        ));
+    }
     let Some(digest) = step.live_plan_digest.clone() else {
         tx.rollback().await.ok();
         return Err((
@@ -15917,7 +15941,7 @@ async fn requests_step_approve_live_apply(
     };
 
     // Mint the step-scoped CP-signed grant + LiveApply job (slice B1b-1).
-    let job_id = crate::agents::create_step_live_apply_job(
+    let job_id = crate::agents::create_step_live_job(
         &mut tx,
         uid,
         &current.site,
@@ -17505,6 +17529,118 @@ pub(crate) async fn dispatch_ready_steps(
         job_ids.push(job_id);
     }
 
+    Ok(job_ids)
+}
+
+/// The `Applied` steps that are READY to tear down (#42 slice B2-2). Rollback
+/// proceeds in REVERSE dependency order, so an `Applied` step may only be
+/// destroyed once NONE of the steps that DEPEND ON it are still `Applied` or
+/// `TearingDown` — its dependents must be rolled back first. `Pending`/`Failed`/
+/// `ToreDown` dependents do not block (they hold nothing built on this step's
+/// resources).
+fn ready_to_teardown(
+    plan: &[crate::repos::job_steps::JobStepRow],
+) -> Vec<&crate::repos::job_steps::JobStepRow> {
+    plan.iter()
+        .filter(|s| s.status == "Applied")
+        .filter(|s| {
+            !plan.iter().any(|d| {
+                d.depends_on.iter().any(|dep| dep == &s.step_key)
+                    && (d.status == "Applied" || d.status == "TearingDown")
+            })
+        })
+        .collect()
+}
+
+/// Dispatch a `LiveDestroy` job for each ready-to-teardown `Applied` step (#42
+/// slice B2-2), INSIDE the caller's transaction. Each job carries a step-scoped
+/// CP-signed `LiveDestroy` grant (`create_step_live_job`) — authorised by the
+/// step's OWN prior approval (approving a step's apply also authorises its
+/// rollback) — and the step flips `Applied -> TearingDown`. Returns the
+/// dispatched job ids. Fail-closed: if the CP signing key is unavailable or any
+/// mint fails, the whole transaction rolls back so a teardown is never
+/// half-dispatched.
+pub(crate) async fn dispatch_teardown_steps(
+    tx: &mut sqlx::PgConnection,
+    request: &ryuki_engine::models::Request,
+    current: &DbRequestRow,
+    plan: &[crate::repos::job_steps::JobStepRow],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let request_id = current.id;
+    let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
+        sqlx::Error::Protocol(
+            "control plane signing key not initialised; cannot mint teardown grants".into(),
+        )
+    })?;
+    // Collect ids first so we don't hold an immutable borrow of `plan` across
+    // the mutations to `tx` in the loop.
+    let ready: Vec<Uuid> = ready_to_teardown(plan).iter().map(|s| s.id).collect();
+    let mut job_ids = Vec::with_capacity(ready.len());
+    for step_id in ready {
+        let step = plan
+            .iter()
+            .find(|s| s.id == step_id)
+            .expect("ready_to_teardown only returns steps present in the plan");
+        let iac_digest =
+            ryuki_runner::iac::offering_iac_digest(&step.iac_ref).unwrap_or_else(|| "0".repeat(64));
+        let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+            offering_id: &step.iac_ref,
+            request_id: &request.id,
+            name: &current.name,
+            site: &current.site,
+            environment: &current.environment,
+            cpu: u32::try_from(current.cpu).unwrap_or(0),
+            memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+            metadata: &request.metadata,
+        });
+        let spec = ryuki_protocol::JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: step.iac_ref.clone(),
+            iac_digest,
+            vars,
+            mode: ryuki_protocol::JobMode::LiveDestroy,
+        };
+        // The teardown grant reuses the step's own recorded plan digest as
+        // provenance (LiveDestroy has no plan-then-apply match); a 64-hex is
+        // required by the mint, so fall back to a zero digest if — defensively —
+        // an Applied step somehow has none.
+        let digest = step
+            .live_plan_digest
+            .clone()
+            .unwrap_or_else(|| "0".repeat(64));
+        let job_id = crate::agents::create_step_live_job(
+            tx,
+            request_id,
+            &current.site,
+            &spec,
+            &digest,
+            "system:auto-teardown",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            cp_key,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::agents::CreateLiveApplyJobError::Db(err) => err,
+            other => {
+                tracing::error!(
+                    ?other,
+                    request_id = %request_id,
+                    step_key = %step.step_key,
+                    "teardown grant mint failed"
+                );
+                sqlx::Error::Protocol("teardown grant mint failed".into())
+            }
+        })?;
+        let affected =
+            crate::repos::job_steps::mark_tearing_down(&mut *tx, step_id, job_id).await?;
+        if affected != 1 {
+            return Err(sqlx::Error::Protocol(
+                "teardown step was not in Applied state at dispatch".into(),
+            ));
+        }
+        job_ids.push(job_id);
+    }
     Ok(job_ids)
 }
 
