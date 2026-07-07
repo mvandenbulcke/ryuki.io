@@ -60,8 +60,12 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Check formatting
+      # Advisory only, NON-BLOCKING — see ci.yml: known repo-wide rustfmt drift, standing
+      # policy is to not run `cargo fmt`. Visible in logs but must not block. Clippy is the
+      # enforced gate.
+      - name: Check formatting (advisory, non-blocking)
         run: cargo fmt --check --all
+        continue-on-error: true
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
