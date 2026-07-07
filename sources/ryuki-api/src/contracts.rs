@@ -2572,6 +2572,9 @@ struct OobFailingQuery {
 #[allow(dead_code)]
 struct HardwareInventoryQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29097,12 +29100,32 @@ async fn hardware_assets_or_empty(
 async fn hardware_inventory(
     AuthExtractor(session): AuthExtractor,
     Query(query): Query<HardwareInventoryQuery>,
-) -> ApiResult {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // #2: scoped-site read ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let assets = hardware_assets_or_empty(site).await?;
-    Ok(Json(serde_json::to_value(assets).unwrap_or_default()))
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    // This is the ONLY hardware read that pages — it uses `list_page`/`count`
+    // directly rather than the shared `hardware_assets_or_empty` helper, which
+    // the aggregate handlers rely on to return EVERY asset. The body stays a
+    // bare array (backward-compatible); the total rides in `X-Total-Count`.
+    let limit = query.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (assets, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::hardware_assets::list_page(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::hardware_assets::count(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
+    };
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(assets).unwrap_or_default()),
+    ))
 }
 
 async fn hardware_warranty_expiring(AuthExtractor(session): AuthExtractor) -> ApiResult {
@@ -64544,9 +64567,13 @@ mod hardware_db_tests {
         };
 
         // inventory: all sites returns ≥ 6 seed rows.
-        let Ok(Json(all)) = hardware_inventory(
+        let Ok((headers, Json(all))) = hardware_inventory(
             AuthExtractor(AuthSession::static_dry_run()),
-            Query(HardwareInventoryQuery { site: None }),
+            Query(HardwareInventoryQuery {
+                site: None,
+                limit: None,
+                offset: None,
+            }),
         )
         .await
         else {
@@ -64558,12 +64585,21 @@ mod hardware_db_tests {
             "expected at least 6 assets from seed rows, got {}",
             all_arr.len()
         );
+        // #14: the total rides in X-Total-Count; the default page (limit 500)
+        // holds every seeded asset, so it equals the returned array length.
+        assert_eq!(
+            headers.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some(all_arr.len().to_string().as_str()),
+            "X-Total-Count header must carry the full total"
+        );
 
         // inventory: GBLON returns ≥ 3 seed rows.
-        let Ok(Json(gblon)) = hardware_inventory(
+        let Ok((_, Json(gblon))) = hardware_inventory(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(HardwareInventoryQuery {
                 site: Some("GBLON".into()),
+                limit: None,
+                offset: None,
             }),
         )
         .await

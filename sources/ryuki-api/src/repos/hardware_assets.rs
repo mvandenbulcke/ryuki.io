@@ -158,8 +158,10 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<HardwareAsset>, sqlx:
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all assets, optionally filtered by site. An empty `site` returns all
-/// assets. Results are ordered by `site, id` for stable pagination.
+/// Return ALL assets, optionally filtered by site. An empty `site` returns all
+/// assets. Used by the aggregate read handlers (warranty-expiring, firmware
+/// gaps, ...) via `hardware_assets_or_empty`, which need every asset; the
+/// paginated inventory endpoint uses [`list_page`] instead.
 pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<HardwareAsset>, sqlx::Error> {
     let rows: Vec<HardwareAssetRow> = if site.is_empty() {
         sqlx::query_as(&format!(
@@ -177,6 +179,53 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<HardwareAsset>, sqlx:
     };
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// List assets (optionally site-filtered) bounded to one `LIMIT`/`OFFSET` page
+/// (#14). SEPARATE from [`list`] because the aggregate callers need the full
+/// set — only the inventory list endpoint pages. `id` is the primary key, so
+/// the `ORDER BY … id` is a unique, stable cut.
+pub async fn list_page(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<HardwareAsset>, sqlx::Error> {
+    let rows: Vec<HardwareAssetRow> = if site.is_empty() {
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM hardware_assets ORDER BY site, id LIMIT $1 OFFSET $2"
+        ))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM hardware_assets WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3"
+        ))
+        .bind(site)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    };
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count assets (optionally site-filtered) — the pagination total for
+/// [`list_page`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM hardware_assets")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM hardware_assets WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Insert a new asset and return the persisted row. The caller supplies the
@@ -280,4 +329,72 @@ pub async fn apply_firmware_update(
         .await?;
 
     updated.into_model().map(Some)
+}
+
+#[cfg(test)]
+mod hardware_assets_db_tests {
+    use super::*;
+
+    async fn test_pool() -> Option<PgPool> {
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("hardware_assets_db_tests: RYUKI_DATABASE_URL not set — skipping");
+            return None;
+        };
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("RYUKI_DATABASE_URL is set but connection failed");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply cleanly when RYUKI_DATABASE_URL is set");
+        Some(pool)
+    }
+
+    /// #14: `list_page` bounds to a LIMIT/OFFSET page, `count` returns the full
+    /// filtered total (SAME WHERE), and the unique `ORDER BY … id` keeps offset
+    /// pages disjoint. `list` (all rows, used by the aggregate handlers) is left
+    /// unpaged.
+    #[tokio::test]
+    async fn test_list_page_and_count_pagination() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let total = count(&pool, "").await.expect("count all");
+        assert!(total >= 6, "migration seeds >=6 hardware assets, got {total}");
+        let all = list_page(&pool, "", 10_000, 0)
+            .await
+            .expect("list_page all");
+        assert_eq!(
+            all.len() as i64,
+            total,
+            "#14: count matches the full unpaged set"
+        );
+        // `list` (all rows) agrees with the large page — the aggregate path is intact.
+        assert_eq!(
+            list(&pool, "").await.expect("list all").len(),
+            all.len(),
+            "list (aggregate path) returns the same rows as an unbounded page"
+        );
+
+        // Site-filtered count matches the site page (GBLON has seeded assets).
+        let gblon_total = count(&pool, "GBLON").await.expect("count GBLON");
+        assert!(gblon_total >= 3, "GBLON has >=3 seeded assets");
+        let gblon = list_page(&pool, "GBLON", 10_000, 0)
+            .await
+            .expect("list_page GBLON");
+        assert_eq!(
+            gblon.len() as i64,
+            gblon_total,
+            "#14: site-filtered count matches the site page"
+        );
+
+        // LIMIT bounds the page; OFFSET advances it disjointly under ORDER BY id.
+        let page1 = list_page(&pool, "", 4, 0).await.expect("page1");
+        let page2 = list_page(&pool, "", 4, 4).await.expect("page2");
+        assert_eq!(page1.len(), 4, "LIMIT 4 bounds the first page");
+        assert!(!page2.is_empty(), "second page continues (>=6 assets)");
+        assert!(
+            page1.iter().all(|a| page2.iter().all(|b| b.id != a.id)),
+            "offset page is disjoint from the first (stable id order)"
+        );
+    }
 }
