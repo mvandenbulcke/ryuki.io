@@ -173,6 +173,24 @@ pub fn LoginView() -> impl IntoView {
                                     </div>
                                 }
                                     .into_any()
+                            } else if mode == "mock-dry-run" {
+                                // The API's development default: every request
+                                // runs as a static admin session, so there are
+                                // no credentials to collect. Offer the same
+                                // labeled preview entry as static builds
+                                // instead of the unrecognized-mode dead end.
+                                view! {
+                                    <div class="login-static-note">
+                                        <span class="eyebrow">"Development mode"</span>
+                                        <p>
+                                            "The platform API is running in mock-dry-run mode and does not authenticate requests. Continue with the labeled development session."
+                                        </p>
+                                        <button class="login-link" on:click=on_continue_preview>
+                                            "Continue with the development session"
+                                        </button>
+                                    </div>
+                                }
+                                    .into_any()
                             } else if mode == "local" {
                                 // Local-auth mode is the expected, fully working
                                 // path: the form above signs in against local
