@@ -3,8 +3,8 @@
 //! Mutation functions (`insert`, `transition`) accept either a `PgPool`
 //! reference (standalone call) or a `&mut PgConnection` (caller-owned tx) so
 //! that handlers can compose the repo mutation and an audit row atomically.
-//! Read functions (`get`, `list`) remain `&PgPool`-only. Callers are
-//! responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Read functions (`get`, `list_page`, `count`) remain `&PgPool`-only. Callers
+//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
 //!
 //! # Audit parameter
 //! `transition` accepts an `_audit_action: Option<&str>` parameter for
@@ -64,7 +64,7 @@ pub async fn scheduled_waves_for_overdue_scan(
 // ─── Row struct ──────────────────────────────────────────────────────────────
 
 /// The DB-managed `created_at`/`updated_at` columns are not part of the
-/// `PatchWave` model, so they are not selected/decoded here. `list` still
+/// `PatchWave` model, so they are not selected/decoded here. `list_page` still
 /// orders by `created_at` in SQL (a column need not be in the SELECT list to be
 /// ordered by).
 #[derive(sqlx::FromRow)]
@@ -246,15 +246,92 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PatchWave>, sqlx::Err
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all patch waves ordered by creation time descending.
-pub async fn list(pool: &PgPool) -> Result<Vec<PatchWave>, sqlx::Error> {
-    let rows: Vec<PatchWaveRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM patch_waves ORDER BY created_at DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Build the per-axis TARGET-SET scope predicate (#2/#14) shared by
+/// [`list_page`] and [`count`] so a page and its total can never drift apart.
+///
+/// A wave's `site_scope`/`environment_scope` are JSONB arrays (its targeting),
+/// so this is the SQL push-down of the handler's old in-memory
+/// `multi_scope_permits` retain: `None` = the principal is unrestricted on
+/// that axis → no predicate; `Some(scopes)` = the wave's array on that axis
+/// must be NON-EMPTY (an empty target list means "all" and fails closed for a
+/// scoped caller) and contained in `scopes`
+/// (`jsonb_array_length > 0 AND axis <@ scopes`). Containment compares entries
+/// EXACTLY; the handler passes trimmed scope entries, so this only diverges
+/// from the in-memory `r.trim()` comparison for a whitespace-padded PERSISTED
+/// target entry — never produced by the wave create/validate path and strictly
+/// narrower (hides, never leaks) if hand-seeded. Predicates are built PER
+/// BRANCH — never a `($n IS NULL OR ...)` over the column (the generic-plan
+/// seq-scan trap). Column names are compile-time literals; every value is a
+/// bound parameter (injection-safe).
+fn scope_preds(
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> (String, Vec<String>) {
+    let mut preds: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(s) = sites {
+        binds.push(serde_json::to_string(s).unwrap_or_else(|_| "[]".into()));
+        preds.push(format!(
+            "(jsonb_array_length(site_scope) > 0 AND site_scope <@ ${}::jsonb)",
+            binds.len()
+        ));
+    }
+    if let Some(e) = environments {
+        binds.push(serde_json::to_string(e).unwrap_or_else(|_| "[]".into()));
+        preds.push(format!(
+            "(jsonb_array_length(environment_scope) > 0 AND environment_scope <@ ${}::jsonb)",
+            binds.len()
+        ));
+    }
+    let clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+    (clause, binds)
+}
 
+/// One `LIMIT`/`OFFSET` page of patch waves (#14), creation time descending,
+/// with the principal's multi-target scope pushed into SQL — the paged
+/// replacement for the old fetch-all `list` + in-memory `multi_scope_permits`
+/// retain. `ORDER BY created_at DESC, id DESC` ends in the unique PK, so equal
+/// timestamps still yield a stable, non-overlapping page cut.
+pub async fn list_page(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PatchWave>, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!(
+        "SELECT {COLUMNS} FROM patch_waves{where_clause} \
+         ORDER BY created_at DESC, id DESC LIMIT ${} OFFSET ${}",
+        binds.len() + 1,
+        binds.len() + 2
+    );
+    let mut q = sqlx::query_as::<_, PatchWaveRow>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count patch waves under the SAME scope predicate as [`list_page`] — the
+/// pagination total (`X-Total-Count`).
+pub async fn count(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> Result<i64, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!("SELECT COUNT(*) FROM patch_waves{where_clause}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    q.fetch_one(pool).await
 }
 
 /// Atomically transition a patch wave to its new state IFF its current DB

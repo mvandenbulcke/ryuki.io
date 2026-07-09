@@ -6,7 +6,7 @@
 //! # Immutability
 //! Coverage reports are immutable once generated — there is no `transition` fn.
 //! `insert` persists the model and returns the DB-authoritative row; `get` and
-//! `list` provide read access.
+//! `list_page`/`count` provide read access.
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::models::{BackupCoverageReport, CoverageReportStatus};
@@ -218,13 +218,90 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<BackupCoverageReport>
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all coverage reports ordered by generation time descending.
-pub async fn list(pool: &PgPool) -> Result<Vec<BackupCoverageReport>, sqlx::Error> {
-    let rows: Vec<BackupCoverageReportRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM backup_coverage_reports ORDER BY generation_time DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Build the per-axis TARGET-SET scope predicate (#2/#14) shared by
+/// [`list_page`] and [`count`] so a page and its total can never drift apart.
+///
+/// A coverage report's `site_scope`/`environment_scope` are JSONB arrays (the
+/// report's footprint), so this is the SQL push-down of the handler's old
+/// in-memory `multi_scope_permits` retain: `None` = the principal is
+/// unrestricted on that axis → no predicate; `Some(scopes)` = the report's
+/// array on that axis must be NON-EMPTY (an empty footprint means "all" and
+/// fails closed for a scoped caller) and contained in `scopes`
+/// (`jsonb_array_length > 0 AND axis <@ scopes`). Containment compares entries
+/// EXACTLY; the handler passes trimmed scope entries, so this only diverges
+/// from the in-memory `r.trim()` comparison for a whitespace-padded PERSISTED
+/// entry — impossible via the create path (entries are validated site codes)
+/// and strictly narrower (hides, never leaks) if hand-seeded. Predicates are
+/// built PER BRANCH — never a `($n IS NULL OR ...)` over the column (the
+/// generic-plan seq-scan trap). Column names are compile-time literals; every
+/// value is a bound parameter (injection-safe).
+fn scope_preds(
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> (String, Vec<String>) {
+    let mut preds: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(s) = sites {
+        binds.push(serde_json::to_string(s).unwrap_or_else(|_| "[]".into()));
+        preds.push(format!(
+            "(jsonb_array_length(site_scope) > 0 AND site_scope <@ ${}::jsonb)",
+            binds.len()
+        ));
+    }
+    if let Some(e) = environments {
+        binds.push(serde_json::to_string(e).unwrap_or_else(|_| "[]".into()));
+        preds.push(format!(
+            "(jsonb_array_length(environment_scope) > 0 AND environment_scope <@ ${}::jsonb)",
+            binds.len()
+        ));
+    }
+    let clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+    (clause, binds)
+}
 
+/// One `LIMIT`/`OFFSET` page of coverage reports (#14), generation time
+/// descending, with the principal's multi-target scope pushed into SQL — the
+/// paged replacement for the old fetch-all `list` + in-memory
+/// `multi_scope_permits` retain. `ORDER BY generation_time DESC, id DESC` ends
+/// in the unique PK, so equal timestamps still yield a stable page cut.
+pub async fn list_page(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<BackupCoverageReport>, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!(
+        "SELECT {COLUMNS} FROM backup_coverage_reports{where_clause} \
+         ORDER BY generation_time DESC, id DESC LIMIT ${} OFFSET ${}",
+        binds.len() + 1,
+        binds.len() + 2
+    );
+    let mut q = sqlx::query_as::<_, BackupCoverageReportRow>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count coverage reports under the SAME scope predicate as [`list_page`] —
+/// the pagination total (`X-Total-Count`).
+pub async fn count(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> Result<i64, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!("SELECT COUNT(*) FROM backup_coverage_reports{where_clause}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    q.fetch_one(pool).await
 }

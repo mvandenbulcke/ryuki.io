@@ -210,15 +210,80 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<RestoreRequest>, sqlx
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all restore requests ordered by creation time descending.
-pub async fn list(pool: &PgPool) -> Result<Vec<RestoreRequest>, sqlx::Error> {
-    let rows: Vec<RestoreRequestRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM restore_requests ORDER BY created_at DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Build the per-axis scope predicate (#2/#14) shared by [`list_page`] and
+/// [`count`] so a page and its total can never drift apart.
+///
+/// `None` = unrestricted on that axis (per `scope_permits`, a LITERALLY empty
+/// scope vec) → no predicate. `Some(values)` = `col = ANY(values)`; the handler
+/// passes trimmed, distinct entries, keeping blanks — an all-blank scope
+/// matches no real site/environment (fail closed), exactly like the old
+/// in-memory `row_scope_permits` filter. Predicates are built PER BRANCH —
+/// never a `($n IS NULL OR col = $n)` over an indexed column, which degrades
+/// to a seq scan under a generic prepared plan. Column names are compile-time
+/// literals; every value is a bound parameter (injection-safe).
+fn scope_preds(
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> (String, Vec<Vec<String>>) {
+    let mut preds: Vec<String> = Vec::new();
+    let mut binds: Vec<Vec<String>> = Vec::new();
+    if let Some(s) = sites {
+        binds.push(s.to_vec());
+        preds.push(format!("target_site = ANY(${})", binds.len()));
+    }
+    if let Some(e) = environments {
+        binds.push(e.to_vec());
+        preds.push(format!("target_environment = ANY(${})", binds.len()));
+    }
+    let clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+    (clause, binds)
+}
 
+/// One `LIMIT`/`OFFSET` page of restore requests (#14), creation time
+/// descending, with the principal's DUAL-AXIS scope pushed into SQL — the paged
+/// replacement for the old fetch-all `list` + in-memory `row_scope_permits`
+/// retain. `ORDER BY created_at DESC, id DESC` ends in the unique PK, so equal
+/// timestamps still yield a stable, non-overlapping page cut.
+pub async fn list_page(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RestoreRequest>, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!(
+        "SELECT {COLUMNS} FROM restore_requests{where_clause} \
+         ORDER BY created_at DESC, id DESC LIMIT ${} OFFSET ${}",
+        binds.len() + 1,
+        binds.len() + 2
+    );
+    let mut q = sqlx::query_as::<_, RestoreRequestRow>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count restore requests under the SAME scope predicate as [`list_page`] —
+/// the pagination total (`X-Total-Count`).
+pub async fn count(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    environments: Option<&[String]>,
+) -> Result<i64, sqlx::Error> {
+    let (where_clause, binds) = scope_preds(sites, environments);
+    let sql = format!("SELECT COUNT(*) FROM restore_requests{where_clause}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    q.fetch_one(pool).await
 }
 
 /// One protected system's restore-test recency aggregate (#47).

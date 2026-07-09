@@ -8747,23 +8747,48 @@ async fn patch_reboot(
     Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
 
-/// List all persisted patch waves (read surface). Returns an empty list when no
-/// database is configured (demo mode), matching the other read-only GETs.
-async fn patch_waves_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
-    if let Some(pool) = get_db() {
-        let waves = crate::repos::patch_waves::list(pool)
+/// Dedicated pagination query for GET /api/maintain/patch/waves (#14) —
+/// endpoint-local rather than a shared struct, so another handler's params can
+/// never bleed into this list's contract (the 400-regression class).
+#[derive(Debug, Deserialize)]
+struct PatchWaveListQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// List persisted patch waves (read surface), paged (#14). Returns an empty
+/// list when no database is configured (demo mode), matching the other
+/// read-only GETs. The body stays a BARE array (backward-compatible); the
+/// scope-filtered total rides the `X-Total-Count` header.
+async fn patch_waves_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<PatchWaveListQuery>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let Some(pool) = get_db() else {
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
+    };
+    // #2: a scoped principal only sees waves whose entire targeting is within
+    // its scope (env-scoped principals see none of the cross-env waves) — the
+    // old in-memory `multi_scope_permits` retain, pushed INTO SQL (#14) so a
+    // LIMIT/OFFSET page and the total both reflect the scope-filtered set.
+    let sites = multi_scope_axis_sql_filter(&session.site_scope);
+    let envs = multi_scope_axis_sql_filter(&session.environment_scope);
+    let waves =
+        crate::repos::patch_waves::list_page(pool, sites.as_deref(), envs.as_deref(), limit, offset)
             .await
             .map_err(db_error)?;
-        // #2: a scoped principal only sees waves whose entire targeting is within
-        // its scope (env-scoped principals see none of the cross-env waves).
-        let waves: Vec<_> = waves
-            .into_iter()
-            .filter(|w| multi_scope_permits(&session, &w.site_scope, &w.environment_scope))
-            .collect();
-        return Ok(Json(serde_json::to_value(&waves).unwrap_or_default()));
-    }
-    Ok(Json(
-        serde_json::to_value(Vec::<serde_json::Value>::new()).unwrap_or_default(),
+    let total = crate::repos::patch_waves::count(pool, sites.as_deref(), envs.as_deref())
+        .await
+        .map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(&waves).unwrap_or_default()),
     ))
 }
 
@@ -25313,24 +25338,56 @@ async fn backup_restore_execute(
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
-/// GET /api/protect/backup/restores — list all persisted restore requests.
-/// Returns an empty array when no DB is available rather than an error.
-async fn backup_restores_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+/// Dedicated pagination query for GET /api/protect/backup/restores (#14) —
+/// endpoint-local rather than a shared struct, so another handler's params can
+/// never bleed into this list's contract (the 400-regression class).
+#[derive(Debug, Deserialize)]
+struct BackupRestoreListQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// GET /api/protect/backup/restores — list persisted restore requests, paged
+/// (#14). Returns an empty array when no DB is available rather than an error.
+/// The body stays a BARE array (backward-compatible); the scope-filtered total
+/// rides the `X-Total-Count` header.
+async fn backup_restores_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<BackupRestoreListQuery>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(serde_json::Value::Array(vec![])));
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
     };
-    let records = crate::repos::restore_requests::list(pool)
-        .await
-        .map_err(db_error)?;
     // #2 dual-axis list filter: keep only rows whose (target_site, target_environment)
     // are both within the principal's scope. An unrestricted principal keeps all
-    // (row_scope_permits is true when a scope axis is empty); a principal scoped on
-    // one axis keeps rows matching that axis and unrestricted on the other.
-    let records: Vec<_> = records
-        .into_iter()
-        .filter(|r| row_scope_permits(&session, &r.target_site, &r.target_environment))
-        .collect();
-    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+    // (scope_permits is unrestricted only for a LITERALLY empty axis); a principal
+    // scoped on one axis keeps rows matching that axis and unrestricted on the
+    // other — the old in-memory `row_scope_permits` retain, pushed INTO SQL (#14)
+    // so a LIMIT/OFFSET page and the total both reflect the scope-filtered set.
+    let sites = scope_axis_sql_filter(&session.site_scope);
+    let envs = scope_axis_sql_filter(&session.environment_scope);
+    let records = crate::repos::restore_requests::list_page(
+        pool,
+        sites.as_deref(),
+        envs.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    .map_err(db_error)?;
+    let total = crate::repos::restore_requests::count(pool, sites.as_deref(), envs.as_deref())
+        .await
+        .map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(&records).unwrap_or_default()),
+    ))
 }
 
 /// GET /api/protect/backup/restores/{id} — fetch a single restore request by id.
@@ -25455,23 +25512,56 @@ async fn backup_restore_test_recency(
     })))
 }
 
-/// GET /api/protect/backup/coverage-reports — list all persisted coverage reports.
-/// Returns an empty array when no DB is available rather than an error.
-async fn backup_coverage_reports_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+/// Dedicated pagination query for GET /api/protect/backup/coverage-reports
+/// (#14) — endpoint-local rather than a shared struct, so another handler's
+/// params can never bleed into this list's contract (the 400-regression class).
+#[derive(Debug, Deserialize)]
+struct BackupCoverageReportListQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// GET /api/protect/backup/coverage-reports — list persisted coverage reports,
+/// paged (#14). Returns an empty array when no DB is available rather than an
+/// error. The body stays a BARE array (backward-compatible); the
+/// scope-filtered total rides the `X-Total-Count` header.
+async fn backup_coverage_reports_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<BackupCoverageReportListQuery>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(serde_json::Value::Array(vec![])));
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
     };
-    let records = crate::repos::backup_coverage_reports::list(pool)
-        .await
-        .map_err(db_error)?;
     // #2: keep only reports whose (site_scope, environment_scope) footprint is
-    // contained in the principal's authority — an unrestricted principal keeps all;
-    // a scoped principal drops all-sites/all-envs and out-of-scope reports.
-    let records: Vec<_> = records
-        .into_iter()
-        .filter(|r| multi_scope_permits(&session, &r.site_scope, &r.environment_scope))
-        .collect();
-    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+    // contained in the principal's authority — an unrestricted principal keeps
+    // all; a scoped principal drops all-sites/all-envs and out-of-scope reports.
+    // The old in-memory `multi_scope_permits` retain, pushed INTO SQL (#14) so a
+    // LIMIT/OFFSET page and the total both reflect the scope-filtered set.
+    let sites = multi_scope_axis_sql_filter(&session.site_scope);
+    let envs = multi_scope_axis_sql_filter(&session.environment_scope);
+    let records = crate::repos::backup_coverage_reports::list_page(
+        pool,
+        sites.as_deref(),
+        envs.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    .map_err(db_error)?;
+    let total =
+        crate::repos::backup_coverage_reports::count(pool, sites.as_deref(), envs.as_deref())
+            .await
+            .map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(&records).unwrap_or_default()),
+    ))
 }
 
 /// GET /api/protect/backup/coverage-reports/{id} — fetch a single coverage report by id.
@@ -25720,26 +25810,59 @@ fn list_site_scope(session: &AuthSession) -> ListSiteScope {
     {
         return ListSiteScope::Empty;
     }
-    // Mirror `scope_permits` EXACTLY: it is unrestricted ONLY when the scope Vec is
-    // LITERALLY empty (`scopes.is_empty()`). A non-empty-but-all-blank scope set is
-    // NOT unrestricted there — it matches only a (nonexistent) blank site — so we
-    // must NOT collapse it to `All`, or we'd widen an empty result to every site.
-    if session.site_scope.is_empty() {
-        return ListSiteScope::All;
+    match scope_axis_sql_filter(&session.site_scope) {
+        None => ListSiteScope::All,
+        Some(sites) => ListSiteScope::Sites(sites),
     }
-    // Non-empty scope set: trimmed, distinct membership (matches scope_permits'
-    // `s.trim() == req` comparison on the scope side). Kept even if it trims to a
-    // blank — `site = ANY('{""}')` matches nothing, which is the fail-closed
-    // equivalent of the old in-memory filter. Real tokens never carry blanks
-    // (parse_token_scope strips them), so in practice this is the held site list.
-    let mut sites: Vec<String> = session
-        .site_scope
-        .iter()
-        .map(|s| s.trim().to_string())
-        .collect();
-    sites.sort();
-    sites.dedup();
-    ListSiteScope::Sites(sites)
+}
+
+/// #14: ONE axis of the SQL scope filter for a DUAL-AXIS row list (rows keyed
+/// on a concrete site + environment, e.g. a restore request's `target_site` /
+/// `target_environment`) — the paged push-down of one `scope_permits` axis of
+/// `row_scope_permits`, and the shared `Sites` arm of [`list_site_scope`].
+///
+/// Mirrors `scope_permits` EXACTLY: `None` (unrestricted, no predicate) ONLY
+/// when the scope Vec is LITERALLY empty (`scopes.is_empty()`). A
+/// non-empty-but-all-blank scope set is NOT unrestricted there — it matches
+/// only a (nonexistent) blank value — so it must NOT collapse to `None`, or an
+/// empty result would widen to every row. `Some(entries)` = `col =
+/// ANY(entries)`: trimmed, distinct membership (matches scope_permits'
+/// `s.trim() == req` comparison on the scope side). Entries are kept even if
+/// they trim to a blank — `= ANY('{""}')` matches nothing real, the
+/// fail-closed equivalent of the old in-memory filter. Real tokens never carry
+/// blanks (parse_token_scope strips them), so in practice this is the held
+/// scope list.
+fn scope_axis_sql_filter(scope: &[String]) -> Option<Vec<String>> {
+    if scope.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<String> = scope.iter().map(|s| s.trim().to_string()).collect();
+    entries.sort();
+    entries.dedup();
+    Some(entries)
+}
+
+/// #14: ONE axis of the SQL scope filter for a TARGET-SET list (rows whose
+/// `site_scope`/`environment_scope` are arrays, e.g. patch waves and backup
+/// coverage reports) — the paged push-down of one [`within_multi_scope`] axis.
+///
+/// Mirrors `within_multi_scope` EXACTLY — whose emptiness law deliberately
+/// DIFFERS from `scope_permits`: an axis is unrestricted (`None`) when every
+/// principal entry trims to blank, INCLUDING an all-blank non-empty vec (the
+/// `principal.iter().all(|s| s.trim().is_empty())` arm). Faithful push-down,
+/// not policy change — the by-id reads guard with the same
+/// `multi_scope_permits`, so the list and the GET must agree. `Some(entries)`
+/// = the row's target array must be non-empty and contained in `entries`
+/// (trimmed, distinct, blanks kept — a blank principal entry can only ever
+/// match a literally-blank persisted target entry).
+fn multi_scope_axis_sql_filter(scope: &[String]) -> Option<Vec<String>> {
+    if scope.iter().all(|s| s.trim().is_empty()) {
+        return None;
+    }
+    let mut entries: Vec<String> = scope.iter().map(|s| s.trim().to_string()).collect();
+    entries.sort();
+    entries.dedup();
+    Some(entries)
 }
 
 /// Body-scope guard for a DUAL-axis WRITE (#2): a scoped principal may only
@@ -46597,7 +46720,14 @@ mod db_lifecycle_tests {
                 .await
                 .expect("read defra wave status");
         // List is filtered to in-scope waves.
-        let listed = patch_waves_list(AuthExtractor(gblon)).await;
+        let listed = patch_waves_list(
+            AuthExtractor(gblon),
+            Query(PatchWaveListQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await;
 
         // Env-axis: a principal scoped to a different ENVIRONMENT is denied.
         let mut staging = AuthSession::static_dry_run();
@@ -46657,7 +46787,7 @@ mod db_lifecycle_tests {
             "unrestricted patch_wave_get must pass: {read_any:?}"
         );
         let listed_json = match listed {
-            Ok(Json(v)) => v.to_string(),
+            Ok((_, Json(v))) => v.to_string(),
             other => panic!("patch_waves_list must succeed: {other:?}"),
         };
         assert!(
@@ -62548,6 +62678,177 @@ mod patch_waves_db_tests {
             "transition with stale expected status must return false (CAS mismatch)"
         );
     }
+
+    /// #14: `patch_waves_list` pushes the multi-target scope into SQL and pages
+    /// it. Verifies, against IDENTICAL-`created_at` seeds (so only the unique
+    /// `id DESC` tie-breaker orders them): the `X-Total-Count` totals per scope,
+    /// exact offset-slice equality, the multi_scope containment matrix (partial
+    /// target out-of-scope EXCLUDED, empty target list excluded for a scoped
+    /// caller, duplicate target entries still contained, all-blank scope =
+    /// unrestricted per `within_multi_scope`), and SQL ≡ in-memory
+    /// `multi_scope_permits` on every seed.
+    #[tokio::test]
+    async fn patch_waves_list_paginates_and_scopes_totals() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Independent baseline for the unrestricted total: a raw table count.
+        let baseline: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves")
+            .fetch_one(pool)
+            .await
+            .expect("raw baseline");
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let site = format!("PAGSITE-{suffix}");
+        let other = format!("PAGSITE-OTHER-{suffix}");
+        // (label, site_scope) — env_scope is ["production"] on every seed. The
+        // unique site token isolates the scoped result set completely, so the
+        // expected totals below are independent ground truth, not the impl's
+        // own count echoed back.
+        let targets: [(&str, Vec<String>); 6] = [
+            ("a", vec![site.clone()]),
+            ("b", vec![site.clone()]),
+            ("c", vec![site.clone()]),
+            // Partial target out of scope: {site, other} ⊄ {site}.
+            ("partial-out", vec![site.clone(), other.clone()]),
+            // Empty target list = "all sites" → fails closed for a scoped caller.
+            ("empty-scope", Vec::new()),
+            // Duplicate entries must still be contained (adversarial seed).
+            ("dup", vec![site.clone(), site.clone()]),
+        ];
+        let mut seeded: Vec<(String, Vec<String>)> = Vec::new();
+        for (label, site_scope) in &targets {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO patch_waves \
+                 (id, site, os_family, status, name, site_scope, environment_scope, \
+                  schedule, created_at) \
+                 VALUES ($1::uuid, $2, 'linux', 'Draft', $3, $4::jsonb, \
+                         '[\"production\"]'::jsonb, \
+                         '{\"start\":\"2099-01-01T00:00:00Z\",\"end\":\"2099-01-01T04:00:00Z\",\
+                           \"maintenance_window\":\"Sat 00:00-04:00\",\"patch_group\":null}'::jsonb, \
+                         '2031-03-03T03:03:03Z')",
+            )
+            .bind(&id)
+            .bind(&site)
+            .bind(format!("pag14-{label}-{suffix}"))
+            .bind(serde_json::to_string(site_scope).expect("scope json"))
+            .execute(pool)
+            .await
+            .expect("seed patch wave");
+            seeded.push((id, site_scope.clone()));
+        }
+
+        let session_for = |sites: Vec<String>, envs: Vec<String>| {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = sites;
+            s.environment_scope = envs;
+            s
+        };
+        let list = |s: AuthSession, limit: Option<i64>, offset: Option<i64>| async move {
+            let (h, Json(body)) =
+                patch_waves_list(AuthExtractor(s), Query(PatchWaveListQuery { limit, offset }))
+                    .await
+                    .expect("patch_waves_list must succeed");
+            let total = h
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .expect("X-Total-Count header")
+                .to_string();
+            let ids: Vec<String> = body
+                .as_array()
+                .expect("bare array body")
+                .iter()
+                .map(|w| w["id"].as_str().expect("wave id").to_string())
+                .collect();
+            (total, ids)
+        };
+
+        // Scoped principal {site} x {production}: sees a, b, c, dup — the
+        // partial-out and empty-scope waves are excluded.
+        let scoped = || session_for(vec![site.clone()], vec!["production".into()]);
+        let (total, full) = list(scoped(), None, None).await;
+        assert_eq!(total, "4", "scoped X-Total-Count must be exactly the 4 contained seeds");
+        // Identical created_at on every seed → the order is the unique id DESC
+        // tie-breaker alone (uuid text order matches Postgres uuid byte order).
+        let mut expected: Vec<String> = [0usize, 1, 2, 5]
+            .iter()
+            .map(|&i| seeded[i].0.clone())
+            .collect();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(full, expected, "scoped full page must be exactly id DESC over the ties");
+        // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
+        for (id, site_scope) in &seeded {
+            let permitted =
+                multi_scope_permits(&scoped(), site_scope, &["production".to_string()]);
+            assert_eq!(
+                full.contains(id),
+                permitted,
+                "SQL visibility must equal multi_scope_permits for {site_scope:?}"
+            );
+        }
+        // Exact offset slices under the tie-breaker; the total never changes.
+        let (t1, page1) = list(scoped(), Some(2), Some(0)).await;
+        let (t2, page2) = list(scoped(), Some(2), Some(2)).await;
+        assert_eq!((t1.as_str(), t2.as_str()), ("4", "4"), "limit/offset must not change the total");
+        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(page2, expected[2..4], "page 2 must be the exact next slice");
+        assert!(
+            page1.iter().all(|id| !page2.contains(id)),
+            "pages must not overlap under the stable tie-breaker"
+        );
+
+        // Multi-scope principal {site, other}: the partial-out wave is now
+        // contained too (its whole target set is held).
+        let (total, ids) = list(
+            session_for(vec![site.clone(), other.clone()], vec!["production".into()]),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(total, "5", "multi-scope principal must also see the {{site,other}} wave");
+        assert!(ids.contains(&seeded[3].0), "partial-out wave must be visible to the wider scope");
+
+        // Env-scoped elsewhere: nothing matches (waves target production only).
+        let (total, ids) = list(
+            session_for(vec![site.clone()], vec![format!("PAGENV-{suffix}")]),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((total.as_str(), ids.len()), ("0", 0), "env-mismatch must see none");
+
+        // All-blank scope vec: within_multi_scope treats it as UNRESTRICTED on
+        // that axis (unlike scope_permits' literal-emptiness law) — the by-id
+        // GET guards with the same predicate, so the list must agree.
+        let (blank_total, blank_ids) =
+            list(session_for(vec!["".into(), " ".into()], vec!["".into()]), None, None).await;
+        let (unrestricted_total, unrestricted_ids) =
+            list(AuthSession::static_dry_run(), None, None).await;
+        assert_eq!(
+            unrestricted_total,
+            (baseline + 6).to_string(),
+            "unrestricted X-Total-Count must equal the independent raw count"
+        );
+        assert_eq!(
+            blank_total, unrestricted_total,
+            "all-blank multi-scope must be unrestricted (within_multi_scope law)"
+        );
+        for i in [3usize, 4] {
+            assert!(
+                unrestricted_ids.contains(&seeded[i].0) && blank_ids.contains(&seeded[i].0),
+                "unrestricted/all-blank must see the partial-out and empty-scope waves"
+            );
+        }
+
+        for (id, _) in &seeded {
+            cleanup(pool, id).await;
+        }
+    }
 }
 
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api snapshots_db_tests
@@ -63379,11 +63680,16 @@ mod backup_restore_db_tests {
         );
 
         // The scoped list excludes the GBLON restore.
-        let listed = backup_restores_list(AuthExtractor(scoped()))
-            .await
-            .expect("list");
+        let (_, Json(listed)) = backup_restores_list(
+            AuthExtractor(scoped()),
+            Query(BackupRestoreListQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list");
         let ids: Vec<String> = listed
-            .0
             .as_array()
             .unwrap_or(&vec![])
             .iter()
@@ -63829,6 +64135,298 @@ mod backup_restore_db_tests {
             applied.is_none(),
             "transition with stale expected status must return None (CAS mismatch)"
         );
+    }
+
+    /// #14: `backup_restores_list` pushes the dual-axis `row_scope_permits`
+    /// filter into SQL and pages it. Verifies, against IDENTICAL-`created_at`
+    /// seeds (so only the unique `id DESC` tie-breaker orders them): the
+    /// `X-Total-Count` totals per scope, exact offset-slice equality, the
+    /// per-axis scope matrix (site-only, env-only, dual, multi-site), the
+    /// `scope_permits` emptiness law (all-blank scope FAILS CLOSED), and
+    /// SQL ≡ in-memory `row_scope_permits` on every seed.
+    #[tokio::test]
+    async fn backup_restores_list_paginates_and_scopes_totals() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Independent baseline for the unrestricted total: a raw table count.
+        let baseline: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM restore_requests")
+            .fetch_one(pool)
+            .await
+            .expect("raw baseline");
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let site = format!("RSITE-{suffix}");
+        let other_site = format!("RSITE-OTHER-{suffix}");
+        let env = format!("RENV-{suffix}");
+        let other_env = format!("RENV-OTHER-{suffix}");
+        // Unique tokens isolate the scoped result sets completely, so the
+        // expected totals below are independent ground truth.
+        let targets: [(&str, &str); 5] = [
+            (&site, &env),
+            (&site, &env),
+            (&site, &env),
+            (&site, &other_env),  // env axis out for the dual-scoped principal
+            (&other_site, &env),  // site axis out for the dual-scoped principal
+        ];
+        let mut seeded: Vec<(String, String, String)> = Vec::new();
+        for (t_site, t_env) in targets {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO restore_requests \
+                 (id, source_ci_key, restore_type, restore_point, target_site, \
+                  target_environment, owner, status, created_at) \
+                 VALUES ($1::uuid, $2, 'FullVm', 'rp-1', $3, $4, 'pag14-owner', 'Draft', \
+                         '2031-03-03T03:03:03Z')",
+            )
+            .bind(&id)
+            .bind(format!("ci-pag14-{suffix}"))
+            .bind(t_site)
+            .bind(t_env)
+            .execute(pool)
+            .await
+            .expect("seed restore request");
+            seeded.push((id, t_site.to_string(), t_env.to_string()));
+        }
+
+        let session_for = |sites: Vec<String>, envs: Vec<String>| {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = sites;
+            s.environment_scope = envs;
+            s
+        };
+        let list = |s: AuthSession, limit: Option<i64>, offset: Option<i64>| async move {
+            let (h, Json(body)) = backup_restores_list(
+                AuthExtractor(s),
+                Query(BackupRestoreListQuery { limit, offset }),
+            )
+            .await
+            .expect("backup_restores_list must succeed");
+            let total = h
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .expect("X-Total-Count header")
+                .to_string();
+            let ids: Vec<String> = body
+                .as_array()
+                .expect("bare array body")
+                .iter()
+                .map(|r| r["id"].as_str().expect("restore id").to_string())
+                .collect();
+            (total, ids)
+        };
+
+        // Dual-scoped principal {site} x {env}: sees the 3 fully-matching rows.
+        let dual = || session_for(vec![site.clone()], vec![env.clone()]);
+        let (total, full) = list(dual(), None, None).await;
+        assert_eq!(total, "3", "dual-scoped X-Total-Count must be exactly the 3 matching seeds");
+        // Identical created_at on every seed → the order is the unique id DESC
+        // tie-breaker alone (uuid text order matches Postgres uuid byte order).
+        let mut expected: Vec<String> = seeded[0..3].iter().map(|(id, _, _)| id.clone()).collect();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(full, expected, "dual-scoped full page must be exactly id DESC over the ties");
+        // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
+        for (id, t_site, t_env) in &seeded {
+            assert_eq!(
+                full.contains(id),
+                row_scope_permits(&dual(), t_site, t_env),
+                "SQL visibility must equal row_scope_permits for ({t_site}, {t_env})"
+            );
+        }
+        // Exact offset slices under the tie-breaker; the total never changes.
+        let (t1, page1) = list(dual(), Some(2), Some(0)).await;
+        let (t2, page2) = list(dual(), Some(2), Some(2)).await;
+        assert_eq!((t1.as_str(), t2.as_str()), ("3", "3"), "limit/offset must not change the total");
+        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(page2, expected[2..3], "page 2 must be the exact next slice");
+        assert!(
+            page1.iter().all(|id| !page2.contains(id)),
+            "pages must not overlap under the stable tie-breaker"
+        );
+
+        // Site-scoped only (env unrestricted): both envs of the site are visible.
+        let (total, ids) = list(session_for(vec![site.clone()], Vec::new()), None, None).await;
+        assert_eq!(total, "4", "site-only scope must include both of the site's envs");
+        assert!(ids.contains(&seeded[3].0) && !ids.contains(&seeded[4].0));
+
+        // Env-scoped only (site unrestricted): both sites of the env are visible.
+        let (total, ids) = list(session_for(Vec::new(), vec![env.clone()]), None, None).await;
+        assert_eq!(total, "4", "env-only scope must include both of the env's sites");
+        assert!(ids.contains(&seeded[4].0) && !ids.contains(&seeded[3].0));
+
+        // Multi-site principal + env filter: the other-site row is in scope too.
+        let (total, ids) = list(
+            session_for(vec![site.clone(), other_site.clone()], vec![env.clone()]),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(total, "4", "multi-site scope must include the other site's row");
+        assert!(ids.contains(&seeded[4].0));
+
+        // scope_permits emptiness law: an all-blank (non-empty) scope vec is NOT
+        // unrestricted — it matches no real site, so the list FAILS CLOSED.
+        let (total, ids) =
+            list(session_for(vec!["".into(), " ".into()], Vec::new()), None, None).await;
+        assert_eq!((total.as_str(), ids.len()), ("0", 0), "all-blank scope must fail closed");
+
+        // Unrestricted total == the independent raw count.
+        let (total, _) = list(AuthSession::static_dry_run(), None, None).await;
+        assert_eq!(
+            total,
+            (baseline + 5).to_string(),
+            "unrestricted X-Total-Count must equal the independent raw count"
+        );
+
+        for (id, _, _) in &seeded {
+            cleanup_restore(pool, id).await;
+        }
+    }
+
+    /// #14: `backup_coverage_reports_list` pushes the multi-target scope into
+    /// SQL and pages it. Verifies, against IDENTICAL-`generation_time` seeds
+    /// (so only the unique `id DESC` tie-breaker orders them): the
+    /// `X-Total-Count` totals per scope, exact offset-slice equality, the
+    /// containment matrix (partial footprint out-of-scope EXCLUDED, empty
+    /// footprint excluded for a scoped caller), and SQL ≡ in-memory
+    /// `multi_scope_permits` on every seed.
+    #[tokio::test]
+    async fn backup_coverage_reports_list_paginates_and_scopes_totals() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Independent baseline for the unrestricted total: a raw table count.
+        let baseline: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_coverage_reports")
+            .fetch_one(pool)
+            .await
+            .expect("raw baseline");
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let site = format!("CSITE-{suffix}");
+        let other = format!("CSITE-OTHER-{suffix}");
+        // env_scope is ["production"] on every seed; the unique site token
+        // isolates the scoped result set, so the totals are ground truth.
+        let footprints: [Vec<String>; 5] = [
+            vec![site.clone()],
+            vec![site.clone()],
+            vec![site.clone()],
+            vec![site.clone(), other.clone()], // partial footprint out of scope
+            Vec::new(),                        // empty footprint = "all" → fails closed when scoped
+        ];
+        let mut seeded: Vec<(String, Vec<String>)> = Vec::new();
+        for footprint in &footprints {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO backup_coverage_reports \
+                 (id, site_scope, environment_scope, generation_time, status) \
+                 VALUES ($1::uuid, $2::jsonb, '[\"production\"]'::jsonb, \
+                         '2031-03-03T03:03:03Z', 'Generated')",
+            )
+            .bind(&id)
+            .bind(serde_json::to_string(footprint).expect("footprint json"))
+            .execute(pool)
+            .await
+            .expect("seed coverage report");
+            seeded.push((id, footprint.clone()));
+        }
+
+        let session_for = |sites: Vec<String>, envs: Vec<String>| {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = sites;
+            s.environment_scope = envs;
+            s
+        };
+        let list = |s: AuthSession, limit: Option<i64>, offset: Option<i64>| async move {
+            let (h, Json(body)) = backup_coverage_reports_list(
+                AuthExtractor(s),
+                Query(BackupCoverageReportListQuery { limit, offset }),
+            )
+            .await
+            .expect("backup_coverage_reports_list must succeed");
+            let total = h
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .expect("X-Total-Count header")
+                .to_string();
+            let ids: Vec<String> = body
+                .as_array()
+                .expect("bare array body")
+                .iter()
+                .map(|r| r["id"].as_str().expect("report id").to_string())
+                .collect();
+            (total, ids)
+        };
+
+        // Scoped principal {site} x {production}: only the 3 fully-contained
+        // reports — the partial and empty footprints are excluded.
+        let scoped = || session_for(vec![site.clone()], vec!["production".into()]);
+        let (total, full) = list(scoped(), None, None).await;
+        assert_eq!(total, "3", "scoped X-Total-Count must be exactly the 3 contained seeds");
+        // Identical generation_time on every seed → the order is the unique
+        // id DESC tie-breaker alone.
+        let mut expected: Vec<String> = seeded[0..3].iter().map(|(id, _)| id.clone()).collect();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(full, expected, "scoped full page must be exactly id DESC over the ties");
+        // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
+        for (id, footprint) in &seeded {
+            let permitted =
+                multi_scope_permits(&scoped(), footprint, &["production".to_string()]);
+            assert_eq!(
+                full.contains(id),
+                permitted,
+                "SQL visibility must equal multi_scope_permits for {footprint:?}"
+            );
+        }
+        // Exact offset slices under the tie-breaker; the total never changes.
+        let (t1, page1) = list(scoped(), Some(2), Some(0)).await;
+        let (t2, page2) = list(scoped(), Some(2), Some(2)).await;
+        assert_eq!((t1.as_str(), t2.as_str()), ("3", "3"), "limit/offset must not change the total");
+        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(page2, expected[2..3], "page 2 must be the exact next slice");
+
+        // Wider principal {site, other}: the partial footprint is contained too.
+        let (total, ids) = list(
+            session_for(vec![site.clone(), other.clone()], vec!["production".into()]),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(total, "4", "multi-scope principal must also see the {{site,other}} report");
+        assert!(ids.contains(&seeded[3].0));
+
+        // Env-scoped elsewhere: nothing matches (all footprints are production).
+        let (total, ids) = list(
+            session_for(vec![site.clone()], vec![format!("CENV-{suffix}")]),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((total.as_str(), ids.len()), ("0", 0), "env-mismatch must see none");
+
+        // Unrestricted total == the independent raw count; the empty-footprint
+        // report is visible only here (a scoped caller never contains "all").
+        let (total, ids) = list(AuthSession::static_dry_run(), None, None).await;
+        assert_eq!(
+            total,
+            (baseline + 5).to_string(),
+            "unrestricted X-Total-Count must equal the independent raw count"
+        );
+        assert!(
+            ids.contains(&seeded[4].0),
+            "unrestricted must see the empty-footprint report"
+        );
+
+        for (id, _) in &seeded {
+            cleanup_report(pool, id).await;
+        }
     }
 }
 
