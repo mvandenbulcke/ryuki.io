@@ -23,7 +23,7 @@
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-<link rel="preload" as="image" href="/assets/ryu.png">
+<link rel="preload" as="image" href="/assets/ryu.webp" type="image/webp">
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"SoftwareApplication","name":"Ryuki","url":"https://ryuki.io/","applicationCategory":"DeveloperApplication","operatingSystem":"Linux, Kubernetes","description":"Open-source, Rust-powered governed control plane for multi-site datacenter infrastructure.","license":"https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE","sameAs":["https://github.com/mvandenbulcke/ryuki.io"],"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
 </script>
@@ -176,7 +176,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   overflow:hidden;
 }
 /* ── Hero backdrop: the hidden ryū ────────────────────────
-   The dragon (ivory line art on alpha, /assets/ryu.png) is
+   The dragon (ivory line art on alpha, /assets/ryu.webp) is
    layered twice: a faint base and a gold-recolored copy seen
    through a soft-edged radial mask. On load the gold lights up
    from the center and expands to the sides, then fades; after
@@ -194,7 +194,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .dragon-art::before,
 .dragon-art::after{
   content:"";position:absolute;inset:0;
-  background:url("/assets/ryu.png") center/contain no-repeat;
+  background:url("/assets/ryu.webp") center/contain no-repeat;
 }
 .dragon-art::before{opacity:var(--ryu-base-opacity);filter:invert(1)}
 .dragon-art::after{
