@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ryuki — Governed Infrastructure Control Plane</title>
+<title>Ryuki · Governed Infrastructure Control Plane</title>
 <meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable, dry-run-first workflows with 17 provider adapters: VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
 <link rel="canonical" href="https://ryuki.io/">
 <meta name="theme-color" content="#0b0d12">
@@ -11,11 +11,11 @@
 <!-- Open Graph / Twitter -->
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ryuki.io/">
-<meta property="og:title" content="Ryuki — Governed Infrastructure Control Plane">
+<meta property="og:title" content="Ryuki · Governed Infrastructure Control Plane">
 <meta property="og:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure. Request, operate, evidence, and retire — with audit-ready evidence at every stage.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Ryuki — Governed Infrastructure Control Plane">
+<meta name="twitter:title" content="Ryuki · Governed Infrastructure Control Plane">
 <meta name="twitter:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure.">
 <meta name="twitter:image" content="https://ryuki.io/assets/og.jpg">
 
@@ -77,7 +77,7 @@ section[id]{scroll-margin-top:76px}
   --card-border:   #232936;
   --card-shadow:   0 1px 3px rgba(0,0,0,.35);
   --card-shadow-hover:0 14px 32px -10px rgba(0,0,0,.55),0 0 0 1px rgba(226,93,93,.07);
-  --header-bg:     rgba(11,13,18,.86);
+  --header-bg:     #0b0d12;
   --logo-red:      #c0392b;
   --logo-gold:     #FFD700;
   --dragon-line:   rgba(255,255,255,.09);
@@ -86,7 +86,6 @@ section[id]{scroll-margin-top:76px}
   --tag-bg:        #2c1717;
   --tag-text:      #dda3a3;
   --section-alt:   #0e1117;
-  --gradient-text: linear-gradient(110deg,#f0876f 0%,#eab308 55%,#FFD700 100%);
   --pill-border:   #4a2424;
 }
 
@@ -114,7 +113,6 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .site-header{
   position:sticky;top:0;z-index:100;
   background:var(--header-bg);
-  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
   border-bottom:1px solid transparent;
   transition:background var(--transition),border-color var(--transition),box-shadow var(--transition);
 }
@@ -256,11 +254,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   max-width:820px;margin:0 auto 1.25rem;
   text-wrap:balance;
 }
-.hero h1 .grad{
-  background:var(--gradient-text);
-  -webkit-background-clip:text;background-clip:text;
-  -webkit-text-fill-color:transparent;color:transparent;
-}
+.hero h1 .grad{color:#eab308}
 .hero .tagline{
   font-size:1.1rem;color:var(--text-secondary);
   max-width:660px;margin:0 auto 2.4rem;line-height:1.7;
@@ -283,12 +277,12 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   background:var(--grad-accent);color:#fff;border:1px solid transparent;
   box-shadow:0 4px 16px -4px var(--accent-glow);
 }
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 10px 26px -6px var(--accent-glow)}
+.btn-primary:hover{box-shadow:0 8px 22px -6px var(--accent-glow)}
 .btn-primary:hover .arrow{transform:translateX(3px)}
 .btn-secondary{
   background:var(--card-bg);color:var(--text);border:1px solid var(--border-strong);
 }
-.btn-secondary:hover{transform:translateY(-2px);border-color:var(--accent);color:var(--accent);box-shadow:var(--card-shadow)}
+.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
 
 /* ── Stats band ─────────────────────────────────────────── */
 .stats{border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:0;background:var(--section-alt);transition:background var(--transition),border-color var(--transition)}
@@ -305,9 +299,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .stat-value{
   font-size:2.3rem;font-weight:800;letter-spacing:-.03em;line-height:1.1;
   font-variant-numeric:tabular-nums;
-  background:var(--gradient-text);
-  -webkit-background-clip:text;background-clip:text;
-  -webkit-text-fill-color:transparent;color:transparent;
+  color:#eab308;
 }
 .stat-label{font-size:.82rem;font-weight:500;color:var(--text-muted);margin-top:.35rem}
 
@@ -338,33 +330,15 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   content:"";position:absolute;top:0;left:0;right:0;height:2px;
   background:var(--grad-accent);opacity:0;transition:opacity var(--transition);
 }
-.feature-card:hover{transform:translateY(-4px);box-shadow:var(--card-shadow-hover);border-color:var(--border-strong)}
+.feature-card:hover{border-color:var(--border-strong)}
 .feature-card:hover::before{opacity:1}
-/* fine pointers get a 3D tilt driven by --rx/--ry from the script */
-.js.fine .feature-card{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
-.js.fine .feature-card:hover{
-  --lift:-4px;
-  transition:transform .12s ease,box-shadow var(--transition),border-color var(--transition),background var(--transition);
-}
-/* spotlight ring that follows the cursor along the card border */
-.js .feature-card::after{
-  content:"";position:absolute;inset:-1px;border-radius:var(--radius);
-  padding:1.5px;pointer-events:none;opacity:0;
-  background:radial-gradient(220px circle at var(--mx,50%) var(--my,50%),var(--accent) 0%,transparent 70%);
-  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-  -webkit-mask-composite:xor;
-  mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-  mask-composite:exclude;
-  transition:opacity .4s ease;
-}
-.js .feature-card:hover::after{opacity:1}
 .feature-icon{
   width:42px;height:42px;border-radius:var(--radius-sm);
   background:var(--accent-bg);color:var(--accent);
   display:flex;align-items:center;justify-content:center;margin-bottom:1.05rem;
   transition:background var(--transition),color var(--transition),transform var(--transition);
 }
-.feature-card:hover .feature-icon{background:var(--grad-accent);color:#fff;transform:scale(1.06)}
+.feature-card:hover .feature-icon{background:var(--grad-accent);color:#fff}
 .feature-card h3{font-size:.98rem;font-weight:700;letter-spacing:-.01em;margin-bottom:.45rem}
 .feature-card p{font-size:.86rem;color:var(--text-secondary);line-height:1.55}
 .feature-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.85rem}
@@ -423,9 +397,6 @@ section.alt .stage{background:var(--section-alt)}
   content:"";height:1px;flex:1;
   background-image:repeating-linear-gradient(90deg,var(--border-strong) 0 6px,transparent 6px 12px);
 }
-.stage.planned{border-style:dashed;opacity:.65}
-.stage.planned:hover{opacity:1}
-.js .stage.planned{animation:none}
 .js .pipeline.quiet .stage{animation:none}
 .js .pipeline.quiet::before{animation:none;background-position:-30% 0}
 .js .stage.active{
@@ -479,7 +450,7 @@ section.alt .stage{background:var(--section-alt)}
   display:flex;align-items:center;justify-content:center;
 }
 .arch-node .node-icon svg{width:17px;height:17px}
-.arch-node h4{font-size:.86rem;font-weight:700;letter-spacing:-.01em}
+.arch-node h3{font-size:.86rem;font-weight:700;letter-spacing:-.01em}
 .arch-node p{font-size:.7rem;color:var(--text-muted);margin-top:.15rem;line-height:1.45}
 .arch-link{
   flex:none;width:54px;display:flex;align-items:center;position:relative;align-self:center;height:2px;
@@ -622,35 +593,26 @@ section.alt .stage{background:var(--section-alt)}
 /* ── CTA ────────────────────────────────────────────────── */
 .cta-panel{
   position:relative;overflow:hidden;text-align:center;
-  background:linear-gradient(155deg,#101c33 0%,#16294d 55%,#1b2440 100%);
-  border:1px solid #27395e;border-radius:18px;
+  background:var(--card-bg);
+  border:1px solid var(--card-border);border-radius:18px;
   padding:4.2rem 2rem;
 }
 .cta-panel::before{
   content:"";position:absolute;inset:0;
   background-image:
-    linear-gradient(rgba(125,170,230,.07) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(125,170,230,.07) 1px,transparent 1px);
+    linear-gradient(rgba(226,93,93,.05) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(226,93,93,.05) 1px,transparent 1px);
   background-size:40px 40px;
   -webkit-mask-image:radial-gradient(ellipse 75% 90% at 50% 110%,#000 30%,transparent 75%);
   mask-image:radial-gradient(ellipse 75% 90% at 50% 110%,#000 30%,transparent 75%);
 }
-.cta-glow{
-  position:absolute;width:560px;height:280px;left:50%;top:-150px;transform:translateX(-50%);
-  background:radial-gradient(ellipse,rgba(95,168,236,.32),transparent 65%);
-  filter:blur(40px);pointer-events:none;
-}
-.js .cta-glow{animation:ctaGlow 7s ease-in-out infinite alternate}
-@keyframes ctaGlow{to{opacity:.55;transform:translateX(-50%) translateY(22px) scale(1.07)}}
 .cta-panel .mark{width:52px;height:52px;margin:0 auto 1.3rem;position:relative}
 .cta-panel h2{
   position:relative;font-size:clamp(1.5rem,3vw,2.1rem);font-weight:800;
-  letter-spacing:-.025em;color:#f2f6fc;margin-bottom:.7rem;
+  letter-spacing:-.025em;color:var(--text);margin-bottom:.7rem;
 }
-.cta-panel p{position:relative;color:#9fb1cd;font-size:.98rem;max-width:520px;margin:0 auto 2.1rem}
+.cta-panel p{position:relative;color:var(--text-secondary);font-size:.98rem;max-width:520px;margin:0 auto 2.1rem}
 .cta-panel .btn-group{position:relative;display:flex;gap:.9rem;justify-content:center;flex-wrap:wrap}
-.cta-panel .btn-secondary{background:rgba(255,255,255,.05);border-color:#37496e;color:#dce6f5}
-.cta-panel .btn-secondary:hover{border-color:#e0a050;color:#fff}
 
 /* ── Footer ─────────────────────────────────────────────── */
 .site-footer{
@@ -787,7 +749,7 @@ section.alt .stage{background:var(--section-alt)}
       <span class="hero-pill fx" style="--d:.15s"><span class="dot"></span>Open source &middot; Rust-powered &middot; MIT licensed</span>
     </div>
     <h1 class="fx" style="--d:.25s">The <span class="grad">governed control plane</span> for multi&#8209;site infrastructure</h1>
-    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong> &mdash; live execution is operator&#8209;gated.</p>
+    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong>; live execution is operator&#8209;gated.</p>
     <div class="hero-links fx" style="--d:.55s">
       <a href="/getting-started.html" class="btn btn-primary">
         Get Started
@@ -805,19 +767,19 @@ section.alt .stage{background:var(--section-alt)}
 <div class="stats">
   <div class="stats-grid">
     <div class="stat">
-      <div class="stat-value" data-count="13">13</div>
+      <div class="stat-value">13</div>
       <div class="stat-label">Governed lifecycle stages</div>
     </div>
     <div class="stat">
-      <div class="stat-value" data-count="17">17</div>
+      <div class="stat-value">17</div>
       <div class="stat-label">Provider adapters</div>
     </div>
     <div class="stat">
-      <div class="stat-value" data-count="110" data-suffix="+">110+</div>
+      <div class="stat-value">110+</div>
       <div class="stat-label">Catalog contracts</div>
     </div>
     <div class="stat">
-      <div class="stat-value" data-count="3900" data-suffix="+">3,900+</div>
+      <div class="stat-value">3,900+</div>
       <div class="stat-label">Tests in CI</div>
     </div>
   </div>
@@ -829,7 +791,7 @@ section.alt .stage{background:var(--section-alt)}
     <div>
       <div class="section-label">Features</div>
       <h2 class="section-title">Everything your platform team operates</h2>
-      <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure &mdash; governed by default, evidenced at every step. Each workflow plans, validates, and records its change against the named providers in a <strong>dry-run-first</strong> model; live provider execution is opt-in and operator-gated.</p>
+      <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure: governed by default, evidenced at every step. Each workflow plans, validates, and records its change against the named providers in a <strong>dry-run-first</strong> model; live provider execution is opt-in and operator-gated.</p>
     </div>
     <div class="features-grid">
 
@@ -838,7 +800,7 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         </div>
         <h3>VM Lifecycle</h3>
-        <p>Provision, resize, migrate, and retire VMs across six hypervisors &mdash; with capacity governance and placement policies per cluster.</p>
+        <p>Provision, resize, migrate, and retire VMs across six hypervisors, with capacity governance and placement policies per cluster.</p>
         <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span><span class="tag">Nutanix AHV</span><span class="tag">Xen</span><span class="tag">KVM</span></div>
       </div>
 
@@ -847,7 +809,7 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         </div>
         <h3>Monitoring &amp; Alerting</h3>
-        <p>Host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts &mdash; on the monitoring stack you already run.</p>
+        <p>Host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts, on the monitoring stack you already run.</p>
         <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">Prometheus</span><span class="tag">Datadog</span><span class="tag">Grafana</span><span class="tag">SolarWinds</span></div>
       </div>
 
@@ -856,7 +818,7 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </div>
         <h3>Backup &amp; Recovery</h3>
-        <p>Backup coverage tracking, restore testing, DR orchestration, and repository health across sites &mdash; whichever backup platform protects them.</p>
+        <p>Backup coverage tracking, restore testing, DR orchestration, and repository health across sites, whichever backup platform protects them.</p>
         <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">Commvault</span><span class="tag">Rubrik</span><span class="tag">Cohesity</span><span class="tag">NetBackup</span></div>
       </div>
 
@@ -865,7 +827,7 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
         </div>
         <h3>CMDB &amp; Inventory</h3>
-        <p>CMDB governance: CI reconciliation, drift tracking, and import/export &mdash; with dry-run publish to ServiceNow (no live CMDB write until the integration is enabled).</p>
+        <p>CMDB governance: CI reconciliation, drift tracking, and import/export, with dry-run publish to ServiceNow (no live CMDB write until the integration is enabled).</p>
         <div class="feature-tags"><span class="tag">ServiceNow</span><span class="tag">Excel</span><span class="tag">Graph</span></div>
       </div>
 
@@ -914,8 +876,8 @@ section.alt .stage{background:var(--section-alt)}
   <div class="container">
     <div>
       <div class="section-label">Request Lifecycle</div>
-      <h2 class="section-title">Thirteen governed stages. Zero blind spots.</h2>
-      <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline — from draft through completion, then into the post-completion lifecycle of protect, publish, maintain, and retire. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
+      <h2 class="section-title">Thirteen governed stages</h2>
+      <p class="section-subtitle">Every infrastructure request flows through the same pipeline, from draft through completion and into the post-completion lifecycle of protect, publish, maintain, and retire. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
     </div>
     <div class="pipeline-wrap">
       <ol class="pipeline">
@@ -944,7 +906,7 @@ section.alt .stage{background:var(--section-alt)}
       </button>
     </div>
     <p class="pipeline-detail" id="pipeline-detail" aria-live="polite">Select a stage to see what it governs.</p>
-    <p class="pipeline-note">A failed request is terminal and keeps its full evidence trail. Break-glass emergency changes follow the same pipeline &mdash; <code>no bypass on evidence</code>.</p>
+    <p class="pipeline-note">A failed request is terminal and keeps its full evidence trail. Break-glass emergency changes follow the same pipeline: <code>no bypass on evidence</code>.</p>
   </div>
 </section>
 
@@ -954,31 +916,31 @@ section.alt .stage{background:var(--section-alt)}
     <div>
       <div class="section-label">Architecture</div>
       <h2 class="section-title">Full-stack Rust control plane</h2>
-      <p class="section-subtitle">SSR portal behind a same-origin boundary, a governed API, and a domain engine &mdash; with secrets isolated in Vault. The browser never talks to a provider directly.</p>
+      <p class="section-subtitle">SSR portal behind a same-origin boundary, a governed API, and a domain engine, with secrets isolated in Vault. The browser never talks to a provider directly.</p>
     </div>
 
     <div class="arch-diagram">
       <div class="arch-node">
         <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-        <h4>Browser</h4>
+        <h3>Browser</h3>
         <p>Ingress over TLS only</p>
       </div>
       <div class="arch-link" aria-hidden="true"></div>
       <div class="arch-node">
         <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>
-        <h4>Portal UI</h4>
+        <h3>Portal UI</h3>
         <p>Leptos / Axum SSR, same-origin boundary</p>
       </div>
       <div class="arch-link" aria-hidden="true"></div>
       <div class="arch-node">
         <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
-        <h4>Platform API</h4>
+        <h3>Platform API</h3>
         <p>Axum, Entra ID SSO, request lifecycle</p>
       </div>
       <div class="arch-link" aria-hidden="true"></div>
       <div class="arch-node">
         <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="m6.3 6.3 2.9 2.9"/><path d="M2 12h4"/><path d="m6.3 17.7 2.9-2.9"/><path d="M12 22v-4"/><path d="m17.7 17.7-2.9-2.9"/><path d="M22 12h-4"/><path d="m17.7 6.3-2.9 2.9"/><circle cx="12" cy="12" r="2"/></svg></div>
-        <h4>Engine</h4>
+        <h3>Engine</h3>
         <p>Domain models, evidence, adapters</p>
       </div>
     </div>
@@ -999,7 +961,7 @@ section.alt .stage{background:var(--section-alt)}
         </div>
       </div>
     </div>
-    <p class="arch-caption">Provider access is brokered through the API alone &mdash; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
+    <p class="arch-caption">Provider access is brokered through the API alone; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
 
     <div class="arch-wrap">
     <table class="arch-table">
@@ -1010,7 +972,7 @@ section.alt .stage{background:var(--section-alt)}
         <tr>
           <td>portal-ui</td>
           <td>Rust / Leptos / Axum</td>
-          <td>Full-stack SSR portal with role-filtered navigation. Same-origin isolation &mdash; never calls provider APIs directly.</td>
+          <td>Full-stack SSR portal with role-filtered navigation. Same-origin isolation; it never calls provider APIs directly.</td>
         </tr>
         <tr>
           <td>ryuki-api</td>
@@ -1055,7 +1017,7 @@ section.alt .stage{background:var(--section-alt)}
         <tr>
           <td>Vault</td>
           <td>HashiCorp Vault</td>
-          <td>Secrets resolver for provider credentials &mdash; referenced by handle, never committed or logged. Vault-backed in production; a mock resolver runs by default.</td>
+          <td>Secrets resolver for provider credentials, referenced by handle, never committed or logged. Vault-backed in production; a mock resolver runs by default.</td>
         </tr>
       </tbody>
     </table>
@@ -1124,7 +1086,6 @@ section.alt .stage{background:var(--section-alt)}
 <section class="cta">
   <div class="container">
     <div class="cta-panel">
-      <div class="cta-glow" aria-hidden="true"></div>
       <svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
   <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
@@ -1133,7 +1094,7 @@ section.alt .stage{background:var(--section-alt)}
   <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
   <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
 </svg>
-      <h2>Ready to tame your infrastructure?</h2>
+      <h2>Run your infrastructure governed</h2>
       <p>Self-hosted, open source, audit-first. Deploy the control plane and bring governance to every request.</p>
       <div class="btn-group">
         <a href="/getting-started.html" class="btn btn-primary">
@@ -1206,35 +1167,6 @@ section.alt .stage{background:var(--section-alt)}
   onScroll();
 
   var reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  /* ── Stats count-up ── */
-  var stats=document.querySelectorAll('[data-count]');
-  function countUp(el){
-    var target=parseInt(el.getAttribute('data-count'),10);
-    var suffix=el.getAttribute('data-suffix')||'';
-    var dur=1400,start=null;
-    function step(now){
-      if(start===null)start=now;
-      var p=Math.min(1,(now-start)/dur);
-      var eased=1-Math.pow(1-p,3);
-      el.textContent=Math.round(target*eased)+suffix;
-      if(p<1)requestAnimationFrame(step);
-    }
-    requestAnimationFrame(step);
-  }
-  if(!('IntersectionObserver' in window)||reduced){
-    /* leave static values from markup */
-  }else{
-    var statsIo=new IntersectionObserver(function(entries){
-      entries.forEach(function(entry){
-        if(entry.isIntersecting){
-          countUp(entry.target);
-          statsIo.unobserve(entry.target);
-        }
-      });
-    },{threshold:.5});
-    stats.forEach(function(el){statsIo.observe(el)});
-  }
 
   /* ── Copy quick-start commands ── */
   var copyBtn=document.getElementById('copy-btn');
@@ -1400,19 +1332,19 @@ section.alt .stage{background:var(--section-alt)}
 
   /* ── Lifecycle pipeline: pick a stage to see what it governs ── */
   var stageInfo=[
-    'Drafted from a catalog offering &mdash; nothing executes yet.',
+    'Drafted from a catalog offering. Nothing executes yet.',
     'Request captured with owner, purpose, environment, and target site.',
     'Static checks against catalog contracts, naming, and capacity.',
     'Execution plan rendered with impact analysis and a rollback path.',
-    'Role-based approval chain &mdash; CAB-ready, fully attributed.',
+    'Role-based approval chain: CAB-ready, fully attributed.',
     'Change window locked, resources reserved, conflicts blocked.',
     'Adapters execute against approved provider endpoints only.',
     'Post-change health probes and configuration drift checks.',
     'Evidence pack sealed, CMDB reconciled, request closed.',
-    'Roadmap &mdash; backup coverage confirmed and monitoring enrolled after completion.',
-    'Roadmap &mdash; CMDB publication and service-catalog visibility for the delivered request.',
-    'Roadmap &mdash; patching, compliance, and ownership through the service life.',
-    'Roadmap &mdash; governed decommission: quarantine, final evidence, teardown.'
+    'Backup coverage confirmed after completion, dry-run first.',
+    'CMDB publication for the delivered request, dry-run until the integration is enabled.',
+    'Ongoing operations: patching, compliance, and ownership through the service life.',
+    'Governed decommission planned dry-run first: quarantine, final evidence, teardown plan.'
   ];
   var stages=document.querySelectorAll('.pipeline .stage');
   var detail=document.getElementById('pipeline-detail');
@@ -1440,7 +1372,7 @@ section.alt .stage{background:var(--section-alt)}
           li.classList.add('active');
           li.setAttribute('aria-pressed','true');
           var name=li.textContent.replace(/^\s*\d+\s*/,'').trim();
-          detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> &mdash; '+stageInfo[idx];
+          detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> · '+stageInfo[idx];
         }
         detail.classList.remove('swap');
       },150);
@@ -1468,7 +1400,7 @@ section.alt .stage{background:var(--section-alt)}
       tourBtn.addEventListener('click',function(){
         if(tourTimer!==null){stopTour();showStage(null);return}
         var i=0;
-        var tourLen=document.querySelectorAll('.pipeline .stage:not(.planned)').length;
+        var tourLen=document.querySelectorAll('.pipeline .stage').length;
         detail.setAttribute('aria-live','off');
         showStage(0);
         tourLabel.textContent='Stop the tour';
@@ -1711,21 +1643,6 @@ section.alt .stage{background:var(--section-alt)}
     });
   }
 
-  /* ── Feature cards: cursor ring + 3D tilt ── */
-  Array.prototype.forEach.call(document.querySelectorAll('.feature-card'),function(card){
-    card.addEventListener('mousemove',function(e){
-      var r=card.getBoundingClientRect();
-      var x=e.clientX-r.left,y=e.clientY-r.top;
-      card.style.setProperty('--mx',x+'px');
-      card.style.setProperty('--my',y+'px');
-      card.style.setProperty('--ry',(((x/r.width)-.5)*6).toFixed(2)+'deg');
-      card.style.setProperty('--rx',((.5-(y/r.height))*6).toFixed(2)+'deg');
-    },{passive:true});
-    card.addEventListener('mouseleave',function(){
-      card.style.setProperty('--rx','0deg');
-      card.style.setProperty('--ry','0deg');
-    });
-  });
 
   try{console.log('%c竜騎 Ryuki%c — the dragon is in the details. (psst: type "ryu")','font-weight:700;color:#c0392b','color:inherit')}catch(e){}
 })();
