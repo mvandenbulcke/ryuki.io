@@ -1391,7 +1391,7 @@ async fn advance_request_out_of_executing(
 
     // CAS: only advance if still `executing` (a concurrent transition wins
     // harmlessly — the job result is already durably recorded).
-    sqlx::query(
+    let advanced = sqlx::query(
         "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, updated_at = NOW() \
          WHERE id = $4 AND status = 'executing'",
     )
@@ -1400,7 +1400,52 @@ async fn advance_request_out_of_executing(
     .bind(&stages_json)
     .bind(request_id)
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
+
+    // The executing -> verifying/failed hop is driven by an EXTERNAL signed
+    // input (the agent's job result) and must appear in the hash-chained audit
+    // trail like every other transition. Recorded only when the CAS actually
+    // advanced — auditing a lost race would forge a transition that never
+    // happened. Actor is the machine identity of the agent whose result this
+    // is; no human session exists on this path.
+    if advanced == 1 {
+        let agent_id: Option<String> =
+            sqlx::query_scalar("SELECT agent_id FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let agent_principal = agent_id.as_deref().unwrap_or("unknown");
+        let actor = ryuki_engine::auth::AuthSession {
+            user_id: format!("agent:{agent_principal}"),
+            display_name: format!("Execution agent {agent_principal} (signed job result)"),
+            roles: Vec::new(),
+            token_valid: false,
+            provider_mode: "agent-result".to_string(),
+            ..Default::default()
+        };
+        let request_id_str = request_id.to_string();
+        crate::audit::record_audit_tx(
+            tx,
+            &actor,
+            &crate::audit::AuditRecord {
+                action: "request.execution-result",
+                request_id: Some(&request_id_str),
+                from_status: Some("executing"),
+                to_status: new_status,
+                from_stage: Some("execute"),
+                to_stage: new_stage,
+                detail: serde_json::json!({
+                    "agent_job_id": job_id.to_string(),
+                    "result_status": result_status_str,
+                    "evidence_digest": evidence_digest,
+                    "success": success,
+                }),
+                outcome: "applied",
+            },
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -11410,6 +11455,24 @@ mod tests {
             execute["metadata"]["agent_job_id"].is_string(),
             "execute stage records the agent job id"
         );
+
+        // The agent-driven hop must land in the hash-chained audit trail with
+        // machine-actor attribution (QA finding: this transition was the one
+        // unaudited status change in the whole lifecycle).
+        let (actor, from_status, to_status, outcome): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT actor_principal, from_status, to_status, outcome FROM audit_log \
+                 WHERE request_id = $1 AND action = 'request.execution-result' \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .expect("audit row for the executing -> verifying hop");
+        assert!(actor.starts_with("agent:"), "machine actor, got {actor}");
+        assert_eq!(from_status, "executing");
+        assert_eq!(to_status, "verifying");
+        assert_eq!(outcome, "applied");
 
         // A non-executing request is left untouched (CAS guard / skip path).
         sqlx::query("UPDATE requests SET status = 'completed' WHERE id = $1")
