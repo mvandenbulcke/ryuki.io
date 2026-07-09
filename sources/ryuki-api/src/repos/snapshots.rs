@@ -182,7 +182,9 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<SnapshotRecord>, sqlx
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all snapshots ordered by creation time descending.
+/// Return ALL snapshots ordered by creation time descending. Used by the
+/// stale-flagging sweep (`snapshot_flag_stale`), which must scan every snapshot;
+/// the paginated list endpoint uses [`list_page`] instead.
 pub async fn list(pool: &PgPool) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
     let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM snapshots ORDER BY created_at DESC, id DESC"
@@ -191,6 +193,33 @@ pub async fn list(pool: &PgPool) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
     .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// List snapshots bounded to one `LIMIT`/`OFFSET` page (#14). SEPARATE from
+/// [`list`] because the stale-flagging sweep needs every snapshot. The
+/// `ORDER BY created_at DESC, id DESC` ends in the unique `id`, so the page is a
+/// stable cut (no overlap/skip across pages with equal `created_at`).
+pub async fn list_page(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
+    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM snapshots ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
+    ))
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count all snapshots — the pagination total for [`list_page`].
+pub async fn count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
+        .fetch_one(pool)
+        .await
 }
 
 /// Atomically transition a snapshot to its new state IFF its current DB status

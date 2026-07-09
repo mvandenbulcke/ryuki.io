@@ -178,23 +178,51 @@ pub async fn get_share(pool: &PgPool, id: &str) -> Result<Option<FileShare>, sql
 
 /// Return all file shares, optionally filtered by site. An empty `site` returns
 /// all rows. Results are ordered by `site, unc_path` for stable output.
-pub async fn list_shares(pool: &PgPool, site: &str) -> Result<Vec<FileShare>, sqlx::Error> {
+pub async fn list_shares(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FileShare>, sqlx::Error> {
+    // `unc_path` is NOT unique (the same path can be seeded per site), so `id`
+    // (the PK) is appended as the tie-breaker — without it, LIMIT/OFFSET pages
+    // could overlap or skip rows sharing a `unc_path` (#14).
     let rows: Vec<FileShareRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {SHARE_COLUMNS} FROM file_shares ORDER BY site, unc_path"
+            "SELECT {SHARE_COLUMNS} FROM file_shares ORDER BY site, unc_path, id LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {SHARE_COLUMNS} FROM file_shares WHERE site = $1 ORDER BY unc_path"
+            "SELECT {SHARE_COLUMNS} FROM file_shares \
+             WHERE site = $1 ORDER BY unc_path, id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count file shares (optionally site-filtered) — the pagination total for
+/// [`list_shares`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count_shares(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM file_shares")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM file_shares WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Return all file shares whose `recertification_due` is at or before `now`,

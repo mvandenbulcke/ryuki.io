@@ -2432,6 +2432,9 @@ struct GmsaInventoryQuery {
 #[allow(dead_code)]
 struct SharesQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2639,6 +2642,9 @@ struct OutageNoticeCreateRequest {
 #[allow(dead_code)]
 struct OutageNoticeListQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4799,17 +4805,28 @@ async fn identity_file_share_ntfs() -> Json<Value> {
 async fn shares_list(
     AuthExtractor(session): AuthExtractor,
     Query(query): Query<SharesQuery>,
-) -> ApiResult {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // #2: scoped-site read ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let shares = match get_db() {
-        Some(pool) => crate::repos::file_share_ntfs::list_shares(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => Vec::new(),
+    // #14: bound the page; bare-array body + X-Total-Count (the total).
+    let limit = query.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (shares, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::file_share_ntfs::list_shares(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::file_share_ntfs::count_shares(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
-    Ok(Json(serde_json::to_value(shares).unwrap_or_default()))
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(shares).unwrap_or_default()),
+    ))
 }
 
 async fn shares_get(AuthExtractor(session): AuthExtractor, Path(id): Path<String>) -> ApiResult {
@@ -24793,14 +24810,24 @@ async fn snapshot_remediate(
 
 /// GET /api/protect/snapshot/records — list all persisted snapshots.
 /// Returns an empty array when no DB is available rather than an error.
-async fn snapshot_records_list() -> ApiResult {
+async fn snapshot_records_list(
+    Query(page): Query<AdminListPage>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page. Snapshots are a classic unbounded-growth log (one row
+    // per VM per snapshot cycle). Bare-array body + X-Total-Count (the total).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(serde_json::Value::Array(vec![])));
+        return Ok((total_count_headers(0), Json(serde_json::Value::Array(vec![]))));
     };
-    let records = crate::repos::snapshots::list(pool)
+    let records = crate::repos::snapshots::list_page(pool, limit, offset)
         .await
         .map_err(db_error)?;
-    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+    let total = crate::repos::snapshots::count(pool).await.map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(&records).unwrap_or_default()),
+    ))
 }
 
 /// GET /api/protect/snapshot/records/{id} — fetch a single snapshot by id.
@@ -29382,17 +29409,28 @@ async fn hardware_contract() -> Json<Value> {
 async fn outage_notices_list(
     AuthExtractor(session): AuthExtractor,
     Query(query): Query<OutageNoticeListQuery>,
-) -> ApiResult {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // #2: scoped-site read ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let notices = match get_db() {
-        Some(pool) => crate::repos::outage_comms::list(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => Vec::new(),
+    // #14: bound the page; bare-array body + X-Total-Count (the total).
+    let limit = query.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (notices, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::outage_comms::list(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::outage_comms::count(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
-    Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(notices).unwrap_or_default()),
+    ))
 }
 
 async fn outage_notices_create(
@@ -65508,7 +65546,7 @@ mod file_share_ntfs_db_tests {
             .await
             .expect("insert GBLON share failed");
 
-        let defra_shares = crate::repos::file_share_ntfs::list_shares(pool, "DEFRA")
+        let defra_shares = crate::repos::file_share_ntfs::list_shares(pool, "DEFRA", 1000, 0)
             .await
             .expect("list_shares DEFRA failed");
         assert!(
@@ -65519,6 +65557,21 @@ mod file_share_ntfs_db_tests {
             !defra_shares.iter().any(|s| s.id == id_gblon),
             "GBLON share must not appear in DEFRA filter"
         );
+
+        // #14: count matches the full site set; LIMIT bounds the page (the
+        // `unc_path, id` tie-breaker keeps pages stable when unc_path repeats).
+        let defra_count = crate::repos::file_share_ntfs::count_shares(pool, "DEFRA")
+            .await
+            .expect("count_shares DEFRA");
+        assert_eq!(
+            defra_count,
+            defra_shares.len() as i64,
+            "#14: count_shares matches the full site set"
+        );
+        let page1 = crate::repos::file_share_ntfs::list_shares(pool, "DEFRA", 1, 0)
+            .await
+            .expect("list_shares page1");
+        assert_eq!(page1.len(), 1, "#14: LIMIT 1 bounds the page");
 
         cleanup_share(pool, &id_defra).await;
         cleanup_share(pool, &id_gblon).await;

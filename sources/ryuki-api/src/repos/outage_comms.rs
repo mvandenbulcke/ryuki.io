@@ -124,24 +124,53 @@ impl OutageNoticeRow {
 
 // ─── Read functions ───────────────────────────────────────────────────────────
 
-/// List all notices, optionally filtered by site.
-pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<OutageNotice>, sqlx::Error> {
+/// List notices (optionally site-filtered), bounded to one `LIMIT`/`OFFSET`
+/// page (#14). `n.created_at DESC` alone is NOT unique, so `n.id DESC` is
+/// appended as a tie-breaker — without it, pages could overlap or skip rows
+/// sharing a `created_at`.
+pub async fn list(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<OutageNotice>, sqlx::Error> {
     let rows: Vec<OutageNoticeRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM outage_notices n ORDER BY n.created_at DESC"
+            "SELECT {COLUMNS} FROM outage_notices n \
+             ORDER BY n.created_at DESC, n.id DESC LIMIT $1 OFFSET $2"
         ))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM outage_notices n WHERE n.site = $1 ORDER BY n.created_at DESC"
+            "SELECT {COLUMNS} FROM outage_notices n WHERE n.site = $1 \
+             ORDER BY n.created_at DESC, n.id DESC LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?
     };
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count notices (optionally site-filtered) — the pagination total for [`list`],
+/// using the SAME `WHERE` so the count matches the paged set.
+pub async fn count(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM outage_notices")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM outage_notices WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Get a single notice by UUID string id. Malformed id → Ok(None).
@@ -436,14 +465,35 @@ mod outage_comms_db_tests {
         };
 
         // Migration 042 seeds 3 notices across DEFRA, GBLON, FRPAR.
-        let all = list(&pool, "").await.expect("list all");
+        let all = list(&pool, "", 1000, 0).await.expect("list all");
         assert!(all.len() >= 3, "migration 042 seeds 3 notices");
+        assert_eq!(
+            count(&pool, "").await.expect("count all"),
+            all.len() as i64,
+            "#14: count matches the full unpaged set"
+        );
 
-        let defra = list(&pool, "DEFRA").await.expect("list DEFRA");
+        let defra = list(&pool, "DEFRA", 1000, 0).await.expect("list DEFRA");
         assert!(!defra.is_empty());
         for n in &defra {
             assert_eq!(n.site, "DEFRA");
         }
+        assert_eq!(
+            count(&pool, "DEFRA").await.expect("count DEFRA"),
+            defra.len() as i64,
+            "#14: site-filtered count matches"
+        );
+
+        // #14 pagination: LIMIT bounds the page; OFFSET advances it disjointly
+        // under the unique `created_at DESC, id DESC` order.
+        let page1 = list(&pool, "", 2, 0).await.expect("page1");
+        let page2 = list(&pool, "", 2, 2).await.expect("page2");
+        assert_eq!(page1.len(), 2, "LIMIT 2 bounds the first page");
+        assert!(!page2.is_empty(), "second page continues (>=3 notices)");
+        assert!(
+            page1.iter().all(|a| page2.iter().all(|b| b.id != a.id)),
+            "offset page is disjoint from the first (stable id tie-breaker)"
+        );
     }
 
     #[tokio::test]
