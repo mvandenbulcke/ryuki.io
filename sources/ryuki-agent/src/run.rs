@@ -67,13 +67,14 @@ use uuid::Uuid;
 use crate::{
     classify::{classify_client_error, RetryClass},
     client::{ClientError, CpClient},
-    executor::{ExecError, JobExecutor},
+    executor::{Evidence, ExecError, JobExecutor},
     identity::AgentIdentity,
     live::evaluate_live_execution,
     live_exec::{LiveExecError, LiveExecutor},
     outbox::{Outbox, OutboxError},
     result::{build_refused_result, build_signed_result, ResultError},
 };
+use ryuki_engine::runners::RunStatus;
 use ryuki_protocol::{Job, JobMode};
 
 // ---------------------------------------------------------------------------
@@ -130,8 +131,8 @@ pub async fn process_job(
         .ack(job.id, lease.attempt_id, &lease.fencing_token)
         .await?;
 
-    // Step 2: execute.
-    let evidence = executor.execute(&job.spec)?;
+    // Step 2: execute (deterministic spec rejections become Failed evidence).
+    let evidence = evidence_or_deterministic_failure(executor, job)?;
 
     // Step 3: build once. result_id is the idempotency key for the outbox.
     // OfflineDryRun is the only mode supported by the current executor.
@@ -141,6 +142,49 @@ pub async fn process_job(
     // Steps 4-6: enqueue BEFORE the network POST, then POST, then mark delivered.
     // Delegate to the shared helper that live and offline paths both use.
     enqueue_and_post(client, outbox, job, body).await
+}
+
+/// Execute the spec, converting DETERMINISTIC spec-level rejections into
+/// signed-able `Failed` evidence instead of propagating an error.
+///
+/// An unsupported mode, an offering with no embedded IaC, or an IaC digest
+/// mismatch can never succeed on retry: propagating those as errors posts NO
+/// result, so the CP lease-expires the job through every attempt into
+/// DeadLettered while the parent request sits `executing` forever (QA
+/// finding). Reporting them as a `Failed` result lets the CP fail the request
+/// cleanly through the normal backlink. Runner errors keep the retry path:
+/// they may be transient host trouble, and execution may have started.
+///
+/// The rejection strings carry only spec-level data (mode, offering slug,
+/// digest hex) — no credentials exist on this pre-execution path.
+fn evidence_or_deterministic_failure(
+    executor: &dyn JobExecutor,
+    job: &Job,
+) -> Result<Evidence, AgentError> {
+    match executor.execute(&job.spec) {
+        Ok(evidence) => Ok(evidence),
+        Err(err @ (ExecError::UnsupportedMode(_) | ExecError::PlanBuild(_))) => {
+            warn!(
+                job_id = %job.id,
+                error = %err,
+                "job spec deterministically rejected — reporting a Failed result \
+                 (retry can never succeed)"
+            );
+            let summary = serde_json::json!({
+                "status": "Failed",
+                "summary": format!("job spec rejected by agent: {err}"),
+                "deterministic_rejection": true,
+            });
+            let evidence_bytes = serde_json::to_vec(&summary)
+                .unwrap_or_else(|_| br#"{"status":"Failed"}"#.to_vec());
+            Ok(Evidence {
+                status: RunStatus::Failed,
+                evidence_bytes,
+                evidence_json: Some(summary),
+            })
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,6 +1980,64 @@ mod tests {
             ),
             "LiveDestroy + digest must be refused: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deterministic spec-rejection → Failed evidence (poison-offering fix)
+    // -----------------------------------------------------------------------
+
+    /// An executor that always fails with the given constructor's error class.
+    struct FailingExecutor(fn() -> ExecError);
+
+    impl JobExecutor for FailingExecutor {
+        fn execute(&self, _spec: &ryuki_protocol::JobSpec) -> Result<Evidence, ExecError> {
+            Err((self.0)())
+        }
+    }
+
+    /// No-IaC / bad-slug class rejections become Failed evidence with the
+    /// deterministic marker, so a result IS posted and the request fails
+    /// cleanly instead of the job dead-lettering while it wedges.
+    #[test]
+    fn plan_build_rejection_becomes_failed_evidence() {
+        let exec = FailingExecutor(|| {
+            ExecError::PlanBuild("no embedded Terraform IaC for offering 'x'".into())
+        });
+        let job = make_leased_job();
+        let evidence =
+            evidence_or_deterministic_failure(&exec, &job).expect("deterministic → evidence");
+        assert_eq!(evidence.status, RunStatus::Failed);
+        let json = evidence.evidence_json.expect("structured evidence");
+        assert_eq!(json["deterministic_rejection"], true);
+        assert!(
+            json["summary"].as_str().unwrap().contains("rejected by agent"),
+            "summary names the rejection"
+        );
+    }
+
+    /// Unsupported mode is equally deterministic.
+    #[test]
+    fn unsupported_mode_rejection_becomes_failed_evidence() {
+        let exec = FailingExecutor(|| ExecError::UnsupportedMode(JobMode::LivePlan));
+        let job = make_leased_job();
+        let evidence =
+            evidence_or_deterministic_failure(&exec, &job).expect("deterministic → evidence");
+        assert_eq!(evidence.status, RunStatus::Failed);
+    }
+
+    /// Runner errors are NOT converted — they keep the retry/lease-expiry path
+    /// (execution may have started; a result must not claim otherwise).
+    #[test]
+    fn runner_error_still_propagates() {
+        let exec = FailingExecutor(|| {
+            ExecError::Runner(ryuki_engine::runners::RunnerError::Spawn(
+                "spawn failed".to_string(),
+            ))
+        });
+        let job = make_leased_job();
+        let err = evidence_or_deterministic_failure(&exec, &job)
+            .expect_err("runner errors must propagate");
+        assert!(matches!(err, AgentError::Exec(ExecError::Runner(_))));
     }
 
     // -----------------------------------------------------------------------
