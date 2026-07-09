@@ -50,16 +50,29 @@ Refusals and results are durable: the agent enqueues every result to a local out
 
 ## Credentials never reach the control plane
 
-The credential seam is `RYUKI_LIVE_CRED_<NAME>` environment variables on the agent host; today no bundle declares secret variables, so wiring real provider credentials is an operator step, not something the platform does implicitly. The Terraform subprocess runs with a minimal environment allowlist (`PATH`, `HOME`, `TMPDIR`, locale); nothing is passed through implicitly, and all command output is scrubbed before it becomes signed evidence.
+Provider credentials live on the agent host, never on the control plane. Each offering declares the secret variables it needs; the vSphere server-deployment offerings declare `VSPHERE_USER`, `VSPHERE_PASSWORD`, and `VSPHERE_SERVER`. For each declared name `<NAME>`, set `RYUKI_LIVE_CRED_<NAME>` on the agent. Before any Terraform runs, the agent resolves the declared set and refuses fail-closed if one is missing or empty, reporting a signed refusal that names the variable but never its value.
 
-Control-plane side, the grant-signing key lives at `RYUKI_CP_SIGNING_KEY_PATH` (default `cp-signing.key`), created with mode `0600` on first boot.
+For a live run, the agent injects only the declared names — plus their `TF_VAR_<lowercase>` aliases, since the bundles route credentials through `var.vsphere_*` — into the Terraform subprocess, on top of a minimal allowlist (`PATH`, `HOME`, `TMPDIR`, locale). Dry-runs receive no credentials at all, enforced at both the agent and the runner API boundary. All command output is scrubbed before it becomes signed evidence.
+
+Control-plane side, integration connections can resolve credential handles through Vault (`VAULT_ADDR` / `VAULT_TOKEN`; handles are `<mount>/<path>[#<field>]`) or a mock resolver by default — see [Configuration](configuration.md). The grant-signing key lives at `RYUKI_CP_SIGNING_KEY_PATH` (default `cp-signing.key`), created `0600` on first boot.
 
 ## Auto-teardown on failed multi-step runs
 
 If a step fails mid-way through a multi-step live request, the control plane force-fails any steps still awaiting approval, then tears down applied steps in reverse dependency order. Each teardown is its own step-scoped `LiveDestroy` grant (approver `system:auto-teardown`); a grant minted for a whole-request apply can never authorize a destroy. If a destroy itself fails, the cascade halts rather than thrashing, and the surviving steps are left for operator reconciliation.
 
+## Running a live apply against real infrastructure
+
+The full path is implemented and tested; the remaining work is operator configuration and the decision to point it at production. To take one offering live against a real vSphere backend:
+
+1. **Enrol an agent** where it can reach vCenter (see the enrolment steps above), and give it a durable Terraform state backend HCL via `RYUKI_AGENT_BACKEND_HCL` — without one, an apply's state does not persist and a later teardown finds nothing to destroy.
+2. **Provide credentials** on the agent host: `RYUKI_LIVE_CRED_VSPHERE_USER`, `RYUKI_LIVE_CRED_VSPHERE_PASSWORD`, `RYUKI_LIVE_CRED_VSPHERE_SERVER`. A missing one produces a signed refusal before Terraform runs.
+3. **Unlock live mode** with `RYUKI_AGENT_ALLOW_LIVE=true` and confirm the agent pinned the control-plane public key at startup.
+4. **Drive the governed flow**: dispatch a `LivePlan`, review the plan evidence, approve it, and let the agent apply the saved plan bytes. The trust gate verifies the signed grant and the re-planned digest before it touches anything.
+
+Start with one low-stakes offering and one cluster; the dry-run pipeline lets you rehearse the whole lifecycle first with zero infrastructure risk.
+
 ## What is implemented, and what stays yours
 
-Implemented and tested: the dry-run pipeline and the full live trust gate, including grant signing and verification, plan-digest integrity, refusal reporting, and no-double-apply.
+Implemented and tested: the dry-run pipeline; the full live trust gate (grant signing and verification, plan-digest integrity, refusal reporting, no-double-apply); agent-side `LiveApply` and `LiveDestroy` execution; the credential seam end to end; and a real Vault KV v2 resolver on the control plane.
 
-Operator-owned: real provider credentials, a durable Terraform state backend, and the decision to set `RYUKI_AGENT_ALLOW_LIVE=true` against production. Provider vendor-API adapters and the production Vault credential resolver are still dry-run/mock placeholders, and agent-side `LiveDestroy` execution is a pending slice.
+Operator-owned: real provider credentials, a durable state backend, pointing an agent at production, and the vendor-API adapters for providers whose live integration you enable. The trust machinery does not change when you go live — only the target does.

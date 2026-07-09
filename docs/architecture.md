@@ -121,9 +121,11 @@ all command output is scrubbed before it becomes signed evidence.
 
 ### Maturity
 
-The dry-run pipeline and the full live trust gate (grant signing/verification,
-plan-digest integrity, refusal reporting, no-double-apply) are implemented and
-tested. Running a real apply against live infrastructure is operator-owned: it
-requires a deployed agent with `RYUKI_AGENT_ALLOW_LIVE=true`, real provider
-credentials, and a durable state backend. Provider vendor-API adapters and the
-production Vault credential resolver remain dry-run/mock placeholders today.
+The dry-run pipeline, the full live trust gate (grant signing/verification,
+plan-digest integrity, refusal reporting, no-double-apply), agent-side
+`LiveApply` and `LiveDestroy` execution, the end-to-end credential seam, and a
+Vault KV v2 resolver are all implemented and tested. Running a real apply
+against live infrastructure is operator-owned: it requires a deployed agent
+with `RYUKI_AGENT_ALLOW_LIVE=true`, real provider credentials via
+`RYUKI_LIVE_CRED_<NAME>`, and a durable state backend. The vendor-API adapters
+for a given provider are enabled per integration as you go live.

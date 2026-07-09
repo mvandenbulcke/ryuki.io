@@ -75,6 +75,7 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
+running a live apply against real infrastructure
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
 per-step live apply
@@ -216,7 +217,7 @@ workflows" href="/api-reference.html">API Reference</a></li></ul><p class="sb-em
 <tr><td><code>RYUKI_CP_SIGNING_KEY_PATH</code></td><td>Control plane</td><td>CP Ed25519 grant-signing key (created at <code>0600</code> on first boot).</td></tr>
 </tbody></table>
 <h3 id="maturity">Maturity</h3>
-<p>The dry-run pipeline and the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply) are implemented and tested. Running a real apply against live infrastructure is operator-owned: it requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials, and a durable state backend. Provider vendor-API adapters and the production Vault credential resolver remain dry-run/mock placeholders today.</p>
+<p>The dry-run pipeline, the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply), agent-side <code>LiveApply</code> and <code>LiveDestroy</code> execution, the end-to-end credential seam, and a Vault KV v2 resolver are all implemented and tested. Running a real apply against live infrastructure is operator-owned: it requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials via <code>RYUKI_LIVE_CRED_&lt;NAME&gt;</code>, and a durable state backend. The vendor-API adapters for a given provider are enabled per integration as you go live.</p>
 <div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/getting-started.html">&larr; Getting Started</a><a href="/configuration.html">Configuration &rarr;</a></nav>
 </main>
 </div>

@@ -40,6 +40,31 @@ Copy `.env.example` to `.env` for Compose workflows, or export the same variable
 | `RYUKI_ENTRA_TENANT_ID` | Entra tenant ID | Required for `entra-id` auth |
 | `RYUKI_ENTRA_CLIENT_ID` | App registration client ID | Required for `entra-id` auth |
 | `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL | `https://login.microsoftonline.com` |
+| `RYUKI_ENTRA_REDIRECT_URI` | Browser SSO callback URL, e.g. `https://<host>/api/auth/entra/callback` | Required for the browser sign-in flow; empty leaves bearer-token auth only |
+
+Two Entra paths coexist. Bearer-token validation (API callers presenting
+`Authorization: Bearer <jwt>`) needs only tenant + client. The browser
+sign-in flow (OIDC authorization-code with PKCE, the "Sign in with
+Microsoft Entra ID" button) additionally needs `RYUKI_ENTRA_REDIRECT_URI`,
+registered as a redirect URI on the app registration. All three must be
+set for the button to appear; an empty redirect URI keeps bearer-only
+behavior unchanged.
+
+### Vault (secrets resolver)
+
+The control plane resolves provider-credential handles through HashiCorp
+Vault when configured; otherwise a mock resolver runs (the development
+default).
+
+| Variable | Description | Default |
+|---|---|---|
+| `VAULT_ADDR` | Vault server address, e.g. `https://vault.internal:8200` | Unset → mock resolver |
+| `VAULT_TOKEN` | Vault token with read access to the secret paths | Unset → mock resolver |
+
+Credential handles are `<mount>/<path>[#<field>]`, for example
+`secret/ryuki/vcenter#password`. A `#field` selector is required unless the
+secret has exactly one field. Values never appear in logs, errors, or
+evidence.
 
 ### Platform
 

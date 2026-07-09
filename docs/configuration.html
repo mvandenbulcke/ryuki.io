@@ -75,6 +75,7 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
+running a live apply against real infrastructure
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
 per-step live apply
@@ -153,7 +154,16 @@ workflows" href="/api-reference.html">API Reference</a></li></ul><p class="sb-em
 <tr><td><code>RYUKI_ENTRA_TENANT_ID</code></td><td>Entra tenant ID</td><td>Required for <code>entra-id</code> auth</td></tr>
 <tr><td><code>RYUKI_ENTRA_CLIENT_ID</code></td><td>App registration client ID</td><td>Required for <code>entra-id</code> auth</td></tr>
 <tr><td><code>RYUKI_ENTRA_AUTHORITY</code></td><td>OIDC authority URL</td><td><code>https://login.microsoftonline.com</code></td></tr>
+<tr><td><code>RYUKI_ENTRA_REDIRECT_URI</code></td><td>Browser SSO callback URL, e.g. <code>https://&lt;host&gt;/api/auth/entra/callback</code></td><td>Required for the browser sign-in flow; empty leaves bearer-token auth only</td></tr>
 </tbody></table>
+<p>Two Entra paths coexist. Bearer-token validation (API callers presenting <code>Authorization: Bearer &lt;jwt&gt;</code>) needs only tenant + client. The browser sign-in flow (OIDC authorization-code with PKCE, the "Sign in with Microsoft Entra ID" button) additionally needs <code>RYUKI_ENTRA_REDIRECT_URI</code>, registered as a redirect URI on the app registration. All three must be set for the button to appear; an empty redirect URI keeps bearer-only behavior unchanged.</p>
+<h3 id="vault-secrets-resolver">Vault (secrets resolver)</h3>
+<p>The control plane resolves provider-credential handles through HashiCorp Vault when configured; otherwise a mock resolver runs (the development default).</p>
+<table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>VAULT_ADDR</code></td><td>Vault server address, e.g. <code>https://vault.internal:8200</code></td><td>Unset → mock resolver</td></tr>
+<tr><td><code>VAULT_TOKEN</code></td><td>Vault token with read access to the secret paths</td><td>Unset → mock resolver</td></tr>
+</tbody></table>
+<p>Credential handles are <code>&lt;mount&gt;/&lt;path&gt;[#&lt;field&gt;]</code>, for example <code>secret/ryuki/vcenter#password</code>. A <code>#field</code> selector is required unless the secret has exactly one field. Values never appear in logs, errors, or evidence.</p>
 <h3 id="platform">Platform</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>RYUKI_PLATFORM_NAME</code></td><td>Display name for the platform</td><td><code>Ryuki Infrastructure Platform</code></td></tr>

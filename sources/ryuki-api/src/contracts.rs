@@ -12800,8 +12800,8 @@ fn mock_login_gate(auth_mode: &AuthMode) -> Result<(), (StatusCode, Json<ApiErro
         AuthMode::EntraId => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError::new(
-                "ENTRA_NOT_CONFIGURED",
-                "Entra SSO not configured",
+                "ENTRA_AUTH_MODE",
+                "Use the Entra ID browser sign-in flow (/api/auth/entra/authorize-url) in entra-id auth mode",
             )),
         )),
     }
@@ -40481,7 +40481,7 @@ mod unit_tests {
             panic!("entra mode should reject the anonymous mock mint");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST, "permanent client error, not a 5xx");
-        assert_eq!(body.error, "ENTRA_NOT_CONFIGURED");
+        assert_eq!(body.error, "ENTRA_AUTH_MODE");
     }
 
     #[test]
