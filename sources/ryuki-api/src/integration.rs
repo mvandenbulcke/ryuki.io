@@ -409,6 +409,16 @@ impl std::fmt::Debug for UpdateConnectionRequest {
 pub struct ListConnectionsQuery {
     pub vendor_type: Option<String>,
     pub site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// #14: query for the actionable-circuit-breakers list (pagination only).
+#[derive(Debug, Deserialize)]
+pub struct CircuitsListQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 // #18 slice 2a: dedicated inbound-webhook signing secret. This is DISTINCT from
@@ -889,6 +899,9 @@ pub async fn integration_list(
     Query(q): Query<ListConnectionsQuery>,
 ) -> ApiResult {
     require_admin(&session)?;
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
 
     // #2: a connection is a SITE-ONLY resource — it has no environment axis. An
     // env-scoped principal therefore cannot be satisfied and must fail closed to an
@@ -908,6 +921,9 @@ pub async fn integration_list(
             "source": source,
             "connections": [],
             "count": 0,
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
         })));
     }
 
@@ -927,14 +943,28 @@ pub async fn integration_list(
     };
 
     if let Some(pool) = get_db() {
+        // `created_at DESC` alone is non-unique → `id` (PK) is the tie-breaker.
+        // Binds: $1=vendor_type, $2=site, $3=limit, $4=offset. `count` reuses the
+        // SAME two filter binds so the total matches the paged set.
         let rows: Vec<IntegrationConnectionRow> = sqlx::query_as(&format!(
             "SELECT {CONN_COLUMNS} FROM integration_connections \
              WHERE ($1 = '' OR vendor_type = $1) AND ($2 = '' OR site_scope = $2) \
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
         ))
         .bind(q.vendor_type.as_deref().unwrap_or(""))
         .bind(effective_site.as_deref().unwrap_or(""))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_connections \
+             WHERE ($1 = '' OR vendor_type = $1) AND ($2 = '' OR site_scope = $2)",
+        )
+        .bind(q.vendor_type.as_deref().unwrap_or(""))
+        .bind(effective_site.as_deref().unwrap_or(""))
+        .fetch_one(pool)
         .await
         .map_err(db_err)?;
         let conns: Vec<IntegrationConnection> =
@@ -947,6 +977,9 @@ pub async fn integration_list(
             "source": "database",
             "connections": json_list,
             "count": json_list.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
 
@@ -956,14 +989,22 @@ pub async fn integration_list(
         q.vendor_type.as_deref(),
         effective_site.as_deref(),
     );
+    // #14: bound the in-memory fallback too — slice by offset/limit; `total` is
+    // the full filtered set so paging metadata is consistent with the DB path.
+    let total = conns.len() as i64;
     let json_list: Vec<Value> = conns
         .iter()
+        .skip(offset as usize)
+        .take(limit as usize)
         .map(IntegrationConnectionRow::to_json)
         .collect();
     Ok(Json(json!({
         "source": "in-memory",
         "connections": json_list,
         "count": json_list.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     })))
 }
 
@@ -2155,9 +2196,15 @@ impl BreakerListRow {
 /// operator can now answer "which integration breakers are OPEN right now?"
 /// without polling every connection id. Carries only state + counters + timestamp
 /// + connection_id (no credential/endpoint material).
-pub async fn integration_circuits_list(Extension(session): Extension<AuthSession>) -> ApiResult {
+pub async fn integration_circuits_list(
+    Extension(session): Extension<AuthSession>,
+    Query(q): Query<CircuitsListQuery>,
+) -> ApiResult {
     require_admin(&session)?;
     let cfg = BreakerConfig::DEFAULT;
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
 
     // #2: a breaker is keyed on a connection, a SITE-ONLY resource. An env-scoped
     // principal fails closed to empty (mirrors the connection list + by-id guard);
@@ -2169,7 +2216,9 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
         .any(|s| !s.trim().is_empty());
     if env_scoped {
         let source = if get_db().is_some() { "db" } else { "no-db" };
-        return Ok(Json(json!({ "source": source, "breakers": [] })));
+        return Ok(Json(
+            json!({ "source": source, "breakers": [], "total": 0, "limit": limit, "offset": offset }),
+        ));
     }
     let effective_site = match resolve_scope_filter(&session.site_scope, None) {
         ScopeFilter::Deny => {
@@ -2183,7 +2232,9 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
 
     let Some(pool) = get_db() else {
         // No DB: no durable breaker state exists to report.
-        return Ok(Json(json!({ "source": "no-db", "breakers": [] })));
+        return Ok(Json(
+            json!({ "source": "no-db", "breakers": [], "total": 0, "limit": limit, "offset": offset }),
+        ));
     };
 
     // Explicit state allow-list (defense beyond the mig-106 CHECK) so no unknown
@@ -2192,6 +2243,9 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
     // platform-wide NULL-site connections; a scoped caller binds its concrete site,
     // and `ic.site_scope = 'GBLON'` never matches a NULL-site connection — so a
     // scoped caller never sees another site's or a platform-wide breaker.
+    // `cb.connection_id` is the circuit_breakers PK (one breaker per connection),
+    // so the ORDER BY ends in a unique key — stable paging. Binds: $1=site,
+    // $2=limit, $3=offset; `count` reuses the SAME site+state filter.
     let rows: Vec<BreakerListRow> = sqlx::query_as(
         "SELECT cb.connection_id, cb.state, cb.consecutive_failures, cb.consecutive_successes, \
                 cb.opened_at_unix \
@@ -2199,10 +2253,22 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
          JOIN integration_connections ic ON ic.id = cb.connection_id \
          WHERE cb.state IN ('open', 'half_open') \
            AND ($1 = '' OR ic.site_scope = $1) \
-         ORDER BY cb.opened_at_unix DESC NULLS LAST, cb.connection_id",
+         ORDER BY cb.opened_at_unix DESC NULLS LAST, cb.connection_id LIMIT $2 OFFSET $3",
     )
     .bind(effective_site.as_deref().unwrap_or(""))
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM circuit_breakers cb \
+         JOIN integration_connections ic ON ic.id = cb.connection_id \
+         WHERE cb.state IN ('open', 'half_open') \
+           AND ($1 = '' OR ic.site_scope = $1)",
+    )
+    .bind(effective_site.as_deref().unwrap_or(""))
+    .fetch_one(pool)
     .await
     .map_err(db_err)?;
 
@@ -2227,6 +2293,9 @@ pub async fn integration_circuits_list(Extension(session): Extension<AuthSession
         "source": "db",
         "now_unix": now_unix,
         "breakers": breakers,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     })))
 }
 
@@ -2960,8 +3029,14 @@ pub mod integration_db_tests {
         .await
         .expect("insert half_open + closed breakers");
 
-        let resp = integration_circuits_list(Extension(AuthSession::static_dry_run()))
-            .await
+        let resp = integration_circuits_list(
+            Extension(AuthSession::static_dry_run()),
+            Query(CircuitsListQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
             .expect("list ok");
         assert_eq!(resp.0["source"], serde_json::json!("db"));
         let breakers = resp.0["breakers"].as_array().expect("breakers array");
@@ -5501,8 +5576,14 @@ mod unit_tests {
 
     #[tokio::test]
     async fn circuits_list_without_db_is_empty() {
-        let resp = integration_circuits_list(Extension(AuthSession::static_dry_run()))
-            .await
+        let resp = integration_circuits_list(
+            Extension(AuthSession::static_dry_run()),
+            Query(CircuitsListQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
             .expect("no DB returns an empty list, not an error");
         assert_eq!(resp.0["source"], serde_json::json!("no-db"));
         assert_eq!(resp.0["breakers"], serde_json::json!([]));
