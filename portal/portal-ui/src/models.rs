@@ -534,6 +534,332 @@ pub fn hardware_inventory_fallback() -> HardwareInventorySnapshot {
     }
 }
 
+// ── ServiceNow publish queue (CMDB tab live read) ───────────────────────────
+
+/// Mirrors one staged ServiceNow submission as served by
+/// `GET /api/cmdb/servicenow/pending` (snake_case wire fields; `request_type`
+/// arrives lowercase — "incident" / "change" / "request", `status` is the
+/// queue lifecycle value, "Pending" or "Ready" for this endpoint).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServiceNowQueueItem {
+    pub id: String,
+    #[serde(default)]
+    pub request_type: String,
+    #[serde(default)]
+    pub ci_name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub payload_summary: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Mirrors the `GET /api/cmdb/servicenow/pending` envelope: the storage
+/// `source` marker, the pending count, and the staged submission items.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiServiceNowQueue {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub items: Vec<ServiceNowQueueItem>,
+}
+
+/// Portal snapshot for the CMDB tab's ServiceNow publish queue. `live`
+/// distinguishes a real API fetch from the labeled static preview; `source`
+/// carries the API's own storage marker through. These are staged dry-run
+/// records — nothing is published to ServiceNow while the live integration
+/// stays disabled, and the view must say so.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServiceNowQueueSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub count: u64,
+    pub items: Vec<ServiceNowQueueItem>,
+}
+
+impl ServiceNowQueueSnapshot {
+    /// Wraps a successful live API fetch, preserving the API's source marker.
+    pub fn from_live(queue: ApiServiceNowQueue) -> Self {
+        Self {
+            live: true,
+            source: queue.source,
+            count: queue.count,
+            items: queue.items,
+        }
+    }
+}
+
+/// Labeled preview queue for static-dry-run mode. Payload summaries carry a
+/// "(preview)" marker and `live=false` badges the panel "Static preview" —
+/// never presented as live queue data.
+pub fn servicenow_queue_fallback() -> ServiceNowQueueSnapshot {
+    fn preview_item(
+        id: &str,
+        request_type: &str,
+        ci_name: &str,
+        status: &str,
+    ) -> ServiceNowQueueItem {
+        ServiceNowQueueItem {
+            id: id.to_string(),
+            request_type: request_type.to_string(),
+            ci_name: ci_name.to_string(),
+            status: status.to_string(),
+            payload_summary: format!("{request_type} record for {ci_name} (preview)"),
+            created_at: "2026-06-13T08:00:00Z".to_string(),
+        }
+    }
+    ServiceNowQueueSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        count: 2,
+        items: vec![
+            preview_item(
+                "preview-snow-1",
+                "incident",
+                "srv-defra-app01.corp.local",
+                "Pending",
+            ),
+            preview_item(
+                "preview-snow-2",
+                "change",
+                "srv-gblon-fs01.corp.local",
+                "Ready",
+            ),
+        ],
+    }
+}
+
+// ── CMDB reconciliation report (CMDB tab live read) ─────────────────────────
+
+/// Mirrors one diverging attribute inside a `CiDrift` entry of the
+/// `POST /api/cmdb/reconcile` dry-run report (snake_case wire fields).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CmdbAttributeDrift {
+    #[serde(default)]
+    pub field: String,
+    #[serde(default)]
+    pub platform_value: String,
+    #[serde(default)]
+    pub cmdb_value: String,
+}
+
+/// Mirrors one matched-CI drift entry of the `POST /api/cmdb/reconcile`
+/// dry-run report: a CI present in BOTH the platform inventory and the CMDB
+/// whose attributes disagree.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CmdbCiDrift {
+    pub ci_name: String,
+    #[serde(default)]
+    pub drifts: Vec<CmdbAttributeDrift>,
+}
+
+/// Mirrors the `POST /api/cmdb/reconcile` envelope: the `source` marker
+/// (always "dry-run" — the reconciliation is computed on demand and never
+/// mutates CMDB records), the presence-reconciliation summary lines, and the
+/// attribute-level drift for matched CIs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiCmdbReconcileReport {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub reconciliation_results: Vec<String>,
+    #[serde(default)]
+    pub attribute_drift: Vec<CmdbCiDrift>,
+}
+
+/// Portal snapshot for the CMDB tab's reconciliation report. `live`
+/// distinguishes a real API dry-run from the labeled static preview.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CmdbReconciliationSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub summary_lines: Vec<String>,
+    pub drift: Vec<CmdbCiDrift>,
+}
+
+impl CmdbReconciliationSnapshot {
+    /// Wraps a successful live API dry-run, preserving the source marker.
+    pub fn from_live(report: ApiCmdbReconcileReport) -> Self {
+        Self {
+            live: true,
+            source: report.source,
+            summary_lines: report.reconciliation_results,
+            drift: report.attribute_drift,
+        }
+    }
+}
+
+/// Labeled preview reconciliation report for static-dry-run mode. Summary
+/// lines carry a PREVIEW marker and `live=false` badges the panel "Static
+/// preview" — never presented as a real reconciliation run.
+pub fn cmdb_reconciliation_report_fallback() -> CmdbReconciliationSnapshot {
+    CmdbReconciliationSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        summary_lines: vec![
+            "PREVIEW: 1 item(s) in platform inventory but not in CMDB".to_string(),
+            "PREVIEW: 2 item(s) reconciled (present in both)".to_string(),
+        ],
+        drift: vec![CmdbCiDrift {
+            ci_name: "srv-defra-app01.corp.local (preview)".to_string(),
+            drifts: vec![CmdbAttributeDrift {
+                field: "owner".to_string(),
+                platform_value: "app-team-a".to_string(),
+                cmdb_value: "app-team".to_string(),
+            }],
+        }],
+    }
+}
+
+// ── Shift queue (Operations tab live read) ──────────────────────────────────
+
+/// Mirrors one open shift-queue item as served by
+/// `GET /api/ops/shift/items` (snake_case wire fields; `item_type` arrives
+/// kebab-case, e.g. "active-incident" / "failed-operation"; `assigned_to` is
+/// null for unassigned items).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShiftQueueItem {
+    pub id: String,
+    #[serde(default)]
+    pub item_type: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(default)]
+    pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default)]
+    pub escalated: bool,
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// Mirrors the aggregate half of the shift-queue read
+/// (`GET /api/ops/shift/summary`): real open/P1/P2/unacknowledged totals over
+/// ALL open items. The `by_type` breakdown is not consumed by the portal and
+/// is ignored on decode.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiShiftSummary {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub total_open: u64,
+    #[serde(default)]
+    pub p1_open: u64,
+    #[serde(default)]
+    pub p2_open: u64,
+    #[serde(default)]
+    pub unacknowledged: u64,
+}
+
+/// Mirrors the `GET /api/ops/shift/items` page envelope: one bounded page of
+/// triage items plus the over-fetch-derived `has_more` marker.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiShiftItemsPage {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub items: Vec<ShiftQueueItem>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// Portal snapshot for the Operations tab's shift queue: the real aggregate
+/// totals plus one bounded page of open items. `live` distinguishes a real
+/// API fetch from the labeled static preview; `source` carries the API's own
+/// storage marker through.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShiftQueueSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub total_open: u64,
+    pub p1_open: u64,
+    pub p2_open: u64,
+    pub unacknowledged: u64,
+    pub items: Vec<ShiftQueueItem>,
+    pub has_more: bool,
+}
+
+impl ShiftQueueSnapshot {
+    /// Combines the aggregate totals and one open-items page from a
+    /// successful live API fetch, preserving the summary's source marker.
+    pub fn from_live(summary: ApiShiftSummary, page: ApiShiftItemsPage) -> Self {
+        Self {
+            live: true,
+            source: summary.source,
+            total_open: summary.total_open,
+            p1_open: summary.p1_open,
+            p2_open: summary.p2_open,
+            unacknowledged: summary.unacknowledged,
+            items: page.items,
+            has_more: page.has_more,
+        }
+    }
+}
+
+/// Labeled preview shift queue for static-dry-run mode. Titles carry a
+/// "(preview)" marker and `live=false` badges the panel "Static preview" —
+/// never presented as live operator data.
+pub fn shift_queue_fallback() -> ShiftQueueSnapshot {
+    fn preview_item(
+        id: &str,
+        item_type: &str,
+        title: &str,
+        priority: &str,
+        assigned_to: Option<&str>,
+        acknowledged: bool,
+    ) -> ShiftQueueItem {
+        ShiftQueueItem {
+            id: id.to_string(),
+            item_type: item_type.to_string(),
+            title: format!("{title} (preview)"),
+            description: "Static preview item — not live operator data.".to_string(),
+            priority: priority.to_string(),
+            assigned_to: assigned_to.map(str::to_string),
+            created_at: "2026-06-13T08:00:00Z".to_string(),
+            acknowledged,
+            escalated: false,
+            resolved: false,
+        }
+    }
+    ShiftQueueSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        total_open: 2,
+        p1_open: 1,
+        p2_open: 1,
+        unacknowledged: 1,
+        items: vec![
+            preview_item(
+                "preview-shift-1",
+                "active-incident",
+                "Cluster capacity alarm on DEFRA",
+                "P1",
+                Some("ops-oncall"),
+                true,
+            ),
+            preview_item(
+                "preview-shift-2",
+                "failed-operation",
+                "Patch wave verification failed",
+                "P2",
+                None,
+                false,
+            ),
+        ],
+        has_more: false,
+    }
+}
+
 pub fn audit_workflow_fallbacks() -> Vec<AuditWorkflowSummary> {
     vec![
         AuditWorkflowSummary {
@@ -3229,6 +3555,197 @@ mod tests {
             .assets
             .iter()
             .all(|asset| asset.serial_number.starts_with("PREVIEW-")));
+    }
+
+    #[test]
+    fn servicenow_queue_decodes_canonical_pending_envelope() {
+        // Canonical GET /api/cmdb/servicenow/pending shape: the DB-backed
+        // handler's `snow_row_to_summary_json` items (snake_case fields,
+        // lowercase request_type, queue-lifecycle status, RFC3339 created_at)
+        // wrapped in the {source, count, items} envelope. The engine
+        // fallback serves the same shape with source "static-dry-run".
+        let body = r#"{
+            "source": "database",
+            "count": 2,
+            "items": [
+                {
+                    "id": "6f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b",
+                    "request_type": "incident",
+                    "ci_name": "srv-defra-app01.corp.local",
+                    "status": "Pending",
+                    "payload_summary": "Incident: CPU alarm on srv-defra-app01",
+                    "created_at": "2026-07-09T10:00:00+00:00"
+                },
+                {
+                    "id": "7a3c9e55-0d2b-4f6a-9b3c-2d0e4f5a6b7c",
+                    "request_type": "change",
+                    "ci_name": "srv-gblon-fs01.corp.local",
+                    "status": "Ready",
+                    "payload_summary": "Change: firmware baseline update",
+                    "created_at": "2026-07-09T11:00:00+00:00"
+                }
+            ]
+        }"#;
+        let queue: ApiServiceNowQueue =
+            serde_json::from_str(body).expect("pending queue envelope must decode");
+        assert_eq!(queue.count, 2);
+        assert_eq!(queue.items.len(), 2);
+        assert_eq!(queue.items[0].request_type, "incident");
+        assert_eq!(queue.items[0].status, "Pending");
+        assert_eq!(queue.items[1].status, "Ready");
+        assert_eq!(queue.items[1].ci_name, "srv-gblon-fs01.corp.local");
+
+        let snapshot = ServiceNowQueueSnapshot::from_live(queue);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.source, "database");
+        assert_eq!(snapshot.count, 2);
+
+        // The static preview is honestly labeled, never `live`.
+        let preview = servicenow_queue_fallback();
+        assert!(!preview.live);
+        assert!(preview
+            .items
+            .iter()
+            .all(|item| item.payload_summary.contains("(preview)")));
+    }
+
+    #[test]
+    fn cmdb_reconcile_report_decodes_canonical_dry_run_envelope() {
+        // Canonical POST /api/cmdb/reconcile shape: the engine's
+        // presence-reconciliation summary lines plus `CiDrift` entries
+        // ({ci_name, drifts: [{field, platform_value, cmdb_value}]}), always
+        // marked source "dry-run" — the run never mutates CMDB records.
+        let body = r#"{
+            "source": "dry-run",
+            "reconciliation_results": [
+                "DRY-RUN: 1 item(s) in platform inventory but not in CMDB: [\"srv-demuc-db01.corp.local\"]",
+                "DRY-RUN: 2 item(s) reconciled (present in both)",
+                "DRY-RUN: Import summary - 1 accepted, 1 rejected, 1 pending review"
+            ],
+            "attribute_drift": [
+                {
+                    "ci_name": "srv-defra-app01.corp.local",
+                    "drifts": [
+                        {
+                            "field": "owner",
+                            "platform_value": "app-team-a",
+                            "cmdb_value": "app-team"
+                        },
+                        {
+                            "field": "criticality",
+                            "platform_value": "high",
+                            "cmdb_value": "medium"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let report: ApiCmdbReconcileReport =
+            serde_json::from_str(body).expect("reconcile report envelope must decode");
+        assert_eq!(report.source, "dry-run");
+        assert_eq!(report.reconciliation_results.len(), 3);
+        assert_eq!(report.attribute_drift.len(), 1);
+        let ci = &report.attribute_drift[0];
+        assert_eq!(ci.ci_name, "srv-defra-app01.corp.local");
+        assert_eq!(ci.drifts.len(), 2);
+        assert_eq!(ci.drifts[0].field, "owner");
+        assert_eq!(ci.drifts[0].platform_value, "app-team-a");
+        assert_eq!(ci.drifts[0].cmdb_value, "app-team");
+
+        let snapshot = CmdbReconciliationSnapshot::from_live(report);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.source, "dry-run");
+        assert_eq!(snapshot.summary_lines.len(), 3);
+        assert_eq!(snapshot.drift.len(), 1);
+
+        // The static preview is honestly labeled, never `live`.
+        let preview = cmdb_reconciliation_report_fallback();
+        assert!(!preview.live);
+        assert!(preview
+            .summary_lines
+            .iter()
+            .all(|line| line.starts_with("PREVIEW:")));
+    }
+
+    #[test]
+    fn shift_queue_decodes_canonical_summary_and_items_envelopes() {
+        // Canonical GET /api/ops/shift/summary shape (DB-backed): real
+        // aggregate totals over all open items; the by_type breakdown is
+        // ignored on decode. The engine fallback serves the same shape with
+        // source "static-dry-run".
+        let summary_body = r#"{
+            "source": "database",
+            "total_open": 4,
+            "p1_open": 1,
+            "p2_open": 2,
+            "unacknowledged": 3,
+            "by_type": {
+                "active-incident": {
+                    "count": 1,
+                    "items": [],
+                    "p1_count": 1,
+                    "p2_count": 0,
+                    "unacknowledged": 1
+                }
+            }
+        }"#;
+        let summary: ApiShiftSummary =
+            serde_json::from_str(summary_body).expect("shift summary envelope must decode");
+        assert_eq!(summary.total_open, 4);
+        assert_eq!(summary.p1_open, 1);
+        assert_eq!(summary.p2_open, 2);
+        assert_eq!(summary.unacknowledged, 3);
+
+        // Canonical GET /api/ops/shift/items shape: one bounded page
+        // (kebab-case item_type, nullable assigned_to, RFC3339 created_at,
+        // over-fetch-derived has_more).
+        let items_body = r#"{
+            "source": "database",
+            "items": [
+                {
+                    "id": "8b4d0f66-1e3c-4a7b-8c4d-3e1f5a6b7c8d",
+                    "item_type": "active-incident",
+                    "title": "Cluster capacity alarm on DEFRA",
+                    "description": "cluster-a exceeded the admission threshold",
+                    "priority": "P1",
+                    "assigned_to": null,
+                    "created_at": "2026-07-09T06:00:00+00:00",
+                    "acknowledged": false,
+                    "escalated": true,
+                    "resolved": false
+                }
+            ],
+            "count": 1,
+            "limit": 50,
+            "offset": 0,
+            "has_more": true
+        }"#;
+        let page: ApiShiftItemsPage =
+            serde_json::from_str(items_body).expect("shift items envelope must decode");
+        assert_eq!(page.items.len(), 1);
+        assert!(page.has_more);
+        let item = &page.items[0];
+        assert_eq!(item.item_type, "active-incident");
+        assert_eq!(item.priority, "P1");
+        assert_eq!(item.assigned_to, None);
+        assert!(item.escalated);
+        assert!(!item.acknowledged);
+        assert!(!item.resolved);
+
+        let snapshot = ShiftQueueSnapshot::from_live(summary, page);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.source, "database");
+        assert_eq!(snapshot.total_open, 4);
+        assert_eq!(snapshot.items.len(), 1);
+        assert!(snapshot.has_more);
+
+        // The static preview is honestly labeled, never `live`.
+        let preview = shift_queue_fallback();
+        assert!(!preview.live);
+        assert!(preview
+            .items
+            .iter()
+            .all(|item| item.title.contains("(preview)")));
     }
 
     #[test]

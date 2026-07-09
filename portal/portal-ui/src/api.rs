@@ -35,6 +35,14 @@ const CMDB_RELATIONSHIP_GRAPH_PATH: &str = "/api/cmdb/relationship-graph-contrac
 const CMDB_IMPORT_PATH: &str = "/api/cmdb/import";
 const CMDB_EXPORT_PATH: &str = "/api/cmdb/export";
 const CMDB_RECONCILE_PATH: &str = "/api/cmdb/reconcile";
+/// ServiceNow publish queue read (staged dry-run submissions; nothing is
+/// published upstream while the live ServiceNow integration stays disabled).
+const SERVICENOW_PENDING_PATH: &str = "/api/cmdb/servicenow/pending";
+/// Live shift-queue reads: open-item aggregates and the filtered triage list.
+/// Operator-tier data — the API gates every `/api/ops/shift/...` read on the
+/// `execute` permission.
+const SHIFT_SUMMARY_PATH: &str = "/api/ops/shift/summary";
+const SHIFT_ITEMS_PATH: &str = "/api/ops/shift/items";
 const EVIDENCE_EXPORT_RETENTION_PATH: &str = "/api/evidence/export-retention-contract";
 const EVIDENCE_COMPLIANCE_DASHBOARD_PATH: &str = "/api/evidence/compliance-dashboard-contract";
 const OPERATIONS_RUNBOOK_LAUNCH_PATH: &str = "/api/operations/runbook-launch-contract";
@@ -242,6 +250,25 @@ pub fn cmdb_export_path() -> &'static str {
 
 pub fn cmdb_reconcile_path() -> &'static str {
     CMDB_RECONCILE_PATH
+}
+
+/// The staged ServiceNow submissions awaiting publish
+/// (`GET /api/cmdb/servicenow/pending`). The CMDB tab's dry-run publish-queue
+/// read surface — rows stay local until the live integration is enabled.
+pub fn servicenow_pending_path() -> &'static str {
+    SERVICENOW_PENDING_PATH
+}
+
+/// Open shift-queue aggregates (`GET /api/ops/shift/summary`): real open/P1/
+/// P2/unacknowledged totals. Operator-tier (`execute`) read.
+pub fn shift_summary_path() -> &'static str {
+    SHIFT_SUMMARY_PATH
+}
+
+/// The filtered shift-queue triage list (`GET /api/ops/shift/items`, paged).
+/// Operator-tier (`execute`) read; DB-backed only.
+pub fn shift_items_path() -> &'static str {
+    SHIFT_ITEMS_PATH
 }
 
 pub fn evidence_export_retention_path() -> &'static str {

@@ -18,20 +18,23 @@ use crate::models::{
     catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session,
     normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
     rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
-    AdminTokenSummary, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult,
-    CreateTokenPayload, HardwareAssetSummary, HardwareInventorySnapshot, OfferingCatalogSnapshot,
-    PlatformSettingsSummary, ALL_APP_ROLES,
+    AdminTokenSummary, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult, CmdbCiDrift,
+    CmdbReconciliationSnapshot, CreateTokenPayload, HardwareAssetSummary,
+    HardwareInventorySnapshot, OfferingCatalogSnapshot, PlatformSettingsSummary,
+    ServiceNowQueueItem, ServiceNowQueueSnapshot, ShiftQueueItem, ShiftQueueSnapshot,
+    ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
     get_admin_platform_settings, get_auth_session, get_boundary_status, get_catalog_offerings,
-    get_hardware_inventory, get_platform_health, get_platform_status, load_admin_sessions,
-    load_admin_tokens, load_portal_activity_run_state, load_portal_evidence_summary_status,
-    load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
-    revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
-    PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
-    PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
-    PortalServerBoundary,
+    get_cmdb_reconciliation_report, get_hardware_inventory, get_platform_health,
+    get_platform_status, get_servicenow_publish_queue, get_shift_queue_overview,
+    load_admin_sessions, load_admin_tokens, load_portal_activity_run_state,
+    load_portal_evidence_summary_status, load_portal_inventory_capacity_status,
+    reset_platform_settings, revoke_admin_session, revoke_admin_token, save_platform_settings,
+    PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
+    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
+    PortalSecretReferenceSnapshot, PortalServerBoundary,
 };
 use crate::views::agents::AgentListView;
 use crate::views::approvals::ApprovalsList;
@@ -278,12 +281,26 @@ pub fn InventoryWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/cmdb` — file exchange, reconciliation, and relationship summaries.
+/// `/cmdb` — the ServiceNow publish queue and reconciliation report served by
+/// the platform API, plus file exchange, reconciliation, and relationship
+/// readiness summaries.
 #[component]
 pub fn CmdbWorkspaceView() -> impl IntoView {
+    // The reconciliation report rides the execute-tier dry-run executor
+    // (`POST /api/cmdb/reconcile`); rendering it for a session the API would
+    // 403 would only paint a guaranteed error panel.
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
+    let can_execute = session_can(&auth_session, "execute");
+
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="cmdb"/>
+            <section class="workspace-detail-grid" aria-label="CMDB live reads">
+                <ServiceNowPublishQueuePanel/>
+                <Show when=move || can_execute fallback=|| ()>
+                    <CmdbReconciliationPanel/>
+                </Show>
+            </section>
             <section class="workspace-detail-grid" aria-label="CMDB workspace details">
                 <CmdbWorkspaceDetail/>
             </section>
@@ -304,12 +321,35 @@ pub fn EvidenceWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/operations` — run state, platform health, and policy guardrails.
+/// `/operations` — the live shift queue served by the platform API, plus run
+/// state, platform health, and policy guardrails.
 #[component]
 pub fn OperationsWorkspaceView() -> impl IntoView {
+    // The shift queue is operator working data — the API gates every
+    // `/api/ops/shift/...` read on the `execute` permission, so the panel
+    // renders only for sessions that hold it (admin passes as superuser).
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
+    let can_execute = session_can(&auth_session, "execute");
+
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="operations"/>
+            <section class="workspace-detail-grid" aria-label="Shift queue">
+                <Show
+                    when=move || can_execute
+                    fallback=|| {
+                        view! {
+                            <div class="request-list-empty" aria-label="No operator access">
+                                <p>
+                                    "The shift queue is operator working data; it is shown to sessions holding the execute (operator) permission."
+                                </p>
+                            </div>
+                        }
+                    }
+                >
+                    <ShiftQueuePanel/>
+                </Show>
+            </section>
             <section class="workspace-detail-grid" aria-label="Operations workspace details">
                 <OperationsWorkspaceDetail/>
                 <PolicyWorkspaceDetail/>
@@ -769,6 +809,504 @@ fn HardwareInventoryPanel() -> impl IntoView {
                                         <p class="empty-state-title">"Hardware inventory unavailable"</p>
                                         <p class="table-note">
                                             "The platform API is unreachable, so the hardware asset list cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Badge class for a ServiceNow queue-status chip: `Pending` submissions are
+/// staged awaiting approval, `Ready` ones have cleared validation. Both stay
+/// local — nothing is published while the live integration is disabled.
+fn servicenow_status_badge(status: &str) -> &'static str {
+    match status {
+        "Ready" => "badge good",
+        "Pending" => "badge warn",
+        "Failed" => "badge bad",
+        _ => "badge neutral",
+    }
+}
+
+/// One staged ServiceNow submission row: CI, record type, queue status, the
+/// redacted payload summary, and the staging timestamp.
+fn servicenow_queue_row(item: ServiceNowQueueItem) -> impl IntoView {
+    let status_class = servicenow_status_badge(&item.status);
+    let created = condense_timestamp(&item.created_at);
+
+    view! {
+        <tr>
+            <td>
+                <strong>{item.ci_name.clone()}</strong>
+                <p class="table-note">{item.id.clone()}</p>
+            </td>
+            <td><span class="badge neutral">{item.request_type.clone()}</span></td>
+            <td><span class=status_class>{item.status.clone()}</span></td>
+            <td>{item.payload_summary.clone()}</td>
+            <td class="cell-date">{created}</td>
+        </tr>
+    }
+}
+
+/// The ServiceNow publish-queue panel for a successfully-loaded snapshot.
+/// Live data is badged with the API's own source marker; the static preview
+/// keeps the honest "Static preview" label. The lede states the core product
+/// caveat: these records are staged dry-run submissions, not published CIs.
+fn servicenow_publish_queue_panel(snapshot: ServiceNowQueueSnapshot) -> impl IntoView {
+    let total = snapshot.count;
+    let count_label = if total == 1 {
+        "1 staged record".to_string()
+    } else {
+        format!("{total} staged records")
+    };
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live queue · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let body = if snapshot.items.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No submissions staged for publish"</p>
+                <p class="table-note">
+                    "Incident, change, and request records staged by the dry-run ServiceNow flow appear here with their queue status."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="ServiceNow publish queue table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Configuration item"</th>
+                            <th scope="col">"Record type"</th>
+                            <th scope="col">"Queue status"</th>
+                            <th scope="col">"Payload summary"</th>
+                            <th scope="col">"Staged"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.items.into_iter().map(servicenow_queue_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="servicenow-queue-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"CMDB"</span>
+                    <h2 id="servicenow-queue-title">"ServiceNow publish queue"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "Dry-run submissions staged for ServiceNow. Nothing is published upstream — records stay in this local queue until the live integration is enabled. " {count_label} "."
+            </p>
+            {body}
+        </article>
+    }
+}
+
+/// `/cmdb` flagship surface — the staged ServiceNow publish queue served by
+/// `GET /api/cmdb/servicenow/pending`. Live mode renders what the API
+/// returns; static mode renders a labeled preview. Never shows stale or
+/// fabricated data — an unreachable API renders an explicit degraded state.
+#[component]
+fn ServiceNowPublishQueuePanel() -> impl IntoView {
+    let queue = Resource::new(|| (), |_| get_servicenow_publish_queue());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="servicenow-queue-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"CMDB"</span>
+                            <h2 id="servicenow-queue-title">"ServiceNow publish queue"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match queue.await {
+                        Ok(snapshot) => servicenow_publish_queue_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="servicenow-queue-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"CMDB"</span>
+                                            <h2 id="servicenow-queue-title">"ServiceNow publish queue"</h2>
+                                        </div>
+                                        <span class="badge bad">"Queue unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"ServiceNow publish queue unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the staged submission queue cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Flattened drift rows for the reconciliation table: one row per diverging
+/// attribute of a matched CI (CI name repeats across its drift rows).
+fn cmdb_drift_rows(drift: Vec<CmdbCiDrift>) -> impl IntoView {
+    drift
+        .into_iter()
+        .flat_map(|ci| {
+            let ci_name = ci.ci_name;
+            ci.drifts
+                .into_iter()
+                .map(move |attribute| {
+                    view! {
+                        <tr>
+                            <td><strong>{ci_name.clone()}</strong></td>
+                            <td><span class="badge warn">{attribute.field.clone()}</span></td>
+                            <td>{attribute.platform_value.clone()}</td>
+                            <td>{attribute.cmdb_value.clone()}</td>
+                        </tr>
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect_view()
+}
+
+/// The CMDB reconciliation panel for a successfully-loaded report. Live
+/// reports are badged with the API's own source marker (always "dry-run" —
+/// the run never mutates CMDB records); the static preview keeps the honest
+/// "Static preview" label.
+fn cmdb_reconciliation_panel(snapshot: CmdbReconciliationSnapshot) -> impl IntoView {
+    let drifted_cis = snapshot.drift.len();
+    let drift_label = if drifted_cis == 1 {
+        "1 CI with attribute drift".to_string()
+    } else {
+        format!("{drifted_cis} CIs with attribute drift")
+    };
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live report · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let summary_lines = snapshot.summary_lines.clone();
+    let drift_body = if snapshot.drift.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No attribute drift detected"</p>
+                <p class="table-note">
+                    "Every CI present in both the platform inventory and the CMDB agrees on owner, site, environment, and criticality."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="CMDB attribute drift table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Configuration item"</th>
+                            <th scope="col">"Attribute"</th>
+                            <th scope="col">"Platform value"</th>
+                            <th scope="col">"CMDB value"</th>
+                        </tr>
+                    </thead>
+                    <tbody>{cmdb_drift_rows(snapshot.drift)}</tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="cmdb-reconciliation-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"CMDB"</span>
+                    <h2 id="cmdb-reconciliation-title">"Reconciliation and drift"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "On-demand dry-run comparison of the platform inventory against the CMDB import — presence gaps plus attribute drift for matched CIs. No CMDB records are modified. " {drift_label} "."
+            </p>
+            <ul class="table-note" aria-label="Reconciliation summary">
+                {summary_lines
+                    .into_iter()
+                    .map(|line| view! { <li>{line}</li> })
+                    .collect_view()}
+            </ul>
+            {drift_body}
+        </article>
+    }
+}
+
+/// `/cmdb` flagship surface — the dry-run reconciliation report served by
+/// `POST /api/cmdb/reconcile` (a pure on-demand computation; execute-tier).
+/// Live mode renders what the API returns; static mode renders a labeled
+/// preview. Never shows stale or fabricated data — an unreachable API renders
+/// an explicit degraded state.
+#[component]
+fn CmdbReconciliationPanel() -> impl IntoView {
+    let report = Resource::new(|| (), |_| get_cmdb_reconciliation_report());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="cmdb-reconciliation-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"CMDB"</span>
+                            <h2 id="cmdb-reconciliation-title">"Reconciliation and drift"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match report.await {
+                        Ok(snapshot) => cmdb_reconciliation_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="cmdb-reconciliation-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"CMDB"</span>
+                                            <h2 id="cmdb-reconciliation-title">"Reconciliation and drift"</h2>
+                                        </div>
+                                        <span class="badge bad">"Report unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Reconciliation report unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the dry-run reconciliation cannot be computed. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Badge class for a shift-item priority chip.
+fn shift_priority_badge(priority: &str) -> &'static str {
+    match priority {
+        "P1" => "badge bad",
+        "P2" => "badge warn",
+        _ => "badge neutral",
+    }
+}
+
+/// One open shift-queue item row: title/description, item type, priority,
+/// assignment, triage state (escalated / acknowledged / unacknowledged), and
+/// the raised timestamp.
+fn shift_queue_row(item: ShiftQueueItem) -> impl IntoView {
+    let priority_class = shift_priority_badge(&item.priority);
+    let type_chip = item.item_type.clone();
+    let assignment = match item.assigned_to.clone() {
+        Some(owner) if !owner.is_empty() => view! { <span>{owner}</span> }.into_any(),
+        _ => view! { <span class="badge stale">"Unassigned"</span> }.into_any(),
+    };
+    let state_chip = if item.escalated {
+        view! { <span class="badge bad">"Escalated"</span> }.into_any()
+    } else if item.acknowledged {
+        view! { <span class="badge good">"Acknowledged"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Unacknowledged"</span> }.into_any()
+    };
+    let created = condense_timestamp(&item.created_at);
+
+    view! {
+        <tr>
+            <td>
+                <strong>{item.title.clone()}</strong>
+                <p class="table-note">{item.description.clone()}</p>
+            </td>
+            <td><span class="badge neutral">{type_chip}</span></td>
+            <td><span class=priority_class>{item.priority.clone()}</span></td>
+            <td>{assignment}</td>
+            <td>{state_chip}</td>
+            <td class="cell-date">{created}</td>
+        </tr>
+    }
+}
+
+/// The shift-queue panel for a successfully-loaded snapshot. Live data is
+/// badged with the API's own source marker and real aggregate totals; the
+/// static preview keeps the honest "Static preview" label.
+fn shift_queue_panel(snapshot: ShiftQueueSnapshot) -> impl IntoView {
+    let shown = snapshot.items.len() as u64;
+    let total = snapshot.total_open;
+    let count_label = if snapshot.has_more || total > shown {
+        format!("Showing {shown} of {total} open items")
+    } else if total == 1 {
+        "1 open item".to_string()
+    } else {
+        format!("{total} open items")
+    };
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live queue · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let totals = [
+        format!("{} open", snapshot.total_open),
+        format!("{} P1", snapshot.p1_open),
+        format!("{} P2", snapshot.p2_open),
+        format!("{} unacknowledged", snapshot.unacknowledged),
+    ];
+    let body = if snapshot.items.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"Shift queue is clear"</p>
+                <p class="table-note">
+                    "Open incidents, failed operations, and expiring certificates land here for triage as they are raised."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="Shift queue table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Item"</th>
+                            <th scope="col">"Type"</th>
+                            <th scope="col">"Priority"</th>
+                            <th scope="col">"Assigned to"</th>
+                            <th scope="col">"State"</th>
+                            <th scope="col">"Raised"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.items.into_iter().map(shift_queue_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="shift-queue-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Operations"</span>
+                    <h2 id="shift-queue-title">"Shift queue"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "Open operator work items awaiting acknowledgement, escalation, or resolution — operator-tier data. " {count_label} "."
+            </p>
+            <div class="role-chips" aria-label="Shift queue totals">
+                {totals
+                    .into_iter()
+                    .map(|chip| view! { <span class="role-chip">{chip}</span> })
+                    .collect_view()}
+            </div>
+            {body}
+        </article>
+    }
+}
+
+/// `/operations` flagship surface — the live shift queue served by
+/// `GET /api/ops/shift/summary` + `GET /api/ops/shift/items`. Live mode
+/// renders what the API returns; static mode renders a labeled preview.
+/// Never shows stale or fabricated data — an unreachable API renders an
+/// explicit degraded state.
+#[component]
+fn ShiftQueuePanel() -> impl IntoView {
+    let overview = Resource::new(|| (), |_| get_shift_queue_overview());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="shift-queue-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Operations"</span>
+                            <h2 id="shift-queue-title">"Shift queue"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match overview.await {
+                        Ok(snapshot) => shift_queue_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="shift-queue-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Operations"</span>
+                                            <h2 id="shift-queue-title">"Shift queue"</h2>
+                                        </div>
+                                        <span class="badge bad">"Queue unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Shift queue unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so open operator work items cannot be shown. No stale or fabricated data is displayed."
                                         </p>
                                     </div>
                                 </article>

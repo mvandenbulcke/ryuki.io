@@ -27,8 +27,8 @@ use crate::api::{
     operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
     platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
     request_create_path, request_intake_form_preview_path, request_intake_path, request_list_path,
-    request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
-    site_catalog_path, ApiPathError,
+    request_preflight_path, same_origin_api_path, secret_references_path, servicenow_pending_path,
+    shift_items_path, shift_queue_path, shift_summary_path, site_catalog_path, ApiPathError,
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
@@ -62,11 +62,13 @@ use crate::models::AgentJobSummary;
 use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
-    actions_for_stage, auth_session_fallback, hardware_inventory_fallback,
-    offering_catalog_fallback, platform_health_fallback, platform_status_fallback,
-    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiEvidencePack,
-    ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog, ApiPlatformSummary, ApiRequestDetail,
-    ApiRequestSummary, HardwareAssetSummary,
+    actions_for_stage, auth_session_fallback, cmdb_reconciliation_report_fallback,
+    hardware_inventory_fallback, offering_catalog_fallback, platform_health_fallback,
+    platform_status_fallback, platform_summary_context_fallback, rbac_role_summary_fallbacks,
+    servicenow_queue_fallback, shift_queue_fallback, ApiAuditTrail, ApiCmdbReconcileReport,
+    ApiEvidencePack, ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog, ApiPlatformSummary,
+    ApiRequestDetail, ApiRequestSummary, ApiServiceNowQueue, ApiShiftItemsPage, ApiShiftSummary,
+    HardwareAssetSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -78,8 +80,9 @@ use crate::models::{
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
     AgentSummary, AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbActionResult,
-    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
-    CreateIntegrationPayload, CreateRequestPayload, CreateTokenPayload, CreateTokenResult,
+    CmdbFileExchangeSummary, CmdbReconciliationSnapshot, CmdbReconciliationSummary,
+    CmdbRelationshipSummary, CreateIntegrationPayload, CreateRequestPayload, CreateTokenPayload,
+    CreateTokenResult,
     DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
     DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
     EvidencePackExport, EvidenceSummary, ExecutionJob, HardwareInventorySnapshot,
@@ -87,7 +90,8 @@ use crate::models::{
     OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth, PlatformSettingsSummary,
     PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary,
     RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult,
-    SecretReferenceSummary, StageActionResponse, UpdateIntegrationPayload,
+    SecretReferenceSummary, ServiceNowQueueSnapshot, ShiftQueueSnapshot, StageActionResponse,
+    UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -139,6 +143,8 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     activity_operation_queue_path,
     activity_audit_feed_path,
     shift_queue_path,
+    shift_summary_path,
+    shift_items_path,
     emergency_change_path,
     cmdb_file_exchange_path,
     cmdb_reconciliation_path,
@@ -146,6 +152,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     cmdb_import_path,
     cmdb_export_path,
     cmdb_reconcile_path,
+    servicenow_pending_path,
     evidence_export_retention_path,
     evidence_compliance_dashboard_path,
     operations_runbook_launch_path,
@@ -3469,6 +3476,140 @@ pub async fn get_hardware_inventory() -> Result<HardwareInventorySnapshot, Serve
         // the Inventory view renders an explicit degraded state instead.
         Err(_) => Err(ServerFnError::new("API unreachable")),
     }
+}
+
+// ── CMDB and shift-queue live-read server functions ────────────────────────
+
+/// Reads the staged ServiceNow publish queue through the allowlisted
+/// `GET /api/cmdb/servicenow/pending` read endpoint. These are dry-run
+/// records staged locally — nothing reaches ServiceNow while the live
+/// integration stays disabled, and the CMDB view labels them that way. Live
+/// mode fetches and parses the queue envelope; static mode serves a labeled
+/// preview. A live API that is unreachable surfaces an error so the view
+/// renders an explicit degraded state rather than fabricated queue rows.
+#[server(prefix = "/portal/api", endpoint = "servicenow-publish-queue")]
+pub async fn get_servicenow_publish_queue() -> Result<ServiceNowQueueSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(servicenow_pending_path())
+        .map_err(|_| ServerFnError::new("ServiceNow queue API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(servicenow_queue_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let queue: ApiServiceNowQueue = response
+                .json()
+                .map_err(|_| ServerFnError::new("ServiceNow queue response was malformed"))?;
+            Ok(ServiceNowQueueSnapshot::from_live(queue))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "ServiceNow queue fetch failed",
+        ))),
+        // Live mode never substitutes preview rows for an unreachable API;
+        // the CMDB view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Runs the dry-run CMDB reconciliation through the allowlisted
+/// `POST /api/cmdb/reconcile` endpoint and reads its report. The API computes
+/// the run on demand from the platform inventory and the CMDB import — it is
+/// a pure read despite the POST verb (the response is always marked
+/// `source: "dry-run"` and no CMDB record is mutated), so the CMDB view may
+/// fetch it on load. Live mode parses the presence summary and the
+/// attribute-drift entries; static mode serves a labeled preview. A live API
+/// that is unreachable surfaces an error so the view renders an explicit
+/// degraded state rather than a fabricated report.
+#[server(prefix = "/portal/api", endpoint = "cmdb-reconciliation-report")]
+pub async fn get_cmdb_reconciliation_report(
+) -> Result<CmdbReconciliationSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(cmdb_reconcile_path())
+        .map_err(|_| ServerFnError::new("CMDB reconcile API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(cmdb_reconciliation_report_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.post(path, None, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let report: ApiCmdbReconcileReport = response
+                .json()
+                .map_err(|_| ServerFnError::new("CMDB reconcile response was malformed"))?;
+            Ok(CmdbReconciliationSnapshot::from_live(report))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "CMDB reconciliation fetch failed",
+        ))),
+        // Live mode never substitutes a preview report for an unreachable
+        // API; the CMDB view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Reads the shift queue through the allowlisted `GET /api/ops/shift/summary`
+/// and `GET /api/ops/shift/items` read endpoints: real aggregate totals over
+/// ALL open items plus one bounded page of open items for the triage table.
+/// Operator-tier data — the API gates every shift read on the `execute`
+/// permission, and the Operations view mirrors that gate. Live mode requires
+/// BOTH reads to succeed (they cover the same queue; a half-loaded panel
+/// would misstate the totals); static mode serves a labeled preview. A live
+/// API that is unreachable surfaces an error so the view renders an explicit
+/// degraded state rather than fabricated operator data.
+#[server(prefix = "/portal/api", endpoint = "shift-queue-overview")]
+pub async fn get_shift_queue_overview() -> Result<ShiftQueueSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let summary_path = boundary
+        .validate_platform_api_path(shift_summary_path())
+        .map_err(|_| ServerFnError::new("shift summary API path failed same-origin guard"))?;
+    let items_path = boundary
+        .validate_platform_api_path(shift_items_path())
+        .map_err(|_| ServerFnError::new("shift items API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(shift_queue_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    let summary_response = match upstream.get(summary_path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => response,
+        Ok(response) => {
+            return Err(ServerFnError::new(api_error_text(
+                &response,
+                "shift summary fetch failed",
+            )))
+        }
+        // Live mode never substitutes preview items for an unreachable API;
+        // the Operations view renders an explicit degraded state instead.
+        Err(_) => return Err(ServerFnError::new("API unreachable")),
+    };
+    let summary: ApiShiftSummary = summary_response
+        .json()
+        .map_err(|_| ServerFnError::new("shift summary response was malformed"))?;
+    // Open items only (`resolved=false`) — the same population the summary
+    // counts. One bounded page keeps the triage table useful without
+    // unbounded payloads (the API clamps limit to 200); `has_more` marks a
+    // truncated page.
+    let items_fetch_path = format!("{items_path}?resolved=false&limit=50");
+    let page_response = match upstream.get(&items_fetch_path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => response,
+        Ok(response) => {
+            return Err(ServerFnError::new(api_error_text(
+                &response,
+                "shift items fetch failed",
+            )))
+        }
+        Err(_) => return Err(ServerFnError::new("API unreachable")),
+    };
+    let page: ApiShiftItemsPage = page_response
+        .json()
+        .map_err(|_| ServerFnError::new("shift items response was malformed"))?;
+    Ok(ShiftQueueSnapshot::from_live(summary, page))
 }
 
 // ── Integration server functions ──────────────────────────────────────────
