@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Page not found · Ryuki</title>
-<meta name="description" content="This page does not exist.">
-<meta name="robots" content="noindex">
-<meta property="og:title" content="Page not found · Ryuki">
-<meta property="og:description" content="This page does not exist.">
+<title>Agents & Live Execution · Ryuki</title>
+<meta name="description" content="Enrolling execution agents and the signed approval chain that gates a live apply.">
+<link rel="canonical" href="https://ryuki.io/agents-and-live-execution.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/agents-and-live-execution.html">
+<meta property="og:title" content="Agents & Live Execution · Ryuki">
+<meta property="og:description" content="Enrolling execution agents and the signed approval chain that gates a live apply.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -212,13 +214,13 @@ enforcement semantics
 platform-wide rows and nullable axes
 managing api tokens
 authentication modes
-a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a></li><li><a class="sb-link" data-sections="how an agent joins the platform
+a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a></li><li><a class="sb-link active" aria-current="page" data-sections="how an agent joins the platform
 execution modes
 the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
+what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a><ul class="sb-sections"><li><a href="#how-an-agent-joins-the-platform">How an agent joins the platform</a></li><li><a href="#execution-modes">Execution modes</a></li><li><a href="#the-live-apply-trust-chain">The live-apply trust chain</a></li><li><a href="#where-to-see-results">Where to see results</a></li><li><a href="#credentials-never-reach-the-control-plane">Credentials never reach the control plane</a></li><li><a href="#auto-teardown-on-failed-multi-step-runs">Auto-teardown on failed multi-step runs</a></li><li><a href="#what-is-implemented-and-what-stays-yours">What is implemented, and what stays yours</a></li></ul></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
 per-step live apply
 automatic teardown
@@ -229,9 +231,56 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-
-<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
-
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Agents & Live Execution</span></nav>
+<h1 id="agents-live-execution">Agents &amp; Live Execution</h1>
+<p>Ryuki is dry-run-first: every domain plans, validates, and records evidence without touching live systems. The single path to real infrastructure runs Terraform and Ansible through a <code>ryuki-agent</code> you deploy next to the infrastructure it manages. This guide covers enrolling an agent, dispatching work, and the signed approval chain that gates a live apply.</p>
+<h2 id="how-an-agent-joins-the-platform">How an agent joins the platform</h2>
+<ol>
+<li>Register the agent with the control plane: <code>POST /api/agents/register</code> with <code>agent_id</code>, <code>platform</code>, <code>capabilities</code>, and the agent's Ed25519 <code>public_key</code>. The response contains the agent bearer token (prefix <code>rya_</code>) exactly once; store it securely. New agents start as <code>pending</code>.</li>
+<li>An admin approves the agent: <code>POST /api/admin/agents/{agent_id}/approve</code>, assigning the platform and optionally narrowing capabilities. Revocation is terminal; a revoked agent cannot be re-approved.</li>
+<li>Run the binary with the enrolment settings below. On first boot the agent generates an Ed25519 keypair and writes the seed to <code>RYUKI_AGENT_KEY_PATH</code> with mode <code>0600</code>; it refuses to overwrite an existing key file.</li>
+</ol>
+<p>The agent binary does not self-register yet: registration is an API call you make during provisioning, then the token is supplied to the process.</p>
+<table><thead><tr><th>Variable</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>RYUKI_AGENT_CP_URL</code></td><td>yes</td><td>Control-plane base URL. HTTPS is mandatory for live mode; cleartext is only accepted for loopback development.</td></tr>
+<tr><td><code>RYUKI_AGENT_PLATFORM</code></td><td>yes</td><td>The platform this agent executes for.</td></tr>
+<tr><td><code>RYUKI_AGENT_TOKEN</code></td><td>yes</td><td>Agent bearer token from registration (<code>rya_...</code>).</td></tr>
+<tr><td><code>RYUKI_AGENT_KEY_PATH</code></td><td>no</td><td>Ed25519 seed path (default <code>agent.key</code>).</td></tr>
+<tr><td><code>RYUKI_AGENT_ALLOW_LIVE</code></td><td>no</td><td>Only the literal <code>true</code> or <code>1</code> unlocks live modes. Anything else, including typos, fails safe to dry-run-only.</td></tr>
+<tr><td><code>RYUKI_AGENT_BACKEND_HCL</code></td><td>no</td><td>Operator-supplied Terraform state backend HCL, written into the workspace before <code>init</code>. Optional, but production operators should supply a durable backend; otherwise Terraform uses the bundle's default.</td></tr>
+<tr><td><code>RYUKI_AGENT_POLL_INTERVAL_SECS</code> / <code>RYUKI_AGENT_LEASE_SECS</code></td><td>no</td><td>Job polling (10s) and lease (300s) tuning.</td></tr>
+</tbody></table>
+<p>When live mode is enabled, the agent fetches the control plane's public key once (<code>GET /api/agents/cp-public-key</code>) and pins it for the process lifetime. If the pin fails, live plans still run; live applies are refused.</p>
+<h2 id="execution-modes">Execution modes</h2>
+<table><thead><tr><th>Mode</th><th>Dispatched by</th><th>What runs</th></tr></thead><tbody>
+<tr><td><code>OfflineDryRun</code> (default)</td><td><code>execute</code> tier</td><td><code>terraform validate</code> / <code>ansible-playbook --check</code> in an isolated workspace. No credentials, no network mutation.</td></tr>
+<tr><td><code>LivePlan</code></td><td>admin</td><td>Real <code>terraform init</code> → <code>plan</code> → <code>show -json</code> against the backend. Produces evidence and a plan digest. Nothing mutates.</td></tr>
+<tr><td><code>LiveApply</code></td><td>never dispatched directly; minted by approval</td><td><code>terraform apply</code> of the exact approved plan bytes.</td></tr>
+<tr><td><code>LiveDestroy</code></td><td>system, during auto-teardown</td><td>Reverse-order teardown of applied steps. The trust gate is live; agent-side destroy execution is a pending slice and currently reports a clean refusal.</td></tr>
+</tbody></table>
+<h2 id="the-live-apply-trust-chain">The live-apply trust chain</h2>
+<ol>
+<li><strong>Plan.</strong> An admin dispatches <code>POST /api/requests/{id}/execute?mode=live-plan</code>. The agent plans against the real backend and posts scrubbed evidence plus a SHA-256 plan digest.</li>
+<li><strong>Approve.</strong> An admin calls <code>POST /api/requests/{id}/approve-live-apply</code>. The control plane mints a grant signed with its Ed25519 key, binding the request id, the approved plan digest, the approver, and an expiry (whole-request approvals use a 1-hour TTL; grants are capped at 24 hours). The database allows one request-level live apply; step-scoped applies in orchestrated runs are bounded one per step.</li>
+<li><strong>Verify.</strong> The agent re-checks everything before acting, in order: live mode enabled, grant present, signature valid against the pinned key, request id match, step binding, expiry, and a fresh re-plan whose digest must equal the approved one. Any failure produces a signed <code>LiveRefused</code> result and <code>apply</code> is never called. When the result comes back, the control plane independently verifies the grant signature, the request and step binding, expiry, and that the reported digest equals the approved one.</li>
+<li><strong>Apply.</strong> On success, Terraform applies the saved plan bytes from the approved plan, never a re-plan, so what changes is exactly what was approved, and Terraform itself errors if live state drifted. Ansible live applies re-run the approved playbook and variables after the check-mode digest gate.</li>
+</ol>
+<p>Refusals and results are durable: the agent enqueues every result to a local outbox before posting, so a network failure cannot lose a refusal.</p>
+<h2 id="where-to-see-results">Where to see results</h2>
+<table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody>
+<tr><td>Job state, including <code>live_refused</code></td><td><code>GET /api/admin/agents/jobs/{job_id}/state</code> (admin)</td></tr>
+<tr><td>Full job result</td><td><code>GET /api/admin/agents/jobs/{job_id}/result</code> (admin)</td></tr>
+<tr><td>Request audit trail / evidence</td><td><code>GET /api/requests/{id}/audit</code> and <code>/evidence</code> (audit tier)</td></tr>
+</tbody></table>
+<h2 id="credentials-never-reach-the-control-plane">Credentials never reach the control plane</h2>
+<p>The credential seam is <code>RYUKI_LIVE_CRED_&lt;NAME&gt;</code> environment variables on the agent host; today no bundle declares secret variables, so wiring real provider credentials is an operator step, not something the platform does implicitly. The Terraform subprocess runs with a minimal environment allowlist (<code>PATH</code>, <code>HOME</code>, <code>TMPDIR</code>, locale); nothing is passed through implicitly, and all command output is scrubbed before it becomes signed evidence.</p>
+<p>Control-plane side, the grant-signing key lives at <code>RYUKI_CP_SIGNING_KEY_PATH</code> (default <code>cp-signing.key</code>), created with mode <code>0600</code> on first boot.</p>
+<h2 id="auto-teardown-on-failed-multi-step-runs">Auto-teardown on failed multi-step runs</h2>
+<p>If a step fails mid-way through a multi-step live request, the control plane force-fails any steps still awaiting approval, then tears down applied steps in reverse dependency order. Each teardown is its own step-scoped <code>LiveDestroy</code> grant (approver <code>system:auto-teardown</code>); a grant minted for a whole-request apply can never authorize a destroy. If a destroy itself fails, the cascade halts rather than thrashing, and the surviving steps are left for operator reconciliation.</p>
+<h2 id="what-is-implemented-and-what-stays-yours">What is implemented, and what stays yours</h2>
+<p>Implemented and tested: the dry-run pipeline and the full live trust gate, including grant signing and verification, plan-digest integrity, refusal reporting, and no-double-apply.</p>
+<p>Operator-owned: real provider credentials, a durable Terraform state backend, and the decision to set <code>RYUKI_AGENT_ALLOW_LIVE=true</code> against production. Provider vendor-API adapters and the production Vault credential resolver are still dry-run/mock placeholders, and agent-side <code>LiveDestroy</code> execution is a pending slice.</p>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/agents-and-live-execution.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/rbac-and-scoping.html">&larr; RBAC & Scoping</a><a href="/orchestration.html">Multi-Step Orchestration &rarr;</a></nav>
 </main>
 </div>
 <script>

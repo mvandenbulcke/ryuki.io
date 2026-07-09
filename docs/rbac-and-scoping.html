@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Page not found · Ryuki</title>
-<meta name="description" content="This page does not exist.">
-<meta name="robots" content="noindex">
-<meta property="og:title" content="Page not found · Ryuki">
-<meta property="og:description" content="This page does not exist.">
+<title>RBAC & Scoping · Ryuki</title>
+<meta name="description" content="Roles, permission tiers, site/environment scopes and their enforcement semantics.">
+<link rel="canonical" href="https://ryuki.io/rbac-and-scoping.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/rbac-and-scoping.html">
+<meta property="og:title" content="RBAC & Scoping · Ryuki">
+<meta property="og:description" content="Roles, permission tiers, site/environment scopes and their enforcement semantics.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -206,13 +208,13 @@ important security notes" href="/entra-app-registration.html">Entra App Registra
 site selection flow
 managing sites
 current active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link active" aria-current="page" data-sections="roles and permission tiers
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
 managing api tokens
 authentication modes
-a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a></li><li><a class="sb-link" data-sections="how an agent joins the platform
+a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a><ul class="sb-sections"><li><a href="#roles-and-permission-tiers">Roles and permission tiers</a></li><li><a href="#scopes">Scopes</a></li><li><a href="#enforcement-semantics">Enforcement semantics</a></li><li><a href="#platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</a></li><li><a href="#managing-api-tokens">Managing API tokens</a></li><li><a href="#authentication-modes">Authentication modes</a></li><li><a href="#a-note-on-the-portal">A note on the portal</a></li></ul></li><li><a class="sb-link" data-sections="how an agent joins the platform
 execution modes
 the live-apply trust chain
 where to see results
@@ -229,9 +231,59 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-
-<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
-
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ RBAC & Scoping</span></nav>
+<h1 id="rbac-scoping">RBAC &amp; Scoping</h1>
+<p>Authorization has two independent layers. Roles decide <strong>what</strong> a principal may do, through five permission tiers. Scopes decide <strong>where</strong> they may do it, along two axes: site and environment. A request must pass both.</p>
+<h2 id="roles-and-permission-tiers">Roles and permission tiers</h2>
+<p>Ryuki uses twelve fixed Entra app roles. Each maps to one or more permission tiers; coarse authorization checks tiers, while approval workflows additionally use canonical role names for approval routing and quorum bookkeeping. See <a href="entra-app-registration.html">Entra App Registration</a> for the full role-to-tier matrix and how the <code>roles</code> claim is issued.</p>
+<table><thead><tr><th>Tier</th><th>Grants</th></tr></thead><tbody>
+<tr><td><code>admin</code></td><td>Platform administration. Superuser: satisfies every other tier.</td></tr>
+<tr><td><code>approve</code></td><td>Approving requests through the governed lifecycle.</td></tr>
+<tr><td><code>execute</code></td><td>Dispatching execution (dry-run by default; live modes have extra gates).</td></tr>
+<tr><td><code>request</code></td><td>Creating and managing requests.</td></tr>
+<tr><td><code>audit</code></td><td>Read access to audit trails and evidence.</td></tr>
+</tbody></table>
+<p>The roles: <code>PlatformAdmin</code>, <code>BreakGlassAdmin</code>, <code>DatacenterApprover</code>, <code>VMwareOperator</code>, <code>HyperVOperator</code>, <code>ProxmoxOperator</code>, <code>WintelLinuxOperator</code>, <code>BackupOperator</code>, <code>MonitoringOperator</code>, <code>ServiceDesk</code>, <code>Auditor</code>, and <code>Requester</code>.</p>
+<p>Role assignment for people happens in the Entra enterprise application, not in Ryuki. Unknown roles on a token mint are rejected.</p>
+<h2 id="scopes">Scopes</h2>
+<p>A principal's session carries a site scope and an environment scope, each a list of allowed values. An empty list means unrestricted on that axis.</p>
+<p>Today, scopes are carried by <strong>API tokens</strong>: interactive sessions (Entra ID or local auth) are unscoped, and the dev auth modes run as an unscoped admin. To give an integration a narrow blast radius, mint it a scoped token.</p>
+<h2 id="enforcement-semantics">Enforcement semantics</h2>
+<p>The same rules apply across all scoped domains:</p>
+<table><thead><tr><th>Access pattern</th><th>Out-of-scope behavior</th></tr></thead><tbody>
+<tr><td>Read a single resource by id</td><td><code>404</code>, identical to a missing row. Cross-scope probing never confirms existence.</td></tr>
+<tr><td>Write or filter that explicitly names an out-of-scope site or environment</td><td><code>403</code></td></tr>
+<tr><td>List endpoints</td><td>Results are silently narrowed to the principal's scope. A principal with multiple scopes must name one explicitly in the filter.</td></tr>
+<tr><td>Fleet-wide or aggregate operations</td><td><code>403</code> for scoped principals: an aggregate over data you cannot fully see is denied, not silently partial.</td></tr>
+<tr><td>Resources that target a set of sites (for example patch waves)</td><td>Allowed only if every targeted site is in scope.</td></tr>
+<tr><td>Environment-scoped principal reading a site-only resource</td><td>Empty result set; the axes do not substitute for each other.</td></tr>
+</tbody></table>
+<h2 id="platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</h2>
+<p>Some resources have optional site or environment columns. A <code>NULL</code> axis means "no value on that axis," not "visible to everyone":</p>
+<ul>
+<li>A row is platform-wide, and visible to any scoped principal, only when <strong>both</strong> site and environment are <code>NULL</code>.</li>
+<li>A row with a concrete site and <code>NULL</code> environment is invisible to an environment-scoped principal, and vice versa. The rule is symmetric.</li>
+<li>For by-id reads of single-axis resources, a platform-wide row is reachable only by unrestricted principals.</li>
+</ul>
+<h2 id="managing-api-tokens">Managing API tokens</h2>
+<table><thead><tr><th>Route</th><th>Method</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>/api/admin/tokens</code></td><td>POST</td><td>Create: name, owner principal, roles, optional <code>site_scope</code> and <code>environment_scope</code> (comma-separated), expiry. Admin tier, interactive session required: a token cannot mint tokens.</td></tr>
+<tr><td><code>/api/admin/tokens</code></td><td>GET</td><td>List tokens.</td></tr>
+<tr><td><code>/api/admin/tokens/{id}</code></td><td>GET / DELETE</td><td>Inspect / revoke.</td></tr>
+<tr><td><code>/api/admin/rbac-roles</code></td><td>GET</td><td>The role and permission catalog, as the server enforces it.</td></tr>
+</tbody></table>
+<p>Tokens are create-and-revoke: there is no edit. To change a token's roles or scope, mint a replacement and revoke the old one.</p>
+<h2 id="authentication-modes">Authentication modes</h2>
+<p><code>RYUKI_AUTH_MODE</code> selects how sessions are established; it never enables live provider calls (that is a separate, operator-gated setting).</p>
+<table><thead><tr><th>Mode</th><th>Behavior</th></tr></thead><tbody>
+<tr><td><code>mock-dry-run</code> (default)</td><td>Static development session, unscoped admin.</td></tr>
+<tr><td><code>static-dry-run</code></td><td>Same, without the mock provider affordances.</td></tr>
+<tr><td><code>local</code></td><td>Local username/password sessions.</td></tr>
+<tr><td><code>entra-id</code></td><td>Entra ID SSO. Bearer tokens are validated cryptographically (RS256, issuer, audience, expiry) against tenant JWKS.</td></tr>
+</tbody></table>
+<h2 id="a-note-on-the-portal">A note on the portal</h2>
+<p>The portal filters navigation and actions by role for usability, but that is convenience, not security: every rule above is enforced server-side, and the API answers the same regardless of which client asks.</p>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/rbac-and-scoping.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/site-management.html">&larr; Site Management</a><a href="/agents-and-live-execution.html">Agents & Live Execution &rarr;</a></nav>
 </main>
 </div>
 <script>

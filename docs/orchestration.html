@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Page not found · Ryuki</title>
-<meta name="description" content="This page does not exist.">
-<meta name="robots" content="noindex">
-<meta property="og:title" content="Page not found · Ryuki">
-<meta property="og:description" content="This page does not exist.">
+<title>Multi-Step Orchestration · Ryuki</title>
+<meta name="description" content="Dependency-ordered step plans, per-step live approval, and automatic teardown.">
+<link rel="canonical" href="https://ryuki.io/orchestration.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/orchestration.html">
+<meta property="og:title" content="Multi-Step Orchestration · Ryuki">
+<meta property="og:description" content="Dependency-ordered step plans, per-step live approval, and automatic teardown.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -218,20 +220,56 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
+what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link active" aria-current="page" data-sections="what exists today
 how a stepped request runs
 per-step live apply
 automatic teardown
-honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
+honest limits" href="/orchestration.html">Multi-Step Orchestration</a><ul class="sb-sections"><li><a href="#what-exists-today">What exists today</a></li><li><a href="#how-a-stepped-request-runs">How a stepped request runs</a></li><li><a href="#per-step-live-apply">Per-step live apply</a></li><li><a href="#automatic-teardown">Automatic teardown</a></li><li><a href="#honest-limits">Honest limits</a></li></ul></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
 api
 the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-
-<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
-
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Multi-Step Orchestration</span></nav>
+<h1 id="multi-step-orchestration">Multi-Step Orchestration</h1>
+<p>Some offerings are not one job but a sequence: preflight, deploy, enroll monitoring. Ryuki can materialize a dependency-ordered step plan inside a single governed request, execute steps as their dependencies succeed, gate each live apply on its own approval, and roll back applied steps in reverse order when a later step fails.</p>
+<h2 id="what-exists-today">What exists today</h2>
+<p>One composite offering is wired: <strong>managed server onboarding</strong>, three steps (<code>preflight</code> → <code>deploy</code> → <code>monitor</code>), each depending on the previous. It is selected by creating a <code>server-deployment</code> request whose <code>fields.deployment_profile</code> is <code>managed-onboarding</code> (the server mirrors that allowlisted field into request metadata); it is not a separate catalog entry. Each step references a real single-offering IaC bundle.</p>
+<p>Step plans are defined in code (a step template in <code>ryuki-runner</code>), not in YAML: adding a new composite offering is a code change. The plan is validated at request creation (duplicate keys, unknown dependencies, and cycles are rejected), materialized in the same transaction as the request, and immutable afterwards.</p>
+<h2 id="how-a-stepped-request-runs">How a stepped request runs</h2>
+<ol>
+<li><code>POST /api/requests</code> creates the request and materializes the step plan.</li>
+<li><code>POST /api/requests/{id}/execute</code> dispatches the initially ready steps (dependencies satisfied). The default mode is <code>OfflineDryRun</code>; <code>?mode=live-plan</code> requires admin.</li>
+<li>When an agent posts a step's job result, the control plane locks the whole plan, records the outcome, and dispatches any steps that just became ready. There is no polling scheduler; progress rides on job completion.</li>
+<li><code>GET /api/requests/{id}</code> includes a <code>steps</code> array with each step's key, dependencies, IaC reference, and status.</li>
+</ol>
+<p>If a step fails, in-flight siblings are swept to failed and their pending agent jobs cancelled. A failed dependency blocks its dependents permanently, by design; there is no automatic retry or skip.</p>
+<h2 id="per-step-live-apply">Per-step live apply</h2>
+<p>A stepped request can never be live-applied as a whole; <code>?mode=live-apply</code> and the request-level approval endpoint both refuse. Instead each step earns its own apply:</p>
+<ol>
+<li>The step's live plan completes and the step parks in <code>AwaitingApproval</code>, carrying its plan digest.</li>
+<li>An admin (not the requester; separation of duties is enforced) calls <code>POST /api/requests/{id}/steps/{step_key}/approve-live-apply</code>.</li>
+<li>The approval flips the step to <code>Applying</code> under a row lock, so a double approval loses cleanly, and mints a step-scoped grant bound to that one job: signed by the control plane, digest-checked by the agent, one live apply per step.</li>
+<li>Approval is refused if the request has begun rolling back.</li>
+</ol>
+<h2 id="automatic-teardown">Automatic teardown</h2>
+<p>If a live step fails after earlier steps have applied, the control plane rolls back:</p>
+<ul>
+<li>Steps still awaiting approval are failed first, so nothing new can be approved into a collapsing run.</li>
+<li>Applied steps are torn down in reverse dependency order, each with its own step-scoped <code>LiveDestroy</code> grant minted by the system. The authority to destroy derives from the step's own apply approval; a whole-request grant can never authorize a destroy.</li>
+<li>If a destroy itself fails, the cascade halts rather than thrashing. The request ends <code>failed</code>, and any steps still marked applied or tearing down are the operator's reconciliation list.</li>
+</ul>
+<p>The request remains <code>executing</code> while teardown runs, so destroy results flow through the same result path, and settles at <code>failed</code> once nothing is left applied.</p>
+<h2 id="honest-limits">Honest limits</h2>
+<ul>
+<li><strong>API-only surface.</strong> The portal does not yet render step plans or the per-step approval; drive stepped requests over the API. The single-job live-apply approval is wired in the portal.</li>
+<li><strong>Agent-side destroy is pending.</strong> The teardown orchestration, grants, and halt semantics are complete and CI-tested, but today's agent refuses <code>LiveDestroy</code> cleanly rather than running <code>terraform destroy</code>; the refusal halts the cascade for operator reconciliation.</li>
+<li><strong>Live steps need a real agent.</strong> Per-step live applies require a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and real provider credentials; CI validates the control-plane side with simulated agent results.</li>
+<li><strong>Provider egress.</strong> Server-deployment bundles use the real <code>vmware/vsphere</code> Terraform provider: <code>init</code> needs one-time registry egress, and <code>plan</code> needs a reachable vCenter, degrading gracefully otherwise.</li>
+<li><strong>No in-place retry.</strong> A non-stepped request's single live-apply slot is consumed permanently, even by a failure; recovery is a new request.</li>
+</ul>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/orchestration.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/agents-and-live-execution.html">&larr; Agents & Live Execution</a><a href="/notifications.html">Notifications &rarr;</a></nav>
 </main>
 </div>
 <script>

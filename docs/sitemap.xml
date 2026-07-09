@@ -7,5 +7,9 @@
   <url><loc>https://ryuki.io/configuration.html</loc></url>
   <url><loc>https://ryuki.io/entra-app-registration.html</loc></url>
   <url><loc>https://ryuki.io/site-management.html</loc></url>
+  <url><loc>https://ryuki.io/rbac-and-scoping.html</loc></url>
+  <url><loc>https://ryuki.io/agents-and-live-execution.html</loc></url>
+  <url><loc>https://ryuki.io/orchestration.html</loc></url>
+  <url><loc>https://ryuki.io/notifications.html</loc></url>
   <url><loc>https://ryuki.io/api-reference.html</loc></url>
 </urlset>

@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Page not found · Ryuki</title>
-<meta name="description" content="This page does not exist.">
-<meta name="robots" content="noindex">
-<meta property="og:title" content="Page not found · Ryuki">
-<meta property="og:description" content="This page does not exist.">
+<title>Notifications · Ryuki</title>
+<meta name="description" content="In-app notifications, read receipts, the portal bell, and what emits them.">
+<link rel="canonical" href="https://ryuki.io/notifications.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/notifications.html">
+<meta property="og:title" content="Notifications · Ryuki">
+<meta property="og:description" content="In-app notifications, read receipts, the portal bell, and what emits them.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -222,16 +224,49 @@ what is implemented, and what stays yours" href="/agents-and-live-execution.html
 how a stepped request runs
 per-step live apply
 automatic teardown
-honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
+honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link active" aria-current="page" data-sections="what gets notified, and to whom
 recipients and read state
 api
 the portal bell
 delivery channels
-known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+known limits" href="/notifications.html">Notifications</a><ul class="sb-sections"><li><a href="#what-gets-notified-and-to-whom">What gets notified, and to whom</a></li><li><a href="#recipients-and-read-state">Recipients and read state</a></li><li><a href="#api">API</a></li><li><a href="#the-portal-bell">The portal bell</a></li><li><a href="#delivery-channels">Delivery channels</a></li><li><a href="#known-limits">Known limits</a></li></ul></li><li><a class="sb-link" data-sections="" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-
-<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
-
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Notifications</span></nav>
+<h1 id="notifications">Notifications</h1>
+<p>Ryuki has in-app notifications with per-user read receipts. They are emitted by the server on lifecycle and operational events, listed in the portal bell, and readable over the API. There is no email or webhook delivery today: a dispatch outbox records what a future sender *would* do, and nothing more.</p>
+<h2 id="what-gets-notified-and-to-whom">What gets notified, and to whom</h2>
+<p>Notifications are created only by server-side domain logic; there is no API to emit one.</p>
+<table><thead><tr><th>Event</th><th>Recipient</th><th>Severity</th></tr></thead><tbody>
+<tr><td><code>request.plan</code></td><td>Role: <code>DatacenterApprover</code></td><td>Info</td></tr>
+<tr><td><code>request.approve</code></td><td>Request owner</td><td>Success</td></tr>
+<tr><td><code>request.reject</code></td><td>Request owner</td><td>Warning</td></tr>
+<tr><td><code>request.verify</code></td><td>Request owner</td><td>Success</td></tr>
+<tr><td><code>request.cancel</code></td><td>Request owner</td><td>Warning</td></tr>
+<tr><td><code>slo.breach</code> / <code>slo.recovered</code></td><td>Role: <code>MonitoringOperator</code></td><td>Critical / Success</td></tr>
+<tr><td><code>budget.breach</code> / <code>budget.recovered</code></td><td>Role: <code>MonitoringOperator</code></td><td>Warning / Success</td></tr>
+<tr><td><code>agent.offline</code> / <code>agent.online</code></td><td>Role: <code>MonitoringOperator</code></td><td>Warning / Success</td></tr>
+</tbody></table>
+<p>Lifecycle notifications are emitted after the transaction commits, detached from the request path: a notification failure can never fail the transition. Monitoring alerts (SLO, budget, agent liveness) are written atomically with their domain event by the background scan loops. A partial approval deliberately does not tell the owner "approved."</p>
+<p>Notification bodies are synthesized from structured fields (request id, aggregate id); free-text never flows into a notification.</p>
+<h2 id="recipients-and-read-state">Recipients and read state</h2>
+<p>A notification targets either one user or one role. Role notifications are a single row that every holder of the role sees; read state is a per-user receipt, so one operator marking an alert read does not clear it for the rest of the team.</p>
+<p>Notifications are not site- or environment-scoped: they follow the recipient, not the resource's scope.</p>
+<h2 id="api">API</h2>
+<table><thead><tr><th>Method</th><th>Path</th><th>Notes</th></tr></thead><tbody>
+<tr><td>GET</td><td><code>/api/notifications</code></td><td>The caller's notifications, newest first (capped at 200).</td></tr>
+<tr><td>GET</td><td><code>/api/notifications/unread-count</code></td><td>Badge count.</td></tr>
+<tr><td>POST</td><td><code>/api/notifications/{id}/read</code></td><td>Mark one read. Non-recipients get a 404; existence is never leaked.</td></tr>
+<tr><td>POST</td><td><code>/api/notifications/read-all</code></td><td>Mark all read.</td></tr>
+<tr><td>GET</td><td><code>/api/admin/notifications/dispatch-outbox</code></td><td>Admin: dry-run dispatch telemetry (<code>?status=</code>, <code>?limit=</code>). Returns metadata only, never bodies.</td></tr>
+</tbody></table>
+<p>Reading requires an ordinary session (audit or request tier); marking read is self-service for the recipient. Without a database the read endpoints degrade to empty <code>no-db</code> responses and the write endpoints return 503.</p>
+<h2 id="the-portal-bell">The portal bell</h2>
+<p>The bell lives in the portal header. The badge shows the unread count and the panel lists recent notifications; clicking an item marks it read and deep-links to the request when one is referenced. Counts refresh when the panel opens or after your own read actions; a background poll is a possible follow-up, so a notification arriving mid-session appears the next time you open the panel.</p>
+<h2 id="delivery-channels">Delivery channels</h2>
+<p>Every emitted notification also plans its hypothetical delivery in the dispatch outbox: Critical events plan email and webhook, Warnings plan webhook, Info and Success plan nothing. The outbox is telemetry for operators to inspect (<code>dry_run_logged</code> status); no send path exists yet, and outbox bookkeeping can never roll back a notification.</p>
+<h2 id="known-limits">Known limits</h2>
+<p>There is no retention or pruning job for notifications yet; the list endpoint caps at the newest 200 per recipient. If you need long-term archival of operational events, use the audit trail and domain events, which are the durable record.</p>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/notifications.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/orchestration.html">&larr; Multi-Step Orchestration</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
 </main>
 </div>
 <script>
