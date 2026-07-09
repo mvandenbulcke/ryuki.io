@@ -21451,11 +21451,15 @@ struct OnCallContactUpdateRequest {
     enabled: Option<bool>,
 }
 
-/// List-filter query for on-call contacts.
+/// List-filter query for on-call contacts. #14: `limit`/`offset` live on this
+/// DEDICATED list struct (never shared with the by-id/mutation handlers), so a
+/// bad `?limit=` can only ever 400 the list endpoint.
 #[derive(Debug, Deserialize, Default)]
 struct OnCallListQuery {
     site: Option<String>,
     tier: Option<i32>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 /// Trim an optional string to `None` when blank.
@@ -21532,34 +21536,98 @@ async fn on_call_contact_list(
     AuthExtractor(session): AuthExtractor,
     Query(q): Query<OnCallListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({ "contacts": [], "durable": false })));
+        return Ok(Json(json!({
+            "contacts": [], "durable": false,
+            "total": 0, "limit": limit, "offset": offset,
+        })));
+    };
+    // #2: the nullable-site containment of `nullable_site_scope_guard_or_404`
+    // (previously applied row-by-row in Rust AFTER a fetch-all), pushed INTO SQL
+    // (#14) so a LIMIT/OFFSET page and the total reflect the filtered set:
+    //   * env-scoped principal → nothing (site-only resource; `Empty`);
+    //   * UNRESTRICTED principal (LITERALLY empty site scope) → every row,
+    //     INCLUDING platform-wide (NULL-site) contacts (`All`, no WHERE);
+    //   * site-scoped principal → only concrete in-scope sites; a NULL-site
+    //     row is never a scoped principal's (`site = ANY(..)` never matches
+    //     NULL — the SQL mirror of the guard's `is_scoped()` 404).
+    let sites: Option<Vec<String>> = match list_site_scope(&session) {
+        ListSiteScope::Empty => {
+            return Ok(Json(json!({
+                "source": "database", "contacts": [], "count": 0,
+                "total": 0, "limit": limit, "offset": offset,
+            })));
+        }
+        ListSiteScope::All => None,
+        ListSiteScope::Sites(s) => Some(s),
     };
     let f_site = norm_opt(&q.site);
-    let rows: Vec<OnCallContactRow> = sqlx::query_as(&format!(
-        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts \
-         WHERE ($1::text IS NULL OR site = $1) \
-           AND ($2::int IS NULL OR escalation_tier = $2) \
-         ORDER BY escalation_tier ASC, name ASC"
-    ))
-    .bind(&f_site)
-    .bind(q.tier)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
-    // #2: apply the same nullable-site containment as the by-id reads — a scoped
-    // principal keeps only contacts tagged to a concrete in-scope site (NULL/
-    // platform-wide and other sites are dropped); an env-scoped principal keeps
-    // none; an unrestricted principal keeps everything.
-    let contacts: Vec<Value> = rows
-        .iter()
-        .filter(|r| nullable_site_scope_guard_or_404(&session, r.site.as_deref(), "").is_ok())
-        .map(OnCallContactRow::to_json)
-        .collect();
+    // Build the WHERE from ONLY the active predicates — the old
+    // `($n IS NULL OR col = $n)` shape seq-scans under a GENERIC prepared plan
+    // (sqlx caches prepared statements). Column names are compile-time
+    // literals; every value is a BOUND parameter, so this is injection-safe.
+    let mut preds: Vec<String> = Vec::new();
+    let mut n = 0;
+    if f_site.is_some() {
+        n += 1;
+        preds.push(format!("site = ${n}"));
+    }
+    if q.tier.is_some() {
+        n += 1;
+        preds.push(format!("escalation_tier = ${n}"));
+    }
+    if sites.is_some() {
+        n += 1;
+        preds.push(format!("site = ANY(${n})"));
+    }
+    let where_sql = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+    // #14: `(escalation_tier, name)` is non-unique → append the unique PK `id`
+    // as the tie-breaker so LIMIT/OFFSET pages are a stable cut.
+    let page_sql = format!(
+        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts{where_sql} \
+         ORDER BY escalation_tier ASC, name ASC, id ASC LIMIT ${} OFFSET ${}",
+        n + 1,
+        n + 2
+    );
+    let count_sql = format!("SELECT COUNT(*) FROM on_call_contacts{where_sql}");
+    // Bind in the SAME order the placeholders were assigned above — the count
+    // query shares the IDENTICAL WHERE and binds (minus LIMIT/OFFSET).
+    let mut page_q = sqlx::query_as::<_, OnCallContactRow>(&page_sql);
+    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+    if let Some(s) = &f_site {
+        page_q = page_q.bind(s);
+        count_q = count_q.bind(s);
+    }
+    if let Some(t) = q.tier {
+        page_q = page_q.bind(t);
+        count_q = count_q.bind(t);
+    }
+    if let Some(s) = &sites {
+        page_q = page_q.bind(s);
+        count_q = count_q.bind(s);
+    }
+    let rows: Vec<OnCallContactRow> = page_q
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+    let total: i64 = count_q.fetch_one(pool).await.map_err(db_error)?;
+    let contacts: Vec<Value> = rows.iter().map(OnCallContactRow::to_json).collect();
     Ok(Json(json!({
         "source": "database",
         "contacts": contacts,
         "count": contacts.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     })))
 }
 
@@ -22927,23 +22995,91 @@ async fn metrics_budget_create(
 }
 
 /// GET /api/metrics/budgets — list all defined budgets. Request-tier read.
-async fn metrics_budget_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+async fn metrics_budget_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<AdminListPage>,
+) -> ApiResult {
     if !check_permission(&session, "request") {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "authentication is required to read budgets"})),
         ));
     }
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({"budgets": [], "durable": false})));
+        return Ok(Json(json!({
+            "budgets": [], "durable": false,
+            "total": 0, "limit": limit, "offset": offset,
+        })));
     };
-    let rows: Vec<MetricBudgetRow> = match sqlx::query_as(
-        "SELECT id, metric_key, site, environment, threshold, comparison, enabled \
-         FROM metric_budgets ORDER BY created_at DESC",
-    )
-    .fetch_all(pool)
-    .await
-    {
+    // #2: a scoped principal sees only in-scope (or platform-wide None) budget
+    // definitions — consistent with metrics_budget_status. Previously applied
+    // row-by-row in Rust after a fetch-all; #14 pushes the SAME per-axis
+    // `scope_permits` containment into SQL so a LIMIT/OFFSET page and the total
+    // reflect the filtered set: on each axis independently, an unrestricted
+    // (LITERALLY empty) scope matches everything, and otherwise the row's axis
+    // must be NULL (platform-wide passes for every principal) or a held value.
+    // Built as a 4-branch (site-axis × env-axis) dynamic WHERE — each branch a
+    // static shape with bound arrays, not the OR-NULL scalar antipattern that
+    // seq-scans under a generic prepared plan.
+    let site_vals = nullable_axis_scope_values(&session.site_scope);
+    let env_vals = nullable_axis_scope_values(&session.environment_scope);
+    const BUDGET_COLS: &str = "id, metric_key, site, environment, threshold, comparison, enabled";
+    // #14: `created_at` is non-unique → append the unique PK `id` as the
+    // tie-breaker so LIMIT/OFFSET pages are a stable cut.
+    const BUDGET_ORDER: &str = "ORDER BY created_at DESC, id DESC";
+    let page_res: Result<Vec<MetricBudgetRow>, sqlx::Error> = match (&site_vals, &env_vals) {
+        (None, None) => {
+            sqlx::query_as(&format!(
+                "SELECT {BUDGET_COLS} FROM metric_budgets {BUDGET_ORDER} LIMIT $1 OFFSET $2"
+            ))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(sites), None) => {
+            sqlx::query_as(&format!(
+                "SELECT {BUDGET_COLS} FROM metric_budgets \
+                 WHERE (site IS NULL OR site = ANY($1)) \
+                 {BUDGET_ORDER} LIMIT $2 OFFSET $3"
+            ))
+            .bind(sites)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+        }
+        (None, Some(envs)) => {
+            sqlx::query_as(&format!(
+                "SELECT {BUDGET_COLS} FROM metric_budgets \
+                 WHERE (environment IS NULL OR environment = ANY($1)) \
+                 {BUDGET_ORDER} LIMIT $2 OFFSET $3"
+            ))
+            .bind(envs)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(sites), Some(envs)) => {
+            sqlx::query_as(&format!(
+                "SELECT {BUDGET_COLS} FROM metric_budgets \
+                 WHERE (site IS NULL OR site = ANY($1)) \
+                   AND (environment IS NULL OR environment = ANY($2)) \
+                 {BUDGET_ORDER} LIMIT $3 OFFSET $4"
+            ))
+            .bind(sites)
+            .bind(envs)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+        }
+    };
+    let rows: Vec<MetricBudgetRow> = match page_res {
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!(error = %e, "listing budgets failed");
@@ -22953,17 +23089,55 @@ async fn metrics_budget_list(AuthExtractor(session): AuthExtractor) -> ApiResult
             ));
         }
     };
+    // Sibling COUNT with the IDENTICAL WHERE/binds (minus LIMIT/OFFSET), so the
+    // reported total is the full filtered set regardless of the page bounds.
+    let total_res: Result<i64, sqlx::Error> = match (&site_vals, &env_vals) {
+        (None, None) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM metric_budgets")
+                .fetch_one(pool)
+                .await
+        }
+        (Some(sites), None) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM metric_budgets WHERE (site IS NULL OR site = ANY($1))",
+            )
+            .bind(sites)
+            .fetch_one(pool)
+            .await
+        }
+        (None, Some(envs)) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM metric_budgets \
+                 WHERE (environment IS NULL OR environment = ANY($1))",
+            )
+            .bind(envs)
+            .fetch_one(pool)
+            .await
+        }
+        (Some(sites), Some(envs)) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM metric_budgets \
+                 WHERE (site IS NULL OR site = ANY($1)) \
+                   AND (environment IS NULL OR environment = ANY($2))",
+            )
+            .bind(sites)
+            .bind(envs)
+            .fetch_one(pool)
+            .await
+        }
+    };
+    let total: i64 = match total_res {
+        Ok(total) => total,
+        Err(e) => {
+            tracing::error!(error = %e, "counting budgets failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list budgets"})),
+            ));
+        }
+    };
     let budgets: Vec<Value> = rows
         .iter()
-        // #2: a scoped principal sees only in-scope (or platform-wide None) budget
-        // definitions — consistent with metrics_budget_status.
-        .filter(|b| {
-            ryuki_engine::auth::scope_permits(&session.site_scope, b.site.as_deref())
-                && ryuki_engine::auth::scope_permits(
-                    &session.environment_scope,
-                    b.environment.as_deref(),
-                )
-        })
         .map(|b| {
             json!({
                 "id": b.id,
@@ -22976,7 +23150,13 @@ async fn metrics_budget_list(AuthExtractor(session): AuthExtractor) -> ApiResult
             })
         })
         .collect();
-    Ok(Json(json!({"budgets": budgets, "durable": true})))
+    Ok(Json(json!({
+        "budgets": budgets,
+        "durable": true,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 /// GET /api/metrics/budgets/status — evaluate every ENABLED budget against its
@@ -25962,6 +26142,27 @@ fn multi_scope_axis_sql_filter(scope: &[String]) -> Option<Vec<String>> {
     entries.sort();
     entries.dedup();
     Some(entries)
+}
+
+/// #14: the SQL translation of ONE `scope_permits` axis for a list read over a
+/// NULLABLE dual-axis resource (metric_budgets): `None` = the principal is
+/// unrestricted on this axis — mirroring `scope_permits`' emptiness test, this
+/// is ONLY the LITERALLY-empty scope Vec (a non-empty-but-all-blank set is NOT
+/// widened to "all"; it keeps the fail-closed `= ANY('{\"\"}')` that matches no
+/// concrete value). `Some(values)` = the row's axis column must be NULL — a
+/// NULL/platform-wide axis value passes `scope_permits` for EVERY principal
+/// (the documented metric-budget read policy; see `metrics_budget_status`) —
+/// or one of these held, trimmed, distinct values. Unlike [`list_site_scope`]
+/// this is per-axis: an environment scope is honored on ITS OWN axis, not
+/// collapsed to an empty result.
+fn nullable_axis_scope_values(scopes: &[String]) -> Option<Vec<String>> {
+    if scopes.is_empty() {
+        return None;
+    }
+    let mut vals: Vec<String> = scopes.iter().map(|s| s.trim().to_string()).collect();
+    vals.sort();
+    vals.dedup();
+    Some(vals)
 }
 
 /// Body-scope guard for a DUAL-axis WRITE (#2): a scoped principal may only
@@ -45813,6 +46014,279 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #14: on_call_contact_list pages with limit/offset + total, with the
+    /// nullable-site containment pushed into SQL. Verifies: total against an
+    /// INDEPENDENT raw COUNT(*) with the same scope; EXACT offset-slice
+    /// equality against the full ordering (identical (tier, name) sort keys
+    /// seeded so a missing `id` tie-breaker would surface); row-by-row
+    /// equivalence with the pre-#14 in-memory guard for a real scoped
+    /// principal; env-scoped and all-blank scopes yield nothing; the ?site /
+    /// ?tier filters compose with the scope in SQL.
+    #[tokio::test]
+    async fn on_call_contact_list_paged_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let admin = || AuthExtractor(AuthSession::static_dry_run());
+        // Idempotent re-run guard: drop leftovers from a crashed earlier run.
+        sqlx::query("DELETE FROM on_call_contacts WHERE role = 'p14-page-test'")
+            .execute(pool)
+            .await
+            .expect("pre-clean");
+        let mk = |site: Option<&str>, name: &str, tier: i32| OnCallContactCreateRequest {
+            name: name.to_string(),
+            role: "p14-page-test".to_string(),
+            site: site.map(str::to_string),
+            escalation_tier: Some(tier),
+            email: Some("p14@example.com".to_string()),
+            phone: None,
+        };
+        // 4 rows with IDENTICAL (tier, name) sort keys — only the unique id
+        // tie-breaker orders them; 2 GBLON rows at tier 2; 1 platform-wide
+        // (NULL-site) row.
+        for _ in 0..4 {
+            let _ = on_call_contact_create(admin(), Json(mk(Some("DEFRA"), "P14 Same", 1)))
+                .await
+                .expect("seed DEFRA");
+        }
+        for i in 0..2 {
+            let _ = on_call_contact_create(admin(), Json(mk(Some("GBLON"), &format!("P14 G{i}"), 2)))
+                .await
+                .expect("seed GBLON");
+        }
+        let global = on_call_contact_create(admin(), Json(mk(None, "P14 Global", 1)))
+            .await
+            .expect("seed platform-wide");
+        let global_id = global.0["id"].as_str().unwrap().to_string();
+
+        // Unrestricted default page: total == an INDEPENDENT raw COUNT(*).
+        let all = on_call_contact_list(admin(), Query(OnCallListQuery::default()))
+            .await
+            .expect("list")
+            .0;
+        let raw_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM on_call_contacts")
+            .fetch_one(pool)
+            .await
+            .expect("raw count");
+        assert_eq!(
+            all["total"].as_i64().unwrap(),
+            raw_total,
+            "#14: total must equal an independent raw COUNT(*)"
+        );
+        let page = all["contacts"].as_array().unwrap();
+        assert_eq!(
+            all["count"].as_i64().unwrap(),
+            page.len() as i64,
+            "count is the page length"
+        );
+        assert!(
+            page.iter().any(|c| c["id"] == json!(global_id)),
+            "an unrestricted list must include the platform-wide (NULL-site) contact"
+        );
+
+        // EXACT offset-slice equality against the full ordering (id tie-breaker).
+        let full_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM on_call_contacts ORDER BY escalation_tier ASC, name ASC, id ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("full ordering");
+        for offset in [0usize, 2, 4] {
+            let paged = on_call_contact_list(
+                admin(),
+                Query(OnCallListQuery {
+                    limit: Some(2),
+                    offset: Some(offset as i64),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("paged list")
+            .0;
+            let got: Vec<String> = paged["contacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().to_string())
+                .collect();
+            let want: Vec<String> = full_ids.iter().skip(offset).take(2).cloned().collect();
+            assert_eq!(
+                got, want,
+                "#14: page at offset {offset} must equal the full-ordering slice"
+            );
+            assert_eq!(
+                paged["total"].as_i64().unwrap(),
+                raw_total,
+                "#14: limit/offset must not change the total"
+            );
+        }
+
+        // GBLON-scoped principal: only concrete GBLON rows (never NULL), and the
+        // page equals — row by row — what the pre-#14 in-memory guard kept.
+        let gblon = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+        let scoped = on_call_contact_list(
+            AuthExtractor(gblon()),
+            Query(OnCallListQuery::default()),
+        )
+        .await
+        .expect("scoped list")
+        .0;
+        let scoped_contacts = scoped["contacts"].as_array().unwrap();
+        assert!(
+            !scoped_contacts.is_empty(),
+            "a GBLON-scoped principal must see the seeded GBLON rows"
+        );
+        assert!(
+            scoped_contacts.iter().all(|c| c["site"] == json!("GBLON")),
+            "a GBLON-scoped page must hold ONLY concrete GBLON rows: {scoped_contacts:?}"
+        );
+        let raw_scoped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM on_call_contacts WHERE site = 'GBLON'")
+                .fetch_one(pool)
+                .await
+                .expect("raw scoped count");
+        assert_eq!(
+            scoped["total"].as_i64().unwrap(),
+            raw_scoped,
+            "#14: scoped total must equal an independent scoped COUNT(*)"
+        );
+        let ordered_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, site FROM on_call_contacts \
+             ORDER BY escalation_tier ASC, name ASC, id ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("ordered rows");
+        let want_scoped: Vec<String> = ordered_rows
+            .iter()
+            .filter(|(_, site)| {
+                nullable_site_scope_guard_or_404(&gblon(), site.as_deref(), "").is_ok()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let got_scoped: Vec<String> = scoped_contacts
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            got_scoped, want_scoped,
+            "#14: the SQL scope push-down must select exactly the rows the \
+             in-memory guard kept, in the same order"
+        );
+        // Scoped offset slice: WHERE + ORDER BY + OFFSET compose.
+        let scoped_page = on_call_contact_list(
+            AuthExtractor(gblon()),
+            Query(OnCallListQuery {
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("scoped paged list")
+        .0;
+        let got_slice: Vec<String> = scoped_page["contacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            got_slice,
+            want_scoped[1..2].to_vec(),
+            "#14: a scoped offset slice must equal the filtered-ordering slice"
+        );
+
+        // An environment-scoped principal sees nothing (site-only resource).
+        let mut env_scoped = AuthSession::static_dry_run();
+        env_scoped.environment_scope = vec!["production".into()];
+        let none = on_call_contact_list(
+            AuthExtractor(env_scoped),
+            Query(OnCallListQuery::default()),
+        )
+        .await
+        .expect("env-scoped list")
+        .0;
+        assert!(
+            none["contacts"].as_array().unwrap().is_empty(),
+            "an env-scoped principal must see no site-only contacts"
+        );
+        assert_eq!(none["total"].as_i64().unwrap(), 0);
+        assert_eq!(none["count"].as_i64().unwrap(), 0);
+
+        // An all-blank (never produced by a real token — parse_token_scope
+        // strips blanks) scope set fails CLOSED to nothing, never widens.
+        let mut blank = AuthSession::static_dry_run();
+        blank.site_scope = vec!["".into(), " ".into()];
+        let nothing = on_call_contact_list(
+            AuthExtractor(blank),
+            Query(OnCallListQuery::default()),
+        )
+        .await
+        .expect("all-blank list")
+        .0;
+        assert!(
+            nothing["contacts"].as_array().unwrap().is_empty(),
+            "an all-blank scope set must match NOTHING"
+        );
+        assert_eq!(nothing["total"].as_i64().unwrap(), 0);
+
+        // ?tier composes: total == an independent COUNT with the same filter.
+        let tier2 = on_call_contact_list(
+            admin(),
+            Query(OnCallListQuery {
+                tier: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("tier filter")
+        .0;
+        let raw_tier2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM on_call_contacts WHERE escalation_tier = 2",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("raw tier count");
+        assert_eq!(tier2["total"].as_i64().unwrap(), raw_tier2);
+        assert!(
+            tier2["contacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["escalation_tier"] == json!(2)),
+            "?tier=2 must filter the page"
+        );
+        // ?site outside the principal's scope intersects to nothing.
+        let cross = on_call_contact_list(
+            AuthExtractor(gblon()),
+            Query(OnCallListQuery {
+                site: Some("DEFRA".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("cross-scope filter")
+        .0;
+        assert_eq!(
+            cross["total"].as_i64().unwrap(),
+            0,
+            "?site outside the scope must intersect to nothing"
+        );
+        assert!(cross["contacts"].as_array().unwrap().is_empty());
+
+        sqlx::query("DELETE FROM on_call_contacts WHERE role = 'p14-page-test'")
+            .execute(pool)
+            .await
+            .expect("cleanup");
+    }
+
     /// #25: an SLO over recorded good/total metrics reports its attainment and
     /// compliance via the status endpoint (999/1000 meets a 0.999 target).
     #[tokio::test]
@@ -48667,6 +49141,293 @@ mod db_lifecycle_tests {
                 "scoped delete of a platform-wide budget must 404: {del:?}"
             );
         }
+    }
+
+    /// #14: metrics_budget_list pages with limit/offset + total, with the
+    /// per-axis `scope_permits` containment (NULL axis = platform-wide, passes
+    /// EVERY principal; unrestricted ⟺ LITERALLY empty scope Vec) pushed into
+    /// SQL. Verifies: total against an INDEPENDENT raw COUNT(*); EXACT
+    /// offset-slice equality against the full ordering (four rows share ONE
+    /// created_at so a missing `id` tie-breaker would surface); row-by-row
+    /// equivalence with the pre-#14 in-memory filter for site-scoped,
+    /// env-scoped, dual-scoped, and all-blank principals — including the
+    /// documented per-axis reads policy (a site-only budget stays visible to
+    /// an env-scoped principal; an all-blank scope matches NO concrete value
+    /// but platform-wide rows still pass).
+    #[tokio::test]
+    async fn metrics_budget_list_paged_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let admin = || AuthExtractor(AuthSession::static_dry_run());
+        // Idempotent re-run guard: drop leftovers from a crashed earlier run.
+        sqlx::query("DELETE FROM metric_budgets WHERE metric_key = 'p14.page.test'")
+            .execute(pool)
+            .await
+            .expect("pre-clean");
+        // (site, environment, created_at): the first FOUR rows share one
+        // created_at (only the id tie-breaker orders them); the rest cover
+        // every NULL/concrete axis combination.
+        let seeds: &[(Option<&str>, Option<&str>, &str)] = &[
+            (Some("DEFRA"), Some("dev"), "2000-01-01T00:00:00Z"),
+            (Some("DEFRA"), Some("dev"), "2000-01-01T00:00:00Z"),
+            (Some("DEFRA"), Some("dev"), "2000-01-01T00:00:00Z"),
+            (Some("DEFRA"), Some("dev"), "2000-01-01T00:00:00Z"),
+            (Some("DEFRA"), None, "2000-01-02T00:00:00Z"),
+            (Some("GBLON"), Some("production"), "2000-01-03T00:00:00Z"),
+            (None, Some("production"), "2000-01-04T00:00:00Z"),
+            (None, None, "2000-01-05T00:00:00Z"),
+        ];
+        let mut seeded: Vec<String> = Vec::new();
+        for (site, env, created) in seeds {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO metric_budgets \
+                 (id, metric_key, site, environment, threshold, comparison, created_at) \
+                 VALUES ($1, 'p14.page.test', $2, $3, 10.0, 'above', $4::timestamptz)",
+            )
+            .bind(&id)
+            .bind(*site)
+            .bind(*env)
+            .bind(*created)
+            .execute(pool)
+            .await
+            .expect("seed budget");
+            seeded.push(id);
+        }
+        let site_only_id = &seeded[4]; // (DEFRA, NULL)
+        let gblon_id = &seeded[5]; // (GBLON, production)
+        let env_only_id = &seeded[6]; // (NULL, production)
+        let global_id = &seeded[7]; // (NULL, NULL)
+
+        // Unrestricted default page: total == an INDEPENDENT raw COUNT(*).
+        let all = metrics_budget_list(
+            admin(),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list")
+        .0;
+        let raw_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metric_budgets")
+            .fetch_one(pool)
+            .await
+            .expect("raw count");
+        assert_eq!(
+            all["total"].as_i64().unwrap(),
+            raw_total,
+            "#14: total must equal an independent raw COUNT(*)"
+        );
+        assert_eq!(all["durable"], json!(true));
+
+        // EXACT offset-slice equality against the full ordering (id tie-breaker
+        // within the shared created_at).
+        let full_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM metric_budgets ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("full ordering");
+        for offset in [0usize, 3, 6] {
+            let paged = metrics_budget_list(
+                admin(),
+                Query(AdminListPage {
+                    limit: Some(3),
+                    offset: Some(offset as i64),
+                }),
+            )
+            .await
+            .expect("paged list")
+            .0;
+            let got: Vec<String> = paged["budgets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["id"].as_str().unwrap().to_string())
+                .collect();
+            let want: Vec<String> = full_ids.iter().skip(offset).take(3).cloned().collect();
+            assert_eq!(
+                got, want,
+                "#14: page at offset {offset} must equal the full-ordering slice"
+            );
+            assert_eq!(
+                paged["total"].as_i64().unwrap(),
+                raw_total,
+                "#14: limit/offset must not change the total"
+            );
+        }
+
+        // Row-by-row equivalence with the pre-#14 in-memory filter, for every
+        // scoped principal shape. The oracle re-applies `scope_permits` per
+        // axis over an independent ordered fetch of ALL rows.
+        let ordered_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, site, environment FROM metric_budgets \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("ordered rows");
+        let expect_ids = |sess: &AuthSession| -> Vec<String> {
+            ordered_rows
+                .iter()
+                .filter(|(_, site, env)| {
+                    ryuki_engine::auth::scope_permits(&sess.site_scope, site.as_deref())
+                        && ryuki_engine::auth::scope_permits(
+                            &sess.environment_scope,
+                            env.as_deref(),
+                        )
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect()
+        };
+        let mk_sess = |sites: &[&str], envs: &[&str]| {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = sites.iter().map(|v| v.to_string()).collect();
+            s.environment_scope = envs.iter().map(|v| v.to_string()).collect();
+            s
+        };
+        for (label, sess) in [
+            ("site-scoped DEFRA", mk_sess(&["DEFRA"], &[])),
+            ("env-scoped production", mk_sess(&[], &["production"])),
+            ("dual-scoped DEFRA/production", mk_sess(&["DEFRA"], &["production"])),
+            ("all-blank site scope", mk_sess(&["", " "], &[])),
+        ] {
+            let want = expect_ids(&sess);
+            let resp = metrics_budget_list(
+                AuthExtractor(sess),
+                Query(AdminListPage {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            .expect("scoped list")
+            .0;
+            let got: Vec<String> = resp["budgets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                got, want,
+                "#14 [{label}]: the SQL scope push-down must select exactly the \
+                 rows the in-memory scope_permits filter kept, in the same order"
+            );
+            assert_eq!(
+                resp["total"].as_i64().unwrap(),
+                want.len() as i64,
+                "#14 [{label}]: total must equal the independently filtered count"
+            );
+        }
+
+        // Targeted semantics of the per-axis policy, pinned on the seeded rows.
+        let ids_for = |resp: &Value| -> Vec<String> {
+            resp["budgets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // A site-scoped principal: platform-wide (NULL) axes pass; a foreign
+        // concrete site does not.
+        let defra = metrics_budget_list(
+            AuthExtractor(mk_sess(&["DEFRA"], &[])),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("defra list")
+        .0;
+        let defra_ids = ids_for(&defra);
+        assert!(defra_ids.contains(site_only_id), "(DEFRA, NULL) is in scope");
+        assert!(
+            defra_ids.contains(env_only_id),
+            "(NULL, production) has a platform-wide site axis — visible"
+        );
+        assert!(defra_ids.contains(global_id), "(NULL, NULL) is platform-wide");
+        assert!(
+            !defra_ids.contains(gblon_id),
+            "a foreign concrete site must NOT leak to a site-scoped principal"
+        );
+        // The documented per-axis reads policy: a SITE-ONLY budget stays
+        // visible to an env-scoped principal (its NULL environment passes) —
+        // unlike domain_events' symmetric feed rule.
+        let envp = metrics_budget_list(
+            AuthExtractor(mk_sess(&[], &["production"])),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("env list")
+        .0;
+        let env_ids = ids_for(&envp);
+        assert!(
+            env_ids.contains(site_only_id),
+            "(DEFRA, NULL) stays visible to an env-scoped principal (per-axis policy)"
+        );
+        assert!(
+            !env_ids.contains(&seeded[0]),
+            "(DEFRA, dev) must NOT be visible to a production-scoped principal"
+        );
+        // All-blank scope: fails CLOSED on every concrete value (never widens)
+        // while platform-wide (NULL-axis) rows still pass scope_permits.
+        let blank = metrics_budget_list(
+            AuthExtractor(mk_sess(&["", " "], &[])),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("all-blank list")
+        .0;
+        let blank_ids = ids_for(&blank);
+        assert!(
+            !blank_ids.contains(&seeded[0]) && !blank_ids.contains(gblon_id),
+            "an all-blank scope must match NO concrete site"
+        );
+        assert!(
+            blank_ids.contains(env_only_id) && blank_ids.contains(global_id),
+            "NULL-site rows still pass scope_permits for an all-blank scope"
+        );
+
+        // A scoped offset slice: WHERE + ORDER BY + OFFSET compose.
+        let want_defra = expect_ids(&mk_sess(&["DEFRA"], &[]));
+        let defra_page = metrics_budget_list(
+            AuthExtractor(mk_sess(&["DEFRA"], &[])),
+            Query(AdminListPage {
+                limit: Some(2),
+                offset: Some(1),
+            }),
+        )
+        .await
+        .expect("scoped paged list")
+        .0;
+        assert_eq!(
+            ids_for(&defra_page),
+            want_defra[1..3].to_vec(),
+            "#14: a scoped offset slice must equal the filtered-ordering slice"
+        );
+        assert_eq!(
+            defra_page["total"].as_i64().unwrap(),
+            want_defra.len() as i64,
+            "#14: a scoped page's total is the full filtered count"
+        );
+
+        sqlx::query("DELETE FROM metric_budgets WHERE metric_key = 'p14.page.test'")
+            .execute(pool)
+            .await
+            .expect("cleanup");
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
