@@ -169,6 +169,55 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<GMSAAccount>, sqlx::E
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// List accounts (optionally site-filtered) bounded to one `LIMIT`/`OFFSET`
+/// page (#14). SEPARATE from [`list`] because the expiry sweep (`gmsa_expiring`)
+/// scans every account. `a.name` is unique, and `a.id` (PK) is appended for a
+/// guaranteed-stable page. The `LIMIT`/`OFFSET` apply AFTER `GROUP BY a.id`, so
+/// they bound DISTINCT accounts (not the array_agg-joined rows).
+pub async fn list_page(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<GMSAAccount>, sqlx::Error> {
+    let rows: Vec<GmsaAccountRow> = if site.is_empty() {
+        sqlx::query_as(&format!(
+            "{SELECT_AGG} GROUP BY a.id ORDER BY a.name, a.id LIMIT $1 OFFSET $2"
+        ))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "{SELECT_AGG} WHERE a.site = $1 GROUP BY a.id ORDER BY a.name, a.id LIMIT $2 OFFSET $3"
+        ))
+        .bind(site)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    };
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count DISTINCT accounts (optionally site-filtered) — the pagination total for
+/// [`list_page`]. Counts the BASE `gmsa_accounts` table (NOT the LEFT-JOIN +
+/// array_agg query, whose pre-GROUP row count would over-count).
+pub async fn count(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
+}
+
 /// Insert a new account and its initial authorized-host rows inside a
 /// caller-owned transaction, then return the persisted account.
 ///

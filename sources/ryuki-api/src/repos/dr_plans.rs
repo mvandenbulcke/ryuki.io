@@ -106,14 +106,53 @@ pub async fn list(pool: &PgPool) -> Result<Vec<DrPlan>, sqlx::Error> {
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<DrPlan>, sqlx::Error> {
-    let rows: Vec<DrPlanRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM dr_plans WHERE site = $1 ORDER BY created_at DESC, id DESC"
-    ))
-    .bind(site)
-    .fetch_all(pool)
-    .await?;
+/// List DR plans (optionally site-filtered), bounded to one `LIMIT`/`OFFSET`
+/// page (#14). SEPARATE from [`list`] because that feeds startup hydration
+/// (`replace_plans`, FATAL-on-error) which must see EVERY row — only the list
+/// endpoint pages. Handles both all-sites (empty `site`) and a site filter, so
+/// it supersedes the old `list_by_site`. `ORDER BY created_at DESC, id DESC`
+/// ends in the unique PK `id`, so the page is a stable cut.
+pub async fn list_page(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<DrPlan>, sqlx::Error> {
+    let rows: Vec<DrPlanRow> = if site.is_empty() {
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM dr_plans ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
+        ))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM dr_plans \
+             WHERE site = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
+        ))
+        .bind(site)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    };
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count DR plans (optionally site-filtered) — the pagination total for
+/// [`list_page`], using the SAME `WHERE` so the count matches the paged set.
+pub async fn count(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    if site.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM dr_plans")
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM dr_plans WHERE site = $1")
+            .bind(site)
+            .fetch_one(pool)
+            .await
+    }
 }
 
 /// Atomically update a DR plan IFF the row has NOT been written since it was

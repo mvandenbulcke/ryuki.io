@@ -2424,6 +2424,9 @@ struct GmsaValidateRequest {
 #[allow(dead_code)]
 struct GmsaInventoryQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 // ─── File Share NTFS recertification request types ───
@@ -4708,17 +4711,26 @@ async fn gmsa_test(
 async fn gmsa_inventory(
     AuthExtractor(session): AuthExtractor,
     Query(query): Query<GmsaInventoryQuery>,
-) -> ApiResult {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // #2: scoped-site read ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
     let site = site_scoped.as_str();
+    // #14: bound the page; bare-array body + X-Total-Count (the total).
+    let limit = query.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(serde_json::Value::Array(vec![])));
+        return Ok((total_count_headers(0), Json(serde_json::Value::Array(vec![]))));
     };
-    let accounts = crate::repos::gmsa_accounts::list(pool, site)
+    let accounts = crate::repos::gmsa_accounts::list_page(pool, site, limit, offset)
         .await
         .map_err(db_error)?;
-    Ok(Json(serde_json::to_value(accounts).unwrap_or_default()))
+    let total = crate::repos::gmsa_accounts::count(pool, site)
+        .await
+        .map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(accounts).unwrap_or_default()),
+    ))
 }
 
 async fn gmsa_expiring(AuthExtractor(session): AuthExtractor) -> ApiResult {
@@ -34689,6 +34701,17 @@ async fn k8s_contract() -> Json<Value> {
 struct DrSiteQuery {
     site: Option<String>,
 }
+
+/// #14: the DR-plans LIST query — site + pagination. SEPARATE from the site-only
+/// `DrSiteQuery` (shared by dr_readiness/dr_scenarios) so those don't start
+/// rejecting a malformed `?limit=` they never used.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DrPlanListQuery {
+    site: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DrPlanCreateRequest {
@@ -34743,20 +34766,25 @@ struct DrTestCompleteRequest {
 
 async fn dr_plans_list(
     AuthExtractor(session): AuthExtractor,
-    Query(q): Query<DrSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Query(q): Query<DrPlanListQuery>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let plans = if site.is_empty() {
-        crate::repos::dr_plans::list(pool).await.map_err(db_error)?
-    } else {
-        crate::repos::dr_plans::list_by_site(pool, site)
-            .await
-            .map_err(db_error)?
-    };
-    Ok(Json(serde_json::to_value(plans).unwrap_or_default()))
+    // #14: bound the page; bare-array body + X-Total-Count (the total).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let plans = crate::repos::dr_plans::list_page(pool, site, limit, offset)
+        .await
+        .map_err(db_error)?;
+    let total = crate::repos::dr_plans::count(pool, site)
+        .await
+        .map_err(db_error)?;
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(plans).unwrap_or_default()),
+    ))
 }
 async fn dr_plan_create(
     AuthExtractor(session): AuthExtractor,
@@ -63984,6 +64012,182 @@ mod gmsa_db_tests {
         cleanup(pool, &name).await;
     }
 
+    // ─── #14 pagination: bounded page + X-Total-Count ─────────────────────────
+
+    /// #14: `gmsa_inventory` bounds the page (LIMIT/OFFSET) while `X-Total-Count`
+    /// carries the FULL site-scoped total (counted over the BASE table, NOT the
+    /// `array_agg` JOIN), and the `name, id` ordering (unique tail) keeps the
+    /// pages a stable, non-overlapping cut. The total is checked against an
+    /// INDEPENDENT raw base-table `COUNT(*)` (not the handler's own `count`), and
+    /// the seeded accounts carry VARYING host/SPN counts so a count over the
+    /// `array_agg` JOIN would inflate the total and fail the assertion.
+    #[tokio::test]
+    async fn test_gmsa_inventory_paginates_and_reports_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Independent baseline: a raw BASE-TABLE count, NOT the handler's `count`.
+        // DB_TEST_SERIAL serializes DB tests, so this is stable across the body.
+        let baseline: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts WHERE site = $1")
+                .bind("GBLON")
+                .fetch_one(pool)
+                .await
+                .expect("raw base-table baseline");
+
+        // Seed 3 accounts in GBLON with VARYING host/SPN counts (2/3/4). A count
+        // over the array_agg JOIN would total the CHILD rows, not the accounts.
+        let uid = uuid::Uuid::new_v4().to_string();
+        let mut names = Vec::new();
+        for i in 0..3 {
+            let name = test_name(&format!("pg{i}-{uid}")[..20]);
+            names.push(name.clone());
+            let n_children = i + 2;
+            let hosts: Vec<String> = (0..n_children)
+                .map(|h| format!("host{h}.corp.local"))
+                .collect();
+            let spns: Vec<String> = (0..n_children)
+                .map(|h| format!("HTTP/host{h}.corp.local"))
+                .collect();
+            let Ok(_) = gmsa_create(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Json(GmsaCreateRequest {
+                    name: name.clone(),
+                    hosts,
+                    spns,
+                    site: "GBLON".into(),
+                }),
+            )
+            .await
+            else {
+                for n in &names {
+                    cleanup(pool, n).await;
+                }
+                panic!("gmsa_create failed");
+            };
+        }
+        // Independent expected total: raw base-table count AFTER seeding.
+        let expected_total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts WHERE site = $1")
+                .bind("GBLON")
+                .fetch_one(pool)
+                .await
+                .expect("raw base-table total");
+        assert_eq!(
+            expected_total,
+            baseline + 3,
+            "seeding 3 accounts must add exactly 3 base-table rows"
+        );
+
+        // Full page (default limit 500) → X-Total-Count == the independent total.
+        let Ok((headers, Json(full))) = gmsa_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(GmsaInventoryQuery {
+                site: Some("GBLON".into()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        else {
+            for n in &names {
+                cleanup(pool, n).await;
+            }
+            panic!("gmsa_inventory full page failed");
+        };
+        let full_arr = full.as_array().expect("body must be a JSON array");
+        assert_eq!(
+            headers.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some(expected_total.to_string().as_str()),
+            "X-Total-Count must equal the independent base-table total"
+        );
+        // Default limit is 500, so the body holds min(total, 500) rows.
+        assert_eq!(
+            full_arr.len() as i64,
+            expected_total.min(500),
+            "default page must hold min(total, 500) GBLON accounts"
+        );
+        let ordered: Vec<String> = full_arr
+            .iter()
+            .map(|a| a["id"].as_str().expect("account id").to_string())
+            .collect();
+
+        // limit=2 bounds the page; the total header is UNCHANGED by the limit.
+        let Ok((h1, Json(page1))) = gmsa_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(GmsaInventoryQuery {
+                site: Some("GBLON".into()),
+                limit: Some(2),
+                offset: Some(0),
+            }),
+        )
+        .await
+        else {
+            for n in &names {
+                cleanup(pool, n).await;
+            }
+            panic!("gmsa_inventory page 1 failed");
+        };
+        let page1_ids: Vec<String> = page1
+            .as_array()
+            .expect("page 1 must be an array")
+            .iter()
+            .map(|a| a["id"].as_str().expect("account id").to_string())
+            .collect();
+        assert_eq!(page1_ids.len(), 2, "limit=2 must bound the page to 2 rows");
+        assert_eq!(
+            page1_ids,
+            ordered[0..2],
+            "page 1 must be the first 2 of the full ordering"
+        );
+        assert_eq!(
+            h1.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some(expected_total.to_string().as_str()),
+            "limit must NOT change the reported total"
+        );
+
+        // offset=2 → the EXACT next slice (not merely disjoint): a wrong-empty
+        // page would fail this. `min(4, len)` handles a site with exactly 3 rows.
+        let Ok((_, Json(page2))) = gmsa_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(GmsaInventoryQuery {
+                site: Some("GBLON".into()),
+                limit: Some(2),
+                offset: Some(2),
+            }),
+        )
+        .await
+        else {
+            for n in &names {
+                cleanup(pool, n).await;
+            }
+            panic!("gmsa_inventory page 2 failed");
+        };
+        let page2_ids: Vec<String> = page2
+            .as_array()
+            .expect("page 2 must be an array")
+            .iter()
+            .map(|a| a["id"].as_str().expect("account id").to_string())
+            .collect();
+        let end = ordered.len().min(4);
+        assert_eq!(
+            page2_ids,
+            ordered[2..end],
+            "page 2 must be the EXACT next slice of the full ordering"
+        );
+        assert!(
+            page1_ids.iter().all(|id| !page2_ids.contains(id)),
+            "pages must not overlap under the stable tie-breaker"
+        );
+
+        for n in &names {
+            cleanup(pool, n).await;
+        }
+    }
+
     // ─── assign adds a host ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -68722,6 +68926,156 @@ mod dr_plans_db_tests {
         );
 
         cleanup(pool, &id).await;
+    }
+
+    /// #14: `dr_plans_list` bounds the page (LIMIT/OFFSET) while `X-Total-Count`
+    /// carries the FULL site-scoped total, and the `created_at DESC, id DESC`
+    /// ordering (unique PK tail) makes the pages a stable, non-overlapping cut.
+    /// The list endpoint pages via `list_page`; the FATAL startup hydration keeps
+    /// using the unbounded `list` — this test only exercises the paged endpoint.
+    #[tokio::test]
+    async fn test_dr_plans_list_paginates_and_reports_total() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Independent baseline: a raw table count, NOT the handler's `count`.
+        // DB_TEST_SERIAL serializes DB tests, so this is stable across the body.
+        let baseline: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dr_plans WHERE site = $1")
+            .bind("DEFRA")
+            .fetch_one(pool)
+            .await
+            .expect("raw baseline");
+
+        // Seed 3 plans in DEFRA.
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let plan = make_plan(&format!("{suffix}-{i}"), "DEFRA");
+            ids.push(plan.id.clone());
+            crate::repos::dr_plans::insert(pool, &plan)
+                .await
+                .expect("insert must succeed");
+        }
+        // Independent expected total: raw table count AFTER seeding.
+        let expected_total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dr_plans WHERE site = $1")
+                .bind("DEFRA")
+                .fetch_one(pool)
+                .await
+                .expect("raw total");
+        assert_eq!(
+            expected_total,
+            baseline + 3,
+            "seeding 3 plans must add exactly 3 rows"
+        );
+
+        // Full page (default limit 500) → X-Total-Count == the independent total.
+        let Ok((headers, super::Json(full))) = super::dr_plans_list(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Query(super::DrPlanListQuery {
+                site: Some("DEFRA".into()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        else {
+            for id in &ids {
+                cleanup(pool, id).await;
+            }
+            panic!("dr_plans_list full page failed");
+        };
+        let full_arr = full.as_array().expect("body must be a JSON array");
+        assert_eq!(
+            headers.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some(expected_total.to_string().as_str()),
+            "X-Total-Count must equal the independent table total"
+        );
+        // Default limit is 500, so the body holds min(total, 500) rows.
+        assert_eq!(
+            full_arr.len() as i64,
+            expected_total.min(500),
+            "default page must hold min(total, 500) DEFRA plans"
+        );
+        let ordered: Vec<String> = full_arr
+            .iter()
+            .map(|p| p["id"].as_str().expect("plan id").to_string())
+            .collect();
+
+        // limit=2 bounds the page; the total header is UNCHANGED by the limit.
+        let Ok((h1, super::Json(page1))) = super::dr_plans_list(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Query(super::DrPlanListQuery {
+                site: Some("DEFRA".into()),
+                limit: Some(2),
+                offset: Some(0),
+            }),
+        )
+        .await
+        else {
+            for id in &ids {
+                cleanup(pool, id).await;
+            }
+            panic!("dr_plans_list page 1 failed");
+        };
+        let page1_ids: Vec<String> = page1
+            .as_array()
+            .expect("page 1 must be an array")
+            .iter()
+            .map(|p| p["id"].as_str().expect("plan id").to_string())
+            .collect();
+        assert_eq!(page1_ids.len(), 2, "limit=2 must bound the page to 2 rows");
+        assert_eq!(
+            page1_ids,
+            ordered[0..2],
+            "page 1 must be the first 2 of the full ordering"
+        );
+        assert_eq!(
+            h1.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some(expected_total.to_string().as_str()),
+            "limit must NOT change the reported total"
+        );
+
+        // offset=2 → the EXACT next slice (not merely disjoint): a wrong-empty
+        // page would fail this. `min(4, len)` handles a site with exactly 3 rows.
+        let Ok((_, super::Json(page2))) = super::dr_plans_list(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Query(super::DrPlanListQuery {
+                site: Some("DEFRA".into()),
+                limit: Some(2),
+                offset: Some(2),
+            }),
+        )
+        .await
+        else {
+            for id in &ids {
+                cleanup(pool, id).await;
+            }
+            panic!("dr_plans_list page 2 failed");
+        };
+        let page2_ids: Vec<String> = page2
+            .as_array()
+            .expect("page 2 must be an array")
+            .iter()
+            .map(|p| p["id"].as_str().expect("plan id").to_string())
+            .collect();
+        let end = ordered.len().min(4);
+        assert_eq!(
+            page2_ids,
+            ordered[2..end],
+            "page 2 must be the EXACT next slice of the full ordering"
+        );
+        assert!(
+            page1_ids.iter().all(|id| !page2_ids.contains(id)),
+            "pages must not overlap under the stable tie-breaker"
+        );
+
+        for id in &ids {
+            cleanup(pool, id).await;
+        }
     }
 
     /// update_rpo_rto persists: rpo/rto change is reflected on re-get.
