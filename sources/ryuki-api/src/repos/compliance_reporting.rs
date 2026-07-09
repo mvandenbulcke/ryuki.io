@@ -343,6 +343,108 @@ pub async fn list_controls(
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// List compliance controls (optionally framework/site-filtered), bounded to one
+/// `LIMIT`/`OFFSET` page (#14). SEPARATE from [`list_controls`] because that feeds
+/// report generation (`compliance_report_generate`) and the compliance summary
+/// (`get_compliance_summary`), which must see EVERY row — only the list endpoint
+/// pages. `ORDER BY id` (the unique PK) makes each page a stable cut.
+pub async fn list_controls_page(
+    pool: &PgPool,
+    framework_id: &str,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ComplianceControl>, sqlx::Error> {
+    let rows: Vec<ControlRow> = match (framework_id.is_empty(), site.is_empty()) {
+        (true, true) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
+              evidence_ref, assessed_by, assessed_at, site \
+             FROM compliance_controls ORDER BY id LIMIT $1 OFFSET $2",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (false, true) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
+              evidence_ref, assessed_by, assessed_at, site \
+             FROM compliance_controls WHERE framework_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+            )
+            .bind(framework_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (true, false) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
+              evidence_ref, assessed_by, assessed_at, site \
+             FROM compliance_controls WHERE site = $1 ORDER BY id LIMIT $2 OFFSET $3",
+            )
+            .bind(site)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (false, false) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
+              evidence_ref, assessed_by, assessed_at, site \
+             FROM compliance_controls WHERE framework_id = $1 AND site = $2 \
+             ORDER BY id LIMIT $3 OFFSET $4",
+            )
+            .bind(framework_id)
+            .bind(site)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count compliance controls (optionally framework/site-filtered) — the
+/// pagination total for [`list_controls_page`], using the SAME `WHERE` so the
+/// count matches the paged set.
+pub async fn count_controls(
+    pool: &PgPool,
+    framework_id: &str,
+    site: &str,
+) -> Result<i64, sqlx::Error> {
+    let count: i64 = match (framework_id.is_empty(), site.is_empty()) {
+        (true, true) => sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls")
+            .fetch_one(pool)
+            .await?,
+        (false, true) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls WHERE framework_id = $1")
+                .bind(framework_id)
+                .fetch_one(pool)
+                .await?
+        }
+        (true, false) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls WHERE site = $1")
+                .bind(site)
+                .fetch_one(pool)
+                .await?
+        }
+        (false, false) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compliance_controls WHERE framework_id = $1 AND site = $2",
+        )
+        .bind(framework_id)
+        .bind(site)
+        .fetch_one(pool)
+        .await?,
+    };
+    Ok(count)
+}
+
 pub async fn get_control(
     pool: &PgPool,
     id: &str,
@@ -1078,6 +1180,82 @@ mod compliance_reporting_db_tests {
             defra.len() as i64,
             defra_total,
             "#14: site-filtered count matches the site page"
+        );
+    }
+
+    /// #14: `list_controls_page` bounds the page while `count_controls` reports the
+    /// full filtered total — verified against an INDEPENDENT raw COUNT — across all
+    /// 4 framework/site branches. `list_controls` (unbounded) is left intact for the
+    /// report + summary aggregates; this asserts the paged fn matches the split.
+    #[tokio::test]
+    async fn test_list_controls_pagination() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        // Independent total (raw COUNT, NOT the fn under test).
+        let raw_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls")
+            .fetch_one(&pool)
+            .await
+            .expect("raw count");
+        let total = count_controls(&pool, "", "").await.expect("count_controls");
+        assert_eq!(total, raw_total, "count_controls must match a raw COUNT(*)");
+        assert!(total >= 15, "expected >=15 seeded controls, got {total}");
+
+        let all = list_controls_page(&pool, "", "", 1000, 0)
+            .await
+            .expect("list_controls_page all");
+        assert_eq!(
+            all.len() as i64,
+            total,
+            "#14: count_controls matches the full unpaged page"
+        );
+        let ordered: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
+
+        // LIMIT bounds the page; OFFSET yields the EXACT next slice (stable id).
+        let page1 = list_controls_page(&pool, "", "", 2, 0)
+            .await
+            .expect("controls page1");
+        let page2 = list_controls_page(&pool, "", "", 2, 2)
+            .await
+            .expect("controls page2");
+        assert_eq!(page1.len(), 2, "LIMIT 2 bounds the first page");
+        let p1_ids: Vec<&str> = page1.iter().map(|c| c.id.as_str()).collect();
+        let p2_ids: Vec<&str> = page2.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(p1_ids, ordered[0..2], "page 1 is the first 2 of the full order");
+        assert_eq!(
+            p2_ids,
+            ordered[2..(ordered.len().min(4))],
+            "page 2 is the EXACT next slice (stable id order)"
+        );
+
+        // count mirrors the SAME framework/site predicate as the page — all 4 branches.
+        let pci_total = count_controls(&pool, "cf-pci-dss", "")
+            .await
+            .expect("count pci");
+        let pci = list_controls_page(&pool, "cf-pci-dss", "", 1000, 0)
+            .await
+            .expect("list pci");
+        assert_eq!(pci.len() as i64, pci_total, "framework-filtered count matches");
+
+        let defra_total = count_controls(&pool, "", "DEFRA")
+            .await
+            .expect("count DEFRA");
+        let defra = list_controls_page(&pool, "", "DEFRA", 1000, 0)
+            .await
+            .expect("list DEFRA");
+        assert_eq!(defra.len() as i64, defra_total, "site-filtered count matches");
+
+        let both_total = count_controls(&pool, "cf-pci-dss", "DEFRA")
+            .await
+            .expect("count pci+DEFRA");
+        let both = list_controls_page(&pool, "cf-pci-dss", "DEFRA", 1000, 0)
+            .await
+            .expect("list pci+DEFRA");
+        assert_eq!(
+            both.len() as i64,
+            both_total,
+            "framework+site count matches the combined page"
         );
     }
 

@@ -28931,6 +28931,17 @@ struct RepoCapacitySiteQuery {
     site: Option<String>,
 }
 
+/// #14: dedicated query for the LIST endpoint. Kept SEPARATE from the site-only
+/// `RepoCapacitySiteQuery` (still used by `repo_capacity_report`) so adding the
+/// typed `limit`/`offset` here can't make the report handler 400 on a malformed
+/// `?limit=abc` it never accepted.
+#[derive(Deserialize)]
+struct RepoCapacityListQuery {
+    site: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoCapacityUpdateBody {
@@ -28953,18 +28964,31 @@ struct RepoCapacityTrendQuery {
 
 async fn repo_capacity_list(
     AuthExtractor(session): AuthExtractor,
-    Query(params): Query<RepoCapacitySiteQuery>,
+    Query(params): Query<RepoCapacityListQuery>,
 ) -> ApiResult {
     // #2: scoped-site read (default DEFRA for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let site = site_scoped.as_str();
-    let repos = match get_db() {
-        Some(pool) => crate::repos::repository_capacity::list_by_site(pool, site)
-            .await
-            .map_err(db_error)?,
-        None => Vec::new(),
+    // #14: bound the page. list_by_site stays unbounded — it feeds
+    // repo_capacity_report (SUMs over EVERY row) — so the list endpoint pages.
+    let limit = params.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let (repos, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::repository_capacity::list_by_site_page(pool, site, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::repository_capacity::count_by_site(pool, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
-    Ok(Json(repository_capacity::get_repositories(&repos, site)))
+    // get_repositories derives `repository_count` from the (paged) slice; add the
+    // full filtered `total` plus the echoed limit/offset via add_page_meta.
+    let mut resp = repository_capacity::get_repositories(&repos, site);
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 
 /// GET /api/protect/repository-capacity/{id} — one repository's current capacity.
@@ -31543,6 +31567,9 @@ struct AccessReviewQuery {
     site: Option<String>,
     #[serde(rename = "reviewType")]
     review_type: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31585,11 +31612,26 @@ async fn access_reviews_list(
     let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
     let site = site_scoped.as_str();
     let review_type_str = params.review_type.as_deref().unwrap_or("");
-    let reviews = match get_db() {
-        Some(pool) => crate::repos::access_recertification::list(pool, site, review_type_str)
+    // #14: bound the page. list() stays unbounded — it feeds access_review_summary
+    // (per-status counts over EVERY row) — so the list endpoint uses the paged fn.
+    let limit = params.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let (reviews, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::access_recertification::list_reviews_page(
+                pool,
+                site,
+                review_type_str,
+                limit,
+                offset,
+            )
             .await
             .map_err(db_error)?,
-        None => Vec::new(),
+            crate::repos::access_recertification::count_reviews(pool, site, review_type_str)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
     let parsed_type = if review_type_str.is_empty() {
         None
@@ -31599,11 +31641,12 @@ async fn access_reviews_list(
                 .map_err(|e| status_400(&e))?,
         )
     };
-    Ok(Json(access_recertification::list_reviews_pure(
-        &reviews,
-        site,
-        parsed_type.as_ref(),
-    )))
+    // list_reviews_pure re-filters by site/type in-memory (idempotent — the repo
+    // already filtered) and sets `count` to this page's length; add_page_meta
+    // stamps the full filtered `total` plus the echoed limit/offset.
+    let mut resp = access_recertification::list_reviews_pure(&reviews, site, parsed_type.as_ref());
+    add_page_meta(&mut resp, total, limit, offset);
+    Ok(Json(resp))
 }
 
 async fn access_review_get(
@@ -35176,6 +35219,9 @@ struct ComplianceControlsQuery {
     #[serde(rename = "frameworkId")]
     framework_id: Option<String>,
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -35259,21 +35305,39 @@ async fn compliance_controls_list(
     // #2: scoped-site list ("" = all sites for an unrestricted caller).
     let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
     let site = site_scoped.as_str();
-    let controls = match get_db() {
-        Some(pool) => crate::repos::compliance_reporting::list_controls(pool, framework_id, site)
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    // list_controls stays unbounded — it feeds report generation + the summary,
+    // which need EVERY row — so the list endpoint uses the separate paged fn.
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (controls, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::compliance_reporting::list_controls_page(
+                pool,
+                framework_id,
+                site,
+                limit,
+                offset,
+            )
             .await
             .map_err(db_error)?,
-        None => vec![],
+            crate::repos::compliance_reporting::count_controls(pool, framework_id, site)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (vec![], 0),
     };
-    let source = if controls.is_empty() {
-        "static-seed"
-    } else {
-        "db"
-    };
+    // Source reflects whether the DB holds matching controls at all (total),
+    // NOT just this page — an out-of-range page on real data is still "db".
+    let source = if total > 0 { "db" } else { "static-seed" };
     Ok(Json(json!({
         "source": source,
         "framework_id": framework_id,
         "site": site,
+        "count": controls.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "controls": controls
     })))
 }

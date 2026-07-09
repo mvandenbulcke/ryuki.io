@@ -232,6 +232,104 @@ pub async fn list(
         .collect()
 }
 
+/// List reviews (optionally site/type-filtered), bounded to one `LIMIT`/`OFFSET`
+/// page (#14). SEPARATE from [`list`] because that feeds `access_review_summary`,
+/// which counts EVERY row by status — only the list endpoint pages. The base
+/// `ORDER BY ... target_name` is non-unique, so `, id` (the UUID PK) is appended
+/// as the tie-breaker to make each page a stable cut.
+pub async fn list_reviews_page(
+    pool: &PgPool,
+    site: &str,
+    review_type: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AccessReview>, sqlx::Error> {
+    let rows: Vec<AccessReviewRow> = match (site.is_empty(), review_type.is_empty()) {
+        (true, true) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews \
+                 ORDER BY site, target_name, id LIMIT $1 OFFSET $2"
+            ))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (false, true) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews WHERE site = $1 \
+                 ORDER BY target_name, id LIMIT $2 OFFSET $3"
+            ))
+            .bind(site)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (true, false) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews WHERE review_type = $1 \
+                 ORDER BY site, target_name, id LIMIT $2 OFFSET $3"
+            ))
+            .bind(review_type)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (false, false) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM access_reviews WHERE site = $1 AND review_type = $2 \
+                 ORDER BY target_name, id LIMIT $3 OFFSET $4"
+            ))
+            .bind(site)
+            .bind(review_type)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    rows.into_iter()
+        .map(|r| r.into_model().map(|(m, _)| m))
+        .collect()
+}
+
+/// Count reviews (optionally site/type-filtered) — the pagination total for
+/// [`list_reviews_page`], using the SAME `WHERE` so the count matches the page.
+pub async fn count_reviews(
+    pool: &PgPool,
+    site: &str,
+    review_type: &str,
+) -> Result<i64, sqlx::Error> {
+    let count: i64 = match (site.is_empty(), review_type.is_empty()) {
+        (true, true) => sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews")
+            .fetch_one(pool)
+            .await?,
+        (false, true) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews WHERE site = $1")
+                .bind(site)
+                .fetch_one(pool)
+                .await?
+        }
+        (true, false) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews WHERE review_type = $1")
+                .bind(review_type)
+                .fetch_one(pool)
+                .await?
+        }
+        (false, false) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM access_reviews WHERE site = $1 AND review_type = $2",
+        )
+        .bind(site)
+        .bind(review_type)
+        .fetch_one(pool)
+        .await?,
+    };
+    Ok(count)
+}
+
 /// Get a single review by UUID string id. Malformed id → Ok(None).
 pub async fn get(
     pool: &PgPool,
@@ -654,6 +752,82 @@ mod access_recertification_db_tests {
             count_type(ReviewType::ServiceAccount) >= 2,
             "ServiceAccount rows unchanged"
         );
+    }
+
+    /// #14: `list_reviews_page` bounds the page, and the `, id` tie-breaker keeps
+    /// pagination deterministic even when `target_name`/`site` TIE (the seeded rows
+    /// all share `target_name='test-target'`). Paging `limit=2` across all offsets
+    /// must visit each row EXACTLY once — no dup/skip. `count_reviews` mirrors the
+    /// site/type `WHERE`. `list` (unbounded) is left intact for access_review_summary.
+    #[tokio::test]
+    async fn list_reviews_page_paginates_deterministically_on_ties() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Isolated 5-char site so count_reviews counts ONLY our rows; every row
+        // shares target_name='test-target', so target_name ties across all 5.
+        let site = format!("Z{}", &uuid::Uuid::new_v4().to_string()[..4]);
+        let mut ids: Vec<uuid::Uuid> = Vec::new();
+        for _ in 0..5 {
+            let id = uuid::Uuid::new_v4();
+            ids.push(id);
+            insert_test_review(&pool, id, "ADGroup", "Pending", &site, 30).await;
+        }
+
+        // Independent + fn totals agree; both == 5.
+        let raw_total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews WHERE site = $1")
+                .bind(&site)
+                .fetch_one(&pool)
+                .await
+                .expect("raw count");
+        let total = count_reviews(&pool, &site, "").await.expect("count_reviews");
+        assert_eq!(total, raw_total, "count_reviews matches a raw COUNT(*)");
+        assert_eq!(total, 5, "seeded exactly 5 reviews in the isolated site");
+
+        // Page limit=2 across offsets 0,2,4 must TILE the 5 rows exactly (2+2+1) —
+        // the tie-breaker guarantee (tied target_name would otherwise dup/skip).
+        let mut seen: Vec<String> = Vec::new();
+        for off in [0i64, 2, 4] {
+            let page = list_reviews_page(&pool, &site, "", 2, off)
+                .await
+                .expect("list_reviews_page");
+            assert!(page.len() <= 2, "LIMIT 2 bounds each page");
+            for r in page {
+                seen.push(r.id);
+            }
+        }
+        // Exact set equality (NOT dedup-then-count, which would mask an overlap
+        // like [A,B],[B,C],[D,E]): the collected page rows must equal the seeded
+        // set, so each row is visited exactly once — no duplicate, no skip.
+        seen.sort();
+        let mut want: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "paged rows equal the seeded set exactly (stable `, id` tie-breaker)"
+        );
+
+        // Type branch: matching type == 5, non-matching == 0 (count mirrors WHERE).
+        let adg = count_reviews(&pool, &site, "ADGroup")
+            .await
+            .expect("count ADGroup");
+        assert_eq!(adg, 5, "all 5 are ADGroup");
+        let svc = count_reviews(&pool, &site, "ServiceAccount")
+            .await
+            .expect("count ServiceAccount");
+        assert_eq!(svc, 0, "none are ServiceAccount");
+        let typed_page = list_reviews_page(&pool, &site, "ADGroup", 1000, 0)
+            .await
+            .expect("typed page");
+        assert_eq!(typed_page.len(), 5, "typed page returns all 5 ADGroup rows");
+
+        for id in &ids {
+            cleanup_review(&pool, *id).await;
+        }
     }
 
     #[tokio::test]

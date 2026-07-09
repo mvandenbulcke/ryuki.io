@@ -214,6 +214,39 @@ pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<Repository>, 
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// Return one `LIMIT`/`OFFSET` page of repositories for a site (#14). SEPARATE
+/// from [`list_by_site`] because that feeds `repo_capacity_report`, which SUMs
+/// over EVERY row — only the list endpoint pages. `WHERE site = $1` makes `name`
+/// unique within the set, but `, id` (the UUID PK) is appended so the cut stays
+/// stable and matches the repo-wide tie-breaker convention.
+pub async fn list_by_site_page(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Repository>, sqlx::Error> {
+    let rows: Vec<RepositoryRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM backup_repositories WHERE site = $1 \
+         ORDER BY name, id LIMIT $2 OFFSET $3"
+    ))
+    .bind(site)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count repositories for a site — the pagination total for [`list_by_site_page`],
+/// using the SAME `WHERE` so the count matches the paged set.
+pub async fn count_by_site(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM backup_repositories WHERE site = $1")
+        .bind(site)
+        .fetch_one(pool)
+        .await
+}
+
 /// Return all repositories, ordered by `site, name` for determinism.
 pub async fn list_all(pool: &PgPool) -> Result<Vec<Repository>, sqlx::Error> {
     let rows: Vec<RepositoryRow> = sqlx::query_as(&format!(
@@ -403,6 +436,78 @@ mod repository_capacity_db_tests {
                 .execute(pool)
                 .await
                 .ok();
+        }
+    }
+
+    // ─── #14 pagination ────────────────────────────────────────────────────────
+
+    /// #14: `list_by_site_page` bounds the page while `count_by_site` reports the
+    /// full site total (verified against an INDEPENDENT raw COUNT). The `name, id`
+    /// tie-breaker makes each page the EXACT slice of the full order. `list_by_site`
+    /// (unbounded) is left intact for `repo_capacity_report`; this asserts the split.
+    #[tokio::test]
+    async fn test_list_by_site_page_pagination() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pool = &pool;
+
+        // Baseline (raw COUNT and the fn agree) before we add our own rows.
+        let raw_baseline: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM backup_repositories WHERE site = $1")
+                .bind("DEFRA")
+                .fetch_one(pool)
+                .await
+                .expect("raw baseline");
+        let fn_baseline = count_by_site(pool, "DEFRA").await.expect("count baseline");
+        assert_eq!(fn_baseline, raw_baseline, "count_by_site matches a raw COUNT(*)");
+
+        // Seed 3 repos in DEFRA (unique names → unique (site,name)).
+        let uid = Uuid::new_v4().to_string();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..3 {
+            let repo = make_repo(&format!("{uid}-{i}"), "DEFRA");
+            ids.push(repo.id.clone());
+            let days = repo_days(&repo);
+            let status_s = capacity_status_str(&repo_status(&repo));
+            insert(pool, &repo, days, status_s)
+                .await
+                .expect("insert must succeed");
+        }
+        let total = count_by_site(pool, "DEFRA").await.expect("count total");
+        assert_eq!(total, fn_baseline + 3, "seeding 3 adds exactly 3 to the total");
+
+        let all = list_by_site_page(pool, "DEFRA", 1000, 0)
+            .await
+            .expect("list_by_site_page all");
+        assert_eq!(
+            all.len() as i64,
+            total,
+            "the full page holds every DEFRA repo"
+        );
+        let ordered: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+
+        // LIMIT bounds the page; OFFSET yields the EXACT next slice (name, id).
+        let page1 = list_by_site_page(pool, "DEFRA", 2, 0)
+            .await
+            .expect("page1");
+        let page2 = list_by_site_page(pool, "DEFRA", 2, 2)
+            .await
+            .expect("page2");
+        let p1_ids: Vec<&str> = page1.iter().map(|r| r.id.as_str()).collect();
+        let p2_ids: Vec<&str> = page2.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(p1_ids.len(), 2, "LIMIT 2 bounds the first page");
+        assert_eq!(p1_ids, ordered[0..2], "page 1 is the first 2 of the full order");
+        assert_eq!(
+            p2_ids,
+            ordered[2..(ordered.len().min(4))],
+            "page 2 is the EXACT next slice (stable name, id order)"
+        );
+
+        for id in &ids {
+            cleanup_repo(pool, id).await;
         }
     }
 
