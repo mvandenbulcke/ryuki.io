@@ -25543,6 +25543,55 @@ fn retain_site_scoped<T>(
         .collect()
 }
 
+/// #14: the SQL site-scope filter for a no-`?site` "list everything" read — the
+/// PAGED equivalent of [`retain_site_scoped`], so the scope predicate can be
+/// pushed into SQL (`site = ANY(...)`) instead of fetching every row and
+/// filtering in Rust (which makes a DB `LIMIT`/`OFFSET` page ≠ the filtered set).
+#[derive(Debug)]
+enum ListSiteScope {
+    /// Environment-scoped principal on a site-only resource → return NO rows
+    /// (mirrors `retain_site_scoped` failing closed to an empty list).
+    Empty,
+    /// Unrestricted principal (empty / all-blank site scope) → no `WHERE`.
+    All,
+    /// Site-scoped principal → `site = ANY(these)` (trimmed, non-blank, distinct).
+    Sites(Vec<String>),
+}
+
+/// Resolve a principal's effective site filter for a list-all read, faithfully
+/// mirroring [`retain_site_scoped`] + `scope_permits`: an environment scope on a
+/// site-only resource yields nothing; an empty/all-blank site scope is
+/// unrestricted; otherwise the read is narrowed to the held sites.
+fn list_site_scope(session: &AuthSession) -> ListSiteScope {
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return ListSiteScope::Empty;
+    }
+    // Mirror `scope_permits` EXACTLY: it is unrestricted ONLY when the scope Vec is
+    // LITERALLY empty (`scopes.is_empty()`). A non-empty-but-all-blank scope set is
+    // NOT unrestricted there — it matches only a (nonexistent) blank site — so we
+    // must NOT collapse it to `All`, or we'd widen an empty result to every site.
+    if session.site_scope.is_empty() {
+        return ListSiteScope::All;
+    }
+    // Non-empty scope set: trimmed, distinct membership (matches scope_permits'
+    // `s.trim() == req` comparison on the scope side). Kept even if it trims to a
+    // blank — `site = ANY('{""}')` matches nothing, which is the fail-closed
+    // equivalent of the old in-memory filter. Real tokens never carry blanks
+    // (parse_token_scope strips them), so in practice this is the held site list.
+    let mut sites: Vec<String> = session
+        .site_scope
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    sites.sort();
+    sites.dedup();
+    ListSiteScope::Sites(sites)
+}
+
 /// Body-scope guard for a DUAL-axis WRITE (#2): a scoped principal may only
 /// create/act on a resource whose site AND environment are both within its
 /// scope (e.g. a Kubernetes namespace, which is keyed on both). Reports the
@@ -30020,22 +30069,52 @@ async fn image_factory_history(
     })))
 }
 
-async fn image_factory_superseded(AuthExtractor(session): AuthExtractor) -> ApiResult {
-    // Graceful degradation: no DB → empty list
-    if let Some(pool) = get_db() {
-        let images = crate::repos::golden_images::list_superseded(pool)
+async fn image_factory_superseded(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<AdminListPage>,
+) -> ApiResult {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    // Graceful degradation: no DB → empty list.
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "superseded_count": 0,
+            "images": [],
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+        })));
+    };
+    // #2: a scoped principal only sees its own site's superseded images. Push the
+    // site scope INTO SQL (was fetch-all + retain_site_scoped) so the page and the
+    // total both reflect the filtered set. Env-scoped → nothing.
+    let sites: Option<Vec<String>> = match list_site_scope(&session) {
+        ListSiteScope::Empty => {
+            return Ok(Json(json!({
+                "superseded_count": 0,
+                "images": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            })));
+        }
+        ListSiteScope::All => None,
+        ListSiteScope::Sites(s) => Some(s),
+    };
+    let images =
+        crate::repos::golden_images::list_superseded_page(pool, sites.as_deref(), limit, offset)
             .await
             .map_err(db_error)?;
-        // #2: a scoped principal only sees its own site's superseded images.
-        let images = retain_site_scoped(&session, images, |i| i.site_scope.as_str());
-        return Ok(Json(json!({
-            "superseded_count": images.len(),
-            "images": serde_json::to_value(&images).unwrap_or_default(),
-        })));
-    }
+    let total = crate::repos::golden_images::count_superseded(pool, sites.as_deref())
+        .await
+        .map_err(db_error)?;
     Ok(Json(json!({
-        "superseded_count": 0,
-        "images": [],
+        "superseded_count": images.len(),
+        "images": serde_json::to_value(&images).unwrap_or_default(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     })))
 }
 
@@ -33620,6 +33699,9 @@ async fn firewall_rule_set_create(
 #[allow(dead_code)]
 struct FwRuleSetListQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 async fn firewall_rule_set_list(
@@ -33627,26 +33709,52 @@ async fn firewall_rule_set_list(
     Query(q): Query<FwRuleSetListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let sets = if let Some(site) = q.site.as_deref().filter(|s| !s.is_empty()) {
-        // #2: an explicit ?site must be within the principal's scope (403 if not;
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    // #2: resolve the SQL site filter, preserving the old two-branch scope logic
+    // (explicit ?site vs list-all) but pushing scope INTO SQL so the page and the
+    // total both reflect the filtered set (was fetch-all + retain_site_scoped).
+    let sites: Option<Vec<String>> = if let Some(site) =
+        q.site.as_deref().filter(|s| !s.is_empty())
+    {
+        // An explicit ?site must be within the principal's scope (403 if not;
         // env-scoped denied), then list just that site.
         let site = enforce_site_scope(&session, Some(site), "")?;
-        crate::repos::firewall_rule_sets::list_by_site(pool, &site)
-            .await
-            .map_err(db_error)?
+        Some(vec![site])
     } else {
-        // #2: no ?site → list all, then retain only the principal's own site rows
-        // (unrestricted keeps all; env-scoped keeps none).
-        let all = crate::repos::firewall_rule_sets::list(pool)
-            .await
-            .map_err(db_error)?;
-        retain_site_scoped(&session, all, |r| r.site.as_str())
+        // No ?site → env-scoped sees none; unrestricted sees all; a site-scoped
+        // principal sees only its own sites.
+        match list_site_scope(&session) {
+            ListSiteScope::Empty => {
+                return Ok(Json(json!({
+                    "source": "database",
+                    "rule_sets": [],
+                    "count": 0,
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                })));
+            }
+            ListSiteScope::All => None,
+            ListSiteScope::Sites(s) => Some(s),
+        }
     };
+    let sets = crate::repos::firewall_rule_sets::list_page(pool, sites.as_deref(), limit, offset)
+        .await
+        .map_err(db_error)?;
+    let total = crate::repos::firewall_rule_sets::count(pool, sites.as_deref())
+        .await
+        .map_err(db_error)?;
     let count = sets.len();
     Ok(Json(json!({
         "source": "database",
         "rule_sets": sets,
         "count": count,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     })))
 }
 
@@ -42926,6 +43034,42 @@ mod unit_tests {
             retain_site_scoped(&scoped_session(&[], &["production"]), rows(), |r| &r.site)
                 .is_empty()
         );
+    }
+
+    /// #14: `list_site_scope` is the PAGED equivalent of `retain_site_scoped`, so it
+    /// must resolve the SQL filter identically to `scope_permits` for every
+    /// principal shape — the guard against a scope push-down widening (Codex).
+    #[test]
+    fn list_site_scope_matches_scope_permits_emptiness() {
+        // Unrestricted (literally-empty site scope) → All (no WHERE).
+        assert!(matches!(
+            list_site_scope(&AuthSession::static_dry_run()),
+            ListSiteScope::All
+        ));
+        // Site-scoped → Sites(held sites), trimmed + sorted + distinct.
+        match list_site_scope(&scoped_session(&["GBLON", "DEFRA"], &[])) {
+            ListSiteScope::Sites(s) => {
+                assert_eq!(s, vec!["DEFRA".to_string(), "GBLON".to_string()])
+            }
+            other => panic!("expected Sites, got {other:?}"),
+        }
+        // Environment-scoped → Empty (a site-only resource can't honor an env scope).
+        assert!(matches!(
+            list_site_scope(&scoped_session(&[], &["production"])),
+            ListSiteScope::Empty
+        ));
+        // SECURITY (Codex): a non-empty but ALL-BLANK site scope must NOT widen to
+        // All — `scope_permits` treats ONLY a literally-empty Vec as unrestricted.
+        // It must fail closed (Sites matching nothing), never expose every site.
+        let mut blank = AuthSession::static_dry_run();
+        blank.site_scope = vec![" ".into(), "".into()];
+        match list_site_scope(&blank) {
+            ListSiteScope::Sites(s) => assert!(
+                !s.iter().any(|x| !x.is_empty()),
+                "all-blank scope must not yield any real site (got {s:?})"
+            ),
+            other => panic!("all-blank scope must be Sites (fail-closed), got {other:?}"),
+        }
     }
 
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
@@ -59961,7 +60105,7 @@ mod firewall_rules_db_tests {
 
         // Unfiltered list for a GBLON principal includes GBLON, excludes DEFRA.
         let Json(listed) =
-            firewall_rule_set_list(scoped(), Query(FwRuleSetListQuery { site: None }))
+            firewall_rule_set_list(scoped(), Query(FwRuleSetListQuery { site: None, limit: None, offset: None }))
                 .await
                 .expect("list");
         let ids = ids_of(&listed);
@@ -59975,6 +60119,8 @@ mod firewall_rules_db_tests {
             scoped(),
             Query(FwRuleSetListQuery {
                 site: Some("DEFRA".into()),
+                limit: None,
+                offset: None,
             }),
         )
         .await;
@@ -59986,7 +60132,7 @@ mod firewall_rules_db_tests {
         // Unrestricted principal sees both.
         let Json(all) = firewall_rule_set_list(
             AuthExtractor(AuthSession::static_dry_run()),
-            Query(FwRuleSetListQuery { site: None }),
+            Query(FwRuleSetListQuery { site: None, limit: None, offset: None }),
         )
         .await
         .expect("list all");

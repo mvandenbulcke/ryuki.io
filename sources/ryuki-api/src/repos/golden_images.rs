@@ -201,17 +201,64 @@ pub async fn stale_promoted_images(
     .await
 }
 
-/// Return all images with `status = 'superseded'`.
-pub async fn list_superseded(pool: &PgPool) -> Result<Vec<GoldenImage>, sqlx::Error> {
-    let rows: Vec<GoldenImageRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM golden_images \
-         WHERE status = 'superseded' \
-         ORDER BY build_date DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// One `LIMIT`/`OFFSET` page of superseded images (#14) with the SITE SCOPE
+/// pushed into SQL — the paged replacement for the handler's old fetch-all +
+/// in-memory `retain_site_scoped`. `sites`: `None` = every site (an unrestricted
+/// principal); `Some(list)` = only those `site_scope`s (a site-scoped principal)
+/// via `site_scope = ANY($1)`. An environment-scoped principal is handled by the
+/// caller (empty result), matching `retain_site_scoped`. `ORDER BY build_date
+/// DESC, id DESC` ends in the unique PK, so each page is a stable cut.
+pub async fn list_superseded_page(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<GoldenImage>, sqlx::Error> {
+    let rows: Vec<GoldenImageRow> = match sites {
+        None => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM golden_images WHERE status = 'superseded' \
+                 ORDER BY build_date DESC, id DESC LIMIT $1 OFFSET $2"
+            ))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        Some(sites) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM golden_images \
+                 WHERE status = 'superseded' AND site_scope = ANY($1) \
+                 ORDER BY build_date DESC, id DESC LIMIT $2 OFFSET $3"
+            ))
+            .bind(sites)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count superseded images under the SAME site scope as [`list_superseded_page`]
+/// — the pagination total. `None` = all sites; `Some(list)` = `site_scope = ANY($1)`.
+pub async fn count_superseded(pool: &PgPool, sites: Option<&[String]>) -> Result<i64, sqlx::Error> {
+    match sites {
+        None => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM golden_images WHERE status = 'superseded'")
+                .fetch_one(pool)
+                .await
+        }
+        Some(sites) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM golden_images \
+             WHERE status = 'superseded' AND site_scope = ANY($1)",
+        )
+        .bind(sites)
+        .fetch_one(pool)
+        .await,
+    }
 }
 
 /// Insert a new image and return the persisted row. The caller supplies the
@@ -434,6 +481,107 @@ mod golden_images_db_tests {
         }
     }
 
+    /// #14: `list_superseded_page`/`count_superseded` push the site scope INTO SQL
+    /// while keeping the `status = 'superseded'` filter. `None` = all sites,
+    /// `Some(list)` = `site_scope = ANY(list)`. Verified against INDEPENDENT raw
+    /// COUNTs; LIMIT/OFFSET give EXACT slices under the `build_date DESC, id DESC`
+    /// tail; and a PROMOTED image in the same site never leaks into the page.
+    #[tokio::test]
+    async fn list_superseded_page_scopes_and_paginates() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            return;
+        };
+
+        // Independent baselines (raw COUNT, NOT the fns under test).
+        let raw_all: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM golden_images WHERE status = 'superseded'")
+                .fetch_one(&pool)
+                .await
+                .expect("raw all superseded");
+        let raw_defra: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM golden_images WHERE status = 'superseded' AND site_scope = $1",
+        )
+        .bind("DEFRA")
+        .fetch_one(&pool)
+        .await
+        .expect("raw defra superseded");
+        let defra = vec!["DEFRA".to_string()];
+        assert_eq!(
+            count_superseded(&pool, None).await.expect("count all"),
+            raw_all,
+            "count_superseded(None) == raw all-sites COUNT"
+        );
+        assert_eq!(
+            count_superseded(&pool, Some(&defra))
+                .await
+                .expect("count defra"),
+            raw_defra,
+            "count_superseded(Some) == raw site-subset COUNT"
+        );
+
+        // Seed 3 superseded DEFRA images + 1 PROMOTED DEFRA image (must NOT leak in).
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let img = unique_image("DEFRA", "Linux", BuildStatus::Superseded);
+            ids.push(img.id.clone());
+            insert(&pool, &img).await.expect("insert superseded");
+        }
+        let promoted = unique_image("DEFRA", "Linux", BuildStatus::Promoted);
+        let promoted_id = promoted.id.clone();
+        ids.push(promoted_id.clone());
+        insert(&pool, &promoted).await.expect("insert promoted");
+
+        let total = count_superseded(&pool, Some(&defra))
+            .await
+            .expect("count defra after");
+        assert_eq!(
+            total,
+            raw_defra + 3,
+            "only the 3 superseded rows count — the promoted one is excluded"
+        );
+        assert_eq!(
+            count_superseded(&pool, None).await.expect("count all after"),
+            raw_all + 3,
+            "None counts every site's superseded rows"
+        );
+
+        // list_superseded_page(Some) returns exactly the DEFRA superseded subset.
+        let all_defra = list_superseded_page(&pool, Some(&defra), 1000, 0)
+            .await
+            .expect("list defra");
+        assert_eq!(all_defra.len() as i64, total, "full DEFRA page == its count");
+        assert!(
+            all_defra
+                .iter()
+                .all(|i| i.site_scope == "DEFRA" && i.status == BuildStatus::Superseded),
+            "page must be DEFRA + superseded only"
+        );
+        assert!(
+            !all_defra.iter().any(|i| i.id == promoted_id),
+            "the promoted image must never appear in the superseded page"
+        );
+        let ordered: Vec<&str> = all_defra.iter().map(|i| i.id.as_str()).collect();
+
+        // LIMIT bounds the page; OFFSET yields the EXACT next slice (stable tail).
+        let page1 = list_superseded_page(&pool, Some(&defra), 2, 0)
+            .await
+            .expect("page1");
+        let page2 = list_superseded_page(&pool, Some(&defra), 2, 2)
+            .await
+            .expect("page2");
+        let p1: Vec<&str> = page1.iter().map(|i| i.id.as_str()).collect();
+        let p2: Vec<&str> = page2.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(p1, ordered[0..2], "page 1 is the first 2 of the full order");
+        assert_eq!(
+            p2,
+            ordered[2..(ordered.len().min(4))],
+            "page 2 is the EXACT next slice"
+        );
+
+        cleanup(&pool, &ids).await;
+    }
+
     #[tokio::test]
     async fn test_insert_and_get_round_trip() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
@@ -632,7 +780,9 @@ mod golden_images_db_tests {
         assert!(active.iter().any(|i| i.id == promoted.id));
         assert!(!active.iter().any(|i| i.id == superseded.id));
 
-        let all_superseded = list_superseded(&pool).await.expect("list_superseded");
+        let all_superseded = list_superseded_page(&pool, None, 1000, 0)
+            .await
+            .expect("list_superseded_page");
         assert!(all_superseded.iter().any(|i| i.id == superseded.id));
 
         cleanup(&pool, &ids).await;
