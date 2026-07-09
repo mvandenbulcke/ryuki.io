@@ -11437,7 +11437,10 @@ struct MonitoringReviewRow {
 /// site's items; an environment-scoped principal sees none (this queue is
 /// site-only). Ordered by SLA deadline (most urgent first). Empty +
 /// `durable:false` when no DB is configured.
-async fn monitoring_review_queue_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+async fn monitoring_review_queue_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<AdminListPage>,
+) -> ApiResult {
     if !check_permission(&session, "request") {
         return Err((
             StatusCode::FORBIDDEN,
@@ -11446,18 +11449,69 @@ async fn monitoring_review_queue_list(AuthExtractor(session): AuthExtractor) -> 
             ),
         ));
     }
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({"items": [], "durable": false})));
+        return Ok(Json(
+            json!({"items": [], "durable": false, "total": 0, "limit": limit, "offset": offset}),
+        ));
     };
-    let rows: Vec<MonitoringReviewRow> = sqlx::query_as(
-        "SELECT id::text AS id, host_or_service_name, review_type, site, assigned_to, \
-                sla_deadline, status, created_at, updated_at \
-         FROM monitoring_review_queue ORDER BY sla_deadline ASC",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
-    let items: Vec<Value> = retain_site_scoped(&session, rows, |r| r.site.as_str())
+    // #2: scope pushed INTO SQL (was fetch-all + retain_site_scoped) so the page
+    // and total reflect the filtered set. Env-scoped → nothing (site-only queue).
+    let sites: Option<Vec<String>> = match list_site_scope(&session) {
+        ListSiteScope::Empty => {
+            return Ok(Json(
+                json!({"items": [], "durable": true, "total": 0, "limit": limit, "offset": offset}),
+            ));
+        }
+        ListSiteScope::All => None,
+        ListSiteScope::Sites(s) => Some(s),
+    };
+    // #14: `sla_deadline` is non-unique → append the unique PK `id` as the
+    // tie-breaker so LIMIT/OFFSET pages are a stable cut.
+    let (rows, total): (Vec<MonitoringReviewRow>, i64) = match sites.as_deref() {
+        None => {
+            let rows: Vec<MonitoringReviewRow> = sqlx::query_as(
+                "SELECT id::text AS id, host_or_service_name, review_type, site, assigned_to, \
+                        sla_deadline, status, created_at, updated_at \
+                 FROM monitoring_review_queue \
+                 ORDER BY sla_deadline ASC, id ASC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?;
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monitoring_review_queue")
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
+            (rows, total)
+        }
+        Some(sites) => {
+            let rows: Vec<MonitoringReviewRow> = sqlx::query_as(
+                "SELECT id::text AS id, host_or_service_name, review_type, site, assigned_to, \
+                        sla_deadline, status, created_at, updated_at \
+                 FROM monitoring_review_queue WHERE site = ANY($1) \
+                 ORDER BY sla_deadline ASC, id ASC LIMIT $2 OFFSET $3",
+            )
+            .bind(sites)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?;
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM monitoring_review_queue WHERE site = ANY($1)")
+                    .bind(sites)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(db_error)?;
+            (rows, total)
+        }
+    };
+    let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -11473,7 +11527,9 @@ async fn monitoring_review_queue_list(AuthExtractor(session): AuthExtractor) -> 
             })
         })
         .collect();
-    Ok(Json(json!({"items": items, "durable": true})))
+    Ok(Json(
+        json!({"items": items, "durable": true, "total": total, "limit": limit, "offset": offset}),
+    ))
 }
 
 async fn observe_log_forwarder() -> Json<Value> {
@@ -48753,9 +48809,15 @@ mod db_lifecycle_tests {
             return;
         };
         // Unrestricted admin sees the seeded rows (mig 031 seeds DEFRA + GBLON).
-        let all = monitoring_review_queue_list(AuthExtractor(AuthSession::static_dry_run()))
-            .await
-            .expect("list must succeed");
+        let all = monitoring_review_queue_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list must succeed");
         assert_eq!(all.0["durable"], json!(true));
         let items = all.0["items"].as_array().expect("items array");
         assert!(
@@ -48763,17 +48825,63 @@ mod db_lifecycle_tests {
             "seeded monitoring-review rows must be returned, got {}",
             items.len()
         );
+        // #14: total is the full (scope-filtered) count; the default page holds all.
+        let total = all.0["total"].as_i64().expect("total is i64");
+        assert_eq!(
+            total,
+            items.len() as i64,
+            "#14: total equals the returned page at seed scale"
+        );
 
-        // A GBLON-scoped principal sees only GBLON rows.
+        // #14: limit bounds the page but the total is unchanged by the limit.
+        let page = monitoring_review_queue_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: Some(1),
+                offset: None,
+            }),
+        )
+        .await
+        .expect("limited list must succeed");
+        assert_eq!(
+            page.0["items"].as_array().expect("items array").len(),
+            1,
+            "limit=1 must bound the page to one row"
+        );
+        assert_eq!(
+            page.0["total"].as_i64().expect("total is i64"),
+            total,
+            "#14: limit must NOT change the reported total"
+        );
+
+        // A GBLON-scoped principal sees only GBLON rows (SQL scope push-down).
         let mut gblon = AuthSession::static_dry_run();
         gblon.site_scope = vec!["GBLON".into()];
-        let scoped = monitoring_review_queue_list(AuthExtractor(gblon))
-            .await
-            .expect("scoped list must succeed");
+        let scoped = monitoring_review_queue_list(
+            AuthExtractor(gblon),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("scoped list must succeed");
         let scoped_items = scoped.0["items"].as_array().expect("scoped items array");
+        // Non-empty guard (mig 031 seeds a GBLON row): without it, the two checks
+        // below would false-green on an empty result (Codex).
+        assert!(
+            !scoped_items.is_empty(),
+            "a GBLON-scoped principal must see the seeded GBLON row(s)"
+        );
         assert!(
             scoped_items.iter().all(|i| i["site"] == json!("GBLON")),
             "a GBLON-scoped principal must see only GBLON rows: {scoped_items:?}"
+        );
+        // The scoped total must match the scoped page (count uses the SAME WHERE).
+        assert_eq!(
+            scoped.0["total"].as_i64().expect("scoped total is i64"),
+            scoped_items.len() as i64,
+            "#14: scoped total equals the scoped page (site = ANY WHERE)"
         );
     }
 
