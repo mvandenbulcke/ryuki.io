@@ -159,6 +159,10 @@ td code{white-space:nowrap}
 .foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
 .foot-nav a{text-decoration:none;font-weight:600}
+.page-meta{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}
+.page-meta a{color:var(--text-secondary);text-decoration:none}
+.page-meta a:hover{color:var(--accent)}
+.page-meta+.foot-nav{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -375,7 +379,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <li>Real role assignments are managed in the Entra admin center, not in code or Git.</li>
 <li>Role <strong>values</strong> (like <code>"PlatformAdmin"</code>) are safe to keep in source code as string constants — they are not secrets.</li>
 </ul>
-<nav class="foot-nav"><a href="/configuration.html">&larr; Configuration</a><a href="/site-management.html">Site Management &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-06-23 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/entra-app-registration.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/configuration.html">&larr; Configuration</a><a href="/site-management.html">Site Management &rarr;</a></nav>
 </main>
 </div>
 <script>

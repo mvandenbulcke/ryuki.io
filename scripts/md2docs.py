@@ -14,6 +14,7 @@ GitHub's web UI; links to docs/<name>.md are rewritten to <name>.html.
 import html as html_mod
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -394,6 +395,10 @@ td code{{white-space:nowrap}}
 .foot-nav{{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}}
 .foot-nav a{{text-decoration:none;font-weight:600}}
+.page-meta{{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}}
+.page-meta a{{color:var(--text-secondary);text-decoration:none}}
+.page-meta a:hover{{color:var(--accent)}}
+.page-meta+.foot-nav{{margin-top:1rem}}
 </style>
 </head>
 <body>
@@ -681,6 +686,21 @@ def build_sidebar(current: str, sections_map: dict) -> str:
             '<p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>')
 
 
+def page_meta(name: str) -> str:
+    """Freshness stamp + edit link for a generated page.
+
+    The date is the last commit that touched the markdown source, so it
+    only moves when the content actually changes (not on regeneration).
+    """
+    date = subprocess.run(
+        ["git", "log", "-1", "--format=%cs", "--", f"docs/{name}.md"],
+        capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    edit = f"https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/{name}.md"
+    stamp = f"Last updated {date} · " if date else ""
+    return (f'<div class="page-meta">{stamp}'
+            f'<a href="{edit}" target="_blank" rel="noopener">Edit this page on GitHub</a></div>')
+
+
 def render(name, title, description, content, crumb, footnav, sidebar):
     return TEMPLATE.format(name=name, title=title, description=description,
                            content=content, crumb=crumb, footnav=footnav,
@@ -702,7 +722,7 @@ def main():
         next_page = PAGES[idx + 1] if idx + 1 < len(PAGES) else None
         left = f'<a href="/{prev_page[0]}.html">&larr; {prev_page[1]}</a>' if prev_page else "<span></span>"
         right = f'<a href="/{next_page[0]}.html">{next_page[1]} &rarr;</a>' if next_page else "<span></span>"
-        footnav = f'<nav class="foot-nav">{left}{right}</nav>'
+        footnav = page_meta(name) + f'<nav class="foot-nav">{left}{right}</nav>'
         (DOCS / f"{name}.html").write_text(
             render(name, title, description, body, crumb, footnav,
                    build_sidebar(name, sections_map)))
@@ -716,7 +736,9 @@ def main():
                      "for multi-site infrastructure.</p>"
                      f'<div class="doc-grid">{cards}</div>')
     (DOCS / "documentation.html").write_text(
-        render("documentation", "Documentation", "Ryuki platform documentation.",
+        render("documentation", "Documentation",
+               "Guides for running Ryuki: getting started, architecture, "
+               "configuration, Entra ID app registration, and site management.",
                index_content, "", "", build_sidebar("documentation", sections_map)))
     print("docs/documentation.html")
 

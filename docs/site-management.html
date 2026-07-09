@@ -159,6 +159,10 @@ td code{white-space:nowrap}
 .foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
 .foot-nav a{text-decoration:none;font-weight:600}
+.page-meta{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}
+.page-meta a{color:var(--text-secondary);text-decoration:none}
+.page-meta a:hover{color:var(--accent)}
+.page-meta+.foot-nav{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -260,7 +264,7 @@ GET /api/admin/sites/search?q=Netherlands → Search by country name</code></pre
 <li><strong>UN/LOCODE standard</strong>: Follows ISO 3166-1 country codes and UN/LOCODE location identifiers.</li>
 <li><strong>Multi-tenancy</strong>: RBAC via Entra ID app roles controls which users can manage which sites.</li>
 </ul>
-<nav class="foot-nav"><a href="/entra-app-registration.html">&larr; Entra App Registration</a><span></span></nav>
+<div class="page-meta">Last updated 2026-06-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/site-management.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/entra-app-registration.html">&larr; Entra App Registration</a><span></span></nav>
 </main>
 </div>
 <script>

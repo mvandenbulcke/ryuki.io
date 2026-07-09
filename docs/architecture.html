@@ -159,6 +159,10 @@ td code{white-space:nowrap}
 .foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
 .foot-nav a{text-decoration:none;font-weight:600}
+.page-meta{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}
+.page-meta a{color:var(--text-secondary);text-decoration:none}
+.page-meta a:hover{color:var(--accent)}
+.page-meta+.foot-nav{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -300,7 +304,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 </tbody></table>
 <h3 id="maturity">Maturity</h3>
 <p>The dry-run pipeline and the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply) are implemented and tested. Running a real apply against live infrastructure is operator-owned: it requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials, and a durable state backend. Provider vendor-API adapters and the production Vault credential resolver remain dry-run/mock placeholders today.</p>
-<nav class="foot-nav"><a href="/getting-started.html">&larr; Getting Started</a><a href="/configuration.html">Configuration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/getting-started.html">&larr; Getting Started</a><a href="/configuration.html">Configuration &rarr;</a></nav>
 </main>
 </div>
 <script>

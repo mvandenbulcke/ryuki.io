@@ -159,6 +159,10 @@ td code{white-space:nowrap}
 .foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
 .foot-nav a{text-decoration:none;font-weight:600}
+.page-meta{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}
+.page-meta a{color:var(--text-secondary);text-decoration:none}
+.page-meta a:hover{color:var(--accent)}
+.page-meta+.foot-nav{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -313,7 +317,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <p>The platform name is configured via <code>RYUKI_PLATFORM_NAME</code>. Logo and branding assets are uploaded through the admin portal UI after deployment; no branding files are stored in the repository.</p>
 <h3 id="access-control">Access Control</h3>
 <p>Access is controlled by Entra ID app roles. The <code>PlatformAdmin</code> role grants full administrative access to the portal.</p>
-<nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/entra-app-registration.html">Entra App Registration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-06-23 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/configuration.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/entra-app-registration.html">Entra App Registration &rarr;</a></nav>
 </main>
 </div>
 <script>

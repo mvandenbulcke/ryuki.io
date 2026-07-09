@@ -159,6 +159,10 @@ td code{white-space:nowrap}
 .foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
   padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
 .foot-nav a{text-decoration:none;font-weight:600}
+.page-meta{margin-top:3rem;font-size:.78rem;color:var(--text-muted)}
+.page-meta a{color:var(--text-secondary);text-decoration:none}
+.page-meta a:hover{color:var(--accent)}
+.page-meta+.foot-nav{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -253,7 +257,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 │   └── validator-rs/   # Rust validators
 ├── tests/              # Integration tests
 └── docs/               # Documentation</code></pre>
-<nav class="foot-nav"><span></span><a href="/architecture.html">Architecture &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/getting-started.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><span></span><a href="/architecture.html">Architecture &rarr;</a></nav>
 </main>
 </div>
 <script>
