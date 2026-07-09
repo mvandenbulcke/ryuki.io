@@ -16,11 +16,14 @@
 //! - `LivePlan` jobs are still executed (the gate only checks `allow_live`).
 //! - `LiveApply` jobs are refused (the gate cannot verify the grant).
 //!
-//! ## Registration (TODO S5)
+//! ## Registration (S5)
 //!
-//! Self-registration via `CpClient::register_new` is a later slice.  For now
-//! the agent MUST already be enrolled and approved in the CP; the token is
-//! supplied via `RYUKI_AGENT_TOKEN`.
+//! First-boot self-registration is wired: when no token is available from
+//! `RYUKI_AGENT_TOKEN` or the token file, and `RYUKI_AGENT_SELF_REGISTER=true`,
+//! the agent registers via `CpClient::register_new`, persists the returned
+//! token to the token file (0600, create-only), and **exits 0** pending admin
+//! approval. See [`self_register_and_exit`] for the exit-vs-poll rationale.
+//! Token precedence is documented in `config.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +37,9 @@ use ryuki_agent::{
     live_exec::RunnerLiveExecutor,
     outbox::Outbox,
     run::run_loop,
+    token::{resolve_token, save_token_file, validate_register_response, ResolvedToken},
 };
+use ryuki_protocol::AgentRegistration;
 use tracing::info;
 
 #[tokio::main]
@@ -69,6 +74,7 @@ async fn main() {
         cp_base_url = %cfg.cp_base_url,
         platform    = %cfg.platform,
         key_path    = %cfg.key_path.display(),
+        token_path  = %cfg.token_path.display(),
         poll_interval_secs = cfg.poll_interval_secs,
         lease_secs  = cfg.lease_secs,
         "ryuki-agent starting"
@@ -98,11 +104,38 @@ async fn main() {
 
     let identity = Arc::new(identity);
 
-    // TODO S5: self-registration via CpClient::register_new when no token exists.
-    // For now the agent MUST be pre-enrolled + approved; the token comes from
-    // RYUKI_AGENT_TOKEN.  The agent_id is the platform string for now (S4c);
-    // make it separately configurable in S5.
+    // The agent_id is the platform string for now (S4c); making it separately
+    // configurable is a follow-up slice.
     let agent_id = cfg.platform.clone();
+
+    // Resolve the bearer token: RYUKI_AGENT_TOKEN → token file → first-boot
+    // self-registration (precedence documented in config.rs). Fail-closed: any
+    // malformed source is fatal here rather than a 401/403 on every request.
+    let token = match resolve_token(&cfg) {
+        Ok(ResolvedToken::FromEnv(token)) => {
+            if cfg.token_path.exists() {
+                info!(
+                    token_path = %cfg.token_path.display(),
+                    "RYUKI_AGENT_TOKEN is set — it takes precedence over the token file"
+                );
+            }
+            token
+        }
+        Ok(ResolvedToken::FromFile(token)) => {
+            info!(
+                token_path = %cfg.token_path.display(),
+                "loaded agent token from token file"
+            );
+            token
+        }
+        Ok(ResolvedToken::SelfRegister) => {
+            self_register_and_exit(&cfg, &identity, &agent_id).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "no agent token available");
+            std::process::exit(1);
+        }
+    };
 
     info!(
         agent_id   = %agent_id,
@@ -111,7 +144,7 @@ async fn main() {
     );
 
     // Build dependencies.
-    let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &cfg.token);
+    let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &token);
 
     // Wire protocol compatibility handshake — runs for EVERY agent, live or not
     // (the CP→agent half of the version check; the CP-side extractor is the
@@ -217,4 +250,92 @@ async fn main() {
         outbox_drain_interval,
     )
     .await;
+}
+
+/// First-boot self-registration: register with the CP, persist the one-time
+/// token to the token file (0600, create-only), print operator instructions,
+/// and **exit 0**.
+///
+/// ## Why exit(0) instead of polling until approved
+///
+/// There is no unambiguous status-poll affordance: every authenticated agent
+/// endpoint returns 403 for BOTH a `pending` and a `revoked` agent, so a
+/// wait-for-approval loop could not terminate correctly on a revoked agent
+/// without string-matching error bodies (a brittle, unversioned contract).
+/// Exiting 0 is simpler and converges naturally: under a supervisor (systemd
+/// `Restart=`), the next boot loads the token file and enters the pull-loop,
+/// whose existing behavior already warn-tolerates 403s until the admin
+/// approval flips them to 2xx. An interactive operator gets an explicit,
+/// unmissable "pending approval" hand-off instead of a silent warn-loop.
+async fn self_register_and_exit(
+    cfg: &AgentConfig,
+    identity: &AgentIdentity,
+    agent_id: &str,
+) -> ! {
+    info!(
+        agent_id,
+        platform = %cfg.platform,
+        cp_base_url = %cfg.cp_base_url,
+        "no agent token found — attempting first-boot self-registration"
+    );
+
+    let reg = AgentRegistration {
+        agent_id: agent_id.to_owned(),
+        platform: cfg.platform.clone(),
+        capabilities: cfg.capabilities.clone(),
+        public_key: identity.public_key_b64(),
+    };
+
+    let resp = match CpClient::register_new(&cfg.cp_base_url, &reg).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                agent_id,
+                "self-registration failed. If this agent_id is already registered \
+                 (HTTP 409), restore its token file or have an admin revoke/delete \
+                 the stale enrollment before re-registering"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Fail-closed: never persist a response we cannot vouch for. The CP shows
+    // the plaintext token exactly once, so validation happens BEFORE the write.
+    if let Err(e) = validate_register_response(&resp, agent_id) {
+        tracing::error!(
+            error = %e,
+            "control plane returned a malformed registration response — refusing to persist"
+        );
+        std::process::exit(1);
+    }
+
+    if let Err(e) = save_token_file(&cfg.token_path, &resp.token) {
+        // The registration is already consumed server-side and the plaintext
+        // token is shown only once. Deliberately do NOT print the token as a
+        // fallback — logs outlive processes (journald etc.) and a credential in
+        // logs is worse than a repeated enrollment. Recovery is explicit.
+        tracing::error!(
+            error = %e,
+            agent_id,
+            token_path = %cfg.token_path.display(),
+            "registration succeeded but the token could NOT be persisted; the \
+             one-time token is now lost. An admin must delete/revoke the pending \
+             agent before retrying self-registration"
+        );
+        std::process::exit(1);
+    }
+
+    info!(
+        agent_id,
+        token_path = %cfg.token_path.display(),
+        "self-registration complete — token persisted (0600); agent is PENDING admin approval"
+    );
+    info!(
+        "next step: an admin must approve this agent: \
+         POST {}/api/admin/agents/{}/approve with body {{\"platform\": \"{}\"}}",
+        cfg.cp_base_url, agent_id, cfg.platform
+    );
+    info!("after approval, start the agent again — it will load the token from the token file");
+    std::process::exit(0);
 }

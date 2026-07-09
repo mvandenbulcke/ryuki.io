@@ -6,18 +6,35 @@
 //! |---------------------------------|-----------------|--------------------------------|
 //! | `RYUKI_AGENT_CP_URL`            | `cp_base_url`   | e.g. `https://ryuki.example/`  |
 //! | `RYUKI_AGENT_PLATFORM`          | `platform`      | e.g. `defra`                   |
-//! | `RYUKI_AGENT_TOKEN`             | `token`         | Bearer token (rya_ prefix)     |
 //!
 //! ## Optional variables (defaults shown)
 //!
 //! | Env var                                | Field                      | Default |
 //! |----------------------------------------|----------------------------|---------|
+//! | `RYUKI_AGENT_TOKEN`                    | `token`                    | (unset) — see token precedence |
+//! | `RYUKI_AGENT_TOKEN_PATH`               | `token_path`               | `agent.token` next to the key file |
+//! | `RYUKI_AGENT_SELF_REGISTER`            | `self_register`            | `false` |
 //! | `RYUKI_AGENT_KEY_PATH`                 | `key_path`                 | `agent.key` (cwd) |
 //! | `RYUKI_AGENT_POLL_INTERVAL_SECS`       | `poll_interval_secs`       | 10      |
 //! | `RYUKI_AGENT_LEASE_SECS`               | `lease_secs`               | 300     |
 //! | `RYUKI_AGENT_ALLOW_LIVE`               | `allow_live`               | `false` |
 //! | `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`      | `max_outbox_attempts`      | 10      |
 //! | `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS` | `outbox_drain_interval_secs` | 60  |
+//!
+//! ### Token resolution precedence (S5 self-registration)
+//!
+//! The bearer token is resolved at startup in this order (`token::resolve_token`):
+//!
+//! 1. `RYUKI_AGENT_TOKEN` — always wins when set. Validation is byte-compatible
+//!    with the pre-S5 behavior (non-empty, `rya_` prefix required).
+//! 2. The token file at `RYUKI_AGENT_TOKEN_PATH` — written by first-boot
+//!    self-registration (0600, create-only) or placed there by an operator.
+//!    A file that exists but is malformed is FATAL, never a fall-through.
+//! 3. First-boot self-registration, only when `RYUKI_AGENT_SELF_REGISTER` is
+//!    `"true"` / `"1"` (same strict opt-in parse as `RYUKI_AGENT_ALLOW_LIVE`):
+//!    the agent registers with the CP, persists the returned token to the
+//!    token file, and exits 0 pending admin approval.
+//! 4. Otherwise startup fails with an error naming all three options.
 //!
 //! ### `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`
 //!
@@ -85,10 +102,30 @@ pub struct AgentConfig {
     /// Platform / site identifier this agent serves (e.g. `defra`).
     pub platform: String,
 
-    /// Bearer token issued by the CP on successful registration.
-    /// Must start with `rya_`.  Used by S4b to construct `CpClient`.
-    #[allow(dead_code)]
-    pub token: String,
+    /// Bearer token supplied directly via `RYUKI_AGENT_TOKEN`.
+    /// Must start with `rya_` when set (validation unchanged from pre-S5).
+    ///
+    /// `None` when the env var is absent — the token is then resolved at
+    /// startup from the token file or via first-boot self-registration
+    /// (`token::resolve_token`; see the module-level precedence doc). The
+    /// fail-closed property is preserved: with no token from ANY source and
+    /// self-registration disabled, startup fails.
+    pub token: Option<String>,
+
+    /// Path to the on-disk bearer-token file (plaintext `rya_…` + newline, 0600).
+    ///
+    /// Set via `RYUKI_AGENT_TOKEN_PATH`; defaults to `agent.token` in the SAME
+    /// directory as `key_path` — token and key share one operational blast
+    /// radius (same host, same backup story), mirroring the outbox placement.
+    pub token_path: PathBuf,
+
+    /// Whether first-boot self-registration is enabled.
+    ///
+    /// Set via `RYUKI_AGENT_SELF_REGISTER=true` (or `1`) — the same strict
+    /// opt-in parse as `allow_live`: absence or any other value is `false`,
+    /// never an error. Only consulted when neither `RYUKI_AGENT_TOKEN` nor the
+    /// token file provides a token.
+    pub self_register: bool,
 
     /// Path to the on-disk Ed25519 secret key file (binary, 32 bytes, 0600).
     pub key_path: PathBuf,
@@ -136,7 +173,10 @@ impl std::fmt::Debug for AgentConfig {
         f.debug_struct("AgentConfig")
             .field("cp_base_url", &self.cp_base_url)
             .field("platform", &self.platform)
-            .field("token", &"<redacted>")
+            // Presence only — Some("<redacted>") / None — never the value.
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_path", &self.token_path)
+            .field("self_register", &self.self_register)
             .field("key_path", &self.key_path)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("lease_secs", &self.lease_secs)
@@ -201,19 +241,47 @@ impl AgentConfig {
             });
         }
 
-        let token = require(&get, "RYUKI_AGENT_TOKEN")?;
-        // The CP only accepts agent tokens with the `rya_` prefix; fail early
-        // with a clear message instead of getting 401 on every request.
-        if !token.starts_with("rya_") {
-            return Err(ConfigError::InvalidEnv {
-                var: "RYUKI_AGENT_TOKEN",
-                value: "<redacted>".to_owned(),
-                reason: "agent token must start with 'rya_'".to_owned(),
-            });
-        }
+        // RYUKI_AGENT_TOKEN is OPTIONAL since the S5 self-registration slice.
+        // When SET, validation is byte-compatible with the pre-S5 behavior:
+        // empty/whitespace counts as absent, and a present value must carry the
+        // `rya_` prefix (fail early with a clear message instead of getting 401
+        // on every request). When ABSENT, startup resolves the token from the
+        // token file or first-boot self-registration — see `token::resolve_token`.
+        let token = match get("RYUKI_AGENT_TOKEN").filter(|v| !v.trim().is_empty()) {
+            Some(t) => {
+                if !t.starts_with("rya_") {
+                    return Err(ConfigError::InvalidEnv {
+                        var: "RYUKI_AGENT_TOKEN",
+                        value: "<redacted>".to_owned(),
+                        reason: "agent token must start with 'rya_'".to_owned(),
+                    });
+                }
+                Some(t)
+            }
+            None => None,
+        };
 
         let key_path = get("RYUKI_AGENT_KEY_PATH").unwrap_or_else(|| "agent.key".to_owned());
         let key_path = PathBuf::from(key_path);
+
+        // Token-file path: explicit env wins; the default is `agent.token` in
+        // the key file's directory (for the default `agent.key` in cwd this is
+        // `agent.token` in cwd). Same next-to-the-key placement as the outbox.
+        let token_path = match get("RYUKI_AGENT_TOKEN_PATH").filter(|v| !v.trim().is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => key_path
+                .parent()
+                .map(|dir| dir.join("agent.token"))
+                .unwrap_or_else(|| PathBuf::from("agent.token")),
+        };
+
+        // `RYUKI_AGENT_SELF_REGISTER` is an explicit opt-in with the exact
+        // semantics of `RYUKI_AGENT_ALLOW_LIVE`: only "true"/"1" enable it;
+        // absence or any other value is false (fail-safe), never an error.
+        let self_register = matches!(
+            get("RYUKI_AGENT_SELF_REGISTER").as_deref(),
+            Some("true") | Some("1")
+        );
 
         let poll_interval_secs = optional_u64(&get, "RYUKI_AGENT_POLL_INTERVAL_SECS", 10)?;
         // A zero poll interval would busy-loop the pull-loop (heartbeat + poll
@@ -277,6 +345,8 @@ impl AgentConfig {
             cp_base_url,
             platform,
             token,
+            token_path,
+            self_register,
             key_path,
             poll_interval_secs,
             lease_secs,
@@ -391,8 +461,10 @@ mod tests {
         // Trailing slash must be stripped.
         assert_eq!(cfg.cp_base_url, "https://cp.example.com");
         assert_eq!(cfg.platform, "defra");
-        assert_eq!(cfg.token, "rya_abc123");
+        assert_eq!(cfg.token, Some("rya_abc123".to_owned()));
         assert_eq!(cfg.key_path, PathBuf::from("/etc/ryuki/agent.key"));
+        // Default token path lands NEXT TO the key file.
+        assert_eq!(cfg.token_path, PathBuf::from("/etc/ryuki/agent.token"));
         assert_eq!(cfg.poll_interval_secs, 15);
         assert_eq!(cfg.lease_secs, 600);
     }
@@ -407,6 +479,9 @@ mod tests {
         ]))
         .expect("must parse with defaults");
         assert_eq!(cfg.key_path, PathBuf::from("agent.key"));
+        // Default key is in cwd → default token file is `agent.token` in cwd.
+        assert_eq!(cfg.token_path, PathBuf::from("agent.token"));
+        assert!(!cfg.self_register, "self_register must default to false");
         assert_eq!(cfg.poll_interval_secs, 10);
         assert_eq!(cfg.lease_secs, 300);
     }
@@ -441,20 +516,17 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_missing_required_token() {
-        let result = AgentConfig::from_source(src(&[
+    fn missing_token_env_is_none_not_an_error() {
+        // S5: RYUKI_AGENT_TOKEN is no longer required at parse time — the
+        // token may come from the token file or first-boot self-registration.
+        // Fail-closed still holds: `token::resolve_token` errors at startup
+        // when no source provides a token.
+        let cfg = AgentConfig::from_source(src(&[
             ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
             ("RYUKI_AGENT_PLATFORM", "defra"),
-        ]));
-        assert!(
-            matches!(
-                result,
-                Err(ConfigError::MissingEnv {
-                    var: "RYUKI_AGENT_TOKEN"
-                })
-            ),
-            "missing TOKEN must be a MissingEnv error"
-        );
+        ]))
+        .expect("config must parse without RYUKI_AGENT_TOKEN");
+        assert_eq!(cfg.token, None, "absent env token must parse as None");
     }
 
     #[test]
@@ -546,6 +618,62 @@ mod tests {
             ),
             "token without rya_ prefix must be rejected"
         );
+    }
+
+    #[test]
+    fn explicit_token_path_env_wins_over_default() {
+        let cfg = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_KEY_PATH", "/etc/ryuki/agent.key"),
+            ("RYUKI_AGENT_TOKEN_PATH", "/var/lib/ryuki/agent.token"),
+        ]))
+        .expect("must parse");
+        assert_eq!(
+            cfg.token_path,
+            PathBuf::from("/var/lib/ryuki/agent.token"),
+            "explicit RYUKI_AGENT_TOKEN_PATH must override the next-to-key default"
+        );
+    }
+
+    #[test]
+    fn empty_token_path_env_falls_back_to_default() {
+        let cfg = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN_PATH", "   "),
+        ]))
+        .expect("must parse");
+        assert_eq!(
+            cfg.token_path,
+            PathBuf::from("agent.token"),
+            "whitespace-only RYUKI_AGENT_TOKEN_PATH must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn self_register_parses_like_allow_live() {
+        // Absent → false; only "true"/"1" enable; anything else is false.
+        let base = [
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+        ];
+        let with = |val: Option<&str>| {
+            let mut pairs: Vec<(&str, &str)> = base.to_vec();
+            if let Some(v) = val {
+                pairs.push(("RYUKI_AGENT_SELF_REGISTER", v));
+            }
+            AgentConfig::from_source(src(&pairs)).expect("must parse")
+        };
+        assert!(!with(None).self_register, "absent must default to false");
+        assert!(with(Some("true")).self_register);
+        assert!(with(Some("1")).self_register);
+        for garbage in ["yes", "TRUE", "on", "0", "false", ""] {
+            assert!(
+                !with(Some(garbage)).self_register,
+                "RYUKI_AGENT_SELF_REGISTER={garbage:?} must be treated as false"
+            );
+        }
     }
 
     #[test]
