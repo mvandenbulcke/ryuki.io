@@ -35,7 +35,8 @@ use crate::api::{
     admin_token_revoke_path, notifications_read_path, request_approve_path, request_audit_path,
     request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
     request_lock_path, request_plan_path, request_protect_path, request_publish_path,
-    request_reject_path, request_retire_path, request_validate_path, request_verify_path,
+    request_reject_path, request_retire_path, request_step_approve_live_apply_path,
+    request_validate_path, request_verify_path,
 };
 // Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
 // `test` build (no ssr feature) free of unused-import warnings.
@@ -282,11 +283,30 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | "retire"
             | "audit"
             | "evidence"
+            | "steps"
     ) {
         return false;
     }
+    let second = segments.next();
+    let third = segments.next();
+    // Per-step live-apply approval (#42 slice B1b):
+    // /api/requests/{id}/steps/{step_key}/approve-live-apply. The step key is
+    // a dynamic segment validated with the same single-segment rules as the
+    // request id; the suffix must be exactly `approve-live-apply`.
+    if second == Some("steps") {
+        let Some(step_key) = third else {
+            return false;
+        };
+        if !is_safe_dynamic_path_segment(step_key) {
+            return false;
+        }
+        return matches!(
+            (segments.next(), segments.next()),
+            (Some("approve-live-apply"), None)
+        );
+    }
     matches!(
-        (segments.next(), segments.next()),
+        (second, third),
         (None, None)
             | (Some("validate"), None)
             | (Some("plan"), None)
@@ -305,6 +325,25 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("execution-job"), None)
             | (Some("approve-live-apply"), None)
     )
+}
+
+/// Single-segment safety rules shared by the dynamic (non-static) path
+/// segments the lifecycle allowlist accepts — currently the step key of the
+/// per-step live-apply approval path. Mirrors the request-id checks above:
+/// no traversal, separators, query/fragment markers, or non-identifier bytes.
+fn is_safe_dynamic_path_segment(segment: &str) -> bool {
+    !(segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.contains("..")
+        || segment.contains('\\')
+        || segment.contains('?')
+        || segment.contains('#')
+        || segment.contains("://")
+        || segment.starts_with("//")
+        || !segment
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_')))
 }
 
 /// Validates `/api/admin/tokens/{id}` and `/api/admin/sessions/{id}` — the
@@ -2749,6 +2788,7 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
             approval_route: Vec::new(),
             stages: Vec::new(),
             payload_fields: Vec::new(),
+            steps: Vec::new(),
         }),
     }
 }
@@ -2912,6 +2952,34 @@ pub async fn approve_live_apply_request(
         return reject_static_preview_request_action(request_id, "live apply");
     }
     dispatch_stage_action_live(request_id, "live apply", &path).await
+}
+
+/// Admin-gated per-step approval for multi-step orchestration (#42 slice
+/// B1b): mints a step-scoped CP-signed LiveApply grant for ONE
+/// `AwaitingApproval` step and dispatches its LiveApply job. Mirrors
+/// `approve_live_apply_request`; the API enforces admin tier, site scope,
+/// separation of duties (the requester cannot approve), and step state — a
+/// step that is not awaiting approval, or a request already rolling back,
+/// answers 409 and the message is surfaced verbatim in the action badge.
+#[server(prefix = "/portal/api", endpoint = "request-step-approve-live-apply")]
+pub async fn approve_step_live_apply(
+    request_id: String,
+    step_key: String,
+) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_step_approve_live_apply_path(&request_id, &step_key).map_err(|_| {
+        ServerFnError::new("step approve-live-apply API path failed same-origin guard")
+    })?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| {
+            ServerFnError::new("step approve-live-apply API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "step live apply");
+    }
+    dispatch_stage_action_live(request_id, "step live apply", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
@@ -4566,21 +4634,42 @@ mod tests {
             );
         }
 
+        // Per-step live-apply approval (#42 B1b): the step key is a dynamic
+        // segment, so the generated path is validated shape-and-charset-wise.
+        let step_path = request_step_approve_live_apply_path(request_id, "provision-vm")
+            .expect("step approve-live-apply path must build");
+        assert_eq!(
+            boundary.validate_request_lifecycle_api_path(&step_path),
+            Ok(step_path.as_str())
+        );
+
         for path in [
             "/api/requests/detail",
             "/api/requests/reject",
             "/api/requests/cancel",
             "/api/requests/audit",
             "/api/requests/evidence",
+            "/api/requests/steps",
             "/api/requests/REQ-123/validate/extra",
             "/api/requests/REQ-123/reject/extra",
             "/api/requests/REQ 123/validate",
             "/api/requests/REQ%2F123/validate",
             "/api/requests/REQ-123?stage=validate",
+            // Step-path shapes that must stay outside the allowlist: missing
+            // suffix, wrong suffix, trailing segments, unsafe step keys.
+            "/api/requests/REQ-123/steps",
+            "/api/requests/REQ-123/steps/provision-vm",
+            "/api/requests/REQ-123/steps/provision-vm/execute",
+            "/api/requests/REQ-123/steps/provision-vm/approve-live-apply/extra",
+            "/api/requests/REQ-123/steps//approve-live-apply",
+            "/api/requests/REQ-123/steps/../approve-live-apply",
+            "/api/requests/REQ-123/steps/step key/approve-live-apply",
+            "/api/requests/REQ-123/steps/step%2Fkey/approve-live-apply",
         ] {
             assert_eq!(
                 boundary.validate_request_lifecycle_api_path(path),
-                Err(PortalBoundaryError::OutsidePortalAllowlist)
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {path:?} must be rejected"
             );
         }
     }

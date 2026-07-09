@@ -1,10 +1,10 @@
 use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::{audit_rows_to_csv, condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
-    approve_live_apply_request, approve_request, cancel_request, execute_request,
-    execute_request_live_plan, get_request_audit, get_request_detail, get_request_evidence,
-    get_request_execution_job, lock_request, plan_request, protect_request, publish_request,
-    reject_request, retire_request, validate_request, verify_request,
+    approve_live_apply_request, approve_request, approve_step_live_apply, cancel_request,
+    execute_request, execute_request_live_plan, get_request_audit, get_request_detail,
+    get_request_evidence, get_request_execution_job, lock_request, plan_request, protect_request,
+    publish_request, reject_request, retire_request, validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -252,6 +252,33 @@ fn action_button_class(action: &str) -> &'static str {
     }
 }
 
+/// Badge class for one orchestration-step status chip (#42 multi-step
+/// orchestration). Covers the full `job_steps.status` vocabulary: green for
+/// landed outcomes, red for failure, amber for in-flight or human-gated
+/// states, neutral for at-rest states (and any unknown future status).
+pub(crate) fn step_status_badge_class(status: &str) -> &'static str {
+    match status {
+        "Succeeded" | "Applied" => "badge good",
+        "Failed" => "badge bad",
+        "Running" | "Planning" | "AwaitingApproval" | "Applying" | "TearingDown" => "badge warn",
+        // Pending (not yet ready) and ToreDown (rolled back to rest) are
+        // at-rest states; unknown statuses degrade to neutral, never hide.
+        _ => "badge neutral",
+    }
+}
+
+/// Human label for one orchestration-step status. The camel-cased engine
+/// values are spaced for display; every other status (known or future) passes
+/// through verbatim so the chip never lies about the underlying state.
+pub(crate) fn step_status_label(status: &str) -> String {
+    match status {
+        "AwaitingApproval" => "Awaiting approval".to_string(),
+        "TearingDown" => "Tearing down".to_string(),
+        "ToreDown" => "Torn down".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Human-readable label for an audit action key (`request.reject`, etc.).
 pub(crate) fn audit_action_label(action: &str) -> &'static str {
     match action {
@@ -317,6 +344,11 @@ pub fn RequestDetail() -> impl IntoView {
     // transition — so a single misclick can't retire a request.
     #[allow(deprecated)]
     let (retire_armed, set_retire_armed) = create_signal(false);
+    // Two-click arm guard for the per-step "Approve live apply" (#42 B1b):
+    // holds the step_key of the armed step, or None. Like `apply_armed`, a
+    // lone misclick must never mint a step-scoped LiveApply grant.
+    #[allow(deprecated)]
+    let (step_apply_armed, set_step_apply_armed) = create_signal::<Option<String>>(None);
 
     // Reset transient per-request UI state whenever the routed request id changes.
     // leptos_router reuses this component across /requests/:id navigations, so a
@@ -333,6 +365,7 @@ pub fn RequestDetail() -> impl IntoView {
         set_reason_error.set(String::new());
         set_apply_armed.set(false);
         set_retire_armed.set(false);
+        set_step_apply_armed.set(None);
     });
 
     let validate_action = Action::new(move |id: &String| {
@@ -485,6 +518,35 @@ pub fn RequestDetail() -> impl IntoView {
         set_action_class.set("badge neutral");
         async move {
             match approve_live_apply_request(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                        execution_job_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    // Per-step live-apply approval (#42 B1b): approves ONE AwaitingApproval
+    // step of a multi-step request. The input is the (request id, step_key)
+    // pair captured from the step row's armed button. API refusals (409 when
+    // the step is not awaiting approval or rollback began, 403 on separation
+    // of duties) surface verbatim in the action badge.
+    let approve_step_live_apply_action = Action::new(move |args: &(String, String)| {
+        let (id, step_key) = args.clone();
+        set_action_feedback.set(format!("Approving live apply for step '{step_key}'..."));
+        set_action_class.set("badge neutral");
+        async move {
+            match approve_step_live_apply(id, step_key).await {
                 Ok(resp) => {
                     let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
@@ -669,6 +731,7 @@ pub fn RequestDetail() -> impl IntoView {
             || execute_action.pending().get()
             || run_live_plan_action.pending().get()
             || approve_live_apply_action.pending().get()
+            || approve_step_live_apply_action.pending().get()
             || verify_action.pending().get()
             || protect_action.pending().get()
             || publish_action.pending().get()
@@ -799,6 +862,18 @@ pub fn RequestDetail() -> impl IntoView {
                         let has_plan = !plan.is_empty();
                         let has_approval_route = !approval_route.is_empty();
                         let has_payload = !payload_fields.is_empty();
+
+                        // Multi-step orchestration plan (#42): ordered step
+                        // rows for composite offerings; empty for single-job
+                        // requests, which hides the panel entirely. The
+                        // per-step "Approve live apply" mirrors the single-job
+                        // button's admin gate; the API additionally enforces
+                        // separation of duties and step state (409s surface
+                        // in the action badge).
+                        let steps = detail.steps.clone();
+                        let has_steps = !steps.is_empty();
+                        let can_approve_step = session_can(&session, "admin");
+                        let step_request_id = detail.id.clone();
 
                         view! {
                             <article
@@ -1001,6 +1076,100 @@ pub fn RequestDetail() -> impl IntoView {
                                     </div>
                                 </Show>
 
+                                // Multi-step orchestration plan (#42): the
+                                // ordered step DAG the API surfaces for
+                                // composite offerings. Each row carries the
+                                // step key, its IaC reference, its
+                                // dependencies, and a status chip; a step
+                                // parked AwaitingApproval offers the
+                                // admin-gated, two-click per-step live-apply
+                                // approval.
+                                <Show when=move || has_steps>
+                                    <div class="request-steps" aria-label="Orchestration steps">
+                                        <h3>"Orchestration Steps"</h3>
+                                        <ol class="request-steps-list">
+                                            {steps
+                                                .clone()
+                                                .into_iter()
+                                                .map(|step| {
+                                                    let chip_class = step_status_badge_class(&step.status);
+                                                    let chip_label = step_status_label(&step.status);
+                                                    let dependencies = if step.depends_on.is_empty() {
+                                                        "none".to_string()
+                                                    } else {
+                                                        step.depends_on.join(", ")
+                                                    };
+                                                    // Per-step approval is offered only on a step the
+                                                    // API reports as parked AwaitingApproval, and only
+                                                    // to admin-capable sessions.
+                                                    let show_step_approve =
+                                                        step.status == "AwaitingApproval" && can_approve_step;
+                                                    let step_key_for_button = step.step_key.clone();
+                                                    let step_id = step_request_id.clone();
+                                                    view! {
+                                                        <li class="request-step-item" aria-label=step.step_key.clone()>
+                                                            <div class="request-step-head">
+                                                                <code class="request-step-key">{step.step_key.clone()}</code>
+                                                                <span class=chip_class>{chip_label}</span>
+                                                            </div>
+                                                            <span class="table-note">"IaC: " {step.iac_ref.clone()}</span>
+                                                            <span class="table-note">"Depends on: " {dependencies}</span>
+                                                            <Show when=move || show_step_approve>
+                                                                {
+                                                                    let id = step_id.clone();
+                                                                    let armed_key = step_key_for_button.clone();
+                                                                    let label_key = step_key_for_button.clone();
+                                                                    let dispatch_key = step_key_for_button.clone();
+                                                                    view! {
+                                                                        <button
+                                                                            class="btn btn-secondary"
+                                                                            class:btn-danger=move || {
+                                                                                step_apply_armed.get().as_deref()
+                                                                                    == Some(armed_key.as_str())
+                                                                            }
+                                                                            disabled=move || any_action_pending.get()
+                                                                            on:click=move |_| {
+                                                                                // First click arms THIS step; the
+                                                                                // confirming second click mints the
+                                                                                // step-scoped LiveApply grant. Arming
+                                                                                // a different step re-targets the arm
+                                                                                // instead of firing.
+                                                                                if step_apply_armed.get().as_deref()
+                                                                                    == Some(dispatch_key.as_str())
+                                                                                {
+                                                                                    set_step_apply_armed.set(None);
+                                                                                    approve_step_live_apply_action
+                                                                                        .dispatch((
+                                                                                            id.clone(),
+                                                                                            dispatch_key.clone(),
+                                                                                        ));
+                                                                                } else {
+                                                                                    set_step_apply_armed
+                                                                                        .set(Some(dispatch_key.clone()));
+                                                                                }
+                                                                            }
+                                                                        >
+                                                                            {move || {
+                                                                                if step_apply_armed.get().as_deref()
+                                                                                    == Some(label_key.as_str())
+                                                                                {
+                                                                                    "Confirm — apply step live".to_string()
+                                                                                } else {
+                                                                                    "Approve live apply".to_string()
+                                                                                }
+                                                                            }}
+                                                                        </button>
+                                                                    }
+                                                                }
+                                                            </Show>
+                                                        </li>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </ol>
+                                    </div>
+                                </Show>
+
                                 // Execution-agent job dispatched for this request.
                                 // Hidden when no job has been dispatched yet.
                                 {match execution_job {
@@ -1133,8 +1302,10 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 return;
                                                             }
                                                             // Any other action cancels a pending
-                                                            // retire arm before dispatching.
+                                                            // retire or step-apply arm before
+                                                            // dispatching.
                                                             set_retire_armed.set(false);
+                                                            set_step_apply_armed.set(None);
                                                             match action.as_str() {
                                                                 "validate" => { validate_action.dispatch(id.clone()); }
                                                                 "plan" => { plan_action.dispatch(id.clone()); }
@@ -1627,8 +1798,8 @@ fn RequestEvidencePanel() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_capability, data_url, digest_slug, effective_stage_for_rail, stage_step_state,
-        STAGE_MILESTONES,
+        action_capability, data_url, digest_slug, effective_stage_for_rail,
+        step_status_badge_class, step_status_label, stage_step_state, STAGE_MILESTONES,
     };
 
     // ── evidence-pack download wiring (#50) ──────────────────────────────────
@@ -1745,6 +1916,54 @@ mod tests {
                 "execute",
                 "{action} must be gated on the execute capability"
             );
+        }
+    }
+
+    // ── orchestration step chips (#42) ──────────────────────────────────────
+
+    /// Every `job_steps.status` value maps to an explicit chip class — landed
+    /// outcomes green, failure red, in-flight/human-gated amber, at-rest
+    /// neutral — and an unknown status degrades to neutral instead of hiding.
+    #[test]
+    fn step_status_badge_class_covers_all_step_statuses() {
+        for (status, expected) in [
+            ("Pending", "badge neutral"),
+            ("Running", "badge warn"),
+            ("Succeeded", "badge good"),
+            ("Failed", "badge bad"),
+            ("Planning", "badge warn"),
+            ("AwaitingApproval", "badge warn"),
+            ("Applying", "badge warn"),
+            ("Applied", "badge good"),
+            ("TearingDown", "badge warn"),
+            ("ToreDown", "badge neutral"),
+            ("SomeFutureStatus", "badge neutral"),
+        ] {
+            assert_eq!(
+                step_status_badge_class(status),
+                expected,
+                "status {status} must map to {expected}"
+            );
+        }
+    }
+
+    /// Camel-cased engine statuses are spaced for display; everything else
+    /// passes through verbatim so the chip never misreports a state.
+    #[test]
+    fn step_status_label_humanizes_camel_cased_statuses() {
+        assert_eq!(step_status_label("AwaitingApproval"), "Awaiting approval");
+        assert_eq!(step_status_label("TearingDown"), "Tearing down");
+        assert_eq!(step_status_label("ToreDown"), "Torn down");
+        for passthrough in [
+            "Pending",
+            "Running",
+            "Succeeded",
+            "Failed",
+            "Planning",
+            "Applying",
+            "Applied",
+        ] {
+            assert_eq!(step_status_label(passthrough), passthrough);
         }
     }
 

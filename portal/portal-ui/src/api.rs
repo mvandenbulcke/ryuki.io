@@ -725,6 +725,48 @@ pub fn request_approve_live_apply_path(request_id: &str) -> Result<String, ApiPa
     request_lifecycle_path(request_id, Some("approve-live-apply"))
 }
 
+/// Validates a multi-step orchestration step key as a single safe URL path
+/// segment (rejects traversal, slashes, query/fragment markers). Mirrors
+/// `safe_request_id`; step keys are engine identifiers such as `provision-vm`.
+fn safe_step_key(step_key: &str) -> Result<&str, ApiPathError> {
+    let step_key = step_key.trim();
+    if step_key.is_empty() {
+        return Err(ApiPathError::Empty);
+    }
+    if step_key.contains("://")
+        || step_key.starts_with("//")
+        || step_key.contains('/')
+        || step_key.contains('\\')
+        || step_key.contains('?')
+        || step_key.contains('#')
+        || step_key == "."
+        || step_key == ".."
+        || step_key.contains("..")
+        || !step_key
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return Err(ApiPathError::UnsafePathSegment);
+    }
+    Ok(step_key)
+}
+
+/// Builds `/api/requests/{id}/steps/{step_key}/approve-live-apply` — the
+/// admin-gated per-step approval endpoint for multi-step orchestration
+/// (#42 live-apply slice B1b). Approves ONE `AwaitingApproval` step by minting
+/// a step-scoped CP-signed LiveApply grant. Both dynamic segments are
+/// validated as single safe URL path segments.
+pub fn request_step_approve_live_apply_path(
+    request_id: &str,
+    step_key: &str,
+) -> Result<String, ApiPathError> {
+    let request_id = safe_request_id(request_id)?;
+    let step_key = safe_step_key(step_key)?;
+    let path = format!("/api/requests/{request_id}/steps/{step_key}/approve-live-apply");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +881,10 @@ mod tests {
         assert_eq!(
             request_approve_live_apply_path(request_id),
             Ok("/api/requests/REQ-123/approve-live-apply".to_string())
+        );
+        assert_eq!(
+            request_step_approve_live_apply_path(request_id, "provision-vm"),
+            Ok("/api/requests/REQ-123/steps/provision-vm/approve-live-apply".to_string())
         );
     }
 
@@ -1117,5 +1163,30 @@ mod tests {
         ] {
             assert!(request_detail_path(request_id).is_err());
         }
+    }
+
+    #[test]
+    fn step_approve_live_apply_path_rejects_unsafe_segments() {
+        // Unsafe step keys must never reach the wire, mirroring the
+        // request-id guard (traversal, slashes, query/fragment markers).
+        for step_key in [
+            "",
+            ".",
+            "..",
+            "step/../../admin",
+            "step/extra",
+            r"step\extra",
+            "step key",
+            "step?mode=live",
+            "step#frag",
+            "https://example.test/step",
+        ] {
+            assert!(
+                request_step_approve_live_apply_path("REQ-123", step_key).is_err(),
+                "step key {step_key:?} must be rejected"
+            );
+        }
+        // An unsafe request id is rejected even when the step key is safe.
+        assert!(request_step_approve_live_apply_path("REQ/123", "provision-vm").is_err());
     }
 }

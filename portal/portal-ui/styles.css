@@ -1469,6 +1469,51 @@ tbody tr:hover {
   font-size: 14px;
 }
 
+/* ── Multi-step orchestration plan (#42) ────────────────────── */
+/* The step list keeps the detail section rhythm; each ordered step row reuses
+   the info-item token treatment and carries a status chip (.badge). */
+.request-steps {
+  display: grid;
+  gap: 10px;
+}
+
+.request-steps h3 {
+  margin: 0;
+}
+
+.request-steps-list {
+  margin: 0;
+  padding-left: 22px;
+  display: grid;
+  gap: 8px;
+}
+
+.request-step-item {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.request-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.request-step-key {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.request-step-item .btn {
+  justify-self: start;
+  margin-top: 4px;
+}
+
 .request-actions {
   display: grid;
   gap: 10px;

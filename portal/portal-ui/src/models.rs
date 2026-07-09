@@ -1337,6 +1337,32 @@ pub struct ApiRequestDetail {
     /// instead of assuming cpu/memory.
     #[serde(default)]
     pub payload: serde_json::Value,
+    /// Multi-step orchestration plan (#42 slice 3): the ordered step rows the
+    /// API surfaces for composite offerings. Empty (`[]` or absent) for every
+    /// single-job request, so older API responses decode unchanged.
+    #[serde(default)]
+    pub steps: Vec<RequestStep>,
+}
+
+/// One orchestration step of a multi-step request plan, as serialized by the
+/// API detail endpoint (`steps` array, #42 slice 3). Carries only the
+/// approver-facing fields (`step_key`/`depends_on`/`iac_ref`/`status`); the
+/// dispatched agent-job id stays internal to the API. Shared between the wire
+/// shape and the display model — the fields map 1:1, mirroring how
+/// `StageEvidenceItem` is forwarded.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct RequestStep {
+    pub step_key: String,
+    /// Keys of the steps this step depends on (empty for root steps).
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// The offering/IaC reference this step executes.
+    #[serde(default)]
+    pub iac_ref: String,
+    /// Engine step status: `Pending`/`Running`/`Succeeded`/`Failed`/`Planning`
+    /// /`AwaitingApproval`/`Applying`/`Applied`/`TearingDown`/`ToreDown`.
+    #[serde(default)]
+    pub status: String,
 }
 
 /// One evidence item on a lifecycle stage, as received from the API.
@@ -1439,6 +1465,7 @@ impl From<ApiRequestDetail> for RequestDetail {
             approval_route: detail.approval_route,
             stages,
             payload_fields,
+            steps: detail.steps,
         }
     }
 }
@@ -1640,6 +1667,10 @@ pub struct RequestDetail {
     /// Per-type request payload flattened into display rows. Empty for VM-type
     /// requests whose fields are already covered by cpu/memory.
     pub payload_fields: Vec<KeyValue>,
+    /// Multi-step orchestration plan (#42): ordered step rows for composite
+    /// offerings. Empty for single-job requests, which hides the panel.
+    #[serde(default)]
+    pub steps: Vec<RequestStep>,
 }
 
 /// A persisted lifecycle stage, projected for display.
@@ -2429,6 +2460,7 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
         approval_route: vec!["datacenter-approver".to_string()],
         stages: Vec::new(),
         payload_fields: Vec::new(),
+        steps: Vec::new(),
     }
 }
 
@@ -3025,6 +3057,29 @@ mod tests {
             mapped.timeline[0].description,
             "Current lifecycle stage (audit trail loads separately)"
         );
+    }
+
+    #[test]
+    fn api_request_detail_decodes_and_forwards_orchestration_steps() {
+        // #42 slice 3: the detail JSON carries an additive `steps` array for
+        // multi-step (composite-offering) requests; absent steps must decode
+        // to empty so single-job requests and older API responses are unchanged.
+        let body = r#"{"request_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","request_type":"server-deployment","status":"executing","stage":"execute","site":"site-alpha","environment":"prod","name":"srv-app-01","cpu":4,"memory_gb":16,"justification":"Need capacity","created_by":"admin","created_at":"t","updated_at":"t2","steps":[{"step_key":"provision-vm","depends_on":[],"iac_ref":"vm-small","status":"Applied"},{"step_key":"configure-os","depends_on":["provision-vm"],"iac_ref":"os-baseline","status":"AwaitingApproval"}]}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+
+        assert_eq!(mapped.steps.len(), 2);
+        assert_eq!(mapped.steps[0].step_key, "provision-vm");
+        assert!(mapped.steps[0].depends_on.is_empty());
+        assert_eq!(mapped.steps[0].iac_ref, "vm-small");
+        assert_eq!(mapped.steps[0].status, "Applied");
+        assert_eq!(mapped.steps[1].depends_on, vec!["provision-vm".to_string()]);
+        assert_eq!(mapped.steps[1].status, "AwaitingApproval");
+
+        // Absent steps decode to an empty plan (single-job request).
+        let single = r#"{"request_id":"r1","request_type":"VM","status":"intake","stage":"","site":"s","environment":"prod","name":"n","cpu":2,"memory_gb":8,"justification":null,"created_by":"req","created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(single).expect("decode");
+        assert!(RequestDetail::from(detail).steps.is_empty());
     }
 
     #[test]
