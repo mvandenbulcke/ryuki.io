@@ -10811,18 +10811,50 @@ fn parse_noise_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value
 
 // ─── Noise remediation handlers ───
 
-/// Engine-equivalent host→site classifier.  Iterates VALID_SITES in order and
-/// returns the first site whose name is a case-insensitive substring of `host`.
-/// Unknown hosts default to "DEFRA" (matching the engine).
+/// The five valid noise sites in CLASSIFICATION PRIORITY ORDER — shared by
+/// [`site_from_host`] and [`site_from_host_sql_case`] so the Rust and SQL
+/// classifiers cannot drift apart.
+const NOISE_VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+
+/// Engine-equivalent host→site classifier.  Iterates `NOISE_VALID_SITES` in
+/// order and returns the first site whose name is a case-insensitive substring
+/// of `host`. Unknown hosts default to "DEFRA" (matching the engine).
 fn site_from_host(host: &str) -> &'static str {
-    const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
     let lower = host.to_lowercase();
-    for &site in VALID_SITES {
+    for &site in NOISE_VALID_SITES {
         if lower.contains(&site.to_lowercase()) {
             return site;
         }
     }
     "DEFRA"
+}
+
+/// #14: a SQL expression EXACTLY equivalent to [`site_from_host`], so
+/// `noise_suppressed_list` can filter AND page on the host-derived site inside
+/// SQL (`noisy_triggers` has no site column). Built from the same
+/// `NOISE_VALID_SITES` in the same order: `CASE` arms short-circuit like the
+/// Rust loop (first match wins), and `ELSE` is the same DEFRA default.
+///
+/// This is a faithful translation, not an approximation: the site tokens are
+/// pure ASCII, and Postgres `lower()` agrees with Rust `to_lowercase()` on
+/// ASCII case-folding in every locale. Non-ASCII host bytes cannot flip a
+/// match either way — the only Unicode codepoints whose lowercase form maps
+/// into ASCII are U+212A ('k') and U+0130 ('i' + combining dot), and neither
+/// letter occurs in any site token (locale-special foldings such as Turkish
+/// dotless-I likewise only affect 'i'/'k').
+fn site_from_host_sql_case() -> String {
+    let mut case = String::from("CASE");
+    for site in NOISE_VALID_SITES {
+        // The tokens are compile-time ASCII constants (no quotes or SQL
+        // metacharacters), so inlining them into the SQL text is injection-safe.
+        case.push_str(&format!(
+            " WHEN strpos(lower(host), '{}') > 0 THEN '{}'",
+            site.to_lowercase(),
+            site
+        ));
+    }
+    case.push_str(" ELSE 'DEFRA' END");
+    case
 }
 
 async fn noise_detect(
@@ -11261,32 +11293,99 @@ async fn noise_report(
     }
 }
 
+/// GET /api/monitoring/noise/suppressed — suppressed triggers. #14: paged in
+/// SQL; the body stays a bare array (backward-compatible) and the filtered
+/// total travels in the `X-Total-Count` header. `noisy_triggers` has no site
+/// column — the row's site is DERIVED from `host` — so the scope filter is
+/// pushed into SQL via [`site_from_host_sql_case`], the exact SQL twin of the
+/// Rust classifier. That keeps the page cut AFTER the site filter (a plain SQL
+/// page filtered in Rust afterwards would make page size and total drift), with
+/// no fetch cap needed.
 async fn noise_suppressed_list(
     AuthExtractor(session): AuthExtractor,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Query(page): Query<AdminListPage>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
     if let Some(pool) = get_db() {
-        let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
-            "SELECT {NOISE_COLUMNS} FROM noisy_triggers \
-             WHERE status = 'Suppressed' ORDER BY updated_at DESC"
-        ))
-        .fetch_all(pool)
-        .await
-        .map_err(db_error)?;
-        // #2: noisy_triggers has no site column — keep only rows whose host-derived
-        // site is in the principal's scope (env-scoped -> none).
-        let arr: Vec<Value> = rows
-            .iter()
-            .filter(|r| row_scope_permits(&session, site_from_host(&r.host), ""))
-            .map(noise_row_to_json)
-            .collect();
-        return Ok(Json(Value::Array(arr)));
+        // #2: same law as the old per-row `row_scope_permits(_, site_from_host,
+        // "")` filter — env-scoped principals see none (site-only resource),
+        // an empty scope vec is unrestricted, all-blank fails closed.
+        let sites: Option<Vec<String>> = match list_site_scope(&session) {
+            ListSiteScope::Empty => {
+                return Ok((total_count_headers(0), Json(Value::Array(vec![]))));
+            }
+            ListSiteScope::All => None,
+            ListSiteScope::Sites(s) => Some(s),
+        };
+        // #14: `updated_at` is non-unique → the unique PK `id` tie-breaker makes
+        // each LIMIT/OFFSET page a stable cut.
+        let (rows, total): (Vec<NoisyTriggerRow>, i64) = match sites.as_deref() {
+            None => {
+                let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
+                    "SELECT {NOISE_COLUMNS} FROM noisy_triggers \
+                     WHERE status = 'Suppressed' \
+                     ORDER BY updated_at DESC, id DESC LIMIT $1 OFFSET $2"
+                ))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await
+                .map_err(db_error)?;
+                let total: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM noisy_triggers WHERE status = 'Suppressed'",
+                )
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
+                (rows, total)
+            }
+            Some(sites) => {
+                let site_case = site_from_host_sql_case();
+                let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
+                    "SELECT {NOISE_COLUMNS} FROM noisy_triggers \
+                     WHERE status = 'Suppressed' AND ({site_case}) = ANY($1) \
+                     ORDER BY updated_at DESC, id DESC LIMIT $2 OFFSET $3"
+                ))
+                .bind(sites)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await
+                .map_err(db_error)?;
+                let total: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM noisy_triggers \
+                     WHERE status = 'Suppressed' AND ({site_case}) = ANY($1)"
+                ))
+                .bind(sites)
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
+                (rows, total)
+            }
+        };
+        let arr: Vec<Value> = rows.iter().map(noise_row_to_json).collect();
+        return Ok((total_count_headers(total), Json(Value::Array(arr))));
     }
     // #2: the engine fallback can't be site-filtered; a scoped principal sees none.
     if is_scoped(&session) {
-        return Ok(Json(Value::Array(vec![])));
+        return Ok((total_count_headers(0), Json(Value::Array(vec![]))));
     }
     match noise_remediation::get_suppressed_triggers() {
-        Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
+        Ok(triggers) => {
+            // #14: page the in-memory fallback the same way (total = pre-page count).
+            let total = triggers.len() as i64;
+            let page: Vec<_> = triggers
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect();
+            Ok((
+                total_count_headers(total),
+                Json(serde_json::to_value(page).unwrap_or_default()),
+            ))
+        }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))),
     }
 }
@@ -26420,22 +26519,50 @@ async fn decommission_rollback(
     Ok(Json(serde_json::to_value(&rolled_back).unwrap_or_default()))
 }
 
-async fn decommission_quarantine_inventory(AuthExtractor(session): AuthExtractor) -> ApiResult {
-    if let Some(pool) = get_db() {
-        let requests = crate::repos::decommissions::list_quarantine(pool)
+/// GET /api/retire/decommission/quarantine — the quarantine inventory. #14:
+/// paged in SQL with a `LIMIT`/`OFFSET` page; the body stays a bare array of
+/// `QuarantineEntry` (backward-compatible) and the filtered total travels in
+/// the `X-Total-Count` header. Both the `status = 'Quarantined'` predicate
+/// (previously applied in Rust by the engine's `get_quarantine_inventory`) and
+/// the principal's site scope (previously `retain_site_scoped` over a
+/// fetch-all) are pushed into SQL so the page and the total describe the same
+/// set. Ordered soonest-expiring first with the unique `id` tie-breaker.
+async fn decommission_quarantine_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
+    let Some(pool) = get_db() else {
+        // No DB: empty inventory (unchanged), now with the zero total header.
+        return Ok((total_count_headers(0), Json(Value::Array(vec![]))));
+    };
+    // #2: a decommission is SITE-ONLY (environment NULL) — an unrestricted
+    // principal keeps all rows, a site-scoped one keeps only its sites, an
+    // environment-scoped one keeps none. Same law as retain_site_scoped, now
+    // resolved to a SQL filter.
+    let sites: Option<Vec<String>> = match list_site_scope(&session) {
+        ListSiteScope::Empty => {
+            return Ok((total_count_headers(0), Json(Value::Array(vec![]))));
+        }
+        ListSiteScope::All => None,
+        ListSiteScope::Sites(s) => Some(s),
+    };
+    let requests =
+        crate::repos::decommissions::list_quarantined_page(pool, sites.as_deref(), limit, offset)
             .await
             .map_err(db_error)?;
-        // Narrow the cross-site inventory to the principal's site scope before
-        // building it — an unrestricted principal keeps all rows, a site-scoped
-        // one keeps only its site, an environment-scoped one keeps none (#2).
-        let requests = retain_site_scoped(&session, requests, |r| r.site.as_str());
-        let inventory = server_decommission::get_quarantine_inventory(&requests);
-        return Ok(Json(serde_json::to_value(inventory).unwrap_or_default()));
-    }
-    // No DB: return empty inventory
-    Ok(Json(
-        serde_json::to_value(Vec::<ryuki_engine::models::QuarantineEntry>::new())
-            .unwrap_or_default(),
+    let total = crate::repos::decommissions::count_quarantined(pool, sites.as_deref())
+        .await
+        .map_err(db_error)?;
+    // The engine mapper still shapes the entries (remaining_days etc.); its
+    // Quarantined-status filter is now a no-op over the pre-filtered page, so
+    // it cannot shrink the page out from under the reported total.
+    let inventory = server_decommission::get_quarantine_inventory(&requests);
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(inventory).unwrap_or_default()),
     ))
 }
 
@@ -58410,8 +58537,16 @@ mod noise_remediation_db_tests {
     #[tokio::test]
     async fn test_noise_suppressed_list_fallback_in_memory() {
         // noise_suppressed_list now returns Result; unwrap the Ok arm.
-        match noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await {
-            Ok(Json(value)) => assert!(value.is_array() || value.is_object()),
+        match noise_suppressed_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        {
+            Ok((_headers, Json(value))) => assert!(value.is_array() || value.is_object()),
             Err(_) => {
                 // Engine error in test environment is acceptable — just verify
                 // it doesn't panic.
@@ -58738,8 +58873,15 @@ mod noise_remediation_db_tests {
         .expect("seed Suppressed row");
 
         // A real DB is present → Result must be Ok, not Err(500).
-        let result = noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await;
-        let Ok(Json(body)) = result else {
+        let result = noise_suppressed_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await;
+        let Ok((_headers, Json(body))) = result else {
             panic!("expected Ok from noise_suppressed_list with live DB, got Err");
         };
         let arr = body.as_array().expect("expected array");
@@ -58937,8 +59079,15 @@ mod noise_remediation_db_tests {
         };
 
         // Ensure at least the seeded Suppressed row is present.
-        let result = noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await;
-        let Ok(Json(body)) = result else {
+        let result = noise_suppressed_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await;
+        let Ok((_headers, Json(body))) = result else {
             panic!("expected Ok from noise_suppressed_list, got Err");
         };
         let arr = body.as_array().expect("expected array");
@@ -58949,6 +59098,224 @@ mod noise_remediation_db_tests {
         assert!(arr
             .iter()
             .all(|t| t["status"].as_str().unwrap_or("") == "Suppressed"));
+    }
+
+    // ── #14: suppressed list pages in SQL with the host→site CASE push-down ──
+
+    /// Call the handler with the given scopes/page and return
+    /// (X-Total-Count, body rows).
+    async fn suppressed_page(
+        site_scope: Vec<String>,
+        environment_scope: Vec<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> (i64, Vec<Value>) {
+        let mut s = AuthSession::static_dry_run();
+        s.site_scope = site_scope;
+        s.environment_scope = environment_scope;
+        let (headers, Json(body)) =
+            noise_suppressed_list(AuthExtractor(s), Query(AdminListPage { limit, offset }))
+                .await
+                .expect("suppressed list must succeed");
+        let total = headers
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("X-Total-Count header must carry the filtered total");
+        (total, body.as_array().expect("array body").clone())
+    }
+
+    /// #14: the suppressed list pages in SQL with the host→site classification
+    /// pushed down as a CASE expression that must match `site_from_host`
+    /// EXACTLY — first-match precedence, case-insensitivity, and the DEFRA
+    /// default. Totals are verified against INDEPENDENT raw counts
+    /// (hand-written CASE, not the production builder), offset slices against
+    /// an independent ordered query with identical sort keys (fixed past
+    /// timestamps — never relative-NOW seeds), and the scope matrix
+    /// (unrestricted / site-scoped / env-scoped / all-blank) fails closed.
+    #[tokio::test]
+    async fn test_suppressed_list_sql_pagination_and_site_split() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Hand-written twin of site_from_host_sql_case(), kept INDEPENDENT of
+        // the production builder so a bug there cannot self-verify.
+        const RAW_CASE: &str = "CASE WHEN strpos(lower(host), 'deber') > 0 THEN 'DEBER' \
+             WHEN strpos(lower(host), 'defra') > 0 THEN 'DEFRA' \
+             WHEN strpos(lower(host), 'frpar') > 0 THEN 'FRPAR' \
+             WHEN strpos(lower(host), 'gblon') > 0 THEN 'GBLON' \
+             WHEN strpos(lower(host), 'nlams') > 0 THEN 'NLAMS' \
+             ELSE 'DEFRA' END";
+
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let host_gblon_a = format!("srv-gblon-a-{tag}");
+        let host_gblon_b = format!("srv-GbLoN-b-{tag}"); // case-insensitive match
+        let host_gblon_c = format!("srv-gblon-c-{tag}");
+        let host_nlams = format!("srv-nlams-a-{tag}");
+        let host_default = format!("srv-nowhere-a-{tag}"); // no site token → DEFRA
+        let host_precedence = format!("srv-nlams-deber-{tag}"); // DEBER wins (first in order)
+        let host_active = format!("srv-gblon-active-{tag}"); // excluded by status
+
+        // Rust-side oracle for the trickiest classifications, so the SQL
+        // assertions below are anchored to the engine-equivalent classifier.
+        assert_eq!(site_from_host(&host_gblon_b), "GBLON");
+        assert_eq!(site_from_host(&host_default), "DEFRA");
+        assert_eq!(site_from_host(&host_precedence), "DEBER");
+
+        let seeds: Vec<(uuid::Uuid, &str, &str)> = vec![
+            (uuid::Uuid::new_v4(), host_gblon_a.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_gblon_b.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_gblon_c.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_nlams.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_default.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_precedence.as_str(), "Suppressed"),
+            (uuid::Uuid::new_v4(), host_active.as_str(), "Active"),
+        ];
+        // All rows share ONE fixed past updated_at → identical primary sort
+        // keys, so the ORDER BY tie-break on the unique id is exercised.
+        for (id, host, status) in &seeds {
+            sqlx::query(
+                "INSERT INTO noisy_triggers \
+                 (id, trigger_name, host, severity, event_count_last_24h, \
+                  avg_interval_minutes, flapping, suggested_action, status, \
+                  suppress_until, created_at, updated_at) \
+                 VALUES ($1, $2, $3, 'warning', 42, 5.0, false, 'seed', $4, \
+                         '2030-01-01T00:00:00Z', '2024-01-01T00:00:00Z', \
+                         '2024-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(format!("pagination seed {host}"))
+            .bind(host)
+            .bind(status)
+            .execute(pool)
+            .await
+            .expect("seed noisy_triggers row");
+        }
+        let id_of = |host: &str| {
+            seeds
+                .iter()
+                .find(|(_, h, _)| *h == host)
+                .map(|(id, _, _)| id.to_string())
+                .expect("seeded host")
+        };
+
+        // INDEPENDENT ordered id list + count for the GBLON-derived scope,
+        // under predicates identical to the handler's.
+        let gblon = vec!["GBLON".to_string()];
+        // `AS id_text` keeps the bare `id` in ORDER BY bound to the table's
+        // uuid column — the same expression the handler orders by.
+        let raw_gblon_ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT id::text AS id_text FROM noisy_triggers \
+             WHERE status = 'Suppressed' AND ({RAW_CASE}) = ANY($1) \
+             ORDER BY updated_at DESC, id DESC"
+        ))
+        .bind(&gblon)
+        .fetch_all(pool)
+        .await
+        .expect("raw GBLON ids");
+        let raw_gblon_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM noisy_triggers \
+             WHERE status = 'Suppressed' AND ({RAW_CASE}) = ANY($1)"
+        ))
+        .bind(&gblon)
+        .fetch_one(pool)
+        .await
+        .expect("raw GBLON count");
+        let raw_all_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM noisy_triggers WHERE status = 'Suppressed'")
+                .fetch_one(pool)
+                .await
+                .expect("raw unrestricted count");
+
+        // Handler pages under the same scopes.
+        let ids = |rows: &[Value]| -> Vec<String> {
+            rows.iter()
+                .map(|t| t["id"].as_str().expect("id").to_string())
+                .collect()
+        };
+        let (g_total, g_rows) = suppressed_page(gblon.clone(), vec![], Some(1000), None).await;
+        let (s_total, s_rows) = suppressed_page(gblon.clone(), vec![], Some(1), Some(1)).await;
+        let (u_total, u_rows) = suppressed_page(vec![], vec![], Some(1000), None).await;
+        let (l_total, l_rows) = suppressed_page(vec![], vec![], Some(1), None).await;
+        let (_, deber_rows) =
+            suppressed_page(vec!["DEBER".into()], vec![], Some(1000), None).await;
+        let (_, nlams_rows) =
+            suppressed_page(vec!["NLAMS".into()], vec![], Some(1000), None).await;
+        let (_, defra_rows) =
+            suppressed_page(vec!["DEFRA".into()], vec![], Some(1000), None).await;
+        let (env_total, env_rows) =
+            suppressed_page(vec![], vec!["prod".into()], Some(1000), None).await;
+        let (blank_total, blank_rows) =
+            suppressed_page(vec![String::new()], vec![], Some(1000), None).await;
+
+        // Cleanup before asserting so a failed assertion does not leak seeds.
+        for (id, _, _) in &seeds {
+            sqlx::query("DELETE FROM noisy_triggers WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        // (1) Total vs INDEPENDENT raw COUNT under identical predicates.
+        assert_eq!(g_total, raw_gblon_count, "scoped total = independent count");
+        assert_eq!(u_total, raw_all_count, "unrestricted total = raw count");
+        // (2) Full scoped page equals the independent ordered id sequence, and
+        // an offset slice is EXACTLY the same cut of that sequence.
+        assert_eq!(ids(&g_rows), raw_gblon_ids, "scoped page = raw sequence");
+        assert_eq!(s_total, raw_gblon_count, "offset must not change the total");
+        assert_eq!(
+            ids(&s_rows),
+            raw_gblon_ids[1..2].to_vec(),
+            "limit=1 offset=1 must be exactly the second row of the sequence"
+        );
+        // (3) Every scoped row satisfies the Rust classifier + status predicate.
+        assert!(
+            g_rows.iter().all(|t| {
+                site_from_host(t["host"].as_str().unwrap_or("")) == "GBLON"
+                    && t["status"] == json!("Suppressed")
+            }),
+            "SQL CASE must agree with site_from_host on every returned row"
+        );
+        // (4) Membership: split, case-insensitivity, precedence, default.
+        let g_ids = ids(&g_rows);
+        for host in [&host_gblon_a, &host_gblon_b, &host_gblon_c] {
+            assert!(g_ids.contains(&id_of(host)), "GBLON must include {host}");
+        }
+        for host in [&host_nlams, &host_default, &host_precedence, &host_active] {
+            assert!(!g_ids.contains(&id_of(host)), "GBLON must exclude {host}");
+        }
+        assert!(
+            ids(&deber_rows).contains(&id_of(&host_precedence)),
+            "first-match precedence: the nlams+deber host must classify as DEBER"
+        );
+        assert!(
+            !ids(&nlams_rows).contains(&id_of(&host_precedence)),
+            "the nlams+deber host must NOT classify as NLAMS"
+        );
+        assert!(
+            ids(&nlams_rows).contains(&id_of(&host_nlams)),
+            "NLAMS must include the nlams host"
+        );
+        assert!(
+            ids(&defra_rows).contains(&id_of(&host_default)),
+            "an unknown host must default to DEFRA"
+        );
+        // (5) The Active row is excluded from page AND total everywhere.
+        assert!(!ids(&u_rows).contains(&id_of(&host_active)));
+        // (6) Scope matrix: env-scoped and all-blank site scope fail closed.
+        assert_eq!((env_total, env_rows.len()), (0, 0), "env-scoped sees none");
+        assert_eq!(
+            (blank_total, blank_rows.len()),
+            (0, 0),
+            "all-blank site scope must fail closed, not widen to all sites"
+        );
+        // (7) The limit bounds the page but not the total.
+        assert_eq!(l_rows.len(), 1, "limit=1 must bound the page");
+        assert_eq!(l_total, raw_all_count, "limit must not change the total");
     }
 
     // ── suggest returns shape-parity with engine ──
@@ -62151,8 +62518,14 @@ mod server_decommission_db_tests {
         };
 
         // inventory must include our server
-        let Ok(Json(inventory)) =
-            decommission_quarantine_inventory(AuthExtractor(AuthSession::static_dry_run())).await
+        let Ok((_headers, Json(inventory))) = decommission_quarantine_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
         else {
             cleanup(pool, &id).await;
             panic!("inventory call failed");
@@ -62164,6 +62537,185 @@ mod server_decommission_db_tests {
 
         cleanup(pool, &id).await;
         assert!(found, "quarantined server must appear in inventory");
+    }
+
+    // ── #14: quarantine inventory pages in SQL (status + site scope pushed down) ──
+
+    /// Call the inventory handler with the given scopes/page and return
+    /// (X-Total-Count, entries).
+    async fn inventory_page(
+        site_scope: Vec<String>,
+        environment_scope: Vec<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> (i64, Vec<Value>) {
+        let mut s = AuthSession::static_dry_run();
+        s.site_scope = site_scope;
+        s.environment_scope = environment_scope;
+        let (headers, Json(body)) = decommission_quarantine_inventory(
+            AuthExtractor(s),
+            Query(AdminListPage { limit, offset }),
+        )
+        .await
+        .expect("inventory list must succeed");
+        let total = headers
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("X-Total-Count header must carry the filtered total");
+        (total, body.as_array().expect("array body").clone())
+    }
+
+    /// #14: the quarantine inventory pushes BOTH the `status = 'Quarantined'`
+    /// predicate (previously an in-Rust engine filter over a fetch-all that
+    /// also pulled Executed/Verified rows) and the site scope into SQL. Totals
+    /// are verified against INDEPENDENT raw counts under identical predicates,
+    /// offset slices against an independent ordered query (identical fixed
+    /// quarantine_until keys → the unique-id tie-break is exercised), the
+    /// non-Quarantined seeds are excluded from BOTH page and total, and the
+    /// scope matrix (unrestricted / site-scoped / env-scoped / all-blank)
+    /// fails closed.
+    #[tokio::test]
+    async fn test_quarantine_inventory_sql_pagination_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        use ryuki_engine::models::{DecommissionRequest, DecommissionStatus, ServerType};
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        // A site token unique to this run isolates the scoped assertions from
+        // shared seeds and other tests' rows.
+        let site = format!("ZZQI-{}", &suffix[..8]);
+        let mk = |tag: &str, status: DecommissionStatus| DecommissionRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            server_name: format!("srv-qi-{tag}-{suffix}"),
+            site: site.clone(),
+            os_family: "Windows".into(),
+            server_type: ServerType::VM,
+            reason: "pagination test".into(),
+            final_backup_required: false,
+            quarantine_days: 30,
+            status,
+            dependencies_identified: vec![],
+            backup_confirmed: false,
+            approvals_collected: vec![],
+            // ONE fixed timestamp across all rows (never relative-NOW): the
+            // primary sort keys tie, so paging must fall back to the id.
+            quarantine_until: Some("2030-01-01T00:00:00Z".into()),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            metadata: Default::default(),
+        };
+        let quarantined: Vec<DecommissionRequest> = (0..3)
+            .map(|i| mk(&format!("q{i}"), DecommissionStatus::Quarantined))
+            .collect();
+        let others = vec![
+            mk("exec", DecommissionStatus::Executed),
+            mk("verif", DecommissionStatus::Verified),
+            mk("draft", DecommissionStatus::Draft),
+        ];
+        for r in quarantined.iter().chain(others.iter()) {
+            crate::repos::decommissions::insert(pool, r)
+                .await
+                .expect("seed decommission row");
+        }
+
+        // INDEPENDENT ordered id list + counts under the handler's predicates.
+        // `id::text AS id` mirrors the repo's COLUMNS projection, so the bare
+        // `id` in ORDER BY resolves to the same output alias as production.
+        let scope = vec![site.clone()];
+        let raw_scoped_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id::text AS id FROM decommission_requests \
+             WHERE status = 'Quarantined' AND site = ANY($1) \
+             ORDER BY quarantine_until ASC, id ASC",
+        )
+        .bind(&scope)
+        .fetch_all(pool)
+        .await
+        .expect("raw scoped ids");
+        let raw_scoped_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decommission_requests \
+             WHERE status = 'Quarantined' AND site = ANY($1)",
+        )
+        .bind(&scope)
+        .fetch_one(pool)
+        .await
+        .expect("raw scoped count");
+        let raw_all_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decommission_requests WHERE status = 'Quarantined'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("raw unrestricted count");
+
+        let ids = |rows: &[Value]| -> Vec<String> {
+            rows.iter()
+                .map(|e| e["decommission_id"].as_str().expect("id").to_string())
+                .collect()
+        };
+        let (full_total, full_rows) =
+            inventory_page(scope.clone(), vec![], Some(1000), None).await;
+        let (mid_total, mid_rows) = inventory_page(scope.clone(), vec![], Some(1), Some(1)).await;
+        let (tail_total, tail_rows) =
+            inventory_page(scope.clone(), vec![], Some(2), Some(2)).await;
+        let (u_total, _) = inventory_page(vec![], vec![], Some(1), None).await;
+        let (env_total, env_rows) =
+            inventory_page(vec![], vec!["prod".into()], Some(1000), None).await;
+        let (blank_total, blank_rows) =
+            inventory_page(vec![String::new()], vec![], Some(1000), None).await;
+
+        // Cleanup before asserting so a failed assertion does not leak seeds.
+        for r in quarantined.iter().chain(others.iter()) {
+            cleanup(pool, &r.id).await;
+        }
+
+        // (1) Total vs INDEPENDENT raw COUNT under identical predicates. The
+        // unique site makes the scoped set exactly the three Quarantined seeds.
+        assert_eq!(raw_scoped_count, 3, "independent count sees only the 3 seeds");
+        assert_eq!(full_total, raw_scoped_count, "scoped total = independent count");
+        assert_eq!(u_total, raw_all_count, "unrestricted total = raw count");
+        // (2) Full scoped page equals the independent ordered sequence, and
+        // offset slices are EXACTLY the matching cuts (id tie-break order).
+        assert_eq!(ids(&full_rows), raw_scoped_ids, "scoped page = raw sequence");
+        assert_eq!(mid_total, 3, "offset must not change the total");
+        assert_eq!(
+            ids(&mid_rows),
+            raw_scoped_ids[1..2].to_vec(),
+            "limit=1 offset=1 must be exactly the second row"
+        );
+        assert_eq!(
+            ids(&tail_rows),
+            raw_scoped_ids[2..3].to_vec(),
+            "limit=2 offset=2 must be exactly the one-row tail"
+        );
+        assert_eq!(tail_total, 3, "tail slice keeps the full total");
+        // (3) Non-Quarantined rows are excluded from BOTH page and total: the
+        // scoped total above is exactly 3, and none of the Executed / Verified /
+        // Draft ids appear in the page.
+        let full_ids = ids(&full_rows);
+        for r in &others {
+            assert!(
+                !full_ids.contains(&r.id),
+                "non-Quarantined row {} must not be in the inventory page",
+                r.server_name
+            );
+        }
+        // Engine mapping still shapes entries: site + server_name round-trip.
+        assert!(
+            full_rows
+                .iter()
+                .all(|e| e["site"] == json!(site.clone()) && e["remaining_days"].is_u64()),
+            "entries must carry the engine-mapped fields"
+        );
+        // (4) Scope matrix: env-scoped and all-blank site scope fail closed.
+        assert_eq!((env_total, env_rows.len()), (0, 0), "env-scoped sees none");
+        assert_eq!(
+            (blank_total, blank_rows.len()),
+            (0, 0),
+            "all-blank site scope must fail closed, not widen to all sites"
+        );
     }
 
     /// Audit log persisted: after quarantine, quarantine_log must have >= 1 row

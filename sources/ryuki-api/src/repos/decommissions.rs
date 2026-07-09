@@ -208,17 +208,78 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<DecommissionRequest>,
     Ok(row.map(|r| r.into_model()))
 }
 
-/// Return all requests whose status is one of the active quarantine states
-/// (Quarantined, Executed, Verified). Used to build the quarantine inventory.
-pub async fn list_quarantine(pool: &PgPool) -> Result<Vec<DecommissionRequest>, sqlx::Error> {
-    let rows: Vec<DecommissionRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM decommission_requests \
-         WHERE status IN ('Quarantined', 'Executed', 'Verified')"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// One `LIMIT`/`OFFSET` page of QUARANTINED requests (#14) for the quarantine
+/// inventory, with BOTH predicates pushed into SQL: the `status =
+/// 'Quarantined'` narrowing the engine's `get_quarantine_inventory` used to do
+/// in Rust (the old `list_quarantine` also fetched Executed/Verified rows only
+/// for the engine to drop them), and the site scope that the handler used to
+/// apply in-memory via `retain_site_scoped` — so the page and the total
+/// describe the same filtered set. `sites`: `None` = every site (an
+/// unrestricted principal); `Some(list)` = only those sites via
+/// `site = ANY($1)`. An environment-scoped principal is handled by the caller
+/// (empty result — the resource is site-only). Ordered soonest-expiring first
+/// (`quarantine_until ASC`, NULLs last per Postgres default); the unique PK
+/// `id` tie-breaker makes each page a stable cut.
+pub async fn list_quarantined_page(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<DecommissionRequest>, sqlx::Error> {
+    let rows: Vec<DecommissionRow> = match sites {
+        None => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM decommission_requests \
+                 WHERE status = 'Quarantined' \
+                 ORDER BY quarantine_until ASC, id ASC LIMIT $1 OFFSET $2"
+            ))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        Some(sites) => {
+            sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM decommission_requests \
+                 WHERE status = 'Quarantined' AND site = ANY($1) \
+                 ORDER BY quarantine_until ASC, id ASC LIMIT $2 OFFSET $3"
+            ))
+            .bind(sites)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     Ok(rows.into_iter().map(|r| r.into_model()).collect())
+}
+
+/// Count quarantined requests under the SAME predicates as
+/// [`list_quarantined_page`] — the pagination total. `None` = all sites;
+/// `Some(list)` = `site = ANY($1)`.
+pub async fn count_quarantined(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+) -> Result<i64, sqlx::Error> {
+    match sites {
+        None => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM decommission_requests WHERE status = 'Quarantined'",
+            )
+            .fetch_one(pool)
+            .await
+        }
+        Some(sites) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM decommission_requests \
+                 WHERE status = 'Quarantined' AND site = ANY($1)",
+            )
+            .bind(sites)
+            .fetch_one(pool)
+            .await
+        }
+    }
 }
 
 /// Atomically transition a request to its new state IFF its current DB status
