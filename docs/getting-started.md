@@ -11,7 +11,7 @@
 ### 1. Clone and set up
 
 ```bash
-git clone <repo-url> ryuki-platform
+git clone https://github.com/mvandenbulcke/ryuki.io.git ryuki-platform
 cd ryuki-platform
 cp .env.example .env
 ```

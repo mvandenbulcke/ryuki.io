@@ -216,7 +216,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 </ul>
 <h2 id="quick-start">Quick Start</h2>
 <h3 id="1-clone-and-set-up">1. Clone and set up</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">git</span> clone &lt;repo-url&gt; ryuki-platform
+<pre><code class="lang-bash"><span class="hl-cmd">git</span> clone https://github.com/mvandenbulcke/ryuki.io.git ryuki-platform
 <span class="hl-cmd">cd</span> ryuki-platform
 <span class="hl-cmd">cp</span> .env.example .env</code></pre>
 <p>For Docker Compose workflows, edit <code>.env</code> and set <code>RYUKI_DATABASE_URL</code> to match your local PostgreSQL. For direct <code>cargo run</code>, export the needed <code>RYUKI_</code> variables or create <code>ryuki.toml</code>, <code>ryuki.json</code>, or <code>platform-config.json</code>; <code>.env</code> is not loaded automatically by the Rust config loader.</p>

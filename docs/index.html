@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ryuki — Governed Infrastructure Control Plane</title>
-<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable, dry-run-first workflows across a 17-provider catalogue — VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
+<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable, dry-run-first workflows with 17 provider adapters: VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
 <link rel="canonical" href="https://ryuki.io/">
 <meta name="theme-color" content="#0b0d12">
 
@@ -548,6 +548,25 @@ section.alt .stage{background:var(--section-alt)}
 .arch-table td{color:var(--text-secondary)}
 .arch-table td:first-child{font-weight:600;color:var(--accent);white-space:nowrap;font-family:var(--mono);font-size:.8rem}
 .arch-table tr:last-child td{border-bottom:none}
+
+/* ── Live execution steps ───────────────────────────────── */
+.exec-steps{
+  margin-top:2.2rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1.1rem;
+  counter-reset:exec;list-style:none;padding:0;
+}
+.exec-steps li{
+  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius);
+  padding:1.3rem 1.3rem 1.2rem;font-size:.9rem;line-height:1.65;color:var(--text-secondary);
+  counter-increment:exec;
+}
+.exec-steps li::before{
+  content:"0" counter(exec);display:block;
+  font-family:var(--mono);font-size:.75rem;color:var(--accent);
+  margin-bottom:.55rem;letter-spacing:.08em;
+}
+.exec-steps li strong{color:var(--text)}
+.exec-steps li code{overflow-wrap:anywhere}
+.exec-note{margin-top:1.6rem;font-size:.85rem;color:var(--text-muted);max-width:720px;line-height:1.7}
 .arch-table tbody tr{transition:background var(--transition)}
 .arch-table tbody tr:hover{background:var(--bg-secondary)}
 
@@ -732,6 +751,7 @@ section.alt .stage{background:var(--section-alt)}
       <a href="#features" class="nav-link">Features</a>
       <a href="#lifecycle" class="nav-link">Lifecycle</a>
       <a href="#architecture" class="nav-link">Architecture</a>
+      <a href="#execution" class="nav-link">Live Execution</a>
       <a href="#quickstart" class="nav-link">Quick Start</a>
       <a href="/documentation.html" class="nav-link">Docs</a>
     </nav>
@@ -767,7 +787,7 @@ section.alt .stage{background:var(--section-alt)}
       <span class="hero-pill fx" style="--d:.15s"><span class="dot"></span>Open source &middot; Rust-powered &middot; MIT licensed</span>
     </div>
     <h1 class="fx" style="--d:.25s">The <span class="grad">governed control plane</span> for multi&#8209;site infrastructure</h1>
-    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a 17&#8209;provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong> &mdash; live execution is operator&#8209;gated.</p>
+    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong> &mdash; live execution is operator&#8209;gated.</p>
     <div class="hero-links fx" style="--d:.55s">
       <a href="/getting-started.html" class="btn btn-primary">
         Get Started
@@ -785,20 +805,20 @@ section.alt .stage{background:var(--section-alt)}
 <div class="stats">
   <div class="stats-grid">
     <div class="stat">
-      <div class="stat-value" data-count="58">58</div>
-      <div class="stat-label">Domain engines</div>
+      <div class="stat-value" data-count="13">13</div>
+      <div class="stat-label">Governed lifecycle stages</div>
     </div>
     <div class="stat">
-      <div class="stat-value" data-count="116">116</div>
+      <div class="stat-value" data-count="17">17</div>
+      <div class="stat-label">Provider adapters</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" data-count="110" data-suffix="+">110+</div>
       <div class="stat-label">Catalog contracts</div>
     </div>
     <div class="stat">
-      <div class="stat-value" data-count="230">230</div>
-      <div class="stat-label">Static validation checks</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value" data-count="100" data-suffix="%">100%</div>
-      <div class="stat-label">Rust, end to end</div>
+      <div class="stat-value" data-count="3900" data-suffix="+">3,900+</div>
+      <div class="stat-label">Tests in CI</div>
     </div>
   </div>
 </div>
@@ -1010,7 +1030,22 @@ section.alt .stage{background:var(--section-alt)}
         <tr>
           <td>ryuki-validator</td>
           <td>Rust</td>
-          <td>Self-contained static validation engine (230 coverage checks across 121 modules) for pre-commit and CI guardrails.</td>
+          <td>Self-contained static validation engine (129 modules with a registry-enforced coverage table) for pre-commit and CI guardrails.</td>
+        </tr>
+        <tr>
+          <td>ryuki-agent</td>
+          <td>Rust</td>
+          <td>Operator-deployed execution agent. Runs Terraform and Ansible on the operator's own infrastructure and refuses any live apply whose signed grant or plan digest fails verification.</td>
+        </tr>
+        <tr>
+          <td>ryuki-runner</td>
+          <td>Rust</td>
+          <td>Process-spawning layer for Terraform and Ansible runs, shared by the agent's dry-run and live paths.</td>
+        </tr>
+        <tr>
+          <td>ryuki-protocol</td>
+          <td>Rust</td>
+          <td>Wire contract between the control plane and agents: pure types plus Ed25519 signature primitives, no IO.</td>
         </tr>
         <tr>
           <td>PostgreSQL</td>
@@ -1028,8 +1063,26 @@ section.alt .stage{background:var(--section-alt)}
   </div>
 </section>
 
+<!-- ── Live Execution ───────────────────────────────────── -->
+<section id="execution" class="alt">
+  <div class="container">
+    <div>
+      <div class="section-label">Live Execution</div>
+      <h2 class="section-title">One gated path to live infrastructure</h2>
+      <p class="section-subtitle">Every domain plans, validates, and records evidence without touching live systems. The single live path runs Terraform and Ansible through an operator-deployed agent, and every step of it is signed.</p>
+    </div>
+    <ol class="exec-steps">
+      <li><strong>Plan.</strong> An admin dispatches a live plan. The agent runs <code>terraform plan</code> against the real backend and returns scrubbed evidence with a plan digest. Nothing mutates.</li>
+      <li><strong>Approve.</strong> An admin approves that exact plan. The control plane mints a grant signed with its Ed25519 key, binding the request, the plan digest, the approver, and an expiry under 24 hours. Each request gets one live apply, or exactly one per step in an orchestrated run, enforced at the database.</li>
+      <li><strong>Verify.</strong> The agent acts only with <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and a pinned control-plane public key. It re-plans and refuses on any mismatch: bad signature, wrong request, expired grant, or a changed plan digest. Refusals are signed and reported.</li>
+      <li><strong>Apply.</strong> On success the agent applies the saved plan bytes, not a re-plan, so what changes is exactly what was approved. Credentials never reach the control plane.</li>
+    </ol>
+    <p class="exec-note">The dry-run pipeline and the full trust gate are implemented and tested. Pointing an agent at production stays operator-owned: real provider credentials, a durable state backend, and <code>RYUKI_AGENT_ALLOW_LIVE</code> set on purpose.</p>
+  </div>
+</section>
+
 <!-- ── Quick Start ──────────────────────────────────────── -->
-<section id="quickstart" class="alt">
+<section id="quickstart">
   <div class="container">
     <div>
       <div class="section-label">Quick Start</div>
@@ -1441,8 +1494,8 @@ section.alt .stage{background:var(--section-alt)}
     var outputFor=function(cmd){
       if(cmd.indexOf('docker compose')===0)return [' \u2714 Container platform-db  Started                0.4s'];
       if(cmd.indexOf('cargo build')===0)return ['   Compiling ryuki-core, ryuki-engine, ryuki-api \u2026','    Finished `dev` profile target(s) in 42.3s'];
-      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 1380 passed; 0 failed; 0 ignored'];
-      if(cmd.indexOf('cargo run')===0)return ['230/230 coverage checks passed \u00b7 evidence pack written'];
+      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 3912 passed; 0 failed; 0 ignored'];
+      if(cmd.indexOf('cargo run')===0)return ['all coverage registry rows verified \u00b7 evidence pack written'];
       return [];
     };
     var termTimers=[];
@@ -1613,7 +1666,7 @@ section.alt .stage{background:var(--section-alt)}
 
   /* ── Header nav: highlight the section in view ── */
   var navMap={};
-  ['features','lifecycle','architecture','quickstart'].forEach(function(id){
+  ['features','lifecycle','architecture','execution','quickstart'].forEach(function(id){
     var a=document.querySelector('.site-nav a[href="#'+id+'"]');
     var s=document.getElementById(id);
     if(a&&s)navMap[id]={a:a,s:s};

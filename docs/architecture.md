@@ -93,8 +93,10 @@ under a control-plane-signed grant.
 2. An `admin` approves via `POST /api/requests/{id}/approve-live-apply`. The
    control plane mints a `LiveApply` grant **signed with its Ed25519 key**,
    binding the request id, the approved plan digest, the approver, and a
-   short expiry (≤ 24 h). A unique constraint prevents a second live-apply per
-   request.
+   short expiry (≤ 24 h). A unique constraint prevents a second request-level
+   live apply; in orchestrated multi-step runs each step gets exactly one
+   step-scoped `LiveApply`, gated by the step's `FOR UPDATE` approval lock
+   (migration 153).
 3. The agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true` and it has pinned the
    control-plane public key. It re-plans, then refuses unless **all** hold:
    the grant signature verifies against the pinned CP key; the grant is for this

@@ -6,7 +6,7 @@
 
 <p align="center"><em>竜騎 &mdash; the Dragon Knight. A governed control plane that watches over your infrastructure.</em></p>
 
-System-engineer platform for multi-site datacenter infrastructure management — **58 domain engines, 17 provider adapters, 116 catalog contracts, 230 static validation checks, 1,380+ tests, 100% Rust**.
+System-engineer platform for multi-site datacenter infrastructure management — **17 provider adapters, 110+ catalog contracts, 3,900+ tests, 100% Rust**.
 
 **Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html)
 
@@ -59,9 +59,12 @@ Browser → Portal UI (Leptos/Axum SSR) → Platform API (Axum) → Engine + Dat
 |---|---|---|
 | `portal-ui` | Rust / Leptos / Axum | Full-stack SSR portal, same-origin API boundary, role-filtered navigation |
 | `ryuki-api` | Rust / Axum / sqlx | Control plane API, Entra ID auth, request lifecycle, admin settings |
-| `ryuki-engine` | Rust | 58 domain engines: models, evidence pipeline, health monitoring, adapters, workflows |
+| `ryuki-engine` | Rust | Domain engines: models, evidence pipeline, health monitoring, adapters, workflows |
 | `ryuki-core` | Rust | Shared types, secret scanning, YAML utilities |
-| `ryuki-validator` | Rust | Self-contained static validation engine — 121 validator modules, 230 coverage checks |
+| `ryuki-agent` | Rust | Operator-deployed execution agent — Terraform/Ansible with a signed live-apply trust gate |
+| `ryuki-runner` | Rust | Process-spawning layer for Terraform and Ansible runs |
+| `ryuki-protocol` | Rust | Control-plane↔agent wire contract — pure types plus Ed25519 signature primitives |
+| `ryuki-validator` | Rust | Self-contained static validation engine — 129 validator modules, registry-enforced coverage |
 | PostgreSQL | CloudNativePG / Docker | Control plane database, migrations via sqlx |
 | Vault | HashiCorp Vault | Runtime secrets, adapter credentials, PKI |
 

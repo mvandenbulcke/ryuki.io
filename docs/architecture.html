@@ -281,7 +281,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <ol>
 <li>An <code>admin</code> approves via <code>POST /api/requests/{id}/approve-live-apply</code>. The</li>
 </ol>
-<p>   control plane mints a <code>LiveApply</code> grant <strong>signed with its Ed25519 key</strong>,    binding the request id, the approved plan digest, the approver, and a    short expiry (≤ 24 h). A unique constraint prevents a second live-apply per    request.</p>
+<p>   control plane mints a <code>LiveApply</code> grant <strong>signed with its Ed25519 key</strong>,    binding the request id, the approved plan digest, the approver, and a    short expiry (≤ 24 h). A unique constraint prevents a second request-level    live apply; in orchestrated multi-step runs each step gets exactly one    step-scoped <code>LiveApply</code>, gated by the step's <code>FOR UPDATE</code> approval lock    (migration 153).</p>
 <ol>
 <li>The agent only acts if <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and it has pinned the</li>
 </ol>
