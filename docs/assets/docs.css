@@ -143,3 +143,36 @@ td code{white-space:nowrap}
 .page-meta a{color:var(--text-secondary);text-decoration:none}
 .page-meta a:hover{color:var(--accent)}
 .page-meta+.foot-nav{margin-top:1rem}
+/* ── API reference: chips, badges, endpoint sections ── */
+.method-chip{display:inline-block;font-family:var(--mono);font-size:.62em;font-weight:600;
+  line-height:1.5;letter-spacing:.05em;padding:.14em .6em;border-radius:6px;
+  border:1px solid var(--border-strong);color:var(--text-secondary);background:var(--bg-secondary)}
+.m-get{color:#7da6d9;background:rgba(125,166,217,.12);border-color:rgba(125,166,217,.35)}
+.m-post{color:#82d9b6;background:rgba(130,217,182,.12);border-color:rgba(130,217,182,.35)}
+.m-put{color:#e0b46a;background:rgba(224,180,106,.12);border-color:rgba(224,180,106,.35)}
+.m-patch{color:#f78c6c;background:rgba(247,140,108,.12);border-color:rgba(247,140,108,.35)}
+.m-delete{color:var(--accent);background:var(--accent-bg);border-color:rgba(226,93,93,.4)}
+.ep-h{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem}
+.ep-h code{background:none;padding:0;font-size:.82em;overflow-wrap:anywhere}
+.badges{display:flex;flex-wrap:wrap;gap:.45rem;margin:.55rem 0 .9rem}
+.badge{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.03em;
+  padding:.13rem .6rem;border-radius:999px;border:1px solid var(--border-strong);
+  color:var(--text-secondary);background:var(--bg-secondary)}
+.badge-open{color:#e0b46a;border-color:rgba(224,180,106,.45);background:rgba(224,180,106,.1)}
+.ep-summary{color:var(--text);font-weight:500}
+.ep-missing{color:var(--text-secondary);font-style:italic}
+h3.ep-sub{font-size:.78rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--text-secondary);margin:1.5rem 0 .45rem}
+.area-count{font-size:.78rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--text-secondary)}
+.sb-sections a.sb-ep{overflow-wrap:anywhere}
+.conv-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:.7rem;margin:1.2rem 0}
+.conv{border:1px solid var(--border);border-radius:var(--radius);padding:.75rem .85rem}
+a.conv{display:block;text-decoration:none;
+  transition:border-color var(--transition),background var(--transition)}
+a.conv:hover{border-color:var(--accent);background:var(--accent-bg)}
+.conv .c-t{display:block;font-size:.85rem;font-weight:700;color:var(--text);margin-bottom:.25rem}
+.conv .c-x{display:block;font-size:.78rem;color:var(--text-secondary);line-height:1.5}
+.doc-card .rc{margin-top:.55rem;font-size:.7rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.06em;color:var(--text-secondary)}

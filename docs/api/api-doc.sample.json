@@ -1,0 +1,113 @@
+{
+  "generated_by": "hand-written sample mirroring the api-doc.json contract (ryuki-validator generate-api-doc)",
+  "route_count": 6,
+  "areas": [
+    {
+      "key": "admin",
+      "title": "Admin",
+      "description": "Administrative surface: API tokens, principals, and platform settings.",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/api/admin/tokens",
+          "tier": "admin",
+          "auth_exempt": false,
+          "handler": "admin_tokens_list",
+          "summary": "List API tokens.",
+          "description": "Returns every token the caller may see, **including revoked ones**, newest first. Reads are narrowed by the caller's site and environment scopes; see [RBAC & Scoping](rbac-and-scoping.md).\n\nUse `limit` and `offset` to page through large fleets. The filtered total is reported alongside the page.",
+          "query_params": [
+            { "name": "limit", "type": "i64", "optional": true, "doc": "Page size; capped server-side." },
+            { "name": "offset", "type": "i64", "optional": true, "doc": "Rows to skip before the first result." },
+            { "name": "site", "type": "String", "optional": false, "doc": "Site code to filter on. Principals with multiple site scopes must name one." }
+          ],
+          "request_body": null,
+          "response_notes": "Bare JSON array; the filtered total arrives in the `X-Total-Count` header."
+        },
+        {
+          "method": "POST",
+          "path": "/api/admin/tokens",
+          "tier": "admin",
+          "auth_exempt": false,
+          "handler": "admin_tokens_create",
+          "summary": "Mint a scoped API token.",
+          "description": "Creates a token bound to the given roles and optional scopes. Tokens are create-and-revoke: there is no edit.",
+          "query_params": null,
+          "request_body": {
+            "struct": "TokenCreateRequest",
+            "fields": [
+              { "name": "name", "type": "String", "optional": false, "doc": "Display name shown in the token list." },
+              { "name": "roles", "type": "Vec<String>", "optional": false, "doc": "Role names to grant." },
+              { "name": "site_scope", "type": "Option<String>", "optional": true, "doc": "Comma-separated site codes; empty means unrestricted." },
+              { "name": "expires_in_days", "type": "u32", "optional": true, "doc": "Days until expiry." },
+              { "name": "enabled", "type": "bool", "optional": false, "doc": "Whether the token is active on creation." }
+            ]
+          },
+          "response_notes": "Returns the token secret once; it is never shown again."
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/admin/tokens/{id}",
+          "tier": "admin",
+          "auth_exempt": false,
+          "handler": "admin_tokens_revoke",
+          "summary": "Revoke a token.",
+          "description": null,
+          "query_params": null,
+          "request_body": null,
+          "response_notes": null
+        }
+      ]
+    },
+    {
+      "key": "platform",
+      "title": "Platform",
+      "description": "Server inventory and lifecycle operations.",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/api/platform/health",
+          "tier": "audit",
+          "auth_exempt": true,
+          "handler": "platform_health",
+          "summary": "Liveness probe.",
+          "description": "Unauthenticated health probe for load balancers and uptime checks.",
+          "query_params": null,
+          "request_body": null,
+          "response_notes": "Plain `200 OK` with build metadata."
+        },
+        {
+          "method": "PUT",
+          "path": "/api/platform/servers/{id}",
+          "tier": "execute",
+          "auth_exempt": false,
+          "handler": "platform_server_update",
+          "summary": null,
+          "description": null,
+          "query_params": null,
+          "request_body": null,
+          "response_notes": null
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/platform/servers/{id}/labels",
+          "tier": "request",
+          "auth_exempt": false,
+          "handler": "platform_server_labels_patch",
+          "summary": "Replace a server's label map.",
+          "description": "Full replacement of the label map; omitted keys are removed.\n\nLabel writes are audited. The `dry_run` flag validates the payload without applying it.",
+          "query_params": [
+            { "name": "dry_run", "type": "bool", "optional": true, "doc": "Validate without applying." }
+          ],
+          "request_body": {
+            "struct": "LabelPatch",
+            "fields": [
+              { "name": "labels", "type": "HashMap<String, String>", "optional": false, "doc": "Replacement label map." },
+              { "name": "reason", "type": "Option<String>", "optional": true, "doc": "Audit note attached to the change." }
+            ]
+          },
+          "response_notes": null
+        }
+      ]
+    }
+  ]
+}
