@@ -303,6 +303,15 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .stat-label{font-size:.82rem;font-weight:500;color:var(--text-muted);margin-top:.35rem}
 
+/* ── Product shot ───────────────────────────────────────── */
+.product-shot{padding:4.2rem 0 0}
+.product-shot figure{margin:0}
+.product-shot img{
+  display:block;width:100%;height:auto;
+  border-radius:var(--radius);border:1px solid var(--card-border);
+}
+.product-shot figcaption{margin-top:.8rem;text-align:center;font-size:.8rem;color:var(--text-muted)}
+
 /* ── Section headings ───────────────────────────────────── */
 .section-label{
   display:inline-flex;align-items:center;gap:.5rem;
@@ -570,19 +579,6 @@ section.alt .stage{background:var(--section-alt)}
 .copy-btn.copied{color:#34c98e;border-color:rgba(52,201,142,.4)}
 .code-block pre .out{color:#7d8699}
 .code-block pre .prompt{color:#e0a050}
-.term-cursor{display:inline-block;width:7px;height:1em;vertical-align:-.15em;background:#82d9b6}
-.js .term-cursor{animation:term-blink 1.1s steps(1) infinite}
-@keyframes term-blink{50%{opacity:0}}
-.replay-btn{
-  display:none;align-items:center;gap:.4rem;
-  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
-  color:#aeb7c7;font-size:.7rem;font-weight:600;font-family:var(--font);
-  border-radius:6px;padding:.3rem .65rem;cursor:pointer;
-  transition:background var(--transition),color var(--transition);
-}
-.js .replay-btn{display:inline-flex}
-.replay-btn:hover{background:rgba(255,255,255,.12);color:#fff}
-.replay-btn svg{width:12px;height:12px}
 .code-block pre{
   padding:1.3rem 1.2rem;overflow-x:auto;
   font-size:.8125rem;line-height:1.75;color:var(--code-text);
@@ -784,6 +780,17 @@ section.alt .stage{background:var(--section-alt)}
     </div>
   </div>
 </div>
+
+<!-- ── Product shot ─────────────────────────────────────── -->
+<section class="product-shot" aria-label="Portal screenshot">
+  <div class="container">
+    <figure>
+      <img src="/assets/portal-dashboard.webp" width="1512" height="900" loading="lazy" decoding="async"
+           alt="The Ryuki portal dashboard: role-filtered navigation with platform health, site readiness, open requests, failed operations, backup risk, and monitoring gap tiles.">
+      <figcaption>The portal dashboard, captured from a running instance in mock-dry-run mode.</figcaption>
+    </figure>
+  </div>
+</section>
 
 <!-- ── Features ─────────────────────────────────────────── -->
 <section id="features">
@@ -1049,7 +1056,7 @@ section.alt .stage{background:var(--section-alt)}
     <div>
       <div class="section-label">Quick Start</div>
       <h2 class="section-title">Running in minutes</h2>
-      <p class="section-subtitle">Start PostgreSQL, configure the environment, build the workspace, and validate.</p>
+      <p class="section-subtitle">Database up, API built and running, health check green. The transcript below is from a real session.</p>
     </div>
     <div class="code-block">
       <div class="code-block-header">
@@ -1059,25 +1066,20 @@ section.alt .stage{background:var(--section-alt)}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           <span>Copy</span>
         </button>
-        <button class="replay-btn" id="replay-btn" type="button" aria-label="Replay the demo">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-          <span>Replay</span>
-        </button>
       </div>
-      <pre id="quickstart-code"><code><span class="c"># Start PostgreSQL via Docker Compose</span>
-<span class="cmd">docker compose -f deploy/compose/compose.yaml up -d platform-db</span>
+      <pre id="quickstart-code" data-src="docker compose -f deploy/compose/compose.yaml up -d platform-db&#10;cp .env.example .env&#10;cargo build -p ryuki-api&#10;./target/debug/ryuki-api &amp;&#10;curl -s localhost:8081/health"><code><span class="c"># Start PostgreSQL via Docker Compose</span>
+<span class="prompt">$ </span><span class="cmd">docker compose -f deploy/compose/compose.yaml up -d platform-db</span>
+<span class="out"> ✔ Container ryuki-infrastructure-platform-platform-db-1  Started</span>
 
-<span class="c"># Copy and configure environment</span>
-<span class="cmd">cp .env.example .env</span>
+<span class="c"># Configure, build, run</span>
+<span class="prompt">$ </span><span class="cmd">cp .env.example .env</span>
+<span class="prompt">$ </span><span class="cmd">cargo build -p ryuki-api</span>
+<span class="out">    Finished `dev` profile [unoptimized + debuginfo] target(s)</span>
+<span class="prompt">$ </span><span class="cmd">./target/debug/ryuki-api &amp;</span>
 
-<span class="c"># Build the full workspace</span>
-<span class="cmd">cargo build --workspace</span>
-
-<span class="c"># Run the test suite</span>
-<span class="cmd">cargo test --workspace</span>
-
-<span class="c"># Execute all validators</span>
-<span class="cmd">cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all</span></code></pre>
+<span class="c"># The control plane is up</span>
+<span class="prompt">$ </span><span class="cmd">curl -s localhost:8081/health</span>
+<span class="out">{"auth_mode":"local","config":{"errors":[],"valid":true,"warnings":[]},"database":{"connected":true,"provider":"postgres-local"},"rate_limit_enabled":false,"status":"healthy"}</span></code></pre>
     </div>
   </div>
 </section>
@@ -1410,90 +1412,6 @@ section.alt .stage{background:var(--section-alt)}
           else{showStage(i)}
         },1600);
       });
-    }
-  }
-
-  /* ── Quick Start: the terminal types itself ──────────────
-     When the code block scrolls into view it replays as a
-     live session: comments appear, commands type themselves,
-     plausible output follows. Replay re-runs it; Copy always
-     copies the pristine commands (kept in data-src). */
-  var term=document.getElementById('quickstart-code');
-  var replayBtn=document.getElementById('replay-btn');
-  if(term){
-    var TERM_SRC=term.innerHTML;
-    term.setAttribute('data-src',term.innerText);
-    var outputFor=function(cmd){
-      if(cmd.indexOf('docker compose')===0)return [' \u2714 Container platform-db  Started                0.4s'];
-      if(cmd.indexOf('cargo build')===0)return ['   Compiling ryuki-core, ryuki-engine, ryuki-api \u2026','    Finished `dev` profile target(s) in 42.3s'];
-      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 3912 passed; 0 failed; 0 ignored'];
-      if(cmd.indexOf('cargo run')===0)return ['all coverage registry rows verified \u00b7 evidence pack written'];
-      return [];
-    };
-    var termTimers=[];
-    var later=function(fn,ms){termTimers.push(setTimeout(fn,ms))};
-    var playTerm=function(){
-      termTimers.forEach(clearTimeout);termTimers=[];
-      term.style.minHeight=Math.max(parseFloat(term.style.minHeight)||0,term.offsetHeight)+'px';
-      if(!term.hasAttribute('aria-hidden')){
-        term.setAttribute('aria-hidden','true');
-        var sr=document.createElement('span');
-        sr.className='sr-only';
-        sr.textContent=term.getAttribute('data-src');
-        term.parentNode.insertBefore(sr,term);
-      }
-      var probe=document.createElement('div');
-      probe.innerHTML=TERM_SRC;
-      var lines=[];
-      Array.prototype.forEach.call(probe.querySelectorAll('span'),function(sp){
-        if(sp.className==='c'||sp.className==='cmd')lines.push({t:sp.className,text:sp.textContent});
-      });
-      term.innerHTML='';
-      var cursor=document.createElement('span');
-      cursor.className='term-cursor';
-      term.appendChild(cursor);
-      var txt=function(s){term.insertBefore(document.createTextNode(s),cursor)};
-      var span=function(cls,s){
-        var el=document.createElement('span');
-        el.className=cls;el.textContent=s;
-        term.insertBefore(el,cursor);
-        return el;
-      };
-      var t=80,STEP=14;
-      lines.forEach(function(ln){
-        if(ln.t==='c'){
-          later(function(){span('c',ln.text);txt('\n')},t);
-          t+=300;
-        }else{
-          later(function(){span('prompt','$ ')},t);
-          t+=140;
-          var el=null;
-          later(function(){el=span('cmd','')},t);
-          ln.text.split('').forEach(function(_,ci){
-            later(function(){if(el)el.textContent=ln.text.slice(0,ci+1)},t+ci*STEP);
-          });
-          t+=ln.text.length*STEP+160;
-          later(function(){txt('\n')},t);
-          outputFor(ln.text).forEach(function(o){
-            t+=120;
-            later(function(){span('out',o);txt('\n')},t);
-          });
-          t+=220;
-        }
-      });
-      later(function(){span('prompt','$ ')},t);
-    };
-    if(!reduced&&'IntersectionObserver' in window){
-      var termIo=new IntersectionObserver(function(entries){
-        if(entries[0].isIntersecting){
-          termIo.disconnect();
-          playTerm();
-        }
-      },{threshold:.45});
-      termIo.observe(term);
-      if(replayBtn)replayBtn.addEventListener('click',playTerm);
-    }else if(replayBtn){
-      replayBtn.style.display='none';
     }
   }
 
