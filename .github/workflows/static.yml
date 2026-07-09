@@ -29,12 +29,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Deploy exactly the tree CI validated, not whatever main moved to
+          # since. Manual dispatch falls back to the current ref.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      # docs/ doubles as the repo's internal documentation tree (design notes,
+      # workflow specs, runbooks) that the validator depends on in place.
+      # Only the curated site files below are published; everything else in
+      # docs/ stays repo-internal. Generated pages land as docs/*.html, so new
+      # md2docs.py pages are picked up automatically.
+      - name: Stage public site files
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site
+          cp docs/*.html docs/CNAME docs/favicon.ico _site/
+          cp docs/robots.txt docs/sitemap.xml docs/search-index.json _site/
+          cp -R docs/assets _site/assets
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './docs'
+          path: './_site'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
