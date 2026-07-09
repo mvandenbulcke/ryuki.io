@@ -367,6 +367,37 @@ pub fn clear_portal_session_cookie() {
     append_set_cookie(&portal_session_cookie("", 0, cookie_secure_from_env()));
 }
 
+/// Name of the per-browser CSRF-binding cookie for the Entra ID sign-in flow.
+/// Must match the API's cookie name exactly: the API callback redeems a login
+/// state only when this cookie matches the binding stored with the state.
+pub const ENTRA_LOGIN_BINDING_COOKIE: &str = "entra_login_csrf";
+
+/// Builds the Entra login CSRF-binding cookie. HttpOnly (the binding never
+/// reaches page JavaScript), SameSite=Lax so the browser presents it on the
+/// top-level redirect back from the IdP to the API callback, Max-Age matching
+/// the API's 10-minute login-state TTL. `Path=/` so it reaches the API
+/// callback route in same-origin deployments.
+pub fn entra_login_binding_cookie(binding: &str, secure: bool) -> String {
+    let mut cookie = format!(
+        "{ENTRA_LOGIN_BINDING_COOKIE}={binding}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Appends a Set-Cookie header carrying the Entra login CSRF binding on the
+/// portal response. The upstream client cannot forward upstream Set-Cookie
+/// headers, so the authorize-url server function re-issues the binding cookie
+/// itself from the API's JSON payload.
+pub fn set_entra_login_binding_cookie(binding: &str) {
+    append_set_cookie(&entra_login_binding_cookie(
+        binding,
+        cookie_secure_from_env(),
+    ));
+}
+
 fn append_set_cookie(cookie: &str) {
     use leptos::prelude::use_context;
 
@@ -426,6 +457,16 @@ mod tests {
         let cleared = portal_session_cookie("", 0, false);
         assert!(cleared.starts_with("ryuki_session=;"));
         assert!(cleared.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn entra_binding_cookie_sets_security_attributes() {
+        let cookie = entra_login_binding_cookie("binding-value", false);
+        assert_eq!(
+            cookie,
+            "entra_login_csrf=binding-value; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"
+        );
+        assert!(entra_login_binding_cookie("binding-value", true).ends_with("; Secure"));
     }
 
     #[test]

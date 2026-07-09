@@ -1346,6 +1346,14 @@ pub fn routes() -> Router {
             "/api/auth/oidc/callback",
             get(crate::oidc_callback::oidc_callback),
         )
+        .route(
+            "/api/auth/entra/authorize-url",
+            get(crate::entra_sso::entra_authorize_url),
+        )
+        .route(
+            "/api/auth/entra/callback",
+            get(crate::entra_sso::entra_callback),
+        )
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/roles", get(auth_roles))

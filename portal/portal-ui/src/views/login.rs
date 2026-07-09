@@ -1,5 +1,5 @@
 use crate::app::SessionResource;
-use crate::server_boundary::{get_platform_summary, perform_login};
+use crate::server_boundary::{get_entra_authorize_url, get_platform_summary, perform_login};
 use crate::shell::BrandMark;
 use leptos::prelude::*;
 
@@ -11,6 +11,18 @@ fn login_error_text(error: &ServerFnError) -> String {
     text.strip_prefix("error running server function: ")
         .map(str::to_string)
         .unwrap_or(text)
+}
+
+/// Sends the browser to the IdP authorize URL. Only meaningful in the
+/// hydrated client — the click-driven Entra sign-in action never runs during
+/// SSR, so the non-hydrate arm is a no-op kept only for compilation.
+fn redirect_browser(url: &str) {
+    #[cfg(feature = "hydrate")]
+    if let Some(win) = web_sys::window() {
+        let _ = win.location().set_href(url);
+    }
+    #[cfg(not(feature = "hydrate"))]
+    let _ = url;
 }
 
 #[component]
@@ -39,6 +51,24 @@ pub fn LoginView() -> impl IntoView {
     });
     let login_pending = login_action.pending();
     let login_result = login_action.value();
+
+    // Entra ID browser SSO: the server function returns the tenant authorize
+    // URL (and sets the HttpOnly CSRF-binding cookie on its response); the
+    // client then performs a full-page navigation to Microsoft. The IdP
+    // redirects back to the API callback, which mints the shared
+    // `ryuki_session` cookie the session gate consumes.
+    let entra_action = Action::new(move |_: &()| async move {
+        match get_entra_authorize_url().await {
+            Ok(url) => {
+                redirect_browser(&url);
+                Ok(())
+            }
+            Err(error) => Err(login_error_text(&error)),
+        }
+    });
+    let entra_pending = entra_action.pending();
+    let entra_result = entra_action.value();
+
 
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -74,38 +104,6 @@ pub fn LoginView() -> impl IntoView {
                 <p class="login-description">
                     "Sign in with your platform account to access the control plane."
                 </p>
-
-                <form class="login-form" on:submit=on_submit>
-                    <div class="form-field">
-                        <label for="login-username">"Username"</label>
-                        <input
-                            id="login-username"
-                            type="text"
-                            class="settings-input"
-                            autocomplete="username"
-                            prop:value=username
-                            on:input=move |ev| set_username.set(event_target_value(&ev))
-                        />
-                    </div>
-                    <div class="form-field">
-                        <label for="login-password">"Password"</label>
-                        <input
-                            id="login-password"
-                            type="password"
-                            class="settings-input"
-                            autocomplete="current-password"
-                            prop:value=password
-                            on:input=move |ev| set_password.set(event_target_value(&ev))
-                        />
-                    </div>
-                    <button
-                        class="login-button"
-                        type="submit"
-                        disabled=move || login_pending.get()
-                    >
-                        "Sign in"
-                    </button>
-                </form>
 
                 <Show when=move || login_pending.get()>
                     <div class="login-status" aria-busy="true">
@@ -145,7 +143,55 @@ pub fn LoginView() -> impl IntoView {
                                 Err(_) => "degraded".to_string(),
                             };
 
-                            if mode == "degraded" {
+                            // The local credentials form renders for every mode
+                            // EXCEPT entra-id (where the API rejects local
+                            // logins and the SSO card below is the sign-in
+                            // path). Gated on the AWAITED mode inside this
+                            // Suspend so SSR and hydration render identical
+                            // structure — a Resource-driven Show outside the
+                            // Suspense boundary would mismatch and panic
+                            // hydration.
+                            let credentials_form = (mode != "entra-id").then(|| {
+                                view! {
+                                    <form class="login-form" on:submit=on_submit>
+                                        <div class="form-field">
+                                            <label for="login-username">"Username"</label>
+                                            <input
+                                                id="login-username"
+                                                type="text"
+                                                class="settings-input"
+                                                autocomplete="username"
+                                                prop:value=username
+                                                on:input=move |ev| {
+                                                    set_username.set(event_target_value(&ev))
+                                                }
+                                            />
+                                        </div>
+                                        <div class="form-field">
+                                            <label for="login-password">"Password"</label>
+                                            <input
+                                                id="login-password"
+                                                type="password"
+                                                class="settings-input"
+                                                autocomplete="current-password"
+                                                prop:value=password
+                                                on:input=move |ev| {
+                                                    set_password.set(event_target_value(&ev))
+                                                }
+                                            />
+                                        </div>
+                                        <button
+                                            class="login-button"
+                                            type="submit"
+                                            disabled=move || login_pending.get()
+                                        >
+                                            "Sign in"
+                                        </button>
+                                    </form>
+                                }
+                            });
+
+                            let mode_view = if mode == "degraded" {
                                 view! {
                                     <div class="login-warning" role="alert">
                                         <span class="eyebrow">"Platform API unreachable"</span>
@@ -207,11 +253,42 @@ pub fn LoginView() -> impl IntoView {
                                     .into_any()
                             } else if mode == "entra-id" {
                                 view! {
-                                    <div class="login-warning">
-                                        <span class="eyebrow">"Entra ID"</span>
-                                        <p>
-                                            "Entra ID SSO is configured for this platform; the browser SSO flow is not wired in this release. Use a local platform account."
-                                        </p>
+                                    <div class="login-entra">
+                                        <div class="login-note">
+                                            <span class="eyebrow">"Single sign-on"</span>
+                                            <p>
+                                                "This platform signs in through Microsoft Entra ID. You will be redirected to Microsoft to authenticate."
+                                            </p>
+                                            <button
+                                                class="login-button"
+                                                on:click=move |_| {
+                                                    entra_action.dispatch(());
+                                                }
+                                                disabled=move || entra_pending.get()
+                                            >
+                                                {move || {
+                                                    if entra_pending.get() {
+                                                        "Redirecting to Microsoft..."
+                                                    } else {
+                                                        "Sign in with Microsoft Entra ID"
+                                                    }
+                                                }}
+                                            </button>
+                                        </div>
+                                        <Show when=move || {
+                                            matches!(entra_result.get(), Some(Err(_)))
+                                                && !entra_pending.get()
+                                        }>
+                                            <div class="login-error" role="alert">
+                                                <span class="eyebrow">"Authentication Error"</span>
+                                                <p>
+                                                    {move || match entra_result.get() {
+                                                        Some(Err(message)) => message,
+                                                        _ => String::new(),
+                                                    }}
+                                                </p>
+                                            </div>
+                                        </Show>
                                     </div>
                                 }
                                     .into_any()
@@ -227,7 +304,9 @@ pub fn LoginView() -> impl IntoView {
                                     </div>
                                 }
                                     .into_any()
-                            }
+                            };
+
+                            view! { {credentials_form} {mode_view} }
                         })
                     }}
                 </Suspense>

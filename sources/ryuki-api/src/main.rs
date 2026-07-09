@@ -10,6 +10,7 @@ mod contracts;
 pub mod cp_identity;
 pub mod database;
 mod entra_auth;
+mod entra_sso;
 mod idempotency;
 mod inbound_webhooks;
 mod integration;
@@ -330,7 +331,7 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
     }
 }
 
-async fn auth_session_from_persisted_session(
+pub(crate) async fn auth_session_from_persisted_session(
     headers: &HeaderMap,
     auth_header: Option<&str>,
     auth_mode: &AuthMode,
@@ -367,13 +368,22 @@ async fn auth_session_from_persisted_session(
         Err(()) => return Some((unverified_session("invalid-session-id"), source)),
     };
     let pool = crate::database::get_db()?;
-    // Local mode only honors sessions minted by the local login flow: stale
-    // dry-run sessions must not survive a switch to local auth.
-    let query = if *auth_mode == AuthMode::Local {
-        "SELECT user_id, display_name, roles FROM sessions \
-         WHERE id = $1 AND expires_at > NOW() AND provider = 'local'"
-    } else {
-        "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()"
+    // Each interactive auth mode honors ONLY the sessions minted by its own
+    // login flow, so a stale session from a previous deployment mode cannot
+    // survive a switch. Local mode → local sessions; Entra mode → the
+    // cryptographically-validated SSO providers ('entra-id', and the generic
+    // 'oidc' flow that shares its validator) — never a mock/dry-run/local
+    // session, which would otherwise let a leftover admin cookie in.
+    let query = match auth_mode {
+        AuthMode::Local => {
+            "SELECT user_id, display_name, roles FROM sessions \
+             WHERE id = $1 AND expires_at > NOW() AND provider = 'local'"
+        }
+        AuthMode::EntraId => {
+            "SELECT user_id, display_name, roles FROM sessions \
+             WHERE id = $1 AND expires_at > NOW() AND provider IN ('entra-id', 'oidc')"
+        }
+        _ => "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()",
     };
     match sqlx::query_as::<_, DbAuthSessionRow>(query)
         .bind(session_id)
@@ -449,6 +459,10 @@ fn is_auth_exempt_path(path: &str) -> bool {
             | "/api/auth/oidc/login"
             // OIDC authorization-code callback (GET — no session yet)
             | "/api/auth/oidc/callback"
+            // Entra ID browser SSO (GET — both run before any session exists;
+            // gated on auth_mode == entra-id inside the handlers)
+            | "/api/auth/entra/authorize-url"
+            | "/api/auth/entra/callback"
     )
 }
 
@@ -1878,6 +1892,13 @@ async fn main() {
                 std::sync::Arc::new(oidc_callback::OidcCallbackDeps { exchanger, validator })
             },
         ))
+        // EntraSsoDeps: built once at startup. The handlers gate on
+        // auth_mode == entra-id (and on a complete tenant/client/redirect-uri
+        // config) before touching the exchanger/validator, so a non-Entra
+        // deployment never dereferences these network deps.
+        .layer(Extension(entra_sso::EntraSsoDeps::from_app_config(
+            &app_config,
+        )))
         .layer(ConcurrencyLimitLayer::new(
             app_config.server.max_concurrent_connections,
         ))

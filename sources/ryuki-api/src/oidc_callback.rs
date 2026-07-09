@@ -44,8 +44,12 @@ pub struct TokenRequest {
     pub code: String,
     pub redirect_uri: String,
     pub client_id: String,
-    /// NEVER log.
-    pub client_secret: String,
+    /// `Some` for confidential clients (the generic OIDC flow, which requires
+    /// a secret when enabled); `None` for public clients (the Entra ID browser
+    /// SSO flow, which is PKCE-only — no `client_secret` form field is sent at
+    /// all, since Entra rejects the parameter from public-client app
+    /// registrations). NEVER log.
+    pub client_secret: Option<String>, // secret-scan-allow: field name, not a literal secret
     pub pkce_verifier: String,
 }
 
@@ -113,15 +117,18 @@ impl TokenExchanger for ReqwestTokenExchanger {
     ) -> Pin<Box<dyn Future<Output = Result<TokenResponse, OidcError>> + Send + 'a>> {
         Box::pin(async move {
             // Build the form body.  `client_secret` is sent in the body (never
-            // in a URL or log line).
-            let form = [
+            // in a URL or log line), and ONLY for confidential clients — a
+            // public (PKCE-only) client omits the field entirely.
+            let mut form: Vec<(&str, &str)> = vec![
                 ("grant_type", "authorization_code"),
                 ("code", &req.code),
                 ("redirect_uri", &req.redirect_uri),
                 ("client_id", &req.client_id),
-                ("client_secret", &req.client_secret),
                 ("code_verifier", &req.pkce_verifier),
             ];
+            if let Some(secret) = req.client_secret.as_deref() {
+                form.push(("client_secret", secret));
+            }
 
             let resp = self
                 .client
@@ -588,7 +595,9 @@ pub(crate) async fn oidc_callback(
             code: code_val,
             redirect_uri: cfg.oidc.redirect_uri.clone(),
             client_id: cfg.oidc.client_id.clone(),
-            client_secret: cfg.oidc.client_secret.clone(), // secret-scan-allow: passing config ref, not a hardcoded secret
+            // The generic OIDC flow is a confidential client: config validation
+            // requires the secret when oidc.enabled, so it is always sent here.
+            client_secret: Some(cfg.oidc.client_secret.clone()), // secret-scan-allow: passing config ref, not a hardcoded secret
             pkce_verifier,
         })
         .await

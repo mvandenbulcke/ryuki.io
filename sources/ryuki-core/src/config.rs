@@ -1401,6 +1401,13 @@ pub struct RyukiConfig {
     pub entra_client_id: String,
     #[serde(default = "default_entra_authority")]
     pub entra_authority: String,
+    /// Redirect URI registered for the Entra ID browser SSO flow
+    /// (`{api-origin}/api/auth/entra/callback`). Empty (the default) leaves
+    /// bearer-token-only EntraId deployments untouched: the browser sign-in
+    /// endpoints reject with ENTRA_SSO_NOT_CONFIGURED until it is set. Set via
+    /// RYUKI_ENTRA_REDIRECT_URI.
+    #[serde(default)]
+    pub entra_redirect_uri: String,
     /// JWKS keyset cache TTL in seconds for Entra token validation (default 24h).
     /// Optional tuning knob; not required for EntraId mode validation.
     #[serde(default = "default_entra_jwks_ttl_secs")]
@@ -1496,6 +1503,7 @@ impl Default for RyukiConfig {
             entra_tenant_id: String::new(),
             entra_client_id: String::new(),
             entra_authority: default_entra_authority(),
+            entra_redirect_uri: String::new(),
             entra_jwks_ttl_secs: default_entra_jwks_ttl_secs(),
             entra_leeway_secs: default_entra_leeway_secs(),
             platform_name: default_platform_name(),

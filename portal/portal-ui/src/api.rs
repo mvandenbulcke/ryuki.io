@@ -410,6 +410,7 @@ const AUTH_LOGIN_PATH: &str = "/api/auth/login";
 const AUTH_LOGOUT_PATH: &str = "/api/auth/logout";
 const AUTH_LOCAL_LOGIN_PATH: &str = "/api/auth/local/login";
 const AUTH_LOCAL_LOGOUT_PATH: &str = "/api/auth/local/logout";
+const AUTH_ENTRA_AUTHORIZE_URL_PATH: &str = "/api/auth/entra/authorize-url";
 
 pub fn auth_login_path() -> &'static str {
     AUTH_LOGIN_PATH
@@ -425,6 +426,10 @@ pub fn auth_local_login_path() -> &'static str {
 
 pub fn auth_local_logout_path() -> &'static str {
     AUTH_LOCAL_LOGOUT_PATH
+}
+
+pub fn auth_entra_authorize_url_path() -> &'static str {
+    AUTH_ENTRA_AUTHORIZE_URL_PATH
 }
 
 pub fn auth_session_path() -> &'static str {

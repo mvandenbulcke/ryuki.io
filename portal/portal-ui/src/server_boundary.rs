@@ -11,8 +11,9 @@ use crate::api::{
     admin_feature_flag_governance_path, admin_platform_settings_path,
     admin_platform_settings_reset_path, admin_rbac_roles_path, admin_sessions_path,
     admin_tokens_path, admin_worker_capability_path, approval_decision_readiness_path,
-    approvals_pending_path, auth_local_login_path, auth_local_logout_path, auth_login_path,
-    auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
+    approvals_pending_path, auth_entra_authorize_url_path, auth_local_login_path,
+    auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
+    boundary_status_path,
     catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
     cluster_capacity_admission_path, cmdb_export_path, cmdb_file_exchange_path, cmdb_import_path,
     cmdb_reconcile_path, cmdb_reconciliation_path, cmdb_relationship_graph_path,
@@ -103,7 +104,7 @@ use crate::models::{request_detail_fallback, request_summary_fallbacks};
 #[cfg(feature = "ssr")]
 use crate::upstream::{
     clear_portal_session_cookie, cookie_max_age_from_expires_at, session_id_from_request,
-    set_portal_session_cookie, UpstreamClient, UpstreamResponse,
+    set_entra_login_binding_cookie, set_portal_session_cookie, UpstreamClient, UpstreamResponse,
 };
 use leptos::prelude::{server, ServerFnError};
 use ryuki_core::types::{BoundaryStatus, ExecutionMode};
@@ -190,6 +191,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     auth_logout_path,
     auth_local_login_path,
     auth_local_logout_path,
+    auth_entra_authorize_url_path,
     auth_session_path,
 ];
 
@@ -2213,6 +2215,63 @@ pub async fn perform_login(
         cookie_max_age_from_expires_at(&login.expires_at),
     );
     Ok(AuthSession::from(login))
+}
+
+/// Payload of the upstream `GET /api/auth/entra/authorize-url`. `binding` is
+/// consumed server-side ONLY — it becomes the HttpOnly `entra_login_csrf`
+/// cookie on the portal response and is never part of the value the browser
+/// script receives, so page JavaScript can never read it.
+#[cfg(feature = "ssr")]
+#[derive(Deserialize)]
+struct EntraAuthorizeUrlPayload {
+    authorize_url: String,
+    binding: String,
+}
+
+/// Begins the Entra ID browser sign-in (auth-code + PKCE): fetches the tenant
+/// authorize URL from the upstream API (which persists the single-use
+/// state/nonce/verifier server-side), re-issues the per-browser CSRF-binding
+/// cookie on the portal response, and returns ONLY the authorize URL for the
+/// client to navigate to. The IdP redirects back to the API callback directly
+/// (same-origin deployment), which mints the shared `ryuki_session` cookie the
+/// portal session gate already consumes.
+#[server(prefix = "/portal/api", endpoint = "auth-entra-authorize-url")]
+pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(auth_entra_authorize_url_path())
+        .map_err(|_| {
+            ServerFnError::new("entra authorize URL API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // Static demo builds have no IdP to hand the browser to.
+        return Err(ServerFnError::new(
+            "Entra ID sign-in requires the live platform API",
+        ));
+    }
+    let response = upstream.get(path, None).await.map_err(|_| {
+        ServerFnError::new("API unreachable; Entra ID sign-in is unavailable right now")
+    })?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "Entra ID sign-in is unavailable",
+        )));
+    }
+    let payload: EntraAuthorizeUrlPayload = response
+        .json()
+        .map_err(|_| ServerFnError::new("Entra authorize URL response was malformed"))?;
+    // Defense-in-depth: only ever hand the browser an absolute http(s) URL.
+    if !(payload.authorize_url.starts_with("https://")
+        || payload.authorize_url.starts_with("http://"))
+    {
+        return Err(ServerFnError::new(
+            "Entra authorize URL response was malformed",
+        ));
+    }
+    set_entra_login_binding_cookie(&payload.binding);
+    Ok(payload.authorize_url)
 }
 
 /// Signs out: best-effort upstream logout with the forwarded session header,
