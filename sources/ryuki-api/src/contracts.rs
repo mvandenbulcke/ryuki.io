@@ -8984,6 +8984,9 @@ const DEPLOYMENT_COLUMNS: &str =
 #[derive(Debug, Deserialize)]
 struct SoftwarePackagesQuery {
     site: Option<String>,
+    // #14 pagination (optional — absent = unfiltered first page, non-breaking).
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9004,15 +9007,31 @@ async fn software_packages_list(
         //   scope='all'  → matches any site request
         //   scope='specific' → site_scope_list must contain the requested site
         // When no site filter is provided ($1 = '') all rows are returned.
+        // #14: bound the page. `id` (PK) ORDER BY is unique. `count` uses the SAME
+        // site-scope WHERE (bind $1=site) so the total matches the paged set.
+        let limit = query.limit.unwrap_or(500).clamp(1, 1000);
+        let offset = query.offset.unwrap_or(0).max(0);
         let rows: Vec<ApprovedPackageRow> = sqlx::query_as(&format!(
             "SELECT {PACKAGE_COLUMNS} FROM approved_packages \
              WHERE ($1 = '' \
                 OR site_scope = 'all' \
                 OR ($1 <> '' AND site_scope = 'specific' AND $1 = ANY(site_scope_list))) \
-             ORDER BY id"
+             ORDER BY id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approved_packages \
+             WHERE ($1 = '' \
+                OR site_scope = 'all' \
+                OR ($1 <> '' AND site_scope = 'specific' AND $1 = ANY(site_scope_list)))",
+        )
+        .bind(site)
+        .fetch_one(pool)
         .await
         .map_err(db_error)?;
         let packages: Vec<Value> = rows.iter().map(ApprovedPackageRow::to_json).collect();
@@ -9020,6 +9039,9 @@ async fn software_packages_list(
             "source": "database",
             "packages": packages,
             "count": packages.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })));
     }
     // No-DB: engine in-memory store (unchanged fallback).
@@ -54433,7 +54455,11 @@ mod approved_packages_db_tests {
             return;
         };
 
-        let query = SoftwarePackagesQuery { site: None };
+        let query = SoftwarePackagesQuery {
+            site: None,
+            limit: None,
+            offset: None,
+        };
         let result =
             software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
                 .await;
@@ -54471,6 +54497,8 @@ mod approved_packages_db_tests {
         // (pkg-veeam-agent) must NOT appear; site_scope='all' packages must appear.
         let query = SoftwarePackagesQuery {
             site: Some("FRPAR".into()),
+            limit: None,
+            offset: None,
         };
         let result =
             software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
@@ -54492,6 +54520,8 @@ mod approved_packages_db_tests {
         // DEFRA: pkg-veeam-agent (scope=specific, list includes DEFRA) must appear.
         let query2 = SoftwarePackagesQuery {
             site: Some("DEFRA".into()),
+            limit: None,
+            offset: None,
         };
         let result2 =
             software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query2))
@@ -54519,7 +54549,11 @@ mod approved_packages_db_tests {
         // the handler but the pool IS set, so it will go through the DB path.
         // That's acceptable: the important guarantee is the no-DB path is NOT
         // broken, proven by `make test-unit`.
-        let query = SoftwarePackagesQuery { site: None };
+        let query = SoftwarePackagesQuery {
+            site: None,
+            limit: None,
+            offset: None,
+        };
         let result =
             software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
                 .await;
