@@ -83,7 +83,28 @@ struct OfferingIac {
     /// Ansible files `(filename, content)`; empty = no Ansible.
     ansible: &'static [(&'static str, &'static str)],
     binding: VarBinding,
+    /// Secret ENVIRONMENT VARIABLE names this offering's LIVE execution
+    /// requires (provider credentials). Empty = the offering needs none.
+    ///
+    /// Contract (see [`live_secret_var_names`]):
+    /// - The DECLARED name is the provider-native env var the offering's IaC
+    ///   reads (e.g. the terraform vsphere provider reads `VSPHERE_USER` /
+    ///   `VSPHERE_PASSWORD` / `VSPHERE_SERVER`).
+    /// - The agent resolves each name from `RYUKI_LIVE_CRED_<NAME>` in ITS OWN
+    ///   environment (fail-closed BEFORE any runner invocation when one is
+    ///   missing) and passes the values as `ResolvedCredentials` material,
+    ///   comma-joined in DECLARED ORDER — the order of this slice is the
+    ///   pairing contract with the runner.
+    /// - The runner injects each declared name (plus its `TF_VAR_<lowercase>`
+    ///   terraform-variable alias) on the terraform child env for LIVE modes
+    ///   ONLY. The offline dry-run path never receives credential material.
+    live_secret_env: &'static [&'static str],
 }
+
+/// Secret env var names required by the vSphere server-deployment offerings.
+/// The terraform vsphere provider reads exactly these provider-native vars.
+/// Order is the credential pairing order (see `OfferingIac::live_secret_env`).
+const VSPHERE_LIVE_SECRET_ENV: &[&str] = &["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"];
 
 /// The offering → IaC registry (the single source of truth, see `OfferingIac`).
 const OFFERINGS: &[OfferingIac] = &[
@@ -92,18 +113,21 @@ const OFFERINGS: &[OfferingIac] = &[
         terraform: &[("main.tf", PATCH_MAINTENANCE_MAIN_TF)],
         ansible: &[("patch-maintenance.yml", PATCH_MAINTENANCE_PLAYBOOK)],
         binding: VarBinding::MetadataPassthrough,
+        live_secret_env: &[],
     },
     OfferingIac {
         id: "request-preflight",
         terraform: &[("main.tf", REQUEST_PREFLIGHT_MAIN_TF)],
         ansible: &[],
         binding: VarBinding::MetadataPassthrough,
+        live_secret_env: &[],
     },
     OfferingIac {
         id: "zabbix-onboarding",
         terraform: &[],
         ansible: &[("zabbix-onboarding.yml", ZABBIX_ONBOARDING_PLAYBOOK)],
         binding: VarBinding::MetadataPassthrough,
+        live_secret_env: &[],
     },
     OfferingIac {
         id: "linux-server-deployment",
@@ -113,12 +137,14 @@ const OFFERINGS: &[OfferingIac] = &[
             LINUX_SERVER_DEPLOYMENT_PLAYBOOK,
         )],
         binding: VarBinding::ServerDeployment,
+        live_secret_env: VSPHERE_LIVE_SECRET_ENV,
     },
     OfferingIac {
         id: "windows-server-deployment",
         terraform: &[("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF)],
         ansible: &[],
         binding: VarBinding::ServerDeployment,
+        live_secret_env: VSPHERE_LIVE_SECRET_ENV,
     },
     OfferingIac {
         id: "controlled-restore-request",
@@ -128,6 +154,7 @@ const OFFERINGS: &[OfferingIac] = &[
             CONTROLLED_RESTORE_REQUEST_PLAYBOOK,
         )],
         binding: VarBinding::MetadataPassthrough,
+        live_secret_env: &[],
     },
 ];
 
@@ -242,6 +269,34 @@ pub fn offering_step_template(offering_id: &str) -> &'static [StepTemplate] {
         "managed-server-onboarding" => MANAGED_SERVER_ONBOARDING_TEMPLATE,
         _ => &[],
     }
+}
+
+/// Secret env var names the given offering's LIVE execution requires.
+///
+/// Returns the offering's declared provider-credential ENVIRONMENT VARIABLE
+/// names (e.g. `["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"]` for
+/// the vSphere server-deployment offerings), or an empty slice for offerings
+/// that declare none and for unknown offering ids.
+///
+/// End-to-end contract:
+/// 1. The agent's live executor populates `RunPlan.secret_var_names` from this
+///    declaration (LIVE modes only — the offline dry-run plan always carries
+///    an empty list and empty credential material).
+/// 2. The agent resolves each declared `<NAME>` from `RYUKI_LIVE_CRED_<NAME>`
+///    in its own environment, failing closed with the VARIABLE NAME (never a
+///    value) BEFORE any runner/terraform invocation when one is missing.
+/// 3. The runner injects each declared name verbatim (provider-native, e.g.
+///    `VSPHERE_USER`) plus its `TF_VAR_<lowercased name>` terraform-variable
+///    alias on the terraform child process env — live modes only, values
+///    scrubbed from all output.
+///
+/// SLICE ORDER IS THE PAIRING CONTRACT: credential material travels as a
+/// comma-joined string in declared order; agent and runner both iterate this
+/// slice, so a declared name always receives its own value.
+pub fn live_secret_var_names(offering_id: &str) -> &'static [&'static str] {
+    lookup(offering_id)
+        .map(|o| o.live_secret_env)
+        .unwrap_or(&[])
 }
 
 /// Resolve the IaC bundle for the given offering ID.
@@ -1084,6 +1139,78 @@ mod tests {
                 assert!(
                     !o.terraform.is_empty(),
                     "offering {} binds ServerDeployment vars but has no Terraform",
+                    o.id
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // live_secret_var_names — provider-credential declarations
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn live_secret_var_names_declares_vsphere_creds_for_server_deployments() {
+        for id in ["linux-server-deployment", "windows-server-deployment"] {
+            assert_eq!(
+                live_secret_var_names(id),
+                &["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"],
+                "{id} must declare exactly the vsphere provider env vars, in pairing order"
+            );
+        }
+    }
+
+    #[test]
+    fn live_secret_var_names_empty_for_non_provider_offerings_and_unknown() {
+        for id in [
+            "patch-maintenance",
+            "request-preflight",
+            "zabbix-onboarding",
+            "controlled-restore-request",
+            "server-deployment",
+            "managed-server-onboarding",
+            "nonexistent-offering",
+            "",
+        ] {
+            assert!(
+                live_secret_var_names(id).is_empty(),
+                "{id} must declare no live secret vars"
+            );
+        }
+    }
+
+    /// Every declared secret var name must pass the runner's injection
+    /// validation — a name the runner would refuse could never be wired, so a
+    /// bad declaration must fail HERE at authoring time, not at live-run time.
+    #[test]
+    fn declared_live_secret_names_are_valid_and_unique_per_offering() {
+        for o in OFFERINGS {
+            let mut seen = std::collections::HashSet::new();
+            for name in o.live_secret_env {
+                assert!(
+                    crate::terraform::validate_var_name(name).is_ok(),
+                    "offering {} declares secret var {name:?} that the runner would refuse",
+                    o.id
+                );
+                assert!(
+                    seen.insert(*name),
+                    "offering {} declares duplicate secret var {name:?}",
+                    o.id
+                );
+            }
+        }
+    }
+
+    /// The declaration only makes sense for offerings whose LIVE path is
+    /// Terraform: declared names feed the terraform child env. Guard that no
+    /// ansible-only offering grows a declaration without the wiring to use it.
+    #[test]
+    fn declared_live_secret_names_require_a_terraform_bundle() {
+        for o in OFFERINGS {
+            if !o.live_secret_env.is_empty() {
+                assert!(
+                    !o.terraform.is_empty(),
+                    "offering {} declares live secret vars but has no Terraform bundle",
                     o.id
                 );
             }

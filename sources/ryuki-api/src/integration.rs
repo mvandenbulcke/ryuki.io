@@ -167,8 +167,8 @@ pub enum CredError {
     /// FIX-6: env-var key name failed the allow-list check.
     #[error("env-var key '{0}' is not permitted: must start with 'RYUKI_INTEGRATION__' (not the encryption key or other platform vars)")]
     EnvVarDenied(String),
-    /// Vault resolution error — variant is used by real VaultResolver impls (later slice).
-    #[allow(dead_code)]
+    /// Vault resolution error — carries the handle / field NAME / HTTP status
+    /// only, NEVER secret material (see `VaultKv2Resolver`).
     #[error("vault resolver error: {0}")]
     Vault(String),
 }
@@ -180,23 +180,239 @@ pub enum CredError {
 pub use ryuki_engine::runners::ResolvedCredentials;
 
 // ---------------------------------------------------------------------------
-// Vault resolver trait (real HTTP client is a later slice)
+// Vault resolver trait + implementations (mock and real KV v2)
 // ---------------------------------------------------------------------------
 
+/// Boxed future returned by [`VaultResolver::resolve`] — keeps the trait
+/// object-safe (`&dyn VaultResolver`) while allowing async HTTP resolvers.
+pub type VaultResolveFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, CredError>> + Send + 'a>>;
+
 pub trait VaultResolver: Send + Sync {
-    /// Resolve the secret at `path`. Returns opaque bytes.
-    /// Must NOT log the returned material.
-    fn resolve(&self, path: &str) -> Result<Vec<u8>, CredError>;
+    /// Resolve the secret at `handle`. Returns opaque bytes.
+    /// Must NOT log the returned material or include it in any error.
+    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a>;
 }
 
-/// Mock Vault resolver for Slice 1. Returns a deterministic non-secret marker
-/// so that vault-sourced connections can be "resolved" without a real Vault.
+/// Mock Vault resolver (default when no Vault is configured). Returns a
+/// deterministic non-secret marker so that vault-sourced connections can be
+/// "resolved" without a real Vault.
 pub struct MockVaultResolver;
 
 impl VaultResolver for MockVaultResolver {
-    fn resolve(&self, path: &str) -> Result<Vec<u8>, CredError> {
+    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a> {
         // Return a deterministic stub — NOT real secret material.
-        Ok(format!("mock-vault-resolved:{}", path).into_bytes())
+        Box::pin(async move { Ok(format!("mock-vault-resolved:{}", handle).into_bytes()) })
+    }
+}
+
+/// Production HashiCorp Vault resolver — minimal KV v2 READ support.
+///
+/// # Configuration (HashiCorp-native names, per `docs/configuration.md` /
+/// `RyukiConfig::validation_warnings`: "ensure VAULT_ADDR and vault token are
+/// configured externally")
+/// - `VAULT_ADDR`  — base URL, e.g. `https://vault.internal:8200`
+/// - `VAULT_TOKEN` — the token sent as `X-Vault-Token`
+///
+/// Both must be non-empty for [`VaultKv2Resolver::from_env`] to return `Some`;
+/// otherwise the platform keeps using [`MockVaultResolver`]
+/// (see [`vault_resolver_from_env`]).
+///
+/// # Secret handle format (the `credential_ref` of a Vault-sourced connection)
+/// `<mount>/<path>[#<field>]` — e.g. `secret/ryuki/vcenter#password`.
+/// The KV v2 read is `GET {addr}/v1/{mount}/data/{path}`. When `#<field>` is
+/// present, that key of the secret's `data.data` object is returned; when
+/// absent, the secret must contain EXACTLY ONE field (ambiguity fails closed).
+///
+/// # Security invariants
+/// - The token is held in `Zeroizing` memory and NEVER appears in `Debug`,
+///   errors, or logs.
+/// - Resolved secret material is returned to the caller only; it is never
+///   logged and never included in any error message (errors carry the handle,
+///   field NAME, and HTTP status only).
+pub struct VaultKv2Resolver {
+    addr: String,
+    token: zeroize::Zeroizing<String>,
+    client: reqwest::Client,
+}
+
+// Custom Debug: ALWAYS redacted — never print the token.
+impl std::fmt::Debug for VaultKv2Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "VaultKv2Resolver {{ addr: {:?}, token: [REDACTED] }}",
+            self.addr
+        )
+    }
+}
+
+impl VaultKv2Resolver {
+    /// Per-request timeout — a hung Vault must not wedge credential resolution.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Construct from explicit parts. Returns `None` unless BOTH `addr` and
+    /// `token` are present and non-blank. Pure (no env access) — the testable
+    /// core of [`Self::from_env`].
+    fn from_parts(addr: Option<String>, token: Option<String>) -> Option<Self> {
+        let addr = addr.map(|a| a.trim().trim_end_matches('/').to_string())?;
+        let token = token.map(|t| t.trim().to_string())?;
+        if addr.is_empty() || token.is_empty() {
+            return None;
+        }
+        // Redirects disabled: reqwest strips Authorization/cookies on
+        // cross-host redirects but NOT custom headers, so a redirecting
+        // (or compromised) endpoint could exfiltrate X-Vault-Token. A real
+        // Vault KV v2 API never redirects; any 3xx is treated as an error.
+        let client = reqwest::Client::builder()
+            .timeout(Self::TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .ok()?;
+        Some(Self {
+            addr,
+            token: zeroize::Zeroizing::new(token),
+            client,
+        })
+    }
+
+    /// Construct from the process environment (`VAULT_ADDR` + `VAULT_TOKEN`).
+    /// Returns `None` when Vault is not configured — callers fall back to the
+    /// mock resolver.
+    pub fn from_env() -> Option<Self> {
+        Self::from_parts(
+            std::env::var("VAULT_ADDR").ok(),
+            std::env::var("VAULT_TOKEN").ok(),
+        )
+    }
+
+    /// Split a secret handle `<mount>/<path>[#<field>]` into its parts.
+    /// The handle is operator-authored metadata (a path, never a secret), so
+    /// error messages may carry it verbatim.
+    fn parse_handle(handle: &str) -> Result<(&str, &str, Option<&str>), CredError> {
+        let handle = handle.trim();
+        let (path_part, field) = match handle.split_once('#') {
+            Some((p, f)) => {
+                if f.is_empty() || f.contains('#') {
+                    return Err(CredError::Vault(format!(
+                        "invalid vault handle '{handle}': the '#<field>' selector must be a \
+                         single non-empty field name"
+                    )));
+                }
+                (p, Some(f))
+            }
+            None => (handle, None),
+        };
+        let (mount, path) = path_part.split_once('/').ok_or_else(|| {
+            CredError::Vault(format!(
+                "invalid vault handle '{handle}': expected '<mount>/<path>[#<field>]' \
+                 (e.g. 'secret/ryuki/vcenter#password')"
+            ))
+        })?;
+        if mount.is_empty() || path.is_empty() || path.ends_with('/') {
+            return Err(CredError::Vault(format!(
+                "invalid vault handle '{handle}': mount and path must be non-empty"
+            )));
+        }
+        Ok((mount, path, field))
+    }
+
+    /// Perform the KV v2 read. Never logs the returned material; every error
+    /// carries only the handle, the field NAME, and/or the HTTP status.
+    async fn resolve_kv2(&self, handle: &str) -> Result<Vec<u8>, CredError> {
+        let (mount, path, field) = Self::parse_handle(handle)?;
+        let url = format!("{}/v1/{}/data/{}", self.addr, mount, path);
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-Vault-Token", self.token.as_str())
+            .send()
+            .await
+            .map_err(|e| {
+                // reqwest transport errors carry the URL at most — never a value.
+                CredError::Vault(format!("vault request for '{handle}' failed: {e}"))
+            })?;
+
+        match resp.status().as_u16() {
+            200 => {}
+            403 => {
+                return Err(CredError::Vault(format!(
+                    "vault denied access to '{handle}' (HTTP 403 — check token policy)"
+                )))
+            }
+            404 => {
+                return Err(CredError::Vault(format!(
+                    "no secret at '{handle}' (HTTP 404 — check the mount and path)"
+                )))
+            }
+            status => {
+                return Err(CredError::Vault(format!(
+                    "vault returned HTTP {status} for '{handle}'"
+                )))
+            }
+        }
+
+        // KV v2 read shape: { "data": { "data": { <field>: <value>, … }, "metadata": … } }
+        let body: serde_json::Value = resp.json().await.map_err(|_| {
+            CredError::Vault(format!(
+                "vault response for '{handle}' is not valid JSON"
+            ))
+        })?;
+        let data = body
+            .pointer("/data/data")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                CredError::Vault(format!(
+                    "vault response for '{handle}' has no KV v2 'data.data' object — \
+                     is the mount a KV VERSION 2 engine?"
+                ))
+            })?;
+
+        let (field_name, value) = match field {
+            Some(f) => (
+                f,
+                data.get(f).ok_or_else(|| {
+                    CredError::Vault(format!(
+                        "field '{f}' not present in vault secret '{handle}'"
+                    ))
+                })?,
+            ),
+            None => {
+                if data.len() != 1 {
+                    return Err(CredError::Vault(format!(
+                        "vault secret '{handle}' has {} fields — append '#<field>' to the \
+                         handle to select one",
+                        data.len()
+                    )));
+                }
+                let (k, v) = data.iter().next().expect("len checked above");
+                (k.as_str(), v)
+            }
+        };
+
+        let material = value.as_str().ok_or_else(|| {
+            CredError::Vault(format!(
+                "field '{field_name}' of vault secret '{handle}' is not a string"
+            ))
+        })?;
+        Ok(material.as_bytes().to_vec())
+    }
+}
+
+impl VaultResolver for VaultKv2Resolver {
+    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a> {
+        Box::pin(self.resolve_kv2(handle))
+    }
+}
+
+/// Select the production vault resolver: the real KV v2 client when
+/// `VAULT_ADDR` + `VAULT_TOKEN` are configured, the deterministic mock
+/// otherwise (dev / no-vault environments keep working unchanged).
+pub fn vault_resolver_from_env() -> Box<dyn VaultResolver> {
+    match VaultKv2Resolver::from_env() {
+        Some(real) => Box::new(real),
+        None => Box::new(MockVaultResolver),
     }
 }
 
@@ -217,7 +433,7 @@ pub async fn resolve_credentials(
 ) -> Result<ResolvedCredentials, CredError> {
     match &conn.credential_source {
         CredentialSource::Vault => {
-            let material = vault.resolve(&conn.credential_ref)?;
+            let material = vault.resolve(&conn.credential_ref).await?;
             Ok(ResolvedCredentials {
                 material,
                 descriptor: format!("vault:{}", conn.credential_ref),
@@ -1609,9 +1825,11 @@ pub async fn integration_test(
 
     // Attempt credential resolution — the ResolvedCredentials is dropped immediately
     // after use and zeroized. Never included in the response.
+    // Vault-sourced connections resolve through the REAL KV v2 client when
+    // VAULT_ADDR + VAULT_TOKEN are configured; the mock otherwise.
     let pool_ref = get_db();
-    let vault = MockVaultResolver;
-    let cred_result = resolve_credentials(&conn, &vault, pool_ref).await;
+    let vault = vault_resolver_from_env();
+    let cred_result = resolve_credentials(&conn, vault.as_ref(), pool_ref).await;
 
     let (cred_status, cred_message) = match cred_result {
         Ok(_creds) => {
@@ -5902,5 +6120,264 @@ mod unit_tests {
             "valid comma-separated list must pass, got: {:?}",
             result
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultKv2Resolver — handle parsing, construction, and Debug redaction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vault_handle_parsing_accepts_and_rejects_the_documented_shapes() {
+        // <mount>/<path>#<field>
+        assert_eq!(
+            VaultKv2Resolver::parse_handle("secret/ryuki/vcenter#password").unwrap(),
+            ("secret", "ryuki/vcenter", Some("password"))
+        );
+        // <mount>/<path> (no field selector)
+        assert_eq!(
+            VaultKv2Resolver::parse_handle("kv/team/api").unwrap(),
+            ("kv", "team/api", None)
+        );
+        // Surrounding whitespace is tolerated (operator-authored metadata).
+        assert_eq!(
+            VaultKv2Resolver::parse_handle("  secret/x#k  ").unwrap(),
+            ("secret", "x", Some("k"))
+        );
+        // Rejected shapes — each must fail closed with a handle-shape error.
+        for bad in [
+            "no-slash",       // no mount/path separator
+            "secret/x#",      // empty field selector
+            "secret/x#a#b",   // multiple selectors
+            "/x",             // empty mount
+            "secret/",        // empty path
+            "secret/x/",      // trailing slash (empty leaf)
+            "#field",         // selector only
+            "",               // empty
+        ] {
+            assert!(
+                VaultKv2Resolver::parse_handle(bad).is_err(),
+                "handle {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_resolver_from_parts_requires_both_addr_and_token() {
+        assert!(VaultKv2Resolver::from_parts(None, None).is_none());
+        assert!(VaultKv2Resolver::from_parts(Some("http://v:8200".into()), None).is_none());
+        assert!(VaultKv2Resolver::from_parts(None, Some("tok".into())).is_none());
+        assert!(
+            VaultKv2Resolver::from_parts(Some("   ".into()), Some("tok".into())).is_none(),
+            "blank addr must not configure a real resolver"
+        );
+        assert!(
+            VaultKv2Resolver::from_parts(Some("http://v:8200".into()), Some("".into())).is_none(),
+            "blank token must not configure a real resolver"
+        );
+        let resolver =
+            VaultKv2Resolver::from_parts(Some("http://v:8200/".into()), Some("tok".into()))
+                .expect("both present → configured");
+        assert_eq!(
+            resolver.addr, "http://v:8200",
+            "trailing slash must be normalized away"
+        );
+    }
+
+    #[test]
+    fn vault_resolver_debug_never_prints_the_token() {
+        let resolver = VaultKv2Resolver::from_parts(
+            Some("http://vault.internal:8200".into()),
+            Some("s.VERY-SECRET-VAULT-TOKEN".into()),
+        )
+        .expect("configured");
+        let debug = format!("{resolver:?}");
+        assert!(
+            !debug.contains("VERY-SECRET-VAULT-TOKEN"),
+            "Debug must redact the token: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "Debug must say [REDACTED]: {debug}");
+        assert!(
+            debug.contains("vault.internal"),
+            "the non-secret addr may appear: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_vault_resolver_still_returns_deterministic_marker() {
+        let material = MockVaultResolver
+            .resolve("secret/some/path")
+            .await
+            .expect("mock always resolves");
+        assert_eq!(material, b"mock-vault-resolved:secret/some/path".to_vec());
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultKv2Resolver — integration against a REAL Vault dev server.
+    //
+    // Run:  docker run -d --name ryuki-vault -p 8201:8200 \
+    //         -e VAULT_DEV_ROOT_TOKEN_ID=ryuki-dev-token hashicorp/vault
+    // The test SKIPs (like the terraform-absent tests) when no Vault dev
+    // server is reachable on 127.0.0.1:8201.
+    // -----------------------------------------------------------------------
+
+    const VAULT_TEST_ADDR: &str = "http://127.0.0.1:8201";
+    const VAULT_TEST_TOKEN: &str = "ryuki-dev-token";
+
+    #[tokio::test]
+    async fn vault_kv2_resolver_end_to_end_against_real_dev_vault() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        // Reachability probe — SKIP when the dev container is not running.
+        if http
+            .get(format!("{VAULT_TEST_ADDR}/v1/sys/health"))
+            .send()
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "SKIP: no Vault dev server at {VAULT_TEST_ADDR} \
+                 (docker run -d --name ryuki-vault -p 8201:8200 \
+                 -e VAULT_DEV_ROOT_TOKEN_ID={VAULT_TEST_TOKEN} hashicorp/vault)"
+            );
+            return;
+        }
+
+        // Seed TWO secrets through the real KV v2 HTTP API (dev servers mount
+        // KV v2 at 'secret/'): a multi-field one and a single-field one.
+        let secret_value = format!("s3cr3t-{}", uuid::Uuid::new_v4());
+        let path_multi = format!("ryuki-it-{}", uuid::Uuid::new_v4().simple());
+        let path_single = format!("ryuki-it-single-{}", uuid::Uuid::new_v4().simple());
+        let seed = http
+            .post(format!("{VAULT_TEST_ADDR}/v1/secret/data/{path_multi}"))
+            .header("X-Vault-Token", VAULT_TEST_TOKEN)
+            .json(&serde_json::json!({
+                "data": {"password": secret_value, "username": "vcenter-admin"}
+            }))
+            .send()
+            .await
+            .expect("seed write must reach vault");
+        assert!(
+            seed.status().is_success(),
+            "seed write must succeed: HTTP {}",
+            seed.status()
+        );
+        let seed_single = http
+            .post(format!("{VAULT_TEST_ADDR}/v1/secret/data/{path_single}"))
+            .header("X-Vault-Token", VAULT_TEST_TOKEN)
+            .json(&serde_json::json!({"data": {"only": secret_value}}))
+            .send()
+            .await
+            .expect("single-field seed write must reach vault");
+        assert!(seed_single.status().is_success());
+
+        let resolver = VaultKv2Resolver::from_parts(
+            Some(VAULT_TEST_ADDR.to_string()),
+            Some(VAULT_TEST_TOKEN.to_string()),
+        )
+        .expect("resolver configured");
+
+        // 1. Field-selected read: the REAL value flows back.
+        let material = resolver
+            .resolve(&format!("secret/{path_multi}#password"))
+            .await
+            .expect("field-selected resolve must succeed");
+        assert_eq!(material, secret_value.as_bytes());
+
+        // 2. Single-field secret resolves WITHOUT a selector.
+        let material_single = resolver
+            .resolve(&format!("secret/{path_single}"))
+            .await
+            .expect("single-field resolve must succeed");
+        assert_eq!(material_single, secret_value.as_bytes());
+
+        // 3. resolve_credentials end-to-end for a Vault-sourced connection:
+        //    the platform seam (CredentialSource::Vault) reaches the REAL
+        //    vault and the descriptor carries the handle, never the value.
+        let conn = IntegrationConnection {
+            id: "ic-vault-it".to_string(),
+            vendor_type: "vmware".to_string(),
+            name: "Vault IT".to_string(),
+            endpoint_url: "https://vcenter.test.example.com".to_string(),
+            site_scope: None,
+            credential_source: CredentialSource::Vault,
+            credential_ref: format!("secret/{path_multi}#password"),
+            status: "configured".to_string(),
+            readiness: "configured".to_string(),
+            execution_mode: ExecutionMode::StaticDryRun,
+            last_test_at: None,
+            last_test_result: None,
+            created_by: "test".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let creds = resolve_credentials(&conn, &resolver, None)
+            .await
+            .expect("vault-sourced resolve_credentials must succeed");
+        assert_eq!(creds.material, secret_value.as_bytes());
+        assert!(
+            creds.descriptor.contains(&path_multi) && !creds.descriptor.contains(&secret_value),
+            "descriptor names the handle, never the value: {}",
+            creds.descriptor
+        );
+        drop(creds); // zeroized
+
+        // 4. NO LEAKAGE: every error path's message must carry names/paths/
+        //    statuses only — never the stored secret value.
+        let missing_field = resolver
+            .resolve(&format!("secret/{path_multi}#nonexistent_field"))
+            .await
+            .expect_err("missing field must fail");
+        let missing_secret = resolver
+            .resolve("secret/ryuki-definitely-missing#x")
+            .await
+            .expect_err("missing secret must fail (404)");
+        let ambiguous = resolver
+            .resolve(&format!("secret/{path_multi}"))
+            .await
+            .expect_err("multi-field secret without selector must fail closed");
+        let bad_token_resolver = VaultKv2Resolver::from_parts(
+            Some(VAULT_TEST_ADDR.to_string()),
+            Some("wrong-token".to_string()),
+        )
+        .expect("configured");
+        let denied = bad_token_resolver
+            .resolve(&format!("secret/{path_multi}#password"))
+            .await
+            .expect_err("wrong token must be denied (403)");
+
+        assert!(missing_field.to_string().contains("nonexistent_field"));
+        assert!(missing_secret.to_string().contains("404"));
+        assert!(
+            ambiguous.to_string().contains("#<field>"),
+            "ambiguity error must explain the selector: {ambiguous}"
+        );
+        assert!(denied.to_string().contains("403"));
+        for (label, err) in [
+            ("missing_field", &missing_field),
+            ("missing_secret", &missing_secret),
+            ("ambiguous", &ambiguous),
+            ("denied", &denied),
+        ] {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(&secret_value),
+                "{label} error must never carry the secret value: {msg}"
+            );
+            assert!(
+                !msg.contains(VAULT_TEST_TOKEN) && !msg.contains("wrong-token"),
+                "{label} error must never carry a token: {msg}"
+            );
+        }
+
+        // Cleanup: delete the seeded secrets (metadata delete removes all versions).
+        for path in [&path_multi, &path_single] {
+            let _ = http
+                .delete(format!("{VAULT_TEST_ADDR}/v1/secret/metadata/{path}"))
+                .header("X-Vault-Token", VAULT_TEST_TOKEN)
+                .send()
+                .await;
+        }
     }
 }

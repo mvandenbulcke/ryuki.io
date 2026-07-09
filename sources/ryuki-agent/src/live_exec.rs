@@ -17,11 +17,14 @@
 //! Secrets mounted as env vars, HashiCorp Vault agent sidecars, systemd
 //! `EnvironmentFile`).  `RunnerLiveExecutor` reads them from `std::env::var`.
 //!
-//! The credential variable names are communicated via `JobSpec.vars` (the
-//! non-secret variable names list — operators configure which env var holds the
-//! credential).  In this slice a placeholder resolver reads
-//! `RYUKI_LIVE_CRED_<VAR_NAME>` from the agent environment; a production-grade
-//! vault integration is a later slice.
+//! The credential variable names come from the OFFERING'S OWN DECLARATION
+//! (`ryuki_runner::iac::live_secret_var_names`) — e.g. the vSphere
+//! server-deployment offerings declare `VSPHERE_USER` / `VSPHERE_PASSWORD` /
+//! `VSPHERE_SERVER`.  For each declared `<NAME>` the resolver reads
+//! `RYUKI_LIVE_CRED_<NAME>` from the agent environment and fails closed —
+//! naming the missing VARIABLE, never a value — BEFORE any runner/terraform
+//! invocation when one is absent.  The control plane never carries the names
+//! or the values; both sides derive the names from the same embedded registry.
 //!
 //! ## `plan_digest`
 //!
@@ -161,20 +164,20 @@ pub trait LiveExecutor: Send + Sync {
 /// Production operators should always provide a backend config for `LiveApply`
 /// so Terraform can persist and lock state.
 ///
-/// ## Credential gap (operator responsibility — do NOT remove this comment)
+/// ## Credential seam (wired — operator provisions the values)
 ///
-/// `build_run_plan` sets `secret_var_names: vec![]`, so no provider credentials
-/// are injected via the `TF_VAR_<name>` mechanism in this slice.  The runner
-/// env allowlist (PATH/HOME/TMPDIR/LANG/LC_ALL) does NOT pass provider-native
-/// vars (AWS_*/ARM_*/VSPHERE_*).  For real live execution an OPERATOR must
-/// either:
-///   (a) populate `secret_var_names` from the spec and set
-///       `RYUKI_LIVE_CRED_<NAME>` for each — the runner maps these to
-///       `TF_VAR_<name>` on the child process, and
-///   (b) or extend the runner env allowlist to pass the specific provider cred
-///       vars AND scrub them from all output before they reach `RunOutcome`.
-/// This is intentionally operator-deferred; the no-infra build cannot exercise
-/// real provider credentials.
+/// `make_run_plan` populates `secret_var_names` from the offering's declaration
+/// (`ryuki_runner::iac::live_secret_var_names`) for every LIVE mode.  For each
+/// declared `<NAME>` (e.g. `VSPHERE_USER`) the operator provisions
+/// `RYUKI_LIVE_CRED_<NAME>` on the agent host; `resolve_creds` reads them in
+/// declared order and the runner injects `<NAME>` (provider-native) plus
+/// `TF_VAR_<lowercased name>` on the terraform child — LIVE modes only.  The
+/// runner env allowlist (PATH/HOME/TMPDIR/LANG/LC_ALL) still never passes
+/// provider-native vars from the HOST env; only declared, resolved values
+/// reach the child, scrubbed from all output.  A missing `RYUKI_LIVE_CRED_*`
+/// fails closed BEFORE terraform with the variable name (never a value) in the
+/// refusal.  The offline dry-run path keeps an empty declaration and empty
+/// material — it never sees credentials.
 pub struct RunnerLiveExecutor {
     /// Optional backend HCL override forwarded to the runner.
     /// Populated from `RYUKI_AGENT_BACKEND_HCL` at construction time.
@@ -218,6 +221,21 @@ impl RunnerLiveExecutor {
                      live execution requires operator-provisioned host credentials"
                 ))
             })?;
+            // FAIL CLOSED on values the transport cannot carry — the messages
+            // name the VARIABLE only, never the value.
+            if val.is_empty() {
+                return Err(LiveExecError::CredResolution(format!(
+                    "credential env var '{env_key}' is set but EMPTY — \
+                     refusing live execution with a blank credential"
+                )));
+            }
+            if val.contains(',') {
+                return Err(LiveExecError::CredResolution(format!(
+                    "credential env var '{env_key}' contains a comma, which the \
+                     comma-joined credential transport cannot carry — refusing live \
+                     execution rather than mis-pairing credentials"
+                )));
+            }
             parts.push(val);
         }
 
@@ -254,16 +272,25 @@ impl RunnerLiveExecutor {
         // to RunnerKind::Ansible, everything else to RunnerKind::Terraform.
         let runner_kind = crate::executor::offering_kind_from_slug(&offering_slug);
 
+        // Secret var names come from the OFFERING'S OWN DECLARATION in the
+        // embedded IaC registry — never from the control plane, never from
+        // spec.vars.  The vSphere server-deployment offerings declare
+        // VSPHERE_USER / VSPHERE_PASSWORD / VSPHERE_SERVER; offerings without
+        // provider credentials declare nothing (empty list → no resolution,
+        // no injection).  This function is only used by the LIVE paths; the
+        // offline dry-run executor builds its own plan with an empty list.
+        let secret_var_names: Vec<String> =
+            ryuki_runner::iac::live_secret_var_names(&offering_slug)
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
         Ok(RunPlan {
             runner_kind,
             mode: RunMode::Live,
             offering_id: offering_slug,
             vars: spec.vars.clone(),
-            // Secret var names come from spec.vars keys that match the cred-naming
-            // convention.  In this slice we use an empty list; the operator
-            // configures TF_VAR_* / extra-vars files directly via the
-            // RYUKI_LIVE_CRED_* mechanism and the runner's env-injection path.
-            secret_var_names: vec![],
+            secret_var_names,
         })
     }
 }
@@ -921,6 +948,181 @@ mod tests {
             "linux-server-deployment must produce RunnerKind::Terraform (keyword is linux-server-deployment-playbook); got {:?}",
             lsd_plan.runner_kind
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential seam: declaration plumbing + fail-closed missing credentials
+    // -----------------------------------------------------------------------
+
+    /// Serializes the tests that mutate the process-global RYUKI_LIVE_CRED_*
+    /// environment (std::env is process-wide; parallel mutation would race).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const VSPHERE_CRED_KEYS: [&str; 3] = [
+        "RYUKI_LIVE_CRED_VSPHERE_USER",
+        "RYUKI_LIVE_CRED_VSPHERE_PASSWORD",
+        "RYUKI_LIVE_CRED_VSPHERE_SERVER",
+    ];
+
+    fn clear_vsphere_cred_env() {
+        for key in VSPHERE_CRED_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// Live plans for the vSphere server-deployment offerings must carry the
+    /// registry-declared secret var names; non-provider offerings carry none.
+    /// The declaration comes from the embedded IaC registry — never the CP.
+    #[test]
+    fn make_run_plan_populates_declared_secret_vars_for_live_modes() {
+        for iac_ref in [
+            "linux-server-deployment@v1.0.0",
+            "windows-server-deployment@v1.0.0",
+        ] {
+            let spec = make_spec_with_iac_ref(JobMode::LivePlan, iac_ref);
+            let run_plan = RunnerLiveExecutor::make_run_plan(&spec).expect("must build");
+            assert_eq!(
+                run_plan.secret_var_names,
+                vec![
+                    "VSPHERE_USER".to_string(),
+                    "VSPHERE_PASSWORD".to_string(),
+                    "VSPHERE_SERVER".to_string()
+                ],
+                "{iac_ref} must declare the vsphere provider env vars in pairing order"
+            );
+        }
+        for iac_ref in [
+            "patch-maintenance@v1.0.0",
+            "request-preflight@v1.0.0",
+            "zabbix-onboarding@v1.0.0",
+        ] {
+            let spec = make_spec_with_iac_ref(JobMode::LiveApply, iac_ref);
+            let run_plan = RunnerLiveExecutor::make_run_plan(&spec).expect("must build");
+            assert!(
+                run_plan.secret_var_names.is_empty(),
+                "{iac_ref} declares no provider credentials"
+            );
+        }
+    }
+
+    /// FAIL CLOSED BEFORE TERRAFORM: a live job whose declared credential is
+    /// missing from the agent environment must be refused with the exact
+    /// VARIABLE NAME (and no value) — on plan, apply, AND destroy. The error
+    /// variant is `CredResolution`, which only `resolve_creds` produces, and
+    /// `resolve_creds` runs before any `ryuki_runner::run_live_*` call — so
+    /// this refusal provably happens before terraform could ever start.
+    #[test]
+    fn live_paths_fail_closed_before_terraform_when_declared_credential_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_vsphere_cred_env();
+        // Two of three provisioned — the THIRD (server) is the one missing.
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "it-user-value");
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "it-pass-value");
+
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        let cases: [(JobMode, &str); 3] = [
+            (JobMode::LivePlan, "plan"),
+            (JobMode::LiveApply, "apply"),
+            (JobMode::LiveDestroy, "destroy"),
+        ];
+        for (mode, label) in cases {
+            let spec = make_spec_with_iac_ref(mode.clone(), "linux-server-deployment@v1.0.0");
+            let result = match mode {
+                JobMode::LivePlan => exec.plan(&spec).map(|_| ()),
+                JobMode::LiveApply => exec.apply(&spec, b"fake-tfplan").map(|_| ()),
+                JobMode::LiveDestroy => exec.destroy(&spec).map(|_| ()),
+                _ => unreachable!(),
+            };
+            match result {
+                Err(LiveExecError::CredResolution(msg)) => {
+                    assert!(
+                        msg.contains("RYUKI_LIVE_CRED_VSPHERE_SERVER"),
+                        "{label}: refusal must name the missing variable: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("it-user-value") && !msg.contains("it-pass-value"),
+                        "{label}: refusal must never carry a credential value: {msg}"
+                    );
+                }
+                other => panic!(
+                    "{label}: missing credential must produce CredResolution before \
+                     terraform; got {other:?}"
+                ),
+            }
+        }
+
+        clear_vsphere_cred_env();
+    }
+
+    /// Values the comma-joined transport cannot carry are refused with the
+    /// VARIABLE NAME only — an empty value and a comma-containing value.
+    #[test]
+    fn resolve_creds_fails_closed_on_empty_and_comma_values() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_vsphere_cred_env();
+        let names = vec!["VSPHERE_USER".to_string()];
+
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "");
+        let empty_err = RunnerLiveExecutor::resolve_creds(&names)
+            .expect_err("empty value must fail closed");
+        assert!(
+            empty_err.to_string().contains("RYUKI_LIVE_CRED_VSPHERE_USER")
+                && empty_err.to_string().contains("EMPTY"),
+            "empty-value refusal must name the variable: {empty_err}"
+        );
+
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "with,comma");
+        let comma_err = RunnerLiveExecutor::resolve_creds(&names)
+            .expect_err("comma value must fail closed");
+        let msg = comma_err.to_string();
+        assert!(
+            msg.contains("RYUKI_LIVE_CRED_VSPHERE_USER") && msg.contains("comma"),
+            "comma refusal must name the variable and the reason: {msg}"
+        );
+        assert!(
+            !msg.contains("with,comma"),
+            "comma refusal must never carry the value: {msg}"
+        );
+
+        clear_vsphere_cred_env();
+    }
+
+    /// Happy path: all declared credentials provisioned → material is the
+    /// comma-joined values in DECLARED order (the runner's pairing contract),
+    /// and the descriptor names the variables but never the values.
+    #[test]
+    fn resolve_creds_joins_values_in_declared_order_and_redacts_descriptor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_vsphere_cred_env();
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "u-val");
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "p-val");
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_SERVER", "s-val");
+
+        let names: Vec<String> = ryuki_runner::iac::live_secret_var_names("linux-server-deployment")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let creds = RunnerLiveExecutor::resolve_creds(&names).expect("all creds provisioned");
+        assert_eq!(
+            creds.material, b"u-val,p-val,s-val",
+            "material must be comma-joined in declared order"
+        );
+        assert!(
+            creds.descriptor.contains("VSPHERE_USER"),
+            "descriptor names the variables: {}",
+            creds.descriptor
+        );
+        for value in ["u-val", "p-val", "s-val"] {
+            assert!(
+                !creds.descriptor.contains(value),
+                "descriptor must never carry a value: {}",
+                creds.descriptor
+            );
+        }
+
+        clear_vsphere_cred_env();
     }
 
     /// plan() for an Ansible offering routes to ansible live plan (absent binary

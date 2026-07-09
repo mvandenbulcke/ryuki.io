@@ -685,6 +685,64 @@ mod tests {
         std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
     }
 
+    // --- DRY-RUN IS CREDENTIAL-FREE: no provider creds ever reach the child ---
+
+    /// The agent builds every OfflineDryRun plan with an EMPTY
+    /// `secret_var_names` list and empty credential material (see
+    /// ryuki-agent executor.rs), and the runner's env allowlist strips the
+    /// host environment. Combined guarantee asserted here: even when the HOST
+    /// carries operator live credentials (RYUKI_LIVE_CRED_*) and provider-
+    /// native vars (VSPHERE_*), the dry-run terraform child sees NONE of them.
+    #[test]
+    fn run_dry_never_receives_credential_env_even_when_host_has_them() {
+        // A shim that prints the full child environment into the captured log.
+        let ws = Workspace::new().expect("ws");
+        let shim = ws.path().join("tf-dryrun-cred-free-probe");
+        std::fs::write(&shim, "#!/bin/sh\nenv\nexit 0\n").expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        // Poison the parent (host) environment the way a live-enabled agent
+        // host would look: operator cred vars AND provider-native vars.
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "DRYRUN-CANARY-CRED");
+        std::env::set_var("VSPHERE_PASSWORD", "DRYRUN-CANARY-NATIVE");
+        std::env::set_var("TF_VAR_vsphere_password", "DRYRUN-CANARY-TFVAR");
+
+        let runner = TerraformRunner::with_binary(shim.to_string_lossy().to_string());
+        // The agent's dry-run contract: NO secret var names, EMPTY material.
+        let plan = make_plan_dryrun();
+        assert!(plan.secret_var_names.is_empty(), "dry-run declares no secrets");
+        let creds = fake_creds("");
+
+        let outcome = runner.run_dry(&plan, &creds).expect("dry run must succeed");
+
+        for canary in [
+            "DRYRUN-CANARY-CRED",
+            "DRYRUN-CANARY-NATIVE",
+            "DRYRUN-CANARY-TFVAR",
+            "RYUKI_LIVE_CRED_",
+        ] {
+            assert!(
+                !outcome.log.contains(canary) && !outcome.summary.contains(canary),
+                "dry-run child env must stay credential-free; found {canary:?} in: {}",
+                outcome.log
+            );
+        }
+        // The child env dump also must not contain injected provider vars at all.
+        assert!(
+            !outcome.log.contains("VSPHERE_PASSWORD="),
+            "no VSPHERE_* var may exist in the dry-run child env: {}",
+            outcome.log
+        );
+
+        std::env::remove_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD");
+        std::env::remove_var("VSPHERE_PASSWORD");
+        std::env::remove_var("TF_VAR_vsphere_password");
+    }
+
     // --- run_dry() returns RunnerUnavailable gracefully ---
 
     #[test]

@@ -106,6 +106,18 @@ pub fn run_offline_dry_run(
             plan.mode
         )));
     }
+    // Dry-runs are credential-free BY CONTRACT (they run with no live access
+    // whatsoever). Enforce it at this API boundary, not just at the agent
+    // call site: a caller handing secret material to a dry-run is a bug and
+    // must fail loudly, never inject silently. Names only in the error.
+    if !plan.secret_var_names.is_empty() || !creds.material.is_empty() {
+        return Err(RunnerError::Spawn(format!(
+            "dry-run refuses credential material: {} secret var(s) declared \
+             ({:?}) — offline dry-runs are credential-free by contract",
+            plan.secret_var_names.len(),
+            plan.secret_var_names
+        )));
+    }
 
     match plan.runner_kind {
         RunnerKind::Terraform => {
@@ -148,6 +160,25 @@ mod tests {
             material: vec![],
             descriptor: "test:dummy".to_string(),
         }
+    }
+
+    /// The dry-run API boundary itself refuses credential material, so no
+    /// future caller can contaminate an offline run (defense-in-depth beyond
+    /// the agent call site, which already passes empty). Error carries names
+    /// only, never values.
+    #[test]
+    fn dry_run_refuses_credential_material_at_the_boundary() {
+        let mut plan = make_plan(RunnerKind::Terraform, RunMode::DryRun);
+        plan.secret_var_names = vec!["VSPHERE_PASSWORD".to_string()];
+        let creds = ResolvedCredentials {
+            material: b"super-secret-value".to_vec(),
+            descriptor: "test:leaky".to_string(),
+        };
+        let err = run_offline_dry_run(&plan, &creds).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("credential-free by contract"), "got: {msg}");
+        assert!(msg.contains("VSPHERE_PASSWORD"), "names allowed: {msg}");
+        assert!(!msg.contains("super-secret-value"), "values NEVER: {msg}");
     }
 
     fn make_plan(runner_kind: RunnerKind, mode: RunMode) -> RunPlan {

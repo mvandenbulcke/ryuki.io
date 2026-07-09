@@ -52,18 +52,25 @@
 //! exit or timeout causes an immediate `RunStatus::Failed` return — the digest
 //! is never computed for a partial plan.
 //!
-//! ## Credential gap (operator responsibility)
+//! ## Credential seam (wired via per-offering declarations)
 //!
-//! The `secret_var_names` in `RunPlan` defaults to `[]` in this slice, so no
-//! credentials are injected.  The runner env allowlist (PATH/HOME/TMPDIR/
-//! LANG/LC_ALL) does NOT pass provider-native vars (AWS_*/ARM_*/VSPHERE_*).
-//! For real live execution an OPERATOR must either:
-//!   (a) populate `secret_var_names` from the spec and set
-//!       `RYUKI_LIVE_CRED_<NAME>` (→ `TF_VAR_<name>`) for each name, OR
-//!   (b) extend the runner env allowlist to pass the specific provider cred
-//!       vars AND ensure those values are scrubbed from the output.
-//! This is intentionally operator-deferred; the no-infra build cannot
-//! exercise real provider credentials.
+//! `RunPlan.secret_var_names` is populated by the agent from the offering's
+//! declaration in `iac::live_secret_var_names` (e.g. the vSphere
+//! server-deployment offerings declare `VSPHERE_USER` / `VSPHERE_PASSWORD` /
+//! `VSPHERE_SERVER`).  The agent resolves each declared name from
+//! `RYUKI_LIVE_CRED_<NAME>` in its own environment — failing closed with the
+//! VARIABLE NAME only, BEFORE the runner is invoked, when one is missing —
+//! and passes the values comma-joined in declared order as
+//! `ResolvedCredentials.material`.  For LIVE modes only, `run_tf_step` injects
+//! each declared name verbatim (the provider-native env var) plus its
+//! `TF_VAR_<lowercased name>` terraform-variable alias on the child process.
+//! The parent env allowlist (PATH/HOME/TMPDIR/LANG/LC_ALL) still never passes
+//! provider-native vars from the HOST environment — only declared, resolved
+//! values reach the child, and every value is scrubbed from all output.  A
+//! declared-vs-resolved arity mismatch fails closed (`CredInjection`) before
+//! any terraform subprocess is spawned.  The offline dry-run path
+//! (`run_offline_dry_run`) never receives credentials: the agent always builds
+//! it with an empty `secret_var_names` list and empty credential material.
 //!
 //! ## Security invariants (MUST hold — same as `terraform.rs`)
 //!
@@ -381,6 +388,13 @@ pub(crate) fn live_terraform_plan(
 
     // Build secret components for scrubbing.
     let components = credential_components(creds.material.as_slice());
+
+    // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
+    // BEFORE any workspace or terraform subprocess exists.
+    if let Some(err) = credential_arity_error(plan, &components) {
+        return Err(err);
+    }
+
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
     let cred_str = std::str::from_utf8(creds.material.as_slice())
         .map(|s| s.to_string())
@@ -603,6 +617,13 @@ pub(crate) fn live_terraform_apply(
 
     // Secret scrubbing components.
     let components = credential_components(creds.material.as_slice());
+
+    // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
+    // BEFORE any workspace or terraform subprocess exists.
+    if let Some(err) = credential_arity_error(plan, &components) {
+        return Err(err);
+    }
+
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
     let cred_str = std::str::from_utf8(creds.material.as_slice())
         .map(|s| s.to_string())
@@ -807,6 +828,13 @@ pub(crate) fn live_terraform_destroy(
 
     // Secret scrubbing components.
     let components = credential_components(creds.material.as_slice());
+
+    // FAIL CLOSED: declared secret vars must pair 1:1 with resolved components
+    // BEFORE any workspace or terraform subprocess exists.
+    if let Some(err) = credential_arity_error(plan, &components) {
+        return Err(err);
+    }
+
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
     let cred_str = std::str::from_utf8(creds.material.as_slice())
         .map(|s| s.to_string())
@@ -944,31 +972,66 @@ struct TfStepResult {
     exit_code: Option<i32>,
 }
 
-/// Run one terraform sub-command in the workspace, scrub the output, and
-/// return an intermediate result.
+/// Map each DECLARED secret var name to the env vars injected on the child.
 ///
-/// `secret_names` and `cred_str` are used to inject `TF_VAR_<name>` env vars.
-/// Pass empty slices/string when no credential injection is needed.
-/// Map each secret var name to ITS OWN credential value, as `(TF_VAR_<name>, value)`
-/// pairs. `resolve_creds` joins the resolved values with `,` in `secret_names` order
-/// (the same encoding `credential_components` splits for scrubbing); this splits them
-/// back so `TF_VAR_<name_i>` receives `value_i`.
+/// `secret_names` come from the offering's declaration
+/// (`iac::live_secret_var_names`); `cred_str` is the comma-joined resolved
+/// material in DECLARED ORDER (the encoding `resolve_creds` produces and
+/// `credential_components` splits for scrubbing). Pass empty slices/string
+/// when no credential injection is needed.
 ///
-/// BUG FIXED: the previous code set `TF_VAR_<name> = <the whole joined string>` for EVERY
-/// name, so a multi-credential offering (e.g. an AWS provider needing access-key +
-/// secret-key) got ALL credentials concatenated into EVERY var — the provider would
-/// authenticate with garbage. Single-credential offerings happened to work (one value, no
-/// comma). A var with no matching component is simply left unset — terraform then fails
-/// closed on the missing required variable rather than authenticating with a wrong value.
-fn tf_var_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, String)> {
+/// For every `(name_i, value_i)` pair this yields TWO env entries carrying the
+/// SAME value:
+/// - `<NAME>` verbatim — the provider-native env var the offering declared
+///   (e.g. `VSPHERE_USER`, which the terraform vsphere provider reads);
+/// - `TF_VAR_<name lowercased>` — the terraform input-variable form for
+///   bundles that route the credential through a declared `variable` block
+///   (the vsphere bundles reference `var.vsphere_user` / `var.vsphere_password`
+///   / `var.vsphere_server` in the provider block, so this alias is the
+///   load-bearing one there).
+///
+/// Both names derive strictly from the declaration — no undeclared credential
+/// can flow — and both values are scrubbed from all output. Callers enforce
+/// name↔component arity up front (`credential_arity_error`), so the zip here
+/// can never mis-pair; a var with no matching component would be left unset
+/// and terraform would fail closed on the missing required variable.
+///
+/// BUG FIXED (historical): earlier code set `TF_VAR_<name> = <whole joined
+/// string>` for EVERY name, so a multi-credential offering got ALL credentials
+/// concatenated into EVERY var. The zip maps each name to ITS OWN value.
+fn secret_env_pairs(secret_names: &[String], cred_str: &str) -> Vec<(String, String)> {
     if secret_names.is_empty() || cred_str.is_empty() {
         return Vec::new();
     }
-    secret_names
-        .iter()
-        .zip(cred_str.split(','))
-        .map(|(name, value)| (format!("TF_VAR_{name}"), value.to_string()))
-        .collect()
+    let mut pairs = Vec::with_capacity(secret_names.len() * 2);
+    for (name, value) in secret_names.iter().zip(cred_str.split(',')) {
+        pairs.push((name.clone(), value.to_string()));
+        pairs.push((format!("TF_VAR_{}", name.to_lowercase()), value.to_string()));
+    }
+    pairs
+}
+
+/// FAIL-CLOSED credential arity gate: a live run whose offering declares
+/// secret vars must receive EXACTLY one resolved credential component per
+/// declared name, or terraform is never invoked.
+///
+/// Without this, a partially-resolved credential string would silently leave
+/// trailing declared vars unset (or mis-pair values) and terraform would reach
+/// out to the real provider with wrong/absent credentials. The error message
+/// carries the VARIABLE NAMES and counts only — NEVER a credential value.
+fn credential_arity_error(plan: &RunPlan, components: &[Vec<u8>]) -> Option<RunnerError> {
+    if plan.secret_var_names.is_empty() || components.len() == plan.secret_var_names.len() {
+        return None;
+    }
+    Some(RunnerError::CredInjection(format!(
+        "live run for offering '{}' declares {} secret var(s) [{}] but the resolved \
+         credential material has {} component(s) — refusing to invoke terraform with \
+         mis-paired credentials",
+        plan.offering_id,
+        plan.secret_var_names.len(),
+        plan.secret_var_names.join(", "),
+        components.len()
+    )))
 }
 
 fn run_tf_step(
@@ -988,7 +1051,7 @@ fn run_tf_step(
         .env("CHECKPOINT_DISABLE", "1")
         .env_remove("TF_LOG");
 
-    for (env_key, value) in tf_var_env_pairs(secret_names, cred_str) {
+    for (env_key, value) in secret_env_pairs(secret_names, cred_str) {
         cmd.env(&env_key, value);
     }
 
@@ -2085,38 +2148,195 @@ esac
     }
 
     #[test]
-    fn tf_var_env_pairs_maps_each_name_to_its_own_credential() {
-        // Multi-credential (the bug): each var must get ITS OWN value, not the whole
-        // comma-joined string.
-        let names = vec![
-            "aws_access_key_id".to_string(),
-            "aws_secret_access_key".to_string(),
-        ];
+    fn secret_env_pairs_maps_each_name_to_native_and_tf_var_forms() {
+        // Each declared name yields its verbatim provider-native env var AND the
+        // TF_VAR_<lowercase> terraform-variable alias, each with ITS OWN value
+        // (multi-credential mis-pairing bug guard).
+        let names = vec!["VSPHERE_USER".to_string(), "VSPHERE_PASSWORD".to_string()];
         assert_eq!(
-            tf_var_env_pairs(&names, "AKIAEXAMPLE,secretvalue"),
+            secret_env_pairs(&names, "admin@vsphere.local,hunter2"),
             vec![
+                ("VSPHERE_USER".to_string(), "admin@vsphere.local".to_string()),
                 (
-                    "TF_VAR_aws_access_key_id".to_string(),
-                    "AKIAEXAMPLE".to_string()
+                    "TF_VAR_vsphere_user".to_string(),
+                    "admin@vsphere.local".to_string()
                 ),
-                (
-                    "TF_VAR_aws_secret_access_key".to_string(),
-                    "secretvalue".to_string()
-                ),
+                ("VSPHERE_PASSWORD".to_string(), "hunter2".to_string()),
+                ("TF_VAR_vsphere_password".to_string(), "hunter2".to_string()),
             ]
         );
-        // Single credential still works.
+        // A lowercase declared name still gets both forms (verbatim + alias).
         assert_eq!(
-            tf_var_env_pairs(&["token".to_string()], "abc123"),
-            vec![("TF_VAR_token".to_string(), "abc123".to_string())]
+            secret_env_pairs(&["token".to_string()], "abc123"),
+            vec![
+                ("token".to_string(), "abc123".to_string()),
+                ("TF_VAR_token".to_string(), "abc123".to_string()),
+            ]
         );
         // No names, or no creds → nothing injected.
-        assert!(tf_var_env_pairs(&[], "abc").is_empty());
-        assert!(tf_var_env_pairs(&["x".to_string()], "").is_empty());
-        // Fewer creds than names → the unmatched var is left unset (fail-closed).
-        assert_eq!(
-            tf_var_env_pairs(&["a".to_string(), "b".to_string()], "only-one"),
-            vec![("TF_VAR_a".to_string(), "only-one".to_string())]
+        assert!(secret_env_pairs(&[], "abc").is_empty());
+        assert!(secret_env_pairs(&["x".to_string()], "").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential seam: declaration plumbing + fail-closed arity + injection
+    // -----------------------------------------------------------------------
+
+    /// FAIL CLOSED: a live run whose offering declares secret vars but whose
+    /// resolved material does not pair 1:1 must be refused with the VARIABLE
+    /// NAMES (never values) BEFORE any terraform subprocess — on ALL THREE
+    /// live paths. The binary path is nonexistent on purpose: getting Err
+    /// (not Ok(RunnerUnavailable)) proves the gate fires before the
+    /// availability probe, i.e. before anything could spawn.
+    #[test]
+    fn live_paths_fail_closed_on_credential_arity_mismatch() {
+        let mut plan = live_plan("linux-server-deployment");
+        plan.secret_var_names = crate::iac::live_secret_var_names("linux-server-deployment")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(plan.secret_var_names.len(), 3, "declaration plumbing");
+        // One component for three declared names.
+        let creds = ResolvedCredentials {
+            material: b"only-one-value".to_vec(),
+            descriptor: "test:mismatch".to_string(),
+        };
+
+        let assert_refused = |result: Result<RunOutcome, RunnerError>, path: &str| {
+            let err = result.expect_err(&format!("{path} must fail closed on arity mismatch"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("VSPHERE_USER")
+                    && msg.contains("VSPHERE_PASSWORD")
+                    && msg.contains("VSPHERE_SERVER"),
+                "{path} error must name the declared variables: {msg}"
+            );
+            assert!(
+                msg.contains("3") && msg.contains("1"),
+                "{path} error must carry the counts: {msg}"
+            );
+            assert!(
+                !msg.contains("only-one-value"),
+                "{path} error must NEVER carry a credential value: {msg}"
+            );
+        };
+
+        assert_refused(
+            live_terraform_plan("/nonexistent/terraform-arity", &plan, &creds, None)
+                .map(|a| a.outcome),
+            "plan",
         );
+        assert_refused(
+            live_terraform_apply("/nonexistent/terraform-arity", &plan, &creds, None, b"tfplan"),
+            "apply",
+        );
+        assert_refused(
+            live_terraform_destroy("/nonexistent/terraform-arity", &plan, &creds, None),
+            "destroy",
+        );
+    }
+
+    /// End-to-end injection proof on the LIVE path: the terraform child sees
+    /// exactly the DECLARED vsphere env vars (provider-native + TF_VAR alias),
+    /// each paired with its own value — and nothing else credential-shaped:
+    /// no RYUKI_LIVE_CRED_* passthrough and no undeclared parent env leakage.
+    #[test]
+    fn live_plan_injects_declared_secret_env_vars_and_only_those() {
+        let ws_probe = super::super::workspace::Workspace::new().expect("ws");
+        let probe_dir = ws_probe.path().to_string_lossy().to_string();
+        let shim = ws_probe.path().join("fake-tf-env-dump");
+        // The shim dumps its environment per step, emits valid JSON for `show`,
+        // and writes the stub tfplan for the plan step.
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nenv > \"{probe_dir}/env-$1\"\nif [ \"$1\" = show ]; then echo '{{\"format_version\":\"1.2\",\"resource_changes\":[]}}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nexit 0\n"
+            ),
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        // Poison the PARENT environment: neither the operator-side cred var nor
+        // an arbitrary parent secret may reach the child (env_clear allowlist).
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "parent-cred-canary");
+        std::env::set_var("RYUKI_TEST_PARENT_SECRET", "parent-secret-canary");
+
+        // Declaration plumbing: names come from the OFFERINGS registry.
+        let mut plan = live_plan("linux-server-deployment");
+        plan.secret_var_names = crate::iac::live_secret_var_names("linux-server-deployment")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Resolved material in declared order: USER, PASSWORD, SERVER.
+        let creds = ResolvedCredentials {
+            material: b"user-value-a,pass-value-b,vcenter.test.invalid".to_vec(),
+            descriptor: "test:vsphere".to_string(),
+        };
+
+        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &creds, None)
+            .expect("env-dump shim plan must not error");
+        assert_eq!(result.outcome.status, RunStatus::Planned);
+
+        for step in ["init", "plan"] {
+            let dump = std::fs::read_to_string(ws_probe.path().join(format!("env-{step}")))
+                .unwrap_or_else(|e| panic!("env dump for {step} must exist: {e}"));
+            // Declared provider-native vars, each with ITS OWN value.
+            assert!(dump.contains("VSPHERE_USER=user-value-a"), "{step}: {dump}");
+            assert!(
+                dump.contains("VSPHERE_PASSWORD=pass-value-b"), // secret-scan-allow: fixture value, not a credential
+                "{step}: {dump}"
+            );
+            assert!(
+                dump.contains("VSPHERE_SERVER=vcenter.test.invalid"),
+                "{step}: {dump}"
+            );
+            // Terraform-variable aliases for the bundle's `var.vsphere_*` refs.
+            assert!(
+                dump.contains("TF_VAR_vsphere_user=user-value-a"),
+                "{step}: {dump}"
+            );
+            assert!(
+                dump.contains("TF_VAR_vsphere_password=pass-value-b"), // secret-scan-allow: fixture value, not a credential
+                "{step}: {dump}"
+            );
+            assert!(
+                dump.contains("TF_VAR_vsphere_server=vcenter.test.invalid"),
+                "{step}: {dump}"
+            );
+            // The agent-side env var namespace must NOT pass through, and the
+            // poisoned parent env must not leak (allowlist + env_clear).
+            assert!(
+                !dump.contains("RYUKI_LIVE_CRED"),
+                "{step}: RYUKI_LIVE_CRED_* must never reach the terraform child: {dump}"
+            );
+            assert!(
+                !dump.contains("parent-cred-canary") && !dump.contains("parent-secret-canary"),
+                "{step}: parent env must not leak into the terraform child: {dump}"
+            );
+        }
+
+        // The `show` step gets NO credential injection (it only renders the
+        // saved plan file — no provider contact).
+        let show_dump = std::fs::read_to_string(ws_probe.path().join("env-show"))
+            .expect("env dump for show must exist");
+        assert!(
+            !show_dump.contains("VSPHERE_") && !show_dump.contains("TF_VAR_"),
+            "show step must not receive credentials: {show_dump}"
+        );
+
+        // The credential values must be scrubbed from the returned evidence.
+        for value in ["user-value-a", "pass-value-b", "vcenter.test.invalid"] {
+            assert!(
+                !result.outcome.log.contains(value) && !result.outcome.summary.contains(value),
+                "credential value {value:?} must be scrubbed from evidence"
+            );
+        }
+
+        std::env::remove_var("RYUKI_LIVE_CRED_VSPHERE_USER");
+        std::env::remove_var("RYUKI_TEST_PARENT_SECRET");
     }
 }
