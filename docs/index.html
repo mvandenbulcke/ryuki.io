@@ -140,6 +140,15 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .nav-link:hover{color:var(--text);background:var(--bg-tertiary)}
 .nav-link.active{color:var(--text);background:var(--bg-tertiary)}
 .header-right{display:flex;align-items:center;gap:.6rem}
+.nav-toggle{
+  display:none;flex-direction:column;align-items:center;justify-content:center;gap:4px;
+  width:38px;height:34px;padding:0;cursor:pointer;
+  background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
+}
+.nav-toggle-bar{width:16px;height:2px;border-radius:2px;background:var(--text);transition:transform .2s ease,opacity .2s ease}
+.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(1){transform:translateY(6px) rotate(45deg)}
+.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(2){opacity:0}
+.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(3){transform:translateY(-6px) rotate(-45deg)}
 .gh-btn{
   display:inline-flex;align-items:center;gap:.45rem;
   font-size:.8125rem;font-weight:600;color:var(--text);text-decoration:none;
@@ -312,14 +321,6 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .section-title{font-size:clamp(1.6rem,3.2vw,2.25rem);font-weight:800;letter-spacing:-.025em;margin-bottom:.9rem;line-height:1.15}
 .section-subtitle{font-size:1rem;color:var(--text-secondary);max-width:640px;line-height:1.7}
 
-/* ── Scroll reveal ──────────────────────────────────────── */
-.js [data-reveal]{
-  opacity:0;transform:translateY(24px);
-  transition:opacity .75s ease,transform .75s var(--ease-out);
-  transition-delay:var(--d,0s);
-}
-.js [data-reveal].revealed{opacity:1;transform:none}
-
 /* ── Features grid ──────────────────────────────────────── */
 .features-grid{
   display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));
@@ -339,10 +340,9 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .feature-card:hover{transform:translateY(-4px);box-shadow:var(--card-shadow-hover);border-color:var(--border-strong)}
 .feature-card:hover::before{opacity:1}
-/* fine pointers get a 3D tilt driven by --rx/--ry from the script
-   (scoped to .revealed so the data-reveal entrance offset still plays) */
-.js.fine .feature-card.revealed{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
-.js.fine .feature-card.revealed:hover{
+/* fine pointers get a 3D tilt driven by --rx/--ry from the script */
+.js.fine .feature-card{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
+.js.fine .feature-card:hover{
   --lift:-4px;
   transition:transform .12s ease,box-shadow var(--transition),border-color var(--transition),background var(--transition);
 }
@@ -663,12 +663,19 @@ section.alt .stage{background:var(--section-alt)}
   html{scroll-behavior:auto}
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
   .js .fx{opacity:1;animation:none}
-  .js [data-reveal]{opacity:1;transform:none;transition:none}
 }
 
 /* ── Responsive ─────────────────────────────────────────── */
 @media(max-width:900px){
-  .site-nav{display:none}
+  .nav-toggle{display:inline-flex}
+  .site-nav{
+    display:none;position:absolute;top:100%;left:0;right:0;
+    flex-direction:column;align-items:stretch;gap:.15rem;
+    background:var(--bg);border-bottom:1px solid var(--border);
+    padding:.6rem .9rem .9rem;box-shadow:0 12px 24px rgba(0,0,0,.35);
+  }
+  .site-nav.open{display:flex}
+  .site-nav .nav-link{padding:.65rem .6rem}
   .arch-diagram{flex-direction:column;align-items:center;gap:0}
   .arch-node{max-width:300px;width:100%}
   .arch-link{width:2px;height:46px;justify-content:center}
@@ -721,7 +728,7 @@ section.alt .stage{background:var(--section-alt)}
 </svg>
       <span>ryuki<span class="io">.io</span></span>
     </a>
-    <nav class="site-nav" aria-label="Main">
+    <nav class="site-nav" id="site-nav" aria-label="Main">
       <a href="#features" class="nav-link">Features</a>
       <a href="#lifecycle" class="nav-link">Lifecycle</a>
       <a href="#architecture" class="nav-link">Architecture</a>
@@ -729,6 +736,9 @@ section.alt .stage{background:var(--section-alt)}
       <a href="/documentation.html" class="nav-link">Docs</a>
     </nav>
     <div class="header-right">
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Menu">
+        <span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span>
+      </button>
       <a href="https://github.com/mvandenbulcke/ryuki.io" class="gh-btn" target="_blank" rel="noopener">
         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
         <span class="gh-label">GitHub</span>
@@ -772,7 +782,7 @@ section.alt .stage{background:var(--section-alt)}
 </section>
 
 <!-- ── Stats ────────────────────────────────────────────── -->
-<div class="stats" data-reveal>
+<div class="stats">
   <div class="stats-grid">
     <div class="stat">
       <div class="stat-value" data-count="58">58</div>
@@ -796,14 +806,14 @@ section.alt .stage{background:var(--section-alt)}
 <!-- ── Features ─────────────────────────────────────────── -->
 <section id="features">
   <div class="container">
-    <div data-reveal>
+    <div>
       <div class="section-label">Features</div>
       <h2 class="section-title">Everything your platform team operates</h2>
       <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure &mdash; governed by default, evidenced at every step. Each workflow plans, validates, and records its change against the named providers in a <strong>dry-run-first</strong> model; live provider execution is opt-in and operator-gated.</p>
     </div>
     <div class="features-grid">
 
-      <div class="feature-card" data-reveal style="--d:.0s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         </div>
@@ -812,7 +822,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span><span class="tag">Nutanix AHV</span><span class="tag">Xen</span><span class="tag">KVM</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.07s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         </div>
@@ -821,7 +831,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">Prometheus</span><span class="tag">Datadog</span><span class="tag">Grafana</span><span class="tag">SolarWinds</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.14s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </div>
@@ -830,7 +840,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">Commvault</span><span class="tag">Rubrik</span><span class="tag">Cohesity</span><span class="tag">NetBackup</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.21s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
         </div>
@@ -839,7 +849,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">ServiceNow</span><span class="tag">Excel</span><span class="tag">Graph</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.0s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
         </div>
@@ -848,7 +858,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">Windows</span><span class="tag">Linux</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.07s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </div>
@@ -857,7 +867,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">Packer</span><span class="tag">Windows</span><span class="tag">Linux</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.14s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         </div>
@@ -866,7 +876,7 @@ section.alt .stage{background:var(--section-alt)}
         <div class="feature-tags"><span class="tag">Audit</span><span class="tag">Compliance</span><span class="tag">RBAC</span></div>
       </div>
 
-      <div class="feature-card" data-reveal style="--d:.21s">
+      <div class="feature-card">
         <div class="feature-icon">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
         </div>
@@ -882,12 +892,12 @@ section.alt .stage{background:var(--section-alt)}
 <!-- ── Lifecycle ────────────────────────────────────────── -->
 <section id="lifecycle" class="alt">
   <div class="container">
-    <div data-reveal>
+    <div>
       <div class="section-label">Request Lifecycle</div>
       <h2 class="section-title">Thirteen governed stages. Zero blind spots.</h2>
       <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline — from draft through completion, then into the post-completion lifecycle of protect, publish, maintain, and retire. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
     </div>
-    <div class="pipeline-wrap" data-reveal>
+    <div class="pipeline-wrap">
       <ol class="pipeline">
         <li class="stage" style="--i:0"><span class="stage-num">01</span>Draft</li>
         <li class="stage" style="--i:1"><span class="stage-num">02</span>Intake</li>
@@ -907,27 +917,27 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage"><span class="stage-num">13</span>Retire</li>
       </ol>
     </div>
-    <div class="tour-wrap" data-reveal>
+    <div class="tour-wrap">
       <button class="tour-btn" id="tour-btn" type="button">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
         <span id="tour-label">Play the lifecycle</span>
       </button>
     </div>
-    <p class="pipeline-detail" id="pipeline-detail" data-reveal aria-live="polite">Select a stage to see what it governs.</p>
-    <p class="pipeline-note" data-reveal>A failed request is terminal and keeps its full evidence trail. Break-glass emergency changes follow the same pipeline &mdash; <code>no bypass on evidence</code>.</p>
+    <p class="pipeline-detail" id="pipeline-detail" aria-live="polite">Select a stage to see what it governs.</p>
+    <p class="pipeline-note">A failed request is terminal and keeps its full evidence trail. Break-glass emergency changes follow the same pipeline &mdash; <code>no bypass on evidence</code>.</p>
   </div>
 </section>
 
 <!-- ── Architecture ─────────────────────────────────────── -->
 <section id="architecture">
   <div class="container">
-    <div data-reveal>
+    <div>
       <div class="section-label">Architecture</div>
       <h2 class="section-title">Full-stack Rust control plane</h2>
       <p class="section-subtitle">SSR portal behind a same-origin boundary, a governed API, and a domain engine &mdash; with secrets isolated in Vault. The browser never talks to a provider directly.</p>
     </div>
 
-    <div class="arch-diagram" data-reveal>
+    <div class="arch-diagram">
       <div class="arch-node">
         <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
         <h4>Browser</h4>
@@ -953,7 +963,7 @@ section.alt .stage{background:var(--section-alt)}
       </div>
     </div>
 
-    <div class="arch-sub" data-reveal>
+    <div class="arch-sub">
       <div class="arch-drop">
         <div class="arch-vlink" aria-hidden="true"></div>
         <div class="arch-mini">
@@ -969,9 +979,9 @@ section.alt .stage{background:var(--section-alt)}
         </div>
       </div>
     </div>
-    <p class="arch-caption" data-reveal>Provider access is brokered through the API alone &mdash; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
+    <p class="arch-caption">Provider access is brokered through the API alone &mdash; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
 
-    <div class="arch-wrap" data-reveal>
+    <div class="arch-wrap">
     <table class="arch-table">
       <thead>
         <tr><th>Component</th><th>Stack</th><th>Description</th></tr>
@@ -1021,12 +1031,12 @@ section.alt .stage{background:var(--section-alt)}
 <!-- ── Quick Start ──────────────────────────────────────── -->
 <section id="quickstart" class="alt">
   <div class="container">
-    <div data-reveal>
+    <div>
       <div class="section-label">Quick Start</div>
       <h2 class="section-title">Running in minutes</h2>
       <p class="section-subtitle">Start PostgreSQL, configure the environment, build the workspace, and validate.</p>
     </div>
-    <div class="code-block" data-reveal>
+    <div class="code-block">
       <div class="code-block-header">
         <div class="code-dots" aria-hidden="true"><span></span><span></span><span></span></div>
         <span>shell</span>
@@ -1060,7 +1070,7 @@ section.alt .stage{background:var(--section-alt)}
 <!-- ── CTA ──────────────────────────────────────────────── -->
 <section class="cta">
   <div class="container">
-    <div class="cta-panel" data-reveal>
+    <div class="cta-panel">
       <div class="cta-glow" aria-hidden="true"></div>
       <svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
@@ -1142,22 +1152,7 @@ section.alt .stage{background:var(--section-alt)}
   window.addEventListener('resize',onScroll,{passive:true});
   onScroll();
 
-  /* ── Scroll reveal ── */
   var reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  var revealEls=document.querySelectorAll('[data-reveal]');
-  if(!('IntersectionObserver' in window)||reduced){
-    revealEls.forEach(function(el){el.classList.add('revealed')});
-  }else{
-    var io=new IntersectionObserver(function(entries){
-      entries.forEach(function(entry){
-        if(entry.isIntersecting){
-          entry.target.classList.add('revealed');
-          io.unobserve(entry.target);
-        }
-      });
-    },{rootMargin:'0px 0px -8% 0px',threshold:.08});
-    revealEls.forEach(function(el){io.observe(el)});
-  }
 
   /* ── Stats count-up ── */
   var stats=document.querySelectorAll('[data-count]');
@@ -1633,6 +1628,34 @@ section.alt .stage{background:var(--section-alt)}
       if(current.length)navMap[current[current.length-1]].a.classList.add('active');
     },{rootMargin:'-40% 0px -55% 0px',threshold:0});
     navIds.forEach(function(k){navIo.observe(navMap[k].s)});
+  }
+
+  /* ── Mobile nav toggle ── */
+  var navToggle=document.getElementById('nav-toggle');
+  var siteNav=document.getElementById('site-nav');
+  if(navToggle&&siteNav){
+    function setNav(open){
+      siteNav.classList.toggle('open',open);
+      navToggle.setAttribute('aria-expanded',open?'true':'false');
+    }
+    navToggle.addEventListener('click',function(){
+      var open=!siteNav.classList.contains('open');
+      setNav(open);
+      if(open){
+        var first=siteNav.querySelector('a');
+        if(first)first.focus();
+      }
+    });
+    siteNav.addEventListener('click',function(e){
+      var t=e.target;
+      while(t&&t!==siteNav){
+        if(t.tagName==='A'){setNav(false);break}
+        t=t.parentNode;
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key==='Escape'&&siteNav.classList.contains('open')){setNav(false);navToggle.focus()}
+    });
   }
 
   /* ── Feature cards: cursor ring + 3D tilt ── */
