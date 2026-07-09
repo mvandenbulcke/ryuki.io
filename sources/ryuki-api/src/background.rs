@@ -57,14 +57,17 @@ pub enum IterError<E> {
 /// the IN-FLIGHT transaction IFF it had not yet committed. A drop during
 /// `tx.commit()` leaves the commit outcome unknown, and a work fn that uses MULTIPLE
 /// transactions keeps its already-committed ones. This is safe ONLY because every
-/// one of the 5 work fns is RETRY-IDEMPOTENT (they are recurring scans designed to
-/// be re-run): `expire_leases` (single tx; re-running re-claims the same expired
-/// leases), `agent_offline_scan_once` (per-agent tx, deduped by the
+/// work fn routed through here is RETRY-IDEMPOTENT (they are recurring scans
+/// designed to be re-run): `expire_leases` (single tx; re-running re-claims the
+/// same expired leases), `agent_offline_scan_once` (per-agent tx, deduped by the
 /// `offline_alerted` flag so a re-run never double-emits), `sweep_expired_records`
 /// (idempotent DELETE of expired idempotency rows), `slo_breach_scan_once` /
 /// `budget_breach_scan_once` (breach events deduped by the same `to_status`/marker
-/// pattern as the other scans). So a partial-then-cancelled iteration is simply
-/// re-done next tick with no double-effect.
+/// pattern as the other scans), `notifications_retention_sweep_once` (bounded
+/// DELETE whose predicate re-selects only still-eligible rows), and the loop
+/// monitor's read-only checks. A partial-then-cancelled iteration is simply
+/// re-done next tick with no double-effect. Any NEW work fn added here must
+/// hold the same property.
 pub async fn run_bounded<T, E>(
     timeout: Duration,
     fut: impl std::future::Future<Output = Result<T, E>>,

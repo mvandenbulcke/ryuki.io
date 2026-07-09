@@ -8,7 +8,7 @@
 
 System-engineer platform for multi-site datacenter infrastructure management — **17 provider adapters, 110+ catalog contracts, 3,900+ tests, 100% Rust**.
 
-**Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html)
+**Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html) · [RBAC & Scoping](https://ryuki.io/rbac-and-scoping.html) · [Agents & Live Execution](https://ryuki.io/agents-and-live-execution.html) · [API Reference](https://ryuki.io/api-reference.html) · [all docs](https://ryuki.io/documentation.html)
 
 ## What It Does
 
