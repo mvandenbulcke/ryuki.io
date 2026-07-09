@@ -988,6 +988,14 @@ pub fn hydrate_active_states(states: &[(String, bool)]) {
 mod tests {
     use super::*;
 
+    // Tests that mutate or read a specific site's ACTIVE flag share the
+    // process-wide `SITE_STORE`. Serialize them so `test_activate_deactivate`'s
+    // transient ESMAD activation cannot race the `!is_valid_site("ESMAD")`
+    // readers under parallel execution (a pre-existing flake that intermittently
+    // reddened CI). Poison-safe: a panicking guarded test must not cascade-fail
+    // the others.
+    static ACTIVE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_list_all_sites() {
         let result = list_sites(false).unwrap();
@@ -1017,6 +1025,9 @@ mod tests {
 
     #[test]
     fn test_activate_deactivate() {
+        let _guard = ACTIVE_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let activate_result = activate_site("ESMAD").unwrap();
         assert!(activate_result["active"].as_bool().unwrap());
         let deactivate_result = deactivate_site("ESMAD").unwrap();
@@ -1052,6 +1063,9 @@ mod tests {
 
     #[test]
     fn test_is_valid_site() {
+        let _guard = ACTIVE_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(is_valid_site("DEFRA"));
         assert!(!is_valid_site("NONEXISTENT"));
         assert!(!is_valid_site("ESMAD"));
@@ -1059,6 +1073,9 @@ mod tests {
 
     #[test]
     fn test_is_known_site_is_membership_not_active() {
+        let _guard = ACTIVE_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // is_known_site is membership-only: an active site AND a recognised but
         // inactive site both count; only a truly-unrecognised code does not.
         assert!(is_known_site("DEFRA")); // active
