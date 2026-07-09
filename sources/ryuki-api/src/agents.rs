@@ -2759,6 +2759,37 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
             },
         )
         .await?;
+
+        // Conclude the parent request exactly as a Failed result would have:
+        // a dead-lettered job posts no result, so without this the request
+        // sits `executing` forever with no request-side signal (QA finding).
+        // Safe here because this branch only dead-letters NON-MUTATING modes
+        // (OfflineDryRun/LivePlan) — nothing ran against live infrastructure.
+        // Mutating modes lease-expire to ReconcileRequired for the OPERATOR to
+        // conclude, deliberately fail-closed, and are untouched by this path.
+        // backlink_request_execution brings the step machinery (mark step
+        // Failed, teardown-aware request failure) and the hash-chained audit
+        // row along for free; its status guard skips non-executing requests.
+        let (Ok(request_uuid), Ok(job_uuid)) = (
+            uuid::Uuid::parse_str(&job.request_id),
+            uuid::Uuid::parse_str(&job.id),
+        ) else {
+            continue; // both are DB uuids by construction; never expected
+        };
+        let mode = match job.mode.as_str() {
+            "LivePlan" => JobMode::LivePlan,
+            _ => JobMode::OfflineDryRun, // predicate admits only these two
+        };
+        backlink_request_execution(
+            &mut tx,
+            request_uuid,
+            &JobResultStatus::Failed,
+            &mode,
+            "dead-lettered",
+            "no-result-dead-lettered",
+            job_uuid,
+        )
+        .await?;
     }
     let dead_count = dead_lettered.len() as u64;
 
@@ -6646,6 +6677,30 @@ mod tests {
         .expect("seed expired leased job")
     }
 
+    /// Like `seed_expired_leased_job`, but linked to a REAL request row so the
+    /// dead-letter -> parent-request conclusion path can be exercised.
+    async fn seed_expired_leased_job_for_request(
+        pool: &PgPool,
+        platform: &str,
+        attempts: i32,
+        request_id: Uuid,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
+             delivery_attempts) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(attempts)
+        .fetch_one(pool)
+        .await
+        .expect("seed expired leased job for request")
+    }
+
     /// Re-Lease a job with a past deadline so the next sweep sees it expired.
     async fn release_expired(pool: &PgPool, job_id: Uuid) {
         sqlx::query(
@@ -6763,6 +6818,90 @@ mod tests {
 
         cleanup_dead_letter_events(&pool, job_id).await;
         cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// A dead-lettered NON-MUTATING job concludes its parent request exactly
+    /// like a Failed result would have: executing -> failed, execute stage
+    /// Failed carrying the dead-letter markers, and the hash-chained audit row
+    /// present. Previously the request wedged `executing` forever with no
+    /// request-side signal (QA finding).
+    #[tokio::test]
+    async fn db_dead_letter_concludes_parent_request() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let req_id = Uuid::new_v4();
+        let stages = json!([{
+            "name": "execute", "status": "InProgress",
+            "started_at": null, "completed_at": null,
+            "evidence": [], "metadata": {}
+        }]);
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'dead-letter-backlink-test', \
+             'executing', 'execute', $2::jsonb)",
+        )
+        .bind(req_id)
+        .bind(&stages)
+        .execute(&pool)
+        .await
+        .expect("insert executing request");
+        let job_id =
+            seed_expired_leased_job_for_request(&pool, &platform, MAX_REDISPATCHES, req_id).await;
+
+        expire_leases(&pool).await.expect("expire");
+
+        let (job_status, _) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(job_status, "DeadLettered", "at cap the job dead-letters");
+
+        let (req_status, stages_after): (String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read request");
+        assert_eq!(
+            req_status, "failed",
+            "dead-letter concludes the parent request instead of wedging it"
+        );
+        let execute = stages_after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "execute")
+            .expect("execute stage");
+        assert_eq!(execute["status"], "Failed", "execute stage failed");
+        assert_eq!(
+            execute["metadata"]["result_status"], "dead-lettered",
+            "stage metadata names the dead-letter"
+        );
+
+        let (audit_to_status, audit_detail): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT to_status, detail FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.execution-result' \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row for the dead-letter conclusion");
+        assert_eq!(audit_to_status, "failed");
+        assert_eq!(audit_detail["result_status"], "dead-lettered");
+
+        cleanup_dead_letter_events(&pool, job_id).await;
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(req_id)
+            .execute(&pool)
+            .await
+            .ok();
         pool.close().await;
     }
 
