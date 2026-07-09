@@ -529,14 +529,29 @@ pub async fn get_campaign(
 }
 
 /// List all campaigns.
-pub async fn list_campaigns(pool: &PgPool) -> Result<Vec<RecertificationCampaign>, sqlx::Error> {
+pub async fn list_campaigns(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RecertificationCampaign>, sqlx::Error> {
+    // `created_at DESC` alone is non-unique → `id` (PK) is the tie-breaker (#14).
     let rows: Vec<CampaignRow> = sqlx::query_as(&format!(
-        "SELECT {CAMPAIGN_COLUMNS} FROM recertification_campaigns ORDER BY created_at DESC"
+        "SELECT {CAMPAIGN_COLUMNS} FROM recertification_campaigns \
+         ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
     ))
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Count all recertification campaigns — the pagination total for [`list_campaigns`].
+pub async fn count_campaigns(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM recertification_campaigns")
+        .fetch_one(pool)
+        .await
 }
 
 // ─── DB integration tests ────────────────────────────────────────────────────
@@ -978,8 +993,15 @@ mod access_recertification_db_tests {
         // reviews_count computed from DB
         let _ = inserted.reviews_count; // just verify no decode error
 
-        let campaigns = list_campaigns(&pool).await.expect("list_campaigns");
+        let campaigns = list_campaigns(&pool, 1000, 0)
+            .await
+            .expect("list_campaigns");
         assert!(campaigns.iter().any(|c| c.id == campaign_id));
+        assert_eq!(
+            count_campaigns(&pool).await.expect("count_campaigns"),
+            campaigns.len() as i64,
+            "#14: count_campaigns matches the full unpaged set"
+        );
 
         cleanup_campaign(&pool, &campaign_id).await;
     }

@@ -1720,13 +1720,27 @@ pub async fn tick_once(pool: &PgPool) -> Result<usize, sqlx::Error> {
 }
 
 /// List all schedules, newest-created first.
-pub async fn list_schedules(pool: &PgPool) -> Result<Vec<ScheduleView>, sqlx::Error> {
+pub async fn list_schedules(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ScheduleView>, sqlx::Error> {
+    // `created_at DESC` alone is non-unique → `id` (PK) is the tie-breaker (#14).
     sqlx::query_as(
         "SELECT id, name, job_kind, interval_secs, enabled, next_run_at, last_run_at \
-         FROM schedules ORDER BY created_at DESC",
+         FROM schedules ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
+}
+
+/// Count all schedules — the pagination total for [`list_schedules`].
+pub async fn count_schedules(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM schedules")
+        .fetch_one(pool)
+        .await
 }
 
 /// List the most recent job executions across all schedules, newest first.
@@ -2094,7 +2108,12 @@ mod db_tests {
             return;
         };
         // The migration seeds the platform self-health probe.
-        let schedules = list_schedules(pool).await.unwrap();
+        let schedules = list_schedules(pool, 1000, 0).await.unwrap();
+        assert_eq!(
+            count_schedules(pool).await.unwrap(),
+            schedules.len() as i64,
+            "#14: count_schedules matches the full unpaged set"
+        );
         assert!(
             schedules.iter().any(|s| s.job_kind == "health_probe"),
             "the seeded health probe is listed"

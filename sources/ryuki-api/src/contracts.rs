@@ -7994,25 +7994,41 @@ struct FailurePatternRow {
 /// base with no site dimension, so no per-site scoping applies. The
 /// suggested_article_body (potentially long) is omitted from the list; the
 /// title + summary fields are returned. Empty + `durable:false` when no DB.
-async fn failure_patterns_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+async fn failure_patterns_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
+) -> ApiResult {
     if !check_permission(&session, "request") {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "authentication is required to read failure patterns"})),
         ));
     }
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({"patterns": [], "durable": false})));
+        return Ok(Json(
+            json!({"patterns": [], "durable": false, "total": 0, "limit": limit, "offset": offset}),
+        ));
     };
+    // `occurrence_count, last_seen` are non-unique, so `id` (PK) is the tie-breaker.
     let rows: Vec<FailurePatternRow> = sqlx::query_as(
         "SELECT id::text AS id, error_type, error_message_fragment, occurrence_count, \
                 affected_workflow, affected_components, first_seen, last_seen, \
                 suggested_article_title, status \
-         FROM failure_patterns ORDER BY occurrence_count DESC, last_seen DESC",
+         FROM failure_patterns ORDER BY occurrence_count DESC, last_seen DESC, id DESC \
+         LIMIT $1 OFFSET $2",
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM failure_patterns")
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
     let patterns: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -8030,7 +8046,9 @@ async fn failure_patterns_list(AuthExtractor(session): AuthExtractor) -> ApiResu
             })
         })
         .collect();
-    Ok(Json(json!({"patterns": patterns, "durable": true})))
+    Ok(Json(
+        json!({"patterns": patterns, "durable": true, "total": total, "limit": limit, "offset": offset}),
+    ))
 }
 
 /// Dry-run operations knowledge-suggestion readiness. Turns the static
@@ -21559,18 +21577,37 @@ async fn audit_log_verify(AuthExtractor(session): AuthExtractor) -> ApiResult {
 /// GET /api/ops/scheduler/schedules — list the durable scheduler's registered
 /// recurring jobs (the registry of what runs and when it next/last ran).
 /// Execute-tier gated; read-only. 200 with an empty list in dry-run / no-DB mode.
-async fn scheduler_schedules(AuthExtractor(session): AuthExtractor) -> ApiResult {
+async fn scheduler_schedules(
+    AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
+) -> ApiResult {
     if !check_permission(&session, "execute") {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "Execute-tier access is required to view scheduler state"})),
         ));
     }
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({"schedules": [], "durable": false})));
+        return Ok(Json(
+            json!({"schedules": [], "durable": false, "total": 0, "limit": limit, "offset": offset}),
+        ));
     };
-    match crate::scheduler::list_schedules(pool).await {
-        Ok(schedules) => Ok(Json(json!({"schedules": schedules, "durable": true}))),
+    match crate::scheduler::list_schedules(pool, limit, offset).await {
+        Ok(schedules) => {
+            let total = crate::scheduler::count_schedules(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(json!({
+                "schedules": schedules,
+                "durable": true,
+                "total": total,
+                "limit": limit,
+                "offset": offset
+            })))
+        }
         Err(e) => {
             tracing::error!(error = %e, "listing scheduler schedules failed");
             Err((
@@ -24253,19 +24290,30 @@ async fn chargeback_rate_set(
 }
 
 /// GET /api/metering/chargeback/rates — list the configured cost rates. Audit-tier.
-async fn chargeback_rates_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+async fn chargeback_rates_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(page): Query<AdminListPage>,
+) -> ApiResult {
     if !check_permission(&session, "audit") {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "Audit-tier access is required to read cost rates"})),
         ));
     }
+    // #14: bound the page. `request_type` is the unique key (no tie-breaker needed).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok(Json(json!({"rates": [], "durable": false})));
+        return Ok(Json(
+            json!({"rates": [], "durable": false, "total": 0, "limit": limit, "offset": offset}),
+        ));
     };
     let rows: Vec<(String, f64, String, bool)> = match sqlx::query_as(
-        "SELECT request_type, unit_cost, currency, enabled FROM cost_rates ORDER BY request_type",
+        "SELECT request_type, unit_cost, currency, enabled FROM cost_rates \
+         ORDER BY request_type LIMIT $1 OFFSET $2",
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     {
@@ -24278,13 +24326,19 @@ async fn chargeback_rates_list(AuthExtractor(session): AuthExtractor) -> ApiResu
             ));
         }
     };
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cost_rates")
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
     let rates: Vec<Value> = rows
         .iter()
         .map(|(rt, cost, cur, enabled)| {
             json!({"request_type": rt, "unit_cost": cost, "currency": cur, "enabled": enabled})
         })
         .collect();
-    Ok(Json(json!({ "rates": rates, "durable": true })))
+    Ok(Json(
+        json!({ "rates": rates, "durable": true, "total": total, "limit": limit, "offset": offset }),
+    ))
 }
 
 /// GET /api/metering/chargeback — allocate cost per site by applying the
@@ -31804,16 +31858,27 @@ async fn access_campaign_get(Path(id): Path<String>) -> ApiResult {
     Ok(Json(access_recertification::campaign_response(&campaign)))
 }
 
-async fn access_campaigns_list() -> ApiResult {
-    let campaigns = match get_db() {
-        Some(pool) => crate::repos::access_recertification::list_campaigns(pool)
-            .await
-            .map_err(db_error)?,
-        None => Vec::new(),
+async fn access_campaigns_list(Query(page): Query<AdminListPage>) -> ApiResult {
+    // #14: bound the page (generous default keeps seed-scale callers unaffected).
+    let limit = page.limit.unwrap_or(500).clamp(1, 1000);
+    let offset = page.offset.unwrap_or(0).max(0);
+    let (campaigns, total) = match get_db() {
+        Some(pool) => (
+            crate::repos::access_recertification::list_campaigns(pool, limit, offset)
+                .await
+                .map_err(db_error)?,
+            crate::repos::access_recertification::count_campaigns(pool)
+                .await
+                .map_err(db_error)?,
+        ),
+        None => (Vec::new(), 0),
     };
     Ok(Json(serde_json::json!({
         "source": "db",
         "count": campaigns.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "campaigns": campaigns
     })))
 }
@@ -48464,11 +48529,23 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let resp = failure_patterns_list(AuthExtractor(AuthSession::static_dry_run()))
-            .await
-            .expect("list must succeed");
+        let resp = failure_patterns_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AdminListPage {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list must succeed");
         assert_eq!(resp.0["durable"], json!(true));
         let patterns = resp.0["patterns"].as_array().expect("patterns array");
+        // #14: total matches the returned page (all seed rows fit the default page).
+        assert_eq!(
+            resp.0["total"].as_i64().expect("total is i64"),
+            patterns.len() as i64,
+            "#14: total equals the returned page length at seed scale"
+        );
         assert!(
             !patterns.is_empty(),
             "seeded failure_patterns rows must be returned"
