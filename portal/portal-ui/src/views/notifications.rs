@@ -26,7 +26,9 @@ fn is_safe_request_segment(id: &str) -> bool {
 /// Reads go through the `get_notifications*` server functions (which self-scope
 /// to the verified session and return empty in static/degraded mode); the
 /// mark-all mutation posts through `mark_all_notifications_read` and the per-item
-/// mutation through `mark_notification_read`, both refetching afterwards.
+/// mutation through `mark_notification_read`, both refetching afterwards. In the
+/// hydrated client the unread COUNT additionally polls in the background (see
+/// below) so a notification arriving mid-session surfaces without user action.
 ///
 /// Activating an item marks THAT notification read and, when the notification
 /// references a request, navigates to `/requests/{request_id}` so the operator
@@ -59,18 +61,101 @@ pub fn NotificationBell() -> impl IntoView {
     });
 
     // Refetch on panel open. Both resources are keyed on `()` and otherwise only
-    // refetch after the user's own mark-read actions, so a notification that
-    // arrived after page load would never appear and the badge would stay frozen
-    // for the whole session. Refetching each time the panel opens picks up new
-    // notifications on demand. (The effect depends only on panel_open, not on the
-    // resource values, so there is no refetch loop; a background badge poll is a
-    // possible follow-up.)
+    // refetch after the user's own mark-read actions, so the LIST is fetched on
+    // demand: refetching each time the panel opens picks up new notifications.
+    // (The effect depends only on panel_open, not on the resource values, so
+    // there is no refetch loop. The badge count is additionally kept fresh by
+    // the background poll below.)
     Effect::new(move |_| {
         if panel_open.get() {
             unread.refetch();
             list.refetch();
         }
     });
+
+    // Background badge poll (hydrated client only): refetch the unread COUNT —
+    // never the list — on a fixed period, so a notification arriving mid-session
+    // shows up on the bell without the user opening the panel. Gated to the
+    // hydrate build the same way the shell guards its client-only effects; the
+    // SSR render must never attempt to poll. While the tab is hidden the
+    // interval is stopped (and a defensive in-tick check skips refetches), so
+    // background tabs do not spin; on becoming visible again the badge refetches
+    // immediately and the interval restarts, so a returning user never waits a
+    // full period for the count to catch up.
+    #[cfg(feature = "hydrate")]
+    {
+        use std::time::Duration;
+
+        const UNREAD_POLL_PERIOD: Duration = Duration::from_secs(60);
+
+        /// True when the document reports itself hidden. A missing
+        /// window/document (never expected in the hydrated client) counts as
+        /// visible so the poll degrades to always-on rather than silently dead.
+        fn document_hidden() -> bool {
+            web_sys::window()
+                .and_then(|window| window.document())
+                .map(|document| document.hidden())
+                .unwrap_or(false)
+        }
+
+        // The live interval handle is shared between the visibility listener
+        // and unmount cleanup. A StoredValue works here because IntervalHandle
+        // is a plain Copy + Send id, which keeps every closure below
+        // `Send + Sync` as `on_cleanup` requires (no raw JS types captured).
+        let poll_handle: StoredValue<Option<IntervalHandle>> = StoredValue::new(None);
+
+        let start_poll = move || {
+            if poll_handle.get_value().is_none() {
+                let started = set_interval_with_handle(
+                    move || {
+                        // Defensive: even if a hide transition was missed, a
+                        // hidden tab must not keep hitting the endpoint.
+                        if !document_hidden() {
+                            unread.refetch();
+                        }
+                    },
+                    UNREAD_POLL_PERIOD,
+                );
+                if let Ok(handle) = started {
+                    poll_handle.set_value(Some(handle));
+                }
+            }
+        };
+        let stop_poll = move || {
+            if let Some(handle) = poll_handle.get_value() {
+                handle.clear();
+                poll_handle.set_value(None);
+            }
+        };
+
+        // `visibilitychange` fires at the document and bubbles to the window
+        // (HTML spec), so the window-level helper observes it in every engine
+        // that can run this wasm bundle.
+        let visibility_listener =
+            window_event_listener_untyped("visibilitychange", move |_| {
+                if document_hidden() {
+                    stop_poll();
+                } else {
+                    unread.refetch();
+                    start_poll();
+                }
+            });
+
+        // Component setup runs in the browser during hydration. If the tab is
+        // already hidden (e.g. opened in the background) the listener starts
+        // the poll on the first visible transition instead.
+        if !document_hidden() {
+            start_poll();
+        }
+
+        // Owner cleanups run BEFORE the owner's arena nodes are disposed, so
+        // reading `poll_handle` here is safe; clearing the interval first also
+        // guarantees no tick can fire against a disposed resource.
+        on_cleanup(move || {
+            stop_poll();
+            visibility_listener.remove();
+        });
+    }
 
     let on_toggle = move |_| set_panel_open.update(|open| *open = !*open);
     let on_mark_all = move |_| {
