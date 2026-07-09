@@ -306,6 +306,234 @@ pub fn catalog_readiness_fallbacks() -> Vec<CatalogReadinessSummary> {
     ]
 }
 
+// ── Offering catalog (Catalog tab live read) ────────────────────────────────
+
+/// Mirrors one offering as served by `GET /api/catalog/offerings-contract`
+/// (camelCase wire fields). Unknown wire fields are ignored so catalog
+/// contract additions never break the portal read.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogOffering {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(default)]
+    pub persona: Vec<String>,
+    #[serde(default)]
+    pub required_inputs: Vec<String>,
+    #[serde(default)]
+    pub approvals: Vec<String>,
+    #[serde(default)]
+    pub dry_run_required: bool,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub integration_data: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Mirrors the `GET /api/catalog/offerings-contract` envelope: the catalog
+/// `source` marker plus the category list and the offering set. The
+/// envelope's boundary flags are not consumed by the portal and are ignored
+/// on decode.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiOfferingCatalog {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub offerings: Vec<CatalogOffering>,
+}
+
+/// Portal snapshot for the Catalog tab's offering list. `live` distinguishes
+/// a real API fetch from the labeled static preview so the view can badge the
+/// source honestly; `source` carries the API's own source marker through.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OfferingCatalogSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub categories: Vec<String>,
+    pub offerings: Vec<CatalogOffering>,
+}
+
+impl OfferingCatalogSnapshot {
+    /// Wraps a successful live API fetch, preserving the API's source marker.
+    pub fn from_live(catalog: ApiOfferingCatalog) -> Self {
+        Self {
+            live: true,
+            source: catalog.source,
+            categories: catalog.categories,
+            offerings: catalog.offerings,
+        }
+    }
+}
+
+/// Labeled preview catalog for static-dry-run mode. Titles carry a
+/// "(preview)" marker and `live=false` badges the panel "Static preview" —
+/// never presented as live catalog data.
+pub fn offering_catalog_fallback() -> OfferingCatalogSnapshot {
+    fn preview_offering(
+        id: &str,
+        title: &str,
+        category: &str,
+        priority: &str,
+        status: &str,
+    ) -> CatalogOffering {
+        CatalogOffering {
+            id: id.to_string(),
+            title: format!("{title} (preview)"),
+            category: category.to_string(),
+            priority: priority.to_string(),
+            persona: vec!["Requester".to_string()],
+            required_inputs: vec![
+                "businessPurpose".to_string(),
+                "site".to_string(),
+                "environment".to_string(),
+            ],
+            approvals: vec!["Datacenter Approver".to_string()],
+            dry_run_required: true,
+            evidence: vec!["Request payload summary".to_string()],
+            integration_data: vec!["Site catalog".to_string()],
+            status: status.to_string(),
+        }
+    }
+    OfferingCatalogSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        categories: vec![
+            "Build".to_string(),
+            "Maintain".to_string(),
+            "Protect".to_string(),
+            "Observe".to_string(),
+            "Operate".to_string(),
+            "Retire".to_string(),
+        ],
+        offerings: vec![
+            preview_offering(
+                "windows-server-deployment",
+                "Windows server deployment",
+                "Build",
+                "P0",
+                "active",
+            ),
+            preview_offering(
+                "patch-wave-planning",
+                "Patch wave planning",
+                "Maintain",
+                "P0",
+                "active",
+            ),
+            preview_offering(
+                "vm-decommission-quarantine",
+                "VM decommission quarantine",
+                "Retire",
+                "P1",
+                "planned",
+            ),
+        ],
+    }
+}
+
+// ── Hardware inventory (Inventory tab live read) ────────────────────────────
+
+/// Mirrors one hardware asset as served by
+/// `GET /api/datacenter/hardware/inventory` (bare array of snake_case
+/// objects; the enum columns arrive as their PascalCase variant names, e.g.
+/// vendor "HPE", support_status "Supported", lifecycle_status "Production").
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HardwareAssetSummary {
+    pub id: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub serial_number: String,
+    #[serde(default)]
+    pub site: String,
+    #[serde(default)]
+    pub cluster: String,
+    #[serde(default)]
+    pub warranty_expiry: String,
+    #[serde(default)]
+    pub firmware_baseline: String,
+    #[serde(default)]
+    pub firmware_installed: String,
+    #[serde(default)]
+    pub support_status: String,
+    #[serde(default)]
+    pub lifecycle_status: String,
+    #[serde(default)]
+    pub last_health_check: String,
+}
+
+/// Portal snapshot for the Inventory tab's hardware asset list. `total` is
+/// the API's filtered total (from `X-Total-Count`) — the fetched page may
+/// carry fewer rows. `live` distinguishes a real API fetch from the labeled
+/// static preview.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HardwareInventorySnapshot {
+    pub live: bool,
+    pub total: u64,
+    pub assets: Vec<HardwareAssetSummary>,
+}
+
+/// Labeled preview asset rows for static-dry-run mode. Serial numbers carry a
+/// PREVIEW marker and `live=false` badges the panel "Static preview" — never
+/// presented as live inventory.
+pub fn hardware_inventory_fallback() -> HardwareInventorySnapshot {
+    fn preview_asset(
+        id: &str,
+        vendor: &str,
+        model: &str,
+        site: &str,
+        cluster: &str,
+        lifecycle_status: &str,
+    ) -> HardwareAssetSummary {
+        HardwareAssetSummary {
+            id: id.to_string(),
+            vendor: vendor.to_string(),
+            model: model.to_string(),
+            serial_number: format!("PREVIEW-{id}"),
+            site: site.to_string(),
+            cluster: cluster.to_string(),
+            warranty_expiry: "2027-01-01T00:00:00Z".to_string(),
+            firmware_baseline: "2025.09".to_string(),
+            firmware_installed: "2025.09".to_string(),
+            support_status: "Supported".to_string(),
+            lifecycle_status: lifecycle_status.to_string(),
+            last_health_check: "2026-06-13T08:00:00Z".to_string(),
+        }
+    }
+    HardwareInventorySnapshot {
+        live: false,
+        total: 2,
+        assets: vec![
+            preview_asset(
+                "asset-1",
+                "HPE",
+                "ProLiant DL380 Gen11",
+                "DEFRA",
+                "cluster-a",
+                "Production",
+            ),
+            preview_asset(
+                "asset-2",
+                "Lenovo",
+                "ThinkSystem SR650 V3",
+                "DEMUC",
+                "cluster-b",
+                "Extended",
+            ),
+        ],
+    }
+}
+
 pub fn audit_workflow_fallbacks() -> Vec<AuditWorkflowSummary> {
     vec![
         AuditWorkflowSummary {
@@ -2914,6 +3142,94 @@ mod ssr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offering_catalog_decodes_canonical_offerings_contract_envelope() {
+        // Canonical GET /api/catalog/offerings-contract shape (camelCase
+        // offering fields; envelope boundary flags are ignored on decode).
+        let body = r#"{
+            "source": "static-seed",
+            "catalogMode": "planned-offerings",
+            "catalogReadOnly": true,
+            "categories": ["Build", "Maintain"],
+            "offerings": [
+                {
+                    "id": "windows-server-deployment",
+                    "title": "Windows server deployment",
+                    "category": "Build",
+                    "priority": "P0",
+                    "persona": ["Requester"],
+                    "requiredInputs": ["businessPurpose", "site"],
+                    "approvals": ["Datacenter Approver"],
+                    "dryRunRequired": true,
+                    "evidence": ["Request payload summary"],
+                    "integrationData": ["vCenter"],
+                    "status": "active"
+                }
+            ]
+        }"#;
+        let catalog: ApiOfferingCatalog =
+            serde_json::from_str(body).expect("offerings envelope must decode");
+        assert_eq!(catalog.source, "static-seed");
+        assert_eq!(catalog.categories, vec!["Build", "Maintain"]);
+        assert_eq!(catalog.offerings.len(), 1);
+        let offering = &catalog.offerings[0];
+        assert_eq!(offering.id, "windows-server-deployment");
+        assert_eq!(offering.required_inputs, vec!["businessPurpose", "site"]);
+        assert!(offering.dry_run_required);
+        assert_eq!(offering.status, "active");
+
+        let snapshot = OfferingCatalogSnapshot::from_live(catalog);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.source, "static-seed");
+        assert_eq!(snapshot.offerings.len(), 1);
+
+        // The static preview is honestly labeled, never `live`.
+        let preview = offering_catalog_fallback();
+        assert!(!preview.live);
+        assert!(preview
+            .offerings
+            .iter()
+            .all(|offering| offering.title.contains("(preview)")));
+    }
+
+    #[test]
+    fn hardware_asset_decodes_canonical_inventory_row() {
+        // Canonical GET /api/datacenter/hardware/inventory element: the
+        // engine HardwareAsset serialization (snake_case fields, enum columns
+        // as PascalCase variant names, RFC3339 timestamps).
+        let body = r#"[{
+            "id": "6f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b",
+            "vendor": "HPE",
+            "model": "ProLiant DL380 Gen11",
+            "serial_number": "CZJ1234ABC",
+            "site": "DEFRA",
+            "cluster": "cluster-a",
+            "warranty_expiry": "2027-03-01T00:00:00+00:00",
+            "firmware_baseline": "2025.09",
+            "firmware_installed": "2025.03",
+            "support_status": "Supported",
+            "lifecycle_status": "Production",
+            "last_health_check": "2026-06-13T08:00:00+00:00"
+        }]"#;
+        let assets: Vec<HardwareAssetSummary> =
+            serde_json::from_str(body).expect("inventory rows must decode");
+        assert_eq!(assets.len(), 1);
+        let asset = &assets[0];
+        assert_eq!(asset.vendor, "HPE");
+        assert_eq!(asset.serial_number, "CZJ1234ABC");
+        assert_eq!(asset.support_status, "Supported");
+        assert_eq!(asset.lifecycle_status, "Production");
+        assert_ne!(asset.firmware_installed, asset.firmware_baseline);
+
+        // The static preview is honestly labeled, never `live`.
+        let preview = hardware_inventory_fallback();
+        assert!(!preview.live);
+        assert!(preview
+            .assets
+            .iter()
+            .all(|asset| asset.serial_number.starts_with("PREVIEW-")));
+    }
 
     #[test]
     fn api_login_session_decodes_canonical_local_login_response() {

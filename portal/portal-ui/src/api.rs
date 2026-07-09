@@ -62,6 +62,7 @@ const DATACENTER_CHECK_RACK_SPACE_PATH: &str = "/api/datacenter/check-rack-space
 const DATACENTER_CHECK_SWITCHPORTS_PATH: &str = "/api/datacenter/check-switchports-contract";
 const DATACENTER_FULL_READINESS_PATH: &str = "/api/datacenter/full-readiness-contract";
 const DATACENTER_SITES_PATH: &str = "/api/datacenter/sites-contract";
+const HARDWARE_INVENTORY_PATH: &str = "/api/datacenter/hardware/inventory";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiPathError {
@@ -143,6 +144,13 @@ pub fn inventory_resource_overview_path() -> &'static str {
 
 pub fn inventory_ownership_risk_path() -> &'static str {
     INVENTORY_OWNERSHIP_RISK_PATH
+}
+
+/// The DB-backed hardware asset list (`GET /api/datacenter/hardware/inventory`,
+/// paged; the filtered total rides in `X-Total-Count`). The Inventory tab's
+/// live read surface.
+pub fn hardware_inventory_path() -> &'static str {
+    HARDWARE_INVENTORY_PATH
 }
 
 pub fn cluster_capacity_admission_path() -> &'static str {

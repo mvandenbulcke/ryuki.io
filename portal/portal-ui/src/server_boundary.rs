@@ -21,7 +21,8 @@ use crate::api::{
     datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
     datacenter_sites_path, dry_run_plan_path, emergency_change_path,
     evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
-    integrations_path, inventory_ownership_risk_path, inventory_resource_overview_path,
+    hardware_inventory_path, integrations_path, inventory_ownership_risk_path,
+    inventory_resource_overview_path,
     notifications_path, notifications_read_all_path, notifications_unread_count_path,
     operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
     platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
@@ -61,9 +62,11 @@ use crate::models::AgentJobSummary;
 use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
-    actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
+    actions_for_stage, auth_session_fallback, hardware_inventory_fallback,
+    offering_catalog_fallback, platform_health_fallback, platform_status_fallback,
     platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiEvidencePack,
-    ApiExecutionJob, ApiLoginSession, ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
+    ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog, ApiPlatformSummary, ApiRequestDetail,
+    ApiRequestSummary, HardwareAssetSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -79,12 +82,12 @@ use crate::models::{
     CreateIntegrationPayload, CreateRequestPayload, CreateTokenPayload, CreateTokenResult,
     DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
     DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
-    EvidencePackExport, EvidenceSummary, ExecutionJob, IntegrationSummary, IntegrationTestResult,
-    InventoryResourceSummary, NotificationSummary, OperationRunSummary, PlatformHealth,
-    PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
-    PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
-    RequestSummary, RevokeResult, SecretReferenceSummary, StageActionResponse,
-    UpdateIntegrationPayload,
+    EvidencePackExport, EvidenceSummary, ExecutionJob, HardwareInventorySnapshot,
+    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, NotificationSummary,
+    OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth, PlatformSettingsSummary,
+    PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary,
+    RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult,
+    SecretReferenceSummary, StageActionResponse, UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -122,6 +125,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     dry_run_plan_path,
     inventory_resource_overview_path,
     inventory_ownership_risk_path,
+    hardware_inventory_path,
     cluster_capacity_admission_path,
     catalog_offerings_path,
     catalog_recommendations_path,
@@ -3386,6 +3390,85 @@ fn static_preview_audit_trail(request_id: &str) -> Vec<AuditEventRow> {
         actor_roles: vec![],
         outcome: None,
     }]
+}
+
+// ── Catalog and inventory live-read server functions ───────────────────────
+
+/// Reads the offering catalog through the allowlisted
+/// `GET /api/catalog/offerings-contract` read endpoint. Live mode fetches and
+/// parses the API's catalog envelope (source marker, categories, offerings);
+/// static mode serves a labeled preview. A live API that is unreachable
+/// surfaces an error so the Catalog view renders an explicit degraded state
+/// rather than fabricated offerings.
+#[server(prefix = "/portal/api", endpoint = "catalog-offerings-data")]
+pub async fn get_catalog_offerings() -> Result<OfferingCatalogSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(catalog_offerings_path())
+        .map_err(|_| ServerFnError::new("catalog offerings API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(offering_catalog_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let catalog: ApiOfferingCatalog = response
+                .json()
+                .map_err(|_| ServerFnError::new("catalog offerings response was malformed"))?;
+            Ok(OfferingCatalogSnapshot::from_live(catalog))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "catalog offerings fetch failed",
+        ))),
+        // Live mode never substitutes preview offerings for an unreachable
+        // API; the Catalog view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Reads the hardware asset list through the allowlisted
+/// `GET /api/datacenter/hardware/inventory` read endpoint (DB-backed, paged;
+/// the filtered total rides in `X-Total-Count`). Live mode fetches one
+/// bounded page; static mode serves a labeled preview. A live API that is
+/// unreachable surfaces an error so the Inventory view renders an explicit
+/// degraded state rather than stale or fabricated assets.
+#[server(prefix = "/portal/api", endpoint = "hardware-inventory-data")]
+pub async fn get_hardware_inventory() -> Result<HardwareInventorySnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(hardware_inventory_path())
+        .map_err(|_| ServerFnError::new("hardware inventory API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(hardware_inventory_fallback());
+    }
+    // One bounded page keeps the read-only table useful without unbounded
+    // payloads (the API clamps limit to 1000); the filtered total still
+    // arrives via the X-Total-Count header for the "N of M" display.
+    let fetch_path = format!("{path}?limit=100");
+    let session_id = session_id_from_request().await;
+    match upstream.get(&fetch_path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let assets: Vec<HardwareAssetSummary> = response
+                .json()
+                .map_err(|_| ServerFnError::new("hardware inventory response was malformed"))?;
+            let total = response.total_count.unwrap_or(assets.len() as u64);
+            Ok(HardwareInventorySnapshot {
+                live: true,
+                total,
+                assets,
+            })
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "hardware inventory fetch failed",
+        ))),
+        // Live mode never substitutes preview assets for an unreachable API;
+        // the Inventory view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 // ── Integration server functions ──────────────────────────────────────────

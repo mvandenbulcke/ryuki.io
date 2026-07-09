@@ -18,18 +18,20 @@ use crate::models::{
     catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session,
     normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
     rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
-    AdminTokenSummary, AuditEventRow, AuthSession, CmdbActionResult, CreateTokenPayload,
+    AdminTokenSummary, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult,
+    CreateTokenPayload, HardwareAssetSummary, HardwareInventorySnapshot, OfferingCatalogSnapshot,
     PlatformSettingsSummary, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
-    get_admin_platform_settings, get_auth_session, get_boundary_status, get_platform_health,
-    get_platform_status, load_admin_sessions, load_admin_tokens, load_portal_activity_run_state,
-    load_portal_evidence_summary_status, load_portal_inventory_capacity_status,
-    reset_platform_settings, revoke_admin_session, revoke_admin_token, save_platform_settings,
-    PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
-    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
-    PortalSecretReferenceSnapshot, PortalServerBoundary,
+    get_admin_platform_settings, get_auth_session, get_boundary_status, get_catalog_offerings,
+    get_hardware_inventory, get_platform_health, get_platform_status, load_admin_sessions,
+    load_admin_tokens, load_portal_activity_run_state, load_portal_evidence_summary_status,
+    load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
+    revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
+    PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
+    PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
+    PortalServerBoundary,
 };
 use crate::views::agents::AgentListView;
 use crate::views::approvals::ApprovalsList;
@@ -156,12 +158,16 @@ pub fn DashboardWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/catalog` — catalog readiness and the request-intake preview.
+/// `/catalog` — the offering catalog served by the platform API, plus
+/// contract readiness and the request-intake preview.
 #[component]
 pub fn CatalogWorkspaceView() -> impl IntoView {
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="catalog"/>
+            <section class="workspace-detail-grid" aria-label="Offering catalog">
+                <CatalogOfferingsPanel/>
+            </section>
             <section class="workspace-detail-grid" aria-label="Catalog workspace details">
                 <CatalogWorkspaceDetail/>
                 <RequestIntakePreview/>
@@ -255,12 +261,16 @@ pub fn ActivityWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/inventory` — freshness, coverage, and capacity admission summaries.
+/// `/inventory` — the hardware asset list served by the platform API, plus
+/// freshness, coverage, and capacity admission summaries.
 #[component]
 pub fn InventoryWorkspaceView() -> impl IntoView {
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="inventory"/>
+            <section class="workspace-detail-grid" aria-label="Hardware asset inventory">
+                <HardwareInventoryPanel/>
+            </section>
             <section class="workspace-detail-grid" aria-label="Inventory workspace details">
                 <InventoryWorkspaceDetail/>
             </section>
@@ -392,6 +402,383 @@ pub fn AgentsWorkspaceView() -> impl IntoView {
                 </Show>
             </section>
         </div>
+    }
+}
+
+/// Badge class for an offering lifecycle status chip: `active` offerings are
+/// requestable today, `planned` ones are visible-but-not-yet-orderable.
+fn offering_status_badge(status: &str) -> &'static str {
+    match status {
+        "active" => "badge good",
+        "planned" => "badge stale",
+        "deprecated" | "retired" => "badge bad",
+        _ => "badge neutral",
+    }
+}
+
+/// One offering row for the catalog table: title, category, priority,
+/// status, approval route, input count, and the dry-run gate.
+fn offering_row(offering: CatalogOffering) -> impl IntoView {
+    let status_class = offering_status_badge(&offering.status);
+    let status_text = offering.status.clone();
+    let approvals = if offering.approvals.is_empty() {
+        "—".to_string()
+    } else {
+        offering.approvals.join(", ")
+    };
+    let input_count = offering.required_inputs.len();
+    let inputs_label = if input_count == 1 {
+        "1 input".to_string()
+    } else {
+        format!("{input_count} inputs")
+    };
+    let dry_run_chip = if offering.dry_run_required {
+        view! { <span class="badge warn">"Dry-run required"</span> }.into_any()
+    } else {
+        view! { <span class="badge neutral">"No dry-run gate"</span> }.into_any()
+    };
+
+    view! {
+        <tr>
+            <td>
+                <strong>{offering.title.clone()}</strong>
+                <p class="table-note">{offering.id.clone()}</p>
+            </td>
+            <td><span class="badge neutral">{offering.category.clone()}</span></td>
+            <td>{offering.priority.clone()}</td>
+            <td><span class=status_class>{status_text}</span></td>
+            <td>{approvals}</td>
+            <td>{inputs_label}</td>
+            <td>{dry_run_chip}</td>
+        </tr>
+    }
+}
+
+/// The offering catalog panel for a successfully-loaded snapshot. Live data
+/// is badged with the API's own source marker; the static preview keeps the
+/// honest "Static preview" label.
+fn catalog_offerings_panel(snapshot: OfferingCatalogSnapshot) -> impl IntoView {
+    let total = snapshot.offerings.len();
+    let category_count = snapshot.categories.len();
+    let count_label = format!(
+        "{total} {} across {category_count} {}",
+        if total == 1 { "offering" } else { "offerings" },
+        if category_count == 1 {
+            "category"
+        } else {
+            "categories"
+        },
+    );
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live catalog · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let categories = snapshot.categories.clone();
+    let body = if snapshot.offerings.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No offerings in the catalog yet"</p>
+                <p class="table-note">
+                    "Offerings appear here with their category, approval route, required inputs, and dry-run gate as the catalog is populated."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="Offering catalog table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Offering"</th>
+                            <th scope="col">"Category"</th>
+                            <th scope="col">"Priority"</th>
+                            <th scope="col">"Status"</th>
+                            <th scope="col">"Approvals"</th>
+                            <th scope="col">"Inputs"</th>
+                            <th scope="col">"Execution gate"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.offerings.into_iter().map(offering_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="offering-catalog-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Catalog"</span>
+                    <h2 id="offering-catalog-title">"Offering catalog"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "Every offering the platform can plan — with its approval route, required inputs, and dry-run gate. " {count_label} "."
+            </p>
+            <div class="role-chips" aria-label="Catalog categories">
+                {categories
+                    .into_iter()
+                    .map(|category| view! { <span class="role-chip">{category}</span> })
+                    .collect_view()}
+            </div>
+            {body}
+        </article>
+    }
+}
+
+/// `/catalog` flagship surface — the offering catalog served by
+/// `GET /api/catalog/offerings-contract`. Live mode renders what the API
+/// returns; static mode renders a labeled preview. Never shows stale or
+/// fabricated data — an unreachable API renders an explicit degraded state.
+#[component]
+fn CatalogOfferingsPanel() -> impl IntoView {
+    let catalog = Resource::new(|| (), |_| get_catalog_offerings());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="offering-catalog-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Catalog"</span>
+                            <h2 id="offering-catalog-title">"Offering catalog"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match catalog.await {
+                        Ok(snapshot) => catalog_offerings_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="offering-catalog-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Catalog"</span>
+                                            <h2 id="offering-catalog-title">"Offering catalog"</h2>
+                                        </div>
+                                        <span class="badge bad">"Catalog unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Offering catalog unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the offering catalog cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Badge class for a hardware support-status chip.
+fn support_status_badge(status: &str) -> &'static str {
+    match status {
+        "Supported" => "badge good",
+        "Expiring" => "badge warn",
+        "Expired" => "badge bad",
+        _ => "badge neutral",
+    }
+}
+
+/// Badge class for a hardware lifecycle-status chip.
+fn lifecycle_status_badge(status: &str) -> &'static str {
+    match status {
+        "Production" => "badge good",
+        "Extended" | "Retiring" => "badge warn",
+        "Retired" => "badge stale",
+        _ => "badge neutral",
+    }
+}
+
+/// One hardware asset row: model/serial, placement, firmware compliance
+/// (installed vs. baseline), support and lifecycle chips, and timestamps.
+fn hardware_asset_row(asset: HardwareAssetSummary) -> impl IntoView {
+    let support_class = support_status_badge(&asset.support_status);
+    let lifecycle_class = lifecycle_status_badge(&asset.lifecycle_status);
+    let firmware_chip = if asset.firmware_installed == asset.firmware_baseline {
+        view! { <span class="badge good">"Compliant"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Drift"</span> }.into_any()
+    };
+    let firmware_note = format!(
+        "{} / baseline {}",
+        asset.firmware_installed, asset.firmware_baseline
+    );
+    let warranty = condense_timestamp(&asset.warranty_expiry);
+    let last_check = condense_timestamp(&asset.last_health_check);
+
+    view! {
+        <tr>
+            <td>
+                <strong>{asset.model.clone()}</strong>
+                <p class="table-note">{asset.serial_number.clone()}</p>
+            </td>
+            <td>{asset.vendor.clone()}</td>
+            <td>{asset.site.clone()}</td>
+            <td>{asset.cluster.clone()}</td>
+            <td>
+                {firmware_chip}
+                <p class="table-note">{firmware_note}</p>
+            </td>
+            <td><span class=support_class>{asset.support_status.clone()}</span></td>
+            <td><span class=lifecycle_class>{asset.lifecycle_status.clone()}</span></td>
+            <td class="cell-date">{warranty}</td>
+            <td class="cell-date">{last_check}</td>
+        </tr>
+    }
+}
+
+/// The hardware inventory panel for a successfully-loaded snapshot. Live data
+/// is badged as such with the page/total counts; the static preview keeps the
+/// honest "Static preview" label.
+fn hardware_inventory_panel(snapshot: HardwareInventorySnapshot) -> impl IntoView {
+    let shown = snapshot.assets.len() as u64;
+    let total = snapshot.total;
+    let count_label = if total > shown {
+        format!("Showing {shown} of {total} assets")
+    } else if total == 1 {
+        "1 asset".to_string()
+    } else {
+        format!("{total} assets")
+    };
+    let source_badge = if snapshot.live {
+        view! { <span class="badge good">"Live inventory"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let body = if snapshot.assets.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No hardware assets recorded yet"</p>
+                <p class="table-note">
+                    "Assets appear here with their site, cluster, firmware compliance, support window, and lifecycle status as inventory is registered."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="Hardware asset table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Asset"</th>
+                            <th scope="col">"Vendor"</th>
+                            <th scope="col">"Site"</th>
+                            <th scope="col">"Cluster"</th>
+                            <th scope="col">"Firmware"</th>
+                            <th scope="col">"Support"</th>
+                            <th scope="col">"Lifecycle"</th>
+                            <th scope="col">"Warranty until"</th>
+                            <th scope="col">"Last check"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.assets.into_iter().map(hardware_asset_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="hardware-inventory-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Inventory"</span>
+                    <h2 id="hardware-inventory-title">"Hardware assets"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "The registered hardware estate — placement, firmware compliance, support window, and lifecycle state, read-only. " {count_label} "."
+            </p>
+            {body}
+        </article>
+    }
+}
+
+/// `/inventory` flagship surface — the DB-backed hardware asset list served
+/// by `GET /api/datacenter/hardware/inventory`. Live mode renders what the
+/// API returns; static mode renders a labeled preview. Never shows stale or
+/// fabricated data — an unreachable API renders an explicit degraded state.
+#[component]
+fn HardwareInventoryPanel() -> impl IntoView {
+    let inventory = Resource::new(|| (), |_| get_hardware_inventory());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="hardware-inventory-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Inventory"</span>
+                            <h2 id="hardware-inventory-title">"Hardware assets"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match inventory.await {
+                        Ok(snapshot) => hardware_inventory_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="hardware-inventory-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Inventory"</span>
+                                            <h2 id="hardware-inventory-title">"Hardware assets"</h2>
+                                        </div>
+                                        <span class="badge bad">"Inventory unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Hardware inventory unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the hardware asset list cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
     }
 }
 
