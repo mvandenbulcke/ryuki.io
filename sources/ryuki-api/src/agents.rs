@@ -12446,6 +12446,178 @@ mod tests {
         pool.close().await;
     }
 
+    /// #42 B2-3 FULL LOOP, cross-crate: an applied step + a failing sibling
+    /// triggers the auto-teardown dispatch (a REAL `LiveDestroy` job with a
+    /// REAL CP-minted, step-bound grant via `dispatch_teardown_steps`); the
+    /// AGENT side then runs its REAL trust gate (`evaluate_live_execution`
+    /// with NO plan digest) and REAL result builder (`build_signed_result`,
+    /// Applied, no digest) for that job; and the REAL CP verifier
+    /// (`post_job_result_with_pool`) accepts the signed result, marks the job
+    /// terminal, the step `ToreDown`, and advances the cascade. The runner's
+    /// actual `terraform destroy` execution is proven separately by
+    /// ryuki-runner's real-terraform e2e; here the destroy evidence is canned
+    /// so the test exercises the trust/result loop deterministically.
+    #[tokio::test]
+    async fn db_b23_full_loop_agent_destroy_result_marks_step_tore_down() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // One global CP key for BOTH the teardown grant mint (inside
+        // backlink → dispatch_teardown_steps) and the result verifier.
+        let cp_key = ensure_test_cp_key();
+        let cp_vk = cp_key.verifying_key();
+
+        // Enroll a REAL agent identity on the seeded request's site platform.
+        let identity = ryuki_agent::identity::AgentIdentity::generate();
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let agent_id = format!("b23-agent-{suffix}");
+        let token = seed_agent_from_identity(&pool, &agent_id, "DEFRA", &identity).await;
+
+        // Executing request: a, b Applied (with recorded digests), c Applying.
+        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+
+        // c's LiveApply FAILS → the teardown begins: b (the deepest applied
+        // step) gets a REAL LiveDestroy job + CP-signed step-bound grant.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveApply,
+            "failed",
+            "c-apply-failed",
+            job_c,
+        )
+        .await
+        .expect("backlink c failure");
+        tx.commit().await.unwrap();
+
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(step_of(&plan, "b").await.status, "TearingDown");
+        let destroy_job_id = step_of(&plan, "b")
+            .await
+            .agent_job_id
+            .expect("auto-teardown must mint a LiveDestroy job for b");
+
+        // Lease THE minted destroy job (targeted by id — race-free against any
+        // other Pending DEFRA jobs) and ack it to Running, as the agent would.
+        let attempt = Uuid::new_v4();
+        let fencing = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        let job_row = sqlx::query_as::<_, AgentJobRow>(&format!(
+            "UPDATE agent_jobs \
+             SET status = 'Leased', agent_id = $1, attempt_id = $2, \
+                 lease_generation = lease_generation + 1, fencing_token = $3, \
+                 cp_nonce = $4, \
+                 lease_deadline = NOW() + make_interval(secs => $5), \
+                 updated_at = NOW() \
+             WHERE id = $6 AND status = 'Pending' RETURNING {AGENT_JOB_COLUMNS}"
+        ))
+        .bind(&agent_id)
+        .bind(attempt)
+        .bind(&fencing)
+        .bind(&nonce)
+        .bind(LEASE_TTL_SECS as f64)
+        .bind(destroy_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("lease the minted LiveDestroy job");
+        assert_eq!(job_row.mode, "LiveDestroy", "the minted job is a destroy");
+        ack_to_running(&pool, destroy_job_id, attempt, &fencing).await;
+
+        // Build the protocol Job the agent would receive — INCLUDING the
+        // CP-minted grant (the destroy gate requires it; build_protocol_job
+        // leaves live_context None for the non-live tests).
+        let mut job = build_protocol_job(
+            &job_row,
+            attempt,
+            fencing.clone(),
+            nonce.clone(),
+            job_row.lease_generation,
+        );
+        let grant: VerifiedLiveContext = serde_json::from_value(
+            job_row
+                .live_context
+                .as_ref()
+                .expect("a teardown job must carry its grant")
+                .0
+                .clone(),
+        )
+        .expect("minted grant deserialises");
+        job.live_context = Some(grant);
+
+        // RUN AGENT CODE (1): the REAL trust gate — no plan digest for destroy.
+        let decision = ryuki_agent::live::evaluate_live_execution(&job, &cp_vk, true, None);
+        assert_eq!(
+            decision,
+            ryuki_agent::live::LiveDecision::Proceed,
+            "the CP-minted step-bound grant must pass the agent's destroy gate"
+        );
+
+        // RUN AGENT CODE (2): destroy evidence (canned Applied outcome — the
+        // real terraform destroy is ryuki-runner's e2e) + the REAL
+        // build_signed_result. A LiveDestroy result carries NO digest.
+        let evidence = ryuki_agent::executor::Evidence {
+            status: ryuki_engine::runners::RunStatus::Applied,
+            evidence_bytes: b"Destroy complete! Resources: 1 destroyed. (scrubbed)".to_vec(),
+            evidence_json: Some(serde_json::json!({
+                "summary": "Destroy complete! Resources: 1 destroyed."
+            })),
+        };
+        let agent_body = ryuki_agent::result::build_signed_result(
+            &identity,
+            &agent_id,
+            &job,
+            &evidence,
+            None,
+        )
+        .expect("build_signed_result for a LiveDestroy Applied result must succeed");
+
+        // Cross the crate boundary and feed the REAL CP verifier.
+        let cp_body: ResultBody =
+            serde_json::from_value(serde_json::to_value(&agent_body).expect("serialise"))
+                .expect("CP deserialises the agent ResultBody");
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            destroy_job_id.to_string(),
+            hdrs,
+            cp_body,
+            &pool,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "agent-built LiveDestroy result must pass the CP verifier: {:?}",
+            resp.err()
+        );
+
+        // THE LOOP CLOSES: job terminal, step b ToreDown, cascade advanced to a.
+        let db = read_job_result_row(&pool, destroy_job_id).await;
+        assert_eq!(db.status, "Succeeded", "destroy job must be terminal");
+        let plan = crate::repos::job_steps::load_plan(&pool, req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_of(&plan, "b").await.status,
+            "ToreDown",
+            "the destroyed step must be marked ToreDown by the agent's result"
+        );
+        assert_eq!(
+            step_of(&plan, "a").await.status,
+            "TearingDown",
+            "the reverse-order cascade must advance to a"
+        );
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
     /// A teardown that ITSELF fails halts the rollback: the request fails and
     /// the remaining applied steps are left intact for an operator (no thrash).
     #[tokio::test]

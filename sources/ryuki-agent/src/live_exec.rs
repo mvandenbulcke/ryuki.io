@@ -115,6 +115,23 @@ pub trait LiveExecutor: Send + Sync {
     ///
     /// Accepted mode: `LiveApply` only.
     fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError>;
+
+    /// Execute a live destroy of the step's applied resources (#42 B2-3).
+    ///
+    /// There is NO saved-plan artifact for a destroy: the implementation
+    /// reconstructs the SAME workspace/backend the step's apply used (offering
+    /// IaC bundle + operator backend HCL + job vars) and runs `terraform
+    /// destroy -input=false -auto-approve` — the destruction set comes from
+    /// the STATE the apply wrote into the durable backend, which is the source
+    /// of truth for what this step created.
+    ///
+    /// Callers MUST invoke this ONLY after `evaluate_live_execution` returned
+    /// `Proceed` for the `LiveDestroy` job (step-bound, CP-signed grant) — the
+    /// gate is the sole authorisation for a destroy; `-auto-approve` inside the
+    /// runner is a terraform mechanic, not an approval.
+    ///
+    /// Accepted mode: `LiveDestroy` only.
+    fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +397,55 @@ impl LiveExecutor for RunnerLiveExecutor {
             evidence_json,
         })
     }
+
+    /// Destroy the step's applied resources (#42 B2-3).
+    ///
+    /// Forwards the SAME `backend_config` used by `plan()`/`apply()` (read once
+    /// from `RYUKI_AGENT_BACKEND_HCL` at construction), so the runner's fresh
+    /// workspace re-attaches to the state lineage the step's apply wrote — the
+    /// state decides what gets destroyed. Evidence follows the apply
+    /// conventions: the scrubbed `RunOutcome` serialised as bytes (digest
+    /// input) plus the structured JSON mirror.
+    fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError> {
+        if spec.mode != JobMode::LiveDestroy {
+            return Err(LiveExecError::UnsupportedMode(spec.mode.clone()));
+        }
+
+        let run_plan = Self::make_run_plan(spec)?;
+        let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
+
+        let outcome = match run_plan.runner_kind {
+            RunnerKind::Terraform => ryuki_runner::run_live_destroy(
+                &run_plan,
+                &creds,
+                self.backend_config.as_deref(),
+            )?,
+
+            RunnerKind::Ansible => {
+                // FAIL CLOSED: Ansible offerings have no terraform state and no
+                // generic inverse playbook — there is nothing state-driven to
+                // destroy. Refuse rather than fake a teardown; the CP-side
+                // lease-expiry sweep halts the rollback for the unexecuted job.
+                return Err(LiveExecError::PlanBuild(format!(
+                    "LiveDestroy is not supported for Ansible offering '{}' — \
+                     playbooks have no terraform state to destroy",
+                    run_plan.offering_id
+                )));
+            }
+        };
+
+        let evidence_bytes =
+            serde_json::to_vec(&outcome).map_err(|e| LiveExecError::PlanBuild(e.to_string()))?;
+
+        let evidence_json: Option<Value> =
+            serde_json::to_value(&outcome).ok().filter(|v| !v.is_null());
+
+        Ok(Evidence {
+            status: outcome.status,
+            evidence_bytes,
+            evidence_json,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,12 +466,16 @@ pub struct StubLiveExecutor {
     plan_outcome: LivePlanOutcome,
     /// The evidence to return from `apply()`.
     apply_evidence: Evidence,
+    /// The evidence to return from `destroy()` (#42 B2-3).
+    destroy_evidence: Evidence,
     /// When `true`, `plan()` returns `Err(PlanFailed)` instead of `Ok`.
     plan_should_fail: bool,
     /// Records the number of times `plan()` was called.
     plan_calls: std::sync::atomic::AtomicU32,
     /// Records the number of times `apply()` was called.
     apply_calls: std::sync::atomic::AtomicU32,
+    /// Records the number of times `destroy()` was called.
+    destroy_calls: std::sync::atomic::AtomicU32,
     /// The tfplan bytes most recently received by `apply()`.
     /// Wrapped in a Mutex so tests can read it from the outside.
     last_apply_tfplan: std::sync::Mutex<Vec<u8>>,
@@ -413,13 +483,24 @@ pub struct StubLiveExecutor {
 
 impl StubLiveExecutor {
     /// Construct with explicit plan outcome and apply evidence.
+    ///
+    /// `destroy()` returns canned evidence with the SAME status as
+    /// `apply_evidence` — one "mutating outcome" knob drives both, since a
+    /// given test exercises either the apply or the destroy path.
     pub fn new(plan_outcome: LivePlanOutcome, apply_evidence: Evidence) -> Self {
+        let destroy_evidence = Evidence {
+            status: apply_evidence.status.clone(),
+            evidence_bytes: b"stub destroy evidence".to_vec(),
+            evidence_json: Some(serde_json::json!({"stub_destroy": true})),
+        };
         Self {
             plan_outcome,
             apply_evidence,
+            destroy_evidence,
             plan_should_fail: false,
             plan_calls: std::sync::atomic::AtomicU32::new(0),
             apply_calls: std::sync::atomic::AtomicU32::new(0),
+            destroy_calls: std::sync::atomic::AtomicU32::new(0),
             last_apply_tfplan: std::sync::Mutex::new(vec![]),
         }
     }
@@ -463,6 +544,11 @@ impl StubLiveExecutor {
         self.apply_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Return the number of times `destroy()` was called.
+    pub fn destroy_call_count(&self) -> u32 {
+        self.destroy_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Return the tfplan bytes most recently passed to `apply()`.
     ///
     /// Use this in tests to assert that the bytes thread through unchanged:
@@ -497,12 +583,19 @@ impl StubLiveExecutor {
             evidence_bytes: vec![],
             evidence_json: None,
         };
+        let dummy_destroy = Evidence {
+            status: RunStatus::Failed,
+            evidence_bytes: vec![],
+            evidence_json: None,
+        };
         Self {
             plan_outcome: dummy_outcome,
             apply_evidence: dummy_apply,
+            destroy_evidence: dummy_destroy,
             plan_should_fail: true,
             plan_calls: std::sync::atomic::AtomicU32::new(0),
             apply_calls: std::sync::atomic::AtomicU32::new(0),
+            destroy_calls: std::sync::atomic::AtomicU32::new(0),
             last_apply_tfplan: std::sync::Mutex::new(vec![]),
         }
     }
@@ -526,6 +619,12 @@ impl LiveExecutor for StubLiveExecutor {
         // Record the tfplan bytes for thread-through assertion in tests.
         *self.last_apply_tfplan.lock().expect("mutex not poisoned") = tfplan.to_vec();
         Ok(self.apply_evidence.clone())
+    }
+
+    fn destroy(&self, _spec: &JobSpec) -> Result<Evidence, LiveExecError> {
+        self.destroy_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.destroy_evidence.clone())
     }
 }
 
@@ -623,6 +722,22 @@ mod tests {
         );
     }
 
+    /// destroy() returns the canned evidence and increments its own counter
+    /// (independently of plan/apply counters).
+    #[test]
+    fn stub_destroy_returns_canned_evidence_and_counts() {
+        let stub = StubLiveExecutor::with_plan(b"p", RunStatus::Applied);
+        let spec = make_spec(JobMode::LiveDestroy);
+
+        assert_eq!(stub.destroy_call_count(), 0);
+        let evidence = stub.destroy(&spec).expect("stub destroy must succeed");
+        assert_eq!(evidence.status, RunStatus::Applied);
+        assert!(!evidence.evidence_bytes.is_empty());
+        assert_eq!(stub.destroy_call_count(), 1);
+        assert_eq!(stub.plan_call_count(), 0, "plan counter untouched");
+        assert_eq!(stub.apply_call_count(), 0, "apply counter untouched");
+    }
+
     // -----------------------------------------------------------------------
     // RunnerLiveExecutor — mode guard (no terraform needed)
     // -----------------------------------------------------------------------
@@ -672,6 +787,61 @@ mod tests {
                 Err(LiveExecError::UnsupportedMode(JobMode::OfflineDryRun))
             ),
             "apply must reject OfflineDryRun: {result:?}"
+        );
+    }
+
+    // -- #42 B2-3: destroy() mode + runner-kind guards -----------------------
+
+    #[test]
+    fn runner_live_executor_destroy_rejects_live_apply_and_dry_run_modes() {
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        for mode in [JobMode::LiveApply, JobMode::LivePlan, JobMode::OfflineDryRun] {
+            let spec = make_spec(mode.clone());
+            let result = exec.destroy(&spec);
+            assert!(
+                matches!(result, Err(LiveExecError::UnsupportedMode(ref m)) if *m == mode),
+                "destroy must reject {mode:?}: {result:?}"
+            );
+        }
+    }
+
+    /// FAIL CLOSED: an Ansible offering has no terraform state — destroy()
+    /// must refuse with a clear error, never pretend to tear down.
+    #[test]
+    fn runner_live_executor_destroy_fails_closed_for_ansible_offering() {
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        // patch-maintenance is an Ansible offering (offering_kind_from_slug).
+        let spec = make_spec_with_iac_ref(JobMode::LiveDestroy, "patch-maintenance@v1.0.0");
+        let result = exec.destroy(&spec);
+        match result {
+            Err(LiveExecError::PlanBuild(msg)) => {
+                assert!(
+                    msg.contains("not supported for Ansible"),
+                    "error must explain the Ansible limitation: {msg}"
+                );
+            }
+            other => panic!("Ansible destroy must fail closed with PlanBuild: {other:?}"),
+        }
+    }
+
+    /// Terraform-offering destroy path does not panic and is not UnsupportedMode.
+    /// With terraform absent the runner reports RunnerUnavailable inside the
+    /// evidence; with terraform present a no-backend destroy is a no-op on an
+    /// empty state — both are Ok(Evidence), never a panic.
+    #[test]
+    fn runner_live_executor_destroy_routes_terraform_offering() {
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        let spec = make_spec_with_iac_ref(JobMode::LiveDestroy, "request-preflight@v1.0.0");
+        let result = exec.destroy(&spec);
+        assert!(
+            !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
+            "valid LiveDestroy mode must not return UnsupportedMode: {result:?}"
         );
     }
 

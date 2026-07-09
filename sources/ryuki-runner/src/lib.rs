@@ -35,7 +35,7 @@ pub mod workspace;
 
 use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunnerError, RunnerKind};
 
-pub use live::{run_live_apply, run_live_plan, LivePlanArtifacts};
+pub use live::{run_live_apply, run_live_destroy, run_live_plan, LivePlanArtifacts};
 pub use live_ansible::{run_ansible_live_apply, run_ansible_live_plan};
 pub use ryuki_engine::runners::ResolvedCredentials;
 

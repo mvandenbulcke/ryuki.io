@@ -13,8 +13,8 @@
 //!
 //! ## Live execution (S5b-2b-ii)
 //!
-//! `process_job_live` handles `LivePlan` and `LiveApply` jobs via a
-//! `&dyn LiveExecutor`.  The gate (`evaluate_live_execution`) is checked
+//! `process_job_live` handles `LivePlan`, `LiveApply`, and `LiveDestroy` jobs
+//! via a `&dyn LiveExecutor`.  The gate (`evaluate_live_execution`) is checked
 //! before ANY platform contact; a `Refused` decision immediately produces a
 //! `build_refused_result` without calling plan or apply.  For `LiveApply` the
 //! ordering is:
@@ -31,6 +31,24 @@
 //!
 //! The result is built EXACTLY ONCE (build-once contract) and placed in the
 //! outbox before any POST.
+//!
+//! ## LiveDestroy execution (#42 slice B2-3)
+//!
+//! `LiveDestroy` (the CP's auto compensating teardown, B2-2) follows the same
+//! shape MINUS the plan step — a destroy has no saved plan; the destruction
+//! set is whatever the step's own apply recorded in the durable backend state:
+//!
+//! 1. No pinned CP key → refuse (the gate's grant-signature check needs it).
+//! 2. `evaluate_live_execution(job, cp_key, allow_live, None)` — checks
+//!    allow_live, grant signature, request_id, REQUIRED step binding (an
+//!    unbound legacy grant is refused), expiry.  No digest check by design.
+//! 3. `Refused` → `build_refused_result` (destroy is NEVER called).
+//! 4. `Proceed` → `live_exec.destroy(spec)` → `Evidence { Applied/Failed }`
+//!    (`Applied` → CP marks the step `ToreDown`; `Failed` → CP halts the
+//!    cascade).
+//! 5. `build_signed_result(.., None)` — a destroy result never carries an
+//!    `approved_plan_digest`.
+//! 6. Same durable outbox flow (enqueue-before-post, mark_delivered).
 //!
 //! ## Error strategy
 //!
@@ -161,6 +179,17 @@ pub async fn process_job(
 /// 3. `Proceed` → `plan()`.
 /// 4. `build_signed_result(.., None)` (LivePlan never carries a digest).
 ///
+/// For `LiveDestroy` (#42 B2-3):
+///
+/// 1. `cp_verifying_key` is `None` → refuse immediately (the gate's grant
+///    signature check requires the pinned key; a destroy grant is mandatory).
+/// 2. Gate checks (allow_live, grant sig, request_id, REQUIRED step binding,
+///    expiry — no plan digest: the destruction set comes from the step's own
+///    backend state, not from an approved plan).
+/// 3. Gate `Refused` → refuse, `destroy()` is NEVER called.
+/// 4. Gate `Proceed` → `destroy()`.
+/// 5. `build_signed_result(.., None)` (LiveDestroy never carries a digest).
+///
 /// ## Build-once contract
 ///
 /// `build_signed_result` / `build_refused_result` is called EXACTLY ONCE.
@@ -193,18 +222,75 @@ pub async fn process_job_live(
         }
 
         // -- LiveDestroy ----------------------------------------------------
-        // #42 slice B2-1: the LiveDestroy protocol mode + trust gate
-        // (evaluate_live_destroy) are in place, but the agent's terraform-
-        // destroy EXECUTION is slice B2-3 (it needs a real provider backend to
-        // build + validate, like LiveApply's real apply). Until then, refuse
-        // cleanly so the CP records a terminal LiveRefused rather than the job
-        // sitting Running. The gate itself is unit-tested directly; the CP-side
-        // teardown orchestration that would mint these jobs is slice B2-2.
+        // #42 slice B2-3: gated terraform-destroy execution. The trust gate
+        // (evaluate_live_destroy, B2-1) is the ONLY path to execution: it
+        // requires --allow-live, a CP-signed grant, request binding, a
+        // REQUIRED step binding (legacy unbound grants are rejected — the step
+        // binding IS a destroy's safety bound), and an unexpired grant. There
+        // is deliberately NO plan-digest check: a destroy has no saved plan —
+        // it removes whatever the step's own apply recorded in the durable
+        // backend state (state is the source of truth for the destruction set).
         JobMode::LiveDestroy => {
-            let reason =
-                "LiveDestroy execution is not yet implemented on this agent (#42 slice B2-3)";
-            warn!(job_id = %job.id, "LiveDestroy received but execution is not yet wired (B2-3)");
-            build_refused_result(identity, agent_id, job, reason)?
+            // Fast-path refuse: !allow_live — byte-identical reason to the
+            // gate's own check 1, kept first so refusal precedence matches
+            // both the gate order and LiveApply's fast-path.
+            if !allow_live {
+                let reason = "LiveDestroy requires --allow-live";
+                warn!(job_id = %job.id, "LiveDestroy refused: !allow_live");
+                return enqueue_and_post(
+                    client,
+                    outbox,
+                    job,
+                    build_refused_result(identity, agent_id, job, reason)?,
+                )
+                .await;
+            }
+
+            // Fast-path refuse: no pinned CP key → the gate's signature check
+            // (check 3) cannot run — refuse with an explicit reason instead of
+            // a misleading "bad signature". Mirrors the LiveApply fast-path.
+            let vk = match cp_verifying_key {
+                Some(k) => k,
+                None => {
+                    let reason =
+                        "LiveDestroy refused: no CP public key available for grant verification";
+                    warn!(job_id = %job.id, "LiveDestroy refused: no pinned CP key");
+                    return enqueue_and_post(
+                        client,
+                        outbox,
+                        job,
+                        build_refused_result(identity, agent_id, job, reason)?,
+                    )
+                    .await;
+                }
+            };
+
+            // Gate: checks 1-6 (no digest for a destroy — pass None).
+            match evaluate_live_execution(job, vk, allow_live, None) {
+                crate::live::LiveDecision::Refused(reason) => {
+                    warn!(
+                        job_id = %job.id,
+                        reason = %reason,
+                        "LiveDestroy refused — destroy() will NOT be called"
+                    );
+                    build_refused_result(identity, agent_id, job, &reason)?
+                }
+                crate::live::LiveDecision::Proceed => {
+                    // Gate passed — destroy the step's applied resources.
+                    // Executor errors propagate (mirroring apply's stance): a
+                    // destroy that MAY have partially mutated (e.g. timeout)
+                    // must never be reported as LiveRefused ("declined, no
+                    // mutation"); the job stays Running and the CP's teardown
+                    // lease-expiry sweep halts the rollback.
+                    let destroy_evidence = live_exec.destroy(&job.spec)?;
+
+                    // A LiveDestroy result NEVER carries approved_plan_digest
+                    // (build_signed_result and the CP verifier both reject it).
+                    // Success maps to Applied → the CP marks the step ToreDown;
+                    // Failed → the CP halts the teardown cascade.
+                    build_signed_result(identity, agent_id, job, &destroy_evidence, None)?
+                }
+            }
         }
 
         // -- LivePlan -------------------------------------------------------
@@ -1590,6 +1676,266 @@ mod tests {
         );
         assert_eq!(failing_exec.plan_call_count(), 1, "plan was called once");
         assert_eq!(failing_exec.apply_call_count(), 0, "apply never called");
+    }
+
+    // =======================================================================
+    // #42 B2-3: LiveDestroy pipeline tests — pure/stub, no terraform
+    // =======================================================================
+
+    /// Build a valid step-bound grant (the ONLY grant shape a destroy accepts).
+    fn make_step_grant(
+        cp_sk: &ed25519_dalek::SigningKey,
+        request_id: Uuid,
+        step_job_id: Uuid,
+    ) -> VerifiedLiveContext {
+        let unsigned = VerifiedLiveContext {
+            request_id,
+            // The digest of the plan the step APPLIED — present in the grant but
+            // deliberately unchecked by the destroy gate (no plan-then-apply).
+            approved_plan_digest: sha256_hex(b"the-applied-plan"),
+            approver: "ops-test".to_owned(),
+            expiry: Utc::now() + Duration::hours(1),
+            step_job_id: Some(step_job_id),
+            signature: String::new(),
+        };
+        sign_vlc(unsigned, cp_sk)
+    }
+
+    /// Build a leased LiveDestroy job whose grant is step-bound to its own id.
+    fn make_live_destroy_job_with_step_grant(cp_sk: &ed25519_dalek::SigningKey) -> Job {
+        let request_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let grant = make_step_grant(cp_sk, request_id, job_id);
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "request-preflight@v1.0.0".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveDestroy,
+        };
+        let lease = JobLease {
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            fencing_token: Uuid::new_v4().to_string(),
+            deadline: Utc::now() + Duration::minutes(5),
+            cp_nonce: Uuid::new_v4().to_string(),
+        };
+        Job {
+            id: job_id,
+            platform: "test-platform".to_string(),
+            spec,
+            status: JobStatus::Running,
+            lease: Some(lease),
+            live_context: Some(grant),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveDestroy happy path: step-bound grant → destroy called, Applied
+    // result, NO digest, outbox-enqueued
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_destroy_happy_path_destroy_called_result_applied_no_digest() {
+        let (cp_sk, vk) = cp_keypair();
+        let live_exec = stub_live(b"unused-plan-bytes", RunStatus::Applied);
+        let job = make_live_destroy_job_with_step_grant(&cp_sk);
+        let identity = AgentIdentity::generate();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+
+        // Gate: LiveDestroy with a valid step-bound grant and NO digest → Proceed.
+        let decision = evaluate_live_execution(&job, &vk, true, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Proceed,
+            "gate must Proceed for a valid step-bound destroy grant"
+        );
+
+        // destroy IS called — and it is the ONLY executor call (no plan step).
+        let destroy_evidence = live_exec.destroy(&job.spec).expect("destroy");
+        assert_eq!(live_exec.destroy_call_count(), 1, "destroy called once");
+        assert_eq!(live_exec.plan_call_count(), 0, "a destroy has NO plan step");
+        assert_eq!(live_exec.apply_call_count(), 0, "apply never called");
+
+        // Result: Applied status, LiveDestroy mode, NO approved_plan_digest.
+        let body =
+            build_signed_result(&identity, "test-agent", &job, &destroy_evidence, None)
+                .expect("build_signed_result");
+        assert_eq!(
+            body.job_result.status,
+            ryuki_protocol::JobResultStatus::Applied,
+            "successful destroy maps to Applied (the CP marks the step ToreDown)"
+        );
+        assert_eq!(body.job_result.signed_envelope.mode, JobMode::LiveDestroy);
+        assert!(
+            body.job_result
+                .signed_envelope
+                .approved_plan_digest
+                .is_none(),
+            "a LiveDestroy result must NEVER carry approved_plan_digest"
+        );
+
+        // Outbox contract: enqueue-before-post.
+        outbox.enqueue(&body).expect("enqueue");
+        assert_eq!(outbox.list_pending().expect("list").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveDestroy refusals: the gate is the only path to execution
+    // -----------------------------------------------------------------------
+
+    /// An UNBOUND (legacy whole-request) grant must refuse a destroy — the
+    /// step binding IS the destroy's safety bound. destroy() is never called.
+    #[test]
+    fn live_destroy_refused_unbound_grant_destroy_not_called() {
+        let (cp_sk, vk) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let identity = AgentIdentity::generate();
+
+        let mut job = make_live_destroy_job_with_step_grant(&cp_sk);
+        // Replace with an unbound grant for the SAME request (a valid legacy
+        // LiveApply-shaped grant — exactly the replay the gate must block).
+        job.live_context = Some(make_grant(
+            &cp_sk,
+            job.spec.request_id,
+            &sha256_hex(b"the-applied-plan"),
+        ));
+
+        let decision = evaluate_live_execution(&job, &vk, true, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused(
+                "LiveDestroy requires a step-bound grant".to_owned()
+            ),
+        );
+        assert_eq!(
+            live_exec.destroy_call_count(),
+            0,
+            "destroy must NOT be called when the gate refuses"
+        );
+
+        // The refusal is reported as a signed LiveRefused result.
+        let refused = build_refused_result(
+            &identity,
+            "test-agent",
+            &job,
+            "LiveDestroy requires a step-bound grant",
+        )
+        .expect("refused result must build");
+        assert_eq!(
+            refused.job_result.status,
+            ryuki_protocol::JobResultStatus::LiveRefused
+        );
+        assert!(refused
+            .job_result
+            .signed_envelope
+            .approved_plan_digest
+            .is_none());
+    }
+
+    /// !allow_live refuses a destroy before any executor call.
+    #[test]
+    fn live_destroy_refused_no_allow_live_destroy_not_called() {
+        let (cp_sk, vk) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let job = make_live_destroy_job_with_step_grant(&cp_sk);
+
+        let decision = evaluate_live_execution(&job, &vk, false, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused("LiveDestroy requires --allow-live".to_owned()),
+        );
+        assert_eq!(live_exec.destroy_call_count(), 0, "destroy NOT called");
+    }
+
+    /// No pinned CP key → the fast-path refusal (mirrors LiveApply's) with its
+    /// explicit reason; destroy() is never reached.
+    #[test]
+    fn live_destroy_no_cp_key_destroy_not_called() {
+        let (cp_sk, _) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let identity = AgentIdentity::generate();
+        let job = make_live_destroy_job_with_step_grant(&cp_sk);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+
+        // Mirror process_job_live's fast-path: no key → refused result built
+        // directly, no gate call, no executor call.
+        let refused = build_refused_result(
+            &identity,
+            "test-agent",
+            &job,
+            "LiveDestroy refused: no CP public key available for grant verification",
+        )
+        .expect("refused result must build");
+
+        outbox.enqueue(&refused).expect("enqueue");
+        assert_eq!(live_exec.destroy_call_count(), 0, "destroy NOT called");
+        assert_eq!(
+            refused.job_result.status,
+            ryuki_protocol::JobResultStatus::LiveRefused
+        );
+        assert_eq!(outbox.list_pending().expect("list").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveDestroy failure: a failed destroy is a signed Failed result (the CP
+    // HALTS the cascade on it) — not a refusal, not a dropped job
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_destroy_failed_destroy_reports_signed_failed_result() {
+        let (cp_sk, vk) = cp_keypair();
+        // Stub whose mutating outcome is Failed (destroy evidence mirrors it).
+        let live_exec = stub_live(b"plan", RunStatus::Failed);
+        let job = make_live_destroy_job_with_step_grant(&cp_sk);
+        let identity = AgentIdentity::generate();
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, None),
+            crate::live::LiveDecision::Proceed
+        );
+        let evidence = live_exec.destroy(&job.spec).expect("destroy runs");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("a Failed destroy must still produce a signed result");
+        assert_eq!(
+            body.job_result.status,
+            ryuki_protocol::JobResultStatus::Failed,
+            "failed destroy → Failed (the CP halts the teardown cascade)"
+        );
+        assert!(body
+            .job_result
+            .signed_envelope
+            .approved_plan_digest
+            .is_none());
+    }
+
+    /// FAIL CLOSED: attaching a plan digest to a LiveDestroy result is a
+    /// contract violation the agent refuses to sign (the CP rejects it too).
+    #[test]
+    fn live_destroy_result_with_digest_is_rejected() {
+        let (cp_sk, _) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let job = make_live_destroy_job_with_step_grant(&cp_sk);
+        let identity = AgentIdentity::generate();
+
+        let evidence = live_exec.destroy(&job.spec).expect("destroy");
+        let result = build_signed_result(
+            &identity,
+            "test-agent",
+            &job,
+            &evidence,
+            Some(sha256_hex(b"the-applied-plan")),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(crate::result::ResultError::PlanDigestOnNonLive { .. })
+            ),
+            "LiveDestroy + digest must be refused: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -201,6 +201,67 @@ pub fn run_live_apply(
     live_terraform_apply(DEFAULT_BINARY, plan, creds, backend_config, tfplan)
 }
 
+/// Execute a live Terraform destroy of a step's applied resources (#42 B2-3).
+///
+/// ## Workspace/state reconstruction — which resources get destroyed
+///
+/// A destroy has NO saved plan artifact. `terraform destroy` computes the
+/// destruction set from the STATE, so this function must attach to exactly the
+/// state the step's apply produced. It does that by reconstructing the SAME
+/// workspace inputs `run_live_apply` used: the offering's embedded IaC bundle,
+/// the operator's `backend_config` HCL (written as `backend_override.tf`
+/// before init), and the job vars. `terraform init` with the same backend HCL
+/// connects to the same durable state backend — the state, not the (ephemeral
+/// TempDir) workspace, is the source of truth for what exists and therefore
+/// for what gets destroyed.
+///
+/// The agent passes the same `backend_config` value to apply and destroy
+/// (`RunnerLiveExecutor.backend_config`, read once from the environment), so
+/// the destroy targets the state lineage the apply wrote. OPERATOR NOTE: if no
+/// durable backend is configured anywhere (no `backend_config` and no backend
+/// in the bundle), the apply's local state died with its TempDir — a destroy
+/// then initialises an EMPTY state and exits 0 with "Resources: 0 destroyed"
+/// (a visible no-op in the evidence, not an error). A durable backend is an
+/// operator requirement for live execution, same as for apply.
+///
+/// ## `-auto-approve` — deliberate difference from apply
+///
+/// `run_live_apply` intentionally omits `-auto-approve`: it applies a SAVED,
+/// digest-gated `tfplan` file, which terraform applies without prompting.
+/// Destroy has no saved plan to hand terraform, so `terraform destroy` re-plans
+/// the destruction at run time and — without `-auto-approve` — prompts for
+/// interactive confirmation, which `-input=false` turns into a hard failure.
+/// `-auto-approve` is therefore REQUIRED here. It does not bypass any Ryuki
+/// gate: the human-approval equivalent for a destroy is the CP-signed,
+/// step-bound `LiveDestroy` grant that the agent gate (`evaluate_live_destroy`)
+/// verifies BEFORE this function is ever invoked. Callers MUST keep that gate
+/// as the only path to this function.
+///
+/// Returns `Ok(RunOutcome)` with status `Applied` on success (exit 0 — the
+/// protocol has no dedicated "Destroyed" status; the job MODE `LiveDestroy`
+/// identifies the operation and the CP maps a successful result to the step
+/// status `ToreDown`), `Failed` on non-zero exit, or `RunnerUnavailable` when
+/// terraform is absent.
+///
+/// # Errors
+///
+/// Same conditions as `run_live_plan` / `run_live_apply` (mode guard, missing
+/// IaC, invalid slug/var names, workspace setup, subprocess timeout).
+pub fn run_live_destroy(
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    backend_config: Option<&str>,
+) -> Result<RunOutcome, RunnerError> {
+    if plan.mode != RunMode::Live {
+        return Err(RunnerError::Spawn(format!(
+            "run_live_destroy only accepts RunMode::Live; got {:?}",
+            plan.mode
+        )));
+    }
+
+    live_terraform_destroy(DEFAULT_BINARY, plan, creds, backend_config)
+}
+
 // ---------------------------------------------------------------------------
 // Internal implementations (take binary path for test injection)
 // ---------------------------------------------------------------------------
@@ -701,6 +762,163 @@ fn post_apply_label(verdict: ryuki_engine::post_apply::PostApplyOutcome) -> &'st
     }
 }
 
+/// Core destroy implementation (#42 B2-3).  `binary` is injectable for tests.
+///
+/// Mirrors `live_terraform_apply`'s structure step for step (validation → IaC
+/// resolve → #11 policy gate → availability probe → workspace → init → run),
+/// with two deliberate differences documented on `run_live_destroy`:
+/// no saved-plan artifact (the destruction set comes from the backend STATE the
+/// step's apply wrote) and `-auto-approve` on the destroy step (required —
+/// there is no plan file to carry the approval; the Ryuki approval is the
+/// step-bound CP grant checked by the agent gate before this runs).
+///
+/// The #11 policy gate stays in force for destroy: `terraform destroy` still
+/// evaluates the configuration, and `when = destroy` provisioners execute
+/// during it — an unsafe bundle must be refused before init, exactly as on the
+/// plan/apply paths.
+pub(crate) fn live_terraform_destroy(
+    binary: &str,
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    backend_config: Option<&str>,
+) -> Result<RunOutcome, RunnerError> {
+    // Validate inputs before any workspace or process creation.
+    validate_offering_slug(&plan.offering_id)?;
+    for name in &plan.secret_var_names {
+        validate_var_name(name)?;
+    }
+
+    // Resolve IaC — FAIL CLOSED. The destroy needs the SAME configuration the
+    // apply ran (providers, backend, variable declarations) so terraform can
+    // evaluate it against the state; an unresolvable bundle must refuse rather
+    // than destroy from an empty workspace.
+    let iac_files = super::iac::resolve(&plan.offering_id).ok_or_else(|| {
+        RunnerError::Spawn(format!(
+            "no embedded Terraform IaC for offering '{}' — \
+             refusing to run an empty live workspace",
+            plan.offering_id
+        ))
+    })?;
+
+    // #11 policy gate: refuse unsafe constructs BEFORE init/providers/destroy.
+    if let Some(refusal) = iac_policy_refusal(&iac_files, RunnerKind::Terraform, plan.mode) {
+        return Ok(refusal);
+    }
+
+    // Secret scrubbing components.
+    let components = credential_components(creds.material.as_slice());
+    let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
+    let cred_str = std::str::from_utf8(creds.material.as_slice())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    // Binary availability check — terraform-absent-safe.
+    if !binary_available(binary) {
+        return Ok(RunOutcome {
+            runner_kind: RunnerKind::Terraform,
+            mode: plan.mode,
+            status: RunStatus::RunnerUnavailable,
+            summary: format!("runner unavailable: terraform binary not found at '{binary}'"),
+            log: String::new(),
+            exit_code: None,
+            post_apply: None,
+        });
+    }
+
+    // --- Workspace setup (fresh TempDir — the state lives in the backend) ---
+    // Reconstruct the SAME workspace inputs the apply used: IaC bundle +
+    // operator backend HCL + job vars. `terraform init` with the same backend
+    // attaches to the same state — that state defines what gets destroyed.
+    let ws = Workspace::new()?;
+
+    for (filename, content) in &iac_files {
+        ws.write_file(filename, content.as_bytes())?;
+    }
+
+    if let Some(backend_hcl) = backend_config {
+        // 0600: backend HCL routinely carries state-backend credentials
+        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
+    }
+
+    if !plan.vars.is_empty() {
+        let vars_json = vars_to_json(&plan.vars);
+        ws.write_file_0600("ryuki.auto.tfvars.json", vars_json.as_bytes())?;
+    }
+
+    // --- Step 1: terraform init ---
+    // FAIL CLOSED: non-zero exit → Failed, destroy is never attempted.
+    let init_outcome = run_tf_step(
+        binary,
+        &["init", "-input=false"],
+        ws.path(),
+        &plan.secret_var_names,
+        &cred_str,
+        &secret_refs,
+        true,
+    )?;
+
+    if init_outcome.exit_code != Some(0) {
+        return Ok(RunOutcome {
+            runner_kind: RunnerKind::Terraform,
+            mode: plan.mode,
+            status: RunStatus::Failed,
+            summary: format!(
+                "terraform init failed before destroy (exit {})",
+                init_outcome.exit_code.unwrap_or(-1)
+            ),
+            log: init_outcome.log,
+            exit_code: init_outcome.exit_code,
+            post_apply: None,
+        });
+    }
+
+    // --- Step 2: terraform destroy -input=false -auto-approve ---
+    // `-auto-approve` is REQUIRED here and is a deliberate difference from the
+    // apply step: apply consumes a saved, digest-gated tfplan file (terraform
+    // does not prompt for a saved plan, so apply omits the flag); destroy has
+    // no plan artifact — terraform re-plans the destruction from state and,
+    // without the flag, demands interactive confirmation, which `-input=false`
+    // turns into a hard failure. The approval for a destroy is NOT this flag:
+    // it is the CP-signed, step-bound LiveDestroy grant the agent gate verified
+    // before invoking the runner.
+    let destroy_outcome = run_tf_step(
+        binary,
+        &["destroy", "-input=false", "-no-color", "-auto-approve"],
+        ws.path(),
+        &plan.secret_var_names,
+        &cred_str,
+        &secret_refs,
+        true,
+    )?;
+
+    // Exit 0 → Applied (the protocol has no dedicated "Destroyed" run status;
+    // the LiveDestroy job MODE identifies the operation, and the CP maps a
+    // successful LiveDestroy result to step status `ToreDown`). Non-zero →
+    // Failed, which HALTS the CP-side teardown cascade. No post-apply verdict:
+    // that re-plan convergence check is an apply-specific (#43) concern.
+    let (status, summary) = match destroy_outcome.exit_code {
+        Some(0) => (
+            RunStatus::Applied,
+            extract_destroy_summary(&destroy_outcome.log),
+        ),
+        code => (
+            RunStatus::Failed,
+            format!("terraform destroy failed (exit {})", code.unwrap_or(-1)),
+        ),
+    };
+
+    Ok(RunOutcome {
+        runner_kind: RunnerKind::Terraform,
+        mode: plan.mode,
+        status,
+        summary,
+        log: destroy_outcome.log,
+        exit_code: destroy_outcome.exit_code,
+        post_apply: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -828,6 +1046,20 @@ fn extract_apply_summary(log: &str) -> String {
         }
     }
     "terraform apply completed".to_string()
+}
+
+/// Extract a one-line destroy summary from scrubbed terraform output.
+/// Terraform prints `Destroy complete! Resources: N destroyed.` on success;
+/// an already-empty state yields either `No changes.` or `Destroy complete!
+/// Resources: 0 destroyed.` depending on the terraform version.
+fn extract_destroy_summary(log: &str) -> String {
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Destroy complete!") || trimmed.starts_with("No changes.") {
+            return trimmed.to_string();
+        }
+    }
+    "terraform destroy completed".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1608,344 @@ esac
     }
 
     // -----------------------------------------------------------------------
+    // #42 B2-3: run_live_destroy — mode guard / missing IaC / absent binary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_live_destroy_rejects_dry_run_mode() {
+        let mut plan = live_plan("patch-maintenance");
+        plan.mode = RunMode::DryRun;
+        let result = run_live_destroy(&plan, &dummy_creds(), None);
+        assert!(
+            result.is_err(),
+            "run_live_destroy must reject RunMode::DryRun"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Live") || msg.contains("DryRun"),
+            "error must mention mode; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_live_destroy_fails_closed_on_missing_iac() {
+        let plan = live_plan("no-such-offering-xyz");
+        let result = run_live_destroy(&plan, &dummy_creds(), None);
+        assert!(
+            result.is_err(),
+            "run_live_destroy must fail closed when IaC is missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no embedded") || msg.contains("IaC"),
+            "error must mention missing IaC; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_live_destroy_terraform_absent_returns_unavailable() {
+        let plan = live_plan("patch-maintenance");
+        let result = live_terraform_destroy(
+            "/nonexistent/terraform-fake-live-destroy",
+            &plan,
+            &dummy_creds(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "absent terraform must not return Err for destroy"
+        );
+        assert_eq!(
+            result.unwrap().status,
+            RunStatus::RunnerUnavailable,
+            "absent terraform must return RunnerUnavailable for destroy"
+        );
+    }
+
+    #[test]
+    fn run_live_destroy_accepts_backend_config_without_error() {
+        let plan = live_plan("patch-maintenance");
+        let backend_hcl = "# dummy backend config for destroy test";
+        let result = live_terraform_destroy(
+            "/nonexistent/terraform-fake-live-backend-destroy",
+            &plan,
+            &dummy_creds(),
+            Some(backend_hcl),
+        );
+        assert!(
+            result.is_ok(),
+            "backend_config must not cause Err for destroy when binary absent"
+        );
+        assert_eq!(result.unwrap().status, RunStatus::RunnerUnavailable);
+    }
+
+    // -----------------------------------------------------------------------
+    // #42 B2-3: destroy invocation shape — -auto-approve + -input=false,
+    // and NO tfplan argument (there is no saved plan for a destroy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_destroy_invokes_destroy_with_auto_approve_and_no_tfplan() {
+        let ws_probe = super::super::workspace::Workspace::new().expect("ws");
+        let shim = ws_probe.path().join("fake-tf-destroy-check");
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+case "$1" in
+  version) exit 0 ;;
+  init) exit 0 ;;
+  destroy)
+    found_auto=0
+    found_input=0
+    for arg in "$@"; do
+      if [ "$arg" = "-auto-approve" ]; then found_auto=1; fi
+      if [ "$arg" = "-input=false" ]; then found_input=1; fi
+      if [ "$arg" = "tfplan" ]; then
+        echo "FAIL: tfplan must not be passed to destroy" >&2
+        exit 3
+      fi
+    done
+    if [ "$found_auto" = "0" ]; then
+      echo "FAIL: -auto-approve is REQUIRED for destroy (no saved plan)" >&2
+      exit 2
+    fi
+    if [ "$found_input" = "0" ]; then
+      echo "FAIL: -input=false missing" >&2
+      exit 4
+    fi
+    echo "Destroy complete! Resources: 1 destroyed."
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let plan = live_plan("patch-maintenance");
+        let result =
+            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None);
+        assert!(result.is_ok(), "destroy shim must not error: {result:?}");
+        let outcome = result.unwrap();
+        assert_eq!(
+            outcome.status,
+            RunStatus::Applied,
+            "destroy shim exits 0 → Applied (success); got {:?} log: {}",
+            outcome.status,
+            outcome.log
+        );
+        assert_eq!(
+            outcome.summary, "Destroy complete! Resources: 1 destroyed.",
+            "summary must be the extracted destroy line"
+        );
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // #42 B2-3: destroy failure paths — non-zero destroy exit and failed init
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_destroy_returns_failed_when_destroy_exits_nonzero() {
+        let ws_probe = super::super::workspace::Workspace::new().expect("ws");
+        let shim = ws_probe.path().join("fake-tf-destroy-fail");
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+case "$1" in
+  version) exit 0 ;;
+  init) exit 0 ;;
+  destroy) echo 'Error: provider refused deletion' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let plan = live_plan("patch-maintenance");
+        let outcome =
+            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None)
+                .expect("shim destroy failure must not be Err");
+        assert_eq!(
+            outcome.status,
+            RunStatus::Failed,
+            "non-zero destroy exit must yield Failed (the CP HALTS the cascade)"
+        );
+        assert!(
+            outcome.summary.contains("terraform destroy failed"),
+            "summary must name the failed step: {}",
+            outcome.summary
+        );
+        assert_eq!(outcome.exit_code, Some(1));
+    }
+
+    #[test]
+    fn live_destroy_returns_failed_when_init_fails_destroy_never_runs() {
+        let ws_probe = super::super::workspace::Workspace::new().expect("ws");
+        let shim = ws_probe.path().join("fake-tf-destroy-init-fail");
+        // init exits 1; destroy would SUCCEED (exit 0 + success line) — so if
+        // the outcome were Applied, destroy wrongly ran after a failed init.
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+case "$1" in
+  version) exit 0 ;;
+  init) echo 'Error: backend unreachable' >&2; exit 1 ;;
+  destroy) echo 'Destroy complete! Resources: 1 destroyed.'; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let plan = live_plan("patch-maintenance");
+        let outcome =
+            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None)
+                .expect("init failure must not be Err");
+        assert_eq!(
+            outcome.status,
+            RunStatus::Failed,
+            "failed init must fail closed — destroy must never run; got {:?}",
+            outcome.status
+        );
+        assert!(
+            outcome.summary.contains("init failed before destroy"),
+            "summary must attribute the failure to init: {}",
+            outcome.summary
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #42 B2-3: REAL-terraform end-to-end — apply a step into a shared durable
+    // (local-path) backend, then destroy from a THIRD fresh workspace and
+    // prove the state is the source of truth (skipped when terraform absent).
+    // -----------------------------------------------------------------------
+
+    /// Drives the REAL `terraform` binary through plan → apply → destroy on the
+    /// provider-less `request-preflight` bundle (terraform_data only — builtin
+    /// provider, no registry egress). Each phase runs in its OWN fresh runner
+    /// workspace, exactly like production (plan job / apply job / destroy job
+    /// are separate processes); the operator `backend_config` (here a
+    /// `backend "local"` pointing at a shared absolute path) is what carries
+    /// the state lineage across them. Asserts: (1) the apply records the
+    /// resource in the shared state; (2) `run_live_destroy`'s workspace
+    /// reconstruction attaches to that SAME state and destroys it (Applied +
+    /// "Destroy complete!"); (3) the state afterwards holds zero resources.
+    #[test]
+    fn real_terraform_live_destroy_e2e_applies_then_destroys_shared_state() {
+        if !binary_available("terraform") {
+            eprintln!("SKIP: terraform binary not found");
+            return;
+        }
+
+        // Shared durable state location (outlives all three run workspaces).
+        let state_dir = super::super::workspace::Workspace::new().expect("state dir");
+        let state_path = state_dir.path().join("terraform.tfstate");
+        let backend_hcl = format!(
+            "terraform {{\n  backend \"local\" {{\n    path = \"{}\"\n  }}\n}}\n",
+            state_path.display()
+        );
+
+        let plan = live_plan("request-preflight");
+
+        // Phase 1: live plan (fresh workspace #1) — produces the saved tfplan.
+        let artifacts =
+            live_terraform_plan("terraform", &plan, &dummy_creds(), Some(&backend_hcl))
+                .expect("live plan must not error");
+        if artifacts.outcome.status == RunStatus::RunnerUnavailable {
+            eprintln!("SKIP: terraform reported unavailable");
+            return;
+        }
+        assert_eq!(
+            artifacts.outcome.status,
+            RunStatus::Planned,
+            "plan phase: {}",
+            artifacts.outcome.summary
+        );
+        assert!(!artifacts.tfplan.is_empty(), "saved tfplan must exist");
+
+        // Phase 2: live apply of the SAVED plan (fresh workspace #2) — the
+        // resource lands in the shared backend state.
+        let applied = live_terraform_apply(
+            "terraform",
+            &plan,
+            &dummy_creds(),
+            Some(&backend_hcl),
+            &artifacts.tfplan,
+        )
+        .expect("live apply must not error");
+        assert_eq!(
+            applied.status,
+            RunStatus::Applied,
+            "apply phase: {} log: {}",
+            applied.summary,
+            applied.log
+        );
+        let state_after_apply: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("state file must exist after apply"),
+        )
+        .expect("state JSON must parse");
+        assert!(
+            !state_after_apply["resources"]
+                .as_array()
+                .expect("resources array")
+                .is_empty(),
+            "apply must record the resource in the shared state"
+        );
+
+        // Phase 3: live destroy (fresh workspace #3) — reconstructs the same
+        // IaC + backend, attaches to the SAME state, destroys what it holds.
+        let destroyed =
+            live_terraform_destroy("terraform", &plan, &dummy_creds(), Some(&backend_hcl))
+                .expect("live destroy must not error");
+        assert_eq!(
+            destroyed.status,
+            RunStatus::Applied,
+            "destroy phase must succeed: {} log: {}",
+            destroyed.summary,
+            destroyed.log
+        );
+        assert!(
+            destroyed.summary.starts_with("Destroy complete!"),
+            "summary must be the real terraform destroy line: {}",
+            destroyed.summary
+        );
+        assert!(
+            destroyed.log.contains("Destroy complete!"),
+            "scrubbed evidence log must carry the destroy proof"
+        );
+        assert_eq!(destroyed.exit_code, Some(0));
+
+        // The state — the source of truth — now holds NOTHING.
+        let state_after_destroy: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("state file must exist after destroy"),
+        )
+        .expect("state JSON must parse after destroy");
+        assert!(
+            state_after_destroy["resources"]
+                .as_array()
+                .expect("resources array")
+                .is_empty(),
+            "destroy must remove every resource from the shared state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Helper unit tests
     // -----------------------------------------------------------------------
 
@@ -1398,6 +1968,23 @@ esac
     fn extract_apply_summary_finds_apply_complete() {
         let log = "...\nApply complete! Resources: 2 added, 0 changed, 0 destroyed.";
         assert!(extract_apply_summary(log).starts_with("Apply complete!"));
+    }
+
+    #[test]
+    fn extract_destroy_summary_finds_destroy_complete() {
+        let log = "terraform_data.x: Destroying...\nDestroy complete! Resources: 3 destroyed.";
+        assert_eq!(
+            extract_destroy_summary(log),
+            "Destroy complete! Resources: 3 destroyed."
+        );
+        // Empty-state destroy variants.
+        assert!(extract_destroy_summary("No changes. No objects need to be destroyed.")
+            .starts_with("No changes."));
+        // Fallback when terraform output has neither line.
+        assert_eq!(
+            extract_destroy_summary("something else"),
+            "terraform destroy completed"
+        );
     }
 
     #[test]
