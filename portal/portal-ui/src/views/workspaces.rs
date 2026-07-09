@@ -18,28 +18,34 @@ use crate::models::{
     catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session,
     normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
     rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
-    AdminTokenSummary, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult, CmdbCiDrift,
-    CmdbReconciliationSnapshot, CreateTokenPayload, HardwareAssetSummary,
-    HardwareInventorySnapshot, OfferingCatalogSnapshot, PlatformSettingsSummary,
+    AdminTokenSummary, AgentSummary, ApiRbacRole, AuditEventRow, AuthSession, CatalogOffering,
+    CmdbActionResult, CmdbCiDrift, CmdbReconciliationSnapshot, CreateTokenPayload,
+    EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot, EvidencePackRef,
+    EvidenceRetentionSnapshot, HardwareAssetSummary, HardwareInventorySnapshot,
+    OfferingCatalogSnapshot, PlatformSettingsSummary, RbacRoleCatalogSnapshot,
     ServiceNowQueueItem, ServiceNowQueueSnapshot, ShiftQueueItem, ShiftQueueSnapshot,
     ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
-    get_admin_platform_settings, get_auth_session, get_boundary_status, get_catalog_offerings,
-    get_cmdb_reconciliation_report, get_hardware_inventory, get_platform_health,
+    get_admin_agents, get_admin_platform_settings, get_admin_rbac_roles, get_auth_session,
+    get_boundary_status, get_catalog_offerings, get_cmdb_reconciliation_report,
+    get_evidence_compliance_contract, get_evidence_pack_directory,
+    get_evidence_retention_contract, get_hardware_inventory, get_platform_health,
     get_platform_status, get_servicenow_publish_queue, get_shift_queue_overview,
-    load_admin_sessions, load_admin_tokens, load_portal_activity_run_state,
-    load_portal_evidence_summary_status, load_portal_inventory_capacity_status,
-    reset_platform_settings, revoke_admin_session, revoke_admin_token, save_platform_settings,
-    PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
-    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
-    PortalSecretReferenceSnapshot, PortalServerBoundary,
+    load_admin_sessions, load_admin_tokens,
+    load_portal_activity_run_state, load_portal_evidence_summary_status,
+    load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
+    revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
+    PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
+    PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
+    PortalServerBoundary,
 };
-use crate::views::agents::AgentListView;
+use crate::views::agents::{status_badge_class, AgentListView};
 use crate::views::approvals::ApprovalsList;
 use crate::views::dashboard::DashboardView;
 use crate::views::integrations::IntegrationsList;
+use crate::views::notifications::is_safe_request_segment;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
 use crate::views::request_detail::{audit_action_label, stage_label};
@@ -308,12 +314,22 @@ pub fn CmdbWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/evidence` — redaction, export, and retention readiness.
+/// `/evidence` — the governance evidence hub: the pack directory derived from
+/// the durable audit feed (deep-linking to each request's sealed evidence
+/// pack), the export/retention and compliance-dashboard governance contracts,
+/// and the redaction/export readiness summary.
 #[component]
 pub fn EvidenceWorkspaceView() -> impl IntoView {
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="evidence"/>
+            <section class="workspace-detail-grid" aria-label="Evidence pack directory">
+                <EvidencePackDirectoryPanel/>
+            </section>
+            <section class="workspace-detail-grid" aria-label="Evidence governance contracts">
+                <EvidenceRetentionContractPanel/>
+                <EvidenceCompliancePanel/>
+            </section>
             <section class="workspace-detail-grid" aria-label="Evidence workspace details">
                 <EvidenceWorkspaceDetail/>
             </section>
@@ -359,14 +375,16 @@ pub fn OperationsWorkspaceView() -> impl IntoView {
 }
 
 /// `/admin` — platform settings, security posture, secret references, and
-/// (for `admin`-capability sessions) token + session administration.
+/// (for `admin`-capability sessions) the role/tier catalog, the enrolled-agent
+/// roster, and token + session administration.
 #[component]
 pub fn AdminWorkspaceView() -> impl IntoView {
     // The admin workspace card is already role-gated to PlatformAdmin via the
-    // catalog; the mutating panels (platform settings, token/session admin) are
-    // gated again on the `admin` capability so non-admins never see or act on
-    // them even if the route is reached (defense in depth — the upstream API is
-    // the authoritative gate, this prevents rendering the controls at all).
+    // catalog; the admin panels (platform settings, role catalog, agent roster,
+    // token/session admin) are gated again on the `admin` capability so
+    // non-admins never see or act on them even if the route is reached
+    // (defense in depth — the upstream API is the authoritative gate, this
+    // prevents rendering the controls at all).
     let auth_session = use_context::<AuthSession>().unwrap_or_else(degraded_auth_session);
     let is_admin = session_can(&auth_session, "admin");
 
@@ -382,6 +400,19 @@ pub fn AdminWorkspaceView() -> impl IntoView {
                     <SessionAdministrationDetail/>
                 </Show>
             </section>
+            // The role catalog and agent roster carry wide read-only tables
+            // (the shared table style has a 920px min-width), so each gets its
+            // own full-width admin-gated grid section below the administration
+            // panels — the same layout precedent as the Catalog and Inventory
+            // flagship tables.
+            <Show when=move || is_admin fallback=|| ()>
+                <section class="workspace-detail-grid" aria-label="Admin RBAC role catalog">
+                    <RbacRoleCatalogPanel/>
+                </section>
+                <section class="workspace-detail-grid" aria-label="Admin execution agent roster">
+                    <AdminAgentsPanel/>
+                </section>
+            </Show>
         </div>
     }
 }
@@ -1307,6 +1338,736 @@ fn ShiftQueuePanel() -> impl IntoView {
                                         <p class="empty-state-title">"Shift queue unavailable"</p>
                                         <p class="table-note">
                                             "The platform API is unreachable, so open operator work items cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// One role row for the RBAC catalog table: the role name with its
+/// description underneath, and the permission tiers the API enforces for it.
+fn rbac_role_row(role: ApiRbacRole) -> impl IntoView {
+    let permissions = if role.permissions.is_empty() {
+        view! { <span class="table-note">"Permission tiers shown when live"</span> }.into_any()
+    } else {
+        view! {
+            <div class="role-chips" aria-label="Permission tiers">
+                {role
+                    .permissions
+                    .into_iter()
+                    .map(|permission| view! { <span class="role-chip">{permission}</span> })
+                    .collect_view()}
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <tr>
+            <td>
+                <strong>{role.name.clone()}</strong>
+                <p class="table-note">{role.description.clone()}</p>
+            </td>
+            <td>{permissions}</td>
+        </tr>
+    }
+}
+
+/// The RBAC role catalog panel for a successfully-loaded snapshot. Live data
+/// is badged as such; the static preview keeps the honest "Static preview"
+/// label and fabricates no permission grants.
+fn rbac_role_catalog_panel(snapshot: RbacRoleCatalogSnapshot) -> impl IntoView {
+    let total = snapshot.roles.len();
+    let count_label = if total == 1 {
+        "1 app role".to_string()
+    } else {
+        format!("{total} app roles")
+    };
+    let source_badge = if snapshot.live {
+        view! { <span class="badge good">"Live role catalog"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let body = if snapshot.roles.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No roles in the catalog"</p>
+                <p class="table-note">
+                    "App roles appear here with their descriptions and permission tiers as the API serves them."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="RBAC role catalog table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Role"</th>
+                            <th scope="col">"Permission tiers"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.roles.into_iter().map(rbac_role_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="rbac-role-catalog-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Admin"</span>
+                    <h2 id="rbac-role-catalog-title">"RBAC role catalog"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "The role/tier catalog the API enforces — every app role with the permission tiers it grants, read-only. " {count_label} "."
+            </p>
+            {body}
+        </article>
+    }
+}
+
+/// `/admin` role-catalog surface — the role/tier list served by
+/// `GET /api/admin/rbac-roles`. Live mode renders what the API returns;
+/// static mode renders a labeled preview. Never shows stale or fabricated
+/// data — an unreachable API renders an explicit degraded state.
+#[component]
+fn RbacRoleCatalogPanel() -> impl IntoView {
+    let catalog = Resource::new(|| (), |_| get_admin_rbac_roles());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="rbac-role-catalog-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Admin"</span>
+                            <h2 id="rbac-role-catalog-title">"RBAC role catalog"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match catalog.await {
+                        Ok(snapshot) => rbac_role_catalog_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="rbac-role-catalog-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Admin"</span>
+                                            <h2 id="rbac-role-catalog-title">"RBAC role catalog"</h2>
+                                        </div>
+                                        <span class="badge bad">"Catalog unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Role catalog unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the role/tier catalog cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// One enrolled-agent row for the Admin roster: agent id, platform, enrollment
+/// status, last-seen heartbeat, and recent-job count. Read-only — approve and
+/// revoke live in the Agents workspace.
+fn admin_agent_row(agent: AgentSummary) -> impl IntoView {
+    let status_class = status_badge_class(&agent.status);
+    let status_text = agent.status.clone();
+    let last_seen = agent
+        .last_seen_at
+        .as_deref()
+        .map(condense_timestamp)
+        .unwrap_or_else(|| "Never".to_string());
+    let enrolled = condense_timestamp(&agent.created_at);
+    let job_count = agent.jobs.len();
+    let jobs_label = if job_count == 1 {
+        "1 job".to_string()
+    } else {
+        format!("{job_count} jobs")
+    };
+
+    view! {
+        <tr>
+            <td>
+                <strong>{agent.agent_id.clone()}</strong>
+                <p class="table-note">"Enrolled " {enrolled}</p>
+            </td>
+            <td><span class="badge neutral">{agent.platform.clone()}</span></td>
+            <td><span class=status_class>{status_text}</span></td>
+            <td class="cell-date">{last_seen}</td>
+            <td>{jobs_label}</td>
+        </tr>
+    }
+}
+
+/// `/admin` enrolled-agent roster — the execution agents served by
+/// `GET /api/admin/agents`, read-only with a link through to the Agents
+/// workspace for approve/revoke. Static mode fabricates no synthetic agents
+/// (the list is honestly empty); an unreachable API renders an explicit
+/// degraded state.
+#[component]
+fn AdminAgentsPanel() -> impl IntoView {
+    let agents = Resource::new(|| (), |_| get_admin_agents());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="admin-agents-roster-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Admin"</span>
+                            <h2 id="admin-agents-roster-title">"Execution agent roster"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match agents.await {
+                        Ok(agents) => {
+                            let total = agents.len();
+                            let count_label = if total == 1 {
+                                "1 agent enrolled".to_string()
+                            } else {
+                                format!("{total} agents enrolled")
+                            };
+                            let body = if agents.is_empty() {
+                                view! {
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"No execution agents enrolled"</p>
+                                        <p class="table-note">
+                                            "Enrolled agents appear here with their platform, status, and heartbeat. No synthetic agents are fabricated in static preview mode."
+                                        </p>
+                                    </div>
+                                }
+                                    .into_any()
+                            } else {
+                                view! {
+                                    <div class="table-wrap">
+                                        <table class="request-table dense-table" aria-label="Execution agent roster table">
+                                            <thead>
+                                                <tr>
+                                                    <th scope="col">"Agent"</th>
+                                                    <th scope="col">"Platform"</th>
+                                                    <th scope="col">"Status"</th>
+                                                    <th scope="col">"Last seen"</th>
+                                                    <th scope="col">"Recent jobs"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {agents.into_iter().map(admin_agent_row).collect_view()}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                }
+                                    .into_any()
+                            };
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="admin-agents-roster-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Admin"</span>
+                                            <h2 id="admin-agents-roster-title">"Execution agent roster"</h2>
+                                        </div>
+                                        <span class="badge neutral">"Read-only roster"</span>
+                                    </div>
+                                    <p class="workspace-detail-lede">
+                                        "Enrolled execution agents and their trust status. " {count_label} ". "
+                                        <a class="timeline-link" href="/agents">"Manage in Agents →"</a>
+                                    </p>
+                                    {body}
+                                </article>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="admin-agents-roster-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Admin"</span>
+                                            <h2 id="admin-agents-roster-title">"Execution agent roster"</h2>
+                                        </div>
+                                        <span class="badge bad">"Roster unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Agent roster unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the enrolled-agent roster cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// One directory row: the request, its latest recorded action with actor and
+/// stage, how many trail actions back it, whether the trail is durable, and
+/// the deep link to the sealed per-request evidence pack.
+fn evidence_pack_ref_row(entry: EvidencePackRef) -> impl IntoView {
+    let action_text = audit_action_label(&entry.last_action);
+    let actor = entry.last_actor.clone();
+    let stage = stage_label(&normalize_api_stage(&entry.last_stage)).to_string();
+    let timestamp = condense_timestamp(&entry.last_occurred_at);
+    let actions_label = if entry.action_count == 1 {
+        "1 action".to_string()
+    } else {
+        format!("{} actions", entry.action_count)
+    };
+    let sealed_chip = if entry.durable {
+        view! { <span class="badge good">"Durable"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Preview"</span> }.into_any()
+    };
+    // Deep link to the request detail, where the sealed evidence pack panel
+    // (GET /api/requests/{id}/evidence) lives. Follows the notification
+    // deep-link policy: an id that is not a single safe path segment gets no
+    // link at all.
+    let pack_link = is_safe_request_segment(&entry.request_id).then(|| {
+        let href = format!("/requests/{}", entry.request_id);
+        view! {
+            <a class="timeline-link" href=href>
+                "Evidence pack →"
+            </a>
+        }
+    });
+
+    view! {
+        <tr>
+            <td>
+                <strong>{entry.request_id.clone()}</strong>
+                <p class="table-note">{actions_label}</p>
+            </td>
+            <td><span class="badge neutral">{action_text}</span></td>
+            <td>{actor}</td>
+            <td>{stage}</td>
+            <td class="cell-date">{timestamp}</td>
+            <td>{sealed_chip}</td>
+            <td>{pack_link}</td>
+        </tr>
+    }
+}
+
+/// The evidence pack directory panel for a successfully-loaded snapshot.
+/// Live data is badged as such with the scanned-action window; the static
+/// preview keeps the honest "Static preview" label.
+fn evidence_pack_directory_panel(snapshot: EvidencePackDirectorySnapshot) -> impl IntoView {
+    let request_count = snapshot.requests.len();
+    let scanned = snapshot.actions_scanned;
+    let count_label = format!(
+        "{request_count} {} from the {scanned} most recent recorded {}",
+        if request_count == 1 {
+            "request"
+        } else {
+            "requests"
+        },
+        if scanned == 1 { "action" } else { "actions" },
+    );
+    let source_badge = if snapshot.live {
+        view! { <span class="badge good">"Live audit feed"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let body = if snapshot.requests.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No evidence-bearing requests yet"</p>
+                <p class="table-note">
+                    "As requests move through the control plane, each one appears here with its latest recorded action and a link to its sealed evidence pack."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="table-wrap">
+                <table class="request-table dense-table" aria-label="Evidence pack directory table">
+                    <thead>
+                        <tr>
+                            <th scope="col">"Request"</th>
+                            <th scope="col">"Latest action"</th>
+                            <th scope="col">"Actor"</th>
+                            <th scope="col">"Stage"</th>
+                            <th scope="col">"When"</th>
+                            <th scope="col">"Trail"</th>
+                            <th scope="col">"Pack"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {snapshot.requests.into_iter().map(evidence_pack_ref_row).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="evidence-pack-directory-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Evidence"</span>
+                    <h2 id="evidence-pack-directory-title">"Evidence pack directory"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "Every request with recorded governance evidence, from the durable audit trail — each links to its digest-sealed, redacted evidence pack. " {count_label} "."
+            </p>
+            {body}
+        </article>
+    }
+}
+
+/// `/evidence` flagship surface — the pack directory derived from the durable
+/// `GET /api/activity/audit` feed, deep-linking to each request's sealed
+/// evidence pack. Live mode renders what the API returns; static mode renders
+/// a labeled preview. Never shows stale or fabricated data — an unreachable
+/// API renders an explicit degraded state.
+#[component]
+fn EvidencePackDirectoryPanel() -> impl IntoView {
+    let directory = Resource::new(|| (), |_| get_evidence_pack_directory());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="evidence-pack-directory-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Evidence"</span>
+                            <h2 id="evidence-pack-directory-title">"Evidence pack directory"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match directory.await {
+                        Ok(snapshot) => evidence_pack_directory_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="evidence-pack-directory-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Evidence"</span>
+                                            <h2 id="evidence-pack-directory-title">"Evidence pack directory"</h2>
+                                        </div>
+                                        <span class="badge bad">"Directory unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Evidence pack directory unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the governance evidence directory cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Renders one labeled chip-list block for a contract vocabulary.
+fn contract_chip_list(label: &'static str, values: Vec<String>) -> impl IntoView {
+    view! {
+        <div class="workspace-detail-item">
+            <strong>{label}</strong>
+            <div class="role-chips" aria-label=label>
+                {values
+                    .into_iter()
+                    .map(|value| view! { <span class="role-chip">{value}</span> })
+                    .collect_view()}
+            </div>
+        </div>
+    }
+}
+
+/// The export/retention contract panel for a successfully-loaded snapshot.
+/// Live data carries the API's own source marker; the static preview keeps
+/// the honest "Static preview" label.
+fn evidence_retention_panel(snapshot: EvidenceRetentionSnapshot) -> impl IntoView {
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live contract · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let redaction_chip = if snapshot.redaction_required {
+        view! { <span class="badge warn">"Redaction required"</span> }.into_any()
+    } else {
+        view! { <span class="badge neutral">"Redaction optional"</span> }.into_any()
+    };
+    // A closed unredacted-export gate is the safe posture (good); an open one
+    // is a governance red flag.
+    let export_gate_chip = if snapshot.export_without_redaction_allowed {
+        view! { <span class="badge bad">"Unredacted export allowed"</span> }.into_any()
+    } else {
+        view! { <span class="badge good">"Unredacted export blocked"</span> }.into_any()
+    };
+    let prohibited_count = snapshot.prohibited_content.len();
+    let prohibited_note = format!(
+        "{prohibited_count} prohibited content {} (credentials, raw payloads, identifiers) can never leave an export",
+        if prohibited_count == 1 {
+            "class"
+        } else {
+            "classes"
+        },
+    );
+    let mode_note = format!("Contract mode: {}", snapshot.mode);
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="evidence-retention-contract-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Evidence"</span>
+                    <h2 id="evidence-retention-contract-title">"Export and retention contract"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "The governance contract every evidence export obeys — redaction gates, export readiness states, safe targets, and retention classes."
+            </p>
+            <div class="boundary-flags" aria-label="Export gates">
+                {redaction_chip}
+                {export_gate_chip}
+            </div>
+            <div class="workspace-detail-columns">
+                <div class="workspace-detail-list" aria-label="Export state vocabularies">
+                    {contract_chip_list("Redaction states", snapshot.redaction_states)}
+                    {contract_chip_list("Export readiness", snapshot.export_readiness)}
+                </div>
+                <div class="workspace-detail-list" aria-label="Export targets and retention">
+                    {contract_chip_list("Safe export targets", snapshot.safe_export_targets)}
+                    {contract_chip_list("Retention classes", snapshot.retention_classes)}
+                    {contract_chip_list("Required guards", snapshot.required_guards)}
+                </div>
+            </div>
+            <span class="table-note">{prohibited_note}</span>
+            <span class="table-note">{mode_note}</span>
+        </article>
+    }
+}
+
+/// `/evidence` contract surface — the export/retention governance contract
+/// served by `GET /api/evidence/export-retention-contract`. Live mode renders
+/// what the API returns (with its own source marker); static mode renders a
+/// labeled preview. An unreachable API renders an explicit degraded state.
+#[component]
+fn EvidenceRetentionContractPanel() -> impl IntoView {
+    let contract = Resource::new(|| (), |_| get_evidence_retention_contract());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="evidence-retention-contract-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Evidence"</span>
+                            <h2 id="evidence-retention-contract-title">"Export and retention contract"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match contract.await {
+                        Ok(snapshot) => evidence_retention_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="evidence-retention-contract-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Evidence"</span>
+                                            <h2 id="evidence-retention-contract-title">"Export and retention contract"</h2>
+                                        </div>
+                                        <span class="badge bad">"Contract unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Export and retention contract unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the export/retention contract cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// The compliance-dashboard contract panel for a successfully-loaded
+/// snapshot. Live data carries the API's own source marker; the static
+/// preview keeps the honest "Static preview" label.
+fn evidence_compliance_panel(snapshot: EvidenceComplianceSnapshot) -> impl IntoView {
+    let source_badge = if snapshot.live {
+        let source_label = format!("Live contract · source: {}", snapshot.source);
+        view! { <span class="badge good">{source_label}</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Static preview"</span> }.into_any()
+    };
+    let evidence_chip = if snapshot.evidence_required {
+        view! { <span class="badge warn">"Evidence pack required"</span> }.into_any()
+    } else {
+        view! { <span class="badge neutral">"Evidence optional"</span> }.into_any()
+    };
+    let mode_note = format!("Contract mode: {}", snapshot.mode);
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="evidence-compliance-contract-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Evidence"</span>
+                    <h2 id="evidence-compliance-contract-title">"Compliance dashboard contract"</h2>
+                </div>
+                {source_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "The compliance domains the platform assesses, the status bands findings land in, and the trend windows the dashboard reports over."
+            </p>
+            <div class="boundary-flags" aria-label="Compliance gates">
+                {evidence_chip}
+            </div>
+            <div class="workspace-detail-columns">
+                <div class="workspace-detail-list" aria-label="Compliance domains and bands">
+                    {contract_chip_list("Domains", snapshot.domains)}
+                    {contract_chip_list("Status bands", snapshot.status_bands)}
+                </div>
+                <div class="workspace-detail-list" aria-label="Trend windows and guards">
+                    {contract_chip_list("Trend windows", snapshot.trend_windows)}
+                    {contract_chip_list("Required guards", snapshot.required_guards)}
+                </div>
+            </div>
+            <span class="table-note">{mode_note}</span>
+        </article>
+    }
+}
+
+/// `/evidence` contract surface — the compliance-dashboard governance
+/// contract served by `GET /api/evidence/compliance-dashboard-contract`.
+/// Live mode renders what the API returns (with its own source marker);
+/// static mode renders a labeled preview. An unreachable API renders an
+/// explicit degraded state.
+#[component]
+fn EvidenceCompliancePanel() -> impl IntoView {
+    let contract = Resource::new(|| (), |_| get_evidence_compliance_contract());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="evidence-compliance-contract-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Evidence"</span>
+                            <h2 id="evidence-compliance-contract-title">"Compliance dashboard contract"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match contract.await {
+                        Ok(snapshot) => evidence_compliance_panel(snapshot).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="evidence-compliance-contract-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Evidence"</span>
+                                            <h2 id="evidence-compliance-contract-title">"Compliance dashboard contract"</h2>
+                                        </div>
+                                        <span class="badge bad">"Contract unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Compliance dashboard contract unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the compliance contract cannot be shown. No stale or fabricated data is displayed."
                                         </p>
                                     </div>
                                 </article>

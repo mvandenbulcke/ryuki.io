@@ -860,6 +860,237 @@ pub fn shift_queue_fallback() -> ShiftQueueSnapshot {
     }
 }
 
+// ── RBAC role catalog (Admin tab live read) ─────────────────────────────────
+
+/// Mirrors one role as served by `GET /api/admin/rbac-roles` (the engine
+/// `RbacRole` serialization: plain snake_case fields). `permissions` carries
+/// the capability tier grants (`admin`, `approve`, `execute`, `request`,
+/// `audit`) the API enforces for that role.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiRbacRole {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
+/// Portal snapshot for the Admin tab's role/tier catalog. `live`
+/// distinguishes a real API fetch from the labeled static preview so the view
+/// can badge the source honestly.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RbacRoleCatalogSnapshot {
+    pub live: bool,
+    pub roles: Vec<ApiRbacRole>,
+}
+
+impl RbacRoleCatalogSnapshot {
+    /// Wraps a successful live API fetch.
+    pub fn from_live(roles: Vec<ApiRbacRole>) -> Self {
+        Self { live: true, roles }
+    }
+}
+
+/// Labeled preview catalog for static-dry-run mode, derived from the same
+/// role list the login/summary fallbacks use. Permission tiers are only known
+/// to the API, so preview rows carry none — the view labels the whole panel
+/// "Static preview" and never fabricates grants.
+pub fn rbac_role_catalog_fallback() -> RbacRoleCatalogSnapshot {
+    RbacRoleCatalogSnapshot {
+        live: false,
+        roles: rbac_role_summary_fallbacks()
+            .into_iter()
+            .map(|role| ApiRbacRole {
+                name: role.name,
+                description: role.description,
+                permissions: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+// ── Evidence governance contracts (Evidence tab live reads) ─────────────────
+
+/// Mirrors the `GET /api/evidence/export-retention-contract` envelope
+/// (camelCase wire fields). Only the fields the Evidence tab renders are
+/// modeled; the envelope's many boundary flags are ignored on decode.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEvidenceRetentionContract {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub export_retention_mode: String,
+    #[serde(default)]
+    pub redaction_required: bool,
+    #[serde(default)]
+    pub export_without_redaction_allowed: bool,
+    #[serde(default)]
+    pub redaction_states: Vec<String>,
+    #[serde(default)]
+    pub export_readiness: Vec<String>,
+    #[serde(default)]
+    pub safe_export_targets: Vec<String>,
+    #[serde(default)]
+    pub retention_classes: Vec<String>,
+    #[serde(default)]
+    pub prohibited_content: Vec<String>,
+    #[serde(default)]
+    pub required_guards: Vec<String>,
+}
+
+/// Portal snapshot for the Evidence tab's export/retention contract panel.
+/// `live` distinguishes a real API fetch from the labeled static preview;
+/// `source` carries the API's own source marker through.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidenceRetentionSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub mode: String,
+    pub redaction_required: bool,
+    pub export_without_redaction_allowed: bool,
+    pub redaction_states: Vec<String>,
+    pub export_readiness: Vec<String>,
+    pub safe_export_targets: Vec<String>,
+    pub retention_classes: Vec<String>,
+    pub prohibited_content: Vec<String>,
+    pub required_guards: Vec<String>,
+}
+
+impl EvidenceRetentionSnapshot {
+    /// Wraps a successful live API fetch, preserving the API's source marker.
+    pub fn from_live(contract: ApiEvidenceRetentionContract) -> Self {
+        Self {
+            live: true,
+            source: contract.source,
+            mode: contract.export_retention_mode,
+            redaction_required: contract.redaction_required,
+            export_without_redaction_allowed: contract.export_without_redaction_allowed,
+            redaction_states: contract.redaction_states,
+            export_readiness: contract.export_readiness,
+            safe_export_targets: contract.safe_export_targets,
+            retention_classes: contract.retention_classes,
+            prohibited_content: contract.prohibited_content,
+            required_guards: contract.required_guards,
+        }
+    }
+}
+
+/// Labeled preview for static-dry-run mode: the fail-closed posture (redaction
+/// required, unredacted export blocked) with a minimal state vocabulary —
+/// never presented as the live contract.
+pub fn evidence_retention_fallback() -> EvidenceRetentionSnapshot {
+    EvidenceRetentionSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        mode: "static-evidence-export-retention".to_string(),
+        redaction_required: true,
+        export_without_redaction_allowed: false,
+        redaction_states: vec![
+            "pending".to_string(),
+            "redacted".to_string(),
+            "blocked".to_string(),
+        ],
+        export_readiness: vec![
+            "draft".to_string(),
+            "redaction-pending".to_string(),
+            "ready-for-audit".to_string(),
+            "blocked".to_string(),
+        ],
+        safe_export_targets: vec!["audit-review".to_string(), "cab-review".to_string()],
+        retention_classes: vec![
+            "operational-review".to_string(),
+            "audit-retained".to_string(),
+        ],
+        prohibited_content: vec![
+            "credential values".to_string(),
+            "raw provider payloads".to_string(),
+            "tenant identifiers".to_string(),
+        ],
+        required_guards: vec![
+            "redaction-state-redacted".to_string(),
+            "no-raw-payloads".to_string(),
+        ],
+    }
+}
+
+/// Mirrors the `GET /api/evidence/compliance-dashboard-contract` envelope
+/// (camelCase wire fields). Only the fields the Evidence tab renders are
+/// modeled; the envelope's boundary flags are ignored on decode.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEvidenceComplianceContract {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub compliance_dashboard_mode: String,
+    #[serde(default)]
+    pub evidence_required: bool,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub status_bands: Vec<String>,
+    #[serde(default)]
+    pub trend_windows: Vec<String>,
+    #[serde(default)]
+    pub required_guards: Vec<String>,
+}
+
+/// Portal snapshot for the Evidence tab's compliance-dashboard contract panel.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidenceComplianceSnapshot {
+    pub live: bool,
+    pub source: String,
+    pub mode: String,
+    pub evidence_required: bool,
+    pub domains: Vec<String>,
+    pub status_bands: Vec<String>,
+    pub trend_windows: Vec<String>,
+    pub required_guards: Vec<String>,
+}
+
+impl EvidenceComplianceSnapshot {
+    /// Wraps a successful live API fetch, preserving the API's source marker.
+    pub fn from_live(contract: ApiEvidenceComplianceContract) -> Self {
+        Self {
+            live: true,
+            source: contract.source,
+            mode: contract.compliance_dashboard_mode,
+            evidence_required: contract.evidence_required,
+            domains: contract.domains,
+            status_bands: contract.status_bands,
+            trend_windows: contract.trend_windows,
+            required_guards: contract.required_guards,
+        }
+    }
+}
+
+/// Labeled preview for static-dry-run mode — a minimal domain/band vocabulary,
+/// never presented as the live contract.
+pub fn evidence_compliance_fallback() -> EvidenceComplianceSnapshot {
+    EvidenceComplianceSnapshot {
+        live: false,
+        source: "static-preview".to_string(),
+        mode: "static-evidence-compliance-dashboard".to_string(),
+        evidence_required: true,
+        domains: vec![
+            "security-baseline".to_string(),
+            "rbac-approvals".to_string(),
+            "evidence-redaction".to_string(),
+        ],
+        status_bands: vec![
+            "compliant".to_string(),
+            "attention".to_string(),
+            "gap".to_string(),
+        ],
+        trend_windows: vec!["current".to_string(), "thirty-day".to_string()],
+        required_guards: vec![
+            "evidence-pack-referenced".to_string(),
+            "redaction-state-reviewed".to_string(),
+        ],
+    }
+}
+
 pub fn audit_workflow_fallbacks() -> Vec<AuditWorkflowSummary> {
     vec![
         AuditWorkflowSummary {
@@ -2455,6 +2686,79 @@ impl ApiAuditEventRow {
     }
 }
 
+// ── Evidence pack directory (Evidence tab live read) ────────────────────────
+
+/// One request's entry in the evidence pack directory: the governance trail
+/// summarized to its latest action, with a deep link target (`/requests/{id}`)
+/// where the sealed per-request evidence pack lives.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidencePackRef {
+    pub request_id: String,
+    pub last_action: String,
+    pub last_actor: String,
+    pub last_stage: String,
+    pub last_occurred_at: String,
+    pub action_count: usize,
+    pub durable: bool,
+}
+
+/// Portal snapshot for the Evidence tab's pack directory. Derived from the
+/// durable audit feed (`GET /api/activity/audit`), grouped by request.
+/// `actions_scanned` is how many feed rows the grouping consumed, so the view
+/// can state the directory's window honestly.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidencePackDirectorySnapshot {
+    pub live: bool,
+    pub actions_scanned: usize,
+    pub requests: Vec<EvidencePackRef>,
+}
+
+/// Groups a newest-first audit feed into one directory row per request: the
+/// first row seen for a request is its latest action; later rows only bump the
+/// action count. Rows without a request id (platform-level actions) are
+/// counted in `actions_scanned` but produce no directory row. A request whose
+/// trail contains any non-durable row is flagged `durable=false` so the view
+/// never presents a preview trail as sealed evidence.
+pub fn evidence_pack_directory_from_rows(
+    live: bool,
+    rows: Vec<AuditEventRow>,
+) -> EvidencePackDirectorySnapshot {
+    let actions_scanned = rows.len();
+    let mut requests: Vec<EvidencePackRef> = Vec::new();
+    for row in rows {
+        let Some(request_id) = row.request_id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if let Some(entry) = requests
+            .iter_mut()
+            .find(|entry| entry.request_id == request_id)
+        {
+            entry.action_count += 1;
+            entry.durable = entry.durable && row.durable;
+        } else {
+            let last_actor = if row.actor_display.is_empty() {
+                row.actor_principal
+            } else {
+                row.actor_display
+            };
+            requests.push(EvidencePackRef {
+                request_id,
+                last_action: row.action,
+                last_actor,
+                last_stage: row.to_stage,
+                last_occurred_at: row.occurred_at,
+                action_count: 1,
+                durable: row.durable,
+            });
+        }
+    }
+    EvidencePackDirectorySnapshot {
+        live,
+        actions_scanned,
+        requests,
+    }
+}
+
 /// One redacted line of a compliance evidence pack, mirroring an engine
 /// `EvidenceItem` as serialized by the API.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2823,6 +3127,53 @@ pub struct AdminSessionSummary {
     pub created_at: Option<String>,
     #[serde(default)]
     pub expires_at: Option<String>,
+}
+
+/// Mirrors the `GET /api/admin/tokens` response. The paginated API (#14)
+/// serializes the rows under the `tokens` key (with `count`/`total`/`limit`/
+/// `offset` metadata the portal ignores); the bare-array arm keeps any older
+/// shape and the fixtures decoding too.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApiAdminTokenList {
+    Enveloped {
+        #[serde(default)]
+        tokens: Vec<AdminTokenSummary>,
+    },
+    Bare(Vec<AdminTokenSummary>),
+}
+
+impl ApiAdminTokenList {
+    /// Flattens either wire shape into the token rows.
+    pub fn into_rows(self) -> Vec<AdminTokenSummary> {
+        match self {
+            ApiAdminTokenList::Enveloped { tokens } => tokens,
+            ApiAdminTokenList::Bare(tokens) => tokens,
+        }
+    }
+}
+
+/// Mirrors the `GET /api/admin/sessions` response. The paginated API (#14)
+/// serializes the rows under the `sessions` key; the bare-array arm keeps any
+/// older shape and the fixtures decoding too.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApiAdminSessionList {
+    Enveloped {
+        #[serde(default)]
+        sessions: Vec<AdminSessionSummary>,
+    },
+    Bare(Vec<AdminSessionSummary>),
+}
+
+impl ApiAdminSessionList {
+    /// Flattens either wire shape into the session rows.
+    pub fn into_rows(self) -> Vec<AdminSessionSummary> {
+        match self {
+            ApiAdminSessionList::Enveloped { sessions } => sessions,
+            ApiAdminSessionList::Bare(sessions) => sessions,
+        }
+    }
 }
 
 /// Result of a revoke (`DELETE` of a token or session). `id` echoes the
@@ -3746,6 +4097,229 @@ mod tests {
             .items
             .iter()
             .all(|item| item.title.contains("(preview)")));
+    }
+
+    #[test]
+    fn rbac_role_decodes_canonical_admin_roles_response() {
+        // Canonical GET /api/admin/rbac-roles element: the engine RbacRole
+        // serialization (plain snake_case fields, permission tier strings).
+        let body = r#"[
+            {
+                "name": "PlatformAdmin",
+                "description": "Platform Admins — full platform administration, approval, and audit access",
+                "permissions": ["admin", "approve", "audit"]
+            },
+            {
+                "name": "Auditor",
+                "description": "Auditor — read-only audit access",
+                "permissions": ["audit"]
+            }
+        ]"#;
+        let roles: Vec<ApiRbacRole> = serde_json::from_str(body).expect("roles must decode");
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].name, "PlatformAdmin");
+        assert_eq!(roles[0].permissions, vec!["admin", "approve", "audit"]);
+        assert_eq!(roles[1].permissions, vec!["audit"]);
+
+        let snapshot = RbacRoleCatalogSnapshot::from_live(roles);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.roles.len(), 2);
+
+        // The static preview is honestly labeled, never `live`, and never
+        // fabricates permission grants (those are only known to the API).
+        let preview = rbac_role_catalog_fallback();
+        assert!(!preview.live);
+        assert!(!preview.roles.is_empty());
+        assert!(preview.roles.iter().all(|role| role.permissions.is_empty()));
+        // The preview names stay in lockstep with the summary fallbacks.
+        assert_eq!(preview.roles.len(), rbac_role_summary_fallbacks().len());
+    }
+
+    #[test]
+    fn evidence_retention_contract_decodes_canonical_envelope() {
+        // Canonical GET /api/evidence/export-retention-contract shape
+        // (camelCase; the many boundary flags not modeled are ignored).
+        let body = r#"{
+            "source": "static-seed",
+            "exportRetentionMode": "static-evidence-export-retention",
+            "redactionRequired": true,
+            "providerCallsEnabled": false,
+            "exportWithoutRedactionAllowed": false,
+            "redactionStates": ["pending", "redacted", "blocked"],
+            "exportReadiness": ["draft", "ready-for-audit", "blocked"],
+            "safeExportTargets": ["audit-review", "cab-review"],
+            "retentionClasses": ["operational-review", "audit-retained"],
+            "prohibitedContent": ["credential values", "raw provider payloads"],
+            "requiredGuards": ["redaction-state-redacted", "no-raw-payloads"]
+        }"#;
+        let contract: ApiEvidenceRetentionContract =
+            serde_json::from_str(body).expect("retention contract must decode");
+        assert_eq!(contract.source, "static-seed");
+        assert!(contract.redaction_required);
+        assert!(!contract.export_without_redaction_allowed);
+        assert_eq!(contract.redaction_states, vec!["pending", "redacted", "blocked"]);
+        assert_eq!(contract.retention_classes.len(), 2);
+
+        let snapshot = EvidenceRetentionSnapshot::from_live(contract);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.source, "static-seed");
+        assert_eq!(snapshot.mode, "static-evidence-export-retention");
+
+        // The static preview is honestly labeled, never `live`, and keeps the
+        // fail-closed posture (redaction required, unredacted export blocked).
+        let preview = evidence_retention_fallback();
+        assert!(!preview.live);
+        assert!(preview.redaction_required);
+        assert!(!preview.export_without_redaction_allowed);
+    }
+
+    #[test]
+    fn evidence_compliance_contract_decodes_canonical_envelope() {
+        // Canonical GET /api/evidence/compliance-dashboard-contract shape
+        // (camelCase; unmodeled boundary flags are ignored).
+        let body = r#"{
+            "source": "static-seed",
+            "complianceDashboardMode": "static-evidence-compliance-dashboard",
+            "evidenceRequired": true,
+            "liveEvaluationAllowed": false,
+            "domains": ["security-baseline", "rbac-approvals", "evidence-redaction"],
+            "statusBands": ["compliant", "attention", "gap", "blocked", "not-assessed"],
+            "trendWindows": ["current", "seven-day", "thirty-day", "quarterly"],
+            "requiredGuards": ["control-scope-known", "evidence-pack-referenced"]
+        }"#;
+        let contract: ApiEvidenceComplianceContract =
+            serde_json::from_str(body).expect("compliance contract must decode");
+        assert_eq!(contract.source, "static-seed");
+        assert!(contract.evidence_required);
+        assert_eq!(contract.domains.len(), 3);
+        assert_eq!(contract.status_bands.len(), 5);
+
+        let snapshot = EvidenceComplianceSnapshot::from_live(contract);
+        assert!(snapshot.live);
+        assert_eq!(snapshot.mode, "static-evidence-compliance-dashboard");
+
+        let preview = evidence_compliance_fallback();
+        assert!(!preview.live);
+        assert!(preview.evidence_required);
+    }
+
+    #[test]
+    fn evidence_pack_directory_groups_feed_rows_by_request() {
+        fn feed_row(
+            action: &str,
+            request_id: Option<&str>,
+            occurred_at: &str,
+            durable: bool,
+        ) -> AuditEventRow {
+            AuditEventRow {
+                action: action.to_string(),
+                actor_display: "Platform Operator".to_string(),
+                actor_principal: "operator".to_string(),
+                from_stage: None,
+                to_stage: "approve".to_string(),
+                to_status: "approved".to_string(),
+                occurred_at: occurred_at.to_string(),
+                reason: None,
+                durable,
+                request_id: request_id.map(str::to_string),
+                actor_roles: vec![],
+                outcome: Some("applied".to_string()),
+            }
+        }
+        // Newest-first feed: REQ-2's approve is its latest action; REQ-1 has
+        // one action; the request-less platform row is scanned but produces
+        // no directory entry.
+        let rows = vec![
+            feed_row("request.approve", Some("REQ-2"), "2026-06-13T08:12:00Z", true),
+            feed_row("platform.settings.update", None, "2026-06-13T08:10:00Z", true),
+            feed_row("request.plan", Some("REQ-2"), "2026-06-13T08:06:00Z", true),
+            feed_row("request.create", Some("REQ-1"), "2026-06-13T08:00:00Z", false),
+        ];
+        let directory = evidence_pack_directory_from_rows(true, rows);
+        assert!(directory.live);
+        assert_eq!(directory.actions_scanned, 4);
+        assert_eq!(directory.requests.len(), 2);
+        // Feed order (newest first) is preserved; the first row seen per
+        // request is its latest action.
+        assert_eq!(directory.requests[0].request_id, "REQ-2");
+        assert_eq!(directory.requests[0].last_action, "request.approve");
+        assert_eq!(directory.requests[0].action_count, 2);
+        assert!(directory.requests[0].durable);
+        assert_eq!(directory.requests[1].request_id, "REQ-1");
+        assert_eq!(directory.requests[1].action_count, 1);
+        // A non-durable trail row flags the whole request as not sealed.
+        assert!(!directory.requests[1].durable);
+    }
+
+    #[test]
+    fn admin_token_list_decodes_enveloped_and_bare_shapes() {
+        // Canonical GET /api/admin/tokens shape after the pagination wave
+        // (#14): rows under `tokens` with count/total/limit/offset metadata.
+        // The hash is never serialized; the plaintext exists only in the
+        // create response.
+        let enveloped = r#"{
+            "count": 1,
+            "limit": 500,
+            "offset": 0,
+            "total": 1,
+            "tokens": [{
+                "id": "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b",
+                "name": "ci-runner",
+                "owner_principal": "platform-engineer",
+                "roles": ["Auditor"],
+                "site_scope": null,
+                "environment_scope": null,
+                "token_valid": true,
+                "created_at": "2026-07-09T20:00:00Z",
+                "expires_at": null,
+                "last_used_at": null,
+                "revoked_at": null
+            }]
+        }"#;
+        let list: ApiAdminTokenList =
+            serde_json::from_str(enveloped).expect("enveloped token list must decode");
+        let rows = list.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ci-runner");
+        assert!(rows[0].token_valid);
+
+        // A bare array (pre-envelope shape) still decodes.
+        let bare = r#"[{"id": "t-1", "name": "legacy"}]"#;
+        let list: ApiAdminTokenList =
+            serde_json::from_str(bare).expect("bare token list must decode");
+        assert_eq!(list.into_rows().len(), 1);
+    }
+
+    #[test]
+    fn admin_session_list_decodes_enveloped_and_bare_shapes() {
+        // Canonical GET /api/admin/sessions shape after the pagination wave
+        // (#14): rows under `sessions` with count/limit/offset metadata.
+        let enveloped = r#"{
+            "count": 1,
+            "limit": 500,
+            "offset": 0,
+            "sessions": [{
+                "id": "b9de6b94-68a5-4407-a1fe-de24e7aecb30",
+                "user_id": "platform-engineer",
+                "display_name": "Platform Engineer",
+                "roles": ["PlatformAdmin", "VMwareOperator"],
+                "provider": "static-dry-run",
+                "created_at": "2026-07-09T20:10:18.209024Z",
+                "expires_at": "2026-07-10T20:10:18.209024Z"
+            }]
+        }"#;
+        let list: ApiAdminSessionList =
+            serde_json::from_str(enveloped).expect("enveloped session list must decode");
+        let rows = list.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_id, "platform-engineer");
+        assert_eq!(rows[0].roles, vec!["PlatformAdmin", "VMwareOperator"]);
+
+        // A bare array (pre-envelope shape) still decodes.
+        let bare = r#"[{"id": "s-1"}]"#;
+        let list: ApiAdminSessionList =
+            serde_json::from_str(bare).expect("bare session list must decode");
+        assert_eq!(list.into_rows().len(), 1);
     }
 
     #[test]

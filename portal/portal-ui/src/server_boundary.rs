@@ -63,12 +63,14 @@ use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
     actions_for_stage, auth_session_fallback, cmdb_reconciliation_report_fallback,
+    evidence_compliance_fallback, evidence_pack_directory_from_rows, evidence_retention_fallback,
     hardware_inventory_fallback, offering_catalog_fallback, platform_health_fallback,
-    platform_status_fallback, platform_summary_context_fallback, rbac_role_summary_fallbacks,
-    servicenow_queue_fallback, shift_queue_fallback, ApiAuditTrail, ApiCmdbReconcileReport,
-    ApiEvidencePack, ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog, ApiPlatformSummary,
-    ApiRequestDetail, ApiRequestSummary, ApiServiceNowQueue, ApiShiftItemsPage, ApiShiftSummary,
-    HardwareAssetSummary,
+    platform_status_fallback, platform_summary_context_fallback, rbac_role_catalog_fallback,
+    servicenow_queue_fallback, shift_queue_fallback, ApiAdminSessionList, ApiAdminTokenList,
+    ApiAuditTrail, ApiCmdbReconcileReport, ApiEvidenceComplianceContract, ApiEvidencePack,
+    ApiEvidenceRetentionContract, ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog,
+    ApiPlatformSummary, ApiRbacRole, ApiRequestDetail, ApiRequestSummary, ApiServiceNowQueue,
+    ApiShiftItemsPage, ApiShiftSummary, HardwareAssetSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -85,13 +87,14 @@ use crate::models::{
     CreateTokenResult,
     DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
     DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
-    EvidencePackExport, EvidenceSummary, ExecutionJob, HardwareInventorySnapshot,
+    EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot, EvidencePackExport,
+    EvidenceRetentionSnapshot, EvidenceSummary, ExecutionJob, HardwareInventorySnapshot,
     IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, NotificationSummary,
     OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth, PlatformSettingsSummary,
-    PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary,
-    RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult,
-    SecretReferenceSummary, ServiceNowQueueSnapshot, ShiftQueueSnapshot, StageActionResponse,
-    UpdateIntegrationPayload,
+    PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome,
+    RbacRoleCatalogSnapshot, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
+    RequestSummary, RevokeResult, SecretReferenceSummary, ServiceNowQueueSnapshot,
+    ShiftQueueSnapshot, StageActionResponse, UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -1750,13 +1753,38 @@ pub async fn get_auth_session() -> Result<Option<AuthSession>, ServerFnError> {
     }
 }
 
+/// Reads the role/tier catalog through the allowlisted
+/// `GET /api/admin/rbac-roles` read endpoint. Live mode fetches and parses
+/// the API's role list (name, description, permission tiers); static mode
+/// serves a labeled preview without fabricated permission grants. A live API
+/// that is unreachable surfaces an error so the Admin view renders an
+/// explicit degraded state rather than a stale role catalog.
 #[server(prefix = "/portal/api", endpoint = "admin-rbac-roles")]
-pub async fn get_admin_rbac_roles() -> Result<Vec<RbacRoleSummary>, ServerFnError> {
+pub async fn get_admin_rbac_roles() -> Result<RbacRoleCatalogSnapshot, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(admin_rbac_roles_path())
         .map_err(|_| ServerFnError::new("admin rbac roles API path failed same-origin guard"))?;
-    Ok(rbac_role_summary_fallbacks())
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(rbac_role_catalog_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let roles: Vec<ApiRbacRole> = response
+                .json()
+                .map_err(|_| ServerFnError::new("admin rbac roles response was malformed"))?;
+            Ok(RbacRoleCatalogSnapshot::from_live(roles))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "admin rbac roles fetch failed",
+        ))),
+        // Live mode never substitutes the preview catalog for an unreachable
+        // API; the Admin view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings")]
@@ -1946,9 +1974,12 @@ pub async fn load_admin_tokens() -> Result<Vec<AdminTokenSummary>, ServerFnError
     let session_id = session_id_from_request().await;
     match upstream.get(path, session_id.as_deref()).await {
         Ok(response) if response.is_success() => {
-            let mut tokens: Vec<AdminTokenSummary> = response
+            // The paginated API (#14) envelopes the rows under `tokens`; the
+            // untagged decode keeps a bare-array shape working too.
+            let list: ApiAdminTokenList = response
                 .json()
                 .map_err(|_| ServerFnError::new("admin tokens response was malformed"))?;
+            let mut tokens = list.into_rows();
             // Defense-in-depth: even if a future API leak attached a hash, the
             // portal type cannot carry it — but explicitly drop any scope
             // strings that are empty so the UI renders a clean "—".
@@ -2064,10 +2095,12 @@ pub async fn load_admin_sessions() -> Result<Vec<AdminSessionSummary>, ServerFnE
     let session_id = session_id_from_request().await;
     match upstream.get(path, session_id.as_deref()).await {
         Ok(response) if response.is_success() => {
-            let sessions: Vec<AdminSessionSummary> = response
+            // The paginated API (#14) envelopes the rows under `sessions`;
+            // the untagged decode keeps a bare-array shape working too.
+            let list: ApiAdminSessionList = response
                 .json()
                 .map_err(|_| ServerFnError::new("admin sessions response was malformed"))?;
-            Ok(sessions)
+            Ok(list.into_rows())
         }
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
@@ -3610,6 +3643,125 @@ pub async fn get_shift_queue_overview() -> Result<ShiftQueueSnapshot, ServerFnEr
         .json()
         .map_err(|_| ServerFnError::new("shift items response was malformed"))?;
     Ok(ShiftQueueSnapshot::from_live(summary, page))
+}
+
+// ── Evidence hub live-read server functions ────────────────────────────────
+
+/// Builds the Evidence tab's pack directory from the allowlisted durable
+/// audit feed (`GET /api/activity/audit`, newest first): one row per request
+/// with its latest recorded action, deep-linking to the sealed per-request
+/// evidence pack at `/requests/{id}`. Live mode fetches one bounded feed page
+/// (the API caps `limit` at 200); static mode derives the directory from the
+/// labeled preview feed. A live API that is unreachable surfaces an error so
+/// the Evidence view renders an explicit degraded state rather than a stale
+/// or fabricated directory.
+#[server(prefix = "/portal/api", endpoint = "evidence-pack-directory")]
+pub async fn get_evidence_pack_directory() -> Result<EvidencePackDirectorySnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(activity_audit_feed_path())
+        .map_err(|_| ServerFnError::new("activity audit feed API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(evidence_pack_directory_from_rows(
+            false,
+            static_preview_activity_feed(),
+        ));
+    }
+    // The widest page the API serves (it clamps limit to 200) so the
+    // directory covers as much of the recent governance window as one read
+    // allows; the panel states the scanned-action window honestly.
+    let fetch_path = format!("{path}?limit=200");
+    let session_id = session_id_from_request().await;
+    match upstream.get(&fetch_path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let feed: ApiAuditTrail = response
+                .json()
+                .map_err(|_| ServerFnError::new("activity audit feed response was malformed"))?;
+            Ok(evidence_pack_directory_from_rows(true, feed.into_rows()))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "evidence pack directory fetch failed",
+        ))),
+        // Live mode never substitutes the preview directory for an
+        // unreachable API; the Evidence view renders an explicit degraded
+        // state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Reads the export/retention governance contract through the allowlisted
+/// `GET /api/evidence/export-retention-contract` read endpoint. Live mode
+/// fetches and parses the API's contract envelope (source marker, redaction
+/// posture, state vocabularies); static mode serves a labeled preview. A live
+/// API that is unreachable surfaces an error so the Evidence view renders an
+/// explicit degraded state rather than a stale contract.
+#[server(prefix = "/portal/api", endpoint = "evidence-retention-contract-data")]
+pub async fn get_evidence_retention_contract() -> Result<EvidenceRetentionSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(evidence_export_retention_path())
+        .map_err(|_| {
+            ServerFnError::new("evidence retention contract API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(evidence_retention_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let contract: ApiEvidenceRetentionContract = response.json().map_err(|_| {
+                ServerFnError::new("evidence retention contract response was malformed")
+            })?;
+            Ok(EvidenceRetentionSnapshot::from_live(contract))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "evidence retention contract fetch failed",
+        ))),
+        // Live mode never substitutes the preview contract for an unreachable
+        // API; the Evidence view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Reads the compliance-dashboard governance contract through the allowlisted
+/// `GET /api/evidence/compliance-dashboard-contract` read endpoint. Live mode
+/// fetches and parses the API's contract envelope (source marker, domains,
+/// status bands, trend windows); static mode serves a labeled preview. A live
+/// API that is unreachable surfaces an error so the Evidence view renders an
+/// explicit degraded state rather than a stale contract.
+#[server(prefix = "/portal/api", endpoint = "evidence-compliance-contract-data")]
+pub async fn get_evidence_compliance_contract(
+) -> Result<EvidenceComplianceSnapshot, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(evidence_compliance_dashboard_path())
+        .map_err(|_| {
+            ServerFnError::new("evidence compliance contract API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(evidence_compliance_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let contract: ApiEvidenceComplianceContract = response.json().map_err(|_| {
+                ServerFnError::new("evidence compliance contract response was malformed")
+            })?;
+            Ok(EvidenceComplianceSnapshot::from_live(contract))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "evidence compliance contract fetch failed",
+        ))),
+        // Live mode never substitutes the preview contract for an unreachable
+        // API; the Evidence view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 // ── Integration server functions ──────────────────────────────────────────

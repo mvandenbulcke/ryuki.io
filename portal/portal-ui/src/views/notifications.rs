@@ -11,8 +11,10 @@ use leptos_router::NavigateOptions;
 /// non-empty and composed only of ASCII alphanumerics, `-`, or `_`. This is the
 /// same policy the route matcher applies (`workspace_catalog::match_portal_route`),
 /// so a deep-link the bell builds can never carry a slash, traversal, query, or
-/// fragment that would redirect the client to a different route.
-fn is_safe_request_segment(id: &str) -> bool {
+/// fragment that would redirect the client to a different route. Shared with
+/// the Evidence tab's pack directory (`views::workspaces`), which builds the
+/// same `/requests/{id}` deep links.
+pub(crate) fn is_safe_request_segment(id: &str) -> bool {
     !id.is_empty()
         && id
             .chars()
