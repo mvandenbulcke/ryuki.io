@@ -1,0 +1,27 @@
+-- 156_portal_notifications_retention.sql — retention index for the portal-notifications prune.
+--
+-- portal_notifications (mig 083) grows without bound: every request-lifecycle transition and
+-- operational alert appends rows, and NOTHING deletes them (the receipts + dispatch-outbox
+-- children only ever grow with it). Retention is enforced by the notifications-retention sweep
+-- in ryuki-api — a spawned background loop (the idempotency-retention-sweep idiom, NOT a
+-- durable-scheduler job), which batch-deletes expired rows oldest-first:
+--
+--   DELETE ... WHERE id IN (SELECT id FROM portal_notifications
+--                           WHERE created_at < NOW() - <window>  [+ unread-Critical carve-out]
+--                           ORDER BY created_at ASC, id ASC LIMIT <cap>)
+--
+-- Policy (consts at the spawn site): read-or-non-Critical rows expire after 90 days; an UNREAD
+-- (zero receipts) Critical row is kept for 365 days, then pruned unconditionally (hard cap).
+--
+-- This index exists so that sweep is cheap. The existing idx_portal_notifications_recipient
+-- (recipient_kind, recipient_id, created_at) cannot serve a GLOBAL created_at range scan
+-- (created_at is 3rd in its key), so without it every tick would seq-scan + top-N sort the
+-- table. The composite matches the prune's predicate (created_at < cutoff) and ORDER BY
+-- (created_at ASC, id ASC — the btree default order; both columns NOT NULL) exactly, so the
+-- common nothing-expired tick is a zero-row index range scan.
+--
+-- Child-row cascades need no new index: portal_notification_reads' PK and the outbox's
+-- UNIQUE (notification_id, channel) both lead on notification_id, so the ON DELETE CASCADE
+-- lookups (migs 083/128) are already indexed.
+CREATE INDEX IF NOT EXISTS idx_portal_notifications_prune
+    ON portal_notifications (created_at, id);

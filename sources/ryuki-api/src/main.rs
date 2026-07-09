@@ -1729,6 +1729,13 @@ async fn main() {
         // offline (agents heartbeat far more often than that).
         agents::spawn_agent_offline_scan(pool.clone(), 60, 180);
         tracing::info!("agent-offline scan started (interval: 60s, threshold: 180s)");
+        // Portal-notifications retention: prunes expired feed rows (receipts +
+        // dispatch-outbox rows cascade) in bounded oldest-first batches. Hourly,
+        // like the idempotency retention sweep — retention windows are DAYS, so
+        // sub-hour checking adds no signal, and the hourly 20k per-run cap
+        // drains any first-run backlog quickly.
+        contracts::spawn_notifications_retention_sweep(pool.clone(), 3600);
+        tracing::info!("notifications retention sweep started (interval: 3600s)");
         // run-5/B: the wedge monitor turns the in-memory loop-liveness registry into
         // PUSHED, acknowledgeable `background_loop.overdue` domain events (edge-
         // triggered), so a silently-wedged scheduler/scan pages an operator instead of

@@ -412,6 +412,68 @@ pub async fn mark_all_read(
     Ok(result.rows_affected())
 }
 
+/// Delete notifications past their retention window, OLDEST FIRST, in one
+/// bounded DELETE (retention fix for the unbounded portal_notifications feed;
+/// index: mig 156). Returns the rows deleted. Per-user read receipts and
+/// dry-run dispatch-outbox rows go with each notification via the existing
+/// ON DELETE CASCADE FKs (migs 083 / 128).
+///
+/// Policy: a notification expires `retention_days` after creation when it is
+/// READ (at least one receipt row exists — for a Role-targeted row ANY member's
+/// receipt counts as acknowledged; role membership is not enumerable, see mig
+/// 083) or when it is not Critical. An UNREAD (zero receipts) Critical
+/// notification is retained for the longer `critical_unread_retention_days`,
+/// then pruned unconditionally — a hard cap so the table stays bounded even
+/// when nobody ever acknowledges.
+///
+/// Concurrency + failure posture: a single statement with a `LIMIT`ed id
+/// subquery (the `prune_resolved_shift_queue` idiom), so a concurrent run on
+/// another replica simply deletes a disjoint-or-empty set — no error, no
+/// double-effect — and a cancelled/failed run leaves nothing partial. Uses
+/// DB-server time only (`NOW()`), no client clock. Deterministic order via the
+/// `id` tie-breaker.
+pub async fn prune_expired(
+    pool: &PgPool,
+    retention_days: i64,
+    critical_unread_retention_days: i64,
+    max_per_run: i64,
+) -> Result<u64, sqlx::Error> {
+    // Fail-safe on nonsensical parameters: prune NOTHING (never everything).
+    // A critical window shorter than the standard window would silently demote
+    // the unread-Critical carve-out, so it is rejected the same way.
+    if retention_days <= 0 || critical_unread_retention_days < retention_days || max_per_run <= 0 {
+        return Ok(0);
+    }
+    // The outer DELETE reasserts the eligibility predicate (the
+    // prune_resolved_shift_queue idiom) so a row mutated between the subquery
+    // snapshot and the delete can never be removed while ineligible.
+    let deleted = sqlx::query(
+        "DELETE FROM portal_notifications \
+         WHERE id IN ( \
+             SELECT n.id FROM portal_notifications n \
+             WHERE n.created_at < NOW() - ($1::bigint * INTERVAL '1 day') \
+               AND (n.severity <> 'Critical' \
+                 OR n.created_at < NOW() - ($2::bigint * INTERVAL '1 day') \
+                 OR EXISTS (SELECT 1 FROM portal_notification_reads r \
+                            WHERE r.notification_id = n.id)) \
+             ORDER BY n.created_at ASC, n.id ASC \
+             LIMIT $3 \
+         ) \
+         AND created_at < NOW() - ($1::bigint * INTERVAL '1 day') \
+         AND (severity <> 'Critical' \
+           OR created_at < NOW() - ($2::bigint * INTERVAL '1 day') \
+           OR EXISTS (SELECT 1 FROM portal_notification_reads r2 \
+                      WHERE r2.notification_id = portal_notifications.id))",
+    )
+    .bind(retention_days)
+    .bind(critical_unread_retention_days)
+    .bind(max_per_run)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 // ── DB integration tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -880,5 +942,234 @@ mod notifications_db_tests {
         let _ = sent; // the global 'sent' list may legitimately contain other tests' rows
 
         cleanup_recipient(&pool, owner).await;
+    }
+
+    // ── retention prune ───────────────────────────────────────────────────────
+
+    /// Seed one notification with an EXPLICIT past `created_at` (repo lesson:
+    /// never rely on NOW()-relative seed rows staying "old" — pin the age at
+    /// insert time) and return its id.
+    async fn seed_aged(pool: &PgPool, recipient: &str, severity: &str, age_days: i64) -> String {
+        let id = format!("pn-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO portal_notifications \
+             (id, recipient_kind, recipient_id, event, severity, title, body, created_at) \
+             VALUES ($1, 'User', $2, 'request.approve', $3, 't', 'b', \
+                     NOW() - ($4::bigint * INTERVAL '1 day'))",
+        )
+        .bind(&id)
+        .bind(recipient)
+        .bind(severity)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .expect("seed aged notification");
+        id
+    }
+
+    async fn add_receipt(pool: &PgPool, notification_id: &str, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO portal_notification_reads (notification_id, user_id) VALUES ($1, $2)",
+        )
+        .bind(notification_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed read receipt");
+    }
+
+    async fn add_outbox_row(pool: &PgPool, notification_id: &str) {
+        sqlx::query(
+            "INSERT INTO notification_dispatch_outbox (id, notification_id, channel, status) \
+             VALUES ($1, $2, 'webhook', 'dry_run_logged')",
+        )
+        .bind(format!("ndo-{}", uuid::Uuid::new_v4()))
+        .bind(notification_id)
+        .execute(pool)
+        .await
+        .expect("seed outbox row");
+    }
+
+    async fn notification_exists(pool: &PgPool, id: &str) -> bool {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM portal_notifications WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("existence query");
+        count == 1
+    }
+
+    async fn child_rows(pool: &PgPool, id: &str) -> (i64, i64) {
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_notification_reads WHERE notification_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("receipts count");
+        let outbox: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_dispatch_outbox WHERE notification_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("outbox count");
+        (receipts, outbox)
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_old_read_keeps_recent_and_cascades() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-retention-basic-001";
+
+        // Expired (120d > 90d), READ, with a dispatch-outbox child row.
+        let old_read = seed_aged(&pool, recipient, "Info", 120).await;
+        add_receipt(&pool, &old_read, recipient).await;
+        add_outbox_row(&pool, &old_read).await;
+        // Expired UNREAD non-Critical: the carve-out is Critical-only.
+        let old_unread = seed_aged(&pool, recipient, "Warning", 120).await;
+        // Recent (10d < 90d): kept regardless of read state.
+        let recent = seed_aged(&pool, recipient, "Info", 10).await;
+
+        let pruned = prune_expired(&pool, 90, 365, 20_000)
+            .await
+            .expect("prune must not fail");
+        assert!(pruned >= 2, "both expired rows pruned (got {pruned})");
+
+        assert!(
+            !notification_exists(&pool, &old_read).await,
+            "old READ notification is pruned"
+        );
+        assert!(
+            !notification_exists(&pool, &old_unread).await,
+            "old unread NON-Critical notification is pruned"
+        );
+        assert!(
+            notification_exists(&pool, &recent).await,
+            "recent notification is kept"
+        );
+        let (receipts, outbox) = child_rows(&pool, &old_read).await;
+        assert_eq!(receipts, 0, "read receipts cascade with the notification");
+        assert_eq!(outbox, 0, "outbox rows cascade with the notification");
+
+        cleanup_recipient(&pool, recipient).await;
+    }
+
+    #[tokio::test]
+    async fn retention_unread_critical_kept_until_hard_cap() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-retention-critical-001";
+
+        // Past the standard window but UNREAD Critical → carve-out keeps it.
+        let unread_within_cap = seed_aged(&pool, recipient, "Critical", 120).await;
+        // Past even the hard cap (400d > 365d) → pruned despite being unread.
+        let unread_past_cap = seed_aged(&pool, recipient, "Critical", 400).await;
+        // READ Critical past the standard window → acknowledged, pruned at 90d.
+        let read_old = seed_aged(&pool, recipient, "Critical", 120).await;
+        add_receipt(&pool, &read_old, recipient).await;
+
+        prune_expired(&pool, 90, 365, 20_000)
+            .await
+            .expect("prune must not fail");
+
+        assert!(
+            notification_exists(&pool, &unread_within_cap).await,
+            "unread Critical younger than the hard cap is KEPT"
+        );
+        assert!(
+            !notification_exists(&pool, &unread_past_cap).await,
+            "unread Critical past the hard cap is pruned"
+        );
+        assert!(
+            !notification_exists(&pool, &read_old).await,
+            "READ Critical past the standard window is pruned"
+        );
+
+        cleanup_recipient(&pool, recipient).await;
+    }
+
+    #[tokio::test]
+    async fn retention_batch_cap_prunes_oldest_first() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-retention-batch-001";
+
+        let oldest = seed_aged(&pool, recipient, "Info", 300).await;
+        let middle = seed_aged(&pool, recipient, "Info", 200).await;
+        let newest_expired = seed_aged(&pool, recipient, "Info", 100).await;
+
+        // Cap 2: at most two rows are deleted in one run, oldest first. A
+        // SHARED DB may hold other tests' expired rows that are globally older
+        // than these three, so the deterministic assertions are (a) the cap
+        // bound — at least one of THIS test's three rows survives — and (b) the
+        // oldest-first ORDER: the deleted set is a PREFIX of (created_at, id)
+        // order, so a deleted row implies every strictly-older sibling was
+        // deleted too.
+        prune_expired(&pool, 90, 365, 2).await.expect("prune 1");
+        let oldest_kept = notification_exists(&pool, &oldest).await;
+        let middle_kept = notification_exists(&pool, &middle).await;
+        let newest_kept = notification_exists(&pool, &newest_expired).await;
+        assert!(
+            oldest_kept || middle_kept || newest_kept,
+            "a cap of 2 cannot delete all three expired rows in one run"
+        );
+        assert!(
+            middle_kept || !oldest_kept,
+            "oldest-first: middle deleted implies oldest deleted"
+        );
+        assert!(
+            newest_kept || !middle_kept,
+            "oldest-first: newest deleted implies middle deleted"
+        );
+
+        // Drain with the production cap — repeated runs converge until this
+        // test's whole expired backlog is gone (bounded batches make progress).
+        for _ in 0..3 {
+            prune_expired(&pool, 90, 365, 20_000)
+                .await
+                .expect("prune drain");
+        }
+        assert!(!notification_exists(&pool, &oldest).await, "oldest drained");
+        assert!(!notification_exists(&pool, &middle).await, "middle drained");
+        assert!(
+            !notification_exists(&pool, &newest_expired).await,
+            "newest expired drained"
+        );
+
+        cleanup_recipient(&pool, recipient).await;
+    }
+
+    #[tokio::test]
+    async fn retention_nonsense_config_prunes_nothing() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-retention-guard-001";
+        let old = seed_aged(&pool, recipient, "Info", 500).await;
+
+        // Fail-safe guards: each nonsensical parameter set deletes NOTHING.
+        for (window, cap_window, batch) in [
+            (0, 365, 20_000),  // zero standard window
+            (-1, 365, 20_000), // negative window
+            (90, 30, 20_000),  // critical cap SHORTER than the standard window
+            (90, 365, 0),      // zero batch
+        ] {
+            let pruned = prune_expired(&pool, window, cap_window, batch)
+                .await
+                .expect("guarded prune must not fail");
+            assert_eq!(pruned, 0, "guard ({window},{cap_window},{batch}) is a no-op");
+        }
+        assert!(
+            notification_exists(&pool, &old).await,
+            "row survives every guarded no-op"
+        );
+
+        cleanup_recipient(&pool, recipient).await;
     }
 }

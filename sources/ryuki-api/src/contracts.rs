@@ -23847,6 +23847,100 @@ pub fn spawn_budget_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
     });
 }
 
+// ── Portal-notifications retention sweep ──────────────────────────────────────
+//
+// portal_notifications (mig 083) grows without bound — every request-lifecycle
+// transition and operational alert appends rows and nothing deletes them. This
+// sweep enforces the retention policy below via `repos::notifications::
+// prune_expired` (bounded oldest-first batches; receipts + dispatch-outbox rows
+// cascade via the mig 083/128 FKs; index: mig 156).
+//
+// The windows and cap are CONSTS, not env/platform-config knobs: every
+// background-loop cadence and retention parameter in this binary is a hardcoded
+// constant at its spawn/call site (the 300s scan intervals in main.rs, the
+// idempotency sweep's RETENTION_TTL_SECS, the scheduler prunes' KEEP/MAX
+// consts) — there is no config precedent for scan knobs, so these follow suit.
+
+/// Standard retention: a READ (any receipt) or non-Critical notification is
+/// pruned this many days after creation. Matches the shift_queue prune's 90-day
+/// resolved-history window; the feed reads at most 200 recent rows, so nothing
+/// user-visible depends on older history.
+const NOTIFICATIONS_RETENTION_DAYS: i64 = 90;
+/// Hard cap for the unread-Critical carve-out: an UNREAD Critical notification
+/// outlives the standard window (it may still need acting on) but is pruned
+/// unconditionally after this many days, so the table stays bounded even when
+/// nobody ever acknowledges.
+const NOTIFICATIONS_CRITICAL_UNREAD_RETENTION_DAYS: i64 = 365;
+/// Per-run delete cap (the established prune batch bound): the first sweep of a
+/// years-old backlog drains over a few ticks instead of one giant DELETE.
+const NOTIFICATIONS_PRUNE_MAX_PER_RUN: i64 = 20_000;
+/// Heartbeat registry name for the notifications retention sweep loop.
+const NOTIFICATIONS_RETENTION_SWEEP_NAME: &str = "notifications_retention_sweep";
+
+/// One retention pass — retry-idempotent (an expired-row DELETE re-run next
+/// tick deletes nothing extra), so `run_bounded` cancellation is safe.
+async fn notifications_retention_sweep_once(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    crate::repos::notifications::prune_expired(
+        pool,
+        NOTIFICATIONS_RETENTION_DAYS,
+        NOTIFICATIONS_CRITICAL_UNREAD_RETENTION_DAYS,
+        NOTIFICATIONS_PRUNE_MAX_PER_RUN,
+    )
+    .await
+}
+
+/// Spawn the portal-notifications retention sweep. Fail-open: an error (or
+/// iteration timeout) logs, backs off, and skips to a later tick — it never
+/// crashes the API. Call once at startup.
+pub fn spawn_notifications_retention_sweep(pool: sqlx::PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        crate::background::register_loop(NOTIFICATIONS_RETENTION_SWEEP_NAME, interval_secs);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick
+        let timeout = crate::background::iteration_timeout(interval_secs);
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            ticker.tick().await;
+            match crate::background::run_bounded(timeout, notifications_retention_sweep_once(&pool))
+                .await
+            {
+                Ok(pruned) => {
+                    consecutive_failures = 0;
+                    crate::background::record_loop_success(NOTIFICATIONS_RETENTION_SWEEP_NAME);
+                    if pruned > 0 {
+                        tracing::info!(
+                            pruned,
+                            "notifications retention sweep pruned expired notifications"
+                        );
+                    }
+                }
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "notifications retention sweep failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "notifications retention sweep exceeded its iteration timeout; backing off"
+                        ),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        interval_secs.saturating_mul(backoff),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 /// PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold,
 /// comparison, enabled); omitted fields are left unchanged (PATCH semantics,
 /// swarm #19). Execute-tier (same as create/delete). 404 if absent; 503 no DB.
