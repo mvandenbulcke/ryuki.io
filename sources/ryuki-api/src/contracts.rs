@@ -12774,18 +12774,23 @@ fn static_login_roles() -> [&'static str; 2] {
 /// Mode gate for POST /api/auth/login: the anonymous mock mint only exists in
 /// the dry-run modes. In Local mode it would bypass local auth entirely, so
 /// it is rejected with a pointer at the local login endpoint.
+///
+/// 400, not 503: the rejection is a permanent property of the configured auth
+/// mode, not a transient outage — a 5xx here invites load-balancer retries of
+/// a request that can never succeed (QA sweep note; this was the only 5xx a
+/// full lifecycle exercise produced).
 fn mock_login_gate(auth_mode: &AuthMode) -> Result<(), (StatusCode, Json<ApiError>)> {
     match auth_mode {
         AuthMode::MockDryRun | AuthMode::StaticDryRun => Ok(()),
         AuthMode::Local => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
             Json(ApiError::new(
                 "LOCAL_AUTH_MODE",
                 "Use /api/auth/local/login in local auth mode",
             )),
         )),
         AuthMode::EntraId => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
             Json(ApiError::new(
                 "ENTRA_NOT_CONFIGURED",
                 "Entra SSO not configured",
@@ -40460,14 +40465,14 @@ mod unit_tests {
         let Err((status, Json(body))) = mock_login_gate(&AuthMode::Local) else {
             panic!("local mode should reject the anonymous mock mint");
         };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "permanent client error, not a 5xx");
         assert_eq!(body.error, "LOCAL_AUTH_MODE");
         assert_eq!(body.message, "Use /api/auth/local/login in local auth mode");
 
         let Err((status, Json(body))) = mock_login_gate(&AuthMode::EntraId) else {
             panic!("entra mode should reject the anonymous mock mint");
         };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "permanent client error, not a 5xx");
         assert_eq!(body.error, "ENTRA_NOT_CONFIGURED");
     }
 
