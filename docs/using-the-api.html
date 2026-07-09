@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Page not found · Ryuki</title>
-<meta name="description" content="This page does not exist.">
-<meta name="robots" content="noindex">
-<meta property="og:title" content="Page not found · Ryuki">
-<meta property="og:description" content="This page does not exist.">
+<title>Using the API · Ryuki</title>
+<meta name="description" content="Authentication, conventions, and a complete request lifecycle with curl.">
+<link rel="canonical" href="https://ryuki.io/using-the-api.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/using-the-api.html">
+<meta property="og:title" content="Using the API · Ryuki">
+<meta property="og:description" content="Authentication, conventions, and a complete request lifecycle with curl.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -83,11 +85,11 @@ recipients and read state
 api
 the portal bell
 delivery channels
-known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
+known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link active" aria-current="page" data-sections="base url and versioning
 authentication
 authorization
 conventions
-walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="contents
+walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a><ul class="sb-sections"><li><a href="#base-url-and-versioning">Base URL and versioning</a></li><li><a href="#authentication">Authentication</a></li><li><a href="#authorization">Authorization</a></li><li><a href="#conventions">Conventions</a></li><li><a href="#walkthrough-a-request-through-its-lifecycle">Walkthrough: a request through its lifecycle</a></li></ul></li><li><a class="sb-link" data-sections="contents
 activity
 admin
 analytics
@@ -126,9 +128,69 @@ validation
 vm
 workflows" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Using the API</span></nav>
+<h1 id="using-the-api">Using the API</h1>
+<p>Everything the portal does, it does through this API, and everything the API serves is available to your own tooling: the same authentication, the same permission tiers, the same audited lifecycle. This guide covers how to authenticate, the conventions every endpoint follows, and a complete request lifecycle you can run with curl. The <a href="api-reference.html">API Reference</a> documents every route by area.</p>
+<h2 id="base-url-and-versioning">Base URL and versioning</h2>
+<p>All routes live under <code>/api</code> on the control plane (the same origin the portal is served behind). Every response carries an <code>x-api-version</code> header. Health lives at <code>/health</code> and readiness at <code>/ready</code>, both unauthenticated.</p>
+<h2 id="authentication">Authentication</h2>
+<p>The API supports three ways in, selected by the platform's <code>RYUKI_AUTH_MODE</code> (see <a href="configuration.html">Configuration</a>):</p>
+<p><strong>Development modes</strong> (<code>mock-dry-run</code>, the default, and <code>static-dry-run</code>): requests run as a static admin session with no credentials. Nothing to configure; never run these against anything real.</p>
+<p><strong>Local accounts</strong> (<code>local</code>): sign in and use the returned session.</p>
+<pre><code class="lang-bash"><span class="hl-c"># Sign in: the response sets a ryuki_session cookie and returns the session id</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-c</span> cookies.txt <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/auth/local/login \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"username": "&lt;user&gt;", "password": "&lt;password&gt;"}'</span>
 
-<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
+<span class="hl-c"># Subsequent calls: send the cookie (or the X-Ryuki-Session-Id header)</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-b</span> cookies.txt https://&lt;host&gt;/api/requests</code></pre>
+<p><strong>Entra ID</strong> (<code>entra-id</code>): browsers use the sign-in flow behind the portal's "Sign in with Microsoft Entra ID" button; non-interactive callers present a bearer JWT from the tenant, validated against its JWKS.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;host&gt;/api/requests <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;entra-jwt&gt;"</span></code></pre>
+<p><strong>API tokens</strong> work in every mode and are the right choice for integrations. An admin mints one; the <code>ryk_...</code> value is returned exactly once. Tokens can carry site and environment scopes, which narrow everything the token sees — the recommended blast-radius control.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-b</span> cookies.txt <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/admin/tokens \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "ci-reader", "owner_principal": "ci@example.test", "roles": ["Auditor"], "site_scope": "DEFRA"}'</span>
 
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;host&gt;/api/requests <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer ryk_..."</span></code></pre>
+<h2 id="authorization">Authorization</h2>
+<p>Every route is gated by one of five permission tiers — <code>admin</code>, <code>approve</code>, <code>execute</code>, <code>request</code>, <code>audit</code> — derived from your roles, and results are narrowed by your site and environment scopes. The enforcement semantics (when you get a 404 versus a 403 versus a silently narrowed list) are documented in <a href="rbac-and-scoping.html">RBAC &amp; Scoping</a>; the per-route tier appears in the <a href="api-reference.html">API Reference</a>.</p>
+<h2 id="conventions">Conventions</h2>
+<p><strong>Errors</strong> are a consistent JSON body with a stable machine code and a human message, plus an optional detail:</p>
+<pre><code class="lang-json">{ <span class="hl-k">"error"</span>: <span class="hl-s">"VALIDATION_FAILED"</span>, <span class="hl-k">"message"</span>: <span class="hl-s">"site is not active"</span>, <span class="hl-k">"detail"</span>: <span class="hl-s">"..."</span> }</code></pre>
+<p><code>4xx</code> means your request cannot succeed as sent (wrong tier, wrong mode, invalid payload — do not retry unchanged). <code>5xx</code> is the platform's problem. The public agent-protocol surface additionally documents RFC 9457-shaped errors in the <a href="api-reference.html">OpenAPI spec</a>.</p>
+<p><strong>Pagination</strong>: list endpoints accept <code>limit</code> (default 500, clamped to 1..1000) and <code>offset</code>. Object-shaped responses add <code>total</code>, <code>limit</code>, and <code>offset</code> keys; bare-array responses carry the filtered total in an <code>X-Total-Count</code> header instead. Totals are filtered and scope-aware, never whole-table counts.</p>
+<p><strong>Timestamps</strong> are RFC 3339 strings. <strong>Degraded behavior</strong>: without a database, read endpoints respond with <code>source: "no-db"</code> and empty data rather than fabricating rows, and writes return 503.</p>
+<h2 id="walkthrough-a-request-through-its-lifecycle">Walkthrough: a request through its lifecycle</h2>
+<p>The heart of the platform is the governed request lifecycle. This runs end-to-end on a dev stack (<code>RYUKI_AUTH_MODE=mock-dry-run</code>, so no auth headers are needed; add yours in real modes).</p>
+<pre><code class="lang-bash"><span class="hl-cmd">BASE=http://localhost:8080</span>
+
+<span class="hl-c"># 1. Create a request (server deployment intake)</span>
+<span class="hl-cmd">REQ=</span>$(curl <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> '{
+    <span class="hl-s">"request_type"</span>: <span class="hl-s">"server-deployment"</span>,
+    <span class="hl-s">"site"</span>: <span class="hl-s">"DEFRA"</span>,
+    <span class="hl-s">"environment"</span>: <span class="hl-s">"prod"</span>,
+    <span class="hl-s">"name"</span>: <span class="hl-s">"app-server-01"</span>,
+    <span class="hl-s">"fields"</span>: {<span class="hl-s">"operating_system"</span>: <span class="hl-s">"linux"</span>}
+  <span class="hl-cmd">}</span><span class="hl-s">' | python3 -c "import sys, json; print(json.load(sys.stdin)['</span>id'])")
+
+<span class="hl-c"># 2. Walk the governed stages</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/validate   <span class="hl-c"># static checks against catalog contracts</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/plan       <span class="hl-c"># execution plan with impact and rollback</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/approve    <span class="hl-c"># role-based approval (separation of duties applies)</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/lock       <span class="hl-c"># change window locked, resources reserved</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/execute    <span class="hl-c"># dispatches agent jobs, dry-run by default</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/verify     <span class="hl-c"># post-change health probes</span>
+<span class="hl-c"># execution completes asynchronously once the agent posts its result</span>
+
+<span class="hl-c"># 3. Read the state, the audit trail, and the sealed evidence pack</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>                    <span class="hl-c"># status, stages, steps[] when orchestrated</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/audit              <span class="hl-c"># hash-chained transition trail (audit tier)</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/evidence           <span class="hl-c"># redacted, digest-sealed evidence pack</span></code></pre>
+<p>Every transition is CAS-guarded (a conflicting transition answers 409), attributed, and appended to the hash-chained audit trail — including the agent-driven <code>executing</code> transition, which is recorded under the machine identity of the agent whose signed result caused it.</p>
+<p>From here: multi-step requests and per-step live approvals are covered in <a href="orchestration.html">Multi-Step Orchestration</a>, and taking execution to real infrastructure in <a href="agents-and-live-execution.html">Agents &amp; Live Execution</a>.</p>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/using-the-api.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/notifications.html">&larr; Notifications</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
 </main>
 </div>
 <script>

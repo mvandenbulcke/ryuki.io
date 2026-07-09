@@ -40,6 +40,8 @@ PAGES = [
      "Dependency-ordered step plans, per-step live approval, and automatic teardown."),
     ("notifications", "Notifications",
      "In-app notifications, read receipts, the portal bell, and what emits them."),
+    ("using-the-api", "Using the API",
+     "Authentication, conventions, and a complete request lifecycle with curl."),
     ("api-reference", "API Reference",
      "Every HTTP endpoint the control plane serves, generated from the route registrations."),
 ]

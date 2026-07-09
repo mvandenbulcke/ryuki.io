@@ -85,7 +85,11 @@ recipients and read state
 api
 the portal bell
 delivery channels
-known limits" href="/notifications.html">Notifications</a><ul class="sb-sections"><li><a href="#what-gets-notified-and-to-whom">What gets notified, and to whom</a></li><li><a href="#recipients-and-read-state">Recipients and read state</a></li><li><a href="#api">API</a></li><li><a href="#the-portal-bell">The portal bell</a></li><li><a href="#delivery-channels">Delivery channels</a></li><li><a href="#known-limits">Known limits</a></li></ul></li><li><a class="sb-link" data-sections="contents
+known limits" href="/notifications.html">Notifications</a><ul class="sb-sections"><li><a href="#what-gets-notified-and-to-whom">What gets notified, and to whom</a></li><li><a href="#recipients-and-read-state">Recipients and read state</a></li><li><a href="#api">API</a></li><li><a href="#the-portal-bell">The portal bell</a></li><li><a href="#delivery-channels">Delivery channels</a></li><li><a href="#known-limits">Known limits</a></li></ul></li><li><a class="sb-link" data-sections="base url and versioning
+authentication
+authorization
+conventions
+walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="contents
 activity
 admin
 analytics
@@ -159,7 +163,7 @@ workflows" href="/api-reference.html">API Reference</a></li></ul><p class="sb-em
 <p>Every emitted notification also plans its hypothetical delivery in the dispatch outbox: Critical events plan email and webhook, Warnings plan webhook, Info and Success plan nothing. The outbox is telemetry for operators to inspect (<code>dry_run_logged</code> status); no send path exists yet, and outbox bookkeeping can never roll back a notification.</p>
 <h2 id="known-limits">Known limits</h2>
 <p>There is no retention or pruning job for notifications yet; the list endpoint caps at the newest 200 per recipient. If you need long-term archival of operational events, use the audit trail and domain events, which are the durable record.</p>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/notifications.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/orchestration.html">&larr; Multi-Step Orchestration</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/notifications.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/orchestration.html">&larr; Multi-Step Orchestration</a><a href="/using-the-api.html">Using the API &rarr;</a></nav>
 </main>
 </div>
 <script>
