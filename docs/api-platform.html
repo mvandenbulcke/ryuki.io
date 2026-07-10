@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Platform API · Ryuki</title>
+<meta name="description" content="Platform status and bootstrap surface: the liveness/readiness/metrics probes registered outside /api, plus platform summary, uptime, degradation drills, and database-readiness reads. The summary read is auth-exempt so the login view can bootstrap before a session exists.">
+<link rel="canonical" href="https://ryuki.io/api-platform.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-platform.html">
+<meta property="og:title" content="Platform API · Ryuki">
+<meta property="og:description" content="Platform status and bootstrap surface: the liveness/readiness/metrics probes registered outside /api, plus platform summary, uptime, degradation drills, and database-readiness reads. The summary read is auth-exempt so the login view can bootstrap before a session exists.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link active" aria-current="page" href="/api-platform.html">Platform</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-platform-database-readiness-contract">GET /api/platform/database-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-degradation-contract">GET /api/platform/degradation-contract</a></li><li><a class="sb-ep" href="#post-api-platform-degradation-check-site">POST /api/platform/degradation/check/{site}</a></li><li><a class="sb-ep" href="#get-api-platform-degradation-degraded">GET /api/platform/degradation/degraded</a></li><li><a class="sb-ep" href="#post-api-platform-degradation-enter-site">POST /api/platform/degradation/enter/{site}</a></li><li><a class="sb-ep" href="#post-api-platform-degradation-exit-site">POST /api/platform/degradation/exit/{site}</a></li><li><a class="sb-ep" href="#get-api-platform-degradation-global">GET /api/platform/degradation/global</a></li><li><a class="sb-ep" href="#get-api-platform-degradation-rules">GET /api/platform/degradation/rules</a></li><li><a class="sb-ep" href="#get-api-platform-design-system-contract">GET /api/platform/design-system-contract</a></li><li><a class="sb-ep" href="#get-api-platform-health">GET /api/platform/health</a></li><li><a class="sb-ep" href="#get-api-platform-health-adapters">GET /api/platform/health/adapters</a></li><li><a class="sb-ep" href="#get-api-platform-health-all">GET /api/platform/health/all</a></li><li><a class="sb-ep" href="#get-api-platform-health-check-adapter">GET /api/platform/health/check/{adapter}</a></li><li><a class="sb-ep" href="#get-api-platform-health-components">GET /api/platform/health/components</a></li><li><a class="sb-ep" href="#get-api-platform-health-dependencies">GET /api/platform/health/dependencies</a></li><li><a class="sb-ep" href="#get-api-platform-health-loops">GET /api/platform/health/loops</a></li><li><a class="sb-ep" href="#get-api-platform-health-metrics">GET /api/platform/health/metrics</a></li><li><a class="sb-ep" href="#get-api-platform-kubernetes-runtime-readiness-contract">GET /api/platform/kubernetes-runtime-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-local-container-readiness-contract">GET /api/platform/local-container-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-object-storage-readiness-contract">GET /api/platform/object-storage-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-portal-information-architecture-contract">GET /api/platform/portal-information-architecture-contract</a></li><li><a class="sb-ep" href="#get-api-platform-registry-readiness-contract">GET /api/platform/registry-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-release-promotion-contract">GET /api/platform/release-promotion-contract</a></li><li><a class="sb-ep" href="#get-api-platform-security-baseline-contract">GET /api/platform/security-baseline-contract</a></li><li><a class="sb-ep" href="#get-api-platform-status">GET /api/platform/status</a></li><li><a class="sb-ep" href="#get-api-platform-status-contract">GET /api/platform/status-contract</a></li><li><a class="sb-ep" href="#get-api-platform-summary">GET /api/platform/summary</a></li><li><a class="sb-ep" href="#get-api-platform-ui-mockup-acceptance-contract">GET /api/platform/ui-mockup-acceptance-contract</a></li><li><a class="sb-ep" href="#get-api-platform-uptime">GET /api/platform/uptime</a></li><li><a class="sb-ep" href="#get-api-platform-vault-deployment-readiness-contract">GET /api/platform/vault-deployment-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-platform-vault-secret-delivery-contract">GET /api/platform/vault-secret-delivery-contract</a></li><li><a class="sb-ep" href="#get-health">GET /health</a></li><li><a class="sb-ep" href="#get-metrics">GET /metrics</a></li><li><a class="sb-ep" href="#get-ready">GET /ready</a></li></ul></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Platform</span></nav>
+<h1>Platform API</h1>
+<p>Platform status and bootstrap surface: the liveness/readiness/metrics probes registered outside /api, plus platform summary, uptime, degradation drills, and database-readiness reads. The summary read is auth-exempt so the login view can bootstrap before a session exists.</p>
+<p class="area-count">34 routes</p>
+<h2 class="ep-h" id="get-api-platform-database-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/database-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/database-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-degradation-contract"><span class="method-chip m-get">GET</span><code>/api/platform/degradation-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation-contract</code></pre>
+<h2 class="ep-h" id="post-api-platform-degradation-check-site"><span class="method-chip m-post">POST</span><code>/api/platform/degradation/check/{site}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation/check/{site}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>degradation_check</code>.</p>
+<h2 class="ep-h" id="get-api-platform-degradation-degraded"><span class="method-chip m-get">GET</span><code>/api/platform/degradation/degraded</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation/degraded</code></pre>
+<h2 class="ep-h" id="post-api-platform-degradation-enter-site"><span class="method-chip m-post">POST</span><code>/api/platform/degradation/enter/{site}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DegradationEnterRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/platform/degradation/enter/{site}</span></code></pre>
+<h2 class="ep-h" id="post-api-platform-degradation-exit-site"><span class="method-chip m-post">POST</span><code>/api/platform/degradation/exit/{site}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation/exit/{site}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>degradation_exit</code>.</p>
+<h2 class="ep-h" id="get-api-platform-degradation-global"><span class="method-chip m-get">GET</span><code>/api/platform/degradation/global</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation/global</code></pre>
+<h2 class="ep-h" id="get-api-platform-degradation-rules"><span class="method-chip m-get">GET</span><code>/api/platform/degradation/rules</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/degradation/rules</code></pre>
+<h2 class="ep-h" id="get-api-platform-design-system-contract"><span class="method-chip m-get">GET</span><code>/api/platform/design-system-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/design-system-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-health"><span class="method-chip m-get">GET</span><code>/api/platform/health</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-adapters"><span class="method-chip m-get">GET</span><code>/api/platform/health/adapters</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/adapters</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-all"><span class="method-chip m-get">GET</span><code>/api/platform/health/all</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/platform/health/all — component health checks.</p>
+<p>GET /api/platform/health/all — component health checks. These are SIMULATED (the health_monitor engine is pure / IO-free), so the overall status is NOT a live truth signal. The response is marked <code>advisory</code> and points at the real dependency-backed probe (#6) so a monitoring system can never mistake a hardcoded <code>healthy</code> for a live one (swarm finding #4). Additive: the original PlatformHealth fields are unchanged.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/all</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-check-adapter"><span class="method-chip m-get">GET</span><code>/api/platform/health/check/{adapter}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/check/{adapter}</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-components"><span class="method-chip m-get">GET</span><code>/api/platform/health/components</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/components</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-dependencies"><span class="method-chip m-get">GET</span><code>/api/platform/health/dependencies</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/platform/health/dependencies — dependency-backed self-health (#6).</p>
+<p>GET /api/platform/health/dependencies — dependency-backed self-health (#6).</p>
+<p>Unlike the binary <code>/ready</code>, this reports EACH backing dependency (database connectivity, migrations, scheduler liveness) and an aggregate verdict. Alerting-safe: a probe that errors is <code>down</code> (never silently healthy), and the aggregate maps to 200 (healthy/degraded — still serving) or 503 (unhealthy). Authenticated (it lives in the human-gated router).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/dependencies</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-loops"><span class="method-chip m-get">GET</span><code>/api/platform/health/loops</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/platform/health/loops — per-loop breakdown of the background-loop heartbeat registry.</p>
+<p>GET /api/platform/health/loops — per-loop breakdown of the background-loop heartbeat registry. The aggregate <code>/api/platform/health/dependencies</code> reports only THAT a loop is wedged; this reports WHICH loop, its cadence, how long it has been silent (<code>age_secs</code>), and its overdue <code>threshold_secs</code>, so an operator can diagnose. Authenticated like its sibling (it lives in the human-gated router; the loop names are already surfaced by the aggregate's <code>down</code> detail). A wedged loop maps to 503 (else 200); the body always carries the full breakdown.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/loops</code></pre>
+<h2 class="ep-h" id="get-api-platform-health-metrics"><span class="method-chip m-get">GET</span><code>/api/platform/health/metrics</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/health/metrics</code></pre>
+<h2 class="ep-h" id="get-api-platform-kubernetes-runtime-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/kubernetes-runtime-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/kubernetes-runtime-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-local-container-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/local-container-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/local-container-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-object-storage-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/object-storage-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/object-storage-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-portal-information-architecture-contract"><span class="method-chip m-get">GET</span><code>/api/platform/portal-information-architecture-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/portal-information-architecture-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-registry-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/registry-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/registry-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-release-promotion-contract"><span class="method-chip m-get">GET</span><code>/api/platform/release-promotion-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/release-promotion-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-security-baseline-contract"><span class="method-chip m-get">GET</span><code>/api/platform/security-baseline-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/security-baseline-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-status"><span class="method-chip m-get">GET</span><code>/api/platform/status</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/status</code></pre>
+<h2 class="ep-h" id="get-api-platform-status-contract"><span class="method-chip m-get">GET</span><code>/api/platform/status-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/status-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-summary"><span class="method-chip m-get">GET</span><code>/api/platform/summary</code></h2>
+<p class="badges"><span class="badge">public tier</span><span class="badge badge-open">no auth required</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;your-host&gt;/api/platform/summary</code></pre>
+<h2 class="ep-h" id="get-api-platform-ui-mockup-acceptance-contract"><span class="method-chip m-get">GET</span><code>/api/platform/ui-mockup-acceptance-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/ui-mockup-acceptance-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-uptime"><span class="method-chip m-get">GET</span><code>/api/platform/uptime</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/uptime</code></pre>
+<h2 class="ep-h" id="get-api-platform-vault-deployment-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/platform/vault-deployment-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/vault-deployment-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-platform-vault-secret-delivery-contract"><span class="method-chip m-get">GET</span><code>/api/platform/vault-secret-delivery-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/platform/vault-secret-delivery-contract</code></pre>
+<h2 class="ep-h" id="get-health"><span class="method-chip m-get">GET</span><code>/health</code></h2>
+<p class="badges"><span class="badge">public tier</span><span class="badge badge-open">no auth required</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;your-host&gt;/health</code></pre>
+<h2 class="ep-h" id="get-metrics"><span class="method-chip m-get">GET</span><code>/metrics</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/metrics</code></pre>
+<h2 class="ep-h" id="get-ready"><span class="method-chip m-get">GET</span><code>/ready</code></h2>
+<p class="badges"><span class="badge">public tier</span><span class="badge badge-open">no auth required</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;your-host&gt;/ready</code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-patching.html">&larr; Patching</a><a href="/api-protect.html">Protect &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

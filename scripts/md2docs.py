@@ -456,6 +456,7 @@ td code{white-space:nowrap}
 .badge-open{color:#e0b46a;border-color:rgba(224,180,106,.45);background:rgba(224,180,106,.1)}
 .ep-summary{color:var(--text);font-weight:500}
 .ep-missing{color:var(--text-secondary);font-style:italic}
+.ep-doc-heading{color:var(--text);font-weight:600;margin-top:1rem}
 h3.ep-sub{font-size:.78rem;font-weight:700;text-transform:uppercase;
   letter-spacing:.08em;color:var(--text-secondary);margin:1.5rem 0 .45rem}
 .area-count{font-size:.78rem;font-weight:600;text-transform:uppercase;
@@ -940,7 +941,14 @@ def render_route(route, anchor) -> str:
     if desc:
         for para in re.split(r"\n\s*\n", desc):
             para = " ".join(para.split())
-            if para:
+            if not para:
+                continue
+            # Handler doc comments sometimes use `##`/`#` subheadings; render
+            # them as bold sub-labels instead of leaking the literal marker.
+            heading = re.match(r"^#{1,4}\s+(.*)$", para)
+            if heading:
+                out.append(f'<p class="ep-doc-heading">{inline(heading.group(1))}</p>')
+            else:
                 out.append(f"<p>{inline(para)}</p>")
     qp = route.get("query_params") or []
     if qp:

@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network API · Ryuki</title>
+<meta name="description" content="Network services: DNS record management, IPAM, firewall rule sets, and load-balancer surfaces.">
+<link rel="canonical" href="https://ryuki.io/api-network.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-network.html">
+<meta property="og:title" content="Network API · Ryuki">
+<meta property="og:description" content="Network services: DNS record management, IPAM, firewall rule sets, and load-balancer surfaces.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link active" aria-current="page" href="/api-network.html">Network</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-network-dns-ipam-contract">GET /api/network/dns-ipam-contract</a></li><li><a class="sb-ep" href="#get-api-network-dns-records">GET /api/network/dns/records</a></li><li><a class="sb-ep" href="#post-api-network-dns-records">POST /api/network/dns/records</a></li><li><a class="sb-ep" href="#delete-api-network-dns-records-id">DELETE /api/network/dns/records/{id}</a></li><li><a class="sb-ep" href="#get-api-network-dns-records-id">GET /api/network/dns/records/{id}</a></li><li><a class="sb-ep" href="#put-api-network-dns-records-id">PUT /api/network/dns/records/{id}</a></li><li><a class="sb-ep" href="#get-api-network-firewall-contract">GET /api/network/firewall-contract</a></li><li><a class="sb-ep" href="#get-api-network-firewall-conflicts">GET /api/network/firewall/conflicts</a></li><li><a class="sb-ep" href="#get-api-network-firewall-rule-sets">GET /api/network/firewall/rule-sets</a></li><li><a class="sb-ep" href="#post-api-network-firewall-rule-sets">POST /api/network/firewall/rule-sets</a></li><li><a class="sb-ep" href="#get-api-network-firewall-rule-sets-id">GET /api/network/firewall/rule-sets/{id}</a></li><li><a class="sb-ep" href="#post-api-network-firewall-rule-sets-id-apply">POST /api/network/firewall/rule-sets/{id}/apply</a></li><li><a class="sb-ep" href="#post-api-network-firewall-rule-sets-id-revoke">POST /api/network/firewall/rule-sets/{id}/revoke</a></li><li><a class="sb-ep" href="#get-api-network-firewall-rules">GET /api/network/firewall/rules</a></li><li><a class="sb-ep" href="#post-api-network-firewall-rules">POST /api/network/firewall/rules</a></li><li><a class="sb-ep" href="#delete-api-network-firewall-rules-id">DELETE /api/network/firewall/rules/{id}</a></li><li><a class="sb-ep" href="#get-api-network-firewall-rules-id">GET /api/network/firewall/rules/{id}</a></li><li><a class="sb-ep" href="#post-api-network-firewall-rules-id-update">POST /api/network/firewall/rules/{id}/update</a></li><li><a class="sb-ep" href="#post-api-network-firewall-validate">POST /api/network/firewall/validate</a></li><li><a class="sb-ep" href="#get-api-network-ipam-availability-id">GET /api/network/ipam/availability/{id}</a></li><li><a class="sb-ep" href="#post-api-network-ipam-release-id">POST /api/network/ipam/release/{id}</a></li><li><a class="sb-ep" href="#post-api-network-ipam-reserve">POST /api/network/ipam/reserve</a></li><li><a class="sb-ep" href="#get-api-network-ipam-subnets">GET /api/network/ipam/subnets</a></li><li><a class="sb-ep" href="#post-api-network-ipam-subnets">POST /api/network/ipam/subnets</a></li><li><a class="sb-ep" href="#delete-api-network-ipam-subnets-id">DELETE /api/network/ipam/subnets/{id}</a></li><li><a class="sb-ep" href="#get-api-network-ipam-subnets-id">GET /api/network/ipam/subnets/{id}</a></li><li><a class="sb-ep" href="#put-api-network-ipam-subnets-id">PUT /api/network/ipam/subnets/{id}</a></li><li><a class="sb-ep" href="#get-api-network-ipam-summary">GET /api/network/ipam/summary</a></li><li><a class="sb-ep" href="#get-api-network-loadbalancer-contract">GET /api/network/loadbalancer-contract</a></li><li><a class="sb-ep" href="#get-api-network-loadbalancer-status">GET /api/network/loadbalancer/status</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-validate-vip">POST /api/network/loadbalancer/validate-vip</a></li><li><a class="sb-ep" href="#get-api-network-loadbalancer-vs">GET /api/network/loadbalancer/vs</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-vs">POST /api/network/loadbalancer/vs</a></li><li><a class="sb-ep" href="#delete-api-network-loadbalancer-vs-id">DELETE /api/network/loadbalancer/vs/{id}</a></li><li><a class="sb-ep" href="#get-api-network-loadbalancer-vs-id">GET /api/network/loadbalancer/vs/{id}</a></li><li><a class="sb-ep" href="#put-api-network-loadbalancer-vs-id">PUT /api/network/loadbalancer/vs/{id}</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-vs-id-disable">POST /api/network/loadbalancer/vs/{id}/disable</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-vs-id-drain">POST /api/network/loadbalancer/vs/{id}/drain</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-vs-id-enable">POST /api/network/loadbalancer/vs/{id}/enable</a></li><li><a class="sb-ep" href="#post-api-network-loadbalancer-vs-id-member">POST /api/network/loadbalancer/vs/{id}/member</a></li><li><a class="sb-ep" href="#delete-api-network-loadbalancer-vs-id-member-hostname">DELETE /api/network/loadbalancer/vs/{id}/member/{hostname}</a></li></ul></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Network</span></nav>
+<h1>Network API</h1>
+<p>Network services: DNS record management, IPAM, firewall rule sets, and load-balancer surfaces.</p>
+<p class="area-count">41 routes</p>
+<h2 class="ep-h" id="get-api-network-dns-ipam-contract"><span class="method-chip m-get">GET</span><code>/api/network/dns-ipam-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/dns-ipam-contract</code></pre>
+<h2 class="ep-h" id="get-api-network-dns-records"><span class="method-chip m-get">GET</span><code>/api/network/dns/records</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>recordType</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/dns/records</code></pre>
+<h2 class="ep-h" id="post-api-network-dns-records"><span class="method-chip m-post">POST</span><code>/api/network/dns/records</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DnsCreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>recordType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>value</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>zone</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>ttl</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "recordType": "&lt;string&gt;", "value": "&lt;string&gt;", "zone": "&lt;string&gt;", "ttl": 0, "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/dns/records</span></code></pre>
+<h2 class="ep-h" id="delete-api-network-dns-records-id"><span class="method-chip m-delete">DELETE</span><code>/api/network/dns/records/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/dns/records/{id}</code></pre>
+<h2 class="ep-h" id="get-api-network-dns-records-id"><span class="method-chip m-get">GET</span><code>/api/network/dns/records/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/dns/records/{id}</code></pre>
+<h2 class="ep-h" id="put-api-network-dns-records-id"><span class="method-chip m-put">PUT</span><code>/api/network/dns/records/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">PUT /api/network/dns/records/{id} — update a record's mutable fields in place (no id churn, unlike delete + recreate).</p>
+<p>PUT /api/network/dns/records/{id} — update a record's mutable fields in place (no id churn, unlike delete + recreate). The resulting record is re-validated through the same pure engine builder as create, so an invalid type/value/ttl is a 400. DB-backed: a record must be persisted to be updated.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DnsUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>value</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>ttl</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>recordType</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"value": "&lt;string&gt;", "ttl": 0, "recordType": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/dns/records/{id}</span></code></pre>
+<h2 class="ep-h" id="get-api-network-firewall-contract"><span class="method-chip m-get">GET</span><code>/api/network/firewall-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall-contract</code></pre>
+<h2 class="ep-h" id="get-api-network-firewall-conflicts"><span class="method-chip m-get">GET</span><code>/api/network/firewall/conflicts</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/conflicts</code></pre>
+<h2 class="ep-h" id="get-api-network-firewall-rule-sets"><span class="method-chip m-get">GET</span><code>/api/network/firewall/rule-sets</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rule-sets</code></pre>
+<h2 class="ep-h" id="post-api-network-firewall-rule-sets"><span class="method-chip m-post">POST</span><code>/api/network/firewall/rule-sets</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>FwRuleSetCreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>ruleIds</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>target</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "ruleIds": [], "site": "&lt;string&gt;", "target": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/firewall/rule-sets</span></code></pre>
+<h2 class="ep-h" id="get-api-network-firewall-rule-sets-id"><span class="method-chip m-get">GET</span><code>/api/network/firewall/rule-sets/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rule-sets/{id}</code></pre>
+<h2 class="ep-h" id="post-api-network-firewall-rule-sets-id-apply"><span class="method-chip m-post">POST</span><code>/api/network/firewall/rule-sets/{id}/apply</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rule-sets/{id}/apply</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>firewall_rule_set_apply</code>.</p>
+<h2 class="ep-h" id="post-api-network-firewall-rule-sets-id-revoke"><span class="method-chip m-post">POST</span><code>/api/network/firewall/rule-sets/{id}/revoke</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rule-sets/{id}/revoke</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>firewall_rule_set_revoke</code>.</p>
+<h2 class="ep-h" id="get-api-network-firewall-rules"><span class="method-chip m-get">GET</span><code>/api/network/firewall/rules</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>direction</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rules</code></pre>
+<h2 class="ep-h" id="post-api-network-firewall-rules"><span class="method-chip m-post">POST</span><code>/api/network/firewall/rules</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>FwCreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>sourceIp</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>destIp</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>protocol</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>action</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>direction</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>description</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "sourceIp": "&lt;string&gt;", "destIp": "&lt;string&gt;", "protocol": "&lt;string&gt;", "action": "&lt;string&gt;", "direction": "&lt;string&gt;", "site": "&lt;string&gt;", "description": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/firewall/rules</span></code></pre>
+<h2 class="ep-h" id="delete-api-network-firewall-rules-id"><span class="method-chip m-delete">DELETE</span><code>/api/network/firewall/rules/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rules/{id}</code></pre>
+<h2 class="ep-h" id="get-api-network-firewall-rules-id"><span class="method-chip m-get">GET</span><code>/api/network/firewall/rules/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/firewall/rules/{id}</code></pre>
+<h2 class="ep-h" id="post-api-network-firewall-rules-id-update"><span class="method-chip m-post">POST</span><code>/api/network/firewall/rules/{id}/update</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>FwUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>action</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"action": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/firewall/rules/{id}/update</span></code></pre>
+<h2 class="ep-h" id="post-api-network-firewall-validate"><span class="method-chip m-post">POST</span><code>/api/network/firewall/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>FwValidateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>sourceIp</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>destIp</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>protocol</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "sourceIp": "&lt;string&gt;", "destIp": "&lt;string&gt;", "protocol": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/firewall/validate</span></code></pre>
+<h2 class="ep-h" id="get-api-network-ipam-availability-id"><span class="method-chip m-get">GET</span><code>/api/network/ipam/availability/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>count</code></td><td><code>u32</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/availability/{id}</code></pre>
+<h2 class="ep-h" id="post-api-network-ipam-release-id"><span class="method-chip m-post">POST</span><code>/api/network/ipam/release/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/release/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>ipam_release_ip</code>.</p>
+<h2 class="ep-h" id="post-api-network-ipam-reserve"><span class="method-chip m-post">POST</span><code>/api/network/ipam/reserve</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>IpamReserveRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>subnetId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>purpose</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>ttlDays</code></td><td><code>u64</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"subnetId": "&lt;string&gt;", "hostname": "&lt;string&gt;", "purpose": "&lt;string&gt;", "ttlDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/ipam/reserve</span></code></pre>
+<h2 class="ep-h" id="get-api-network-ipam-subnets"><span class="method-chip m-get">GET</span><code>/api/network/ipam/subnets</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/subnets</code></pre>
+<h2 class="ep-h" id="post-api-network-ipam-subnets"><span class="method-chip m-post">POST</span><code>/api/network/ipam/subnets</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/network/ipam/subnets — create a subnet (validated + counters derived from the CIDR by the pure engine builder, then persisted).</p>
+<p>POST /api/network/ipam/subnets — create a subnet (validated + counters derived from the CIDR by the pure engine builder, then persisted). Execute-tier (the /api/network family). 503 when no database is configured.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>IpamSubnetCreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>cidr</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>gateway</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>vlan_id</code></td><td><code>u16</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"cidr": "&lt;string&gt;", "gateway": "&lt;string&gt;", "vlan_id": 0, "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/ipam/subnets</span></code></pre>
+<h2 class="ep-h" id="delete-api-network-ipam-subnets-id"><span class="method-chip m-delete">DELETE</span><code>/api/network/ipam/subnets/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/network/ipam/subnets/{id} — delete a subnet.</p>
+<p>DELETE /api/network/ipam/subnets/{id} — delete a subnet. REFUSES with 409 when the subnet still has IP reservations (deleting it would silently drop live allocations via the FK cascade); release them first. 404 when unknown.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/subnets/{id}</code></pre>
+<h2 class="ep-h" id="get-api-network-ipam-subnets-id"><span class="method-chip m-get">GET</span><code>/api/network/ipam/subnets/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/subnets/{id}</code></pre>
+<h2 class="ep-h" id="put-api-network-ipam-subnets-id"><span class="method-chip m-put">PUT</span><code>/api/network/ipam/subnets/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">PUT /api/network/ipam/subnets/{id} — update a subnet's mutable fields (gateway, vlan_id, status), preserving the reservation counters.</p>
+<p>PUT /api/network/ipam/subnets/{id} — update a subnet's mutable fields (gateway, vlan_id, status), preserving the reservation counters. The new gateway/vlan are revalidated against the immutable CIDR through the same pure engine path as create. 404 when the subnet is unknown; 503 when no DB.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>IpamSubnetUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>gateway</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>vlan_id</code></td><td><code>u16</code></td><td>optional</td><td></td></tr><tr><td><code>status</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"gateway": "&lt;string&gt;", "vlan_id": 0, "status": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/ipam/subnets/{id}</span></code></pre>
+<h2 class="ep-h" id="get-api-network-ipam-summary"><span class="method-chip m-get">GET</span><code>/api/network/ipam/summary</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/ipam/summary</code></pre>
+<h2 class="ep-h" id="get-api-network-loadbalancer-contract"><span class="method-chip m-get">GET</span><code>/api/network/loadbalancer-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer-contract</code></pre>
+<h2 class="ep-h" id="get-api-network-loadbalancer-status"><span class="method-chip m-get">GET</span><code>/api/network/loadbalancer/status</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/status</code></pre>
+<h2 class="ep-h" id="post-api-network-loadbalancer-validate-vip"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/validate-vip</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LbValidateVipRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>vip</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"vip": "&lt;string&gt;", "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/loadbalancer/validate-vip</span></code></pre>
+<h2 class="ep-h" id="get-api-network-loadbalancer-vs"><span class="method-chip m-get">GET</span><code>/api/network/loadbalancer/vs</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs</code></pre>
+<h2 class="ep-h" id="post-api-network-loadbalancer-vs"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/vs</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LbProvisionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>vip</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>port</code></td><td><code>u16</code></td><td>required</td><td></td></tr><tr><td><code>protocol</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>members</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>algorithm</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "vip": "&lt;string&gt;", "port": 0, "protocol": "&lt;string&gt;", "site": "&lt;string&gt;", "members": [], "algorithm": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/loadbalancer/vs</span></code></pre>
+<h2 class="ep-h" id="delete-api-network-loadbalancer-vs-id"><span class="method-chip m-delete">DELETE</span><code>/api/network/loadbalancer/vs/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/network/loadbalancer/vs/{id} — decommission a VS (and orphan-clean its backing pool).</p>
+<p>DELETE /api/network/loadbalancer/vs/{id} — decommission a VS (and orphan-clean its backing pool). 404 when unknown; 503 when no DB.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}</code></pre>
+<h2 class="ep-h" id="get-api-network-loadbalancer-vs-id"><span class="method-chip m-get">GET</span><code>/api/network/loadbalancer/vs/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}</code></pre>
+<h2 class="ep-h" id="put-api-network-loadbalancer-vs-id"><span class="method-chip m-put">PUT</span><code>/api/network/loadbalancer/vs/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">PUT /api/network/loadbalancer/vs/{id} — update a VS's structural fields (validated through the pure engine parsers).</p>
+<p>PUT /api/network/loadbalancer/vs/{id} — update a VS's structural fields (validated through the pure engine parsers). 404 when unknown; 503 when no DB.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LbVsUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>port</code></td><td><code>u16</code></td><td>optional</td><td></td></tr><tr><td><code>protocol</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>persistence_method</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>ssl_profile</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"port": 0, "protocol": "&lt;string&gt;", "persistence_method": "&lt;string&gt;", "ssl_profile": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-network-loadbalancer-vs-id-disable"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/vs/{id}/disable</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}/disable</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>lb_vs_disable</code>.</p>
+<h2 class="ep-h" id="post-api-network-loadbalancer-vs-id-drain"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/vs/{id}/drain</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}/drain</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>lb_vs_drain</code>.</p>
+<h2 class="ep-h" id="post-api-network-loadbalancer-vs-id-enable"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/vs/{id}/enable</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}/enable</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>lb_vs_enable</code>.</p>
+<h2 class="ep-h" id="post-api-network-loadbalancer-vs-id-member"><span class="method-chip m-post">POST</span><code>/api/network/loadbalancer/vs/{id}/member</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LbMemberRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>ip</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>port</code></td><td><code>u16</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"hostname": "&lt;string&gt;", "ip": "&lt;string&gt;", "port": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}/member</span></code></pre>
+<h2 class="ep-h" id="delete-api-network-loadbalancer-vs-id-member-hostname"><span class="method-chip m-delete">DELETE</span><code>/api/network/loadbalancer/vs/{id}/member/{hostname}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/network/loadbalancer/vs/{id}/member/{hostname}</code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-monitoring.html">&larr; Monitoring</a><a href="/api-notifications.html">Notifications &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

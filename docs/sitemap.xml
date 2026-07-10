@@ -13,4 +13,42 @@
   <url><loc>https://ryuki.io/notifications.html</loc></url>
   <url><loc>https://ryuki.io/using-the-api.html</loc></url>
   <url><loc>https://ryuki.io/api-reference.html</loc></url>
+  <url><loc>https://ryuki.io/api-activity.html</loc></url>
+  <url><loc>https://ryuki.io/api-admin.html</loc></url>
+  <url><loc>https://ryuki.io/api-agents.html</loc></url>
+  <url><loc>https://ryuki.io/api-analytics.html</loc></url>
+  <url><loc>https://ryuki.io/api-approvals.html</loc></url>
+  <url><loc>https://ryuki.io/api-audit.html</loc></url>
+  <url><loc>https://ryuki.io/api-auth.html</loc></url>
+  <url><loc>https://ryuki.io/api-boundary.html</loc></url>
+  <url><loc>https://ryuki.io/api-build.html</loc></url>
+  <url><loc>https://ryuki.io/api-catalog.html</loc></url>
+  <url><loc>https://ryuki.io/api-cmdb.html</loc></url>
+  <url><loc>https://ryuki.io/api-dashboard.html</loc></url>
+  <url><loc>https://ryuki.io/api-datacenter.html</loc></url>
+  <url><loc>https://ryuki.io/api-events.html</loc></url>
+  <url><loc>https://ryuki.io/api-evidence.html</loc></url>
+  <url><loc>https://ryuki.io/api-identity.html</loc></url>
+  <url><loc>https://ryuki.io/api-images.html</loc></url>
+  <url><loc>https://ryuki.io/api-integrations.html</loc></url>
+  <url><loc>https://ryuki.io/api-inventory.html</loc></url>
+  <url><loc>https://ryuki.io/api-maintain.html</loc></url>
+  <url><loc>https://ryuki.io/api-me.html</loc></url>
+  <url><loc>https://ryuki.io/api-metering.html</loc></url>
+  <url><loc>https://ryuki.io/api-metrics.html</loc></url>
+  <url><loc>https://ryuki.io/api-monitoring.html</loc></url>
+  <url><loc>https://ryuki.io/api-network.html</loc></url>
+  <url><loc>https://ryuki.io/api-notifications.html</loc></url>
+  <url><loc>https://ryuki.io/api-observe.html</loc></url>
+  <url><loc>https://ryuki.io/api-operations.html</loc></url>
+  <url><loc>https://ryuki.io/api-ops.html</loc></url>
+  <url><loc>https://ryuki.io/api-patching.html</loc></url>
+  <url><loc>https://ryuki.io/api-platform.html</loc></url>
+  <url><loc>https://ryuki.io/api-protect.html</loc></url>
+  <url><loc>https://ryuki.io/api-requests.html</loc></url>
+  <url><loc>https://ryuki.io/api-retire.html</loc></url>
+  <url><loc>https://ryuki.io/api-software.html</loc></url>
+  <url><loc>https://ryuki.io/api-validation.html</loc></url>
+  <url><loc>https://ryuki.io/api-vm.html</loc></url>
+  <url><loc>https://ryuki.io/api-workflows.html</loc></url>
 </urlset>

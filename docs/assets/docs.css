@@ -161,6 +161,7 @@ td code{white-space:nowrap}
 .badge-open{color:#e0b46a;border-color:rgba(224,180,106,.45);background:rgba(224,180,106,.1)}
 .ep-summary{color:var(--text);font-weight:500}
 .ep-missing{color:var(--text-secondary);font-style:italic}
+.ep-doc-heading{color:var(--text);font-weight:600;margin-top:1rem}
 h3.ep-sub{font-size:.78rem;font-weight:700;text-transform:uppercase;
   letter-spacing:.08em;color:var(--text-secondary);margin:1.5rem 0 .45rem}
 .area-count{font-size:.78rem;font-weight:600;text-transform:uppercase;

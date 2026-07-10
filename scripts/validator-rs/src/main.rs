@@ -28,6 +28,7 @@ mod admin_delegation_boundary;
 mod admin_feature_flag;
 mod aiops_suggestion;
 mod alert_routing;
+mod api_doc;
 mod api_token_safety;
 mod app_skeleton;
 mod application_aware_backup;
@@ -2334,6 +2335,11 @@ fn run() -> Result<(), String> {
                 "routes": route_count,
             }))
         }
+        "generate-api-doc" => {
+            let (root, _) = parse_root_args(&args[1..])?;
+            let summary = api_doc::generate_api_doc(&root)?;
+            print_json(&summary)
+        }
         "scaffold-docs" => {
             let (root, _) = parse_root_args(&args[1..])?;
             let output = scaffold_docs::scaffold(&root, &registry_rows())?;
@@ -2359,7 +2365,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|scaffold-docs|check-config> <slice> [options]"
+    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|generate-api-doc|scaffold-docs|check-config> <slice> [options]"
         .to_string()
 }
 
@@ -2941,10 +2947,16 @@ fn active_route_registrations(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
+const RUST_API_AGENTS_PATH: &str = "sources/ryuki-api/src/agents.rs";
 const RUST_API_ROUTE_SOURCES: &[&str] = &[
     RUST_API_CONTRACTS_PATH,
     RUST_API_MAIN_PATH,
     RUST_API_BOUNDARY_PATH,
+    // The agent-protocol routes (register/poll/ack/heartbeat/cp-public-key) and
+    // the admin agent-management routes live here, not in contracts.rs. Test
+    // routers in this file re-register the same production paths, so they
+    // dedupe by path exactly like the other sources' test routers.
+    RUST_API_AGENTS_PATH,
 ];
 const ROUTE_METHOD_TOKENS: &[(&str, &str)] = &[
     ("get(", "GET"),
@@ -3043,27 +3055,28 @@ fn endpoints_doc_section(path: &str) -> String {
 
 // Extracts (path, methods) pairs from active `.route("path", get(handler))`
 // registrations, including chained registrations like `get(a).post(b)`.
+// Delegates to the richer api_doc parser (which also captures the handler
+// ident per method) so `generate-endpoints-doc` and `generate-api-doc`
+// always agree on the route surface.
 fn extract_route_methods(source: &str) -> Vec<(String, Vec<String>)> {
-    let source = strip_source_comments(source);
-    let mut results = Vec::new();
-    for candidate in source.split(".route(").skip(1) {
-        let rest = candidate.trim_start();
-        let Some(route) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = route.find('"') else {
-            continue;
-        };
-        let path = route[..end].to_string();
-        let arguments = route_call_arguments(&route[end + 1..]);
-        let methods = route_methods_in(&arguments);
-        results.push((path, methods));
-    }
-    results
+    api_doc::extract_route_registrations(source)
+        .into_iter()
+        .map(|registration| {
+            (
+                registration.path,
+                registration
+                    .methods
+                    .into_iter()
+                    .map(|entry| entry.method)
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 // Returns the text between the route path and the closing parenthesis of the
-// `.route(...)` call, tracking nested parentheses.
+// `.route(...)` call, tracking nested parentheses. Note: nested parenthesized
+// text (handler arguments) is included in the output.
 fn route_call_arguments(after_path: &str) -> String {
     let mut depth: usize = 1;
     let mut arguments = String::new();
@@ -3081,25 +3094,6 @@ fn route_call_arguments(after_path: &str) -> String {
         arguments.push(ch);
     }
     arguments
-}
-
-fn route_methods_in(arguments: &str) -> Vec<String> {
-    let mut methods = Vec::new();
-    for (token, method) in ROUTE_METHOD_TOKENS {
-        for (index, _) in arguments.match_indices(token) {
-            let boundary_ok = arguments[..index]
-                .chars()
-                .next_back()
-                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
-            if boundary_ok && !methods.contains(&(*method).to_string()) {
-                methods.push((*method).to_string());
-            }
-        }
-    }
-    if methods.is_empty() {
-        methods.push("ANY".to_string());
-    }
-    methods
 }
 
 // Strips `//` line comments and `/* */` block comments while preserving string

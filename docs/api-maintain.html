@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maintain API · Ryuki</title>
+<meta name="description" content="Maintenance operations: OS baseline checks and remediation, patch approval and waves, certificate lifecycle, and approved-software deployment.">
+<link rel="canonical" href="https://ryuki.io/api-maintain.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-maintain.html">
+<meta property="og:title" content="Maintain API · Ryuki">
+<meta property="og:description" content="Maintenance operations: OS baseline checks and remediation, patch approval and waves, certificate lifecycle, and approved-software deployment.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link active" aria-current="page" href="/api-maintain.html">Maintain</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-maintain-baseline-contract">GET /api/maintain/baseline-contract</a></li><li><a class="sb-ep" href="#post-api-maintain-baseline-check-server">POST /api/maintain/baseline/check/{server}</a></li><li><a class="sb-ep" href="#get-api-maintain-baseline-compliance">GET /api/maintain/baseline/compliance</a></li><li><a class="sb-ep" href="#get-api-maintain-baseline-coverage">GET /api/maintain/baseline/coverage</a></li><li><a class="sb-ep" href="#get-api-maintain-baseline-noncompliant">GET /api/maintain/baseline/noncompliant</a></li><li><a class="sb-ep" href="#post-api-maintain-baseline-remediate-server-check-id">POST /api/maintain/baseline/remediate/{server}/{check_id}</a></li><li><a class="sb-ep" href="#get-api-maintain-baseline-trend">GET /api/maintain/baseline/trend</a></li><li><a class="sb-ep" href="#get-api-maintain-calendar-contract">GET /api/maintain/calendar-contract</a></li><li><a class="sb-ep" href="#get-api-maintain-calendar-active">GET /api/maintain/calendar/active</a></li><li><a class="sb-ep" href="#post-api-maintain-calendar-cancel-id">POST /api/maintain/calendar/cancel/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-calendar-conflicts">GET /api/maintain/calendar/conflicts</a></li><li><a class="sb-ep" href="#get-api-maintain-calendar-month">GET /api/maintain/calendar/month</a></li><li><a class="sb-ep" href="#post-api-maintain-calendar-schedule">POST /api/maintain/calendar/schedule</a></li><li><a class="sb-ep" href="#get-api-maintain-calendar-upcoming">GET /api/maintain/calendar/upcoming</a></li><li><a class="sb-ep" href="#get-api-maintain-certificate-contract">GET /api/maintain/certificate-contract</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-approve-id">POST /api/maintain/certificates/approve/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-certificates-expiring">GET /api/maintain/certificates/expiring</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-install-id">POST /api/maintain/certificates/install/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-certificates-inventory">GET /api/maintain/certificates/inventory</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-renew-id">POST /api/maintain/certificates/renew/{id}</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-request">POST /api/maintain/certificates/request</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-revoke-id">POST /api/maintain/certificates/revoke/{id}</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-validate">POST /api/maintain/certificates/validate</a></li><li><a class="sb-ep" href="#post-api-maintain-certificates-verify-id">POST /api/maintain/certificates/verify/{id}</a></li><li><a class="sb-ep" href="#delete-api-maintain-certificates-id">DELETE /api/maintain/certificates/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-certificates-id">GET /api/maintain/certificates/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-patch-contract">GET /api/maintain/patch-contract</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-approve">POST /api/maintain/patch/approve</a></li><li><a class="sb-ep" href="#get-api-maintain-patch-compliance">GET /api/maintain/patch/compliance</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-execute">POST /api/maintain/patch/execute</a></li><li><a class="sb-ep" href="#get-api-maintain-patch-pending-reboots">GET /api/maintain/patch/pending-reboots</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-plan">POST /api/maintain/patch/plan</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-reboot">POST /api/maintain/patch/reboot</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-validate">POST /api/maintain/patch/validate</a></li><li><a class="sb-ep" href="#post-api-maintain-patch-verify">POST /api/maintain/patch/verify</a></li><li><a class="sb-ep" href="#get-api-maintain-patch-waves">GET /api/maintain/patch/waves</a></li><li><a class="sb-ep" href="#delete-api-maintain-patch-waves-id">DELETE /api/maintain/patch/waves/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-patch-waves-id">GET /api/maintain/patch/waves/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-software-contract">GET /api/maintain/software-contract</a></li><li><a class="sb-ep" href="#post-api-maintain-software-approve-id">POST /api/maintain/software/approve/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-software-compliance">GET /api/maintain/software/compliance</a></li><li><a class="sb-ep" href="#post-api-maintain-software-execute-id">POST /api/maintain/software/execute/{id}</a></li><li><a class="sb-ep" href="#get-api-maintain-software-history-server">GET /api/maintain/software/history/{server}</a></li><li><a class="sb-ep" href="#get-api-maintain-software-packages">GET /api/maintain/software/packages</a></li><li><a class="sb-ep" href="#post-api-maintain-software-plan">POST /api/maintain/software/plan</a></li><li><a class="sb-ep" href="#post-api-maintain-software-validate">POST /api/maintain/software/validate</a></li><li><a class="sb-ep" href="#post-api-maintain-software-verify-id">POST /api/maintain/software/verify/{id}</a></li></ul></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Maintain</span></nav>
+<h1>Maintain API</h1>
+<p>Maintenance operations: OS baseline checks and remediation, patch approval and waves, certificate lifecycle, and approved-software deployment.</p>
+<p class="area-count">47 routes</p>
+<h2 class="ep-h" id="get-api-maintain-baseline-contract"><span class="method-chip m-get">GET</span><code>/api/maintain/baseline-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline-contract</code></pre>
+<h2 class="ep-h" id="post-api-maintain-baseline-check-server"><span class="method-chip m-post">POST</span><code>/api/maintain/baseline/check/{server}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/check/{server}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>baseline_check</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-baseline-compliance"><span class="method-chip m-get">GET</span><code>/api/maintain/baseline/compliance</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/compliance</code></pre>
+<h2 class="ep-h" id="get-api-maintain-baseline-coverage"><span class="method-chip m-get">GET</span><code>/api/maintain/baseline/coverage</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/coverage</code></pre>
+<h2 class="ep-h" id="get-api-maintain-baseline-noncompliant"><span class="method-chip m-get">GET</span><code>/api/maintain/baseline/noncompliant</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/noncompliant</code></pre>
+<h2 class="ep-h" id="post-api-maintain-baseline-remediate-server-check-id"><span class="method-chip m-post">POST</span><code>/api/maintain/baseline/remediate/{server}/{check_id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/remediate/{server}/{check_id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>baseline_remediate</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-baseline-trend"><span class="method-chip m-get">GET</span><code>/api/maintain/baseline/trend</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/baseline/trend</code></pre>
+<h2 class="ep-h" id="get-api-maintain-calendar-contract"><span class="method-chip m-get">GET</span><code>/api/maintain/calendar-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar-contract</code></pre>
+<h2 class="ep-h" id="get-api-maintain-calendar-active"><span class="method-chip m-get">GET</span><code>/api/maintain/calendar/active</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar/active</code></pre>
+<h2 class="ep-h" id="post-api-maintain-calendar-cancel-id"><span class="method-chip m-post">POST</span><code>/api/maintain/calendar/cancel/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar/cancel/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>maintenance_calendar_cancel</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-calendar-conflicts"><span class="method-chip m-get">GET</span><code>/api/maintain/calendar/conflicts</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>start</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>end</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar/conflicts</code></pre>
+<h2 class="ep-h" id="get-api-maintain-calendar-month"><span class="method-chip m-get">GET</span><code>/api/maintain/calendar/month</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>month</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar/month</code></pre>
+<h2 class="ep-h" id="post-api-maintain-calendar-schedule"><span class="method-chip m-post">POST</span><code>/api/maintain/calendar/schedule</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>MaintenanceCalendarScheduleRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>startTime</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>endTime</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>affectedCis</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;", "startTime": "&lt;string&gt;", "endTime": "&lt;string&gt;", "reason": "&lt;string&gt;", "affectedCis": []}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/calendar/schedule</span></code></pre>
+<h2 class="ep-h" id="get-api-maintain-calendar-upcoming"><span class="method-chip m-get">GET</span><code>/api/maintain/calendar/upcoming</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/calendar/upcoming</code></pre>
+<h2 class="ep-h" id="get-api-maintain-certificate-contract"><span class="method-chip m-get">GET</span><code>/api/maintain/certificate-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificate-contract</code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-approve-id"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/approve/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/approve/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>certificates_approve</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-certificates-expiring"><span class="method-chip m-get">GET</span><code>/api/maintain/certificates/expiring</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>days</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/expiring</code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-install-id"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/install/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/install/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>certificates_install</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-certificates-inventory"><span class="method-chip m-get">GET</span><code>/api/maintain/certificates/inventory</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>usize</code></td><td>optional</td><td>Absent = ALL (the inventory is historically unbounded; a default page size
+would truncate existing callers). An explicit value only reduces the page.</td></tr><tr><td><code>offset</code></td><td><code>usize</code></td><td>optional</td><td></td></tr><tr><td><code>status</code></td><td><code>String</code></td><td>optional</td><td>Exact, case-insensitive match on the lifecycle status (Active/Expiring/
+Expired/Revoked); an unknown value simply matches nothing.</td></tr><tr><td><code>hostname</code></td><td><code>String</code></td><td>optional</td><td>Case-insensitive substring on hostname.</td></tr><tr><td><code>q</code></td><td><code>String</code></td><td>optional</td><td>Case-insensitive substring on common_name OR subject.</td></tr><tr><td><code>sort</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>direction</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/inventory</code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-renew-id"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/renew/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CertificateRenewRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>validityDays</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"validityDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/certificates/renew/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-request"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/request</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CertificateRequestRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>commonName</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>subject</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>serviceType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>validityDays</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"commonName": "&lt;string&gt;", "subject": "&lt;string&gt;", "serviceType": "&lt;string&gt;", "hostname": "&lt;string&gt;", "site": "&lt;string&gt;", "validityDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/certificates/request</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-revoke-id"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/revoke/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/revoke/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>certificates_revoke</code>.</p>
+<h2 class="ep-h" id="post-api-maintain-certificates-validate"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CertificateValidateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>commonName</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>subject</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>serviceType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>validityDays</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"commonName": "&lt;string&gt;", "subject": "&lt;string&gt;", "serviceType": "&lt;string&gt;", "hostname": "&lt;string&gt;", "site": "&lt;string&gt;", "validityDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/certificates/validate</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-certificates-verify-id"><span class="method-chip m-post">POST</span><code>/api/maintain/certificates/verify/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/verify/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>certificates_verify</code>.</p>
+<h2 class="ep-h" id="delete-api-maintain-certificates-id"><span class="method-chip m-delete">DELETE</span><code>/api/maintain/certificates/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/maintain/certificates/{id} — operational cleanup of a TERMINAL certificate.</p>
+<p>DELETE /api/maintain/certificates/{id} — operational cleanup of a TERMINAL certificate. Only an <code>Expired</code>/<code>Revoked</code> cert is deletable: an <code>Active</code>/<code>Expiring</code> cert is LIVE, and removing its record from the <code>execute</code> tier would lose tracking of an in-use certificate (the patch-wave delete lesson). Certificates are a leaf table (no FK references them) — no cascade. Site-scoped (out-of-scope → 404, no oracle).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/{id}</code></pre>
+<h2 class="ep-h" id="get-api-maintain-certificates-id"><span class="method-chip m-get">GET</span><code>/api/maintain/certificates/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/certificates/{id}</code></pre>
+<h2 class="ep-h" id="get-api-maintain-patch-contract"><span class="method-chip m-get">GET</span><code>/api/maintain/patch-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch-contract</code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-approve"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/approve</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>waveId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"waveId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/approve</span></code></pre>
+<h2 class="ep-h" id="get-api-maintain-patch-compliance"><span class="method-chip m-get">GET</span><code>/api/maintain/patch/compliance</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch/compliance</code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-execute"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/execute</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>waveId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"waveId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/execute</span></code></pre>
+<h2 class="ep-h" id="get-api-maintain-patch-pending-reboots"><span class="method-chip m-get">GET</span><code>/api/maintain/patch/pending-reboots</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch/pending-reboots</code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-plan"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/plan</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchPlanRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>osFamily</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>criticality</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;", "osFamily": "&lt;string&gt;", "criticality": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/plan</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-reboot"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/reboot</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">Produce the dry-run reboot-orchestration plan for a persisted wave.</p>
+<p>Produce the dry-run reboot-orchestration plan for a persisted wave. Like verify, this is evidence-only: it computes the staged, BATCHED (rolling) reboot plan (backup verify -&gt; per batch: drain-batch -&gt; reboot-batch servers -&gt; health-check-batch gate -&gt; final fleet-wide check, all simulated) and does NOT transition the wave. Batch size comes from the wave's <code>reboot_batch_size</code> / <code>reboot_batch_percent</code> metadata (default: one server per batch). 503 without a database, 404 when the wave is absent, 409 when the engine rejects the wave (e.g. zero servers).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>waveId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"waveId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/reboot</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-validate"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>waveId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"waveId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/validate</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-patch-verify"><span class="method-chip m-post">POST</span><code>/api/maintain/patch/verify</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PatchActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>waveId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"waveId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/patch/verify</span></code></pre>
+<h2 class="ep-h" id="get-api-maintain-patch-waves"><span class="method-chip m-get">GET</span><code>/api/maintain/patch/waves</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">List persisted patch waves (read surface), paged (#14).</p>
+<p>List persisted patch waves (read surface), paged (#14). Returns an empty list when no database is configured (demo mode), matching the other read-only GETs. The body stays a BARE array (backward-compatible); the scope-filtered total rides the <code>X-Total-Count</code> header.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch/waves</code></pre>
+<h2 class="ep-h" id="delete-api-maintain-patch-waves-id"><span class="method-chip m-delete">DELETE</span><code>/api/maintain/patch/waves/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/maintain/patch/waves/{id} — remove a mistaken patch wave.</p>
+<p>DELETE /api/maintain/patch/waves/{id} — remove a mistaken patch wave. Only an UNAPPROVED draft (<code>Draft</code>/<code>Validated</code>) is deletable at this <code>execute</code>-tier route: an <code>Approved</code>/<code>Scheduled</code> wave is approver-reviewed (deleting it is an approval-tier cancellation — out of scope) and an <code>InProgress</code>/<code>Completed</code>/<code>Failed</code> wave has executed (its run is evidence). The <code>patch_wave_servers</code> rows cascade.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch/waves/{id}</code></pre>
+<h2 class="ep-h" id="get-api-maintain-patch-waves-id"><span class="method-chip m-get">GET</span><code>/api/maintain/patch/waves/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">Fetch a single persisted patch wave by id (read surface).</p>
+<p>Fetch a single persisted patch wave by id (read surface). 404 when absent or when no database is configured.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/patch/waves/{id}</code></pre>
+<h2 class="ep-h" id="get-api-maintain-software-contract"><span class="method-chip m-get">GET</span><code>/api/maintain/software-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software-contract</code></pre>
+<h2 class="ep-h" id="post-api-maintain-software-approve-id"><span class="method-chip m-post">POST</span><code>/api/maintain/software/approve/{id}</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/approve/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>software_approve</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-software-compliance"><span class="method-chip m-get">GET</span><code>/api/maintain/software/compliance</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/compliance</code></pre>
+<h2 class="ep-h" id="post-api-maintain-software-execute-id"><span class="method-chip m-post">POST</span><code>/api/maintain/software/execute/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/execute/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>software_execute</code>.</p>
+<h2 class="ep-h" id="get-api-maintain-software-history-server"><span class="method-chip m-get">GET</span><code>/api/maintain/software/history/{server}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/history/{server}</code></pre>
+<h2 class="ep-h" id="get-api-maintain-software-packages"><span class="method-chip m-get">GET</span><code>/api/maintain/software/packages</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/packages</code></pre>
+<h2 class="ep-h" id="post-api-maintain-software-plan"><span class="method-chip m-post">POST</span><code>/api/maintain/software/plan</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>software_deployment::DeploymentRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>server_name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>package_id</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>target_version</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>scheduled_time</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>requester</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"server_name": "&lt;string&gt;", "package_id": "&lt;string&gt;", "target_version": "&lt;string&gt;", "scheduled_time": "&lt;string&gt;", "requester": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/software/plan</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-software-validate"><span class="method-chip m-post">POST</span><code>/api/maintain/software/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>software_deployment::DeploymentRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>server_name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>package_id</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>target_version</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>scheduled_time</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>requester</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"server_name": "&lt;string&gt;", "package_id": "&lt;string&gt;", "target_version": "&lt;string&gt;", "scheduled_time": "&lt;string&gt;", "requester": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/maintain/software/validate</span></code></pre>
+<h2 class="ep-h" id="post-api-maintain-software-verify-id"><span class="method-chip m-post">POST</span><code>/api/maintain/software/verify/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/maintain/software/verify/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>software_verify</code>.</p>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-inventory.html">&larr; Inventory</a><a href="/api-me.html">Me &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

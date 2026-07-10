@@ -1567,8 +1567,133 @@ async fn shutdown_signal(timeout_secs: u64) {
     tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
 }
 
+// ─── Hidden docs-extraction flag (`ryuki-api --dump-route-meta`) ────────────
+//
+// Maintenance subcommand used by `ryuki-validator generate-api-doc`; it is
+// NOT part of the served API surface (no route, absent from the OpenAPI
+// document) and exits before config/logging/DB/server startup.
+//
+// Input  (stdin):  JSON array of {"path": "...", "method": "..."} route keys.
+// Output (stdout): one JSON envelope:
+//   {"meta":    [{"path","method","tier","auth_exempt"}, ...],
+//    "openapi": <openapi::openapi_document()>}
+//
+// `tier`/`auth_exempt` are computed by CALLING the same functions the auth
+// middleware runs (`is_auth_exempt_path`, `is_self_service_mutation`,
+// `route_permission_for`, `is_audit_read_path`, `read_permission_for`), so
+// the generated reference can never drift from enforcement. The `openapi`
+// half carries the curated public/agent-protocol spec verbatim so the docs
+// site can publish it as machine-readable JSON.
+
+#[derive(serde::Deserialize)]
+struct RouteMetaKey {
+    path: String,
+    method: String,
+}
+
+#[derive(serde::Serialize)]
+struct RouteMetaEntry {
+    path: String,
+    method: String,
+    tier: Option<&'static str>,
+    auth_exempt: bool,
+}
+
+/// The effective permission tier for one (method, path) route, exactly as
+/// `auth_middleware` enforces it:
+///
+/// * `public`  — auth-exempt (reachable without a session);
+/// * mutations — `route_permission_for` (admin/approve/execute/request/...),
+///   unless the mutation is self-service (gated like a read);
+/// * audit-grade reads — `audit` specifically;
+/// * remaining reads/self-service — `read_permission_for`'s tier, where the
+///   ordinary arm is reported as `read` because `read_authorized` accepts
+///   EITHER `audit` OR `request` there (labeling it `audit` would wrongly
+///   exclude Requesters).
+///
+/// Returns `None` only for a method the HTTP layer cannot parse or the
+/// synthetic `ANY` placeholder, where enforcement is method-dependent and
+/// cannot be attested.
+fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
+    if method_str.eq_ignore_ascii_case("any") {
+        return None;
+    }
+    let method: Method = method_str.parse().ok()?;
+    if is_auth_exempt_path(path) {
+        return Some("public");
+    }
+    // The agent subrouter under /api/agents/ bypasses the human auth_middleware
+    // entirely. Its enrolment/bootstrap endpoints are open (no token yet by
+    // definition): register mints the first token, and the CP public key and
+    // agent-facing OpenAPI spec are fetched before one exists. The rest
+    // (poll/ack/heartbeat/result) carry the "rya_" agent bearer token,
+    // validated inside each handler by `authenticate_agent`. /api/admin/agents/*
+    // is a separate, human-gated prefix that falls through to the admin logic.
+    if matches!(
+        path,
+        "/api/agents/register" | "/api/agents/cp-public-key" | "/api/agents/openapi.json"
+    ) {
+        return Some("public");
+    }
+    if path.starts_with("/api/agents/") {
+        return Some("agent");
+    }
+    if is_unsafe_method(&method) && !is_self_service_mutation(&method, path) {
+        return Some(route_permission_for(&method, path));
+    }
+    if is_audit_read_path(path) {
+        return Some("audit");
+    }
+    Some(match read_permission_for(path) {
+        "admin" => "admin",
+        "execute" => "execute",
+        _ => "read",
+    })
+}
+
+/// Builds the `--dump-route-meta` JSON envelope from the stdin payload.
+/// Pure (no IO) so it is unit-testable.
+fn dump_route_meta(input: &str) -> Result<String, String> {
+    let routes: Vec<RouteMetaKey> = serde_json::from_str(input).map_err(|error| {
+        format!("--dump-route-meta expects a JSON array of {{path,method}} objects on stdin: {error}")
+    })?;
+    let meta: Vec<RouteMetaEntry> = routes
+        .into_iter()
+        .map(|key| RouteMetaEntry {
+            tier: route_meta_tier(&key.method, &key.path),
+            auth_exempt: is_auth_exempt_path(&key.path),
+            path: key.path,
+            method: key.method,
+        })
+        .collect();
+    let envelope = serde_json::json!({
+        "meta": meta,
+        "openapi": openapi::openapi_document(),
+    });
+    serde_json::to_string(&envelope)
+        .map_err(|error| format!("failed to serialize route meta: {error}"))
+}
+
 #[tokio::main]
 async fn main() {
+    // Hidden maintenance flag (see `dump_route_meta` above): answer and exit
+    // BEFORE config/logging/DB/server startup so it works in a bare checkout.
+    if std::env::args().nth(1).as_deref() == Some("--dump-route-meta") {
+        let mut input = String::new();
+        if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+            eprintln!("failed to read stdin: {error}");
+            std::process::exit(2);
+        }
+        match dump_route_meta(&input) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     START_TIME.set(Instant::now()).ok();
     let app_config = config::load_config();
     config_store::init_with_config("platform-config.json", &app_config);
@@ -3645,6 +3770,74 @@ mod tests {
             route_permission_for(&Method::DELETE, "/api/something/else/entirely"),
             "admin"
         );
+    }
+
+    #[test]
+    fn test_dump_route_meta_tier_mirrors_middleware_decisions() {
+        // exempt surface
+        assert_eq!(route_meta_tier("GET", "/health"), Some("public"));
+        assert_eq!(route_meta_tier("POST", "/api/auth/local/login"), Some("public"));
+        // mutations resolve through the central mutating table
+        assert_eq!(route_meta_tier("POST", "/api/admin/tokens"), Some("admin"));
+        assert_eq!(route_meta_tier("POST", "/api/requests"), Some("request"));
+        assert_eq!(
+            route_meta_tier("POST", "/api/requests/{id}/approve"),
+            Some("approve")
+        );
+        assert_eq!(
+            route_meta_tier("POST", "/api/requests/{id}/validate"),
+            Some("execute")
+        );
+        // self-service mutations are gated like reads, not fail-closed admin
+        assert_eq!(
+            route_meta_tier("POST", "/api/notifications/{id}/read"),
+            Some("read")
+        );
+        assert_eq!(route_meta_tier("PUT", "/api/me/preferences"), Some("read"));
+        // reads: audit-grade, sensitive-admin, operator shift queue, ordinary
+        assert_eq!(route_meta_tier("GET", "/api/activity/audit"), Some("audit"));
+        assert_eq!(
+            route_meta_tier("GET", "/api/requests/{id}/audit"),
+            Some("audit")
+        );
+        assert_eq!(route_meta_tier("GET", "/api/admin/tokens"), Some("admin"));
+        assert_eq!(
+            route_meta_tier("GET", "/api/ops/shift/summary"),
+            Some("execute")
+        );
+        assert_eq!(route_meta_tier("GET", "/api/requests"), Some("read"));
+        // agent subrouter: open bootstrap endpoints are public, the rest carry
+        // the agent bearer token; the human /api/admin/agents prefix stays admin
+        assert_eq!(route_meta_tier("POST", "/api/agents/register"), Some("public"));
+        assert_eq!(
+            route_meta_tier("GET", "/api/agents/cp-public-key"),
+            Some("public")
+        );
+        assert_eq!(
+            route_meta_tier("POST", "/api/agents/{agent_id}/heartbeat"),
+            Some("agent")
+        );
+        assert_eq!(route_meta_tier("GET", "/api/admin/agents"), Some("admin"));
+        // the synthetic ANY placeholder cannot be attested
+        assert_eq!(route_meta_tier("ANY", "/api/requests"), None);
+    }
+
+    #[test]
+    fn test_dump_route_meta_envelope_shape() {
+        let output = dump_route_meta(
+            r#"[{"path":"/health","method":"GET"},{"path":"/api/admin/tokens","method":"POST"}]"#,
+        )
+        .expect("dump must succeed");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["meta"][0]["path"], "/health");
+        assert_eq!(value["meta"][0]["tier"], "public");
+        assert_eq!(value["meta"][0]["auth_exempt"], true);
+        assert_eq!(value["meta"][1]["tier"], "admin");
+        assert_eq!(value["meta"][1]["auth_exempt"], false);
+        // the curated OpenAPI document rides along verbatim
+        assert_eq!(value["openapi"]["openapi"], "3.1.0");
+        // malformed stdin fails with a clear message instead of panicking
+        assert!(dump_route_meta("not json").is_err());
     }
 
     #[test]

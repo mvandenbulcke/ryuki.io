@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datacenter API · Ryuki</title>
+<meta name="description" content="Datacenter readiness and capacity checks (power, cooling, rack space, switch ports), plus firmware, hardware, out-of-band, storage, network, and image-factory surfaces with per-site readiness reporting.">
+<link rel="canonical" href="https://ryuki.io/api-datacenter.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-datacenter.html">
+<meta property="og:title" content="Datacenter API · Ryuki">
+<meta property="og:description" content="Datacenter readiness and capacity checks (power, cooling, rack space, switch ports), plus firmware, hardware, out-of-band, storage, network, and image-factory surfaces with per-site readiness reporting.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link active" aria-current="page" href="/api-datacenter.html">Datacenter</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-datacenter-check-cooling-contract">GET /api/datacenter/check-cooling-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-power-contract">GET /api/datacenter/check-power-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-rack-space-contract">GET /api/datacenter/check-rack-space-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-switchports-contract">GET /api/datacenter/check-switchports-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-failing-checks-contract">GET /api/datacenter/failing-checks-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-contract">GET /api/datacenter/firmware-contract</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-check-id">POST /api/datacenter/firmware/check/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-device-id">GET /api/datacenter/firmware/device/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-devices">GET /api/datacenter/firmware/devices</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-eol">GET /api/datacenter/firmware/eol</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-exception">POST /api/datacenter/firmware/exception</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-exceptions">GET /api/datacenter/firmware/exceptions</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-noncompliant">GET /api/datacenter/firmware/noncompliant</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-report">GET /api/datacenter/firmware/report</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-revoke-id">POST /api/datacenter/firmware/revoke/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-vendor-summary">GET /api/datacenter/firmware/vendor-summary</a></li><li><a class="sb-ep" href="#get-api-datacenter-full-readiness-contract">GET /api/datacenter/full-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-contract">GET /api/datacenter/hardware-contract</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-add">POST /api/datacenter/hardware/add</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-firmware-check-id">POST /api/datacenter/hardware/firmware-check/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-firmware-gaps">GET /api/datacenter/hardware/firmware-gaps</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-inventory">GET /api/datacenter/hardware/inventory</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-lifecycle-report">GET /api/datacenter/hardware/lifecycle-report</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-refresh-plan">GET /api/datacenter/hardware/refresh-plan</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-support-risk">GET /api/datacenter/hardware/support-risk</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-update-firmware-id">POST /api/datacenter/hardware/update-firmware/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-warranty-expiring">GET /api/datacenter/hardware/warranty-expiring</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-contract">GET /api/datacenter/image-factory-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-active-site">GET /api/datacenter/image-factory/active/{site}</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-history-site">GET /api/datacenter/image-factory/history/{site}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-initiate-build">POST /api/datacenter/image-factory/initiate-build</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-promote-id">POST /api/datacenter/image-factory/promote/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-reject-id">POST /api/datacenter/image-factory/reject/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-run-tests-id">POST /api/datacenter/image-factory/run-tests/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-schedule-monthly">POST /api/datacenter/image-factory/schedule-monthly</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-superseded">GET /api/datacenter/image-factory/superseded</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-contract">GET /api/datacenter/network-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-capacity">GET /api/datacenter/network/capacity</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-ports">GET /api/datacenter/network/ports</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-readiness">GET /api/datacenter/network/readiness</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-release-id">POST /api/datacenter/network/release/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-reserve-ips">POST /api/datacenter/network/reserve-ips</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-reserve-ports">POST /api/datacenter/network/reserve-ports</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-vlans">GET /api/datacenter/network/vlans</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-contract">GET /api/datacenter/oob-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-cert-expiring">GET /api/datacenter/oob/cert-expiring</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-check-defaults-id">POST /api/datacenter/oob/check-defaults/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-failing">GET /api/datacenter/oob/failing</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-firmware-outdated">GET /api/datacenter/oob/firmware-outdated</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-inventory">GET /api/datacenter/oob/inventory</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-test-id">POST /api/datacenter/oob/test/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-validate-cert-id">POST /api/datacenter/oob/validate-cert/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-validate-site-site">POST /api/datacenter/oob/validate-site/{site}</a></li><li><a class="sb-ep" href="#get-api-datacenter-readiness-score-contract">GET /api/datacenter/readiness-score-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-site-report-contract">GET /api/datacenter/site-report-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-sites-contract">GET /api/datacenter/sites-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-contract">GET /api/datacenter/storage-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-arrays">GET /api/datacenter/storage/arrays</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-arrays">POST /api/datacenter/storage/arrays</a></li><li><a class="sb-ep" href="#delete-api-datacenter-storage-arrays-id">DELETE /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-arrays-id">GET /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#put-api-datacenter-storage-arrays-id">PUT /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-check-capacity">POST /api/datacenter/storage/check-capacity</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-report">GET /api/datacenter/storage/report</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-volumes">GET /api/datacenter/storage/volumes</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes">POST /api/datacenter/storage/volumes</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-volumes-id">GET /api/datacenter/storage/volumes/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-extend">POST /api/datacenter/storage/volumes/{id}/extend</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-map">POST /api/datacenter/storage/volumes/{id}/map</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-retire">POST /api/datacenter/storage/volumes/{id}/retire</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-unmap">POST /api/datacenter/storage/volumes/{id}/unmap</a></li></ul></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Datacenter</span></nav>
+<h1>Datacenter API</h1>
+<p>Datacenter readiness and capacity checks (power, cooling, rack space, switch ports), plus firmware, hardware, out-of-band, storage, network, and image-factory surfaces with per-site readiness reporting.</p>
+<p class="area-count">71 routes</p>
+<h2 class="ep-h" id="get-api-datacenter-check-cooling-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/check-cooling-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/check-cooling-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-check-power-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/check-power-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/check-power-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-check-rack-space-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/check-rack-space-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/check-rack-space-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-check-switchports-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/check-switchports-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/check-switchports-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-failing-checks-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/failing-checks-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/failing-checks-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware-contract</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-firmware-check-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/firmware/check/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/check/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>firmware_check_compliance</code>.</p>
+<h2 class="ep-h" id="get-api-datacenter-firmware-device-id"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/device/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/device/{id}</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-devices"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/devices</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/devices</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-eol"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/eol</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/eol</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-firmware-exception"><span class="method-chip m-post">POST</span><code>/api/datacenter/firmware/exception</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>FirmwareExceptionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>deviceId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>expiryDays</code></td><td><code>i64</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"deviceId": "&lt;string&gt;", "reason": "&lt;string&gt;", "expiryDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/firmware/exception</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-exceptions"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/exceptions</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/exceptions</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-noncompliant"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/noncompliant</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/noncompliant</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-firmware-report"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/report</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/report</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-firmware-revoke-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/firmware/revoke/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/revoke/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>firmware_revoke_exception</code>.</p>
+<h2 class="ep-h" id="get-api-datacenter-firmware-vendor-summary"><span class="method-chip m-get">GET</span><code>/api/datacenter/firmware/vendor-summary</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/firmware/vendor-summary</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-full-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/full-readiness-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/full-readiness-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware-contract</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-hardware-add"><span class="method-chip m-post">POST</span><code>/api/datacenter/hardware/add</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>HardwareAddRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>vendor</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>model</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>cluster</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>serial</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>warrantyExpiry</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"vendor": "&lt;string&gt;", "model": "&lt;string&gt;", "site": "&lt;string&gt;", "cluster": "&lt;string&gt;", "serial": "&lt;string&gt;", "warrantyExpiry": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/hardware/add</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-hardware-firmware-check-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/hardware/firmware-check/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/firmware-check/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>hardware_firmware_check</code>.</p>
+<h2 class="ep-h" id="get-api-datacenter-hardware-firmware-gaps"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/firmware-gaps</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/firmware-gaps</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-inventory"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/inventory</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/inventory</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-lifecycle-report"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/lifecycle-report</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/lifecycle-report</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-refresh-plan"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/refresh-plan</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/refresh-plan</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-support-risk"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/support-risk</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/support-risk</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-hardware-update-firmware-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/hardware/update-firmware/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>HardwareUpdateFirmwareRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>version</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"version": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/hardware/update-firmware/{id}</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-hardware-warranty-expiring"><span class="method-chip m-get">GET</span><code>/api/datacenter/hardware/warranty-expiring</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/hardware/warranty-expiring</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-image-factory-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/image-factory-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-image-factory-active-site"><span class="method-chip m-get">GET</span><code>/api/datacenter/image-factory/active/{site}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory/active/{site}</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-image-factory-history-site"><span class="method-chip m-get">GET</span><code>/api/datacenter/image-factory/history/{site}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory/history/{site}</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-image-factory-initiate-build"><span class="method-chip m-post">POST</span><code>/api/datacenter/image-factory/initiate-build</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ImageFactoryBuildBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>image_name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>os_family</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>distro</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>version</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"image_name": "&lt;string&gt;", "os_family": "&lt;string&gt;", "distro": "&lt;string&gt;", "version": "&lt;string&gt;", "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/image-factory/initiate-build</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-image-factory-promote-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/image-factory/promote/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory/promote/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>image_factory_promote</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-image-factory-reject-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/image-factory/reject/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ImageFactoryRejectBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/image-factory/reject/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-image-factory-run-tests-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/image-factory/run-tests/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory/run-tests/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>image_factory_run_tests</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-image-factory-schedule-monthly"><span class="method-chip m-post">POST</span><code>/api/datacenter/image-factory/schedule-monthly</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ImageFactoryScheduleBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>os_family</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>distro</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;", "os_family": "&lt;string&gt;", "distro": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/image-factory/schedule-monthly</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-image-factory-superseded"><span class="method-chip m-get">GET</span><code>/api/datacenter/image-factory/superseded</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/image-factory/superseded</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-network-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/network-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-network-capacity"><span class="method-chip m-get">GET</span><code>/api/datacenter/network/capacity</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network/capacity</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-network-ports"><span class="method-chip m-get">GET</span><code>/api/datacenter/network/ports</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>switch</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network/ports</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-network-readiness"><span class="method-chip m-get">GET</span><code>/api/datacenter/network/readiness</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>ports</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>vlan</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>ips</code></td><td><code>u32</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network/readiness</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-network-release-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/network/release/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network/release/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>network_release</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-network-reserve-ips"><span class="method-chip m-post">POST</span><code>/api/datacenter/network/reserve-ips</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>NetworkReserveIpsRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>vlan_id</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>count</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>purpose</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;", "vlan_id": 0, "count": 0, "purpose": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/network/reserve-ips</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-network-reserve-ports"><span class="method-chip m-post">POST</span><code>/api/datacenter/network/reserve-ports</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>NetworkReservePortsRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>count</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>purpose</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;", "count": 0, "purpose": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/network/reserve-ports</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-network-vlans"><span class="method-chip m-get">GET</span><code>/api/datacenter/network/vlans</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/network/vlans</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-oob-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/oob-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-oob-cert-expiring"><span class="method-chip m-get">GET</span><code>/api/datacenter/oob/cert-expiring</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/cert-expiring</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-oob-check-defaults-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/oob/check-defaults/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/check-defaults/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>oob_check_defaults</code>.</p>
+<h2 class="ep-h" id="get-api-datacenter-oob-failing"><span class="method-chip m-get">GET</span><code>/api/datacenter/oob/failing</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/failing</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-oob-firmware-outdated"><span class="method-chip m-get">GET</span><code>/api/datacenter/oob/firmware-outdated</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/firmware-outdated</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-oob-inventory"><span class="method-chip m-get">GET</span><code>/api/datacenter/oob/inventory</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/inventory</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-oob-test-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/oob/test/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/test/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>oob_test_endpoint</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-oob-validate-cert-id"><span class="method-chip m-post">POST</span><code>/api/datacenter/oob/validate-cert/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/validate-cert/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>oob_validate_cert</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-oob-validate-site-site"><span class="method-chip m-post">POST</span><code>/api/datacenter/oob/validate-site/{site}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/oob/validate-site/{site}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>oob_validate_site</code>.</p>
+<h2 class="ep-h" id="get-api-datacenter-readiness-score-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/readiness-score-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/readiness-score-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-site-report-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/site-report-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/site-report-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-sites-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/sites-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/sites-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-contract"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage-contract</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-arrays"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage/arrays</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/arrays</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-arrays"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/arrays</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/datacenter/storage/arrays — register a new storage array.</p>
+<p>POST /api/datacenter/storage/arrays — register a new storage array. It is validated and constructed by the pure engine builder, then persisted. Execute-tier. 503 when no database is configured.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageArrayRegisterRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>vendor</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>model</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>total_capacity_gb</code></td><td><code>u64</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "vendor": "&lt;string&gt;", "model": "&lt;string&gt;", "site": "&lt;string&gt;", "total_capacity_gb": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/arrays</span></code></pre>
+<h2 class="ep-h" id="delete-api-datacenter-storage-arrays-id"><span class="method-chip m-delete">DELETE</span><code>/api/datacenter/storage/arrays/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/datacenter/storage/arrays/{id} — decommission an array.</p>
+<p>DELETE /api/datacenter/storage/arrays/{id} — decommission an array. REFUSES (409) when volumes still reference it. 404 when unknown; 503 when no DB.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/arrays/{id}</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-arrays-id"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage/arrays/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/arrays/{id}</code></pre>
+<h2 class="ep-h" id="put-api-datacenter-storage-arrays-id"><span class="method-chip m-put">PUT</span><code>/api/datacenter/storage/arrays/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">PUT /api/datacenter/storage/arrays/{id} — update an array's mutable fields (partial).</p>
+<p>PUT /api/datacenter/storage/arrays/{id} — update an array's mutable fields (partial). Lowering total capacity below the used capacity is a 400 (the DB <code>used &lt;= total</code> invariant). 404 when unknown; 503 when no DB.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageArrayUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>model</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>total_capacity_gb</code></td><td><code>u64</code></td><td>optional</td><td></td></tr><tr><td><code>pool_count</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>status</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"model": "&lt;string&gt;", "total_capacity_gb": 0, "pool_count": 0, "status": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/arrays/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-check-capacity"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/check-capacity</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageCapacityRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>arrayId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>requestedGb</code></td><td><code>u64</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"arrayId": "&lt;string&gt;", "requestedGb": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/check-capacity</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-report"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage/report</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/report</code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-volumes"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage/volumes</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/volumes</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-volumes"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/volumes</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageProvisionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>sizeGb</code></td><td><code>u64</code></td><td>required</td><td></td></tr><tr><td><code>volumeType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>arrayId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "sizeGb": 0, "volumeType": "&lt;string&gt;", "arrayId": "&lt;string&gt;", "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/volumes</span></code></pre>
+<h2 class="ep-h" id="get-api-datacenter-storage-volumes-id"><span class="method-chip m-get">GET</span><code>/api/datacenter/storage/volumes/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/volumes/{id}</code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-volumes-id-extend"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/volumes/{id}/extend</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageExtendRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>additionalGb</code></td><td><code>u64</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"additionalGb": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/volumes/{id}/extend</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-volumes-id-map"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/volumes/{id}/map</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageMapRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"hostname": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/volumes/{id}/map</span></code></pre>
+<h2 class="ep-h" id="post-api-datacenter-storage-volumes-id-retire"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/volumes/{id}/retire</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/datacenter/storage/volumes/{id}/retire</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>storage_volume_retire</code>.</p>
+<h2 class="ep-h" id="post-api-datacenter-storage-volumes-id-unmap"><span class="method-chip m-post">POST</span><code>/api/datacenter/storage/volumes/{id}/unmap</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>StorageMapRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>hostname</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"hostname": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/datacenter/storage/volumes/{id}/unmap</span></code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-dashboard.html">&larr; Dashboard</a><a href="/api-events.html">Events &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

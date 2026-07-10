@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin API · Ryuki</title>
+<meta name="description" content="Platform administration: API token and session management, approval groups, delegation boundaries, feature-flag governance, and notification dispatch-outbox introspection. Both reads and mutations under /api/admin require the admin tier.">
+<link rel="canonical" href="https://ryuki.io/api-admin.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-admin.html">
+<meta property="og:title" content="Admin API · Ryuki">
+<meta property="og:description" content="Platform administration: API token and session management, approval groups, delegation boundaries, feature-flag governance, and notification dispatch-outbox introspection. Both reads and mutations under /api/admin require the admin tier.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link active" aria-current="page" href="/api-admin.html">Admin</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-admin-agents">GET /api/admin/agents</a></li><li><a class="sb-ep" href="#get-api-admin-agents-dead-lettered-jobs">GET /api/admin/agents/dead-lettered-jobs</a></li><li><a class="sb-ep" href="#post-api-admin-agents-dead-lettered-jobs-job-id-requeue">POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue</a></li><li><a class="sb-ep" href="#post-api-admin-agents-jobs-job-id-cancel">POST /api/admin/agents/jobs/{job_id}/cancel</a></li><li><a class="sb-ep" href="#post-api-admin-agents-jobs-job-id-force-fail">POST /api/admin/agents/jobs/{job_id}/force-fail</a></li><li><a class="sb-ep" href="#post-api-admin-agents-jobs-job-id-priority">POST /api/admin/agents/jobs/{job_id}/priority</a></li><li><a class="sb-ep" href="#post-api-admin-agents-jobs-job-id-reconcile">POST /api/admin/agents/jobs/{job_id}/reconcile</a></li><li><a class="sb-ep" href="#get-api-admin-agents-jobs-job-id-result">GET /api/admin/agents/jobs/{job_id}/result</a></li><li><a class="sb-ep" href="#get-api-admin-agents-jobs-job-id-state">GET /api/admin/agents/jobs/{job_id}/state</a></li><li><a class="sb-ep" href="#post-api-admin-agents-live-apply-jobs">POST /api/admin/agents/live-apply-jobs</a></li><li><a class="sb-ep" href="#get-api-admin-agents-liveness">GET /api/admin/agents/liveness</a></li><li><a class="sb-ep" href="#get-api-admin-agents-queue-depth">GET /api/admin/agents/queue-depth</a></li><li><a class="sb-ep" href="#post-api-admin-agents-agent-id-approve">POST /api/admin/agents/{agent_id}/approve</a></li><li><a class="sb-ep" href="#post-api-admin-agents-agent-id-revoke">POST /api/admin/agents/{agent_id}/revoke</a></li><li><a class="sb-ep" href="#get-api-admin-approval-groups-contract">GET /api/admin/approval-groups-contract</a></li><li><a class="sb-ep" href="#get-api-admin-delegation-boundary-contract">GET /api/admin/delegation-boundary-contract</a></li><li><a class="sb-ep" href="#get-api-admin-delegation-boundary-readiness">GET /api/admin/delegation-boundary-readiness</a></li><li><a class="sb-ep" href="#get-api-admin-feature-flag-governance-contract">GET /api/admin/feature-flag-governance-contract</a></li><li><a class="sb-ep" href="#get-api-admin-feature-flag-governance-readiness">GET /api/admin/feature-flag-governance-readiness</a></li><li><a class="sb-ep" href="#get-api-admin-notifications-dispatch-outbox">GET /api/admin/notifications/dispatch-outbox</a></li><li><a class="sb-ep" href="#get-api-admin-platform-settings">GET /api/admin/platform-settings</a></li><li><a class="sb-ep" href="#put-api-admin-platform-settings">PUT /api/admin/platform-settings</a></li><li><a class="sb-ep" href="#get-api-admin-platform-settings-history">GET /api/admin/platform-settings/history</a></li><li><a class="sb-ep" href="#post-api-admin-platform-settings-reset">POST /api/admin/platform-settings/reset</a></li><li><a class="sb-ep" href="#get-api-admin-rbac-roles">GET /api/admin/rbac-roles</a></li><li><a class="sb-ep" href="#get-api-admin-sessions">GET /api/admin/sessions</a></li><li><a class="sb-ep" href="#delete-api-admin-sessions-id">DELETE /api/admin/sessions/{id}</a></li><li><a class="sb-ep" href="#get-api-admin-sessions-id">GET /api/admin/sessions/{id}</a></li><li><a class="sb-ep" href="#get-api-admin-site-registry-contract">GET /api/admin/site-registry-contract</a></li><li><a class="sb-ep" href="#get-api-admin-sites">GET /api/admin/sites</a></li><li><a class="sb-ep" href="#get-api-admin-sites-countries">GET /api/admin/sites/countries</a></li><li><a class="sb-ep" href="#get-api-admin-sites-countries-code-cities">GET /api/admin/sites/countries/{code}/cities</a></li><li><a class="sb-ep" href="#get-api-admin-sites-search">GET /api/admin/sites/search</a></li><li><a class="sb-ep" href="#get-api-admin-sites-unlocode">GET /api/admin/sites/{unlocode}</a></li><li><a class="sb-ep" href="#post-api-admin-sites-unlocode-activate">POST /api/admin/sites/{unlocode}/activate</a></li><li><a class="sb-ep" href="#post-api-admin-sites-unlocode-deactivate">POST /api/admin/sites/{unlocode}/deactivate</a></li><li><a class="sb-ep" href="#get-api-admin-tokens">GET /api/admin/tokens</a></li><li><a class="sb-ep" href="#post-api-admin-tokens">POST /api/admin/tokens</a></li><li><a class="sb-ep" href="#delete-api-admin-tokens-id">DELETE /api/admin/tokens/{id}</a></li><li><a class="sb-ep" href="#get-api-admin-tokens-id">GET /api/admin/tokens/{id}</a></li><li><a class="sb-ep" href="#get-api-admin-worker-capability-contract">GET /api/admin/worker-capability-contract</a></li></ul></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Admin</span></nav>
+<h1>Admin API</h1>
+<p>Platform administration: API token and session management, approval groups, delegation boundaries, feature-flag governance, and notification dispatch-outbox introspection. Both reads and mutations under /api/admin require the admin tier.</p>
+<p class="area-count">41 routes</p>
+<h2 class="ep-h" id="get-api-admin-agents"><span class="method-chip m-get">GET</span><code>/api/admin/agents</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents Returns a list of all registered agents with their most recent jobs.</p>
+<p>GET /api/admin/agents</p>
+<p>Returns a list of all registered agents with their most recent jobs. Requires <code>admin</code> permission — enforced in-handler as defense-in-depth regardless of RBAC middleware method handling.</p>
+<p class="ep-doc-heading">Secret hygiene</p>
+<p><code>token_hash</code> and <code>public_key</code> are NEVER included in the response.</p>
+<p class="ep-doc-heading">Bounds</p>
+<p>Agents are capped at 500 (newest first); jobs are capped at 5 000 total across all agents, then further limited to the 10 most recent per agent in Rust. <code>capped: true</code> in the response signals the agent list was truncated.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents</code></pre>
+<h2 class="ep-h" id="get-api-admin-agents-dead-lettered-jobs"><span class="method-chip m-get">GET</span><code>/api/admin/agents/dead-lettered-jobs</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents/dead-lettered-jobs Lists every terminal <code>DeadLettered</code> agent job (poison jobs that exhausted the redispatch cap, #23) so an operator can SEE them — otherwise they are an operational black hole.</p>
+<p>GET /api/admin/agents/dead-lettered-jobs</p>
+<p>Lists every terminal <code>DeadLettered</code> agent job (poison jobs that exhausted the redispatch cap, #23) so an operator can SEE them — otherwise they are an operational black hole. Admin-only (re-checked in-handler as defense-in-depth). Newest first, capped at 500. <code>spec</code>/<code>live_context</code> are excluded (secret hygiene).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/dead-lettered-jobs</code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-dead-lettered-jobs-job-id-requeue"><span class="method-chip m-post">POST</span><code>/api/admin/agents/dead-lettered-jobs/{job_id}/requeue</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue Recovers a <code>DeadLettered</code> job: returns it to <code>Pending</code> with a fresh redispatch budget (<code>delivery_attempts = 0</code>) + cleared lease state, so the agent fleet can pick it up again.</p>
+<p>POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue</p>
+<p>Recovers a <code>DeadLettered</code> job: returns it to <code>Pending</code> with a fresh redispatch budget (<code>delivery_attempts = 0</code>) + cleared lease state, so the agent fleet can pick it up again. Admin-only + audited. Guards (in the project lock order requests -&gt; agent_jobs, which cannot deadlock since no path locks job -&gt; request): - the job must still be <code>DeadLettered</code> (idempotent: a second requeue 409s); - the PARENT REQUEST must still be ACTIVE — a job whose request has concluded (failed/cancelled/rejected/completed/...) or is orphaned/unknown is REFUSED (409), so requeue can never re-dispatch stale work for a closed request.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/dead-lettered-jobs/{job_id}/requeue</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>admin_requeue_dead_lettered_job</code>.</p>
+<h2 class="ep-h" id="post-api-admin-agents-jobs-job-id-cancel"><span class="method-chip m-post">POST</span><code>/api/admin/agents/jobs/{job_id}/cancel</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/jobs/{job_id}/cancel Cancels a PENDING (not-yet-leased) agent job — one created in error or no longer wanted — instead of letting an agent lease and run it.</p>
+<p>POST /api/admin/agents/jobs/{job_id}/cancel</p>
+<p>Cancels a PENDING (not-yet-leased) agent job — one created in error or no longer wanted — instead of letting an agent lease and run it. CASes on <code>status = 'Pending'</code>: once <code>Leased</code>/<code>Running</code> an agent owns the job (cancelling CP-side would split-brain), and a terminal job is already done — both → 409. Admin-only, audited; emits a NON-alerting <code>job.cancelled</code> event. JOB-SCOPED: the parent request stays <code>Executing</code>, and the operator concludes it with <code>POST /api/requests/{id}/fail</code> (identical to the reconcile-resolve contract). A cancelled LiveApply still consumes the request's permanent LiveApply slot — there is no in-place retry; re-attempting needs a fresh request (see <code>create_live_apply_job</code>).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CancelJobBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/cancel</span></code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-jobs-job-id-force-fail"><span class="method-chip m-post">POST</span><code>/api/admin/agents/jobs/{job_id}/force-fail</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/jobs/{job_id}/force-fail Terminally fails a STUCK <code>Leased</code> agent job (leased to an agent that died / never acked) without waiting out the lease-expiry + dead-letter cycles.</p>
+<p>POST /api/admin/agents/jobs/{job_id}/force-fail</p>
+<p>Terminally fails a STUCK <code>Leased</code> agent job (leased to an agent that died / never acked) without waiting out the lease-expiry + dead-letter cycles. Scoped to <code>Leased</code> jobs whose mode is <code>OfflineDryRun</code> / <code>LivePlan</code> — modes that NEVER touch real infrastructure, so <code>Failed</code> is safe and a late ack/result is rejected by the result CAS (<code>status IN ('Leased','Running')</code>). A <code>Leased</code> <code>LiveApply</code> is EXCLUDED (409): with out-of-order delivery the agent may have started applying real infra, so it must go through the lease-expiry path → <code>ReconcileRequired</code> (this endpoint never sets <code>ReconcileRequired</code>). <code>Pending</code> uses cancel; a <code>Running</code> job belongs on the lease-expiry/reconcile path. Admin-only, audited; emits a NON-alerting <code>job.force_failed</code> event. JOB-SCOPED: the parent request is left for the operator's <code>POST /api/requests/{id}/fail</code> (identical to the cancel/reconcile contract).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ForceFailJobBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/force-fail</span></code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-jobs-job-id-priority"><span class="method-chip m-post">POST</span><code>/api/admin/agents/jobs/{job_id}/priority</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/jobs/{job_id}/priority — re-prioritize a PENDING agent job (#15).</p>
+<p>POST /api/admin/agents/jobs/{job_id}/priority — re-prioritize a PENDING agent job (#15). Admin-tier. Only a Pending (not-yet-leased) job is reprioritizable — a leased/running/ terminal job's queue priority is moot, so the UPDATE CASes on <code>status = 'Pending'</code>. Higher = more urgent (0..=9). Audited.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SetJobPriorityBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>priority</code></td><td><code>i32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"priority": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/priority</span></code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-jobs-job-id-reconcile"><span class="method-chip m-post">POST</span><code>/api/admin/agents/jobs/{job_id}/reconcile</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/jobs/{job_id}/reconcile Resolves a terminal-dead-end <code>ReconcileRequired</code> agent job (a LiveApply whose lease expired mid-run, leaving real provider infra in an unknown state) to the terminal <code>Failed</code> once an operator has reconciled out-of-band.</p>
+<p>POST /api/admin/agents/jobs/{job_id}/reconcile</p>
+<p>Resolves a terminal-dead-end <code>ReconcileRequired</code> agent job (a LiveApply whose lease expired mid-run, leaving real provider infra in an unknown state) to the terminal <code>Failed</code> once an operator has reconciled out-of-band. <code>Failed</code> is the conservative truth — the CP cannot verify the interrupted apply succeeded — and the operator's reconciliation is captured in the audited <code>reason</code>. Admin-only. A non-alerting <code>job.reconcile_resolved</code> domain event closes the reconcile-required alert lifecycle (it does NOT page). The STRANDED PARENT REQUEST is left <code>Executing</code> (job-scoped): the operator concludes it with <code>POST /api/requests/{id}/fail</code>. There is NO in-place retry — the request's single LiveApply slot is permanently consumed (the no-double-apply index is all-statuses); re-attempting requires a fresh request (see <code>create_live_apply_job</code>).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ReconcileBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/reconcile</span></code></pre>
+<h2 class="ep-h" id="get-api-admin-agents-jobs-job-id-result"><span class="method-chip m-get">GET</span><code>/api/admin/agents/jobs/{job_id}/result</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result attestation + metadata (#agent-job-result).</p>
+<p>GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result attestation + metadata (#agent-job-result). Admin-only. The <code>signed_envelope</code> is a pure cryptographic attestation (digests + signature + ids, NO raw evidence); the raw agent-submitted <code>evidence_json</code> is NEVER exposed (no server-side redaction guarantee — a redacted-evidence view is a separate slice). 404 if the job is unknown OR has no result yet (<code>signed_envelope IS NULL</code>). Scoped principals see only jobs whose parent request falls within their site/environment scope (run-5 A0).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/result</code></pre>
+<h2 class="ep-h" id="get-api-admin-agents-jobs-job-id-state"><span class="method-chip m-get">GET</span><code>/api/admin/agents/jobs/{job_id}/state</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent job's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch attempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail / cancel / reconcile it.</p>
+<p>GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent job's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch attempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail / cancel / reconcile it. Admin-only. SECRET-SAFE: never returns spec / fencing_token / cp_nonce / live_context / raw evidence / the signed envelope (the attestation is GET .../result). The 5-segment <code>…/state</code> path (vs a bare 4-segment <code>…/jobs/{job_id}</code>) avoids shadowing <code>…/agents/{agent_id}/approve|revoke</code> for an agent literally named "jobs" — a bare GET there would 405 the agent's approve/revoke (codex).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/jobs/{job_id}/state</code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-live-apply-jobs"><span class="method-chip m-post">POST</span><code>/api/admin/agents/live-apply-jobs</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/live-apply-jobs Operator-gated endpoint that mints a CP-signed LiveApply grant and enqueues the job for dispatch.</p>
+<p>POST /api/admin/agents/live-apply-jobs</p>
+<p>Operator-gated endpoint that mints a CP-signed LiveApply grant and enqueues the job for dispatch. The approver identity is taken exclusively from the verified session — the request body cannot override it.</p>
+<p class="ep-doc-heading">Auth posture</p>
+<p>The route sits under <code>/api/admin/</code> so the human RBAC middleware already enforces <code>admin</code> permission at the routing layer. The <code>check_permission</code> call below is defense-in-depth: it fires if the middleware assumption ever changes or the handler is composed without it.</p>
+<p>Returns 503 if the database pool or CP signing key was not initialised at startup (degraded mode).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ApproveLiveApplyBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>request_id</code></td><td><code>Uuid</code></td><td>required</td><td></td></tr><tr><td><code>platform</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>spec</code></td><td><code>JobSpec</code></td><td>required</td><td></td></tr><tr><td><code>approved_plan_digest</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>expiry_seconds</code></td><td><code>u64</code></td><td>required</td><td>Requested grant lifetime in seconds. Must be &gt; 0 and ≤ MAX_GRANT_TTL_HOURS * 3600.</td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"request_id": "&lt;uuid&gt;", "platform": "&lt;string&gt;", "spec": "&lt;JobSpec&gt;", "approved_plan_digest": "&lt;string&gt;", "expiry_seconds": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/live-apply-jobs</span></code></pre>
+<h2 class="ep-h" id="get-api-admin-agents-liveness"><span class="method-chip m-get">GET</span><code>/api/admin/agents/liveness</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents/liveness?offline_after_secs=N — operational liveness of approved agents (#44).</p>
+<p>GET /api/admin/agents/liveness?offline_after_secs=N — operational liveness of approved agents (#44). Admin-gated; 503 with no DB. Read-only: this surfaces which approved agents have gone silent (offline detection) WITHOUT mutating the enrollment status, so it can never accidentally revoke an agent.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>offline_after_secs</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/liveness</code></pre>
+<h2 class="ep-h" id="get-api-admin-agents-queue-depth"><span class="method-chip m-get">GET</span><code>/api/admin/agents/queue-depth</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/agents/queue-depth — the pending (queued) agent-job backlog per platform (#6 read slice; the pending-jobs view #15 deferred).</p>
+<p>GET /api/admin/agents/queue-depth — the pending (queued) agent-job backlog per platform (#6 read slice; the pending-jobs view #15 deferred). For each platform with pending work: the pending count, the oldest pending job's age, and the highest priority waiting. Admin-only (explicit re-check — GET routes under /api/admin/ may not be gated by the RBAC middleware). Only <code>Pending</code> jobs are "queued" (leased/running/terminal are excluded). Exposes ONLY aggregates + the platform name — no spec/live_context/request_id/agent ids.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/queue-depth</code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-agent-id-approve"><span class="method-chip m-post">POST</span><code>/api/admin/agents/{agent_id}/approve</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/{agent_id}/approve Sets an agent's status to 'approved'.</p>
+<p>POST /api/admin/agents/{agent_id}/approve</p>
+<p>Sets an agent's status to 'approved'. ALWAYS overwrites platform and (optionally) capabilities with admin-authoritative values — the agent's self-declared registration data is treated as a hint only.</p>
+<p><code>platform</code> is required in the request body; omitting it is a 400 error. This endpoint sits under <code>/api/admin/</code> so the human RBAC middleware enforces the <code>admin</code> permission and agent-token auth cannot reach it.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ApproveBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>platform</code></td><td><code>String</code></td><td>required</td><td>Authoritative platform assigned by admin (overwrites self-declared).
+Required — approval without an admin-assigned platform is rejected.</td></tr><tr><td><code>capabilities</code></td><td><code>Capabilities</code></td><td>optional</td><td>Authoritative capabilities assigned by admin (overwrites self-declared).</td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"platform": "&lt;string&gt;", "capabilities": "&lt;Capabilities&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/agents/{agent_id}/approve</span></code></pre>
+<h2 class="ep-h" id="post-api-admin-agents-agent-id-revoke"><span class="method-chip m-post">POST</span><code>/api/admin/agents/{agent_id}/revoke</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/agents/{agent_id}/revoke Sets an agent's status to 'revoked' (from <code>pending</code> or <code>approved</code>).</p>
+<p>POST /api/admin/agents/{agent_id}/revoke</p>
+<p>Sets an agent's status to 'revoked' (from <code>pending</code> or <code>approved</code>). Revocation is TERMINAL: <code>authenticate_agent</code> rejects any status other than 'approved', so the agent's token is refused on its next call, and <code>admin_approve_agent</code> cannot move it back. Already-leased jobs are NOT force-cancelled here — they wind down via the lease/fencing/reconcile path; this closes the door to NEW work. Admin- tier (the <code>/api/admin/</code> middleware blocks agent-token auth). Idempotent: re- revoking an already-revoked agent returns 200 without a duplicate audit row. 404 if the agent is unknown.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/agents/{agent_id}/revoke</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>admin_revoke_agent</code>.</p>
+<h2 class="ep-h" id="get-api-admin-approval-groups-contract"><span class="method-chip m-get">GET</span><code>/api/admin/approval-groups-contract</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/approval-groups-contract</code></pre>
+<h2 class="ep-h" id="get-api-admin-delegation-boundary-contract"><span class="method-chip m-get">GET</span><code>/api/admin/delegation-boundary-contract</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/delegation-boundary-contract</code></pre>
+<h2 class="ep-h" id="get-api-admin-delegation-boundary-readiness"><span class="method-chip m-get">GET</span><code>/api/admin/delegation-boundary-readiness</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">Dry-run admin delegation-boundary readiness.</p>
+<p>Dry-run admin delegation-boundary readiness. Turns the static <code>admin/delegation-boundary</code> descriptor into a real decision: evaluate the boundary-review guards over a proposed delegation and return <code>boundary-recorded</code> (all criteria met; the live delegation change is a separately-approved step) or <code>block</code>. Never changes live delegation; evidence is referenced by summary only.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>delegate_role</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site_scope</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>approval_route</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>expiry</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>separation_of_duties</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>break_glass</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>evidence_manifest</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/delegation-boundary-readiness</code></pre>
+<h2 class="ep-h" id="get-api-admin-feature-flag-governance-contract"><span class="method-chip m-get">GET</span><code>/api/admin/feature-flag-governance-contract</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/feature-flag-governance-contract</code></pre>
+<h2 class="ep-h" id="get-api-admin-feature-flag-governance-readiness"><span class="method-chip m-get">GET</span><code>/api/admin/feature-flag-governance-readiness</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">Dry-run admin feature-flag governance readiness.</p>
+<p>Dry-run admin feature-flag governance readiness. Turns the static <code>admin/feature-flag-governance</code> descriptor into a real decision: evaluate the governance guards over a proposed feature-flag change and return <code>governance-recorded</code> (all criteria met; the live toggle is a separately- approved step) or <code>block</code>. Never toggles a flag or mutates rollout/targeting.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>owner</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>approval_route</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>blast_radius</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>rollback_plan</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>evidence_manifest</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/feature-flag-governance-readiness</code></pre>
+<h2 class="ep-h" id="get-api-admin-notifications-dispatch-outbox"><span class="method-chip m-get">GET</span><code>/api/admin/notifications/dispatch-outbox</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/notifications/dispatch-outbox Admin telemetry: the dry-run notification-dispatch outbox, newest first.</p>
+<p>GET /api/admin/notifications/dispatch-outbox Admin telemetry: the dry-run notification-dispatch outbox, newest first. Optional <code>?status=</code> (validated) and <code>?limit=</code> (clamped 1..=200). Returns ONLY dispatch metadata — never a notification body/recipient/target. Admin-gated by the central <code>/api/admin</code> prefix; an explicit check is kept as defense-in-depth. Degrades to <code>{"source":"no-db","dispatches":[]}</code> without a DB.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>status</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/notifications/dispatch-outbox</code></pre>
+<h2 class="ep-h" id="get-api-admin-platform-settings"><span class="method-chip m-get">GET</span><code>/api/admin/platform-settings</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/platform-settings</code></pre>
+<h2 class="ep-h" id="put-api-admin-platform-settings"><span class="method-chip m-put">PUT</span><code>/api/admin/platform-settings</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>PlatformConfig</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>entra_tenant_id</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>entra_client_id</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>entra_authority</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>auth_mode</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>database_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>platform_name</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>platform_url</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>secret_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>kubernetes_runtime</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>monitoring_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>backup_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>hypervisor_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>storage_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>dns_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>ipam_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>load_balancer_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>firewall_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>build_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>network_provider</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>retention_daily_backups</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>retention_weekly_backups</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>retention_monthly_backups</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>retention_yearly_backups</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>maintenance_window_day</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>maintenance_window_start_hour</code></td><td><code>u8</code></td><td>optional</td><td></td></tr><tr><td><code>maintenance_window_duration_hours</code></td><td><code>u8</code></td><td>optional</td><td></td></tr><tr><td><code>keep_alive_timeout_secs</code></td><td><code>u64</code></td><td>optional</td><td></td></tr><tr><td><code>max_concurrent_connections</code></td><td><code>u64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"entra_tenant_id": "&lt;string&gt;", "entra_client_id": "&lt;string&gt;", "entra_authority": "&lt;string&gt;", "auth_mode": "&lt;string&gt;", "database_provider": "&lt;string&gt;", "platform_name": "&lt;string&gt;", "platform_url": "&lt;string&gt;", "secret_provider": "&lt;string&gt;", "kubernetes_runtime": "&lt;string&gt;", "monitoring_provider": "&lt;string&gt;", "backup_provider": "&lt;string&gt;", "hypervisor_provider": "&lt;string&gt;", "storage_provider": "&lt;string&gt;", "dns_provider": "&lt;string&gt;", "ipam_provider": "&lt;string&gt;", "load_balancer_provider": "&lt;string&gt;", "firewall_provider": "&lt;string&gt;", "build_provider": "&lt;string&gt;", "network_provider": "&lt;string&gt;", "retention_daily_backups": 0, "retention_weekly_backups": 0, "retention_monthly_backups": 0, "retention_yearly_backups": 0, "maintenance_window_day": "&lt;string&gt;", "maintenance_window_start_hour": 0, "maintenance_window_duration_hours": 0, "keep_alive_timeout_secs": 0, "max_concurrent_connections": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/platform-settings</span></code></pre>
+<h2 class="ep-h" id="get-api-admin-platform-settings-history"><span class="method-chip m-get">GET</span><code>/api/admin/platform-settings/history</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/platform-settings/history — the change history of platform settings (#28).</p>
+<p>GET /api/admin/platform-settings/history — the change history of platform settings (#28). The update/reset handlers (#6) write durable, hash-chained audit_log rows (<code>platform-settings-update</code> / <code>platform-settings-reset</code>); this surfaces them as a queryable history (who changed it, when, and the recorded NON-secret detail) without needing a separate config_history table — the append-only audit_log IS the history. Admin-tier read, newest first, bounded pagination. Empty + <code>durable:false</code> with no DB. (Active-vs-DB drift detection — flagging when the in-memory config diverges from the persisted row — remains a separate follow-up; this closes the change-history gap.)</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>usize</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>usize</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/platform-settings/history</code></pre>
+<h2 class="ep-h" id="post-api-admin-platform-settings-reset"><span class="method-chip m-post">POST</span><code>/api/admin/platform-settings/reset</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/platform-settings/reset</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>admin_platform_settings_reset</code>.</p>
+<h2 class="ep-h" id="get-api-admin-rbac-roles"><span class="method-chip m-get">GET</span><code>/api/admin/rbac-roles</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/rbac-roles</code></pre>
+<h2 class="ep-h" id="get-api-admin-sessions"><span class="method-chip m-get">GET</span><code>/api/admin/sessions</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/sessions — list active (non-expired) browser sessions.</p>
+<p>GET /api/admin/sessions — list active (non-expired) browser sessions.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys. Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sessions</code></pre>
+<h2 class="ep-h" id="delete-api-admin-sessions-id"><span class="method-chip m-delete">DELETE</span><code>/api/admin/sessions/{id}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">DELETE /api/admin/sessions/{id} — admin revoke of ANY session (closes the self-only gap in auth_logout).</p>
+<p>DELETE /api/admin/sessions/{id} — admin revoke of ANY session (closes the self-only gap in auth_logout). Sessions are ephemeral, so a hard DELETE is acceptable here (unlike tokens, which are soft-revoked as evidence). 404 when absent.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sessions/{id}</code></pre>
+<h2 class="ep-h" id="get-api-admin-sessions-id"><span class="method-chip m-get">GET</span><code>/api/admin/sessions/{id}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/sessions/{id} — fetch a single browser session by id for inspection (#38).</p>
+<p>GET /api/admin/sessions/{id} — fetch a single browser session by id for inspection (#38). Unlike the list (which shows only active sessions), this returns the row regardless of expiry so an operator can also inspect an expired session; <code>expires_at</code> reports its state. 404 when absent, 503 no DB.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sessions/{id}</code></pre>
+<h2 class="ep-h" id="get-api-admin-site-registry-contract"><span class="method-chip m-get">GET</span><code>/api/admin/site-registry-contract</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/site-registry-contract</code></pre>
+<h2 class="ep-h" id="get-api-admin-sites"><span class="method-chip m-get">GET</span><code>/api/admin/sites</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites</code></pre>
+<h2 class="ep-h" id="get-api-admin-sites-countries"><span class="method-chip m-get">GET</span><code>/api/admin/sites/countries</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/countries</code></pre>
+<h2 class="ep-h" id="get-api-admin-sites-countries-code-cities"><span class="method-chip m-get">GET</span><code>/api/admin/sites/countries/{code}/cities</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/countries/{code}/cities</code></pre>
+<h2 class="ep-h" id="get-api-admin-sites-search"><span class="method-chip m-get">GET</span><code>/api/admin/sites/search</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>q</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/search</code></pre>
+<h2 class="ep-h" id="get-api-admin-sites-unlocode"><span class="method-chip m-get">GET</span><code>/api/admin/sites/{unlocode}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/{unlocode}</code></pre>
+<h2 class="ep-h" id="post-api-admin-sites-unlocode-activate"><span class="method-chip m-post">POST</span><code>/api/admin/sites/{unlocode}/activate</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/{unlocode}/activate</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>site_registry_activate</code>.</p>
+<h2 class="ep-h" id="post-api-admin-sites-unlocode-deactivate"><span class="method-chip m-post">POST</span><code>/api/admin/sites/{unlocode}/deactivate</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/sites/{unlocode}/deactivate</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>site_registry_deactivate</code>.</p>
+<h2 class="ep-h" id="get-api-admin-tokens"><span class="method-chip m-get">GET</span><code>/api/admin/tokens</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/tokens — list token metadata with the hash REDACTED.</p>
+<p>GET /api/admin/tokens — list token metadata with the hash REDACTED. Reads are not gated by the central ROUTE_PERMISSIONS table this wave, so the handler enforces the admin gate explicitly (these reads expose token metadata).</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys. Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/tokens</code></pre>
+<h2 class="ep-h" id="post-api-admin-tokens"><span class="method-chip m-post">POST</span><code>/api/admin/tokens</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/admin/tokens — mint a service-account credential.</p>
+<p>POST /api/admin/tokens — mint a service-account credential. The plaintext <code>ryk_...</code> token is returned EXACTLY ONCE in this response and is never persisted (only its SHA-256 hash) or logged.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CreateTokenRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>owner_principal</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>roles</code></td><td><code>Vec&lt;String&gt;</code></td><td>optional</td><td></td></tr><tr><td><code>site_scope</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment_scope</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>expires_at</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "owner_principal": "&lt;string&gt;", "roles": [], "site_scope": "&lt;string&gt;", "environment_scope": "&lt;string&gt;", "expires_at": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/admin/tokens</span></code></pre>
+<h2 class="ep-h" id="delete-api-admin-tokens-id"><span class="method-chip m-delete">DELETE</span><code>/api/admin/tokens/{id}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">DELETE /api/admin/tokens/{id} — soft-revoke (sets revoked_at).</p>
+<p>DELETE /api/admin/tokens/{id} — soft-revoke (sets revoked_at). 404 when no active token by that id (already-revoked or absent are indistinguishable to the caller). Never a hard DELETE: the row survives as evidence.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/tokens/{id}</code></pre>
+<h2 class="ep-h" id="get-api-admin-tokens-id"><span class="method-chip m-get">GET</span><code>/api/admin/tokens/{id}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry before revoking).</p>
+<p>GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry before revoking). Mirrors <code>admin_tokens_list</code>'s secret-safe projection via the shared <code>token_row_to_json</code>. <code>WHERE id = $1</code> only (NO <code>revoked_at</code> filter), so a revoked token is still readable like the list; a genuinely-absent id is 404.</p>
+<p class="ep-notes"><strong>Response:</strong> Error responses use the RFC 9457-shaped error body (error, message, optional detail).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/tokens/{id}</code></pre>
+<h2 class="ep-h" id="get-api-admin-worker-capability-contract"><span class="method-chip m-get">GET</span><code>/api/admin/worker-capability-contract</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/admin/worker-capability-contract</code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-activity.html">&larr; Activity</a><a href="/api-agents.html">Agents &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

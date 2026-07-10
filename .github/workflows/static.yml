@@ -47,6 +47,8 @@ jobs:
           mkdir -p _site
           cp docs/*.html docs/CNAME docs/favicon.ico _site/
           cp docs/robots.txt docs/sitemap.xml docs/search-index.json _site/
+          # Machine-readable public OpenAPI spec, linked from the API reference hub.
+          cp docs/openapi.json _site/
           cp -R docs/assets _site/assets
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

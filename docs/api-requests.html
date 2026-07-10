@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requests API · Ryuki</title>
+<meta name="description" content="The governed request lifecycle: create and track requests, validate, plan, approve or reject, execute, verify, cancel, and batch equivalents, with per-request audit trails, approval ledgers, and evidence packs.">
+<link rel="canonical" href="https://ryuki.io/api-requests.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-requests.html">
+<meta property="og:title" content="Requests API · Ryuki">
+<meta property="og:description" content="The governed request lifecycle: create and track requests, validate, plan, approve or reject, execute, verify, cancel, and batch equivalents, with per-request audit trails, approval ledgers, and evidence packs.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link active" aria-current="page" href="/api-requests.html">Requests</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-requests">GET /api/requests</a></li><li><a class="sb-ep" href="#post-api-requests">POST /api/requests</a></li><li><a class="sb-ep" href="#post-api-requests-batch-approve">POST /api/requests/batch/approve</a></li><li><a class="sb-ep" href="#post-api-requests-batch-cancel">POST /api/requests/batch/cancel</a></li><li><a class="sb-ep" href="#post-api-requests-batch-fail">POST /api/requests/batch/fail</a></li><li><a class="sb-ep" href="#post-api-requests-batch-reject">POST /api/requests/batch/reject</a></li><li><a class="sb-ep" href="#post-api-requests-batch-rework">POST /api/requests/batch/rework</a></li><li><a class="sb-ep" href="#get-api-requests-execution-timeline-contract">GET /api/requests/execution-timeline-contract</a></li><li><a class="sb-ep" href="#get-api-requests-intake-form">GET /api/requests/intake-form</a></li><li><a class="sb-ep" href="#get-api-requests-intake-support-contract">GET /api/requests/intake-support-contract</a></li><li><a class="sb-ep" href="#get-api-requests-lifecycle-contract">GET /api/requests/lifecycle-contract</a></li><li><a class="sb-ep" href="#get-api-requests-preflight-contract">GET /api/requests/preflight-contract</a></li><li><a class="sb-ep" href="#get-api-requests-id">GET /api/requests/{id}</a></li><li><a class="sb-ep" href="#get-api-requests-id-approval-decisions">GET /api/requests/{id}/approval-decisions</a></li><li><a class="sb-ep" href="#get-api-requests-id-approval-quorum">GET /api/requests/{id}/approval-quorum</a></li><li><a class="sb-ep" href="#post-api-requests-id-approve">POST /api/requests/{id}/approve</a></li><li><a class="sb-ep" href="#post-api-requests-id-approve-live-apply">POST /api/requests/{id}/approve-live-apply</a></li><li><a class="sb-ep" href="#get-api-requests-id-audit">GET /api/requests/{id}/audit</a></li><li><a class="sb-ep" href="#post-api-requests-id-cancel">POST /api/requests/{id}/cancel</a></li><li><a class="sb-ep" href="#get-api-requests-id-evidence">GET /api/requests/{id}/evidence</a></li><li><a class="sb-ep" href="#post-api-requests-id-execute">POST /api/requests/{id}/execute</a></li><li><a class="sb-ep" href="#get-api-requests-id-execution-job">GET /api/requests/{id}/execution-job</a></li><li><a class="sb-ep" href="#post-api-requests-id-fail">POST /api/requests/{id}/fail</a></li><li><a class="sb-ep" href="#post-api-requests-id-lock">POST /api/requests/{id}/lock</a></li><li><a class="sb-ep" href="#post-api-requests-id-plan">POST /api/requests/{id}/plan</a></li><li><a class="sb-ep" href="#get-api-requests-id-policy-eval">GET /api/requests/{id}/policy-eval</a></li><li><a class="sb-ep" href="#post-api-requests-id-protect">POST /api/requests/{id}/protect</a></li><li><a class="sb-ep" href="#post-api-requests-id-publish">POST /api/requests/{id}/publish</a></li><li><a class="sb-ep" href="#post-api-requests-id-reject">POST /api/requests/{id}/reject</a></li><li><a class="sb-ep" href="#post-api-requests-id-retire">POST /api/requests/{id}/retire</a></li><li><a class="sb-ep" href="#post-api-requests-id-rework">POST /api/requests/{id}/rework</a></li><li><a class="sb-ep" href="#post-api-requests-id-steps-step-key-approve-live-apply">POST /api/requests/{id}/steps/{step_key}/approve-live-apply</a></li><li><a class="sb-ep" href="#post-api-requests-id-validate">POST /api/requests/{id}/validate</a></li><li><a class="sb-ep" href="#post-api-requests-id-verify">POST /api/requests/{id}/verify</a></li></ul></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Requests</span></nav>
+<h1>Requests API</h1>
+<p>The governed request lifecycle: create and track requests, validate, plan, approve or reject, execute, verify, cancel, and batch equivalents, with per-request audit trails, approval ledgers, and evidence packs.</p>
+<p class="area-count">34 routes</p>
+<h2 class="ep-h" id="get-api-requests"><span class="method-chip m-get">GET</span><code>/api/requests</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>usize</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>usize</code></td><td>optional</td><td></td></tr><tr><td><code>status</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>request_type</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>created_by</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>q</code></td><td><code>String</code></td><td>optional</td><td>Case-insensitive substring on the request name.</td></tr><tr><td><code>sort</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>direction</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests</code></pre>
+<h2 class="ep-h" id="post-api-requests"><span class="method-chip m-post">POST</span><code>/api/requests</code></h2>
+<p class="badges"><span class="badge">request tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>request_type</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>cpu</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>memory_gb</code></td><td><code>u32</code></td><td>optional</td><td></td></tr><tr><td><code>justification</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>fields</code></td><td><code>std::collections::BTreeMap&lt;String, String&gt;</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"request_type": "&lt;string&gt;", "site": "&lt;string&gt;", "environment": "&lt;string&gt;", "name": "&lt;string&gt;", "cpu": 0, "memory_gb": 0, "justification": "&lt;string&gt;", "fields": "&lt;std::collections::BTreeMap&lt;String, String&gt;&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-batch-approve"><span class="method-chip m-post">POST</span><code>/api/requests/batch/approve</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-summary">POST /api/requests/batch/approve — record THIS approver's sign-off on up to 100 requests in one call (#17, final slice).</p>
+<p>POST /api/requests/batch/approve — record THIS approver's sign-off on up to 100 requests in one call (#17, final slice). Each id goes through the SAME <code>approve_one</code> quorum/SoD core as a single approve, so a batch CANNOT bypass the multi-role quorum: a <code>required_approval_roles &gt; 1</code> request gets this approver's ONE decision and stays <code>Planned</code> (<code>quorum_met=false</code>) until N distinct roles + approvers approve. Items are independent; partial success is normal; HTTP 200 always (clients MUST inspect each result's <code>ok</code>/<code>quorum_met</code>). Duplicate ids are deduped.</p>
+<p><code>approve</code> is a FLAT capability, checked ONCE up front: a caller lacking it gets a single 403 for the WHOLE batch, audited EXACTLY ONCE with the non-id "batch" sentinel. <code>check_sod</code> (approver != creator) stays the PER-ITEM gate inside <code>approve_one</code>, so approving a request you created fails only that id.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>BatchApproveRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>ids</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"ids": []}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/batch/approve</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-batch-cancel"><span class="method-chip m-post">POST</span><code>/api/requests/batch/cancel</code></h2>
+<p class="badges"><span class="badge">request tier</span></p>
+<p class="ep-summary">POST /api/requests/batch/cancel — cancel up to 100 requests in one call (#17).</p>
+<p>POST /api/requests/batch/cancel — cancel up to 100 requests in one call (#17). Each id is cancelled INDEPENDENTLY through the same <code>cancel_one</code> core (so the SoD rule and the per-item transaction are identical to a single cancel); partial success is normal and the response reports a per-id outcome. Items are NOT atomic with each other — a failure on one does not roll back the rest. NOTE: even an all-failed batch returns HTTP 200; clients MUST inspect <code>failed</code>/<code>results</code>. Duplicate ids are deduped (each request is acted on once).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>BatchCancelRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>ids</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"ids": [], "reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/batch/cancel</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-batch-fail"><span class="method-chip m-post">POST</span><code>/api/requests/batch/fail</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/requests/batch/fail — terminally fail up to 100 requests in one call (#17, slice 3).</p>
+<p>POST /api/requests/batch/fail — terminally fail up to 100 requests in one call (#17, slice 3). Each id is failed INDEPENDENTLY through the same <code>fail_one</code> core (so the scope rule, the per-item transaction, AND the fails-at-its-current-stage behavior are identical to a single fail); partial success is normal and the response reports a per-id outcome. Items are NOT atomic with each other. Even an all-failed batch returns HTTP 200; clients MUST inspect <code>failed</code>/<code>results</code>. Duplicate ids are deduped.</p>
+<p><code>execute</code> is a FLAT capability, checked ONCE up front: a caller lacking it gets a single 403 for the WHOLE batch, audited EXACTLY ONCE with a non-id "batch" sentinel.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>BatchFailRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>ids</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"ids": [], "reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/batch/fail</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-batch-reject"><span class="method-chip m-post">POST</span><code>/api/requests/batch/reject</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-summary">POST /api/requests/batch/reject — reject up to 100 requests in one call (#17, slice 2).</p>
+<p>POST /api/requests/batch/reject — reject up to 100 requests in one call (#17, slice 2). Each id is rejected INDEPENDENTLY through the same <code>reject_one</code> core (so the scope/SoD rule and the per-item transaction are identical to a single reject); partial success is normal and the response reports a per-id outcome. Items are NOT atomic with each other — a failure on one does not roll back the rest. NOTE: even an all-failed batch returns HTTP 200; clients MUST inspect <code>failed</code>/<code>results</code>. Duplicate ids are deduped (each request is acted on once).</p>
+<p>The <code>approve</code> capability is a FLAT capability, so it is checked ONCE up front: a caller lacking it gets a single 403 for the WHOLE batch (never per-item), audited EXACTLY ONCE with a non-id sentinel — looping the ids would be wasteful and risk an existence oracle on a denied caller. <code>check_sod</code> (creator != approver) remains the per-item gate inside <code>reject_one</code>.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>BatchRejectRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>ids</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"ids": [], "reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/batch/reject</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-batch-rework"><span class="method-chip m-post">POST</span><code>/api/requests/batch/rework</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-summary">POST /api/requests/batch/rework — send up to 100 requests back to Intake in one call (#17, slice 3).</p>
+<p>POST /api/requests/batch/rework — send up to 100 requests back to Intake in one call (#17, slice 3). Each id is reworked INDEPENDENTLY through the same <code>rework_one</code> core (so the scope rule and per-item transaction are identical to a single rework); partial success is normal and the response reports a per-id outcome. Items are NOT atomic with each other. Even an all-failed batch returns HTTP 200; clients MUST inspect <code>failed</code>/<code>results</code>. Duplicate ids are deduped.</p>
+<p><code>approve</code> is a FLAT capability, checked ONCE up front: a caller lacking it gets a single 403 for the WHOLE batch, audited EXACTLY ONCE with a non-id "batch" sentinel (looping the ids would be wasteful and risk an existence oracle on a denied caller). rework has no SoD gate (matching the single handler).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>BatchReworkRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>ids</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"ids": [], "reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/batch/rework</span></code></pre>
+<h2 class="ep-h" id="get-api-requests-execution-timeline-contract"><span class="method-chip m-get">GET</span><code>/api/requests/execution-timeline-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/execution-timeline-contract</code></pre>
+<h2 class="ep-h" id="get-api-requests-intake-form"><span class="method-chip m-get">GET</span><code>/api/requests/intake-form</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/intake-form</code></pre>
+<h2 class="ep-h" id="get-api-requests-intake-support-contract"><span class="method-chip m-get">GET</span><code>/api/requests/intake-support-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/intake-support-contract</code></pre>
+<h2 class="ep-h" id="get-api-requests-lifecycle-contract"><span class="method-chip m-get">GET</span><code>/api/requests/lifecycle-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/lifecycle-contract</code></pre>
+<h2 class="ep-h" id="get-api-requests-preflight-contract"><span class="method-chip m-get">GET</span><code>/api/requests/preflight-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/preflight-contract</code></pre>
+<h2 class="ep-h" id="get-api-requests-id"><span class="method-chip m-get">GET</span><code>/api/requests/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}</code></pre>
+<h2 class="ep-h" id="get-api-requests-id-approval-decisions"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/approval-decisions</code></h2>
+<p class="badges"><span class="badge">audit tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/approval-decisions — the individual approval-decision LEDGER for one request: every recorded <code>request_approval_decisions</code> row (role, decision, actor, decided_at, reason), the per-decision DETAIL the quorum endpoint deliberately omits (it returns only breadth aggregates).</p>
+<p>GET /api/requests/{id}/approval-decisions — the individual approval-decision LEDGER for one request: every recorded <code>request_approval_decisions</code> row (role, decision, actor, decided_at, reason), the per-decision DETAIL the quorum endpoint deliberately omits (it returns only breadth aggregates). The companion to <code>requests_approval_quorum</code>: quorum = the verdict, this = the records behind it.</p>
+<p>Audit-tier — same identity-grade sensitivity as the quorum endpoint and the audit trail. NOT approve-tier: every approve-holding role (DatacenterApprover, PlatformAdmin) ALSO holds <code>audit</code>, and gating on <code>approve</code> would wrongly exclude the audit-only <code>Auditor</code> from an audit ledger. <code>actor</code> is already exposed by the quorum endpoint's approvers list; <code>reason</code> is the approver's free-text reject justification — treat it as AUDIT-VISIBLE free text (any secret/PII redaction is a write-side concern, out of scope for this read). 404 for an unknown OR out-of-scope request (no oracle). Empty ledger + <code>durable:false</code> with no DB (the dry-run approve arm writes no ledger), distinct from a durable-but-empty <code>{decisions:[],durable:true}</code>.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/approval-decisions</code></pre>
+<h2 class="ep-h" id="get-api-requests-id-approval-quorum"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/approval-quorum</code></h2>
+<p class="badges"><span class="badge">audit tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/approval-quorum — multi-role approval quorum status for one request (#4).</p>
+<p>GET /api/requests/{id}/approval-quorum — multi-role approval quorum status for one request (#4). Reads the recorded <code>request_approval_decisions</code> and reports whether they meet a breadth quorum: distinct approving ROLES and distinct APPROVERS (default 2/2, bounded 1..=10), with any rejection blocking it. Audit-tier (approval identities, like the audit trail). 404 unknown request. READ-ONLY: reports the quorum; it does not yet ENFORCE it in the approval flow (that is a tracked follow-up). Empty + <code>durable:false</code> with no DB.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>required_roles</code></td><td><code>usize</code></td><td>optional</td><td></td></tr><tr><td><code>required_approvers</code></td><td><code>usize</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/approval-quorum</code></pre>
+<h2 class="ep-h" id="post-api-requests-id-approve"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/approve</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/approve</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_approve</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-approve-live-apply"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/approve-live-apply</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/approve-live-apply — admin approves the completed LivePlan for this request and mints a CP-signed LiveApply grant (AWX bridge slice 5c).</p>
+<p>POST /api/requests/{id}/approve-live-apply — admin approves the completed LivePlan for this request and mints a CP-signed LiveApply grant (AWX bridge slice 5c). It RECONSTRUCTS the LiveApply job from the latest SUCCEEDED LivePlan agent_job's spec + evidence_digest, so the approver never hand-builds the spec or the digest. The agent then INDEPENDENTLY verifies the grant (digest match, request binding, expiry) before applying with operator-provided creds. Admin-gated and mutation-authorizing — fail closed.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/approve-live-apply</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_approve_live_apply</code>.</p>
+<h2 class="ep-h" id="get-api-requests-id-audit"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/audit</code></h2>
+<p class="badges"><span class="badge">audit tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/audit — the ordered, actor-attributed audit trail for one request.</p>
+<p>GET /api/requests/{id}/audit — the ordered, actor-attributed audit trail for one request. DB-backed entries are tagged <code>durable: true</code>; the no-DB (dry-run) store is tagged <code>durable: false</code>. No secrets are ever written to the trail, so this read is safe to expose.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/audit</code></pre>
+<h2 class="ep-h" id="post-api-requests-id-cancel"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/cancel</code></h2>
+<p class="badges"><span class="badge">request tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/cancel — withdraw a request before execution begins.</p>
+<p>POST /api/requests/{id}/cancel — withdraw a request before execution begins. SoD: an admin may cancel any request; a requester may cancel only their OWN request (matched against <code>requests.created_by</code>). The central route gate applies a coarse <code>request</code> floor; this handler enforces the finer requester-or-admin rule because the route table cannot see <code>created_by</code>.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ReasonBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/{id}/cancel</span></code></pre>
+<h2 class="ep-h" id="get-api-requests-id-evidence"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/evidence</code></h2>
+<p class="badges"><span class="badge">audit tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/evidence — a tamper-evident compliance evidence pack for ONE persisted request: the redacted evidence pack (from the pure engine pipeline, built off the REAL persisted request state) plus the durable, actor-attributed audit trail, sealed with a SHA-256 digest over the stable <code>content</code>.</p>
+<p>GET /api/requests/{id}/evidence — a tamper-evident compliance evidence pack for ONE persisted request: the redacted evidence pack (from the pure engine pipeline, built off the REAL persisted request state) plus the durable, actor-attributed audit trail, sealed with a SHA-256 digest over the stable <code>content</code>. The digest deliberately excludes <code>generated_at</code>, so re-exporting an unchanged request yields the SAME digest (tamper-evidence). Gated on the <code>audit</code> tier — the same identity-grade sensitivity as the audit trail.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/evidence</code></pre>
+<h2 class="ep-h" id="post-api-requests-id-execute"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/execute</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>mode</code></td><td><code>String</code></td><td>optional</td><td>Requested execution mode: omitted / "offline-dry-run" / "dry-run"
+(default), "live-plan" (privileged), or "live-apply" (rejected here —
+requires a CP-signed approval grant).</td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/execute</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_execute</code>.</p>
+<h2 class="ep-h" id="get-api-requests-id-execution-job"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/execution-job</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/execution-job — the execution-agent job dispatched for this request (AWX bridge slice 3).</p>
+<p>GET /api/requests/{id}/execution-job — the execution-agent job dispatched for this request (AWX bridge slice 3). Read-only AWX-style "job" view: which agent ran it, the mode (dry-run/live), job + result status, the evidence digest, and timestamps. The full (sanitized) evidence lives on the request's stages via GET /api/requests/{id}; this surfaces the job itself. 404 when no job has been dispatched (e.g. request not yet executed).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/execution-job</code></pre>
+<h2 class="ep-h" id="post-api-requests-id-fail"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/fail</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/fail — mark a request terminally Failed (e.g. an execution or verification failure).</p>
+<p>POST /api/requests/{id}/fail — mark a request terminally Failed (e.g. an execution or verification failure). Execute-tier; requires a reason. Valid from any non-concluded state.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ReasonBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/{id}/fail</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-id-lock"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/lock</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/lock</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_lock</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-plan"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/plan</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/plan</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_plan</code>.</p>
+<h2 class="ep-h" id="get-api-requests-id-policy-eval"><span class="method-chip m-get">GET</span><code>/api/requests/{id}/policy-eval</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/requests/{id}/policy-eval — evaluate the request's policy readiness against the guardrail catalog.</p>
+<p>GET /api/requests/{id}/policy-eval — evaluate the request's policy readiness against the guardrail catalog. Informational (a read): it reports which guardrail rules' required inputs are satisfied; it does NOT gate the lifecycle. Degrades to 404 when the request is unknown.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/policy-eval</code></pre>
+<h2 class="ep-h" id="post-api-requests-id-protect"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/protect</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/protect — the post-completion Protect stage (Theme 8).</p>
+<p>POST /api/requests/{id}/protect — the post-completion Protect stage (Theme 8). Valid only from <code>Completed</code>; computes a dry-run backup-coverage summary for the delivered asset and transitions the request to <code>Protecting</code>. Operator- initiated; <code>execute</code> permission. Mirrors <code>requests_verify</code> (dual-store + CAS).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/protect</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_protect</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-publish"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/publish</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/publish — the post-completion Publish stage (Theme 8).</p>
+<p>POST /api/requests/{id}/publish — the post-completion Publish stage (Theme 8). Valid only from <code>Protecting</code>; imports the CI records and prepares the dry-run CMDB export, then transitions the request to <code>Operational</code> (its resting state). Operator-initiated; <code>execute</code> permission. Mirrors <code>requests_verify</code>.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/publish</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_publish</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-reject"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/reject</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/reject — the approver "say no" act.</p>
+<p>POST /api/requests/{id}/reject — the approver "say no" act. Valid only from Planned (the approval decision point); guarded by the <code>approve</code> permission (the inverse of approve). The mandatory reason is recorded in the audit trail and the rejection evidence. Terminal.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ReasonBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/{id}/reject</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-id-retire"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/retire</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/retire — the governed end-of-life stage (Theme 8).</p>
+<p>POST /api/requests/{id}/retire — the governed end-of-life stage (Theme 8). Valid only from <code>Operational</code>; computes a dry-run decommission plan (quarantine-first, rollback-capable) and transitions the request to <code>Retired</code> (the terminal end-of-life state). Operator-initiated; <code>execute</code> permission. Mirrors <code>requests_verify</code> (dual-store + CAS).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/retire</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_retire</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-rework"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/rework</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/rework — send a request back to Intake for the requester to fix and re-submit (the non-terminal alternative to reject).</p>
+<p>POST /api/requests/{id}/rework — send a request back to Intake for the requester to fix and re-submit (the non-terminal alternative to reject). Approve-tier; requires a reason. Valid from Validated/Planned/Approved/Locked.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>ReasonBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/requests/{id}/rework</span></code></pre>
+<h2 class="ep-h" id="post-api-requests-id-steps-step-key-approve-live-apply"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/steps/{step_key}/approve-live-apply</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-summary">POST /api/requests/{id}/steps/{step_key}/approve-live-apply — approve ONE step's live apply in a multi-step request (#42 live-apply slice B1b).</p>
+<p>POST /api/requests/{id}/steps/{step_key}/approve-live-apply — approve ONE step's live apply in a multi-step request (#42 live-apply slice B1b).</p>
+<p>Admin-gated + site-scoped, with separation of duties: the requester may not approve their own live apply (owner decision). The step must be parked at <code>AwaitingApproval</code> (its LivePlan ran and recorded a plan digest). This mints a step-scoped, CP-signed grant bound to a fresh LiveApply job (<code>VerifiedLiveContext.step_job_id</code>, slice A) off the step's OWN recorded plan digest, flips the step <code>AwaitingApproval -&gt; Applying</code> under a row lock (single-approval), and dispatches the LiveApply job — all in one transaction. The agent verifies the grant (step-job binding + plan-then- apply digest) before applying; the CP re-verifies on result ingest.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/steps/{step_key}/approve-live-apply</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_step_approve_live_apply</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-validate"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/validate</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_validate</code>.</p>
+<h2 class="ep-h" id="post-api-requests-id-verify"><span class="method-chip m-post">POST</span><code>/api/requests/{id}/verify</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/requests/{id}/verify</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>requests_verify</code>.</p>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-protect.html">&larr; Protect</a><a href="/api-retire.html">Retire &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

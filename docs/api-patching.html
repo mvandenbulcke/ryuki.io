@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Getting Started · Ryuki</title>
-<meta name="description" content="Prerequisites, database setup, first build and run.">
-<link rel="canonical" href="https://ryuki.io/getting-started.html">
+<title>Patching API · Ryuki</title>
+<meta name="description" content="Contract endpoints for patching: maintenance calendar, policy import, and reboot orchestration.">
+<link rel="canonical" href="https://ryuki.io/api-patching.html">
 <meta property="og:type" content="article">
-<meta property="og:url" content="https://ryuki.io/getting-started.html">
-<meta property="og:title" content="Getting Started · Ryuki">
-<meta property="og:description" content="Prerequisites, database setup, first build and run.">
+<meta property="og:url" content="https://ryuki.io/api-patching.html">
+<meta property="og:title" content="Patching API · Ryuki">
+<meta property="og:description" content="Contract endpoints for patching: maintenance calendar, policy import, and reboot orchestration.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -40,106 +40,33 @@
 </header>
 <div class="docs-shell">
 <button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
-<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link active" aria-current="page" data-sections="prerequisites
-quick start
-authentication modes
-project structure" href="/getting-started.html">Getting Started</a><ul class="sb-sections"><li><a href="#prerequisites">Prerequisites</a></li><li><a href="#quick-start">Quick Start</a></li><li><a href="#authentication-modes">Authentication Modes</a></li><li><a href="#project-structure">Project Structure</a></li></ul></li><li><a class="sb-link" data-sections="stack
-component diagram
-key decisions
-network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
-core environment variables
-infrastructure providers
-nested configuration groups
-validation
-entra id app registration
-postgresql
-admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
-app roles definition
-how it works
-permissions by role
-environment configuration
-important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
-site selection flow
-managing sites
-current active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
-scopes
-enforcement semantics
-platform-wide rows and nullable axes
-managing api tokens
-authentication modes
-a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a></li><li><a class="sb-link" data-sections="how an agent joins the platform
-execution modes
-the live-apply trust chain
-where to see results
-credentials never reach the control plane
-auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
-what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
-how a stepped request runs
-per-step live apply
-automatic teardown
-honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
-recipients and read state
-api
-the portal bell
-delivery channels
-known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
-authentication
-authorization
-conventions
-walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
-areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link active" aria-current="page" href="/api-patching.html">Patching</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-patching-maintenance-calendar-contract">GET /api/patching/maintenance-calendar-contract</a></li><li><a class="sb-ep" href="#get-api-patching-maintenance-contract">GET /api/patching/maintenance-contract</a></li><li><a class="sb-ep" href="#get-api-patching-policy-import-contract">GET /api/patching/policy-import-contract</a></li><li><a class="sb-ep" href="#get-api-patching-reboot-orchestration-contract">GET /api/patching/reboot-orchestration-contract</a></li></ul></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Getting Started</span></nav>
-<h1 id="getting-started">Getting Started</h1>
-<h2 id="prerequisites">Prerequisites</h2>
-<ul>
-<li>Rust 1.85+ (edition 2024)</li>
-<li>Docker and Docker Compose</li>
-<li>PostgreSQL 18+</li>
-</ul>
-<h2 id="quick-start">Quick Start</h2>
-<h3 id="1-clone-and-set-up">1. Clone and set up</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">git</span> clone https://github.com/mvandenbulcke/ryuki.io.git ryuki-platform
-<span class="hl-cmd">cd</span> ryuki-platform
-<span class="hl-cmd">cp</span> .env.example .env</code></pre>
-<p>For Docker Compose workflows, edit <code>.env</code> and set <code>RYUKI_DATABASE_URL</code> to match your local PostgreSQL. For direct <code>cargo run</code>, export the needed <code>RYUKI_</code> variables or create <code>ryuki.toml</code>, <code>ryuki.json</code>, or <code>platform-config.json</code>; <code>.env</code> is not loaded automatically by the Rust config loader.</p>
-<h3 id="2-start-the-database">2. Start the database</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">docker</span> compose <span class="hl-f">-f</span> deploy/compose/compose.yaml up <span class="hl-f">-d</span> platform-db</code></pre>
-<h3 id="3-build-the-workspace">3. Build the workspace</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">cargo</span> build <span class="hl-f">--workspace</span></code></pre>
-<h3 id="4-run-the-api-server">4. Run the API server</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">-p</span> ryuki-api</code></pre>
-<p>The API listens on <code>http://localhost:8080</code> by default. The compose API service publishes container port <code>8080</code> as host port <code>18080</code>.</p>
-<h3 id="5-run-tests">5. Run tests</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span></code></pre>
-<h3 id="6-run-validators">6. Run validators</h3>
-<p>Run from the repository root (the validator defaults <code>--root</code> to the current directory; pass <code>--root &lt;path&gt;</code> to validate another checkout):</p>
-<pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">--manifest-path</span> scripts/validator-rs/Cargo.toml <span class="hl-f">--</span> run-all</code></pre>
-<h2 id="authentication-modes">Authentication Modes</h2>
-<p>Default is <strong>mock-dry-run</strong> — no real Entra ID, all operations are simulated.</p>
-<p>To enable live Entra ID authentication:</p>
-<ol>
-<li>Register an Entra ID application (see <code>docs/configuration.md</code>)</li>
-<li>Set <code>RYUKI_AUTH_MODE=entra-id</code> in <code>.env</code></li>
-<li>Set <code>RYUKI_ENTRA_TENANT_ID</code> and <code>RYUKI_ENTRA_CLIENT_ID</code></li>
-<li>Restart the API</li>
-</ol>
-<h2 id="project-structure">Project Structure</h2>
-<pre><code>ryuki.io/
-├── sources/
-│   ├── ryuki-core/     # Shared types, YAML, secret scanning
-│   ├── ryuki-api/      # Axum HTTP API server
-│   └── ryuki-engine/   # Business logic, auth, adapters
-├── portal/
-│   └── portal-ui/      # Leptos SPA frontend
-├── scripts/
-│   └── validator-rs/   # Rust validators
-├── tests/              # Integration tests
-└── docs/               # Documentation</code></pre>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/getting-started.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><span></span><a href="/architecture.html">Architecture &rarr;</a></nav>
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Patching</span></nav>
+<h1>Patching API</h1>
+<p>Contract endpoints for patching: maintenance calendar, policy import, and reboot orchestration.</p>
+<p class="area-count">4 routes</p>
+<h2 class="ep-h" id="get-api-patching-maintenance-calendar-contract"><span class="method-chip m-get">GET</span><code>/api/patching/maintenance-calendar-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/patching/maintenance-calendar-contract</code></pre>
+<h2 class="ep-h" id="get-api-patching-maintenance-contract"><span class="method-chip m-get">GET</span><code>/api/patching/maintenance-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/patching/maintenance-contract</code></pre>
+<h2 class="ep-h" id="get-api-patching-policy-import-contract"><span class="method-chip m-get">GET</span><code>/api/patching/policy-import-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/patching/policy-import-contract</code></pre>
+<h2 class="ep-h" id="get-api-patching-reboot-orchestration-contract"><span class="method-chip m-get">GET</span><code>/api/patching/reboot-orchestration-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/patching/reboot-orchestration-contract</code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-ops.html">&larr; Ops</a><a href="/api-platform.html">Platform &rarr;</a></nav>
 </main>
 </div>
 <script>

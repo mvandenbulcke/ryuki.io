@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protect API · Ryuki</title>
+<meta name="description" content="Data protection: backup coverage and gap analysis, DR assignment and plans, restore approvals, and secrets management including rotation.">
+<link rel="canonical" href="https://ryuki.io/api-protect.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/api-protect.html">
+<meta property="og:title" content="Protect API · Ryuki">
+<meta property="og:description" content="Data protection: backup coverage and gap analysis, DR assignment and plans, restore approvals, and secrets management including rotation.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link active" aria-current="page" href="/api-protect.html">Protect</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-protect-application-aware-backup-validation-contract">GET /api/protect/application-aware-backup-validation-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-contract">GET /api/protect/backup-coverage-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-gap-contract">GET /api/protect/backup-coverage-gap-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-dr-assignment-contract">GET /api/protect/backup-dr-assignment-contract</a></li><li><a class="sb-ep" href="#post-api-protect-backup-coverage-report">POST /api/protect/backup/coverage-report</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-reports">GET /api/protect/backup/coverage-reports</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-reports-id">GET /api/protect/backup/coverage-reports/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-approve">POST /api/protect/backup/restore-approve</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-execute">POST /api/protect/backup/restore-execute</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-plan">POST /api/protect/backup/restore-plan</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restore-tests-recency">GET /api/protect/backup/restore-tests/recency</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-validate">POST /api/protect/backup/restore-validate</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restores">GET /api/protect/backup/restores</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restores-id">GET /api/protect/backup/restores/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-controlled-restore-contract">GET /api/protect/controlled-restore-contract</a></li><li><a class="sb-ep" href="#get-api-protect-dr-contract">GET /api/protect/dr-contract</a></li><li><a class="sb-ep" href="#get-api-protect-dr-due-tests">GET /api/protect/dr/due-tests</a></li><li><a class="sb-ep" href="#get-api-protect-dr-plans">GET /api/protect/dr/plans</a></li><li><a class="sb-ep" href="#post-api-protect-dr-plans">POST /api/protect/dr/plans</a></li><li><a class="sb-ep" href="#delete-api-protect-dr-plans-id">DELETE /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-dr-plans-id">GET /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#put-api-protect-dr-plans-id">PUT /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-dr-plans-id-rpo-rto">POST /api/protect/dr/plans/{id}/rpo-rto</a></li><li><a class="sb-ep" href="#get-api-protect-dr-readiness">GET /api/protect/dr/readiness</a></li><li><a class="sb-ep" href="#get-api-protect-dr-scenarios">GET /api/protect/dr/scenarios</a></li><li><a class="sb-ep" href="#post-api-protect-dr-tests-complete">POST /api/protect/dr/tests/complete</a></li><li><a class="sb-ep" href="#get-api-protect-dr-tests-results-id">GET /api/protect/dr/tests/results/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-dr-tests-start">POST /api/protect/dr/tests/start</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-air-gap-compliance-contract">GET /api/protect/immutability-air-gap-compliance-contract</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-contract">GET /api/protect/immutability-contract</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-air-gap-id">POST /api/protect/immutability/air-gap/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-check-id">POST /api/protect/immutability/check/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-compliance">GET /api/protect/immutability/compliance</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-noncompliant">GET /api/protect/immutability/noncompliant</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-remediation-id">GET /api/protect/immutability/remediation/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-retention-lock-id">POST /api/protect/immutability/retention-lock/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-retention-risk">GET /api/protect/immutability/retention-risk</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-verify-all">POST /api/protect/immutability/verify-all</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-contract">GET /api/protect/legal-hold-contract</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-retention-contract">GET /api/protect/legal-hold-retention-contract</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-active">GET /api/protect/legal-hold/active</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-compliance-server">GET /api/protect/legal-hold/compliance/{server}</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-evidence-id">GET /api/protect/legal-hold/evidence/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-expiring">GET /api/protect/legal-hold/expiring</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-extend-id">POST /api/protect/legal-hold/extend/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-place">POST /api/protect/legal-hold/place</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-release-id">POST /api/protect/legal-hold/release/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-validate-id">POST /api/protect/legal-hold/validate/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity">GET /api/protect/repository-capacity</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-contract">GET /api/protect/repository-capacity-contract</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-at-risk">GET /api/protect/repository-capacity/at-risk</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-forecast-id">GET /api/protect/repository-capacity/forecast/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-recommendations-id">GET /api/protect/repository-capacity/recommendations/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-report">GET /api/protect/repository-capacity/report</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-trend-id">GET /api/protect/repository-capacity/trend/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-repository-capacity-update-id">POST /api/protect/repository-capacity/update/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-id">GET /api/protect/repository-capacity/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-restore-testing-contract">GET /api/protect/restore-testing-contract</a></li><li><a class="sb-ep" href="#get-api-protect-secrets">GET /api/protect/secrets</a></li><li><a class="sb-ep" href="#post-api-protect-secrets">POST /api/protect/secrets</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-contract">GET /api/protect/secrets-contract</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-due">GET /api/protect/secrets/due</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-expiring">GET /api/protect/secrets/expiring</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-fail">POST /api/protect/secrets/fail</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-rotate-all">POST /api/protect/secrets/rotate-all</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-summary">GET /api/protect/secrets/summary</a></li><li><a class="sb-ep" href="#delete-api-protect-secrets-id">DELETE /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-id">GET /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#put-api-protect-secrets-id">PUT /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-id-history">GET /api/protect/secrets/{id}/history</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-id-rotate">POST /api/protect/secrets/{id}/rotate</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-governance-contract">GET /api/protect/snapshot-governance-contract</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-flag-stale">POST /api/protect/snapshot/flag-stale</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-plan">POST /api/protect/snapshot/plan</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-records">GET /api/protect/snapshot/records</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-records-id">GET /api/protect/snapshot/records/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-remediate">POST /api/protect/snapshot/remediate</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-review">POST /api/protect/snapshot/review</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-validate">POST /api/protect/snapshot/validate</a></li></ul></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Protect</span></nav>
+<h1>Protect API</h1>
+<p>Data protection: backup coverage and gap analysis, DR assignment and plans, restore approvals, and secrets management including rotation.</p>
+<p class="area-count">79 routes</p>
+<h2 class="ep-h" id="get-api-protect-application-aware-backup-validation-contract"><span class="method-chip m-get">GET</span><code>/api/protect/application-aware-backup-validation-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/application-aware-backup-validation-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-coverage-contract"><span class="method-chip m-get">GET</span><code>/api/protect/backup-coverage-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup-coverage-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-coverage-gap-contract"><span class="method-chip m-get">GET</span><code>/api/protect/backup-coverage-gap-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup-coverage-gap-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-dr-assignment-contract"><span class="method-chip m-get">GET</span><code>/api/protect/backup-dr-assignment-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup-dr-assignment-contract</code></pre>
+<h2 class="ep-h" id="post-api-protect-backup-coverage-report"><span class="method-chip m-post">POST</span><code>/api/protect/backup/coverage-report</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>CoverageReportRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>siteScope</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>environmentScope</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"siteScope": [], "environmentScope": []}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/backup/coverage-report</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-coverage-reports"><span class="method-chip m-get">GET</span><code>/api/protect/backup/coverage-reports</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/backup/coverage-reports — list persisted coverage reports, paged (#14).</p>
+<p>GET /api/protect/backup/coverage-reports — list persisted coverage reports, paged (#14). Returns an empty array when no DB is available rather than an error. The body stays a BARE array (backward-compatible); the scope-filtered total rides the <code>X-Total-Count</code> header.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup/coverage-reports</code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-coverage-reports-id"><span class="method-chip m-get">GET</span><code>/api/protect/backup/coverage-reports/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/backup/coverage-reports/{id} — fetch a single coverage report by id.</p>
+<p>GET /api/protect/backup/coverage-reports/{id} — fetch a single coverage report by id. Returns 404 when absent or when no DB is configured.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup/coverage-reports/{id}</code></pre>
+<h2 class="ep-h" id="post-api-protect-backup-restore-approve"><span class="method-chip m-post">POST</span><code>/api/protect/backup/restore-approve</code></h2>
+<p class="badges"><span class="badge">approve tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>RestoreActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>restoreId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"restoreId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/backup/restore-approve</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-backup-restore-execute"><span class="method-chip m-post">POST</span><code>/api/protect/backup/restore-execute</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">Execute a persisted restore request (must be Approved) and record the execution by transitioning Approved -&gt; Executed.</p>
+<p>Execute a persisted restore request (must be Approved) and record the execution by transitioning Approved -&gt; Executed. The response is the evidence the engine produced. The CAS transition also makes execute non-idempotent in the safe direction: a second call finds the request Executed (not Approved), so the engine's Approved precondition rejects it (409) — a restore cannot be silently run twice, and list/get reflect that it ran.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>RestoreActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>restoreId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"restoreId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/backup/restore-execute</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-backup-restore-plan"><span class="method-chip m-post">POST</span><code>/api/protect/backup/restore-plan</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>RestorePlanRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>sourceCiKey</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>restoreType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>restorePoint</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>targetSite</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>targetEnvironment</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>owner</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"sourceCiKey": "&lt;string&gt;", "restoreType": "&lt;string&gt;", "restorePoint": "&lt;string&gt;", "targetSite": "&lt;string&gt;", "targetEnvironment": "&lt;string&gt;", "owner": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/backup/restore-plan</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-restore-tests-recency"><span class="method-chip m-get">GET</span><code>/api/protect/backup/restore-tests/recency</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/backup/restore-tests/recency?overdue_after_days=N — restore test recency (#47).</p>
+<p>GET /api/protect/backup/restore-tests/recency?overdue_after_days=N — restore test recency (#47). A backup is only proven by a successful restore test; this reports, per <code>source_ci_key</code> THAT HAS RESTORE-REQUEST HISTORY, the last successful test (status Verified/Completed) and classifies it <code>current</code>/<code>overdue</code>/<code>never_tested</code> against the policy window (default 90 days, bounded). Systems with no restore request at all are out of scope (a coverage question — see coverage reports); the response carries a <code>scope</code> + <code>note</code> saying so. Read-only; empty + <code>durable:false</code> when no DB.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>overdue_after_days</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup/restore-tests/recency</code></pre>
+<h2 class="ep-h" id="post-api-protect-backup-restore-validate"><span class="method-chip m-post">POST</span><code>/api/protect/backup/restore-validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">Validate a persisted restore request (read-only — no state transition).</p>
+<p>Validate a persisted restore request (read-only — no state transition).</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>RestoreActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>restoreId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"restoreId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/backup/restore-validate</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-restores"><span class="method-chip m-get">GET</span><code>/api/protect/backup/restores</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/backup/restores — list persisted restore requests, paged (#14).</p>
+<p>GET /api/protect/backup/restores — list persisted restore requests, paged (#14). Returns an empty array when no DB is available rather than an error. The body stays a BARE array (backward-compatible); the scope-filtered total rides the <code>X-Total-Count</code> header.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup/restores</code></pre>
+<h2 class="ep-h" id="get-api-protect-backup-restores-id"><span class="method-chip m-get">GET</span><code>/api/protect/backup/restores/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/backup/restores/{id} — fetch a single restore request by id.</p>
+<p>GET /api/protect/backup/restores/{id} — fetch a single restore request by id. Returns 404 when absent or when no DB is configured.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/backup/restores/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-controlled-restore-contract"><span class="method-chip m-get">GET</span><code>/api/protect/controlled-restore-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/controlled-restore-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-contract"><span class="method-chip m-get">GET</span><code>/api/protect/dr-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-due-tests"><span class="method-chip m-get">GET</span><code>/api/protect/dr/due-tests</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/due-tests</code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-plans"><span class="method-chip m-get">GET</span><code>/api/protect/dr/plans</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/plans</code></pre>
+<h2 class="ep-h" id="post-api-protect-dr-plans"><span class="method-chip m-post">POST</span><code>/api/protect/dr/plans</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DrPlanCreateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>targetSite</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>systems</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>rpo</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>rto</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "site": "&lt;string&gt;", "targetSite": "&lt;string&gt;", "systems": [], "rpo": 0, "rto": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/dr/plans</span></code></pre>
+<h2 class="ep-h" id="delete-api-protect-dr-plans-id"><span class="method-chip m-delete">DELETE</span><code>/api/protect/dr/plans/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/plans/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-plans-id"><span class="method-chip m-get">GET</span><code>/api/protect/dr/plans/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/plans/{id}</code></pre>
+<h2 class="ep-h" id="put-api-protect-dr-plans-id"><span class="method-chip m-put">PUT</span><code>/api/protect/dr/plans/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DrPlanUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>targetSite</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>systems</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr><tr><td><code>rpo</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>rto</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "targetSite": "&lt;string&gt;", "systems": [], "rpo": 0, "rto": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/dr/plans/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-dr-plans-id-rpo-rto"><span class="method-chip m-post">POST</span><code>/api/protect/dr/plans/{id}/rpo-rto</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DrRpoRtoRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>rpo</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>rto</code></td><td><code>u32</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"rpo": 0, "rto": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/dr/plans/{id}/rpo-rto</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-readiness"><span class="method-chip m-get">GET</span><code>/api/protect/dr/readiness</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/readiness</code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-scenarios"><span class="method-chip m-get">GET</span><code>/api/protect/dr/scenarios</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/scenarios</code></pre>
+<h2 class="ep-h" id="post-api-protect-dr-tests-complete"><span class="method-chip m-post">POST</span><code>/api/protect/dr/tests/complete</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DrTestCompleteRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>testId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>result</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>systemsFailed</code></td><td><code>Vec&lt;String&gt;</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"testId": "&lt;string&gt;", "result": "&lt;string&gt;", "systemsFailed": []}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/dr/tests/complete</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-dr-tests-results-id"><span class="method-chip m-get">GET</span><code>/api/protect/dr/tests/results/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/dr/tests/results/{id}</code></pre>
+<h2 class="ep-h" id="post-api-protect-dr-tests-start"><span class="method-chip m-post">POST</span><code>/api/protect/dr/tests/start</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>DrTestStartRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>planId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>scenarioType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>tester</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"planId": "&lt;string&gt;", "scenarioType": "&lt;string&gt;", "tester": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/dr/tests/start</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-immutability-air-gap-compliance-contract"><span class="method-chip m-get">GET</span><code>/api/protect/immutability-air-gap-compliance-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability-air-gap-compliance-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-immutability-contract"><span class="method-chip m-get">GET</span><code>/api/protect/immutability-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability-contract</code></pre>
+<h2 class="ep-h" id="post-api-protect-immutability-air-gap-id"><span class="method-chip m-post">POST</span><code>/api/protect/immutability/air-gap/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/air-gap/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>immutability_air_gap</code>.</p>
+<h2 class="ep-h" id="post-api-protect-immutability-check-id"><span class="method-chip m-post">POST</span><code>/api/protect/immutability/check/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/check/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>immutability_check</code>.</p>
+<h2 class="ep-h" id="get-api-protect-immutability-compliance"><span class="method-chip m-get">GET</span><code>/api/protect/immutability/compliance</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/compliance</code></pre>
+<h2 class="ep-h" id="get-api-protect-immutability-noncompliant"><span class="method-chip m-get">GET</span><code>/api/protect/immutability/noncompliant</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/noncompliant</code></pre>
+<h2 class="ep-h" id="get-api-protect-immutability-remediation-id"><span class="method-chip m-get">GET</span><code>/api/protect/immutability/remediation/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/remediation/{id}</code></pre>
+<h2 class="ep-h" id="post-api-protect-immutability-retention-lock-id"><span class="method-chip m-post">POST</span><code>/api/protect/immutability/retention-lock/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/retention-lock/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>immutability_retention_lock</code>.</p>
+<h2 class="ep-h" id="get-api-protect-immutability-retention-risk"><span class="method-chip m-get">GET</span><code>/api/protect/immutability/retention-risk</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/retention-risk</code></pre>
+<h2 class="ep-h" id="post-api-protect-immutability-verify-all"><span class="method-chip m-post">POST</span><code>/api/protect/immutability/verify-all</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/immutability/verify-all</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>immutability_verify_all</code>.</p>
+<h2 class="ep-h" id="get-api-protect-legal-hold-contract"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-legal-hold-retention-contract"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold-retention-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold-retention-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-legal-hold-active"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold/active</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/active</code></pre>
+<h2 class="ep-h" id="get-api-protect-legal-hold-compliance-server"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold/compliance/{server}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/compliance/{server}</code></pre>
+<h2 class="ep-h" id="get-api-protect-legal-hold-evidence-id"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold/evidence/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/evidence/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-legal-hold-expiring"><span class="method-chip m-get">GET</span><code>/api/protect/legal-hold/expiring</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/expiring</code></pre>
+<h2 class="ep-h" id="post-api-protect-legal-hold-extend-id"><span class="method-chip m-post">POST</span><code>/api/protect/legal-hold/extend/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LegalHoldExtendRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>newExpiry</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"newExpiry": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/legal-hold/extend/{id}</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-legal-hold-place"><span class="method-chip m-post">POST</span><code>/api/protect/legal-hold/place</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>LegalHoldPlaceRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>target</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>holdType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"target": "&lt;string&gt;", "holdType": "&lt;string&gt;", "reason": "&lt;string&gt;", "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/legal-hold/place</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-legal-hold-release-id"><span class="method-chip m-post">POST</span><code>/api/protect/legal-hold/release/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/release/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>legal_hold_release</code>.</p>
+<h2 class="ep-h" id="post-api-protect-legal-hold-validate-id"><span class="method-chip m-post">POST</span><code>/api/protect/legal-hold/validate/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/legal-hold/validate/{id}</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>legal_hold_validate</code>.</p>
+<h2 class="ep-h" id="get-api-protect-repository-capacity"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-contract"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-at-risk"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/at-risk</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/at-risk</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-forecast-id"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/forecast/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>days</code></td><td><code>u32</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/forecast/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-recommendations-id"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/recommendations/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/recommendations/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-report"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/report</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/report</code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-trend-id"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/trend/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>months</code></td><td><code>u32</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/trend/{id}</code></pre>
+<h2 class="ep-h" id="post-api-protect-repository-capacity-update-id"><span class="method-chip m-post">POST</span><code>/api/protect/repository-capacity/update/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>RepoCapacityUpdateBody</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>used_capacity_tb</code></td><td><code>f64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"used_capacity_tb": 0.0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/repository-capacity/update/{id}</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-repository-capacity-id"><span class="method-chip m-get">GET</span><code>/api/protect/repository-capacity/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/repository-capacity/{id} — one repository's current capacity.</p>
+<p>GET /api/protect/repository-capacity/{id} — one repository's current capacity. Mirrors the by-id READ pattern of <code>repo_capacity_forecast</code>: load → 404 if absent → <code>site_scope_guard_or_404</code> (an out-of-scope repo 404s like a missing one, no existence oracle). The projection matches <code>repo_capacity_update</code>'s single-repo view. No-DB resolves to None ⇒ 404 (read consistency, not the update's 503).</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/repository-capacity/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-restore-testing-contract"><span class="method-chip m-get">GET</span><code>/api/protect/restore-testing-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/restore-testing-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets"><span class="method-chip m-get">GET</span><code>/api/protect/secrets</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>secretType</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets</code></pre>
+<h2 class="ep-h" id="post-api-protect-secrets"><span class="method-chip m-post">POST</span><code>/api/protect/secrets</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SecretsRegisterRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>secretType</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>vaultPath</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>intervalDays</code></td><td><code>u64</code></td><td>required</td><td></td></tr><tr><td><code>owner</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "secretType": "&lt;string&gt;", "vaultPath": "&lt;string&gt;", "intervalDays": 0, "owner": "&lt;string&gt;", "site": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/secrets</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets-contract"><span class="method-chip m-get">GET</span><code>/api/protect/secrets-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets-contract</code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets-due"><span class="method-chip m-get">GET</span><code>/api/protect/secrets/due</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/due</code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets-expiring"><span class="method-chip m-get">GET</span><code>/api/protect/secrets/expiring</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>days</code></td><td><code>u64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/expiring</code></pre>
+<h2 class="ep-h" id="post-api-protect-secrets-fail"><span class="method-chip m-post">POST</span><code>/api/protect/secrets/fail</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SecretsFailRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>rotationId</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>error</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"rotationId": "&lt;string&gt;", "error": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/secrets/fail</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-secrets-rotate-all"><span class="method-chip m-post">POST</span><code>/api/protect/secrets/rotate-all</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/rotate-all</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>secrets_rotate_all</code>.</p>
+<h2 class="ep-h" id="get-api-protect-secrets-summary"><span class="method-chip m-get">GET</span><code>/api/protect/secrets/summary</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/summary</code></pre>
+<h2 class="ep-h" id="delete-api-protect-secrets-id"><span class="method-chip m-delete">DELETE</span><code>/api/protect/secrets/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">DELETE /api/protect/secrets/{id} — soft-RETIRE (deregister) a managed secret (#49 deregister half).</p>
+<p>DELETE /api/protect/secrets/{id} — soft-RETIRE (deregister) a managed secret (#49 deregister half). Sets status=retired so it STOPS rotating (excluded from due/expiring/rotate-all and a direct rotate is refused), while PRESERVING the row and its rotation_runs history — this is NOT a hard delete. Idempotent: re-retiring an already-retired secret is a no-op success. 404 if missing; 503 with no DB.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/{id}</code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets-id"><span class="method-chip m-get">GET</span><code>/api/protect/secrets/{id}</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/{id}</code></pre>
+<h2 class="ep-h" id="put-api-protect-secrets-id"><span class="method-chip m-put">PUT</span><code>/api/protect/secrets/{id}</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-summary">PUT /api/protect/secrets/{id} — update a tracked secret's metadata (name / owner / site / rotation cadence) in place, instead of DB surgery.</p>
+<p>PUT /api/protect/secrets/{id} — update a tracked secret's metadata (name / owner / site / rotation cadence) in place, instead of DB surgery. Never accepts or returns a credential value. Changing the interval reschedules next_rotation_due from the existing last_rotated. 404 on a missing secret.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SecretsUpdateRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>owner</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>intervalDays</code></td><td><code>u64</code></td><td>optional</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "owner": "&lt;string&gt;", "site": "&lt;string&gt;", "intervalDays": 0}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/secrets/{id}</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-secrets-id-history"><span class="method-chip m-get">GET</span><code>/api/protect/secrets/{id}/history</code></h2>
+<p class="badges"><span class="badge">admin tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/{id}/history</code></pre>
+<h2 class="ep-h" id="post-api-protect-secrets-id-rotate"><span class="method-chip m-post">POST</span><code>/api/protect/secrets/{id}/rotate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/secrets/{id}/rotate</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>secrets_rotate</code>.</p>
+<h2 class="ep-h" id="get-api-protect-snapshot-governance-contract"><span class="method-chip m-get">GET</span><code>/api/protect/snapshot-governance-contract</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/snapshot-governance-contract</code></pre>
+<h2 class="ep-h" id="post-api-protect-snapshot-flag-stale"><span class="method-chip m-post">POST</span><code>/api/protect/snapshot/flag-stale</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/snapshot/flag-stale</code></pre>
+<p class="ep-missing">Request body not extracted — see handler <code>snapshot_flag_stale</code>.</p>
+<h2 class="ep-h" id="post-api-protect-snapshot-plan"><span class="method-chip m-post">POST</span><code>/api/protect/snapshot/plan</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SnapshotPlanRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>platformCiKey</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>snapshotPurpose</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>requestedExpiry</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>owner</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>supportGroup</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>changeContext</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"platformCiKey": "&lt;string&gt;", "snapshotPurpose": "&lt;string&gt;", "requestedExpiry": "&lt;string&gt;", "owner": "&lt;string&gt;", "supportGroup": "&lt;string&gt;", "changeContext": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/snapshot/plan</span></code></pre>
+<h2 class="ep-h" id="get-api-protect-snapshot-records"><span class="method-chip m-get">GET</span><code>/api/protect/snapshot/records</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/snapshot/records — list all persisted snapshots.</p>
+<p>GET /api/protect/snapshot/records — list all persisted snapshots. Returns an empty array when no DB is available rather than an error.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
+<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/snapshot/records</code></pre>
+<h2 class="ep-h" id="get-api-protect-snapshot-records-id"><span class="method-chip m-get">GET</span><code>/api/protect/snapshot/records/{id}</code></h2>
+<p class="badges"><span class="badge">read tier</span></p>
+<p class="ep-summary">GET /api/protect/snapshot/records/{id} — fetch a single snapshot by id.</p>
+<p>GET /api/protect/snapshot/records/{id} — fetch a single snapshot by id. Returns 404 when absent or when no DB is configured.</p>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/protect/snapshot/records/{id}</code></pre>
+<h2 class="ep-h" id="post-api-protect-snapshot-remediate"><span class="method-chip m-post">POST</span><code>/api/protect/snapshot/remediate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SnapshotActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>snapshotId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"snapshotId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/snapshot/remediate</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-snapshot-review"><span class="method-chip m-post">POST</span><code>/api/protect/snapshot/review</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SnapshotActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>snapshotId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"snapshotId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/snapshot/review</span></code></pre>
+<h2 class="ep-h" id="post-api-protect-snapshot-validate"><span class="method-chip m-post">POST</span><code>/api/protect/snapshot/validate</code></h2>
+<p class="badges"><span class="badge">execute tier</span></p>
+<p class="ep-missing">No description extracted yet.</p>
+<h3 class="ep-sub">Request body</h3>
+<p class="ep-struct">Structure: <code>SnapshotActionRequest</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>snapshotId</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
+<h3 class="ep-sub">Example request</h3>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"snapshotId": "&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">https://&lt;your-host&gt;/api/protect/snapshot/validate</span></code></pre>
+<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-platform.html">&larr; Platform</a><a href="/api-requests.html">Requests &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>
