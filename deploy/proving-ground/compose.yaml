@@ -1,0 +1,117 @@
+# Live-execution proving ground — the control-plane stack for testing real
+# provider execution (vCenter etc.) per docs/agents-and-live-execution.md
+# ("Running a live apply against real infrastructure").
+#
+# Deliberately a SEPARATE compose project from deploy/compose (its own
+# volumes, network, and ports), so the regular dev stack and its data stay
+# untouched and both can coexist.
+#
+#   cp env.example .env            # fill in credentials first
+#   docker compose create          # create everything powered down
+#   docker compose up -d           # start when ready to test
+#
+# The execution agent deliberately runs OUTSIDE compose, on the host, via
+# ./run-agent.sh: agents belong next to the infrastructure they execute
+# against, and the agent's fail-closed transport gate refuses cleartext
+# non-loopback control-plane URLs in live mode — from the host, the
+# published port is loopback and passes.
+
+name: ryuki-proving-ground
+
+services:
+  platform-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ryuki
+      POSTGRES_PASSWORD: ${PG_DB_PASSWORD:?set in .env}
+      POSTGRES_DB: ryuki_platform
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ryuki"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - pg-net
+
+  vault:
+    image: hashicorp/vault
+    # Dev mode: in-memory, auto-unsealed, root token from .env. Good enough
+    # for proving-ground credential resolution (CredentialSource::Vault on
+    # integration connections); NOT durable — re-seed secrets after restart.
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${PG_VAULT_TOKEN:?set in .env}
+    ports:
+      - "18200:8200"
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - pg-net
+
+  platform-api:
+    # Same image the regular dev stack builds (deploy/compose). Build once:
+    #   docker compose -f ../compose/compose.yaml build platform-api
+    image: ryuki/platform-api:rust-dev
+    environment:
+      RYUKI_DATABASE_URL: postgres://ryuki:${PG_DB_PASSWORD}@platform-db:5432/ryuki_platform
+      RYUKI_DATABASE__REQUIRED: "true"
+      RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8080
+      RYUKI_PLATFORM_URL: http://localhost:18081
+      # Real authentication for a real test: local accounts from .env.
+      RYUKI_AUTH_MODE: local
+      RYUKI_LOCAL_AUTH__USERS: ${PG_LOCAL_USERS:?set in .env}
+      # Control-plane Vault resolver (VaultKv2Resolver); unset would fall
+      # back to the mock resolver.
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${PG_VAULT_TOKEN}
+      # Persist the CP grant-signing key across container recreation —
+      # agents pin this key's public half at enrolment.
+      RYUKI_CP_SIGNING_KEY_PATH: /app/keys/cp-signing.key
+    ports:
+      - "18081:8080"
+    volumes:
+      - pg-cp-keys:/app/keys
+    depends_on:
+      platform-db:
+        condition: service_healthy
+      vault:
+        condition: service_started
+    networks:
+      - pg-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  portal-ui:
+    image: ryuki/portal-ui:rust-dev
+    environment:
+      RYUKI_API_URL: http://platform-api:8080
+      RYUKI_PORTAL_EXECUTION_MODE: live-provider
+    ports:
+      - "18001:8080"
+    depends_on:
+      platform-api:
+        condition: service_healthy
+    networks:
+      - pg-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pg-pgdata:
+  pg-cp-keys:
+
+networks:
+  pg-net:
+    driver: bridge

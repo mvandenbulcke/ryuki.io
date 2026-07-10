@@ -43,3 +43,6 @@ __pycache__/
 
 # Local agent settings
 .claude/settings.local.json
+
+# Proving-ground local state (agent key/token, terraform state, filled env)
+deploy/proving-ground/agent-state/
