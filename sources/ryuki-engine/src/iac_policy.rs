@@ -17,9 +17,10 @@
 //! ## Scope & known fail-closed cases
 //!
 //! The gate runs only over the curated IaC bundles embedded in `ryuki-runner`
-//! (the `OFFERINGS` registry), whose files are all `.tf` (HCL) or `.yml`/`.yaml`
-//! (Ansible) — a conformance test asserts every bundled offering passes. Any
-//! other file extension (notably Terraform's first-class JSON variant
+//! (the `OFFERINGS` registry), whose files are `.tf` (HCL), the exact generated
+//! `.terraform.lock.hcl` filename, or `.yml`/`.yaml` (Ansible) — a conformance
+//! test asserts every bundled offering passes. Any other file extension
+//! (notably Terraform's first-class JSON variant
 //! `*.tf.json`, or a `*.tfvars`) is treated as `Unscannable` and REFUSED — this
 //! HCL/YAML scanner does not parse JSON-form config, so it fails closed rather
 //! than wave it through. If a `.tf.json` offering is ever bundled it must get a
@@ -96,7 +97,7 @@ pub fn evaluate_iac_bundle<'a>(
     let mut violations = Vec::new();
     for (name, content) in files {
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".tf") {
+        if lower.ends_with(".tf") || lower == ".terraform.lock.hcl" {
             violations.extend(scan_terraform(name, content));
         } else if lower.ends_with(".yml") || lower.ends_with(".yaml") {
             violations.extend(scan_ansible(name, content));
@@ -833,5 +834,20 @@ resource "docker_container" "web" {
             "terraform {\n  required_version = \">= 1.5\"\n}\nresource \"null_resource\" \"ok\" {}\n",
         )]);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn generated_terraform_dependency_lock_is_scanned_as_hcl() {
+        let v = evaluate_iac_bundle([(
+            ".terraform.lock.hcl",
+            "provider \"registry.terraform.io/vmware/vsphere\" {\n  version = \"2.16.1\"\n}\n",
+        )]);
+        assert!(v.is_empty());
+
+        let unknown = evaluate_iac_bundle([(
+            "dependencies.lock.hcl",
+            "provider \"registry.terraform.io/vmware/vsphere\" {}\n",
+        )]);
+        assert_eq!(rules(&unknown), vec![&IacPolicyRule::Unscannable]);
     }
 }

@@ -202,8 +202,8 @@ pub fn resolve_token(cfg: &AgentConfig) -> Result<ResolvedToken, TokenError> {
     //    would silently route an inaccessible token file into re-registration.
     match load_token_file(&cfg.token_path) {
         Ok(token) => return Ok(ResolvedToken::FromFile(token)),
-        Err(TokenError::Io { ref source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(TokenError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+        }
         Err(other) => return Err(other),
     }
 
@@ -395,8 +395,7 @@ mod tests {
     #[test]
     fn resolve_env_token_wins_over_existing_file() {
         let dir = TempDir::new().expect("tempdir");
-        let (cfg, token_path) =
-            cfg_with_token_path(&dir, &[("RYUKI_AGENT_TOKEN", "rya_from_env")]);
+        let (cfg, token_path) = cfg_with_token_path(&dir, &[("RYUKI_AGENT_TOKEN", "rya_from_env")]);
         save_token_file(&token_path, "rya_from_file").expect("save");
 
         let resolved = resolve_token(&cfg).expect("resolve");
@@ -436,20 +435,25 @@ mod tests {
         let err = resolve_token(&cfg).expect_err("must fail with no token source");
         let msg = err.to_string();
         // The error must name every remedy.
-        assert!(msg.contains("RYUKI_AGENT_TOKEN"), "must name the env var: {msg}");
+        assert!(
+            msg.contains("RYUKI_AGENT_TOKEN"),
+            "must name the env var: {msg}"
+        );
         assert!(
             msg.contains("RYUKI_AGENT_SELF_REGISTER"),
             "must name the self-register opt-in: {msg}"
         );
-        assert!(msg.contains("agent.token"), "must name the file path: {msg}");
+        assert!(
+            msg.contains("agent.token"),
+            "must name the file path: {msg}"
+        );
     }
 
     #[test]
     fn resolve_malformed_file_is_fatal_not_a_fallthrough_to_registration() {
         // A malformed EXISTING file must never silently re-register.
         let dir = TempDir::new().expect("tempdir");
-        let (cfg, token_path) =
-            cfg_with_token_path(&dir, &[("RYUKI_AGENT_SELF_REGISTER", "true")]);
+        let (cfg, token_path) = cfg_with_token_path(&dir, &[("RYUKI_AGENT_SELF_REGISTER", "true")]);
         std::fs::write(&token_path, "garbage").expect("write");
 
         let result = resolve_token(&cfg);
@@ -472,8 +476,7 @@ mod tests {
 
     #[test]
     fn register_response_valid_passes() {
-        validate_register_response(&resp("defra", TOK), "defra")
-            .expect("valid response must pass");
+        validate_register_response(&resp("defra", TOK), "defra").expect("valid response must pass");
     }
 
     #[test]

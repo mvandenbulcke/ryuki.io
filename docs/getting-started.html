@@ -43,7 +43,17 @@
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link active" aria-current="page" data-sections="prerequisites
 quick start
 authentication modes
-project structure" href="/getting-started.html">Getting Started</a><ul class="sb-sections"><li><a href="#prerequisites">Prerequisites</a></li><li><a href="#quick-start">Quick Start</a></li><li><a href="#authentication-modes">Authentication Modes</a></li><li><a href="#project-structure">Project Structure</a></li></ul></li><li><a class="sb-link" data-sections="stack
+project structure" href="/getting-started.html">Getting Started</a><ul class="sb-sections"><li><a href="#prerequisites">Prerequisites</a></li><li><a href="#quick-start">Quick Start</a></li><li><a href="#authentication-modes">Authentication Modes</a></li><li><a href="#project-structure">Project Structure</a></li></ul></li><li><a class="sb-link" data-sections="authority and scope
+required roles and target
+tool and provider prerequisites
+request contract
+gate 1: repository checks
+gate 2: proving-ground readiness
+gate 3: offline rehearsal
+gate 4: live plan and state isolation
+gate 5: live apply and verification
+gate 6: mandatory cleanup
+result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
 network policy
@@ -60,9 +70,10 @@ how it works
 permissions by role
 environment configuration
 important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
-site selection flow
+custom codes
+site selection
 managing sites
-current active sites
+seeded active sites
 important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
 scopes
 enforcement semantics
@@ -97,9 +108,13 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="prerequisites">Prerequisites</h2>
 <ul>
 <li>Rust 1.85+ (edition 2024)</li>
+<li><code>cargo-leptos</code> and the <code>wasm32-unknown-unknown</code> Rust target</li>
 <li>Docker and Docker Compose</li>
 <li>PostgreSQL 18+</li>
 </ul>
+<p>Install the portal build tooling once:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">rustup</span> target add wasm32-unknown-unknown
+<span class="hl-cmd">cargo</span> install cargo-leptos <span class="hl-f">--locked</span></code></pre>
 <h2 id="quick-start">Quick Start</h2>
 <h3 id="1-clone-and-set-up">1. Clone and set up</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">git</span> clone https://github.com/mvandenbulcke/ryuki.io.git ryuki-platform
@@ -110,14 +125,24 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <pre><code class="lang-bash"><span class="hl-cmd">docker</span> compose <span class="hl-f">-f</span> deploy/compose/compose.yaml up <span class="hl-f">-d</span> platform-db</code></pre>
 <h3 id="3-build-the-workspace">3. Build the workspace</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> build <span class="hl-f">--workspace</span></code></pre>
-<h3 id="4-run-the-api-server">4. Run the API server</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">-p</span> ryuki-api</code></pre>
-<p>The API listens on <code>http://localhost:8080</code> by default. The compose API service publishes container port <code>8080</code> as host port <code>18080</code>.</p>
-<h3 id="5-run-tests">5. Run tests</h3>
+<h3 id="4-run-the-api-server-on-port-8081">4. Run the API server on port 8081</h3>
+<p>The Rust config loader does not read <code>.env</code> itself. Export <code>RYUKI_DATABASE_URL</code> in this shell without committing its value, then pass the bind address explicitly so the portal can use its default port <code>8080</code>. Pass additional authentication settings explicitly or through a supported Ryuki config file rather than sourcing <code>.env</code> as shell code:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">RYUKI_SERVER__BIND_ADDRESS=127.0.0.1:8081</span> \
+  <span class="hl-cmd">cargo</span> run <span class="hl-f">-p</span> ryuki-api</code></pre>
+<p>Wait for <code>curl --fail http://127.0.0.1:8081/ready</code> to succeed.</p>
+<h3 id="5-run-the-portal-on-port-8080">5. Run the portal on port 8080</h3>
+<p>In a second terminal:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">RYUKI_API_URL=http://127.0.0.1:8081</span> \
+<span class="hl-cmd">RYUKI_PORTAL_EXECUTION_MODE=live-provider</span> \
+<span class="hl-cmd">cargo</span> leptos serve <span class="hl-f">--manifest-path</span> portal/portal-ui/Cargo.toml</code></pre>
+<p>Open <code>http://127.0.0.1:8080</code>. Without <code>live-provider</code>, the portal deliberately uses its labeled static dry-run data instead of forwarding to the API.</p>
+<p>The Compose stack uses different host ports: API <code>18080</code>, portal <code>18000</code>.</p>
+<h3 id="6-run-tests">6. Run tests</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span></code></pre>
-<h3 id="6-run-validators">6. Run validators</h3>
+<h3 id="7-run-validators">7. Run validators</h3>
 <p>Run from the repository root (the validator defaults <code>--root</code> to the current directory; pass <code>--root &lt;path&gt;</code> to validate another checkout):</p>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">--manifest-path</span> scripts/validator-rs/Cargo.toml <span class="hl-f">--</span> run-all</code></pre>
+<p>For the complete pre-test gate, also run the format, Clippy, secret-scan, and diff checks in <a href="first-test.html">First Test Acceptance</a>.</p>
 <h2 id="authentication-modes">Authentication Modes</h2>
 <p>Default is <strong>mock-dry-run</strong> — no real Entra ID, all operations are simulated.</p>
 <p>To enable live Entra ID authentication:</p>
@@ -139,7 +164,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 │   └── validator-rs/   # Rust validators
 ├── tests/              # Integration tests
 └── docs/               # Documentation</code></pre>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/getting-started.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><span></span><a href="/architecture.html">Architecture &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/getting-started.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><span></span><a href="/first-test.html">First Test Acceptance &rarr;</a></nav>
 </main>
 </div>
 <script>

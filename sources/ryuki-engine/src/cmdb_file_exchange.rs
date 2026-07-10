@@ -4,7 +4,7 @@
 //! proposed normalized CMDB import row it validates the row against the contract's
 //! rejection reasons and decides `accepted` (importable in the dry-run preview) or
 //! `rejected` (with the specific reasons). Site validation is DATA-BACKED — the
-//! site code is checked against the [`site_registry`] UN/LOCODE set.
+//! site code is checked against the governed [`site_registry`].
 //!
 //! PURE / dry-run: no live ServiceNow API call, file-based only. The output is the
 //! decision + rejection reasons (redacted), never raw CMDB rows or provider
@@ -59,8 +59,8 @@ fn present(field: &Option<String>) -> bool {
     field.as_deref().is_some_and(|s| !s.trim().is_empty())
 }
 
-/// The site code is a RECOGNISED UN/LOCODE (trimmed + upper-cased, since the
-/// registry stores uppercase codes). Membership only — a CMDB record can
+/// The site code is RECOGNISED by the registry (trimmed + upper-cased, since
+/// canonical UN/LOCODE and custom codes are uppercase). Membership only — a CMDB record can
 /// legitimately reference a recognised but currently-INACTIVE site, so this uses
 /// `is_known_site` rather than the active-only `is_valid_site`.
 fn site_known(input: &CmdbRowInput) -> bool {
@@ -137,7 +137,7 @@ mod tests {
             environment: Some("prod".into()),
             business_owner: Some("team-platform".into()),
             support_group: Some("platform-ops".into()),
-            // DEFRA is a recognised UN/LOCODE site.
+            // DEFRA is a recognised registry site (and a UN/LOCODE).
             site_code: Some("DEFRA".into()),
             evidence_reference: Some("ev-1".into()),
         }

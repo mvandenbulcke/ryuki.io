@@ -11,8 +11,18 @@ Full-stack Rust/Leptos operational portal with SSR and hydration.
 ## Development
 
 ```bash
-cargo leptos serve
+rustup target add wasm32-unknown-unknown
+cargo install cargo-leptos --locked
+
+RYUKI_PORTAL_EXECUTION_MODE=live-provider \
+cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
+
+The portal listens on loopback port `8080` and forwards same-origin server
+functions to the API on port `8081` by default. Override `RYUKI_API_URL` when
+the upstream is elsewhere. Run the local API with
+`RYUKI_SERVER__BIND_ADDRESS=127.0.0.1:8081`. Omitting `live-provider` keeps the
+portal in its labeled static dry-run mode.
 
 ## Build
 

@@ -1,7 +1,7 @@
 //! Terraform runner — dry-run (plan) only (Slice 1).
 //!
-//! Executes `terraform init -input=false` then `terraform plan -input=false
-//! -no-color` in an isolated workspace.
+//! Executes `terraform init -input=false -lockfile=readonly` then `terraform
+//! plan -input=false -no-color` in an isolated workspace.
 //!
 //! # Security invariants
 //! - All child `Command`s call `.env_clear()` and then re-inject only a minimal
@@ -33,6 +33,10 @@ const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default binary name; overridable for tests via `TerraformRunner::with_binary`.
 const DEFAULT_BINARY: &str = "terraform";
+
+/// Dependency selection is part of the embedded IaC contract. Every runner
+/// path uses this exact init argv so Terraform cannot silently rewrite it.
+pub(crate) const TERRAFORM_INIT_ARGS: &[&str] = &["init", "-input=false", "-lockfile=readonly"];
 
 /// Environment variables inherited from the parent process into child commands.
 /// All other parent env vars are stripped via `env_clear()`.
@@ -301,7 +305,7 @@ impl Runner for TerraformRunner {
         // go into the per-run workspace and are cleaned up on drop.
         pin_home_tmpdir_to_workspace(&mut init_cmd, ws.path());
         init_cmd
-            .args(["init", "-input=false"])
+            .args(TERRAFORM_INIT_ARGS)
             .current_dir(ws.path())
             // Disable Terraform telemetry/checkpoint entirely.
             .env("CHECKPOINT_DISABLE", "1")
@@ -572,6 +576,14 @@ mod tests {
         "/bin/echo".to_string()
     }
 
+    #[test]
+    fn terraform_init_requires_the_embedded_dependency_lock() {
+        assert_eq!(
+            TERRAFORM_INIT_ARGS,
+            ["init", "-input=false", "-lockfile=readonly"]
+        );
+    }
+
     fn make_plan_dryrun() -> RunPlan {
         RunPlan {
             runner_kind: RunnerKind::Terraform,
@@ -714,7 +726,10 @@ mod tests {
         let runner = TerraformRunner::with_binary(shim.to_string_lossy().to_string());
         // The agent's dry-run contract: NO secret var names, EMPTY material.
         let plan = make_plan_dryrun();
-        assert!(plan.secret_var_names.is_empty(), "dry-run declares no secrets");
+        assert!(
+            plan.secret_var_names.is_empty(),
+            "dry-run declares no secrets"
+        );
         let creds = fake_creds("");
 
         let outcome = runner.run_dry(&plan, &creds).expect("dry run must succeed");
@@ -761,7 +776,7 @@ mod tests {
     #[test]
     fn run_dry_with_echo_shim_captures_outcome() {
         // /bin/echo will: print its args and exit 0.
-        // For "init" step: `echo init -input=false` → exits 0.
+        // For "init" step: `echo init -input=false -lockfile=readonly` → exits 0.
         // For "plan" step: `echo plan -input=false -no-color` → exits 0.
         // This proves: the runner invokes the binary, captures stdout, builds RunOutcome.
         let runner = TerraformRunner::with_binary(fake_shim_path());
@@ -776,6 +791,36 @@ mod tests {
         assert_eq!(outcome.mode, RunMode::DryRun);
         // The log should contain something from the echo output.
         assert!(!outcome.log.is_empty() || outcome.summary.contains("completed"));
+    }
+
+    #[test]
+    fn run_dry_invokes_init_with_readonly_dependency_lock() {
+        let probe = Workspace::new().expect("test probe workspace");
+        let probe_dir = probe.path().to_string_lossy();
+        let shim_path = probe.path().join("fake-terraform-init-args");
+        std::fs::write(
+            &shim_path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{probe_dir}/args-$1\"\nexit 0\n"),
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let runner = TerraformRunner::with_binary(shim_path.to_string_lossy());
+        let outcome = runner
+            .run_dry(&make_plan_dryrun(), &fake_creds(""))
+            .expect("dry run must execute the shim");
+        assert_eq!(outcome.status, RunStatus::Planned);
+        let args = std::fs::read_to_string(probe.path().join("args-init"))
+            .expect("init argv must be captured");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["init", "-input=false", "-lockfile=readonly"]
+        );
     }
 
     // --- SECRET SCRUB: secret value must not appear in outcome ---

@@ -1,3 +1,4 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -70,8 +71,6 @@ pub struct ComplianceResult {
     pub active_holds: Vec<LegalHold>,
     pub message: String,
 }
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 fn seed_holds() -> Vec<LegalHold> {
     let now = chrono::Utc::now();
@@ -176,7 +175,7 @@ pub fn place_hold(
     if by.is_empty() {
         return Err("initiated_by cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 

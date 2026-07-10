@@ -37,12 +37,10 @@ pattern_names=(
 )
 
 # Inline allowlist marker. A line carrying this marker is exempt from the
-# heuristic "secret assignment" check ONLY. Use it to annotate VERIFIED false
-# positives — e.g. an HCL `password = var.x` provider argument that references a
-# variable, not a literal credential. The marker is visible on the line and
-# reviewable in every diff, so suppression is explicit and auditable rather than
-# hidden. High-confidence formats (AWS keys, private keys, provider/API tokens)
-# are NEVER suppressible — the allowlist cannot become a real bypass.
+# heuristic "secret assignment" check ONLY. Use it for a reviewed provider
+# argument that references a variable rather than a literal credential. The
+# marker stays visible in every diff, so suppression is explicit and auditable.
+# High-confidence formats are never suppressible.
 allow_marker='secret-scan-allow'
 
 found_any=false
@@ -51,12 +49,12 @@ for i in "${!patterns[@]}"; do
   pattern="${patterns[$i]}"
   category="${pattern_names[$i]}"
 
-  # The heuristic "secret assignment" category supports the inline allowlist:
-  # scan line-by-line, then drop lines explicitly marked as verified false
-  # positives before deciding whether to fail.
+  # The heuristic category supports inline suppressions. Candidate content is
+  # filtered in memory; diagnostics name only the category and file so a secret
+  # can never be copied into local or CI logs.
   if [ "$category" = "secret assignment" ]; then
     set +e
-    raw=$(rg --hidden --glob '!.git/**' --line-number --no-heading -- "$pattern" "${paths[@]}" 2>/dev/null)
+    candidate_files=$(rg --hidden --glob '!.git/**' --files-with-matches -- "$pattern" "${paths[@]}" 2>/dev/null)
     status=$?
     set -e
 
@@ -65,14 +63,16 @@ for i in "${!patterns[@]}"; do
       exit "$status"
     fi
 
-    if [ "$status" -eq 0 ] && [ -n "$raw" ]; then
-      flagged=$(printf '%s\n' "$raw" | rg --invert-match -- "$allow_marker" || true)
-      if [ -n "$flagged" ]; then
-        found_any=true
-        while IFS= read -r line; do
-          [ -n "$line" ] && printf 'category=%s match=%s\n' "$category" "$line" >&2
-        done <<< "$flagged"
-      fi
+    if [ "$status" -eq 0 ] && [ -n "$candidate_files" ]; then
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        raw=$(rg --no-heading -- "$pattern" "$file" 2>/dev/null || true)
+        flagged=$(printf '%s\n' "$raw" | rg --invert-match -- "$allow_marker" || true)
+        if [ -n "$flagged" ]; then
+          found_any=true
+          printf 'category=%s path=%s\n' "$category" "$file" >&2
+        fi
+      done <<< "$candidate_files"
     fi
 
     continue

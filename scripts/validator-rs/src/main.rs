@@ -14,7 +14,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::ExitCode;
 use std::time::Instant;
 
 mod access_review_recertification;
@@ -440,20 +440,24 @@ enum CoverageKind {
     InformationArchitecture,
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
-        process::exit(2);
+fn main() -> ExitCode {
+    match run() {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<ExitCode, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some(command) = args.first().map(String::as_str) else {
         return Err(usage());
     };
 
-    match command {
+    let mut exit_code = ExitCode::SUCCESS;
+    let result: Result<(), String> = match command {
         "coverage" => {
             require_slice(&args)?;
             print_json(&coverage_output())
@@ -2318,6 +2322,9 @@ fn run() -> Result<(), String> {
         "run-all" => {
             let (root, _) = parse_root_args(&args[1..])?;
             let output = run_all_validate(&root, true)?;
+            if output.failed > 0 {
+                exit_code = ExitCode::FAILURE;
+            }
             print_json(&output)
         }
         "generate-endpoints-doc" => {
@@ -2354,6 +2361,9 @@ fn run() -> Result<(), String> {
                 .filter(|line| !line.is_empty())
                 .collect();
             let output = run_batch_validate(&root, &slices)?;
+            if output.failed > 0 {
+                exit_code = ExitCode::FAILURE;
+            }
             print_json(&output)
         }
         "check-config" => {
@@ -2361,7 +2371,9 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         _ => Err(usage()),
-    }
+    };
+    result?;
+    Ok(exit_code)
 }
 
 fn usage() -> String {
@@ -3019,7 +3031,11 @@ fn generate_endpoints_doc(root: &Path) -> Result<(String, usize), String> {
     document.push_str("## Contents\n\n");
     for (name, entries) in &sections {
         let section_routes: usize = entries.iter().map(|(_, methods)| methods.len()).sum();
-        let noun = if section_routes == 1 { "route" } else { "routes" };
+        let noun = if section_routes == 1 {
+            "route"
+        } else {
+            "routes"
+        };
         document.push_str(&format!("- [{name}](#{name}) ({section_routes} {noun})\n"));
     }
     for (name, entries) in &sections {

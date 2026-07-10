@@ -6,7 +6,7 @@
 # volumes, network, and ports), so the regular dev stack and its data stay
 # untouched and both can coexist.
 #
-#   cp env.example .env            # fill in credentials first
+#   install -m 600 env.example .env # fill in credentials when each gate permits
 #   docker compose create          # create everything powered down
 #   docker compose up -d           # start when ready to test
 #
@@ -23,10 +23,10 @@ services:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: ryuki
-      POSTGRES_PASSWORD: ${PG_DB_PASSWORD:?set in .env}
+      POSTGRES_PASSWORD: ${PG_DB_PASSWORD:?set in .env} # secret-scan-allow: reviewed env reference
       POSTGRES_DB: ryuki_platform
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - pg-pgdata:/var/lib/postgresql
     healthcheck:
@@ -46,7 +46,7 @@ services:
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: ${PG_VAULT_TOKEN:?set in .env}
     ports:
-      - "18200:8200"
+      - "127.0.0.1:18200:8200"
     cap_add:
       - IPC_LOCK
     networks:
@@ -64,6 +64,9 @@ services:
       # Real authentication for a real test: local accounts from .env.
       RYUKI_AUTH_MODE: local
       RYUKI_LOCAL_AUTH__USERS: ${PG_LOCAL_USERS:?set in .env}
+      # This stack is loopback-only plain HTTP; Secure cookies would not be
+      # returned by browsers. Never use this setting on a non-loopback stack.
+      RYUKI_SESSION__COOKIE_SECURE: "false"
       # Control-plane Vault resolver (VaultKv2Resolver); unset would fall
       # back to the mock resolver.
       VAULT_ADDR: http://vault:8200
@@ -72,7 +75,7 @@ services:
       # agents pin this key's public half at enrolment.
       RYUKI_CP_SIGNING_KEY_PATH: /app/keys/cp-signing.key
     ports:
-      - "18081:8080"
+      - "127.0.0.1:18081:8080"
     volumes:
       - pg-cp-keys:/app/keys
     depends_on:
@@ -83,7 +86,7 @@ services:
     networks:
       - pg-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -95,7 +98,7 @@ services:
       RYUKI_API_URL: http://platform-api:8080
       RYUKI_PORTAL_EXECUTION_MODE: live-provider
     ports:
-      - "18001:8080"
+      - "127.0.0.1:18001:8080"
     depends_on:
       platform-api:
         condition: service_healthy

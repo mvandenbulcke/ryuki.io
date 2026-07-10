@@ -1,9 +1,7 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn plan_patch_wave_from_servers(servers: &[Server]) -> Result<PatchWave, String> {
     if servers.is_empty() {
@@ -89,7 +87,7 @@ pub fn validate_patch_policy(wave: &PatchWave) -> Result<Vec<String>, String> {
     }
 
     for site in &wave.site_scope {
-        if !VALID_SITES.contains(&site.as_str()) {
+        if !site_registry::is_valid_site(site) {
             results.push(format!("FAIL: Unknown site in scope: {}", site));
         } else {
             results.push(format!("PASS: Site {} is valid", site));
@@ -460,7 +458,7 @@ pub fn plan_patch_wave(
     os_family: &str,
     criticality: &str,
 ) -> Result<PatchWave, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
     if os_family.is_empty() {
@@ -552,7 +550,7 @@ pub fn validate_patch_wave(wave: &PatchWave) -> Result<(PatchWave, ValidationRes
     }
 
     for site in &wave.site_scope {
-        if !VALID_SITES.contains(&site.as_str()) {
+        if !site_registry::is_valid_site(site) {
             errors.push(format!("Unknown site in scope: {}", site));
             failed_rules.push("p0-valid-site-required".into());
             remediation.push(format!("Correct site '{}' to a known site code.", site));

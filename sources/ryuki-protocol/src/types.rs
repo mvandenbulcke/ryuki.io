@@ -100,6 +100,28 @@ pub enum JobResultStatus {
     LiveRefused,
 }
 
+/// Whether an agent-reported terminal status is valid for an execution mode.
+/// `Verified` is deliberately absent: it is a control-plane-derived outcome.
+pub fn job_result_status_allowed(mode: &JobMode, status: &JobResultStatus) -> bool {
+    match mode {
+        JobMode::OfflineDryRun => matches!(
+            status,
+            JobResultStatus::CheckOk | JobResultStatus::Planned | JobResultStatus::Failed
+        ),
+        JobMode::LivePlan => matches!(
+            status,
+            JobResultStatus::CheckOk
+                | JobResultStatus::Planned
+                | JobResultStatus::Failed
+                | JobResultStatus::LiveRefused
+        ),
+        JobMode::LiveApply | JobMode::LiveDestroy => matches!(
+            status,
+            JobResultStatus::Applied | JobResultStatus::Failed | JobResultStatus::LiveRefused
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Agent capabilities
 // ---------------------------------------------------------------------------
@@ -155,6 +177,16 @@ pub struct AgentRegistration {
 // Job specification
 // ---------------------------------------------------------------------------
 
+/// Return whether a control-plane Terraform state key is safe for substitution
+/// into the operator's quoted backend-HCL template.
+pub fn is_safe_state_key(state_key: &str) -> bool {
+    !state_key.is_empty()
+        && state_key.len() <= 128
+        && state_key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 /// References the IaC artefacts by stable identifier + digest, never by
 /// inline content.  Credentials are **never** in the spec — the agent
 /// resolves them from its own environment/secret store.
@@ -171,6 +203,16 @@ pub struct JobSpec {
     /// Variable overrides (non-secret; secrets are env-injected by the agent).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vars: BTreeMap<String, String>,
+    /// Opaque control-plane-owned key that selects this job's Terraform state.
+    ///
+    /// New control planes set this on every dispatched spec. It is optional on
+    /// the wire so agents can still decode jobs persisted by an older control
+    /// plane; live Terraform execution rejects an absent or unsafe key before
+    /// invoking the runner. A single-job request reuses one request key, while
+    /// every orchestration step reuses its own distinct step key for plan,
+    /// apply, and destroy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
     /// Requested execution mode.
     pub mode: JobMode,
 }
@@ -190,8 +232,9 @@ pub struct JobLease {
     /// Monotonically increasing per-job counter.  The CP only accepts results
     /// from the highest-seen `lease_generation`; stale attempts are rejected.
     pub lease_generation: u64,
-    /// Opaque fencing token (e.g. a random UUID string).  Must be echoed back
-    /// in `ack`, `heartbeat`, and `result` calls.
+    /// Opaque fencing token (e.g. a random UUID string). Must be echoed back in
+    /// `ack` and running-heartbeat renewal calls. Results are independently
+    /// fenced by the signed attempt id, lease generation, and CP nonce.
     pub fencing_token: String,
     /// Absolute deadline (CP DB time — no client clock).  After this the CP
     /// transitions the job per §5 (redispatch or ReconcileRequired).
@@ -208,6 +251,48 @@ pub struct JobLease {
     pub cp_nonce: String,
 }
 
+/// Agent heartbeat payload.
+///
+/// Idle heartbeats set every lease field to `None`. A heartbeat for a running
+/// job MUST populate all four lease fields; the control plane uses them as an
+/// exact ownership fence before extending the database-clock lease deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeat {
+    pub running_job_id: Option<Uuid>,
+    pub attempt_id: Option<Uuid>,
+    pub lease_generation: Option<u64>,
+    pub fencing_token: Option<String>,
+}
+
+impl AgentHeartbeat {
+    pub fn idle() -> Self {
+        Self {
+            running_job_id: None,
+            attempt_id: None,
+            lease_generation: None,
+            fencing_token: None,
+        }
+    }
+
+    pub fn renewing(job_id: Uuid, lease: &JobLease) -> Self {
+        Self {
+            running_job_id: Some(job_id),
+            attempt_id: Some(lease.attempt_id),
+            lease_generation: Some(lease.lease_generation),
+            fencing_token: Some(lease.fencing_token.clone()),
+        }
+    }
+}
+
+/// Successful heartbeat response. `lease_deadline` is present only when the
+/// request renewed an exact running-job lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeatResponse {
+    pub agent_id: String,
+    pub last_seen_at: DateTime<Utc>,
+    pub lease_deadline: Option<DateTime<Utc>>,
+}
+
 // ---------------------------------------------------------------------------
 // Job (the full dispatched unit)
 // ---------------------------------------------------------------------------
@@ -222,7 +307,7 @@ pub struct Job {
     pub status: JobStatus,
     /// Present when the job has been leased.
     pub lease: Option<JobLease>,
-    /// CP-signed approval grant — required for `LiveApply`; absent for other modes.
+    /// CP-signed approval grant — required for `LiveApply` and `LiveDestroy`.
     pub live_context: Option<VerifiedLiveContext>,
 }
 
@@ -256,15 +341,21 @@ pub struct JobResult {
 // VerifiedLiveContext — CP-signed approval grant
 // ---------------------------------------------------------------------------
 
-/// Issued by the control plane when an operator approves a `LiveApply`.
+/// Issued by the control plane for an approved `LiveApply` or step rollback
+/// `LiveDestroy`.
 /// The agent verifies this against the CP's own public key before executing.
 ///
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
-/// `request_id, approved_plan_digest, approver, expiry (RFC 3339), step_job_id`
+/// `request_id, job_spec_digest, approved_plan_digest, approver, expiry (RFC
+/// 3339), step_job_id`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
     pub request_id: Uuid,
+    /// SHA-256 digest of the exact canonical [`JobSpec`] this grant authorizes.
+    /// The agent recomputes it before any live mutation, binding the grant to
+    /// the spec's mode, IaC reference/digest, variables, and Terraform state key.
+    pub job_spec_digest: String,
     /// SHA-256 hex digest of the plan the approver reviewed.
     /// The agent re-plans and MUST match this before applying.
     pub approved_plan_digest: String,
@@ -281,15 +372,9 @@ pub struct VerifiedLiveContext {
     /// field existed.  `Some(id)` means the grant is valid ONLY when applied
     /// against the job whose `Job::id == id`.
     ///
-    /// **Backward compatibility (CRITICAL):** `#[serde(skip_serializing_if =
-    /// "Option::is_none")]` means a `None` value is omitted entirely from the
-    /// JSON representation — the key is absent, not `null`. Combined with
-    /// `#[serde(default)]` for deserialisation, a grant minted with
-    /// `step_job_id: None` produces byte-identical canonical signing bytes
-    /// (see `signing_bytes_vlc`) and byte-identical wire JSON to a grant built
-    /// before this field existed. Every pre-existing single-job grant
-    /// therefore continues to sign/verify exactly as it did before this
-    /// change.
+    /// `None` is the whole-request grant shape; `Some(id)` is required for
+    /// step-scoped live work. The v2 signing domain intentionally invalidates
+    /// grants created before `job_spec_digest` became mandatory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_job_id: Option<Uuid>,
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
@@ -342,7 +427,12 @@ pub const SUPPORTED_REDACTION_POLICY_VERSIONS: &[&str] = &[REDACTION_POLICY_VERS
 /// not lean on this header. The threat model is accidental drift, not forgery:
 /// a tampered header yields a version-mismatch *rejection* (denial), never a
 /// verification bypass, because every security-sensitive field stays signed.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 2 adds `JobSpec.state_key` as a live-execution safety boundary. An
+/// older v1 agent would ignore that field, execute against its legacy shared or
+/// local backend, and only reveal the mismatch when the CP rejects its result
+/// digest after execution. This version is therefore intentionally not
+/// interoperable with v1 for any job mode.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The closed set of wire-protocol versions a peer will accept, gated
 /// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
@@ -350,7 +440,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
 /// (accepting agent requests) and the agent (accepting the CP's advertised
 /// version) reference this ONE constant, so emission and acceptance cannot drift.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[2];
 
 /// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
 /// predates protocol versioning sends no header; it is, by definition, speaking
@@ -422,4 +512,70 @@ pub struct SignedEnvelope {
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
     /// above.  Produced by `sign`; verified by `verify`.
     pub signature: String,
+}
+
+#[cfg(test)]
+mod result_status_tests {
+    use super::*;
+
+    #[test]
+    fn result_status_matrix_is_fail_closed() {
+        assert!(job_result_status_allowed(
+            &JobMode::OfflineDryRun,
+            &JobResultStatus::CheckOk
+        ));
+        assert!(job_result_status_allowed(
+            &JobMode::LivePlan,
+            &JobResultStatus::Planned
+        ));
+        assert!(job_result_status_allowed(
+            &JobMode::LivePlan,
+            &JobResultStatus::CheckOk
+        ));
+        assert!(job_result_status_allowed(
+            &JobMode::LiveApply,
+            &JobResultStatus::Applied
+        ));
+        assert!(job_result_status_allowed(
+            &JobMode::LiveDestroy,
+            &JobResultStatus::Applied
+        ));
+
+        assert!(!job_result_status_allowed(
+            &JobMode::LiveDestroy,
+            &JobResultStatus::Planned
+        ));
+        assert!(!job_result_status_allowed(
+            &JobMode::LiveApply,
+            &JobResultStatus::CheckOk
+        ));
+        for mode in [
+            JobMode::OfflineDryRun,
+            JobMode::LivePlan,
+            JobMode::LiveApply,
+            JobMode::LiveDestroy,
+        ] {
+            assert!(!job_result_status_allowed(
+                &mode,
+                &JobResultStatus::Verified
+            ));
+        }
+    }
+
+    #[test]
+    fn heartbeat_renewal_copies_the_complete_lease_fence() {
+        let lease = JobLease {
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 9,
+            fencing_token: "opaque-fence".to_owned(),
+            deadline: Utc::now(),
+            cp_nonce: "nonce".to_owned(),
+        };
+        let job_id = Uuid::new_v4();
+        let heartbeat = AgentHeartbeat::renewing(job_id, &lease);
+        assert_eq!(heartbeat.running_job_id, Some(job_id));
+        assert_eq!(heartbeat.attempt_id, Some(lease.attempt_id));
+        assert_eq!(heartbeat.lease_generation, Some(9));
+        assert_eq!(heartbeat.fencing_token.as_deref(), Some("opaque-fence"));
+    }
 }

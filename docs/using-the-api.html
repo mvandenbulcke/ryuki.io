@@ -43,7 +43,17 @@
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link" data-sections="prerequisites
 quick start
 authentication modes
-project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="stack
+project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="authority and scope
+required roles and target
+tool and provider prerequisites
+request contract
+gate 1: repository checks
+gate 2: proving-ground readiness
+gate 3: offline rehearsal
+gate 4: live plan and state isolation
+gate 5: live apply and verification
+gate 6: mandatory cleanup
+result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
 network policy
@@ -60,9 +70,10 @@ how it works
 permissions by role
 environment configuration
 important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
-site selection flow
+custom codes
+site selection
 managing sites
-current active sites
+seeded active sites
 important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
 scopes
 enforcement semantics
@@ -100,18 +111,41 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="authentication">Authentication</h2>
 <p>The API supports three ways in, selected by the platform's <code>RYUKI_AUTH_MODE</code> (see <a href="configuration.html">Configuration</a>):</p>
 <p><strong>Development modes</strong> (<code>mock-dry-run</code>, the default, and <code>static-dry-run</code>): requests run as a static admin session with no credentials. Nothing to configure; never run these against anything real.</p>
-<p><strong>Local accounts</strong> (<code>local</code>): sign in and use the returned session.</p>
-<pre><code class="lang-bash"><span class="hl-c"># Sign in: the response sets a ryuki_session cookie and returns the session id</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-c</span> cookies.txt <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/auth/local/login \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"username": "&lt;user&gt;", "password": "&lt;password&gt;"}'</span>
+<p><strong>Local accounts</strong> (<code>local</code>): sign in and use the returned session ID. Browser safe reads may use the session cookie, but unsafe methods reject cookie-only authorization as a CSRF defense; scripts must send <code>X-Ryuki-Session-Id</code>.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">printf</span> <span class="hl-s">'Password: '</span> &gt;&amp;2
+<span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> PASSWORD &lt;/dev/tty
+<span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
+<span class="hl-cmd">LOGIN=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$PASSWORD"</span> | <span class="hl-cmd">\</span>
+  <span class="hl-cmd">jq</span> <span class="hl-f">-Rs</span> <span class="hl-f">--arg</span> username <span class="hl-s">'&lt;user&gt;'</span> <span class="hl-s">'{username: $username, password: .}'</span> | <span class="hl-cmd">\</span>
+  <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">'https://&lt;host&gt;/api/auth/local/login'</span> \
+    <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
+<span class="hl-cmd">unset</span> PASSWORD
+<span class="hl-cmd">SESSION_ID=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$LOGIN"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+<span class="hl-cmd">unset</span> LOGIN
+<span class="hl-cmd">umask</span> 077
+<span class="hl-cmd">SESSION_HEADER=</span>$(mktemp <span class="hl-s">"${TMPDIR:-/tmp}/ryuki-session.XXXXXX"</span>)
+<span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$SESSION_ID"</span> &gt; <span class="hl-s">"$SESSION_HEADER"</span>
+<span class="hl-cmd">unset</span> SESSION_ID
 
-<span class="hl-c"># Subsequent calls: send the cookie (or the X-Ryuki-Session-Id header)</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-b</span> cookies.txt https://&lt;host&gt;/api/requests</code></pre>
+<span class="hl-cmd">cleanup_session()</span> {
+  <span class="hl-cmd">local</span> logout_status=0
+  <span class="hl-cmd">if</span> test <span class="hl-f">-f</span> <span class="hl-s">"$SESSION_HEADER"</span>; <span class="hl-cmd">then</span>
+    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST \
+      <span class="hl-s">'https://&lt;host&gt;/api/auth/local/logout'</span> \
+      <span class="hl-cmd">-H</span> <span class="hl-s">"@$SESSION_HEADER"</span> &gt;/dev/null || <span class="hl-cmd">logout_status=</span>$?
+    <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$SESSION_HEADER"</span>
+  <span class="hl-cmd">fi</span>
+  <span class="hl-cmd">return</span> <span class="hl-s">"$logout_status"</span>
+<span class="hl-cmd">}</span>
+<span class="hl-cmd">trap</span> <span class="hl-s">'cleanup_session || true'</span> EXIT
+
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-s">'https://&lt;host&gt;/api/requests'</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"@$SESSION_HEADER"</span></code></pre>
 <p><strong>Entra ID</strong> (<code>entra-id</code>): browsers use the sign-in flow behind the portal's "Sign in with Microsoft Entra ID" button; non-interactive callers present a bearer JWT from the tenant, validated against its JWKS.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;host&gt;/api/requests <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;entra-jwt&gt;"</span></code></pre>
 <p><strong>API tokens</strong> work in every mode and are the right choice for integrations. An admin mints one; the <code>ryk_...</code> value is returned exactly once. Tokens can carry site and environment scopes, which narrow everything the token sees — the recommended blast-radius control.</p>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-b</span> cookies.txt <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/admin/tokens \
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/admin/tokens \
+  <span class="hl-cmd">-H</span> <span class="hl-s">"@$SESSION_HEADER"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
   <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "ci-reader", "owner_principal": "ci@example.test", "roles": ["Auditor"], "site_scope": "DEFRA"}'</span>
 
@@ -119,40 +153,183 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="authorization">Authorization</h2>
 <p>Every route is gated by one of five permission tiers — <code>admin</code>, <code>approve</code>, <code>execute</code>, <code>request</code>, <code>audit</code> — derived from your roles, and results are narrowed by your site and environment scopes. The enforcement semantics (when you get a 404 versus a 403 versus a silently narrowed list) are documented in <a href="rbac-and-scoping.html">RBAC &amp; Scoping</a>; the per-route tier appears in the <a href="api-reference.html">API Reference</a>.</p>
 <h2 id="conventions">Conventions</h2>
-<p><strong>Errors</strong> are a consistent JSON body with a stable machine code and a human message, plus an optional detail:</p>
+<p><strong>Errors</strong> use HTTP status as the authoritative contract. Newer endpoints may return a machine code, message, and optional detail, while legacy request and agent handlers may return only a human-readable <code>error</code> string:</p>
 <pre><code class="lang-json">{ <span class="hl-k">"error"</span>: <span class="hl-s">"VALIDATION_FAILED"</span>, <span class="hl-k">"message"</span>: <span class="hl-s">"site is not active"</span>, <span class="hl-k">"detail"</span>: <span class="hl-s">"..."</span> }</code></pre>
-<p><code>4xx</code> means your request cannot succeed as sent (wrong tier, wrong mode, invalid payload — do not retry unchanged). <code>5xx</code> is the platform's problem. The public agent-protocol surface additionally documents RFC 9457-shaped errors in the <a href="api-reference.html">OpenAPI spec</a>.</p>
-<p><strong>Pagination</strong>: list endpoints accept <code>limit</code> (default 500, clamped to 1..1000) and <code>offset</code>. Object-shaped responses add <code>total</code>, <code>limit</code>, and <code>offset</code> keys; bare-array responses carry the filtered total in an <code>X-Total-Count</code> header instead. Totals are filtered and scope-aware, never whole-table counts.</p>
-<p><strong>Timestamps</strong> are RFC 3339 strings. <strong>Degraded behavior</strong>: without a database, read endpoints respond with <code>source: "no-db"</code> and empty data rather than fabricating rows, and writes return 503.</p>
+<p>Most <code>4xx</code> responses mean the request cannot succeed unchanged. A CAS <code>409</code> requires reloading current state and deciding whether a new transition is still valid; do not blindly replay it. <code>5xx</code> is the platform's problem. The bounded agent, public, and operations-read subset additionally documents RFC 9457-shaped errors in the machine-readable <a href="api-reference.html">OpenAPI spec</a>; the route-by-area reference covers the full registered control-plane surface.</p>
+<p><strong>Pagination</strong>: pagination-enabled list endpoints accept <code>limit</code> (default 500, clamped to 1..1000) and <code>offset</code>. Object-shaped responses add <code>total</code>, <code>limit</code>, and <code>offset</code> keys; bare-array responses carry the filtered total in an <code>X-Total-Count</code> header instead. Check the route reference because pagination is not yet universal. Totals are filtered and scope-aware, never whole-table counts.</p>
+<p><strong>Timestamps</strong> are RFC 3339 strings. <strong>Degraded behavior</strong>: DB-authoritative endpoints generally return <code>source: "no-db"</code> plus empty reads or <code>503</code> writes when PostgreSQL is unavailable. Static contracts and selected in-memory development handlers have their documented fallback behavior instead.</p>
 <h2 id="walkthrough-a-request-through-its-lifecycle">Walkthrough: a request through its lifecycle</h2>
-<p>The heart of the platform is the governed request lifecycle. This runs end-to-end on a dev stack (<code>RYUKI_AUTH_MODE=mock-dry-run</code>, so no auth headers are needed; add yours in real modes).</p>
-<pre><code class="lang-bash"><span class="hl-cmd">BASE=http://localhost:8080</span>
+<p>The heart of the platform is the governed request lifecycle. This walkthrough maps directly to the proving ground: a <code>Requester</code> creates the request and a different <code>PlatformAdmin</code> drives every later transition and evidence read. It assumes PostgreSQL and an approved execution agent for <code>DEFRA</code>. <code>mock-dry-run</code> maps every call to one static identity, so it cannot demonstrate the required separation of duties. In <code>local</code> mode, sign in as the two configured accounts and keep their session headers separate.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">set</span> <span class="hl-f">-euo</span> pipefail
 
-<span class="hl-c"># 1. Create a request (server deployment intake)</span>
-<span class="hl-cmd">REQ=</span>$(curl <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests \
+<span class="hl-cmd">BASE=http://127.0.0.1:18081</span>
+<span class="hl-c"># The direct host-development API normally uses :8081 instead.</span>
+<span class="hl-cmd">umask</span> 077
+<span class="hl-cmd">AUTH_DIR=</span>$(mktemp <span class="hl-f">-d</span> <span class="hl-s">"${TMPDIR:-/tmp}/ryuki-api-guide.XXXXXX"</span>)
+<span class="hl-cmd">REQUESTER_HEADERS=</span><span class="hl-s">"$AUTH_DIR/requester.headers"</span>
+<span class="hl-cmd">ADMIN_HEADERS=</span><span class="hl-s">"$AUTH_DIR/admin.headers"</span>
+
+<span class="hl-cmd">login_local()</span> {
+  <span class="hl-cmd">local</span> username=<span class="hl-v">$1</span>
+  <span class="hl-cmd">local</span> header_file=<span class="hl-v">$2</span>
+  <span class="hl-cmd">local</span> password login session_id
+  <span class="hl-cmd">printf</span> <span class="hl-s">'%s password: '</span> <span class="hl-s">"$username"</span> &gt;&amp;2
+  <span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> password &lt;/dev/tty
+  <span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
+  <span class="hl-cmd">login=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$password"</span> | <span class="hl-cmd">\</span>
+    <span class="hl-cmd">jq</span> <span class="hl-f">-Rs</span> <span class="hl-f">--arg</span> username <span class="hl-s">"$username"</span> <span class="hl-s">'{username: $username, password: .}'</span> | <span class="hl-cmd">\</span>
+    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/login"</span> \
+      <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
+  <span class="hl-cmd">unset</span> password
+  <span class="hl-cmd">session_id=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+  <span class="hl-cmd">unset</span> login
+  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_id"</span> &gt; <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">unset</span> session_id
+<span class="hl-cmd">}</span>
+
+<span class="hl-cmd">logout_local()</span> {
+  <span class="hl-cmd">local</span> header_file=<span class="hl-v">$1</span>
+  <span class="hl-cmd">local</span> logout_status=0
+  <span class="hl-cmd">if</span> test <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>; <span class="hl-cmd">then</span>
+    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/logout"</span> \
+      <span class="hl-cmd">-H</span> <span class="hl-s">"@$header_file"</span> &gt;/dev/null || <span class="hl-cmd">logout_status=</span>$?
+    <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">fi</span>
+  <span class="hl-cmd">return</span> <span class="hl-s">"$logout_status"</span>
+<span class="hl-cmd">}</span>
+
+<span class="hl-cmd">cleanup_auth()</span> {
+  <span class="hl-cmd">logout_local</span> <span class="hl-s">"$REQUESTER_HEADERS"</span> || <span class="hl-cmd">true</span>
+  <span class="hl-cmd">logout_local</span> <span class="hl-s">"$ADMIN_HEADERS"</span> || <span class="hl-cmd">true</span>
+  <span class="hl-cmd">rm</span> <span class="hl-f">-rf</span> <span class="hl-s">"$AUTH_DIR"</span>
+<span class="hl-cmd">}</span>
+<span class="hl-cmd">trap</span> cleanup_auth EXIT
+
+<span class="hl-cmd">login_local</span> requester <span class="hl-s">"$REQUESTER_HEADERS"</span>
+<span class="hl-cmd">login_local</span> admin <span class="hl-s">"$ADMIN_HEADERS"</span>
+
+<span class="hl-c"># 1. Create a server-deployment request as the requester.</span>
+<span class="hl-c"># Replace every &lt;...&gt; value with an approved vSphere inventory name before</span>
+<span class="hl-c"># selecting the live branch below.</span>
+<span class="hl-cmd">CREATE=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$REQUESTER_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
   <span class="hl-cmd">-d</span> '{
     <span class="hl-s">"request_type"</span>: <span class="hl-s">"server-deployment"</span>,
     <span class="hl-s">"site"</span>: <span class="hl-s">"DEFRA"</span>,
-    <span class="hl-s">"environment"</span>: <span class="hl-s">"prod"</span>,
+    <span class="hl-s">"environment"</span>: <span class="hl-s">"test"</span>,
     <span class="hl-s">"name"</span>: <span class="hl-s">"app-server-01"</span>,
-    <span class="hl-s">"fields"</span>: {<span class="hl-s">"operating_system"</span>: <span class="hl-s">"linux"</span>}
-  <span class="hl-cmd">}</span><span class="hl-s">' | python3 -c "import sys, json; print(json.load(sys.stdin)['</span>id'])")
+    <span class="hl-s">"cpu"</span>: 4,
+    <span class="hl-s">"memory_gb"</span>: 16,
+    <span class="hl-s">"justification"</span>: <span class="hl-s">"First governed server deployment test"</span>,
+    <span class="hl-s">"fields"</span>: {
+      <span class="hl-s">"operating_system"</span>: <span class="hl-s">"RHEL 9"</span>,
+      <span class="hl-s">"datacenter"</span>: <span class="hl-s">"&lt;vSphere-datacenter&gt;"</span>,
+      <span class="hl-s">"cluster"</span>: <span class="hl-s">"&lt;vSphere-cluster&gt;"</span>,
+      <span class="hl-s">"datastore"</span>: <span class="hl-s">"&lt;vSphere-datastore&gt;"</span>,
+      <span class="hl-s">"network"</span>: <span class="hl-s">"&lt;vSphere-network&gt;"</span>,
+      <span class="hl-s">"template"</span>: <span class="hl-s">"&lt;approved-vSphere-template&gt;"</span>,
+      <span class="hl-s">"disk_size_gb"</span>: <span class="hl-s">"80"</span>
+    <span class="hl-cmd">}</span>
+  <span class="hl-cmd">}</span>')
+<span class="hl-cmd">REQ=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$CREATE"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.id'</span>)
 
-<span class="hl-c"># 2. Walk the governed stages</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/validate   <span class="hl-c"># static checks against catalog contracts</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/plan       <span class="hl-c"># execution plan with impact and rollback</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/approve    <span class="hl-c"># role-based approval (separation of duties applies)</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/lock       <span class="hl-c"># change window locked, resources reserved</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/execute    <span class="hl-c"># dispatches agent jobs, dry-run by default</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/verify     <span class="hl-c"># post-change health probes</span>
-<span class="hl-c"># execution completes asynchronously once the agent posts its result</span>
+<span class="hl-c"># 2. The admin drives every post-create governance stage.</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/validate"</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/plan"</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/approve"</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/lock"</span></code></pre>
+<p>All values under <code>fields</code> are JSON strings, including numeric-looking values such as <code>disk_size_gb</code>. Top-level <code>cpu</code> and <code>memory_gb</code> are JSON numbers.</p>
+<p>Execution is asynchronous. Use this helper after every execution or apply dispatch; it returns only for <code>Succeeded</code> and fails closed on every terminal failure state.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">wait_for_latest_job()</span> {
+  <span class="hl-cmd">expected_job=</span><span class="hl-v">$1</span>
+  <span class="hl-cmd">while</span> true; do
+    <span class="hl-cmd">JOB_JSON=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+      <span class="hl-s">"$BASE/api/requests/$REQ/execution-job"</span>)
+    <span class="hl-cmd">CURRENT_JOB=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$JOB_JSON"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.agent_job_id'</span>)
+    <span class="hl-cmd">JOB_STATUS=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$JOB_JSON"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.status'</span>)
 
-<span class="hl-c"># 3. Read the state, the audit trail, and the sealed evidence pack</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>                    <span class="hl-c"># status, stages, steps[] when orchestrated</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/audit              <span class="hl-c"># hash-chained transition trail (audit tier)</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-v">$BASE</span>/api/requests/<span class="hl-v">$REQ</span>/evidence           <span class="hl-c"># redacted, digest-sealed evidence pack</span></code></pre>
-<p>Every transition is CAS-guarded (a conflicting transition answers 409), attributed, and appended to the hash-chained audit trail — including the agent-driven <code>executing</code> transition, which is recorded under the machine identity of the agent whose signed result caused it.</p>
+    <span class="hl-cmd">if</span> [ <span class="hl-s">"$CURRENT_JOB"</span> != <span class="hl-s">"$expected_job"</span> ]; then
+      <span class="hl-cmd">printf</span> <span class="hl-s">'expected job %s, but request reports %s\n'</span> \
+        <span class="hl-s">"$expected_job"</span> <span class="hl-s">"$CURRENT_JOB"</span> &gt;&amp;2
+      <span class="hl-cmd">return</span> 1
+    <span class="hl-cmd">fi</span>
+
+    <span class="hl-cmd">printf</span> <span class="hl-s">'job %s: %s\n'</span> <span class="hl-s">"$CURRENT_JOB"</span> <span class="hl-s">"$JOB_STATUS"</span>
+    <span class="hl-cmd">case</span> <span class="hl-s">"$JOB_STATUS"</span> in
+      <span class="hl-cmd">Succeeded)</span> return 0 ;;
+      <span class="hl-cmd">Failed|Expired|ReconcileRequired|LiveRefused|DeadLettered|Cancelled)</span>
+        <span class="hl-cmd">return</span> 1
+        <span class="hl-cmd">;;</span>
+    <span class="hl-cmd">esac</span>
+    <span class="hl-cmd">sleep</span> 2
+  <span class="hl-cmd">done</span>
+<span class="hl-cmd">}</span></code></pre>
+<p>Choose exactly one execution branch for this request. The default branch is credential-free and provider-connection-free and is the right first pass; Terraform registry downloads may still occur:</p>
+<pre><code class="lang-bash"><span class="hl-c"># 3a. Offline dry-run branch (default; no provider mutation).</span>
+<span class="hl-cmd">EXECUTION=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/execute"</span>)
+<span class="hl-cmd">EXECUTION_JOB=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$EXECUTION"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.agent_job_id'</span>)
+<span class="hl-cmd">wait_for_latest_job</span> <span class="hl-s">"$EXECUTION_JOB"</span></code></pre>
+<p>For an explicitly authorized infrastructure test, start from a newly locked request and use the live branch instead. This one-request walkthrough illustrates the API calls; it is not the full four-request acceptance recipe in <a href="first-test.html">First Test Acceptance</a>. Approve the disposable target before dispatch. Live plan may read the provider and update backend lock or state metadata, but it must not create, update, or delete provider resources. Live apply is dispatched only after the admin approves the completed plan digest. The current approval endpoints support only the reviewed Linux and Windows vSphere single-VM bundles; other Terraform plans and Ansible check-mode results remain preview-only.</p>
+<pre><code class="lang-bash"><span class="hl-c"># 3b. Live branch. Do not run this after branch 3a on the same request.</span>
+<span class="hl-cmd">LIVE_PLAN=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/execute?mode=live-plan"</span>)
+<span class="hl-cmd">PLAN_JOB=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$LIVE_PLAN"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.agent_job_id'</span>)
+<span class="hl-cmd">wait_for_latest_job</span> <span class="hl-s">"$PLAN_JOB"</span>
+
+<span class="hl-c"># Review only the server-derived, digest-verified projection. Do not approve</span>
+<span class="hl-c"># from raw Terraform/provider output. Compare every placement value with the</span>
+<span class="hl-c"># recorded request before continuing. The control plane has already required</span>
+<span class="hl-c"># the VM's actual planned name/CPU/memory/disk and the five planned placement</span>
+<span class="hl-c"># lookup names to match the JobSpec exactly.</span>
+<span class="hl-cmd">PLAN_RESULT=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/admin/agents/jobs/$PLAN_JOB/result"</span>)
+<span class="hl-cmd">printf</span> <span class="hl-s">'%s'</span> <span class="hl-s">"$PLAN_RESULT"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-e</span> '
+  <span class="hl-cmd">.plan_review</span> as <span class="hl-v">$review</span>
+  <span class="hl-cmd">|</span> <span class="hl-cmd">if</span> (<span class="hl-v">$review</span>.digest_verified == true
+      <span class="hl-cmd">and</span> <span class="hl-v">$review</span>.counts == {create: 1, update: 0, delete: 0, replace: 0})
+    <span class="hl-cmd">then</span> <span class="hl-v">$review</span>
+    <span class="hl-cmd">else</span> error(<span class="hl-s">"digest-verified single-create plan review is unavailable"</span>)
+    <span class="hl-cmd">end</span>'</code></pre>
+<p>For the normative first test, stop here. Complete Gate 4's separate-request state-isolation proof and the exact <code>destroy-state.sh --preflight</code> rehearsal. Do not run the next block until both pass and you have returned to the primary request.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">LIVE_APPLY=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/approve-live-apply"</span>)
+<span class="hl-cmd">APPLY_JOB=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$LIVE_APPLY"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.job_id'</span>)
+<span class="hl-cmd">wait_for_latest_job</span> <span class="hl-s">"$APPLY_JOB"</span>
+
+<span class="hl-c"># vSphere live applies must include a clean post-apply re-plan. An `applied`</span>
+<span class="hl-c"># result without `verified` convergence is a hard stop.</span>
+<span class="hl-cmd">APPLY_RESULT=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/admin/agents/jobs/$APPLY_JOB/result"</span>)
+<span class="hl-cmd">APPLY_STATUS=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$APPLY_RESULT"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.result_status'</span>)
+<span class="hl-cmd">test</span> <span class="hl-s">"$APPLY_STATUS"</span> = verified</code></pre>
+<p>Only verify after the selected branch has succeeded and the signed agent result has advanced the request to <code>verifying</code>:</p>
+<pre><code class="lang-bash"><span class="hl-c"># 4. Confirm the asynchronous backlink before running verification.</span>
+<span class="hl-cmd">REQUEST_JSON=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/requests/$REQ"</span>)
+<span class="hl-cmd">REQUEST_STATUS=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$REQUEST_JSON"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.status'</span>)
+<span class="hl-cmd">if</span> [ <span class="hl-s">"$REQUEST_STATUS"</span> != <span class="hl-s">"verifying"</span> ]; then
+  <span class="hl-cmd">printf</span> <span class="hl-s">'request is %s, expected verifying\n'</span> <span class="hl-s">"$REQUEST_STATUS"</span> &gt;&amp;2
+  <span class="hl-cmd">exit</span> 1
+<span class="hl-cmd">fi</span>
+
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$REQ/verify"</span>
+
+<span class="hl-c"># 5. Read the state, the audit trail, and the sealed evidence pack.</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/requests/$REQ"</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/requests/$REQ/audit"</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-s">"$BASE/api/requests/$REQ/evidence"</span></code></pre>
+<p>If you selected the live branch, <code>completed</code> is not final acceptance. Record the state/provider disposition after the apply, then immediately perform the mandatory state-keyed cleanup and direct vSphere absence check in Gate 6 of <a href="first-test.html">First Test Acceptance</a>. Preserve the database and agent state until that evidence is accepted. An uncertain apply follows that document's reconcile-and-fail procedure and is never retried on the same request.</p>
+<p>Every transition is CAS-guarded (a conflicting transition answers 409), attributed, and appended to the hash-chained audit trail. A successful LivePlan records an agent-attributed approval pause while the request remains <code>executing</code>; only the accepted execution result for the selected branch moves the request to <code>verifying</code>.</p>
 <p>From here: multi-step requests and per-step live approvals are covered in <a href="orchestration.html">Multi-Step Orchestration</a>, and taking execution to real infrastructure in <a href="agents-and-live-execution.html">Agents &amp; Live Execution</a>.</p>
 <div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/using-the-api.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/notifications.html">&larr; Notifications</a><a href="/api-reference.html">API Reference &rarr;</a></nav>
 </main>

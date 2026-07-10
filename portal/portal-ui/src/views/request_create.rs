@@ -47,15 +47,39 @@ pub(crate) const REQUEST_TYPE_OPTIONS: &[(&str, &str)] = &[
     ("backup-coverage-report", "Backup Coverage Report"),
 ];
 
-/// `(API value, display label)` pairs for the site select; values mirror the
-/// engine's valid site codes (ryuki-engine request lifecycle).
-pub(crate) const SITE_OPTIONS: &[(&str, &str)] = &[
+/// Recommended UN/LOCODE examples for the editable site-code input. The
+/// registry may also contain administrator-defined custom codes.
+pub(crate) const RECOMMENDED_SITE_OPTIONS: &[(&str, &str)] = &[
     ("DEBER", "DEBER — Berlin"),
     ("DEFRA", "DEFRA — Frankfurt"),
     ("FRPAR", "FRPAR — Paris"),
     ("GBLON", "GBLON — London"),
     ("NLAMS", "NLAMS — Amsterdam"),
 ];
+
+/// Canonicalize the site code exactly as the API does for request intake.
+/// UN/LOCODE's optional display-space is removed; custom codes are uppercase,
+/// URL-safe ASCII with one unambiguous canonical spelling.
+pub(crate) fn normalize_site_code_input(input: &str) -> Option<String> {
+    let upper = input.trim().to_ascii_uppercase();
+    let code = if upper.len() == 6
+        && upper.as_bytes().get(2) == Some(&b' ')
+        && upper.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic)
+        && upper.as_bytes()[3..].iter().all(u8::is_ascii_alphanumeric)
+    {
+        format!("{}{}", &upper[..2], &upper[3..])
+    } else {
+        upper
+    };
+    let bytes = code.as_bytes();
+    ((2..=32).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric))
+    .then_some(code)
+}
 
 /// `(API value, display label)` pairs for the environment select; values
 /// mirror the engine's valid environments (ryuki-engine request lifecycle).
@@ -150,14 +174,14 @@ const fn req(mut def: FieldDef) -> FieldDef {
 }
 
 // Per-type intake fields. `server-deployment` keeps the typed CPU/Memory inputs
-// (rendered separately) and adds OS/disk here; every other type defines the
+// (rendered separately) and adds OS/placement here; every other type defines the
 // fields meaningful to it. Keys are snake_case so the detail view humanizes them
 // ("patch_wave" -> "Patch wave"). The API persists them into the payload JSONB.
 //
 // Required-field rationale (conservative rule: required iff an empty value has
 // NO safe default / "not applicable" reading and yields a structurally
 // meaningless work-order):
-//   server-deployment  → operating_system (OS is identity of the deployment)
+//   server-deployment  → OS plus explicit vSphere placement (no live defaults)
 //   patch-maintenance  → target_host_group, maintenance_window (WHAT + WHEN)
 //   reboot-orchestration → target_host_group, reboot_strategy (target + action)
 //   controlled-restore → source_backup_id, restore_point, target_host (all load-bearing)
@@ -178,7 +202,32 @@ const SERVER_DEPLOYMENT_FIELDS: &[FieldDef] = &[
         "Select OS",
         &["Windows Server 2022", "RHEL 9", "Ubuntu 22.04 LTS"],
     )),
-    number("data_disk_gb", "Data Disk GB", "e.g. 100"),
+    req(text(
+        "datacenter",
+        "vSphere Datacenter",
+        "e.g. dc-production",
+    )),
+    req(text(
+        "cluster",
+        "vSphere Cluster",
+        "e.g. compute-production",
+    )),
+    req(text(
+        "datastore",
+        "vSphere Datastore",
+        "e.g. datastore-production-01",
+    )),
+    req(text(
+        "network",
+        "vSphere Network",
+        "e.g. application-production",
+    )),
+    req(text(
+        "template",
+        "vSphere Template",
+        "e.g. approved-server-template",
+    )),
+    req(number("disk_size_gb", "OS Disk GB", "e.g. 80")),
 ];
 const PATCH_FIELDS: &[FieldDef] = &[
     req(text(
@@ -544,7 +593,7 @@ pub fn RequestCreate() -> impl IntoView {
     #[allow(deprecated)]
     let (site, set_site) = create_signal("DEBER".to_string());
     #[allow(deprecated)]
-    let (environment, set_environment) = create_signal("production".to_string());
+    let (environment, set_environment) = create_signal("test".to_string());
     #[allow(deprecated)]
     let (name, set_name) = create_signal(String::new());
     #[allow(deprecated)]
@@ -565,6 +614,7 @@ pub fn RequestCreate() -> impl IntoView {
 
     let is_valid = move || {
         !name.get().trim().is_empty()
+            && normalize_site_code_input(&site.get()).is_some()
             && !justification.get().trim().is_empty()
             && missing_required_fields(&request_type.get(), &field_values.get()).is_empty()
     };
@@ -647,20 +697,30 @@ pub fn RequestCreate() -> impl IntoView {
                 </div>
 
                 <div class="form-field">
-                    <label for="request-site">"Site"</label>
-                    <select
+                    <label for="request-site">"Site code"</label>
+                    <input
                         id="request-site"
+                        type="text"
                         class="settings-input"
+                        list="request-site-options"
+                        maxlength="32"
+                        placeholder="e.g. DEFRA or DC-EU-01"
                         prop:value=site
-                        on:change=move |ev| {
+                        on:input=move |ev| {
                             set_site.set(event_target_value(&ev));
                         }
-                    >
-                        {SITE_OPTIONS
+                    />
+                    <datalist id="request-site-options">
+                        {RECOMMENDED_SITE_OPTIONS
                             .iter()
-                            .map(|(value, label)| view! { <option value=*value>{*label}</option> })
+                            .map(|(value, label)| view! { <option value=*value label=*label></option> })
                             .collect_view()}
-                    </select>
+                    </datalist>
+                    <Show when=move || {
+                        show_errors.get() && normalize_site_code_input(&site.get()).is_none()
+                    }>
+                        <span class="form-error">"Enter a valid site code"</span>
+                    </Show>
                 </div>
 
                 <div class="form-field">
@@ -812,7 +872,8 @@ pub fn RequestCreate() -> impl IntoView {
                                 let payload = CreateRequestPayload {
                                     request_type: selected_type,
                                     name: name.get().trim().to_string(),
-                                    site: site.get(),
+                                    site: normalize_site_code_input(&site.get())
+                                        .expect("validated site code"),
                                     environment: environment.get(),
                                     cpu: if is_vm { cpu.get() } else { 0 },
                                     memory: if is_vm { memory.get() } else { 0 },
@@ -868,10 +929,24 @@ mod tests {
     }
 
     #[test]
-    fn site_options_match_engine_site_codes() {
-        let values: Vec<&str> = SITE_OPTIONS.iter().map(|(value, _)| *value).collect();
-        // Pinned to VALID_SITES in sources/ryuki-engine/src/request_lifecycle.rs.
+    fn recommended_site_options_are_unlocode_examples() {
+        let values: Vec<&str> = RECOMMENDED_SITE_OPTIONS
+            .iter()
+            .map(|(value, _)| *value)
+            .collect();
         assert_eq!(values, vec!["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"]);
+    }
+
+    #[test]
+    fn site_input_accepts_unlocode_and_safe_custom_codes() {
+        assert_eq!(normalize_site_code_input("  bebru "), Some("BEBRU".into()));
+        assert_eq!(normalize_site_code_input("jp tyo"), Some("JPTYO".into()));
+        assert_eq!(
+            normalize_site_code_input(" dc-eu_01.prod "),
+            Some("DC-EU_01.PROD".into())
+        );
+        assert_eq!(normalize_site_code_input("dc/eu"), None);
+        assert_eq!(normalize_site_code_input("a"), None);
     }
 
     #[test]
@@ -927,7 +1002,7 @@ mod tests {
     fn every_option_has_a_humane_label_distinct_from_machine_values() {
         for (value, label) in REQUEST_TYPE_OPTIONS
             .iter()
-            .chain(SITE_OPTIONS)
+            .chain(RECOMMENDED_SITE_OPTIONS)
             .chain(ENVIRONMENT_OPTIONS)
         {
             assert!(!value.is_empty() && !label.is_empty());
@@ -936,5 +1011,31 @@ mod tests {
                 "label {label} must be display text, not legacy demo vocabulary"
             );
         }
+    }
+
+    #[test]
+    fn server_deployment_requires_explicit_vsphere_placement() {
+        let fields = type_fields("server-deployment");
+        let placement_keys: Vec<&str> = fields
+            .iter()
+            .filter(|field| field.key != "operating_system")
+            .map(|field| field.key)
+            .collect();
+
+        assert_eq!(
+            placement_keys,
+            vec![
+                "datacenter",
+                "cluster",
+                "datastore",
+                "network",
+                "template",
+                "disk_size_gb",
+            ]
+        );
+        assert!(
+            fields.iter().all(|field| field.required),
+            "OS and every live placement input must be explicit"
+        );
     }
 }

@@ -33,10 +33,12 @@ pub fn openapi_document() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Machine-readable contract for three route groups. (1) The \
                 CP↔agent wire protocol (registration, job polling/lease, ack, result \
-                submission, heartbeat): all endpoints except `cp-public-key` require an \
-                agent bearer token (`Authorization: Bearer rya_...`), and every request \
-                MAY carry the `x-ryuki-protocol-version` header (absent => legacy version \
-                1). (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
+                submission, heartbeat): poll, ack, result, and heartbeat require an agent \
+                bearer token (`Authorization: Bearer rya_...`); registration and \
+                `cp-public-key` are unauthenticated. Every agent-protocol request MUST \
+                carry the supported `x-ryuki-protocol-version` header. This build is \
+                protocol-v2-only; an absent header resolves to legacy v1 and is rejected. \
+                (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal \
                 bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts \
                 feed, scheduler introspection) that requires an operator session and a \
                 permission tier, documented for operational tooling, not external agents."
@@ -67,19 +69,23 @@ pub fn openapi_document() -> Value {
                 "ProtocolVersionHeader": {
                     "name": "x-ryuki-protocol-version",
                     "in": "header",
-                    "required": false,
-                    "description": "Sender's CP↔agent wire-schema version (decimal u32). \
-                        Absent => resolved to the legacy value (1). Rejected (400) if it \
-                        appears more than once, is not a positive integer, or is outside \
-                        the control plane's supported set.",
-                    "schema": { "type": "integer", "format": "int64", "minimum": 1 }
+                    "required": true,
+                    "description": "Required sender CP↔agent wire-schema version. This \
+                        control plane accepts protocol v2 only. An absent header resolves \
+                        to legacy v1 and is rejected (400), as are duplicate, malformed, \
+                        or unsupported values.",
+                    "schema": {
+                        "type": "integer",
+                        "format": "int64",
+                        "enum": [ryuki_protocol::PROTOCOL_VERSION]
+                    }
                 }
             },
             "schemas": {
                 "JobMode": {
                     "type": "string",
                     "description": "Execution mode. The agent MUST NOT elevate the mode on its own.",
-                    "enum": ["offline_dry_run", "live_plan", "live_apply"]
+                    "enum": ["offline_dry_run", "live_plan", "live_apply", "live_destroy"]
                 },
                 "JobStatus": {
                     "type": "string",
@@ -105,7 +111,6 @@ pub fn openapi_document() -> Value {
                         "check_ok",
                         "planned",
                         "applied",
-                        "verified",
                         "failed",
                         "live_refused"
                     ]
@@ -148,6 +153,11 @@ pub fn openapi_document() -> Value {
                             "description": "Non-secret variable overrides.",
                             "additionalProperties": { "type": "string" }
                         },
+                        "state_key": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9_-]{1,128}$",
+                            "description": "Opaque control-plane-owned Terraform state key. New specs always carry it; absent legacy specs remain decodable but are refused for live Terraform execution."
+                        },
                         "mode": { "$ref": "#/components/schemas/JobMode" }
                     }
                 },
@@ -165,17 +175,22 @@ pub fn openapi_document() -> Value {
                 },
                 "VerifiedLiveContext": {
                     "type": "object",
-                    "description": "CP-signed approval grant for a LiveApply job.",
-                    "required": ["request_id", "approved_plan_digest", "approver", "expiry", "signature"],
+                    "description": "CP-signed approval grant for a live_apply or live_destroy job; live_destroy grants are step-bound.",
+                    "required": ["request_id", "job_spec_digest", "approved_plan_digest", "approver", "expiry", "signature"],
                     "properties": {
                         "request_id": { "type": "string", "format": "uuid" },
+                        "job_spec_digest": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "SHA-256 digest of the exact canonical JobSpec authorized by this grant, including mode and state_key."
+                        },
                         "approved_plan_digest": { "type": "string" },
                         "approver": { "type": "string" },
                         "expiry": { "type": "string", "format": "date-time" },
                         "step_job_id": {
                             "type": "string",
                             "format": "uuid",
-                            "description": "Present only for a step-scoped grant (#42 slice A): binds this grant to ONE specific dispatched step job id, preventing replay across steps or across a re-dispatch of the same step. Absent (not null) for a legacy/whole-request grant — the pre-existing single-job trust model, unchanged."
+                            "description": "Present only for a step-scoped grant: binds this grant to one dispatched step job id, preventing replay across steps or re-dispatches. Absent for a whole-request LiveApply grant."
                         },
                         "signature": { "type": "string", "description": "Base64-encoded Ed25519 signature." }
                     }
@@ -201,7 +216,7 @@ pub fn openapi_document() -> Value {
                                 { "$ref": "#/components/schemas/VerifiedLiveContext" },
                                 { "type": "null" }
                             ],
-                            "description": "CP-signed approval grant; required for live_apply, absent otherwise."
+                            "description": "CP-signed approval grant; required for live_apply and live_destroy, absent otherwise."
                         }
                     }
                 },
@@ -313,19 +328,33 @@ pub fn openapi_document() -> Value {
                 },
                 "HeartbeatBody": {
                     "type": "object",
+                    "description": "Idle heartbeats leave every field null. A running heartbeat must supply the complete current lease fence; partial fences are rejected.",
                     "properties": {
                         "running_job_id": {
                             "oneOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }],
                             "description": "Currently running job id, if any."
+                        },
+                        "attempt_id": {
+                            "oneOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }]
+                        },
+                        "lease_generation": {
+                            "oneOf": [{ "type": "integer", "format": "int64", "minimum": 0 }, { "type": "null" }]
+                        },
+                        "fencing_token": {
+                            "oneOf": [{ "type": "string" }, { "type": "null" }]
                         }
                     }
                 },
                 "HeartbeatResponse": {
                     "type": "object",
-                    "required": ["agent_id", "last_seen_at"],
+                    "required": ["agent_id", "last_seen_at", "lease_deadline"],
                     "properties": {
                         "agent_id": { "type": "string" },
-                        "last_seen_at": { "type": "string", "format": "date-time" }
+                        "last_seen_at": { "type": "string", "format": "date-time" },
+                        "lease_deadline": {
+                            "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }],
+                            "description": "Database-clock deadline returned only after an exact running-job lease renewal."
+                        }
                     }
                 },
                 "CpPublicKeyResponse": {
@@ -649,6 +678,10 @@ pub fn openapi_document() -> Value {
                                 "application/json": { "schema": { "$ref": "#/components/schemas/CpPublicKeyResponse" } }
                             }
                         },
+                        "400": {
+                            "description": "Missing, malformed, duplicate, or unsupported x-ryuki-protocol-version header.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
                         "503": {
                             "description": "CP signing key not initialised (degraded startup).",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
@@ -782,8 +815,8 @@ pub fn openapi_document() -> Value {
             },
             "/api/agents/{agent_id}/heartbeat": {
                 "post": {
-                    "summary": "Report agent liveness",
-                    "description": "Updates last_seen_at on the agent row. Optionally records the currently running job id.",
+                    "summary": "Report liveness or renew a running job lease",
+                    "description": "Idle heartbeats update agent liveness. Running heartbeats atomically renew only the exact unexpired job/attempt/generation/fencing ownership tuple.",
                     "operationId": "heartbeat",
                     "tags": ["agents"],
                     "security": [{ "agentBearer": [] }],
@@ -802,12 +835,20 @@ pub fn openapi_document() -> Value {
                             "description": "Heartbeat recorded.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HeartbeatResponse" } } }
                         },
+                        "400": {
+                            "description": "Malformed or incomplete running-job lease fence, or unsupported protocol version.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
                         "401": {
                             "description": "Missing/malformed bearer token.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
                         },
                         "403": {
                             "description": "Token does not match agent_id.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+                        },
+                        "409": {
+                            "description": "Running-job lease ownership was superseded or expired.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
                         },
                         "503": {
@@ -1143,6 +1184,40 @@ mod tests {
             doc["components"]["securitySchemes"]["apiSessionHeader"].is_object(),
             "components.securitySchemes.apiSessionHeader must be present"
         );
+    }
+
+    #[test]
+    fn agent_protocol_live_authorization_schema_matches_the_wire_contract() {
+        let doc = openapi_document();
+        let schemas = &doc["components"]["schemas"];
+        let protocol_header = &doc["components"]["parameters"]["ProtocolVersionHeader"];
+        assert_eq!(protocol_header["required"], true);
+        assert_eq!(
+            protocol_header["schema"]["enum"],
+            serde_json::json!([ryuki_protocol::PROTOCOL_VERSION])
+        );
+        assert_eq!(
+            schemas["JobMode"]["enum"],
+            serde_json::json!(["offline_dry_run", "live_plan", "live_apply", "live_destroy"])
+        );
+        assert_eq!(
+            schemas["JobResultStatus"]["enum"],
+            serde_json::json!(["check_ok", "planned", "applied", "failed", "live_refused"]),
+            "verified is CP-internal and must not be advertised as agent-reportable"
+        );
+        assert_eq!(
+            schemas["JobSpec"]["properties"]["state_key"]["pattern"],
+            "^[A-Za-z0-9_-]{1,128}$"
+        );
+        assert_eq!(
+            schemas["VerifiedLiveContext"]["properties"]["job_spec_digest"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert!(schemas["VerifiedLiveContext"]["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "job_spec_digest"));
     }
 
     /// Asserts every (METHOD, path) pair in `expected` is present in `doc.paths`

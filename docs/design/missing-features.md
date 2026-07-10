@@ -1,12 +1,21 @@
 # Ryuki — Missing Features: Analysis & Implementation Design
 
+> ## Historical snapshot — do not use for current readiness
+>
+> This analysis is retained for design rationale and audit history. Its body,
+> status table, gap counts, and file/line references describe older revisions
+> and are not a current project assessment. For current first-test acceptance,
+> use [`docs/first-test.md`](../first-test.md). For feature implementation
+> status, use [`missing-features-tracker.md`](missing-features-tracker.md) and
+> verify it against the current code and test gates.
+>
 > ## ⚠️ Reconciliation status — 2026-06-14, HEAD 408efd2
 >
 > This document was authored at `7172ea8` (2026-06-12). Approximately 65 commits have landed since
 > on `main`, implementing substantial portions of every P0 theme. The "Current state" sections,
 > file:line anchors, and gap counts in the body below are **largely stale** — they describe the
-> codebase as it was on 2026-06-12. Trust this banner for present status; treat the body as
-> design rationale and implementation context, not as an accurate current-state assessment.
+> codebase as it was on 2026-06-12. Treat this dated reconciliation as historical context too;
+> it does not override the current acceptance specification or tracker.
 >
 > | # | Theme | Status | Evidence |
 > |---|-------|--------|----------|
@@ -1979,4 +1988,3 @@ The following claims were raised during the survey, adversarially verified again
 ## Appendix: method
 
 This document was produced by an orchestrated multi-agent analysis run on 2026-06-12. Independent survey agents each took a slice of the platform — domain engines, API layer, portal, catalog contracts, migrations, deploy artifacts, docs, and test surfaces — and proposed candidate gaps with file/line evidence. A separate adversarial-verification pass re-checked every claim against the repository source; claims that failed verification were either dropped or recorded in the refuted-claims appendix above, and surviving claims were consolidated into 13 priority-ordered theme sections, each authored as a self-contained design (current state, design, implementation plan, risks). A fourteenth theme, "Adapter & vendor expansion," was researched and added in a follow-up pass on the same date at the owner's request. All file paths and line numbers reference the repository at `/Users/mvandenbulcke/Repos/ryuki.io` as of the time of writing (branch `main`, HEAD `7172ea8`); they are evidence pointers, not stable anchors, and may drift as the codebase evolves. Proposed migration numbers (044+) were assigned independently per theme and must be reconciled into a single sequence at implementation time.
-

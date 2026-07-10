@@ -1,11 +1,25 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(not(test))]
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(not(test))]
 static POOL: OnceLock<Option<PgPool>> = OnceLock::new();
 static MIGRATION_STATUS: AtomicU8 = AtomicU8::new(MigrationStatus::NotApplied as u8);
+
+#[cfg(test)]
+thread_local! {
+    // Each `#[tokio::test]` owns a short-lived runtime on its test thread.
+    // Keeping one process-global SQLx pool crosses reactor lifetimes and loses
+    // pool permits after a few tests. A thread-local owned pool gives every
+    // handler-style test a pool registered to its own runtime and drops it with
+    // that test thread. Production remains process-global below.
+    static TEST_POOL: std::cell::RefCell<Option<Box<PgPool>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -25,8 +39,23 @@ impl MigrationStatus {
     }
 }
 
+#[cfg(not(test))]
 pub fn get_db() -> Option<&'static PgPool> {
     POOL.get().and_then(|o| o.as_ref())
+}
+
+#[cfg(test)]
+pub fn get_db() -> Option<&'static PgPool> {
+    TEST_POOL.with(|slot| {
+        let borrowed = slot.borrow();
+        let pointer = borrowed.as_deref()? as *const PgPool;
+        drop(borrowed);
+        // SAFETY: TEST_POOL owns the Box at a stable address until the current
+        // Rust test thread exits. API tests use current-thread Tokio runtimes;
+        // references are consumed within that test. Detached work clones PgPool
+        // before spawning, so it does not retain this borrowed handle.
+        Some(unsafe { &*pointer })
+    })
 }
 
 pub fn migration_status() -> MigrationStatus {
@@ -126,40 +155,43 @@ pub async fn try_connect_with_url(
     acquire_timeout_secs: u64,
     max_lifetime_secs: u64,
 ) {
-    // Set-once: `POOL` is a `OnceLock`, so once it has been initialized a second
-    // call could neither replace it nor store its pool — it would just open a
-    // throwaway connection and drop it. Skip entirely when already initialized.
-    // (Matters under test, where global_pool() calls this once per test.)
-    if POOL.get().is_some() {
+    // Production is process-global; tests are runtime/thread-local because each
+    // `#[tokio::test]` drops its reactor after the test.
+    if get_db().is_some() {
         return;
     }
-    let pool = match PgPoolOptions::new()
-        .max_connections(max_connections)
-        .min_connections(min_connections)
-        .idle_timeout(Duration::from_secs(idle_timeout_secs))
-        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-        .max_lifetime(Duration::from_secs(max_lifetime_secs))
-        // #12: bound every statement at the DB so a runaway query (missing index,
-        // bad plan, full scan) cannot pin a pool connection until the much-larger
-        // request timeout (60-300s) fires and saturate the pool. 30s is generous
-        // for this control plane's small-table OLTP and its fast DDL migrations,
-        // yet well below the request timeout so the statement aborts first.
-        // `lock_timeout` (10s, < statement_timeout) bounds waits on a contended
-        // lock specifically — the advisory-chain / row locks are held only
-        // briefly, so a longer wait means real pile-up and should fail fast and
-        // retry rather than queue behind statement_timeout. Both are
-        // session-scoped, set once per physical connection.
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'")
-                    .await?;
-                Ok(())
+    let build_pool = move |url: String, minimum| async move {
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .min_connections(minimum)
+            .idle_timeout(Duration::from_secs(idle_timeout_secs))
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+            .max_lifetime(Duration::from_secs(max_lifetime_secs))
+            // #12: bound every statement at the DB so a runaway query (missing index,
+            // bad plan, full scan) cannot pin a pool connection until the much-larger
+            // request timeout (60-300s) fires and saturate the pool. 30s is generous
+            // for this control plane's small-table OLTP and its fast DDL migrations,
+            // yet well below the request timeout so the statement aborts first.
+            // `lock_timeout` (10s, < statement_timeout) bounds waits on a contended
+            // lock specifically — the advisory-chain / row locks are held only
+            // briefly, so a longer wait means real pile-up and should fail fast and
+            // retry rather than queue behind statement_timeout. Both are
+            // session-scoped, set once per physical connection.
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'")
+                        .await?;
+                    Ok(())
+                })
             })
-        })
-        .connect(url)
-        .await
-    {
+            .connect(&url)
+            .await
+    };
+
+    let connected = build_pool(url.to_owned(), min_connections).await;
+
+    let pool = match connected {
         Ok(pool) => {
             tracing::info!("database connected");
             Some(pool)
@@ -175,7 +207,12 @@ pub async fn try_connect_with_url(
             None
         }
     };
+    #[cfg(not(test))]
     POOL.set(pool).ok();
+    #[cfg(test)]
+    TEST_POOL.with(|slot| {
+        *slot.borrow_mut() = pool.map(Box::new);
+    });
 }
 
 pub async fn migrate_if_connected() -> MigrationStatus {
@@ -247,6 +284,40 @@ mod tests {
             lock, "10s",
             "every pooled connection must carry the 10s lock_timeout from after_connect"
         );
+    }
+
+    #[test]
+    fn handler_pool_reconnects_on_each_short_lived_test_thread() {
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let lock_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build DB-test serialization runtime");
+        let serial = lock_runtime.block_on(DB_TEST_SERIAL.lock());
+
+        for sequence in 1..=2 {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build short-lived test runtime");
+                runtime.block_on(async {
+                    try_connect_with_url(&url, 2, 1, 300, 30, 1800).await;
+                    let one: i32 = sqlx::query_scalar("SELECT 1")
+                        .fetch_one(get_db().expect("thread-local handler pool connected"))
+                        .await
+                        .unwrap_or_else(|error| panic!("query on test thread {sequence}: {error}"));
+                    assert_eq!(one, 1);
+                });
+            })
+            .join()
+            .unwrap_or_else(|_| panic!("test thread {sequence} panicked"));
+        }
+        drop(serial);
     }
 
     #[test]

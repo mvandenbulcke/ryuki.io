@@ -1307,20 +1307,23 @@ pub fn routes() -> Router {
             "/api/admin/approval-groups-contract",
             get(admin_approval_groups),
         )
-        // ─── Site Registry (UN/LOCODE) ───
-        .route("/api/admin/sites", get(site_registry_list))
+        // ─── Site Registry (UN/LOCODE recommended, custom codes supported) ───
+        .route(
+            "/api/admin/sites",
+            get(site_registry_list).post(site_registry_create),
+        )
         .route("/api/admin/sites/countries", get(site_registry_countries))
         .route(
             "/api/admin/sites/countries/{code}/cities",
             get(site_registry_cities_by_country),
         )
-        .route("/api/admin/sites/{unlocode}", get(site_registry_get))
+        .route("/api/admin/sites/{code}", get(site_registry_get))
         .route(
-            "/api/admin/sites/{unlocode}/activate",
+            "/api/admin/sites/{code}/activate",
             post(site_registry_activate),
         )
         .route(
-            "/api/admin/sites/{unlocode}/deactivate",
+            "/api/admin/sites/{code}/deactivate",
             post(site_registry_deactivate),
         )
         .route("/api/admin/sites/search", get(site_registry_search))
@@ -4452,7 +4455,7 @@ async fn ad_computer_contract() -> Json<Value> {
         "lifecycleModes": ["prestage", "validate", "move", "disable", "enable", "delete", "reconcile"],
         "computerStatuses": ["Active", "Disabled", "Quarantined", "Deleted"],
         "supportedOs": ["Windows Server 2022", "Windows Server 2019", "Windows Server 2016", "Windows 11", "Windows 10"],
-        "validSites": ["DEBER","DEFRA","DEDUS","DEMUC","FRPAR","FRMRS","GBLON","GBMAN","NLAMS","NLEIN","ESMAD","ESBCN","ITMIL","ITROM","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
+        "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
         "namingPattern": "SITE-ROLE-NN (e.g. DEFRA-SRV-01, GBLON-DB-01)",
         "validRoles": ["SRV", "WS", "DC", "MGMT", "TEST", "DEV"],
         "validOuPrefixes": ["OU=Servers", "OU=Workstations", "OU=DMZ", "OU=Management", "OU=Testing", "OU=Development"],
@@ -4550,13 +4553,13 @@ async fn gmsa_assign(
         HostOpOutcome::AccountRevoked => {
             return Err(status_409(&format!(
                 "Cannot assign hosts to revoked gMSA {name}"
-            )))
+            )));
         }
         HostOpOutcome::Applied => {}
         other => {
             return Err(db_error(sqlx::Error::Protocol(format!(
                 "add_host returned unexpected outcome {other:?}"
-            ))))
+            ))));
         }
     }
     audit::record_audit_tx(
@@ -4606,18 +4609,18 @@ async fn gmsa_remove(
         HostOpOutcome::HostNotPresent => {
             return Err(status_409(&format!(
                 "Host {host} is not in the authorized list for {name}"
-            )))
+            )));
         }
         HostOpOutcome::LastHost => {
             return Err(status_409(&format!(
                 "Cannot remove last host from {name}. At least one authorized host required."
-            )))
+            )));
         }
         HostOpOutcome::Applied => {}
         other => {
             return Err(db_error(sqlx::Error::Protocol(format!(
                 "remove_host returned unexpected outcome {other:?}"
-            ))))
+            ))));
         }
     }
     audit::record_audit_tx(
@@ -4727,7 +4730,10 @@ async fn gmsa_inventory(
     let limit = query.limit.unwrap_or(500).clamp(1, 1000);
     let offset = query.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok((total_count_headers(0), Json(serde_json::Value::Array(vec![]))));
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
     };
     let accounts = crate::repos::gmsa_accounts::list_page(pool, site, limit, offset)
         .await
@@ -5045,7 +5051,7 @@ async fn shares_contract() -> Json<Value> {
             "POST /api/identity/shares/revoke/{id}/{group}": "Revoke permission (dry-run)",
             "GET /api/identity/shares-contract": "File share NTFS recertification contract"
         },
-        "validSites": ["DEBER","DEFRA","DEDUS","DEMUC","FRPAR","FRMRS","GBLON","GBMAN","NLAMS","NLEIN","ESMAD","ESBCN","ITMIL","ITROM","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
+        "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
         "validStatuses": ["Compliant", "Overdue", "NeedsRecertification"],
         "validPermissionTypes": ["Read", "Write", "Modify", "FullControl"],
         "riskLevels": ["Critical", "High", "Medium", "Low"],
@@ -8787,10 +8793,15 @@ async fn patch_waves_list(
     // LIMIT/OFFSET page and the total both reflect the scope-filtered set.
     let sites = multi_scope_axis_sql_filter(&session.site_scope);
     let envs = multi_scope_axis_sql_filter(&session.environment_scope);
-    let waves =
-        crate::repos::patch_waves::list_page(pool, sites.as_deref(), envs.as_deref(), limit, offset)
-            .await
-            .map_err(db_error)?;
+    let waves = crate::repos::patch_waves::list_page(
+        pool,
+        sites.as_deref(),
+        envs.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    .map_err(db_error)?;
     let total = crate::repos::patch_waves::count(pool, sites.as_deref(), envs.as_deref())
         .await
         .map_err(db_error)?;
@@ -8925,7 +8936,7 @@ async fn patch_contract() -> Json<Value> {
         "supportedWorkflows": ["patch-plan","patch-validate","patch-approve","patch-execute","patch-verify","patch-reboot","patch-compliance","pending-reboots"],
         "waveDimensions": ["site","osFamily","criticality","maintenanceWindow","rebootPolicy","dependencyGroup","backupState"],
         "validOsFamilies": ["windows","linux"],
-        "validSites": ["DEBER","DEFRA","DEDUS","FRPAR","GBLON","NLAMS","ESMAD","ITMIL","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
+        "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
         "requiredInputs": ["site","osFamily","criticality"],
         "requiredGuards": ["patch-policy-imported","inventory-coverage-current","backup-state-known","maintenance-window-known","approval-route-assigned","evidence-redacted"],
         "blockedReasons": ["provider-calls-disabled","live-execution-disabled","unknown-site","invalid-os-family","backup-state-unknown","maintenance-window-missing","approval-missing","evidence-not-redacted"],
@@ -9441,15 +9452,16 @@ async fn software_history(Path(server): Path<String>) -> ApiResult {
 
 async fn software_compliance(
     AuthExtractor(session): AuthExtractor,
-    Query(query): Query<SoftwareComplianceQuery>,
+    Query(mut query): Query<SoftwareComplianceQuery>,
 ) -> ApiResult {
     // #2: site-only compliance report — a scoped principal may only read its own
     // site (site is a required, caller-supplied param, so 403 is not an oracle);
     // an environment-scoped principal is denied (no environment axis here). Guards
     // both the DB and the no-DB engine fallback below.
+    query.site = site_registry::normalize_site_code_for_lookup(&query.site)
+        .map_err(|error| status_400(&error))?;
     guard_body_site_scope(&session, &query.site)?;
-    const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-    if !VALID_SITES.contains(&query.site.as_str()) {
+    if !site_registry::is_valid_site(&query.site) {
         return Err(status_400(&format!("Unknown site: {}", query.site)));
     }
 
@@ -9653,7 +9665,7 @@ async fn baseline_contract() -> Json<Value> {
             {"id": "bc-003", "check_name": "Zabbix Agent", "category": "Monitoring", "severity": "High"},
             {"id": "bc-004", "check_name": "Windows Firewall", "category": "Configuration", "severity": "Critical"}
         ],
-        "validSites": ["DEBER","DEFRA","DEDUS","FRPAR","GBLON","NLAMS","ESMAD","ITMIL","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
+        "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
         "requiredGuards": [
             "site-known",
             "server-name-known",
@@ -9937,10 +9949,10 @@ async fn legal_hold_place(
                 Json(
                     json!({"error": format!("Invalid hold_type: {}. Must be Investigation, Litigation, Compliance, or Retention.", req.hold_type)}),
                 ),
-            ))
+            ));
         }
     };
-    // Validate + construct via the engine (enforces VALID_SITES; also pushes to
+    // Validate + construct via the engine (enforces the active site registry; also pushes to
     // the static, which is the no-DB fallback).
     let hold = match legal_hold::place_hold(
         &req.target,
@@ -10819,42 +10831,44 @@ fn parse_noise_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value
 
 // ─── Noise remediation handlers ───
 
-/// The five valid noise sites in CLASSIFICATION PRIORITY ORDER — shared by
-/// [`site_from_host`] and [`site_from_host_sql_case`] so the Rust and SQL
-/// classifiers cannot drift apart.
-const NOISE_VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+/// Active registry codes in deterministic host-classification priority order.
+/// Longer custom codes win over their prefixes; equal-length codes are sorted
+/// lexically, which preserves the legacy ordering of the built-in codes.
+fn active_noise_sites_by_match_priority() -> Vec<String> {
+    let mut sites = site_registry::get_active_site_codes().unwrap_or_default();
+    sites.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    sites
+}
 
-/// Engine-equivalent host→site classifier.  Iterates `NOISE_VALID_SITES` in
-/// order and returns the first site whose name is a case-insensitive substring
-/// of `host`. Unknown hosts default to "DEFRA" (matching the engine).
-fn site_from_host(host: &str) -> &'static str {
+/// Engine-equivalent host-to-site classifier. Unknown hosts retain the legacy
+/// DEFRA default.
+fn site_from_host(host: &str) -> String {
     let lower = host.to_lowercase();
-    for &site in NOISE_VALID_SITES {
+    for site in active_noise_sites_by_match_priority() {
         if lower.contains(&site.to_lowercase()) {
             return site;
         }
     }
-    "DEFRA"
+    "DEFRA".into()
 }
 
 /// #14: a SQL expression EXACTLY equivalent to [`site_from_host`], so
 /// `noise_suppressed_list` can filter AND page on the host-derived site inside
 /// SQL (`noisy_triggers` has no site column). Built from the same
-/// `NOISE_VALID_SITES` in the same order: `CASE` arms short-circuit like the
-/// Rust loop (first match wins), and `ELSE` is the same DEFRA default.
+/// the active registry codes in the same order: `CASE` arms short-circuit like
+/// the Rust loop (first match wins), and `ELSE` is the same DEFRA default.
 ///
 /// This is a faithful translation, not an approximation: the site tokens are
 /// pure ASCII, and Postgres `lower()` agrees with Rust `to_lowercase()` on
 /// ASCII case-folding in every locale. Non-ASCII host bytes cannot flip a
 /// match either way — the only Unicode codepoints whose lowercase form maps
 /// into ASCII are U+212A ('k') and U+0130 ('i' + combining dot), and neither
-/// letter occurs in any site token (locale-special foldings such as Turkish
-/// dotless-I likewise only affect 'i'/'k').
+/// registered site tokens are restricted to ASCII.
 fn site_from_host_sql_case() -> String {
     let mut case = String::from("CASE");
-    for site in NOISE_VALID_SITES {
-        // The tokens are compile-time ASCII constants (no quotes or SQL
-        // metacharacters), so inlining them into the SQL text is injection-safe.
+    for site in active_noise_sites_by_match_priority() {
+        // Registry normalization permits only ASCII alphanumerics plus '.',
+        // '_' and '-', so inlining a governed token is injection-safe.
         case.push_str(&format!(
             " WHEN strpos(lower(host), '{}') > 0 THEN '{}'",
             site.to_lowercase(),
@@ -10869,21 +10883,18 @@ async fn noise_detect(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = site_registry::normalize_site_code_for_lookup(&body.site)
+        .map_err(|error| status_400(&error))?;
     // #2: a scoped principal may only run noise detection for its own site;
     // env-scoped principals are rejected (noise is site-keyed via the host).
-    guard_body_site_scope(&session, &body.site)?;
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
-        // Replicate engine: exact VALID_SITES membership check (uppercase), then
-        // fetch all rows and classify via site_from_host in Rust — same logic the
-        // engine uses, not a substring pattern match.
-        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-        // Validate the raw site exactly as the engine does (no case-folding) so
-        // lowercase input is rejected on the DB path too — parity with the engine.
-        let site = body.site.as_str();
-        if !VALID_SITES.contains(&site) {
+        // Validate through the active registry, then classify via the same
+        // host-derived logic used by the engine fallback.
+        if !site_registry::is_valid_site(&site) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Unknown site: {}", body.site)})),
+                Json(json!({"error": format!("Unknown site: {}", site)})),
             ));
         }
         let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
@@ -10900,7 +10911,7 @@ async fn noise_detect(
             .collect();
         return Ok(Json(Value::Array(arr)));
     }
-    match noise_remediation::detect_noise(&body.site) {
+    match noise_remediation::detect_noise(&site) {
         Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
@@ -10910,19 +10921,17 @@ async fn noise_flapping_detect(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = site_registry::normalize_site_code_for_lookup(&body.site)
+        .map_err(|error| status_400(&error))?;
     // #2: a scoped principal may only detect flapping for its own site.
-    guard_body_site_scope(&session, &body.site)?;
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
-        // Replicate engine: exact VALID_SITES check, then classify hosts via
-        // site_from_host in Rust, filter flapping = true.
-        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-        // Validate the raw site exactly as the engine does (no case-folding) so
-        // lowercase input is rejected on the DB path too — parity with the engine.
-        let site = body.site.as_str();
-        if !VALID_SITES.contains(&site) {
+        // Validate through the active registry, then classify hosts via the
+        // same Rust helper as the engine fallback.
+        if !site_registry::is_valid_site(&site) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Unknown site: {}", body.site)})),
+                Json(json!({"error": format!("Unknown site: {}", site)})),
             ));
         }
         let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
@@ -10939,7 +10948,7 @@ async fn noise_flapping_detect(
             .collect();
         return Ok(Json(Value::Array(arr)));
     }
-    match noise_remediation::detect_flapping(&body.site) {
+    match noise_remediation::detect_flapping(&site) {
         Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
@@ -10963,7 +10972,7 @@ async fn noise_suggest(
                     .await
                     .map_err(db_error)?;
             if !host
-                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .map(|h| row_scope_permits(&session, &site_from_host(&h), ""))
                 .unwrap_or(false)
             {
                 return Err((
@@ -11046,7 +11055,7 @@ async fn noise_suppress(
                     .await
                     .map_err(db_error)?;
             if !host
-                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .map(|h| row_scope_permits(&session, &site_from_host(&h), ""))
                 .unwrap_or(false)
             {
                 return Err((
@@ -11179,7 +11188,7 @@ async fn noise_resolve(
                     .await
                     .map_err(db_error)?;
             if !host
-                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .map(|h| row_scope_permits(&session, &site_from_host(&h), ""))
                 .unwrap_or(false)
             {
                 return Err((
@@ -11246,12 +11255,15 @@ async fn noise_report(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: narrow the site to the principal's scope (env-scoped -> 403; an
     // unrestricted caller with no ?site keeps the legacy DEFRA default).
-    let site = enforce_site_scope(&session, q.site.as_deref(), "DEFRA")?;
+    let requested_site = q
+        .site
+        .as_deref()
+        .map(site_registry::normalize_site_code_for_lookup)
+        .transpose()
+        .map_err(|error| status_400(&error))?;
+    let site = enforce_site_scope(&session, requested_site.as_deref(), "DEFRA")?;
     if let Some(pool) = get_db() {
-        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-        // Validate the raw site exactly as the engine does (no case-folding) so
-        // lowercase input is rejected on the DB path too — parity with the engine.
-        if !VALID_SITES.contains(&site.as_str()) {
+        if !site_registry::is_valid_site(&site) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown site: {}", site)})),
@@ -11634,12 +11646,13 @@ async fn monitoring_review_queue_list(
             .fetch_all(pool)
             .await
             .map_err(db_error)?;
-            let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM monitoring_review_queue WHERE site = ANY($1)")
-                    .bind(sites)
-                    .fetch_one(pool)
-                    .await
-                    .map_err(db_error)?;
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM monitoring_review_queue WHERE site = ANY($1)",
+            )
+            .bind(sites)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
             (rows, total)
         }
     };
@@ -14732,6 +14745,85 @@ async fn apply_transition_audited(
         return Err(transition_conflict_409(&request_id));
     };
 
+    // Concluding a request must also fence live work that has not started. The
+    // request CAS above holds the request-row lock used by every LiveApply mint,
+    // so no new grant can appear until this transaction commits or rolls back.
+    // A poll can still race on an already-Pending job because dispatch does not
+    // lock the request: cancel Pending LiveApply rows here, then fail closed if
+    // the poll won (Leased/Running) or an automated LiveDestroy is outstanding.
+    // On conflict the whole transaction rolls back, including the request CAS.
+    if db_status_to_request_status(&row.status).is_concluded() {
+        #[derive(sqlx::FromRow)]
+        struct CancelledLiveApply {
+            id: Uuid,
+            platform: String,
+        }
+
+        let cancelled: Vec<CancelledLiveApply> = sqlx::query_as(
+            "UPDATE agent_jobs SET status = 'Cancelled', updated_at = NOW() \
+             WHERE status = 'Pending' \
+               AND spec->>'request_id' = $1 \
+               AND (mode = 'LiveApply' OR spec->>'mode' = 'live_apply') \
+             RETURNING id, platform",
+        )
+        .bind(&request_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        let live_mutation_in_flight: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+               SELECT 1 FROM agent_jobs \
+               WHERE spec->>'request_id' = $1 \
+                 AND ( \
+                   (status IN ('Leased', 'Running', 'ReconcileRequired') AND ( \
+                     mode IN ('LiveApply', 'LiveDestroy') \
+                     OR spec->>'mode' IN ('live_apply', 'live_destroy') \
+                   )) \
+                   OR (status = 'Pending' AND ( \
+                     mode = 'LiveDestroy' OR spec->>'mode' = 'live_destroy' \
+                   )) \
+                 ) \
+             )",
+        )
+        .bind(&request_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        if live_mutation_in_flight {
+            tx.rollback().await.ok();
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "request has live infrastructure mutation in flight or pending teardown; reconcile it before failing the request"
+                })),
+            ));
+        }
+
+        for job in cancelled {
+            let aggregate_id = job.id.to_string();
+            crate::repos::domain_events::insert(
+                &mut *tx,
+                crate::repos::domain_events::NewEvent {
+                    event_type: "job.cancelled",
+                    aggregate_type: "agent_job",
+                    aggregate_id: &aggregate_id,
+                    site: Some(&row.site),
+                    environment: Some(&row.environment),
+                    actor: &session.user_id,
+                    payload: json!({
+                        "to_status": "request-concluded-before-dispatch",
+                        "platform": job.platform,
+                        "request_id": request_id,
+                        "note": "pending live apply cancelled atomically with request conclusion",
+                    }),
+                },
+            )
+            .await
+            .map_err(db_error)?;
+        }
+    }
+
     // Shared inner block: audit row + (optional) approval-decision ledger row +
     // domain event, all in THIS tx, then commit and the detached notification.
     // Factored out so apply_approval_decision_audited keeps audit/event PARITY
@@ -15273,7 +15365,16 @@ fn completed_request_stage(
 /// flag). Deliberately narrow: only these keys are copied so the serialized
 /// `Request.metadata` surface is NOT broadened with arbitrary intake fields.
 /// Keep in sync with the no-DB create path.
-const METADATA_ALLOWLIST: &[&str] = &["operating_system", "deployment_profile"];
+const METADATA_ALLOWLIST: &[&str] = &[
+    "operating_system",
+    "deployment_profile",
+    "datacenter",
+    "cluster",
+    "datastore",
+    "network",
+    "template",
+    "disk_size_gb",
+];
 
 /// Extract the allowlisted string-valued keys from a request's payload JSONB
 /// into a `HashMap<String, String>` suitable for `Request::metadata`.
@@ -15401,7 +15502,7 @@ fn validation_failed_response(
 
 async fn requests_create(
     AuthExtractor(session): AuthExtractor,
-    Json(body): Json<CreateRequest>,
+    Json(mut body): Json<CreateRequest>,
 ) -> ApiResult {
     // Defense-in-depth: the central route gate also enforces "request" for
     // POST /api/requests. Keeping the handler check makes the requirement
@@ -15425,6 +15526,12 @@ async fn requests_create(
         .await;
         return Err(status_403());
     }
+    // Canonicalize before the scope check and persistence. Site scopes use the
+    // same exact uppercase key, so case aliases cannot bypass or accidentally
+    // fail authorization.
+    body.site = site_registry::normalize_site_code_for_lookup(&body.site)
+        .map_err(|error| status_400(&error))?;
+
     // #2 site/environment-scoped RBAC: a scoped principal may only create a
     // request within its own site/environment. Asserts the body's (site,
     // environment) are in scope (403 otherwise); an unrestricted principal passes
@@ -15933,18 +16040,27 @@ async fn requests_approve_live_apply(
     // branch below (no-double-apply / plan-state) can leak the request's existence.
     // requests is dual-axis (site, environment both NOT NULL), so the canonical
     // by-id guard applies. Admin permission alone does not imply unrestricted scope.
-    match sqlx::query_as::<_, (String, String)>(
-        "SELECT site, environment FROM requests WHERE id = $1",
+    let requester = match sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT site, environment, requester FROM requests WHERE id = $1",
     )
     .bind(uid)
     .fetch_optional(pool)
     .await
     .map_err(db_error)?
     {
-        Some((site, environment)) => {
-            scope_guard_or_404(&session, &site, &environment, &request_id)?
+        Some((site, environment, requester)) => {
+            scope_guard_or_404(&session, &site, &environment, &request_id)?;
+            requester
         }
         None => return Err(status_404(&request_id)),
+    };
+    if requester.as_deref() == Some(session.user_id.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "separation of duties: the requester cannot approve their own live apply"
+            })),
+        ));
     }
 
     // No-double-apply: at most ONE LiveApply may ever be approved per request.
@@ -15991,6 +16107,7 @@ async fn requests_approve_live_apply(
         "SELECT j.platform, j.spec, j.evidence_digest, r.status AS req_status, r.site AS site \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 AND j.mode = 'LivePlan' \
+           AND j.status = 'Succeeded' \
            AND j.result_status IN ('planned', 'check_ok') \
            AND j.completed_at IS NOT NULL \
            AND j.evidence_digest IS NOT NULL \
@@ -16040,6 +16157,27 @@ async fn requests_approve_live_apply(
     // the expiry before signing the grant.
     let mut spec: ryuki_protocol::JobSpec = serde_json::from_value(plan.spec)
         .map_err(|e| status_400(&format!("stored plan spec is malformed: {e}")))?;
+    ryuki_runner::iac::validate_live_placement_vars(&spec.iac_ref, &spec.vars)
+        .map_err(|error| status_400(&error.to_string()))?;
+    // The first live-mutation contract supports only the two reviewed vSphere
+    // server bundles. Every approval must have the server-derived safe review;
+    // a bare Terraform digest or Ansible check result is not operator-review
+    // evidence and must never mint a live grant.
+    let evidence: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT bytes FROM evidence_blobs WHERE digest = $1")
+            .bind(&digest)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+    let reviewable = evidence.as_deref().is_some_and(|bytes| {
+        ryuki_protocol::sha256_hex(bytes) == digest
+            && crate::agents::server_live_plan_is_safe_to_approve(&spec, bytes)
+    });
+    if !reviewable {
+        return Err(status_409(
+            "live apply currently requires a digest-verified, reviewed vSphere single-VM create plan",
+        ));
+    }
     spec.mode = ryuki_protocol::JobMode::LiveApply;
 
     let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
@@ -16128,8 +16266,6 @@ async fn requests_step_approve_live_apply(
             Json(json!({"error": "control plane is not configured to sign grants"})),
         )
     })?;
-    let request_model = db_row_to_request(&current, &request_id);
-
     let mut tx = pool.begin().await.map_err(db_error)?;
     // Lock the step row; it must be parked AwaitingApproval with a digest.
     let step = crate::repos::job_steps::load_step_for_update(&mut tx, uid, &step_key)
@@ -16182,33 +16318,66 @@ async fn requests_step_approve_live_apply(
         ));
     };
 
-    // Build the step's LiveApply spec directly (NOT via build_step_job_spec,
-    // which deliberately clamps LiveApply -> OfflineDryRun for the dispatcher).
-    let iac_digest =
-        ryuki_runner::iac::offering_iac_digest(&step.iac_ref).unwrap_or_else(|| "0".repeat(64));
-    let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
-        offering_id: &step.iac_ref,
-        request_id: &request_model.id,
-        name: &current.name,
-        site: &current.site,
-        environment: &current.environment,
-        cpu: u32::try_from(current.cpu).unwrap_or(0),
-        memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
-        metadata: &request_model.metadata,
-    });
-    let spec = ryuki_protocol::JobSpec {
-        request_id: uid,
-        offering_id: Uuid::new_v4(),
-        iac_ref: step.iac_ref.clone(),
-        iac_digest,
-        vars,
-        mode: ryuki_protocol::JobMode::LiveApply,
+    // Derive the apply spec from the exact successful step LivePlan. Rebuilding
+    // it would create a new offering_id and could drift from the digest the
+    // approver reviewed. State key + digest identify this step's plan.
+    let expected_state_key = step_state_key(step.id);
+    let plan_spec_json: Option<sqlx::types::Json<serde_json::Value>> = sqlx::query_scalar(
+        "SELECT spec FROM agent_jobs \
+         WHERE request_id = $1 AND mode = 'LivePlan' AND status = 'Succeeded' \
+           AND result_status IN ('planned', 'check_ok') \
+           AND completed_at IS NOT NULL AND evidence_digest = $2 \
+           AND spec->>'state_key' = $3 \
+         ORDER BY completed_at DESC, id DESC LIMIT 1",
+    )
+    .bind(uid)
+    .bind(&digest)
+    .bind(&expected_state_key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    let Some(plan_spec_json) = plan_spec_json else {
+        return Err(status_409(
+            "the step has no matching successful stored LivePlan to approve",
+        ));
     };
+    let mut spec: ryuki_protocol::JobSpec = serde_json::from_value(plan_spec_json.0)
+        .map_err(|_| status_409("the stored step LivePlan spec is malformed"))?;
+    if spec.mode != ryuki_protocol::JobMode::LivePlan
+        || spec.request_id != uid
+        || spec.iac_ref != step.iac_ref
+        || spec.state_key.as_deref() != Some(expected_state_key.as_str())
+    {
+        return Err(status_409(
+            "the stored step LivePlan does not match the persisted step",
+        ));
+    }
+    ryuki_runner::iac::validate_live_placement_vars(&spec.iac_ref, &spec.vars)
+        .map_err(|error| status_400(&error.to_string()))?;
+
+    let evidence: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT bytes FROM evidence_blobs WHERE digest = $1")
+            .bind(&digest)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    let approvable = evidence.as_deref().is_some_and(|bytes| {
+        ryuki_protocol::sha256_hex(bytes) == digest
+            && crate::agents::server_live_plan_is_safe_to_approve(&spec, bytes)
+    });
+    if !approvable {
+        tx.rollback().await.ok();
+        return Err(status_409(
+            "step live apply currently requires a digest-verified, reviewed vSphere single-VM create plan",
+        ));
+    }
+    spec.mode = ryuki_protocol::JobMode::LiveApply;
 
     // Mint the step-scoped CP-signed grant + LiveApply job (slice B1b-1).
     let job_id = crate::agents::create_step_live_job(
         &mut tx,
         uid,
+        step.id,
         &current.site,
         &spec,
         &digest,
@@ -16296,6 +16465,7 @@ async fn requests_execution_job(
         status: String,
         result_status: Option<String>,
         evidence_digest: Option<String>,
+        verification_ready: bool,
         created_at: chrono::DateTime<chrono::Utc>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
         // #2: the parent request's scope, used only for the by-id scope guard.
@@ -16311,6 +16481,16 @@ async fn requests_execution_job(
     // identity, surfaced only via the admin-gated agents view.
     let row: Option<ExecJobRow> = sqlx::query_as(
         "SELECT j.id, j.mode, j.status, j.result_status, j.evidence_digest, \
+         CASE \
+           WHEN j.status <> 'Succeeded' OR j.completed_at IS NULL THEN FALSE \
+           WHEN j.mode = 'OfflineDryRun' AND j.result_status IN ('check_ok', 'planned') THEN TRUE \
+           WHEN j.mode = 'LiveApply' AND j.result_status = 'verified' THEN TRUE \
+           WHEN j.mode = 'LiveApply' AND j.result_status = 'applied' \
+             AND split_part(j.spec->>'iac_ref', '@', 1) NOT IN ( \
+               'linux-server-deployment', 'windows-server-deployment' \
+             ) THEN TRUE \
+           ELSE FALSE \
+         END AS verification_ready, \
          j.created_at, j.completed_at, r.site, r.environment \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 \
@@ -16333,6 +16513,7 @@ async fn requests_execution_job(
         "status": j.status,
         "result_status": j.result_status,
         "evidence_digest": j.evidence_digest,
+        "verification_ready": j.verification_ready,
         "created_at": j.created_at.to_rfc3339(),
         "completed_at": j.completed_at.map(|t| t.to_rfc3339()),
         "source": "database",
@@ -17403,8 +17584,9 @@ async fn requests_execute(
     // AWX "check" equivalent). LivePlan (a real terraform plan / ansible --check
     // against a backend; NO mutation) additionally requires the `admin`
     // permission. LiveApply mutates and is NOT dispatchable here: it requires a
-    // CP-signed approval grant minted via the dedicated operator endpoint, so
-    // the caller is routed there rather than silently dispatching a mutation.
+    // CP-signed approval grant minted from the stored plan by the request-scoped
+    // approval endpoint, so the caller is routed there rather than silently
+    // dispatching a mutation.
     let (mode, mode_label) = match params.mode.as_deref() {
         None | Some("") | Some("offline-dry-run") | Some("dry-run") | Some("offline") => {
             (ryuki_protocol::JobMode::OfflineDryRun, "OfflineDryRun")
@@ -17419,7 +17601,7 @@ async fn requests_execute(
         Some("live-apply") => {
             return Err(status_400(
                 "live-apply is not dispatchable via execute; an operator must mint a \
-                 CP-signed approval grant via POST /api/admin/agents/live-apply-jobs",
+                 CP-signed approval grant via POST /api/requests/{id}/approve-live-apply",
             ));
         }
         Some(other) => return Err(status_400(&format!("unknown execution mode: {other}"))),
@@ -17479,8 +17661,12 @@ async fn requests_execute(
                 tx.rollback().await.ok();
                 return Err(status_400(
                     "multi-step requests do not support live-apply mode; \
-                     per-step live-apply approval is not yet available",
+                    per-step live-apply approval is not yet available",
                 ));
+            }
+            Err(MaterializeError::InvalidLivePlacement(message)) => {
+                tx.rollback().await.ok();
+                return Err(status_400(&message));
             }
             Err(MaterializeError::Db(e)) => {
                 tx.rollback().await.ok();
@@ -17608,6 +17794,16 @@ enum MaterializeOutcome {
     StepJobs { job_ids: Vec<Uuid> },
 }
 
+/// Stable Terraform state key for a request without an orchestration plan.
+pub(crate) fn request_state_key(request_id: Uuid) -> String {
+    format!("request-{request_id}")
+}
+
+/// Stable Terraform state key for one persisted orchestration step.
+pub(crate) fn step_state_key(step_id: Uuid) -> String {
+    format!("step-{step_id}")
+}
+
 /// Why materialization failed.
 #[derive(Debug)]
 enum MaterializeError {
@@ -17622,6 +17818,10 @@ enum MaterializeError {
     /// endpoint, off a step's own recorded LivePlan digest. Rather than
     /// silently downgrading, this is rejected. Caller maps to a 400.
     ModeNotSupportedForStepPlan,
+    /// Live vSphere work must carry explicit, valid placement. The caller
+    /// rolls back the execution transition and returns this safe message as a
+    /// 400 before an agent job can be inserted or a provider can be invoked.
+    InvalidLivePlacement(String),
     Db(sqlx::Error),
 }
 
@@ -17654,6 +17854,27 @@ async fn materialize_execution(
 ) -> Result<MaterializeOutcome, MaterializeError> {
     let plan = crate::repos::job_steps::load_plan(&mut *tx, request_id).await?;
 
+    // A multi-step live plan may begin with a provider-free preflight step, but
+    // its later deployment step still needs explicit placement. Validate every
+    // step up front so the request transition rolls back with a clear 400
+    // before any live job is dispatched.
+    if matches!(&mode, ryuki_protocol::JobMode::LivePlan) && !plan.is_empty() {
+        for step in &plan {
+            let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+                offering_id: &step.iac_ref,
+                request_id: &request.id,
+                name: &current.name,
+                site: &request.site,
+                environment: &request.environment,
+                cpu: u32::try_from(current.cpu).unwrap_or(0),
+                memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+                metadata: &request.metadata,
+            });
+            ryuki_runner::iac::validate_live_placement_vars(&step.iac_ref, &vars)
+                .map_err(|error| MaterializeError::InvalidLivePlacement(error.to_string()))?;
+        }
+    }
+
     if plan.is_empty() {
         // Today's exact single-job behavior — unaffected by step-plan support.
         let offering = ryuki_runner::iac::resolve_offering_id(request);
@@ -17669,6 +17890,13 @@ async fn materialize_execution(
             memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
             metadata: &request.metadata,
         });
+        if matches!(
+            &mode,
+            ryuki_protocol::JobMode::LivePlan | ryuki_protocol::JobMode::LiveApply
+        ) {
+            ryuki_runner::iac::validate_live_placement_vars(&offering, &vars)
+                .map_err(|error| MaterializeError::InvalidLivePlacement(error.to_string()))?;
+        }
         let mode_label = job_mode_label(&mode);
         let spec = ryuki_protocol::JobSpec {
             request_id,
@@ -17676,6 +17904,7 @@ async fn materialize_execution(
             iac_ref: offering,
             iac_digest,
             vars,
+            state_key: Some(request_state_key(request_id)),
             mode,
         };
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
@@ -17755,7 +17984,14 @@ pub(crate) async fn dispatch_ready_steps(
             .iter()
             .find(|row| &row.step_key == key)
             .expect("ready_steps only returns keys present in the input plan");
-        let spec = build_step_job_spec(request_id, &step.iac_ref, request, current, mode.clone());
+        let spec = build_step_job_spec(
+            request_id,
+            &step.iac_ref,
+            step.id,
+            request,
+            current,
+            mode.clone(),
+        );
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let job_id: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
@@ -17864,6 +18100,7 @@ pub(crate) async fn dispatch_teardown_steps(
             iac_ref: step.iac_ref.clone(),
             iac_digest,
             vars,
+            state_key: Some(step_state_key(step.id)),
             mode: ryuki_protocol::JobMode::LiveDestroy,
         };
         // The teardown grant reuses the step's own recorded plan digest as
@@ -17877,6 +18114,7 @@ pub(crate) async fn dispatch_teardown_steps(
         let job_id = crate::agents::create_step_live_job(
             tx,
             request_id,
+            step.id,
             &current.site,
             &spec,
             &digest,
@@ -17937,6 +18175,7 @@ fn job_mode_label(mode: &ryuki_protocol::JobMode) -> &'static str {
 fn build_step_job_spec(
     request_id: Uuid,
     step_iac_ref: &str,
+    step_id: Uuid,
     request: &ryuki_engine::models::Request,
     current: &DbRequestRow,
     mode: ryuki_protocol::JobMode,
@@ -17971,6 +18210,7 @@ fn build_step_job_spec(
         iac_ref: step_iac_ref.to_string(),
         iac_digest,
         vars,
+        state_key: Some(step_state_key(step_id)),
         mode: effective_mode,
     }
 }
@@ -18028,6 +18268,61 @@ mod step_materialization_unit_tests {
         }
     }
 
+    #[test]
+    fn submitted_vsphere_placement_reaches_job_spec_vars() {
+        let body: CreateRequest = serde_json::from_value(json!({
+            "request_type": "server-deployment",
+            "site": "DEFRA",
+            "environment": "production",
+            "name": "vm-placement-test",
+            "cpu": 4,
+            "memory_gb": 16,
+            "justification": "placement plumbing regression",
+            "fields": {
+                "operating_system": "RHEL 9",
+                "datacenter": "DC-PROD",
+                "cluster": "Compute-01",
+                "datastore": "Datastore-01",
+                "network": "VLAN-210",
+                "template": "rhel-9-approved",
+                "disk_size_gb": "80"
+            }
+        }))
+        .expect("server-deployment intake deserializes");
+        let payload = build_request_payload(
+            &ryuki_engine::models::RequestType::ServerDeployment,
+            &body,
+            "standard",
+        );
+
+        let mut request = sample_request();
+        request.metadata = payload_to_metadata(&payload);
+        let current = sample_current_row(&request);
+        let spec = build_step_job_spec(
+            current.id,
+            "linux-server-deployment",
+            Uuid::new_v4(),
+            &request,
+            &current,
+            ryuki_protocol::JobMode::LivePlan,
+        );
+
+        for (key, expected) in [
+            ("datacenter", "DC-PROD"),
+            ("cluster", "Compute-01"),
+            ("datastore", "Datastore-01"),
+            ("network", "VLAN-210"),
+            ("template", "rhel-9-approved"),
+            ("disk_size_gb", "80"),
+        ] {
+            assert_eq!(spec.vars.get(key).map(String::as_str), Some(expected));
+        }
+        assert_eq!(
+            ryuki_runner::iac::validate_live_placement_vars(&spec.iac_ref, &spec.vars),
+            Ok(())
+        );
+    }
+
     /// #42 slice B1a: the multi-step dispatcher's per-step spec builder
     /// passes through the caller-resolved mode faithfully for both
     /// `OfflineDryRun` and `LivePlan` — it no longer hard-codes
@@ -18048,8 +18343,14 @@ mod step_materialization_unit_tests {
                 ryuki_protocol::JobMode::OfflineDryRun,
                 ryuki_protocol::JobMode::LivePlan,
             ] {
-                let spec =
-                    build_step_job_spec(Uuid::new_v4(), iac_ref, &request, &current, mode.clone());
+                let spec = build_step_job_spec(
+                    Uuid::new_v4(),
+                    iac_ref,
+                    Uuid::new_v4(),
+                    &request,
+                    &current,
+                    mode.clone(),
+                );
                 assert_eq!(
                     spec.mode, mode,
                     "step spec for iac_ref={iac_ref} must pass through mode={mode:?}"
@@ -18079,6 +18380,7 @@ mod step_materialization_unit_tests {
             let spec = build_step_job_spec(
                 Uuid::new_v4(),
                 iac_ref,
+                Uuid::new_v4(),
                 &request,
                 &current,
                 ryuki_protocol::JobMode::LiveApply,
@@ -18094,6 +18396,45 @@ mod step_materialization_unit_tests {
                 "the LiveApply clamp fallback is OfflineDryRun"
             );
         }
+    }
+
+    #[test]
+    fn state_keys_isolate_requests_and_steps_and_are_stable_per_scope() {
+        let request_a = Uuid::new_v4();
+        let request_b = Uuid::new_v4();
+        let step_a = Uuid::new_v4();
+        let step_b = Uuid::new_v4();
+
+        assert_ne!(request_state_key(request_a), request_state_key(request_b));
+        assert_ne!(step_state_key(step_a), step_state_key(step_b));
+        assert_ne!(request_state_key(request_a), step_state_key(step_a));
+
+        let plan_key = step_state_key(step_a);
+        let apply_key = step_state_key(step_a);
+        let destroy_key = step_state_key(step_a);
+        assert_eq!(plan_key, apply_key);
+        assert_eq!(apply_key, destroy_key);
+    }
+
+    #[test]
+    fn step_live_plan_spec_carries_the_persisted_step_state_key() {
+        let request = sample_request();
+        let current = sample_current_row(&request);
+        let request_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let spec = build_step_job_spec(
+            request_id,
+            "request-preflight",
+            step_id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::LivePlan,
+        );
+
+        assert_eq!(
+            spec.state_key.as_deref(),
+            Some(step_state_key(step_id).as_str())
+        );
     }
 }
 
@@ -18132,6 +18473,23 @@ mod step_materialization_db_tests {
         .await
         .expect("seed locked request");
         id
+    }
+
+    async fn seed_server_placement(pool: &PgPool, id: Uuid) {
+        sqlx::query("UPDATE requests SET payload = $2::jsonb WHERE id = $1")
+            .bind(id)
+            .bind(json!({
+                "operating_system": "RHEL 9",
+                "datacenter": "DC-PROD",
+                "cluster": "Compute-01",
+                "datastore": "Datastore-01",
+                "network": "VLAN-210",
+                "template": "rhel-9-approved",
+                "disk_size_gb": "80"
+            }))
+            .execute(pool)
+            .await
+            .expect("seed server placement");
     }
 
     async fn cleanup_request(pool: &PgPool, id: Uuid) {
@@ -18310,6 +18668,52 @@ mod step_materialization_db_tests {
         pool.close().await;
     }
 
+    #[tokio::test]
+    async fn live_plan_with_missing_placement_inserts_no_agent_job() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_locked_request(&pool).await;
+        sqlx::query("UPDATE requests SET payload = $2::jsonb WHERE id = $1")
+            .bind(id)
+            .bind(json!({"operating_system": "RHEL 9"}))
+            .execute(&pool)
+            .await
+            .expect("seed OS without placement");
+        let (current, request) = load_request(&pool, id).await;
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let error = materialize_execution(
+            &mut tx,
+            id,
+            &request,
+            &current,
+            ryuki_protocol::JobMode::LivePlan,
+        )
+        .await
+        .expect_err("live plan must reject missing placement");
+        tx.rollback().await.expect("rollback tx");
+
+        match error {
+            MaterializeError::InvalidLivePlacement(message) => {
+                assert!(message.contains("datacenter"));
+                assert!(message.contains("disk_size_gb"));
+            }
+            other => panic!("expected InvalidLivePlacement, got {other:?}"),
+        }
+        let job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("count jobs");
+        assert_eq!(job_count, 0, "validation must run before job insertion");
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
     /// #42 slice B1a: a step-plan request executed with `mode=LivePlan`
     /// dispatches its initial ready step(s) as `LivePlan` agent_jobs, with
     /// `job_steps.status = 'Planning'` (not `Running`, which is the
@@ -18323,6 +18727,7 @@ mod step_materialization_db_tests {
             return;
         };
         let id = seed_locked_request(&pool).await;
+        seed_server_placement(&pool, id).await;
         let mut conn = pool.acquire().await.expect("acquire conn");
         crate::repos::job_steps::insert_plan(
             &mut conn,
@@ -18760,6 +19165,7 @@ mod step_authoring_db_tests {
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
             vars: Default::default(),
+            state_key: Some(request_state_key(id)),
             mode: ryuki_protocol::JobMode::LiveApply,
         };
         let digest = "a".repeat(64);
@@ -18828,6 +19234,7 @@ mod step_authoring_db_tests {
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
             vars: Default::default(),
+            state_key: Some(request_state_key(id)),
             mode: ryuki_protocol::JobMode::LiveApply,
         };
         let digest = "a".repeat(64);
@@ -18864,6 +19271,124 @@ mod step_authoring_db_tests {
     }
 }
 
+fn live_verify_prerequisite_error(
+    has_live_plan: bool,
+    has_digest_bound_live_apply: bool,
+    has_incomplete_live_steps: bool,
+) -> Option<&'static str> {
+    if !has_live_plan {
+        return None;
+    }
+    if !has_digest_bound_live_apply {
+        return Some(
+            "live verification requires a successful LiveApply bound to the reviewed LivePlan",
+        );
+    }
+    if has_incomplete_live_steps {
+        return Some("live verification requires every orchestration step to be applied");
+    }
+    None
+}
+
+/// A request that entered the live path may be verified only after the exact
+/// reviewed plan digest was used by a successful LiveApply. This is enforced at
+/// the API boundary in addition to the request state machine so a stale portal
+/// or direct client cannot turn a plan-only request into `completed`.
+async fn enforce_live_verify_prerequisite(
+    pool: &sqlx::PgPool,
+    request_id: Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let has_live_plan: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agent_jobs \
+         WHERE request_id = $1 AND mode = 'LivePlan')",
+    )
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+
+    if !has_live_plan {
+        return Ok(());
+    }
+
+    let has_digest_bound_live_apply: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM agent_jobs plan_job \
+             JOIN agent_jobs apply_job \
+               ON apply_job.request_id = plan_job.request_id \
+              AND apply_job.mode = 'LiveApply' \
+              AND apply_job.status = 'Succeeded' \
+              AND ( \
+                    apply_job.result_status = 'verified' \
+                    OR ( \
+                        apply_job.result_status = 'applied' \
+                        AND split_part(apply_job.spec->>'iac_ref', '@', 1) NOT IN ( \
+                            'linux-server-deployment', 'windows-server-deployment' \
+                        ) \
+                    ) \
+                  ) \
+              AND apply_job.completed_at IS NOT NULL \
+              AND apply_job.live_context->>'approved_plan_digest' = plan_job.evidence_digest \
+             WHERE plan_job.request_id = $1 \
+               AND plan_job.mode = 'LivePlan' \
+               AND plan_job.status = 'Succeeded' \
+               AND plan_job.result_status IN ('planned', 'check_ok') \
+               AND plan_job.evidence_digest IS NOT NULL \
+         )",
+    )
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+
+    let has_incomplete_live_steps: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM job_steps \
+         WHERE request_id = $1 AND status <> 'Applied')",
+    )
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+
+    if let Some(message) = live_verify_prerequisite_error(
+        has_live_plan,
+        has_digest_bound_live_apply,
+        has_incomplete_live_steps,
+    ) {
+        return Err(status_409(message));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod live_verify_prerequisite_tests {
+    use super::live_verify_prerequisite_error;
+
+    #[test]
+    fn offline_request_has_no_live_prerequisite() {
+        assert_eq!(live_verify_prerequisite_error(false, false, false), None);
+    }
+
+    #[test]
+    fn plan_only_request_cannot_verify() {
+        assert!(live_verify_prerequisite_error(true, false, false)
+            .expect("plan-only request must be blocked")
+            .contains("successful LiveApply"));
+    }
+
+    #[test]
+    fn incomplete_step_plan_cannot_verify() {
+        assert!(live_verify_prerequisite_error(true, true, true)
+            .expect("incomplete live steps must be blocked")
+            .contains("every orchestration step"));
+    }
+
+    #[test]
+    fn digest_bound_apply_with_complete_steps_can_verify() {
+        assert_eq!(live_verify_prerequisite_error(true, true, false), None);
+    }
+}
+
 async fn requests_verify(
     Path(request_id): Path<String>,
     AuthExtractor(session): AuthExtractor,
@@ -18886,6 +19411,7 @@ async fn requests_verify(
         // logic — so an out-of-scope request is a clean 404 (no state oracle),
         // never a cross-scope action. Unrestricted principals pass unchanged.
         scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+        enforce_live_verify_prerequisite(pool, uid).await?;
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::verify_request(&request).map_err(map_engine_error)?;
@@ -25373,12 +25899,17 @@ async fn snapshot_records_list(
     let limit = page.limit.unwrap_or(500).clamp(1, 1000);
     let offset = page.offset.unwrap_or(0).max(0);
     let Some(pool) = get_db() else {
-        return Ok((total_count_headers(0), Json(serde_json::Value::Array(vec![]))));
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
     };
     let records = crate::repos::snapshots::list_page(pool, limit, offset)
         .await
         .map_err(db_error)?;
-    let total = crate::repos::snapshots::count(pool).await.map_err(db_error)?;
+    let total = crate::repos::snapshots::count(pool)
+        .await
+        .map_err(db_error)?;
     Ok((
         total_count_headers(total),
         Json(serde_json::to_value(&records).unwrap_or_default()),
@@ -28212,9 +28743,10 @@ async fn network_reserve_ips(
                 body.vlan_id, body.site
             )))
         }
-        Err(crate::repos::network_readiness::ReserveError::NotFound) => {
-            Err(status_404(&format!("VLAN {} at site {}", body.vlan_id, body.site)))
-        }
+        Err(crate::repos::network_readiness::ReserveError::NotFound) => Err(status_404(&format!(
+            "VLAN {} at site {}",
+            body.vlan_id, body.site
+        ))),
         Err(crate::repos::network_readiness::ReserveError::Db(e)) => Err(db_error(e)),
     }
 }
@@ -31077,7 +31609,20 @@ async fn platform_health_metrics_text() -> axum::response::Response {
         .unwrap()
 }
 
-// ─── Site Registry (UN/LOCODE) handlers ───
+// ─── Site Registry handlers ───
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SiteRegistryCreateRequest {
+    code: String,
+    code_system: ryuki_engine::site_registry::SiteCodeSystem,
+    name: String,
+    country: String,
+    country_code: String,
+    timezone: String,
+    #[serde(default)]
+    active: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -31085,29 +31630,157 @@ struct SiteSearchQuery {
     q: String,
 }
 
-async fn site_registry_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry::list_sites(false)
+#[derive(Debug, Default, Deserialize)]
+struct SiteListQuery {
+    active: Option<bool>,
+}
+
+async fn site_registry_list(
+    Query(params): Query<SiteListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::list_sites(params.active.unwrap_or(false))
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 
 async fn site_registry_get(
-    Path(unlocode): Path<String>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry::get_site(&unlocode)
+    site_registry::get_site(&code)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-/// Serializes site-registry toggles so each DB write + write-through static update
+fn normalized_site_metadata(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(status_400(&format!(
+            "{field} must contain 1-{max_len} non-control characters"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn normalized_site_country_code(
+    code: &str,
+    code_system: site_registry::SiteCodeSystem,
+    value: &str,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let country_code = value.trim().to_ascii_uppercase();
+    if country_code.len() != 2 || !country_code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(status_400(
+            "countryCode must be a two-letter ISO 3166-1 alpha-2 code",
+        ));
+    }
+    if code_system == site_registry::SiteCodeSystem::Unlocode && !code.starts_with(&country_code) {
+        return Err(status_400(
+            "countryCode must match the first two characters of the UN/LOCODE",
+        ));
+    }
+    Ok(country_code)
+}
+
+async fn site_registry_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<SiteRegistryCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Defense in depth: the central `/api/admin` permission gate is
+    // authoritative, and this keeps registration protected if routing changes.
+    if !check_permission(&session, "admin") {
+        return Err(status_403());
+    }
+
+    let code = site_registry::normalize_site_code(&body.code, body.code_system)
+        .map_err(|error| status_400(&error))?;
+    let name = normalized_site_metadata("name", &body.name, 120)?;
+    let country = normalized_site_metadata("country", &body.country, 120)?;
+    let country_code = normalized_site_country_code(&code, body.code_system, &body.country_code)?;
+    let timezone = normalized_site_metadata("timezone", &body.timezone, 64)?;
+    if !timezone.is_ascii()
+        || !timezone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+'))
+    {
+        return Err(status_400(
+            "timezone must use an ASCII IANA-style identifier",
+        ));
+    }
+
+    let site = site_registry::SiteEntry {
+        unlocode: code.clone(),
+        name,
+        country,
+        country_code,
+        timezone,
+        active: body.active,
+    };
+
+    if let Some(pool) = get_db() {
+        let _guard = site_registry_write_lock().lock().await;
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let row = crate::repos::site_registry::SiteEntryRow {
+            unlocode: site.unlocode.clone(),
+            code_system: body.code_system.as_str().to_string(),
+            name: site.name.clone(),
+            country: site.country.clone(),
+            country_code: site.country_code.clone(),
+            timezone: site.timezone.clone(),
+            active: site.active,
+        };
+        let inserted = crate::repos::site_registry::insert(&mut *tx, &row)
+            .await
+            .map_err(db_error)?;
+        if !inserted {
+            tx.rollback().await.map_err(db_error)?;
+            return Err(status_409(&format!("Site '{code}' already exists")));
+        }
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "site-registry-create",
+                None,
+                "registered",
+                json!({ "code": code, "code_system": body.code_system.as_str() }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        site_registry::upsert_site(site, body.code_system).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+        })?;
+        let mut result = site_registry::get_site(&code).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+        })?;
+        result["source"] = json!("database");
+        Ok(Json(result))
+    } else {
+        site_registry::register_site(site, body.code_system)
+            .map(Json)
+            .map_err(|error| status_409(&error))
+    }
+}
+
+/// Serializes site-registry writes so each DB write + write-through static update
 /// applies as ONE unit. Without this, two concurrent OPPOSITE toggles of the same
 /// site could commit to the DB in one order but update the static in another,
 /// leaving the cache (which drives cross-engine `is_valid_site`) disagreeing with
 /// the DB until the next toggle/restart. Site toggles are rare admin actions, so a
 /// single global lock is adequate.
-static SITE_TOGGLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-fn site_toggle_lock() -> &'static Mutex<()> {
-    SITE_TOGGLE_LOCK.get_or_init(|| Mutex::new(()))
+static SITE_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn site_registry_write_lock() -> &'static Mutex<()> {
+    SITE_REGISTRY_WRITE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// Toggle a site's `active` flag with write-through-cache coherence. With a DB,
@@ -31115,7 +31788,7 @@ fn site_toggle_lock() -> &'static Mutex<()> {
 /// the two never diverge, returning the engine site view tagged `source:database`.
 /// Without a DB, falls back to the engine static only (`source:dry-run`).
 async fn site_registry_set_active(
-    unlocode: &str,
+    code: &str,
     active: bool,
     session: &AuthSession,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -31135,34 +31808,36 @@ async fn site_registry_set_active(
     };
 
     if let Some(pool) = get_db() {
-        // One critical section for DB write + static update (see SITE_TOGGLE_LOCK).
-        let _guard = site_toggle_lock().lock().await;
+        // One critical section for DB write + static update.
+        let _guard = site_registry_write_lock().lock().await;
         let mut tx = pool.begin().await.map_err(db_error)?;
-        let found = crate::repos::site_registry::set_active(&mut *tx, unlocode, active)
+        let code = site_registry::normalize_site_code_for_lookup(code)
+            .map_err(|error| status_400(&error))?;
+        let found = crate::repos::site_registry::set_active(&mut *tx, &code, active)
             .await
             .map_err(db_error)?;
         if !found {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Site '{}' not found in reference list", unlocode)})),
+                Json(json!({"error": format!("Site '{}' not found in registry", code)})),
             ));
         }
         audit::record_audit_tx(
             &mut tx,
             session,
-            &audit::security_audit(action, None, to_status, json!({ "unlocode": unlocode })),
+            &audit::security_audit(action, None, to_status, json!({ "code": code })),
         )
         .await
         .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
-        let mut result = engine_toggle(unlocode)
-            .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
+        let mut result =
+            engine_toggle(&code).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
         result["source"] = json!("database");
         Ok(Json(result))
     } else {
         // No DB: engine static only (dry-run fallback); the static is the sole
         // store, so there is no DB/cache divergence to guard against.
-        engine_toggle(unlocode)
+        engine_toggle(code)
             .map(Json)
             .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
     }
@@ -31170,16 +31845,16 @@ async fn site_registry_set_active(
 
 async fn site_registry_activate(
     AuthExtractor(session): AuthExtractor,
-    Path(unlocode): Path<String>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry_set_active(&unlocode, true, &session).await
+    site_registry_set_active(&code, true, &session).await
 }
 
 async fn site_registry_deactivate(
     AuthExtractor(session): AuthExtractor,
-    Path(unlocode): Path<String>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry_set_active(&unlocode, false, &session).await
+    site_registry_set_active(&code, false, &session).await
 }
 
 async fn site_registry_search(
@@ -31205,22 +31880,97 @@ async fn site_registry_cities_by_country(
 }
 
 async fn site_registry_contract() -> Json<Value> {
+    let active_sites = site_registry::get_active_site_codes().unwrap_or_default();
     Json(json!({
-        "source": "static-seed",
+        "source": "database-backed-registry",
         "providerCallsEnabled": false,
         "liveExecutionEnabled": false,
-        "description": "UN/LOCODE-based site registry. Sites are identified by 5-character UN/LOCODE codes (e.g. DEFRA for Frankfurt, GBLON for London). Activate sites to make them available for engine operations.",
+        "description": "Governed site-code registry. UN/LOCODE is recommended; administrators may register canonical custom codes. Only active registered sites are available for engine operations.",
+        "recommendedCodeSystem": "unlocode",
+        "supportedCodeSystems": ["unlocode", "custom"],
+        "customCodeFormat": "2-32 uppercase ASCII letters, digits, dots, underscores or hyphens; starts and ends alphanumeric",
         "referenceData": "UN/LOCODE — United Nations Code for Trade and Transport Locations",
         "endpoints": [
-            {"method":"GET","path":"/api/admin/sites","description":"List all reference sites with active status"},
-            {"method":"GET","path":"/api/admin/sites/{unlocode}","description":"Get single site details"},
-            {"method":"POST","path":"/api/admin/sites/{unlocode}/activate","description":"Activate a site for use"},
-            {"method":"POST","path":"/api/admin/sites/{unlocode}/deactivate","description":"Deactivate a site"},
-            {"method":"GET","path":"/api/admin/sites/search?q={query}","description":"Search by unlocode, city name, country, or country code"}
+            {"method":"GET","path":"/api/admin/sites","description":"List registered sites with active status"},
+            {"method":"POST","path":"/api/admin/sites","description":"Register a UN/LOCODE or custom site code"},
+            {"method":"GET","path":"/api/admin/sites/{code}","description":"Get single site details"},
+            {"method":"POST","path":"/api/admin/sites/{code}/activate","description":"Activate a site for use"},
+            {"method":"POST","path":"/api/admin/sites/{code}/deactivate","description":"Deactivate a site"},
+            {"method":"GET","path":"/api/admin/sites/search?q={query}","description":"Search by site code, city name, country, or country code"}
         ],
-        "activeSites": ["DEBER","DEFRA","FRPAR","GBLON","NLAMS"],
-        "supportedCountries": ["DE","FR","GB","NL","ES","IT","CH","AT","BE","SE","DK","IE"]
+        "activeSites": active_sites,
+        "referenceCountryExamples": ["DE","FR","GB","NL","ES","IT","CH","AT","BE","SE","DK","IE"]
     }))
+}
+
+#[cfg(test)]
+mod site_registry_contract_tests {
+    use super::*;
+
+    fn registration_json() -> Value {
+        json!({
+            "code": "BEBRU",
+            "codeSystem": "unlocode",
+            "name": "Brussels",
+            "country": "Belgium",
+            "countryCode": "BE",
+            "timezone": "Europe/Brussels",
+            "active": false
+        })
+    }
+
+    #[test]
+    fn registration_body_is_strict_and_uses_explicit_code_system() {
+        let body: SiteRegistryCreateRequest =
+            serde_json::from_value(registration_json()).expect("valid registration body");
+        assert_eq!(body.code_system, site_registry::SiteCodeSystem::Unlocode);
+
+        let mut with_unknown = registration_json();
+        with_unknown["unexpected"] = json!(true);
+        assert!(
+            serde_json::from_value::<SiteRegistryCreateRequest>(with_unknown).is_err(),
+            "unknown registration fields must be rejected"
+        );
+
+        let mut without_system = registration_json();
+        without_system
+            .as_object_mut()
+            .expect("registration fixture object")
+            .remove("codeSystem");
+        assert!(
+            serde_json::from_value::<SiteRegistryCreateRequest>(without_system).is_err(),
+            "codeSystem must be explicit so a five-character custom code is not misclassified"
+        );
+    }
+
+    #[test]
+    fn unlocode_country_must_match_identifier_prefix() {
+        let code =
+            site_registry::normalize_site_code("BEBRU", site_registry::SiteCodeSystem::Unlocode)
+                .unwrap();
+        assert_eq!(
+            normalized_site_country_code(&code, site_registry::SiteCodeSystem::Unlocode, " be ",)
+                .unwrap(),
+            "BE"
+        );
+        let error =
+            normalized_site_country_code(&code, site_registry::SiteCodeSystem::Unlocode, "NL")
+                .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1["error"],
+            "countryCode must match the first two characters of the UN/LOCODE"
+        );
+    }
+
+    #[test]
+    fn custom_code_country_is_metadata_not_an_identifier_prefix() {
+        assert_eq!(
+            normalized_site_country_code("DC-EU-01", site_registry::SiteCodeSystem::Custom, "BE",)
+                .unwrap(),
+            "BE"
+        );
+    }
 }
 
 // ─── Runbook Execution handlers ───
@@ -34188,7 +34938,7 @@ async fn firewall_rule_update(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error": format!("Unrecognised update action: {}", other)})),
-                ))
+                ));
             }
         };
         // #2: lock the row and guard its site inside ONE tx BEFORE the update, so
@@ -34330,8 +35080,7 @@ async fn firewall_rule_set_list(
     // #2: resolve the SQL site filter, preserving the old two-branch scope logic
     // (explicit ?site vs list-all) but pushing scope INTO SQL so the page and the
     // total both reflect the filtered set (was fetch-all + retain_site_scoped).
-    let sites: Option<Vec<String>> = if let Some(site) =
-        q.site.as_deref().filter(|s| !s.is_empty())
+    let sites: Option<Vec<String>> = if let Some(site) = q.site.as_deref().filter(|s| !s.is_empty())
     {
         // An explicit ?site must be within the principal's scope (403 if not;
         // env-scoped denied), then list just that site.
@@ -37346,7 +38095,7 @@ async fn secrets_rotation_fail(
                 return Err(secrets_not_found(format!(
                     "Rotation '{}' not found",
                     b.rotation_id
-                )))
+                )));
             }
         };
         // #2: rotation_runs has no site column — scope on the PARENT secret's site
@@ -40473,14 +41222,22 @@ mod unit_tests {
         let Err((status, Json(body))) = mock_login_gate(&AuthMode::Local) else {
             panic!("local mode should reject the anonymous mock mint");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST, "permanent client error, not a 5xx");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "permanent client error, not a 5xx"
+        );
         assert_eq!(body.error, "LOCAL_AUTH_MODE");
         assert_eq!(body.message, "Use /api/auth/local/login in local auth mode");
 
         let Err((status, Json(body))) = mock_login_gate(&AuthMode::EntraId) else {
             panic!("entra mode should reject the anonymous mock mint");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST, "permanent client error, not a 5xx");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "permanent client error, not a 5xx"
+        );
         assert_eq!(body.error, "ENTRA_AUTH_MODE");
     }
 
@@ -43882,6 +44639,21 @@ mod db_lifecycle_tests {
             .ok();
     }
 
+    fn reviewable_server_plan_bytes() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "format_version": "1.2",
+            "resource_changes": [
+                {"mode":"data","type":"vsphere_datacenter","name":"dc","change":{"actions":["read"],"after":{"name":"DC-PROD"}}},
+                {"mode":"data","type":"vsphere_compute_cluster","name":"cluster","change":{"actions":["read"],"after":{"name":"Compute-01"}}},
+                {"mode":"data","type":"vsphere_datastore","name":"ds","change":{"actions":["read"],"after":{"name":"Datastore-01"}}},
+                {"mode":"data","type":"vsphere_network","name":"net","change":{"actions":["read"],"after":{"name":"VLAN-210"}}},
+                {"mode":"data","type":"vsphere_virtual_machine","name":"template","change":{"actions":["read"],"after":{"name":"rhel-9-approved"}}},
+                {"mode":"managed","type":"vsphere_virtual_machine","name":"linux_server","change":{"actions":["create"],"after":{"name":"first-test-vm","num_cpus":2,"memory":4096,"disk":[{"label":"disk0","size":80}]}}}
+            ]
+        }))
+        .expect("serialize reviewable server plan")
+    }
+
     /// #2 RBAC: EVERY request lifecycle transition funnels through
     /// apply_transition_audited, which now scope-guards on the loaded request's
     /// site/environment. A principal scoped to another site gets a 404 (not a
@@ -46065,9 +46837,10 @@ mod db_lifecycle_tests {
                 .expect("seed DEFRA");
         }
         for i in 0..2 {
-            let _ = on_call_contact_create(admin(), Json(mk(Some("GBLON"), &format!("P14 G{i}"), 2)))
-                .await
-                .expect("seed GBLON");
+            let _ =
+                on_call_contact_create(admin(), Json(mk(Some("GBLON"), &format!("P14 G{i}"), 2)))
+                    .await
+                    .expect("seed GBLON");
         }
         let global = on_call_contact_create(admin(), Json(mk(None, "P14 Global", 1)))
             .await
@@ -46143,13 +46916,11 @@ mod db_lifecycle_tests {
             s.site_scope = vec!["GBLON".into()];
             s
         };
-        let scoped = on_call_contact_list(
-            AuthExtractor(gblon()),
-            Query(OnCallListQuery::default()),
-        )
-        .await
-        .expect("scoped list")
-        .0;
+        let scoped =
+            on_call_contact_list(AuthExtractor(gblon()), Query(OnCallListQuery::default()))
+                .await
+                .expect("scoped list")
+                .0;
         let scoped_contacts = scoped["contacts"].as_array().unwrap();
         assert!(
             !scoped_contacts.is_empty(),
@@ -46219,13 +46990,11 @@ mod db_lifecycle_tests {
         // An environment-scoped principal sees nothing (site-only resource).
         let mut env_scoped = AuthSession::static_dry_run();
         env_scoped.environment_scope = vec!["production".into()];
-        let none = on_call_contact_list(
-            AuthExtractor(env_scoped),
-            Query(OnCallListQuery::default()),
-        )
-        .await
-        .expect("env-scoped list")
-        .0;
+        let none =
+            on_call_contact_list(AuthExtractor(env_scoped), Query(OnCallListQuery::default()))
+                .await
+                .expect("env-scoped list")
+                .0;
         assert!(
             none["contacts"].as_array().unwrap().is_empty(),
             "an env-scoped principal must see no site-only contacts"
@@ -46237,13 +47006,10 @@ mod db_lifecycle_tests {
         // strips blanks) scope set fails CLOSED to nothing, never widens.
         let mut blank = AuthSession::static_dry_run();
         blank.site_scope = vec!["".into(), " ".into()];
-        let nothing = on_call_contact_list(
-            AuthExtractor(blank),
-            Query(OnCallListQuery::default()),
-        )
-        .await
-        .expect("all-blank list")
-        .0;
+        let nothing = on_call_contact_list(AuthExtractor(blank), Query(OnCallListQuery::default()))
+            .await
+            .expect("all-blank list")
+            .0;
         assert!(
             nothing["contacts"].as_array().unwrap().is_empty(),
             "an all-blank scope set must match NOTHING"
@@ -46261,12 +47027,11 @@ mod db_lifecycle_tests {
         .await
         .expect("tier filter")
         .0;
-        let raw_tier2: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM on_call_contacts WHERE escalation_tier = 2",
-        )
-        .fetch_one(pool)
-        .await
-        .expect("raw tier count");
+        let raw_tier2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM on_call_contacts WHERE escalation_tier = 2")
+                .fetch_one(pool)
+                .await
+                .expect("raw tier count");
         assert_eq!(tier2["total"].as_i64().unwrap(), raw_tier2);
         assert!(
             tier2["contacts"]
@@ -46735,6 +47500,10 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        crate::config_store::init_with_config(
+            "/tmp/ryuki-test-token-audit-config.json",
+            &ryuki_core::config::RyukiConfig::default(),
+        );
         let admin = admin_session("dbtest-admin-tok-4d2");
         let created = admin_tokens_create(
             AuthExtractor(admin.clone()),
@@ -46901,13 +47670,11 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        // Claim the set-once config store with a TEMP path so the handler's
-        // file-save can never touch the real gitignored platform-config.json.
-        // Skip if another test in this binary already owns the store.
-        if !crate::config_store::try_init_for_test("/tmp/ryuki-test-cfg-6e0.json") {
-            eprintln!("SKIP: config store already initialized by another test");
-            return;
-        }
+        // Keep the handler's file save away from the real gitignored config.
+        crate::config_store::init_with_config(
+            "/tmp/ryuki-test-cfg-6e0.json",
+            &ryuki_core::config::RyukiConfig::default(),
+        );
         // A verified interactive admin (token_valid + non-machine provider)
         // passes require_verified_external_admin_permission for any auth_mode.
         let mut admin = admin_session("dbtest-admin-cfg-6e0");
@@ -49239,12 +50006,11 @@ mod db_lifecycle_tests {
 
         // EXACT offset-slice equality against the full ordering (id tie-breaker
         // within the shared created_at).
-        let full_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM metric_budgets ORDER BY created_at DESC, id DESC",
-        )
-        .fetch_all(pool)
-        .await
-        .expect("full ordering");
+        let full_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM metric_budgets ORDER BY created_at DESC, id DESC")
+                .fetch_all(pool)
+                .await
+                .expect("full ordering");
         for offset in [0usize, 3, 6] {
             let paged = metrics_budget_list(
                 admin(),
@@ -49306,7 +50072,10 @@ mod db_lifecycle_tests {
         for (label, sess) in [
             ("site-scoped DEFRA", mk_sess(&["DEFRA"], &[])),
             ("env-scoped production", mk_sess(&[], &["production"])),
-            ("dual-scoped DEFRA/production", mk_sess(&["DEFRA"], &["production"])),
+            (
+                "dual-scoped DEFRA/production",
+                mk_sess(&["DEFRA"], &["production"]),
+            ),
             ("all-blank site scope", mk_sess(&["", " "], &[])),
         ] {
             let want = expect_ids(&sess);
@@ -49360,12 +50129,18 @@ mod db_lifecycle_tests {
         .expect("defra list")
         .0;
         let defra_ids = ids_for(&defra);
-        assert!(defra_ids.contains(site_only_id), "(DEFRA, NULL) is in scope");
+        assert!(
+            defra_ids.contains(site_only_id),
+            "(DEFRA, NULL) is in scope"
+        );
         assert!(
             defra_ids.contains(env_only_id),
             "(NULL, production) has a platform-wide site axis — visible"
         );
-        assert!(defra_ids.contains(global_id), "(NULL, NULL) is platform-wide");
+        assert!(
+            defra_ids.contains(global_id),
+            "(NULL, NULL) is platform-wide"
+        );
         assert!(
             !defra_ids.contains(gblon_id),
             "a foreign concrete site must NOT leak to a site-scoped principal"
@@ -49456,6 +50231,19 @@ mod db_lifecycle_tests {
     }
 
     fn create_body(request_type: &str) -> CreateRequest {
+        let fields = if request_type == "server-deployment" {
+            std::collections::BTreeMap::from([
+                ("operating_system".into(), "RHEL 9".into()),
+                ("datacenter".into(), "DC-PROD".into()),
+                ("cluster".into(), "Compute-01".into()),
+                ("datastore".into(), "Datastore-01".into()),
+                ("network".into(), "VLAN-210".into()),
+                ("template".into(), "rhel-9-approved".into()),
+                ("disk_size_gb".into(), "80".into()),
+            ])
+        } else {
+            std::collections::BTreeMap::new()
+        };
         CreateRequest {
             request_type: request_type.into(),
             site: "DEFRA".into(),
@@ -49464,7 +50252,7 @@ mod db_lifecycle_tests {
             cpu: 4,
             memory_gb: 8,
             justification: "p2 durable-state test".into(),
-            fields: std::collections::BTreeMap::new(),
+            fields,
         }
     }
 
@@ -51829,11 +52617,13 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        // Unrestricted admin creates a DEFRA/production request (create_body site).
+        // A distinct requester creates a DEFRA/production request (create_body
+        // site); the unrestricted admin is the approving principal.
         let admin = admin_session("la-scope-admin");
+        let requester = admin_session("la-scope-requester");
         let p = |s: &str| Path(s.to_string());
         let Ok(Json(created)) = requests_create(
-            AuthExtractor(admin.clone()),
+            AuthExtractor(requester.clone()),
             Json(create_body("server-deployment")),
         )
         .await
@@ -51842,6 +52632,12 @@ mod db_lifecycle_tests {
         };
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let own = requests_approve_live_apply(p(&id_str), AuthExtractor(requester)).await;
+        assert!(
+            matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "the requester must not approve their own live apply: {own:?}"
+        );
 
         // A GBLON-scoped admin must 404 (not 409) — scope guard precedes the
         // no-completed-plan 409, so it is not an existence oracle.
@@ -51877,10 +52673,11 @@ mod db_lifecycle_tests {
         // Idempotent test init of the process-global CP signing key.
         crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
         let admin = admin_session("approver-la");
+        let requester = admin_session("requester-la");
         let p = |s: &str| Path(s.to_string());
 
         let Ok(Json(created)) = requests_create(
-            AuthExtractor(admin.clone()),
+            AuthExtractor(requester),
             Json(create_body("server-deployment")),
         )
         .await
@@ -51898,24 +52695,48 @@ mod db_lifecycle_tests {
         };
         assert_eq!(st, StatusCode::CONFLICT);
 
-        // Seed a SUCCEEDED LivePlan job: spec.request_id == uid, mode serializes
-        // snake_case ("live_plan"), 64-hex evidence digest (the plan digest).
-        let digest = "a".repeat(64);
-        let spec = json!({
-            "request_id": id_str,
-            "offering_id": Uuid::new_v4().to_string(),
-            "iac_ref": "linux-server-deployment@v1",
-            "iac_digest": "0".repeat(64),
-            "vars": {},
-            "mode": "live_plan"
-        });
+        // Seed a SUCCEEDED LivePlan plus its digest-covered canonical Terraform
+        // JSON. Approval must be able to derive the same safe review projection
+        // the portal showed; a bare digest is no longer sufficient.
+        let plan_bytes = reviewable_server_plan_bytes();
+        let digest = ryuki_protocol::sha256_hex(&plan_bytes);
+        let spec = ryuki_protocol::JobSpec {
+            request_id: id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: ryuki_runner::iac::offering_iac_digest("linux-server-deployment")
+                .expect("embedded IaC digest"),
+            vars: std::collections::BTreeMap::from([
+                ("vm_name".to_string(), "first-test-vm".to_string()),
+                ("num_cpus".to_string(), "2".to_string()),
+                ("memory_mb".to_string(), "4096".to_string()),
+                ("datacenter".to_string(), "DC-PROD".to_string()),
+                ("cluster".to_string(), "Compute-01".to_string()),
+                ("datastore".to_string(), "Datastore-01".to_string()),
+                ("network".to_string(), "VLAN-210".to_string()),
+                ("template".to_string(), "rhel-9-approved".to_string()),
+                ("disk_size_gb".to_string(), "80".to_string()),
+            ]),
+            state_key: Some(request_state_key(id)),
+            mode: ryuki_protocol::JobMode::LivePlan,
+        };
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO NOTHING",
+        )
+        .bind(&digest)
+        .bind(&plan_bytes)
+        .bind(plan_bytes.len() as i64)
+        .execute(pool)
+        .await
+        .expect("seed digest-covered plan bytes");
         sqlx::query(
             "INSERT INTO agent_jobs \
              (request_id, platform, spec, mode, status, result_status, evidence_digest, completed_at) \
              VALUES ($1, 'DEFRA', $2::jsonb, 'LivePlan', 'Succeeded', 'planned', $3, NOW())",
         )
         .bind(id)
-        .bind(&spec)
+        .bind(serde_json::to_value(&spec).unwrap())
         .bind(&digest)
         .execute(pool)
         .await
@@ -51959,6 +52780,11 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+        sqlx::query("DELETE FROM evidence_blobs WHERE digest = $1")
+            .bind(&digest)
+            .execute(pool)
+            .await
+            .ok();
         cleanup_request(pool, id).await;
     }
 
@@ -51971,23 +52797,66 @@ mod db_lifecycle_tests {
         let req_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by, requester) \
-             VALUES ($1, 'server-deployment', 'executing', 'execute', 'DEFRA', 'production', 'b1b-step', 2, 4, $2, $2)",
+             VALUES ($1, 'server-deployment', 'executing', 'execute', 'DEFRA', 'production', 'first-test-vm', 2, 4, $2, $2)",
         )
         .bind(req_id)
         .bind(requester)
         .execute(pool)
         .await
         .expect("seed executing request");
+        let plan_bytes = reviewable_server_plan_bytes();
+        let plan_digest = ryuki_protocol::sha256_hex(&plan_bytes);
         let step_id: Uuid = sqlx::query_scalar(
             "INSERT INTO job_steps (request_id, step_key, depends_on, iac_ref, status, live_plan_digest) \
              VALUES ($1, 'a', '{}', 'linux-server-deployment', $2, $3) RETURNING id",
         )
         .bind(req_id)
         .bind(status)
-        .bind("a".repeat(64))
+        .bind(&plan_digest)
         .fetch_one(pool)
         .await
         .expect("seed step");
+        let spec = ryuki_protocol::JobSpec {
+            request_id: req_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment".to_string(),
+            iac_digest: ryuki_runner::iac::offering_iac_digest("linux-server-deployment")
+                .expect("embedded IaC digest"),
+            vars: std::collections::BTreeMap::from([
+                ("vm_name".to_string(), "first-test-vm".to_string()),
+                ("num_cpus".to_string(), "2".to_string()),
+                ("memory_mb".to_string(), "4096".to_string()),
+                ("datacenter".to_string(), "DC-PROD".to_string()),
+                ("cluster".to_string(), "Compute-01".to_string()),
+                ("datastore".to_string(), "Datastore-01".to_string()),
+                ("network".to_string(), "VLAN-210".to_string()),
+                ("template".to_string(), "rhel-9-approved".to_string()),
+                ("disk_size_gb".to_string(), "80".to_string()),
+            ]),
+            state_key: Some(step_state_key(step_id)),
+            mode: ryuki_protocol::JobMode::LivePlan,
+        };
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO NOTHING",
+        )
+        .bind(&plan_digest)
+        .bind(&plan_bytes)
+        .bind(plan_bytes.len() as i64)
+        .execute(pool)
+        .await
+        .expect("seed step plan evidence");
+        sqlx::query(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, result_status, evidence_digest, completed_at) \
+             VALUES ($1, 'DEFRA', $2::jsonb, 'LivePlan', 'Succeeded', 'planned', $3, NOW())",
+        )
+        .bind(req_id)
+        .bind(serde_json::to_value(spec).unwrap())
+        .bind(&plan_digest)
+        .execute(pool)
+        .await
+        .expect("seed successful step LivePlan");
         (req_id, step_id)
     }
 
@@ -52633,6 +53502,137 @@ mod db_lifecycle_tests {
 
         cleanup_request(pool, a).await;
         cleanup_request(pool, b).await;
+    }
+
+    async fn seed_pending_live_apply_for_request(
+        pool: &sqlx::PgPool,
+        request_id: Uuid,
+        platform: &str,
+    ) -> Uuid {
+        let spec = ryuki_protocol::JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
+            mode: ryuki_protocol::JobMode::LiveApply,
+        };
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, 'LiveApply', 'Pending') RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(serde_json::to_value(spec).expect("serialize live apply spec"))
+        .fetch_one(pool)
+        .await
+        .expect("seed pending live apply")
+    }
+
+    #[tokio::test]
+    async fn request_fail_atomically_cancels_pending_live_apply() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let request_id = seed_request(pool, "approved", "execute").await;
+        let platform = format!("fail-fence-{}", Uuid::new_v4().simple());
+        let job_id = seed_pending_live_apply_for_request(pool, request_id, &platform).await;
+
+        fail_one(
+            &operator_session(),
+            &request_id.to_string(),
+            "operator stopped request before dispatch",
+        )
+        .await
+        .expect("failure must cancel a not-yet-dispatched live apply");
+
+        let (request_status, job_status): (String, String) = sqlx::query_as(
+            "SELECT r.status, j.status FROM requests r JOIN agent_jobs j ON j.request_id = r.id \
+             WHERE r.id = $1 AND j.id = $2",
+        )
+        .bind(request_id)
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read fenced failure state");
+        assert_eq!(request_status, "failed");
+        assert_eq!(job_status, "Cancelled");
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events WHERE event_type = 'job.cancelled' \
+             AND aggregate_id = $1 AND payload->>'to_status' = 'request-concluded-before-dispatch'",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count cancellation event");
+        assert_eq!(event_count, 1);
+
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, request_id).await;
+    }
+
+    #[tokio::test]
+    async fn request_fail_and_live_apply_lease_never_commit_together() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        for _ in 0..12 {
+            let request_id = seed_request(pool, "approved", "execute").await;
+            let platform = format!("fail-race-{}", Uuid::new_v4().simple());
+            let job_id = seed_pending_live_apply_for_request(pool, request_id, &platform).await;
+            let request_id_string = request_id.to_string();
+            let operator = operator_session();
+            let (failed, leased) = tokio::join!(
+                fail_one(&operator, &request_id_string, "race failure"),
+                crate::agents::lease_pending_job(pool, "race-agent", &platform),
+            );
+            let leased = leased.expect("lease query");
+            let (request_status, job_status): (String, String) = sqlx::query_as(
+                "SELECT r.status, j.status FROM requests r JOIN agent_jobs j ON j.request_id = r.id \
+                 WHERE r.id = $1 AND j.id = $2",
+            )
+            .bind(request_id)
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read race outcome");
+
+            assert!(
+                !(request_status == "failed" && job_status == "Leased"),
+                "a terminal request must never retain a leased LiveApply"
+            );
+            match (failed, leased) {
+                (Ok(_), None) => {
+                    assert_eq!(request_status, "failed");
+                    assert_eq!(job_status, "Cancelled");
+                }
+                (Err((StatusCode::CONFLICT, _)), Some(_)) => {
+                    assert_eq!(request_status, "approved");
+                    assert_eq!(job_status, "Leased");
+                }
+                (failure, lease) => panic!(
+                    "unexpected fail/lease race outcome: failure={failure:?}, leased={}",
+                    lease.is_some()
+                ),
+            }
+
+            sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .execute(pool)
+                .await
+                .ok();
+            cleanup_request(pool, request_id).await;
+        }
     }
 
     /// Denial audited EXACTLY ONCE (codex): an approver (holds `approve`, NOT
@@ -53698,7 +54698,7 @@ mod quorum_enforcement_db_tests {
     /// overwrite stages/route with its own stale (lockless) view and drop the
     /// first approver. Driven via two concurrent handler calls; the row lock
     /// serializes them at the DB.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn concurrent_two_approvers_keep_both_in_route() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
@@ -55046,7 +56046,11 @@ mod maint_calendar_db_tests {
                 note.is_some(),
                 "graceful degradation: terraform-plan-note must be present when terraform is absent; \
                  evidence keys: {:?}",
-                plan_stage.evidence.iter().map(|e| &e.key).collect::<Vec<_>>()
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
             );
             let note_ev = note.unwrap();
             assert!(
@@ -55557,18 +56561,13 @@ mod maint_calendar_db_tests {
     /// - `terraform plan` requires a live vCenter; without one it fails gracefully →
     ///   no `terraform-plan` item emitted (Validated status, not Planned).
     ///
-    /// When terraform is absent (CI without binary): graceful-degradation note.
+    /// When Terraform or the provider registry is unavailable: a
+    /// graceful-degradation note is required instead.
     #[test]
     fn plan_stages_enriched_with_windows_terraform_for_windows_os() {
-        use ryuki_runner::terraform::TerraformRunner;
-        use ryuki_runner::Runner;
-
         let req = make_server_deployment_request_with_os(Some("Windows Server 2022"));
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
             .expect("plan_request must succeed for Validated request");
-
-        let runner = TerraformRunner::new();
-        let terraform_available = runner.available();
 
         enrich_plan_stages_with_terraform_sync(&req, &mut stages);
 
@@ -55577,25 +56576,11 @@ mod maint_calendar_db_tests {
             .find(|s| s.name == "plan")
             .expect("plan stage must exist");
 
-        if terraform_available {
-            // vSphere IaC: validate passes (offline), plan fails without vCenter.
-            // Expect terraform-validate item; terraform-plan may or may not be
-            // present (only present when a live vCenter is reachable).
-            let validate_ev = plan_stage
-                .evidence
-                .iter()
-                .find(|e| e.key == "terraform-validate");
-            assert!(
-                validate_ev.is_some(),
-                "terraform-validate evidence must be present for Windows OS \
-                 when terraform is available; evidence keys: {:?}",
-                plan_stage
-                    .evidence
-                    .iter()
-                    .map(|e| &e.key)
-                    .collect::<Vec<_>>()
-            );
-            let ev = validate_ev.unwrap();
+        let validate_ev = plan_stage
+            .evidence
+            .iter()
+            .find(|e| e.key == "terraform-validate");
+        if let Some(ev) = validate_ev {
             assert!(
                 ev.value.contains("configuration is valid"),
                 "terraform-validate evidence must confirm schema validity; got: {:?}",
@@ -55608,7 +56593,13 @@ mod maint_calendar_db_tests {
                 .find(|e| e.key == "terraform-plan-note");
             assert!(
                 note.is_some(),
-                "graceful degradation: terraform-plan-note must be present when terraform absent"
+                "graceful degradation: terraform-plan-note must be present when Terraform \
+                 or its provider is unavailable; evidence keys: {:?}",
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -55618,18 +56609,13 @@ mod maint_calendar_db_tests {
     /// TDD — server-deployment with Linux OS routes to linux vSphere IaC.
     ///
     /// Same validate-only oracle as the Windows variant — `terraform validate`
-    /// confirms schema correctness offline; live plan requires vCenter.
+    /// confirms schema correctness after provider initialization; live plan
+    /// requires vCenter. Provider-registry failure degrades to a note.
     #[test]
     fn plan_stages_enriched_with_linux_terraform_for_linux_os() {
-        use ryuki_runner::terraform::TerraformRunner;
-        use ryuki_runner::Runner;
-
         let req = make_server_deployment_request_with_os(Some("Ubuntu 22.04 LTS"));
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
             .expect("plan_request must succeed for Validated request");
-
-        let runner = TerraformRunner::new();
-        let terraform_available = runner.available();
 
         enrich_plan_stages_with_terraform_sync(&req, &mut stages);
 
@@ -55638,23 +56624,11 @@ mod maint_calendar_db_tests {
             .find(|s| s.name == "plan")
             .expect("plan stage must exist");
 
-        if terraform_available {
-            // vSphere IaC: validate passes (offline), plan fails without vCenter.
-            let validate_ev = plan_stage
-                .evidence
-                .iter()
-                .find(|e| e.key == "terraform-validate");
-            assert!(
-                validate_ev.is_some(),
-                "terraform-validate evidence must be present for Linux OS \
-                 when terraform is available; evidence keys: {:?}",
-                plan_stage
-                    .evidence
-                    .iter()
-                    .map(|e| &e.key)
-                    .collect::<Vec<_>>()
-            );
-            let ev = validate_ev.unwrap();
+        let validate_ev = plan_stage
+            .evidence
+            .iter()
+            .find(|e| e.key == "terraform-validate");
+        if let Some(ev) = validate_ev {
             assert!(
                 ev.value.contains("configuration is valid"),
                 "terraform-validate evidence must confirm schema validity; got: {:?}",
@@ -55667,7 +56641,13 @@ mod maint_calendar_db_tests {
                 .find(|e| e.key == "terraform-plan-note");
             assert!(
                 note.is_some(),
-                "graceful degradation: terraform-plan-note must be present when terraform absent"
+                "graceful degradation: terraform-plan-note must be present when Terraform \
+                 or its provider is unavailable; evidence keys: {:?}",
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -59308,6 +60288,37 @@ mod noise_remediation_db_tests {
         assert!(value.is_array() || value.is_object());
     }
 
+    #[test]
+    fn custom_site_registry_drives_rust_and_sql_noise_classification() {
+        const ACTIVE: &str = "API-NOISE-ACTIVE";
+        const INACTIVE: &str = "API-NOISE-INACTIVE";
+        for (code, active) in [(ACTIVE, true), (INACTIVE, false)] {
+            site_registry::upsert_site(
+                site_registry::SiteEntry {
+                    unlocode: code.into(),
+                    name: format!("API noise test site {code}"),
+                    country: "Test country".into(),
+                    country_code: "ZZ".into(),
+                    timezone: "UTC".into(),
+                    active,
+                },
+                site_registry::SiteCodeSystem::Custom,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            site_from_host("srv-api-noise-active-app01.example.test"),
+            ACTIVE
+        );
+        let sql_case = site_from_host_sql_case();
+        assert!(sql_case.contains("'api-noise-active'"));
+        assert!(sql_case.contains("'API-NOISE-ACTIVE'"));
+        assert!(!sql_case.contains("'API-NOISE-INACTIVE'"));
+        assert!(!site_registry::is_valid_site(INACTIVE));
+        assert!(!site_registry::is_valid_site("API-NOISE-UNKNOWN"));
+    }
+
     #[tokio::test]
     async fn test_noise_suppressed_list_fallback_in_memory() {
         // noise_suppressed_list now returns Result; unwrap the Ok arm.
@@ -59690,7 +60701,7 @@ mod noise_remediation_db_tests {
         )
         .bind(ghost_id)
         .bind("Ghost trigger")
-        .bind("srv-unknown-host.corp.local") // no VALID_SITES substring → site_from_host → DEFRA
+        .bind("srv-unknown-host.corp.local") // no active site-code substring -> site_from_host -> DEFRA
         .bind("warning")
         .bind(99_i32)
         .bind(5.0_f64)
@@ -60014,12 +61025,9 @@ mod noise_remediation_db_tests {
         let (s_total, s_rows) = suppressed_page(gblon.clone(), vec![], Some(1), Some(1)).await;
         let (u_total, u_rows) = suppressed_page(vec![], vec![], Some(1000), None).await;
         let (l_total, l_rows) = suppressed_page(vec![], vec![], Some(1), None).await;
-        let (_, deber_rows) =
-            suppressed_page(vec!["DEBER".into()], vec![], Some(1000), None).await;
-        let (_, nlams_rows) =
-            suppressed_page(vec!["NLAMS".into()], vec![], Some(1000), None).await;
-        let (_, defra_rows) =
-            suppressed_page(vec!["DEFRA".into()], vec![], Some(1000), None).await;
+        let (_, deber_rows) = suppressed_page(vec!["DEBER".into()], vec![], Some(1000), None).await;
+        let (_, nlams_rows) = suppressed_page(vec!["NLAMS".into()], vec![], Some(1000), None).await;
+        let (_, defra_rows) = suppressed_page(vec!["DEFRA".into()], vec![], Some(1000), None).await;
         let (env_total, env_rows) =
             suppressed_page(vec![], vec!["prod".into()], Some(1000), None).await;
         let (blank_total, blank_rows) =
@@ -60145,16 +61153,15 @@ mod noise_remediation_db_tests {
     }
 
     #[tokio::test]
-    async fn test_detect_lowercase_site_rejected() {
+    async fn test_detect_lowercase_site_is_canonicalized() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(_pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
 
-        // The engine validates the raw site (exact uppercase membership) and
-        // rejects lowercase; the DB path must reject it identically (400), not
-        // silently case-fold "defra" -> "DEFRA".
+        // Registry lookup canonicalizes aliases before validation and filtering,
+        // so DB and engine paths both classify the canonical DEFRA site.
         let result = noise_detect(
             AuthExtractor(AuthSession::static_dry_run()),
             Json(NoiseSiteRequest {
@@ -60162,10 +61169,10 @@ mod noise_remediation_db_tests {
             }),
         )
         .await;
-        let Err((status, _)) = result else {
-            panic!("expected Err 400 for lowercase site, got Ok");
-        };
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            result.is_ok(),
+            "lowercase alias should canonicalize: {result:?}"
+        );
     }
 }
 
@@ -61577,10 +62584,16 @@ mod firewall_rules_db_tests {
         };
 
         // Unfiltered list for a GBLON principal includes GBLON, excludes DEFRA.
-        let Json(listed) =
-            firewall_rule_set_list(scoped(), Query(FwRuleSetListQuery { site: None, limit: None, offset: None }))
-                .await
-                .expect("list");
+        let Json(listed) = firewall_rule_set_list(
+            scoped(),
+            Query(FwRuleSetListQuery {
+                site: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list");
         let ids = ids_of(&listed);
         assert!(
             ids.contains(&gblon.id) && !ids.contains(&defra.id),
@@ -61605,7 +62618,11 @@ mod firewall_rules_db_tests {
         // Unrestricted principal sees both.
         let Json(all) = firewall_rule_set_list(
             AuthExtractor(AuthSession::static_dry_run()),
-            Query(FwRuleSetListQuery { site: None, limit: None, offset: None }),
+            Query(FwRuleSetListQuery {
+                site: None,
+                limit: None,
+                offset: None,
+            }),
         )
         .await
         .expect("list all");
@@ -62486,6 +63503,48 @@ mod software_deployment_db_tests {
         s
     }
 
+    #[tokio::test]
+    async fn software_compliance_admits_active_custom_site_only() {
+        const ACTIVE: &str = "API-SOFTWARE-ACTIVE";
+        const INACTIVE: &str = "API-SOFTWARE-INACTIVE";
+        for (code, active) in [(ACTIVE, true), (INACTIVE, false)] {
+            site_registry::upsert_site(
+                site_registry::SiteEntry {
+                    unlocode: code.into(),
+                    name: format!("API software test site {code}"),
+                    country: "Test country".into(),
+                    country_code: "ZZ".into(),
+                    timezone: "UTC".into(),
+                    active,
+                },
+                site_registry::SiteCodeSystem::Custom,
+            )
+            .unwrap();
+        }
+
+        let session = AuthSession::static_dry_run();
+        assert!(software_compliance(
+            AuthExtractor(session.clone()),
+            Query(SoftwareComplianceQuery {
+                site: ACTIVE.into(),
+            }),
+        )
+        .await
+        .is_ok());
+
+        for site in [INACTIVE, "API-SOFTWARE-UNKNOWN"] {
+            let Err((status, _)) = software_compliance(
+                AuthExtractor(session.clone()),
+                Query(SoftwareComplianceQuery { site: site.into() }),
+            )
+            .await
+            else {
+                panic!("{site} must not be admitted");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
     /// plan → approve → execute → verify: each transition persists in DB.
     /// history SELECT returns the deployment.
     #[tokio::test]
@@ -63162,9 +64221,11 @@ mod server_decommission_db_tests {
             "quarantine + execute must each emit one event: {admin_events:?}"
         );
         assert!(
-            admin_events.iter().all(|e| e["aggregate_type"] == json!("decommission")
-                && e["site"] == json!("DEFRA")
-                && e["environment"].is_null()),
+            admin_events
+                .iter()
+                .all(|e| e["aggregate_type"] == json!("decommission")
+                    && e["site"] == json!("DEFRA")
+                    && e["environment"].is_null()),
             "decommission events must be site-only (site=DEFRA, environment=NULL): {admin_events:?}"
         );
         let types: Vec<&str> = admin_events
@@ -63429,11 +64490,9 @@ mod server_decommission_db_tests {
                 .map(|e| e["decommission_id"].as_str().expect("id").to_string())
                 .collect()
         };
-        let (full_total, full_rows) =
-            inventory_page(scope.clone(), vec![], Some(1000), None).await;
+        let (full_total, full_rows) = inventory_page(scope.clone(), vec![], Some(1000), None).await;
         let (mid_total, mid_rows) = inventory_page(scope.clone(), vec![], Some(1), Some(1)).await;
-        let (tail_total, tail_rows) =
-            inventory_page(scope.clone(), vec![], Some(2), Some(2)).await;
+        let (tail_total, tail_rows) = inventory_page(scope.clone(), vec![], Some(2), Some(2)).await;
         let (u_total, _) = inventory_page(vec![], vec![], Some(1), None).await;
         let (env_total, env_rows) =
             inventory_page(vec![], vec!["prod".into()], Some(1000), None).await;
@@ -63447,12 +64506,22 @@ mod server_decommission_db_tests {
 
         // (1) Total vs INDEPENDENT raw COUNT under identical predicates. The
         // unique site makes the scoped set exactly the three Quarantined seeds.
-        assert_eq!(raw_scoped_count, 3, "independent count sees only the 3 seeds");
-        assert_eq!(full_total, raw_scoped_count, "scoped total = independent count");
+        assert_eq!(
+            raw_scoped_count, 3,
+            "independent count sees only the 3 seeds"
+        );
+        assert_eq!(
+            full_total, raw_scoped_count,
+            "scoped total = independent count"
+        );
         assert_eq!(u_total, raw_all_count, "unrestricted total = raw count");
         // (2) Full scoped page equals the independent ordered sequence, and
         // offset slices are EXACTLY the matching cuts (id tie-break order).
-        assert_eq!(ids(&full_rows), raw_scoped_ids, "scoped page = raw sequence");
+        assert_eq!(
+            ids(&full_rows),
+            raw_scoped_ids,
+            "scoped page = raw sequence"
+        );
         assert_eq!(mid_total, 3, "offset must not change the total");
         assert_eq!(
             ids(&mid_rows),
@@ -64075,10 +65144,12 @@ mod patch_waves_db_tests {
             s
         };
         let list = |s: AuthSession, limit: Option<i64>, offset: Option<i64>| async move {
-            let (h, Json(body)) =
-                patch_waves_list(AuthExtractor(s), Query(PatchWaveListQuery { limit, offset }))
-                    .await
-                    .expect("patch_waves_list must succeed");
+            let (h, Json(body)) = patch_waves_list(
+                AuthExtractor(s),
+                Query(PatchWaveListQuery { limit, offset }),
+            )
+            .await
+            .expect("patch_waves_list must succeed");
             let total = h
                 .get("x-total-count")
                 .and_then(|v| v.to_str().ok())
@@ -64097,7 +65168,10 @@ mod patch_waves_db_tests {
         // partial-out and empty-scope waves are excluded.
         let scoped = || session_for(vec![site.clone()], vec!["production".into()]);
         let (total, full) = list(scoped(), None, None).await;
-        assert_eq!(total, "4", "scoped X-Total-Count must be exactly the 4 contained seeds");
+        assert_eq!(
+            total, "4",
+            "scoped X-Total-Count must be exactly the 4 contained seeds"
+        );
         // Identical created_at on every seed → the order is the unique id DESC
         // tie-breaker alone (uuid text order matches Postgres uuid byte order).
         let mut expected: Vec<String> = [0usize, 1, 2, 5]
@@ -64106,11 +65180,13 @@ mod patch_waves_db_tests {
             .collect();
         expected.sort();
         expected.reverse();
-        assert_eq!(full, expected, "scoped full page must be exactly id DESC over the ties");
+        assert_eq!(
+            full, expected,
+            "scoped full page must be exactly id DESC over the ties"
+        );
         // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
         for (id, site_scope) in &seeded {
-            let permitted =
-                multi_scope_permits(&scoped(), site_scope, &["production".to_string()]);
+            let permitted = multi_scope_permits(&scoped(), site_scope, &["production".to_string()]);
             assert_eq!(
                 full.contains(id),
                 permitted,
@@ -64120,8 +65196,16 @@ mod patch_waves_db_tests {
         // Exact offset slices under the tie-breaker; the total never changes.
         let (t1, page1) = list(scoped(), Some(2), Some(0)).await;
         let (t2, page2) = list(scoped(), Some(2), Some(2)).await;
-        assert_eq!((t1.as_str(), t2.as_str()), ("4", "4"), "limit/offset must not change the total");
-        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(
+            (t1.as_str(), t2.as_str()),
+            ("4", "4"),
+            "limit/offset must not change the total"
+        );
+        assert_eq!(
+            page1,
+            expected[0..2],
+            "page 1 must be the exact first slice"
+        );
         assert_eq!(page2, expected[2..4], "page 2 must be the exact next slice");
         assert!(
             page1.iter().all(|id| !page2.contains(id)),
@@ -64136,8 +65220,14 @@ mod patch_waves_db_tests {
             None,
         )
         .await;
-        assert_eq!(total, "5", "multi-scope principal must also see the {{site,other}} wave");
-        assert!(ids.contains(&seeded[3].0), "partial-out wave must be visible to the wider scope");
+        assert_eq!(
+            total, "5",
+            "multi-scope principal must also see the {{site,other}} wave"
+        );
+        assert!(
+            ids.contains(&seeded[3].0),
+            "partial-out wave must be visible to the wider scope"
+        );
 
         // Env-scoped elsewhere: nothing matches (waves target production only).
         let (total, ids) = list(
@@ -64146,13 +65236,21 @@ mod patch_waves_db_tests {
             None,
         )
         .await;
-        assert_eq!((total.as_str(), ids.len()), ("0", 0), "env-mismatch must see none");
+        assert_eq!(
+            (total.as_str(), ids.len()),
+            ("0", 0),
+            "env-mismatch must see none"
+        );
 
         // All-blank scope vec: within_multi_scope treats it as UNRESTRICTED on
         // that axis (unlike scope_permits' literal-emptiness law) — the by-id
         // GET guards with the same predicate, so the list must agree.
-        let (blank_total, blank_ids) =
-            list(session_for(vec!["".into(), " ".into()], vec!["".into()]), None, None).await;
+        let (blank_total, blank_ids) = list(
+            session_for(vec!["".into(), " ".into()], vec!["".into()]),
+            None,
+            None,
+        )
+        .await;
         let (unrestricted_total, unrestricted_ids) =
             list(AuthSession::static_dry_run(), None, None).await;
         assert_eq!(
@@ -65495,8 +66593,8 @@ mod backup_restore_db_tests {
             (&site, &env),
             (&site, &env),
             (&site, &env),
-            (&site, &other_env),  // env axis out for the dual-scoped principal
-            (&other_site, &env),  // site axis out for the dual-scoped principal
+            (&site, &other_env), // env axis out for the dual-scoped principal
+            (&other_site, &env), // site axis out for the dual-scoped principal
         ];
         let mut seeded: Vec<(String, String, String)> = Vec::new();
         for (t_site, t_env) in targets {
@@ -65548,13 +66646,19 @@ mod backup_restore_db_tests {
         // Dual-scoped principal {site} x {env}: sees the 3 fully-matching rows.
         let dual = || session_for(vec![site.clone()], vec![env.clone()]);
         let (total, full) = list(dual(), None, None).await;
-        assert_eq!(total, "3", "dual-scoped X-Total-Count must be exactly the 3 matching seeds");
+        assert_eq!(
+            total, "3",
+            "dual-scoped X-Total-Count must be exactly the 3 matching seeds"
+        );
         // Identical created_at on every seed → the order is the unique id DESC
         // tie-breaker alone (uuid text order matches Postgres uuid byte order).
         let mut expected: Vec<String> = seeded[0..3].iter().map(|(id, _, _)| id.clone()).collect();
         expected.sort();
         expected.reverse();
-        assert_eq!(full, expected, "dual-scoped full page must be exactly id DESC over the ties");
+        assert_eq!(
+            full, expected,
+            "dual-scoped full page must be exactly id DESC over the ties"
+        );
         // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
         for (id, t_site, t_env) in &seeded {
             assert_eq!(
@@ -65566,8 +66670,16 @@ mod backup_restore_db_tests {
         // Exact offset slices under the tie-breaker; the total never changes.
         let (t1, page1) = list(dual(), Some(2), Some(0)).await;
         let (t2, page2) = list(dual(), Some(2), Some(2)).await;
-        assert_eq!((t1.as_str(), t2.as_str()), ("3", "3"), "limit/offset must not change the total");
-        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(
+            (t1.as_str(), t2.as_str()),
+            ("3", "3"),
+            "limit/offset must not change the total"
+        );
+        assert_eq!(
+            page1,
+            expected[0..2],
+            "page 1 must be the exact first slice"
+        );
         assert_eq!(page2, expected[2..3], "page 2 must be the exact next slice");
         assert!(
             page1.iter().all(|id| !page2.contains(id)),
@@ -65576,12 +66688,18 @@ mod backup_restore_db_tests {
 
         // Site-scoped only (env unrestricted): both envs of the site are visible.
         let (total, ids) = list(session_for(vec![site.clone()], Vec::new()), None, None).await;
-        assert_eq!(total, "4", "site-only scope must include both of the site's envs");
+        assert_eq!(
+            total, "4",
+            "site-only scope must include both of the site's envs"
+        );
         assert!(ids.contains(&seeded[3].0) && !ids.contains(&seeded[4].0));
 
         // Env-scoped only (site unrestricted): both sites of the env are visible.
         let (total, ids) = list(session_for(Vec::new(), vec![env.clone()]), None, None).await;
-        assert_eq!(total, "4", "env-only scope must include both of the env's sites");
+        assert_eq!(
+            total, "4",
+            "env-only scope must include both of the env's sites"
+        );
         assert!(ids.contains(&seeded[4].0) && !ids.contains(&seeded[3].0));
 
         // Multi-site principal + env filter: the other-site row is in scope too.
@@ -65591,14 +66709,25 @@ mod backup_restore_db_tests {
             None,
         )
         .await;
-        assert_eq!(total, "4", "multi-site scope must include the other site's row");
+        assert_eq!(
+            total, "4",
+            "multi-site scope must include the other site's row"
+        );
         assert!(ids.contains(&seeded[4].0));
 
         // scope_permits emptiness law: an all-blank (non-empty) scope vec is NOT
         // unrestricted — it matches no real site, so the list FAILS CLOSED.
-        let (total, ids) =
-            list(session_for(vec!["".into(), " ".into()], Vec::new()), None, None).await;
-        assert_eq!((total.as_str(), ids.len()), ("0", 0), "all-blank scope must fail closed");
+        let (total, ids) = list(
+            session_for(vec!["".into(), " ".into()], Vec::new()),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (total.as_str(), ids.len()),
+            ("0", 0),
+            "all-blank scope must fail closed"
+        );
 
         // Unrestricted total == the independent raw count.
         let (total, _) = list(AuthSession::static_dry_run(), None, None).await;
@@ -65694,17 +66823,22 @@ mod backup_restore_db_tests {
         // reports — the partial and empty footprints are excluded.
         let scoped = || session_for(vec![site.clone()], vec!["production".into()]);
         let (total, full) = list(scoped(), None, None).await;
-        assert_eq!(total, "3", "scoped X-Total-Count must be exactly the 3 contained seeds");
+        assert_eq!(
+            total, "3",
+            "scoped X-Total-Count must be exactly the 3 contained seeds"
+        );
         // Identical generation_time on every seed → the order is the unique
         // id DESC tie-breaker alone.
         let mut expected: Vec<String> = seeded[0..3].iter().map(|(id, _)| id.clone()).collect();
         expected.sort();
         expected.reverse();
-        assert_eq!(full, expected, "scoped full page must be exactly id DESC over the ties");
+        assert_eq!(
+            full, expected,
+            "scoped full page must be exactly id DESC over the ties"
+        );
         // SQL ≡ in-memory predicate on EVERY seed (faithful push-down proof).
         for (id, footprint) in &seeded {
-            let permitted =
-                multi_scope_permits(&scoped(), footprint, &["production".to_string()]);
+            let permitted = multi_scope_permits(&scoped(), footprint, &["production".to_string()]);
             assert_eq!(
                 full.contains(id),
                 permitted,
@@ -65714,8 +66848,16 @@ mod backup_restore_db_tests {
         // Exact offset slices under the tie-breaker; the total never changes.
         let (t1, page1) = list(scoped(), Some(2), Some(0)).await;
         let (t2, page2) = list(scoped(), Some(2), Some(2)).await;
-        assert_eq!((t1.as_str(), t2.as_str()), ("3", "3"), "limit/offset must not change the total");
-        assert_eq!(page1, expected[0..2], "page 1 must be the exact first slice");
+        assert_eq!(
+            (t1.as_str(), t2.as_str()),
+            ("3", "3"),
+            "limit/offset must not change the total"
+        );
+        assert_eq!(
+            page1,
+            expected[0..2],
+            "page 1 must be the exact first slice"
+        );
         assert_eq!(page2, expected[2..3], "page 2 must be the exact next slice");
 
         // Wider principal {site, other}: the partial footprint is contained too.
@@ -65725,7 +66867,10 @@ mod backup_restore_db_tests {
             None,
         )
         .await;
-        assert_eq!(total, "4", "multi-scope principal must also see the {{site,other}} report");
+        assert_eq!(
+            total, "4",
+            "multi-scope principal must also see the {{site,other}} report"
+        );
         assert!(ids.contains(&seeded[3].0));
 
         // Env-scoped elsewhere: nothing matches (all footprints are production).
@@ -65735,7 +66880,11 @@ mod backup_restore_db_tests {
             None,
         )
         .await;
-        assert_eq!((total.as_str(), ids.len()), ("0", 0), "env-mismatch must see none");
+        assert_eq!(
+            (total.as_str(), ids.len()),
+            ("0", 0),
+            "env-mismatch must see none"
+        );
 
         // Unrestricted total == the independent raw count; the empty-footprint
         // report is visible only here (a scoped caller never contains "all").
@@ -70995,10 +72144,10 @@ mod incident_contexts_db_tests {
         );
     }
 
-    /// Resolve twice: second resolve with fresh version after re-get SUCCEEDS.
-    /// Proves there is no guard on already-resolved (engine behavior: just overwrites).
+    /// Resolve is terminal: a second resolve is rejected even after reloading a
+    /// fresh row version, and the original resolution remains authoritative.
     #[tokio::test]
-    async fn test_resolve_twice_overwrites() {
+    async fn test_resolve_twice_is_rejected() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
@@ -71032,36 +72181,27 @@ mod incident_contexts_db_tests {
         };
         assert!(ok, "first resolve must succeed");
 
-        // Re-get to get fresh version, then resolve again
-        let (already_resolved, v2) = crate::repos::incident_contexts::get(pool, &id)
+        // Re-get to prove the lifecycle guard, rather than a stale CAS version,
+        // rejects the second resolution.
+        let (already_resolved, _) = crate::repos::incident_contexts::get(pool, &id)
             .await
             .expect("get 2")
             .expect("found 2");
         assert_eq!(already_resolved.status, "resolved");
 
-        let resolved2 =
+        let error =
             ryuki_engine::incident_context::resolve_incident_pure(&already_resolved, "second fix")
-                .expect("resolve 2 — no guard on already-resolved");
-        let ok2 = {
-            let mut tx = pool.begin().await.expect("begin tx");
-            let result = crate::repos::incident_contexts::transition(&mut tx, &id, &v2, &resolved2)
-                .await
-                .expect("transition 2");
-            if result {
-                tx.commit().await.expect("commit tx");
-            }
-            result
-        };
+                .expect_err("an already-resolved incident is terminal");
         assert!(
-            ok2,
-            "second resolve with fresh version must succeed (no already-resolved guard)"
+            error.contains("only an active incident can be resolved"),
+            "the lifecycle guard should explain the terminal state: {error}"
         );
 
         let (final_ctx, _) = crate::repos::incident_contexts::get(pool, &id)
             .await
             .expect("final get")
             .expect("found final");
-        assert_eq!(final_ctx.resolution, Some("second fix".to_string()));
+        assert_eq!(final_ctx.resolution, Some("first fix".to_string()));
 
         cleanup(pool, &id).await;
     }

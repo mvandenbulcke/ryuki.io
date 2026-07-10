@@ -705,6 +705,17 @@ pub fn admin_agent_revoke_path(agent_id: &str) -> Result<String, ApiPathError> {
     Ok(path)
 }
 
+/// Builds the admin-only signed-result path used to retrieve a safe LivePlan
+/// review projection. The job id is one validated path segment; query strings,
+/// traversal, and suffix injection are rejected before the SSR boundary calls
+/// the control plane.
+pub fn admin_agent_job_result_path(job_id: &str) -> Result<String, ApiPathError> {
+    let job_id = safe_request_id(job_id)?;
+    let path = format!("/api/admin/agents/jobs/{job_id}/result");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 fn safe_integration_id(integration_id: &str) -> Result<&str, ApiPathError> {
     let integration_id = integration_id.trim();
     if integration_id.is_empty() {
@@ -994,6 +1005,29 @@ mod tests {
             assert!(
                 admin_session_revoke_path(id).is_err(),
                 "{id} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_agent_job_result_path_is_exact_and_rejects_suffix_injection() {
+        let id = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+        assert_eq!(
+            admin_agent_job_result_path(id),
+            Ok(format!("/api/admin/agents/jobs/{id}/result"))
+        );
+        for unsafe_id in [
+            "",
+            "../jobs",
+            "id/result",
+            r"id\result",
+            "id?raw=true",
+            "id#fragment",
+            "https://evil.test/id",
+        ] {
+            assert!(
+                admin_agent_job_result_path(unsafe_id).is_err(),
+                "{unsafe_id} must be rejected"
             );
         }
     }

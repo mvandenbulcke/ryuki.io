@@ -1163,7 +1163,10 @@ mod notifications_db_tests {
             let pruned = prune_expired(&pool, window, cap_window, batch)
                 .await
                 .expect("guarded prune must not fail");
-            assert_eq!(pruned, 0, "guard ({window},{cap_window},{batch}) is a no-op");
+            assert_eq!(
+                pruned, 0,
+                "guard ({window},{cap_window},{batch}) is a no-op"
+            );
         }
         assert!(
             notification_exists(&pool, &old).await,

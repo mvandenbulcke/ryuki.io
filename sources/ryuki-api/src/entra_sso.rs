@@ -298,7 +298,9 @@ pub(crate) async fn entra_authorize_url(
     let cookie_hv = axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "ENTRA_AUTHORIZE_URL_FAILED", "message": "cookie encoding failed"})),
+            Json(
+                json!({"error": "ENTRA_AUTHORIZE_URL_FAILED", "message": "cookie encoding failed"}),
+            ),
         )
     })?;
 
@@ -461,9 +463,10 @@ pub(crate) async fn entra_callback(
     .map_err(|(status, Json(api_err))| {
         (
             status,
-            Json(serde_json::to_value(&api_err).unwrap_or_else(|_| {
-                json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})
-            })),
+            Json(
+                serde_json::to_value(&api_err)
+                    .unwrap_or_else(|_| json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
+            ),
         )
     })?;
 
@@ -522,12 +525,19 @@ mod tests {
             endpoints.jwks,
             "https://login.microsoftonline.example/t-1/discovery/v2.0/keys"
         );
-        assert_eq!(endpoints.issuer, "https://login.microsoftonline.example/t-1/v2.0");
+        assert_eq!(
+            endpoints.issuer,
+            "https://login.microsoftonline.example/t-1/v2.0"
+        );
     }
 
     #[test]
     fn test_gate_rejects_non_entra_mode_with_400() {
-        let wrong_mode = deps(false, "client-1", "http://localhost/api/auth/entra/callback");
+        let wrong_mode = deps(
+            false,
+            "client-1",
+            "http://localhost/api/auth/entra/callback",
+        );
         let Err((status, Json(body))) = entra_sso_gate(&wrong_mode) else {
             panic!("non-entra mode must be rejected");
         };
@@ -1375,7 +1385,10 @@ mod entra_sso_db_tests {
         // The stale local session must NOT authenticate: no roles, not valid.
         let local = resolve(local_id).await;
         assert!(!local.token_valid, "stale local session must not be valid");
-        assert!(local.roles.is_empty(), "stale local session grants no roles");
+        assert!(
+            local.roles.is_empty(),
+            "stale local session grants no roles"
+        );
         // The entra-id session resolves with its identity + roles.
         let entra = resolve(entra_id).await;
         assert_eq!(entra.user_id, "admin");

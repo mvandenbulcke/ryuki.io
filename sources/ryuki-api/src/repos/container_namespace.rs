@@ -580,7 +580,9 @@ mod container_namespace_db_tests {
             all.len()
         );
         assert_eq!(
-            count_namespaces(&db, "").await.expect("count_namespaces all"),
+            count_namespaces(&db, "")
+                .await
+                .expect("count_namespaces all"),
             all.len() as i64,
             "#14: count_namespaces matches the full unpaged set"
         );

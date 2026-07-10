@@ -38,8 +38,8 @@ The request remains `executing` while teardown runs, so destroy results flow thr
 
 ## Honest limits
 
-- **API-only surface.** The portal does not yet render step plans or the per-step approval; drive stepped requests over the API. The single-job live-apply approval is wired in the portal.
-- **Agent-side destroy is pending.** The teardown orchestration, grants, and halt semantics are complete and CI-tested, but today's agent refuses `LiveDestroy` cleanly rather than running `terraform destroy`; the refusal halts the cascade for operator reconciliation.
+- **Portal support exists.** Request detail renders the step plan and status of every step. An admin sees a two-click live-apply approval on a step only while it is `AwaitingApproval`; the API remains available for automation.
+- **Destroy is compensating, not operator-triggered.** Terraform `LiveDestroy` runs on the agent during automatic rollback of a failed multi-step run. A successful request has no general operator destroy endpoint, so its cleanup must use a separately approved state-keyed procedure.
 - **Live steps need a real agent.** Per-step live applies require a deployed agent with `RYUKI_AGENT_ALLOW_LIVE=true` and real provider credentials; CI validates the control-plane side with simulated agent results.
 - **Provider egress.** Server-deployment bundles use the real `vmware/vsphere` Terraform provider: `init` needs one-time registry egress, and `plan` needs a reachable vCenter, degrading gracefully otherwise.
 - **No in-place retry.** A non-stepped request's single live-apply slot is consumed permanently, even by a failure; recovery is a new request.

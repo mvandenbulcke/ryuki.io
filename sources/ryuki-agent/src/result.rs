@@ -32,7 +32,8 @@
 use chrono::Utc;
 use ryuki_engine::runners::RunStatus;
 use ryuki_protocol::{
-    job_spec_digest, sha256_hex, sign, Job, JobMode, JobResult, JobResultStatus, SignedEnvelope,
+    job_result_status_allowed, job_spec_digest, sha256_hex, sign, Job, JobMode, JobResult,
+    JobResultStatus, SignedEnvelope,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -125,6 +126,11 @@ pub enum ResultError {
         mode: JobMode,
         status: JobResultStatus,
     },
+    #[error("result status {status:?} is not valid for execution mode {mode:?}")]
+    InvalidStatusForMode {
+        mode: JobMode,
+        status: JobResultStatus,
+    },
     #[error(
         "approved_plan_digest must be None for non-LiveApply mode ({mode:?}) — \
          the CP rejects non-live results that carry a plan digest"
@@ -190,6 +196,12 @@ pub fn build_signed_result(
         && matches!(result_status, JobResultStatus::Applied)
     {
         return Err(ResultError::LiveStatusInNonLiveMode {
+            mode: job.spec.mode.clone(),
+            status: result_status,
+        });
+    }
+    if !job_result_status_allowed(&job.spec.mode, &result_status) {
+        return Err(ResultError::InvalidStatusForMode {
             mode: job.spec.mode.clone(),
             status: result_status,
         });
@@ -299,11 +311,10 @@ pub fn build_signed_result(
 /// - All lease fields, `request_id`, `job_spec_digest`, `key_id`, `cp_nonce`,
 ///   and signature follow exactly the same rules as `build_signed_result`.
 ///
-/// ## Works for any leased mode
+/// ## Works for live leased modes
 ///
-/// A refusal can occur for `LivePlan` OR `LiveApply` — both can be leased
-/// before the agent discovers a problem.  The CP records `LiveRefused`
-/// terminally for both.
+/// A refusal can occur for `LivePlan`, `LiveApply`, or `LiveDestroy` after the
+/// agent discovers a live gate problem. Offline dry runs use `Failed` instead.
 ///
 /// ## Panics
 /// None — fail-closed via `Result`.
@@ -315,6 +326,12 @@ pub fn build_refused_result(
 ) -> Result<ResultBody, ResultError> {
     // Require an active lease — cannot sign without attempt_id and cp_nonce.
     let lease = job.lease.as_ref().ok_or(ResultError::NoLease)?;
+    if !job_result_status_allowed(&job.spec.mode, &JobResultStatus::LiveRefused) {
+        return Err(ResultError::InvalidStatusForMode {
+            mode: job.spec.mode.clone(),
+            status: JobResultStatus::LiveRefused,
+        });
+    }
 
     let result_id = Uuid::new_v4();
 
@@ -394,6 +411,7 @@ mod tests {
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: sha256_hex(b"iac-bytes"),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode,
         };
         let lease = JobLease {
@@ -624,6 +642,36 @@ mod tests {
             ),
             "OfflineDryRun producing Applied must be refused, not signed"
         );
+    }
+
+    #[test]
+    fn plan_or_check_status_rejected_for_mutating_modes() {
+        let identity = make_identity();
+        for (mode, status) in [
+            (JobMode::LiveApply, RunStatus::CheckOk),
+            (JobMode::LiveDestroy, RunStatus::Planned),
+        ] {
+            let job = make_leased_job(mode.clone());
+            let evidence = make_evidence(status);
+            let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
+            assert!(matches!(
+                result,
+                Err(ResultError::InvalidStatusForMode { mode: actual, .. }) if actual == mode
+            ));
+        }
+    }
+
+    #[test]
+    fn offline_dry_run_cannot_report_live_refusal() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::OfflineDryRun);
+        assert!(matches!(
+            build_refused_result(&identity, "test-agent", &job, "not live"),
+            Err(ResultError::InvalidStatusForMode {
+                mode: JobMode::OfflineDryRun,
+                status: JobResultStatus::LiveRefused,
+            })
+        ));
     }
 
     // -----------------------------------------------------------------------

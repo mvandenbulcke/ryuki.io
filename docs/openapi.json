@@ -2,13 +2,15 @@
   "components": {
     "parameters": {
       "ProtocolVersionHeader": {
-        "description": "Sender's CP↔agent wire-schema version (decimal u32). Absent => resolved to the legacy value (1). Rejected (400) if it appears more than once, is not a positive integer, or is outside the control plane's supported set.",
+        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v2 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
         "in": "header",
         "name": "x-ryuki-protocol-version",
-        "required": false,
+        "required": true,
         "schema": {
+          "enum": [
+            2
+          ],
           "format": "int64",
-          "minimum": 1,
           "type": "integer"
         }
       }
@@ -452,7 +454,41 @@
         "type": "object"
       },
       "HeartbeatBody": {
+        "description": "Idle heartbeats leave every field null. A running heartbeat must supply the complete current lease fence; partial fences are rejected.",
         "properties": {
+          "attempt_id": {
+            "oneOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fencing_token": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lease_generation": {
+            "oneOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "running_job_id": {
             "description": "Currently running job id, if any.",
             "oneOf": [
@@ -476,11 +512,24 @@
           "last_seen_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "lease_deadline": {
+            "description": "Database-clock deadline returned only after an exact running-job lease renewal.",
+            "oneOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "agent_id",
-          "last_seen_at"
+          "last_seen_at",
+          "lease_deadline"
         ],
         "type": "object"
       },
@@ -503,7 +552,7 @@
             ]
           },
           "live_context": {
-            "description": "CP-signed approval grant; required for live_apply, absent otherwise.",
+            "description": "CP-signed approval grant; required for live_apply and live_destroy, absent otherwise.",
             "oneOf": [
               {
                 "$ref": "#/components/schemas/VerifiedLiveContext"
@@ -569,7 +618,8 @@
         "enum": [
           "offline_dry_run",
           "live_plan",
-          "live_apply"
+          "live_apply",
+          "live_destroy"
         ],
         "type": "string"
       },
@@ -615,7 +665,6 @@
           "check_ok",
           "planned",
           "applied",
-          "verified",
           "failed",
           "live_refused"
         ],
@@ -640,6 +689,11 @@
           },
           "request_id": {
             "format": "uuid",
+            "type": "string"
+          },
+          "state_key": {
+            "description": "Opaque control-plane-owned Terraform state key. New specs always carry it; absent legacy specs remain decodable but are refused for live Terraform execution.",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$",
             "type": "string"
           },
           "vars": {
@@ -1070,7 +1124,7 @@
         "type": "object"
       },
       "VerifiedLiveContext": {
-        "description": "CP-signed approval grant for a LiveApply job.",
+        "description": "CP-signed approval grant for a live_apply or live_destroy job; live_destroy grants are step-bound.",
         "properties": {
           "approved_plan_digest": {
             "type": "string"
@@ -1082,6 +1136,11 @@
             "format": "date-time",
             "type": "string"
           },
+          "job_spec_digest": {
+            "description": "SHA-256 digest of the exact canonical JobSpec authorized by this grant, including mode and state_key.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
           "request_id": {
             "format": "uuid",
             "type": "string"
@@ -1091,13 +1150,14 @@
             "type": "string"
           },
           "step_job_id": {
-            "description": "Present only for a step-scoped grant (#42 slice A): binds this grant to ONE specific dispatched step job id, preventing replay across steps or across a re-dispatch of the same step. Absent (not null) for a legacy/whole-request grant — the pre-existing single-job trust model, unchanged.",
+            "description": "Present only for a step-scoped grant: binds this grant to one dispatched step job id, preventing replay across steps or re-dispatches. Absent for a whole-request LiveApply grant.",
             "format": "uuid",
             "type": "string"
           }
         },
         "required": [
           "request_id",
+          "job_spec_digest",
           "approved_plan_digest",
           "approver",
           "expiry",
@@ -1122,7 +1182,7 @@
     }
   },
   "info": {
-    "description": "Machine-readable contract for three route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): all endpoints except `cp-public-key` require an agent bearer token (`Authorization: Bearer rya_...`), and every request MAY carry the `x-ryuki-protocol-version` header (absent => legacy version 1). (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents.",
+    "description": "Machine-readable contract for three route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration and `cp-public-key` are unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v2-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents.",
     "title": "Ryuki Agent Protocol API",
     "version": "0.1.0"
   },
@@ -1147,6 +1207,16 @@
               }
             },
             "description": "CP public key + advertised protocol version."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Missing, malformed, duplicate, or unsupported x-ryuki-protocol-version header."
           },
           "503": {
             "content": {
@@ -1235,7 +1305,7 @@
     },
     "/api/agents/{agent_id}/heartbeat": {
       "post": {
-        "description": "Updates last_seen_at on the agent row. Optionally records the currently running job id.",
+        "description": "Idle heartbeats update agent liveness. Running heartbeats atomically renew only the exact unexpired job/attempt/generation/fencing ownership tuple.",
         "operationId": "heartbeat",
         "parameters": [
           {
@@ -1271,6 +1341,16 @@
             },
             "description": "Heartbeat recorded."
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed or incomplete running-job lease fence, or unsupported protocol version."
+          },
           "401": {
             "content": {
               "application/json": {
@@ -1291,6 +1371,16 @@
             },
             "description": "Token does not match agent_id."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Running-job lease ownership was superseded or expired."
+          },
           "503": {
             "content": {
               "application/json": {
@@ -1307,7 +1397,7 @@
             "agentBearer": []
           }
         ],
-        "summary": "Report agent liveness",
+        "summary": "Report liveness or renew a running job lease",
         "tags": [
           "agents"
         ]

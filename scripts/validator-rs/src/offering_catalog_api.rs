@@ -1723,7 +1723,10 @@ mod tests {
         // Governance policy: every canonical offering is sanctioned for activation
         // EXCEPT the two inherently-destructive Retire offerings, which need explicit
         // owner confirmation before they may carry status: active.
-        let held_back = ["vm-decommission-quarantine", "application-environment-retirement"];
+        let held_back = [
+            "vm-decommission-quarantine",
+            "application-environment-retirement",
+        ];
         for id in REQUIRED_OFFERING_IDS {
             let should_be_sanctioned = !held_back.contains(id);
             assert_eq!(

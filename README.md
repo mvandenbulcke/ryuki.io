@@ -8,7 +8,7 @@
 
 System-engineer platform for multi-site datacenter infrastructure management — **17 provider adapters, 110+ catalog contracts, 3,900+ tests, 100% Rust**.
 
-**Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html) · [RBAC & Scoping](https://ryuki.io/rbac-and-scoping.html) · [Agents & Live Execution](https://ryuki.io/agents-and-live-execution.html) · [API Reference](https://ryuki.io/api-reference.html) · [all docs](https://ryuki.io/documentation.html)
+**Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [First Test](https://ryuki.io/first-test.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html) · [RBAC & Scoping](https://ryuki.io/rbac-and-scoping.html) · [Agents & Live Execution](https://ryuki.io/agents-and-live-execution.html) · [API Reference](https://ryuki.io/api-reference.html) · [all docs](https://ryuki.io/documentation.html)
 
 ## What It Does
 
@@ -30,7 +30,7 @@ Ryuki is an operational control plane that gives system engineers, datacenter te
 | **Firmware Lifecycle** | EOL tracking, compliance exceptions, vendor summaries, firmware governance |
 | **Incident Context** | Context assembly, affected services, on-call escalation, dependency graph |
 | **Access Recertification** | AD groups, service accounts, local admin, sudo — recertification campaigns |
-| **Site Registry** | UN/LOCODE reference (89 locations, 49 countries), activate/deactivate via admin |
+| **Site Registry** | UN/LOCODE recommended, custom codes supported; register and activate via admin |
 | **Adapter Framework** | 17 provider adapters: VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, ServiceNow |
 | **Evidence & Audit** | Redacted evidence packs, approval chains, shift handover, compliance dashboards |
 | **Break-Glass** | Emergency change with full audit trail, no bypass on evidence |
@@ -85,6 +85,7 @@ Default deny. Explicit egress and ingress allowances only.
 ### Prerequisites
 
 - Rust (stable, see `rust-toolchain.toml`)
+- `cargo-leptos` and the `wasm32-unknown-unknown` Rust target
 - Docker (for PostgreSQL)
 - PostgreSQL 18 client libraries (for sqlx)
 
@@ -103,18 +104,32 @@ cp .env.example .env
 # Edit .env — set RYUKI_DATABASE_URL; for live SSO set RYUKI_AUTH_MODE,
 # RYUKI_ENTRA_TENANT_ID, and RYUKI_ENTRA_CLIENT_ID
 
+# Install portal tooling once
+rustup target add wasm32-unknown-unknown
+cargo install cargo-leptos --locked
+
 # Build
 cargo build --workspace
 
 # Test
 cargo test --workspace
 
-# Run API
-cargo run --manifest-path sources/ryuki-api/Cargo.toml
+# Run API on the portal's default upstream port. Pass any additional auth
+# settings explicitly; do not source .env as executable shell code.
+# Export RYUKI_DATABASE_URL in this shell without committing its value.
+RYUKI_SERVER__BIND_ADDRESS=127.0.0.1:8081 \
+  cargo run --manifest-path sources/ryuki-api/Cargo.toml
 
 # Run portal (separate terminal)
-cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
+RYUKI_API_URL=http://127.0.0.1:8081 \
+RYUKI_PORTAL_EXECUTION_MODE=live-provider \
+  cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
+
+The API is then at `http://127.0.0.1:8081` and the portal at
+`http://127.0.0.1:8080`. Check API readiness at `/ready` before using the
+portal. The full first-test gate and evidence requirements are in
+[`docs/first-test.md`](docs/first-test.md).
 
 ### Validation
 
@@ -126,10 +141,13 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 cargo fmt --check --all
 
 # Clippy (matches the CI lint gate)
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Secret scan
 ./scripts/no-secret-scan.sh
+
+# Patch hygiene
+git diff --check
 ```
 
 ## Authentication
@@ -173,10 +191,11 @@ Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmw
 
 ### Site Management
 
-Sites use UN/LOCODE identifiers (e.g. `DEFRA` for Frankfurt, `GBLON` for London). The admin API provides:
+Sites preferably use UN/LOCODE identifiers (for example, `DEFRA` for Frankfurt or `GBLON` for London), but administrators can register canonical organization-specific codes such as `DC-EU-01`. The admin API provides:
 
 - `GET /api/admin/sites/countries` — List available countries
 - `GET /api/admin/sites/countries/{DE}/cities` — List cities for a country
+- `POST /api/admin/sites` — Register a UN/LOCODE or custom site code
 - `POST /api/admin/sites/{code}/activate` — Activate a site for operations
 
 See `docs/site-management.md` for details.

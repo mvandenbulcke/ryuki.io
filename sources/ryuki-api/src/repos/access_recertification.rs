@@ -304,9 +304,11 @@ pub async fn count_reviews(
     review_type: &str,
 ) -> Result<i64, sqlx::Error> {
     let count: i64 = match (site.is_empty(), review_type.is_empty()) {
-        (true, true) => sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews")
-            .fetch_one(pool)
-            .await?,
+        (true, true) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews")
+                .fetch_one(pool)
+                .await?
+        }
         (false, true) => {
             sqlx::query_scalar("SELECT COUNT(*) FROM access_reviews WHERE site = $1")
                 .bind(site)
@@ -319,13 +321,15 @@ pub async fn count_reviews(
                 .fetch_one(pool)
                 .await?
         }
-        (false, false) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM access_reviews WHERE site = $1 AND review_type = $2",
-        )
-        .bind(site)
-        .bind(review_type)
-        .fetch_one(pool)
-        .await?,
+        (false, false) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM access_reviews WHERE site = $1 AND review_type = $2",
+            )
+            .bind(site)
+            .bind(review_type)
+            .fetch_one(pool)
+            .await?
+        }
     };
     Ok(count)
 }
@@ -784,7 +788,9 @@ mod access_recertification_db_tests {
                 .fetch_one(&pool)
                 .await
                 .expect("raw count");
-        let total = count_reviews(&pool, &site, "").await.expect("count_reviews");
+        let total = count_reviews(&pool, &site, "")
+            .await
+            .expect("count_reviews");
         assert_eq!(total, raw_total, "count_reviews matches a raw COUNT(*)");
         assert_eq!(total, 5, "seeded exactly 5 reviews in the isolated site");
 

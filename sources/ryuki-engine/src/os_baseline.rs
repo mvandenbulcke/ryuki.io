@@ -1,6 +1,14 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+fn active_site_code(site: &str) -> Result<String, String> {
+    let code = site_registry::normalize_site_code_for_lookup(site)?;
+    if site_registry::is_valid_site(&code) {
+        Ok(code)
+    } else {
+        Err(format!("Unknown site: {code}"))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BaselineCheck {
@@ -85,14 +93,12 @@ pub fn check_server_compliance<'r>(
 
 /// Summarises compliance for all servers in `site`, from the provided slices.
 ///
-/// Returns `Err` when `site` is not in the canonical list.
+/// Returns `Err` when `site` is not active in the governed registry.
 pub fn check_site_compliance(
     results: &[BaselineResult],
     site: &str,
 ) -> Result<SiteComplianceSummary, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let site = active_site_code(site)?;
 
     let site_results: Vec<BaselineResult> =
         results.iter().filter(|r| r.site == site).cloned().collect();
@@ -111,7 +117,7 @@ pub fn check_site_compliance(
     };
 
     Ok(SiteComplianceSummary {
-        site: site.to_string(),
+        site,
         total_servers: server_names.len(),
         total_checks,
         compliant_checks,
@@ -123,15 +129,13 @@ pub fn check_site_compliance(
 
 /// Returns all noncompliant servers in `site`, with their critical failures.
 ///
-/// Returns `Err` when `site` is not in the canonical list.
+/// Returns `Err` when `site` is not active in the governed registry.
 pub fn get_noncompliant(
     checks: &[BaselineCheck],
     results: &[BaselineResult],
     site: &str,
 ) -> Result<Vec<NoncompliantServer>, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let site = active_site_code(site)?;
 
     let critical_check_ids: std::collections::HashSet<&str> = checks
         .iter()
@@ -163,7 +167,7 @@ pub fn get_noncompliant(
             .collect();
         servers.push(NoncompliantServer {
             server_name,
-            site: site.to_string(),
+            site: site.clone(),
             critical_failures,
             total_failures: failures.len(),
         });
@@ -182,9 +186,7 @@ pub fn get_compliance_trend(
     trend_points: &[(String, f64)],
     site: &str,
 ) -> Result<Vec<ComplianceTrendPoint>, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let _site = active_site_code(site)?;
 
     Ok(trend_points
         .iter()

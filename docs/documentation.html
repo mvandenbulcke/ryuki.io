@@ -43,7 +43,17 @@
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label active" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link" data-sections="prerequisites
 quick start
 authentication modes
-project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="stack
+project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="authority and scope
+required roles and target
+tool and provider prerequisites
+request contract
+gate 1: repository checks
+gate 2: proving-ground readiness
+gate 3: offline rehearsal
+gate 4: live plan and state isolation
+gate 5: live apply and verification
+gate 6: mandatory cleanup
+result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
 network policy
@@ -60,9 +70,10 @@ how it works
 permissions by role
 environment configuration
 important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
-site selection flow
+custom codes
+site selection
 managing sites
-current active sites
+seeded active sites
 important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
 scopes
 enforcement semantics
@@ -94,6 +105,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <main id="main">
 
 <h1>Documentation</h1><p>Everything you need to run Ryuki — the governed control plane for multi-site infrastructure.</p><div class="doc-grid"><a class="doc-card" href="/getting-started.html"><h2>Getting Started</h2><p>Prerequisites, database setup, first build and run.</p></a>
+<a class="doc-card" href="/first-test.html"><h2>First Test Acceptance</h2><p>Normative dry-run and live vSphere test gates, evidence, and cleanup.</p></a>
 <a class="doc-card" href="/architecture.html"><h2>Architecture</h2><p>The stack, component diagram, key decisions and network policy.</p></a>
 <a class="doc-card" href="/configuration.html"><h2>Configuration</h2><p>Environment variables, providers and platform configuration.</p></a>
 <a class="doc-card" href="/entra-app-registration.html"><h2>Entra App Registration</h2><p>OIDC / OAuth2 app registration and role setup for Entra ID.</p></a>
@@ -103,7 +115,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <a class="doc-card" href="/orchestration.html"><h2>Multi-Step Orchestration</h2><p>Dependency-ordered step plans, per-step live approval, and automatic teardown.</p></a>
 <a class="doc-card" href="/notifications.html"><h2>Notifications</h2><p>In-app notifications, read receipts, the portal bell, and what emits them.</p></a>
 <a class="doc-card" href="/using-the-api.html"><h2>Using the API</h2><p>Authentication, conventions, and a complete request lifecycle with curl.</p></a>
-<a class="doc-card" href="/api-reference.html"><h2>API Reference</h2><p>Every HTTP endpoint the control plane serves, generated from the route registrations.</p></a></div>
+<a class="doc-card" href="/api-reference.html"><h2>API Reference</h2><p>Route-by-area control-plane reference, plus a bounded machine-readable OpenAPI subset.</p></a></div>
 
 </main>
 </div>

@@ -133,7 +133,7 @@ fn security_job_runs_ripgrep_secret_scan() {
 }
 
 #[test]
-fn validate_job_runs_validator_without_shell_escape_hatch() {
+fn validate_job_runs_validator_as_a_hard_gate() {
     let workflow = load_workflow(CI_WORKFLOW_PATH);
     let validate = job(&workflow, "validate");
     let run_text = job_run_text(validate);
@@ -148,16 +148,11 @@ fn validate_job_runs_validator_without_shell_escape_hatch() {
     );
     assert!(
         !run_text.contains("|| true"),
-        "validator failures must not be shell-masked; use continue-on-error instead"
+        "validator failures must not be shell-masked"
     );
-    // Temporary: the validator slices largely assert the retired C# layout and
-    // fail at HEAD, so the job is observational until the "Catalog, contract &
-    // documentation integrity" theme lands. This assertion flips to
-    // `is_none()`/false once the slices are green.
-    assert_eq!(
-        validate["continue-on-error"].as_bool(),
-        Some(true),
-        "validate is expected to be continue-on-error until validator slices are green"
+    assert!(
+        validate["continue-on-error"].is_null(),
+        "validator failures must fail the CI job; continue-on-error is forbidden"
     );
 }
 

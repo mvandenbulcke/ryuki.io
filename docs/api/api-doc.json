@@ -1,6 +1,6 @@
 {
   "generated_by": "ryuki-validator generate-api-doc",
-  "route_count": 770,
+  "route_count": 771,
   "areas": [
     {
       "key": "activity",
@@ -147,8 +147,8 @@
           "tier": "admin",
           "auth_exempt": false,
           "handler": "admin_resolve_reconcile_required_job",
-          "summary": "POST /api/admin/agents/jobs/{job_id}/reconcile Resolves a terminal-dead-end `ReconcileRequired` agent job (a LiveApply whose lease expired mid-run, leaving real provider infra in an unknown state) to the terminal `Failed` once an operator has reconciled out-of-band.",
-          "description": "POST /api/admin/agents/jobs/{job_id}/reconcile\n\nResolves a terminal-dead-end `ReconcileRequired` agent job (a LiveApply whose\nlease expired mid-run, leaving real provider infra in an unknown state) to the\nterminal `Failed` once an operator has reconciled out-of-band. `Failed` is the\nconservative truth — the CP cannot verify the interrupted apply succeeded — and\nthe operator's reconciliation is captured in the audited `reason`. Admin-only.\nA non-alerting `job.reconcile_resolved` domain event closes the\nreconcile-required alert lifecycle (it does NOT page). The STRANDED PARENT\nREQUEST is left `Executing` (job-scoped): the operator concludes it with\n`POST /api/requests/{id}/fail`. There is NO in-place retry — the request's\nsingle LiveApply slot is permanently consumed (the no-double-apply index is\nall-statuses); re-attempting requires a fresh request (see\n`create_live_apply_job`).",
+          "summary": "POST /api/admin/agents/jobs/{job_id}/reconcile Resolves a terminal-dead-end `ReconcileRequired` live-mutation job to terminal `Failed` once an operator has reconciled provider and state out-of-band.",
+          "description": "POST /api/admin/agents/jobs/{job_id}/reconcile\n\nResolves a terminal-dead-end `ReconcileRequired` live-mutation job to terminal\n`Failed` once an operator has reconciled provider and state out-of-band. `Failed`\nis the conservative truth: the CP cannot verify that an interrupted mutation\nreached its intended state. The operator's reconciliation is captured in the\naudited `reason`. Admin-only.\nA non-alerting `job.reconcile_resolved` domain event closes the\nreconcile-required alert lifecycle (it does NOT page). A LiveApply parent stays\n`Executing` for explicit operator conclusion through\n`POST /api/requests/{id}/fail`; resolving a LiveDestroy also fails its\n`TearingDown` step and parent request so rollback cannot remain wedged. There is\nNO in-place LiveApply retry: its request slot is permanently consumed (the\nno-double-apply index is all-statuses), so re-attempting requires a fresh request\n(see `create_live_apply_job`).",
           "query_params": null,
           "request_body": {
             "struct": "ReconcileBody",
@@ -170,7 +170,7 @@
           "auth_exempt": false,
           "handler": "admin_agent_job_result",
           "summary": "GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result attestation + metadata (#agent-job-result).",
-          "description": "GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result\nattestation + metadata (#agent-job-result). Admin-only. The `signed_envelope` is a pure\ncryptographic attestation (digests + signature + ids, NO raw evidence); the raw\nagent-submitted `evidence_json` is NEVER exposed (no server-side redaction guarantee — a\nredacted-evidence view is a separate slice). 404 if the job is unknown OR has no result\nyet (`signed_envelope IS NULL`). Scoped principals see only jobs whose parent request\nfalls within their site/environment scope (run-5 A0).",
+          "description": "GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result\nattestation + metadata (#agent-job-result). Admin-only. The `signed_envelope` is a pure\ncryptographic attestation (digests + signature + ids, NO raw evidence); the raw\nagent-submitted `evidence_json` is NEVER exposed. For a successful Terraform\nLivePlan, `plan_review` is reparsed server-side from the exact bytes whose\ndigest is carried by the signed envelope and contains only an allowlisted\naction/placement projection. 404 if the job is unknown OR has no result yet\n(`signed_envelope IS NULL`). Scoped principals see only jobs whose parent\nrequest falls within their site/environment scope (run-5 A0).",
           "query_params": null,
           "request_body": null,
           "response_notes": null
@@ -193,44 +193,10 @@
           "tier": "admin",
           "auth_exempt": false,
           "handler": "admin_approve_live_apply_job",
-          "summary": "POST /api/admin/agents/live-apply-jobs Operator-gated endpoint that mints a CP-signed LiveApply grant and enqueues the job for dispatch.",
-          "description": "POST /api/admin/agents/live-apply-jobs\n\nOperator-gated endpoint that mints a CP-signed LiveApply grant and enqueues\nthe job for dispatch. The approver identity is taken exclusively from the\nverified session — the request body cannot override it.\n\n## Auth posture\n\nThe route sits under `/api/admin/` so the human RBAC middleware already\nenforces `admin` permission at the routing layer. The `check_permission`\ncall below is defense-in-depth: it fires if the middleware assumption ever\nchanges or the handler is composed without it.\n\nReturns 503 if the database pool or CP signing key was not initialised\nat startup (degraded mode).",
+          "summary": "POST /api/admin/agents/live-apply-jobs Disabled legacy endpoint.",
+          "description": "POST /api/admin/agents/live-apply-jobs\n\nDisabled legacy endpoint. Its caller-supplied platform, spec, and plan\ndigest could bypass the request-scoped safe plan-review derivation. Live\napply approval is available only through\n`POST /api/requests/{id}/approve-live-apply`, which derives every\nmutation-authorizing field from a successful stored LivePlan.\n\n## Auth posture\n\nThe route sits under `/api/admin/` so the human RBAC middleware already\nenforces `admin` permission at the routing layer. The `check_permission`\ncall below is defense-in-depth: it fires if the middleware assumption ever\nchanges or the handler is composed without it.\n\nReturns `410 Gone` for every authorized caller. No request body is accepted\nand no database or signing-key state is consulted.",
           "query_params": null,
-          "request_body": {
-            "struct": "ApproveLiveApplyBody",
-            "fields": [
-              {
-                "name": "request_id",
-                "type": "Uuid",
-                "optional": false,
-                "doc": null
-              },
-              {
-                "name": "platform",
-                "type": "String",
-                "optional": false,
-                "doc": null
-              },
-              {
-                "name": "spec",
-                "type": "JobSpec",
-                "optional": false,
-                "doc": null
-              },
-              {
-                "name": "approved_plan_digest",
-                "type": "String",
-                "optional": false,
-                "doc": null
-              },
-              {
-                "name": "expiry_seconds",
-                "type": "u64",
-                "optional": false,
-                "doc": "Requested grant lifetime in seconds. Must be > 0 and ≤ MAX_GRANT_TTL_HOURS * 3600."
-              }
-            ]
-          },
+          "request_body": null,
           "response_notes": null
         },
         {
@@ -777,8 +743,73 @@
           "handler": "site_registry_list",
           "summary": null,
           "description": null,
-          "query_params": null,
+          "query_params": [
+            {
+              "name": "active",
+              "type": "bool",
+              "optional": true,
+              "doc": null
+            }
+          ],
           "request_body": null,
+          "response_notes": null
+        },
+        {
+          "method": "POST",
+          "path": "/api/admin/sites",
+          "tier": "admin",
+          "auth_exempt": false,
+          "handler": "site_registry_create",
+          "summary": null,
+          "description": null,
+          "query_params": null,
+          "request_body": {
+            "struct": "SiteRegistryCreateRequest",
+            "fields": [
+              {
+                "name": "code",
+                "type": "String",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "codeSystem",
+                "type": "ryuki_engine::site_registry::SiteCodeSystem",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "name",
+                "type": "String",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "country",
+                "type": "String",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "countryCode",
+                "type": "String",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "timezone",
+                "type": "String",
+                "optional": false,
+                "doc": null
+              },
+              {
+                "name": "active",
+                "type": "bool",
+                "optional": true,
+                "doc": null
+              }
+            ]
+          },
           "response_notes": null
         },
         {
@@ -826,7 +857,7 @@
         },
         {
           "method": "GET",
-          "path": "/api/admin/sites/{unlocode}",
+          "path": "/api/admin/sites/{code}",
           "tier": "admin",
           "auth_exempt": false,
           "handler": "site_registry_get",
@@ -838,7 +869,7 @@
         },
         {
           "method": "POST",
-          "path": "/api/admin/sites/{unlocode}/activate",
+          "path": "/api/admin/sites/{code}/activate",
           "tier": "admin",
           "auth_exempt": false,
           "handler": "site_registry_activate",
@@ -850,7 +881,7 @@
         },
         {
           "method": "POST",
-          "path": "/api/admin/sites/{unlocode}/deactivate",
+          "path": "/api/admin/sites/{code}/deactivate",
           "tier": "admin",
           "auth_exempt": false,
           "handler": "site_registry_deactivate",
@@ -1050,17 +1081,35 @@
           "tier": "agent",
           "auth_exempt": false,
           "handler": "heartbeat",
-          "summary": "POST /api/agents/{agent_id}/heartbeat Updates last_seen_at on the agent row.",
-          "description": "POST /api/agents/{agent_id}/heartbeat\n\nUpdates last_seen_at on the agent row. Optionally records the running job.",
+          "summary": null,
+          "description": null,
           "query_params": null,
           "request_body": {
-            "struct": "HeartbeatBody",
+            "struct": "AgentHeartbeat",
             "fields": [
               {
                 "name": "running_job_id",
                 "type": "Uuid",
                 "optional": true,
-                "doc": "Currently running job id, if any."
+                "doc": null
+              },
+              {
+                "name": "attempt_id",
+                "type": "Uuid",
+                "optional": true,
+                "doc": null
+              },
+              {
+                "name": "lease_generation",
+                "type": "u64",
+                "optional": true,
+                "doc": null
+              },
+              {
+                "name": "fencing_token",
+                "type": "String",
+                "optional": true,
+                "doc": null
               }
             ]
           },
@@ -1072,8 +1121,8 @@
           "tier": "agent",
           "auth_exempt": false,
           "handler": "poll_job",
-          "summary": "GET /api/agents/{agent_id}/jobs Authenticated (bearer token + approved).",
-          "description": "GET /api/agents/{agent_id}/jobs\n\nAuthenticated (bearer token + approved). Atomically leases the next\nPending job for this agent's platform using SELECT … FOR UPDATE SKIP LOCKED,\nthen returns the full Job with its JobLease (including cp_nonce +\nfencing_token). Returns 204 when no Pending job is available.",
+          "summary": null,
+          "description": null,
           "query_params": null,
           "request_body": null,
           "response_notes": null
@@ -1113,7 +1162,7 @@
           "auth_exempt": false,
           "handler": "post_job_result",
           "summary": "Verifies and records the signed `JobResult` from an agent.",
-          "description": "Verifies and records the signed `JobResult` from an agent.\n\nThe full 9-step verifier runs FAIL-CLOSED: every check that fails returns\n4xx and mutates nothing. The terminal UPDATE is a single atomic conditional\nstatement guarded on (id, attempt_id, lease_generation, status IN\n('Leased','Running')). A repeat POST with the same (job_id, attempt_id,\nresult_id) returns idempotent 200.",
+          "description": "Verifies and records the signed `JobResult` from an agent.\n\nThe full 9-step verifier runs FAIL-CLOSED: every check that fails returns\n4xx and mutates nothing. The terminal UPDATE is a single atomic conditional\nstatement guarded on (id, attempt_id, lease_generation, status IN\n('Leased','Running'), unexpired database-clock lease). A repeat POST with the\nsame (job_id, attempt_id, result_id) returns idempotent 200.",
           "query_params": null,
           "request_body": {
             "struct": "ResultBody",

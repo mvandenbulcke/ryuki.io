@@ -359,7 +359,10 @@ mod hardware_assets_db_tests {
             return;
         };
         let total = count(&pool, "").await.expect("count all");
-        assert!(total >= 6, "migration seeds >=6 hardware assets, got {total}");
+        assert!(
+            total >= 6,
+            "migration seeds >=6 hardware assets, got {total}"
+        );
         let all = list_page(&pool, "", 10_000, 0)
             .await
             .expect("list_page all");

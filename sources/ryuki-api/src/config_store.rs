@@ -1,11 +1,49 @@
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::types::PlatformConfig;
 use std::path::Path;
+#[cfg(not(test))]
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
+#[cfg(not(test))]
 static STORE: OnceLock<Mutex<ConfigStore>> = OnceLock::new();
+#[cfg(not(test))]
 static APP_CONFIG: OnceLock<RyukiConfig> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    // Auth-mode tests require different immutable startup configurations. A
+    // process-global OnceLock makes the first test silently dictate every later
+    // test's mode, so test builds scope both values to the Rust test thread.
+    // The small fixtures are leaked intentionally: callers receive `static`
+    // references, and repeated initialization must never invalidate one.
+    static TEST_STORE: std::cell::RefCell<Option<&'static Mutex<ConfigStore>>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_APP_CONFIG: std::cell::RefCell<Option<&'static RyukiConfig>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(not(test))]
+fn app_config_if_initialized() -> Option<&'static RyukiConfig> {
+    APP_CONFIG.get()
+}
+
+#[cfg(test)]
+fn app_config_if_initialized() -> Option<&'static RyukiConfig> {
+    TEST_APP_CONFIG.with(|slot| *slot.borrow())
+}
+
+#[cfg(not(test))]
+fn config_store() -> &'static Mutex<ConfigStore> {
+    STORE.get().expect("config store not initialized")
+}
+
+#[cfg(test)]
+fn config_store() -> &'static Mutex<ConfigStore> {
+    TEST_STORE.with(|slot| slot.borrow().expect("config store not initialized"))
+}
 
 #[derive(Debug)]
 pub struct ConfigStore {
@@ -22,7 +60,7 @@ impl ConfigStore {
     pub fn load_config(&self) -> Result<PlatformConfig, String> {
         let mut config = PlatformConfig::default();
 
-        if let Some(app_cfg) = APP_CONFIG.get() {
+        if let Some(app_cfg) = app_config_if_initialized() {
             config.entra_tenant_id = app_cfg.entra_tenant_id.clone();
             config.entra_client_id = app_cfg.entra_client_id.clone();
             config.entra_authority = app_cfg.entra_authority.clone();
@@ -50,6 +88,7 @@ impl ConfigStore {
     }
 }
 
+#[cfg(not(test))]
 pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
     let _ = APP_CONFIG.set(app_cfg.clone());
     let store = ConfigStore::new(path);
@@ -58,38 +97,35 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
         .expect("config store already initialized");
 }
 
-pub fn get_app_config() -> &'static RyukiConfig {
-    APP_CONFIG.get().expect("app config not initialized")
+#[cfg(test)]
+pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
+    TEST_APP_CONFIG.with(|slot| {
+        *slot.borrow_mut() = Some(Box::leak(Box::new(app_cfg.clone())));
+    });
+    TEST_STORE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::leak(Box::new(Mutex::new(ConfigStore::new(path)))));
+    });
 }
 
-/// Idempotently initialize the app config + config store for a test, pointing
-/// the FILE store at `path` (pass a temp path so handler file-saves never touch
-/// a real config). Returns true ONLY if this call claimed the set-once store, so
-/// a caller can skip rather than risk clobbering a store another test owns.
-#[cfg(test)]
-pub fn try_init_for_test(path: &str) -> bool {
-    let _ = APP_CONFIG.set(RyukiConfig::default());
-    STORE.set(Mutex::new(ConfigStore::new(path))).is_ok()
+pub fn get_app_config() -> &'static RyukiConfig {
+    app_config_if_initialized().expect("app config not initialized")
 }
 
 /// The configured auth mode, or the default (`MockDryRun`) when the config store
 /// is not initialized (e.g. unit tests). Never panics — use this on hot paths
 /// (like the separation-of-duties gate) that can run before/without init.
 pub fn auth_mode_or_default() -> ryuki_core::config::AuthMode {
-    APP_CONFIG
-        .get()
+    app_config_if_initialized()
         .map(|c| c.auth_mode.clone())
         .unwrap_or_default()
 }
 
 pub async fn load_config() -> Result<PlatformConfig, String> {
-    let store = STORE.get().expect("config store not initialized");
-    store.lock().await.load_config()
+    config_store().lock().await.load_config()
 }
 
 pub async fn save_config(config: &PlatformConfig) -> Result<(), String> {
-    let store = STORE.get().expect("config store not initialized");
-    store.lock().await.save_config(config)
+    config_store().lock().await.save_config(config)
 }
 
 #[cfg(test)]

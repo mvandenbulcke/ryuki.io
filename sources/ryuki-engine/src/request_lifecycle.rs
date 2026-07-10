@@ -1,9 +1,9 @@
 use crate::models::*;
+use crate::site_registry;
 use chrono::Utc;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 const VALID_ENVIRONMENTS: &[&str] = &["development", "test", "acceptance", "production"];
 
 fn has_completed_stage(request: &Request, name: &str) -> bool {
@@ -45,9 +45,10 @@ pub fn create_request(
     if owner.is_empty() {
         return Err("owner cannot be empty".into());
     }
-    if site.is_empty() {
+    if site.trim().is_empty() {
         return Err("site cannot be empty".into());
     }
+    let site = site_registry::normalize_site_code_for_lookup(site)?;
     if environment.is_empty() {
         return Err("environment cannot be empty".into());
     }
@@ -69,7 +70,7 @@ pub fn create_request(
         request_type,
         requester.to_string(),
         owner.to_string(),
-        site.to_string(),
+        site,
         environment.to_string(),
         criticality.to_string(),
     );
@@ -143,13 +144,13 @@ pub fn validate_request(request: &Request) -> Result<ValidationResult, String> {
         remediation.push("Add the service criticality before validation.".into());
     }
 
-    if !request.site.is_empty() && !VALID_SITES.contains(&request.site.as_str()) {
+    if !request.site.is_empty() && !site_registry::is_valid_site(&request.site) {
         errors.push(format!("Unknown site: {}", request.site));
         failed_rules.push("p0-site-ou-catalog-match".into());
-        remediation.push(format!(
-            "Select a known site. Valid sites: {:?}",
-            VALID_SITES
-        ));
+        remediation.push(
+            "Select an active registered site. UN/LOCODE is recommended; custom codes must be registered and activated by an administrator first."
+                .into(),
+        );
     }
 
     if !request.environment.is_empty()
@@ -959,6 +960,35 @@ mod tests {
         let result = validate_request(&req).unwrap();
         assert!(!result.passed);
         assert!(result.errors.iter().any(|e| e.contains("Unknown site")));
+    }
+
+    #[test]
+    fn test_validate_request_accepts_active_registered_custom_site() {
+        let code = "TEST-REQUEST-SITE-01";
+        let _ = site_registry::register_site(
+            site_registry::SiteEntry {
+                unlocode: code.into(),
+                name: "Request lifecycle test site".into(),
+                country: "Belgium".into(),
+                country_code: "BE".into(),
+                timezone: "Europe/Brussels".into(),
+                active: true,
+            },
+            site_registry::SiteCodeSystem::Custom,
+        );
+        let mut req = create_request(
+            "windows-server-deployment",
+            RequestType::ServerDeployment,
+            "alice",
+            "bob",
+            "test-request-site-01",
+            "production",
+            "critical",
+        )
+        .unwrap();
+        req.approval_route.push("Datacenter Approver".into());
+        assert_eq!(req.site, code);
+        assert!(validate_request(&req).unwrap().passed);
     }
 
     #[test]

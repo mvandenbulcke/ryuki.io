@@ -346,7 +346,10 @@ fn decl_name(line: &str, keyword: &str) -> Option<(String, usize)> {
     }
     let after = &line[pos + needle.len()..];
     let rel = after.find(|c: char| !c.is_whitespace())?;
-    let name: String = after[rel..].chars().take_while(|c| is_ident_char(*c)).collect();
+    let name: String = after[rel..]
+        .chars()
+        .take_while(|c| is_ident_char(*c))
+        .collect();
     if name.is_empty() || name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -519,7 +522,10 @@ fn record_struct(
     let (fields, end) = if chars[open] == '{' {
         let close = matching_delimiter(chars, open, '{', '}').unwrap_or(chars.len() - 1);
         let body: String = chars[open + 1..close].iter().collect();
-        (Some(parse_struct_fields(&body, rename_all.as_deref())), close)
+        (
+            Some(parse_struct_fields(&body, rename_all.as_deref())),
+            close,
+        )
     } else if chars[open] == '(' {
         // tuple struct: field shapes are not documented
         let close = matching_delimiter(chars, open, '(', ')').unwrap_or(chars.len() - 1);
@@ -713,7 +719,10 @@ fn normalize_type(raw: &str) -> String {
 /// Strips ONE outer `Option<...>` layer; the boolean reports whether it was
 /// present (Option-ness is emitted separately as `optional`).
 fn strip_option(ty: &str) -> (String, bool) {
-    match ty.strip_prefix("Option<").and_then(|rest| rest.strip_suffix('>')) {
+    match ty
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
         Some(inner) => (inner.trim().to_string(), true),
         None => (ty.to_string(), false),
     }
@@ -817,10 +826,7 @@ fn extractor_type(params: &str, wrapper: &str) -> Option<String> {
 /// A type token that can name a findable struct: a plain ident, optionally
 /// module-qualified. Returns the final segment for index lookup.
 fn plain_struct_name(ty: &str) -> Option<&str> {
-    let plain = !ty.is_empty()
-        && ty
-            .chars()
-            .all(|ch| is_ident_char(ch) || ch == ':');
+    let plain = !ty.is_empty() && ty.chars().all(|ch| is_ident_char(ch) || ch == ':');
     if plain {
         ty.rsplit("::").next()
     } else {
@@ -982,10 +988,7 @@ const AREA_DESCRIPTIONS: &[(&str, &str)] = &[
          recertification, AD computer lifecycle, gMSA lifecycle, file-share/NTFS \
          recertification, and RBAC approval-model contracts.",
     ),
-    (
-        "images",
-        "Contract endpoint for the golden-image factory.",
-    ),
+    ("images", "Contract endpoint for the golden-image factory."),
     (
         "integrations",
         "Adapter readiness and contract-test surface for external providers (backup, \
@@ -1403,8 +1406,7 @@ fn resolve_struct<'a>(
 fn query_params_for(info: &HandlerInfo, scan: &SourceScan) -> Option<Vec<ApiField>> {
     let params = info.params.as_deref()?;
     let ty = extractor_type(params, "Query")?;
-    resolve_struct(scan, &ty, &info.file)
-        .and_then(|found| found.fields.clone())
+    resolve_struct(scan, &ty, &info.file).and_then(|found| found.fields.clone())
 }
 
 fn request_body_for(info: &HandlerInfo, scan: &SourceScan) -> Option<ApiRequestBody> {
@@ -1571,8 +1573,10 @@ struct Tuple(String);
         scan_file(source, "sources/ryuki-api/src/contracts.rs", &mut scan);
 
         let fields = scan.structs["WidgetListQuery"][0].fields.clone().unwrap();
-        let by_name: BTreeMap<&str, &ApiField> =
-            fields.iter().map(|field| (field.name.as_str(), field)).collect();
+        let by_name: BTreeMap<&str, &ApiField> = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field))
+            .collect();
         assert_eq!(fields.len(), 5, "skip field must be excluded");
         assert_eq!(by_name["limit"].type_, "i64");
         assert!(by_name["limit"].optional);
@@ -1591,7 +1595,10 @@ struct Tuple(String);
         // commas inside generics
         let trapped = scan.structs["CommentTrap"][0].fields.clone().unwrap();
         assert_eq!(trapped.len(), 1);
-        assert_eq!(trapped[0].type_, "std::collections::BTreeMap<String, String>");
+        assert_eq!(
+            trapped[0].type_,
+            "std::collections::BTreeMap<String, String>"
+        );
         assert!(trapped[0].optional, "serde default implies optional");
 
         assert!(scan.structs["Tuple"][0].fields.is_none());
@@ -1607,7 +1614,10 @@ struct Tuple(String);
             first_sentence("Uses e.g. lowered text before ending. Second."),
             "Uses e.g. lowered text before ending."
         );
-        assert_eq!(first_sentence("No terminal period at all"), "No terminal period at all");
+        assert_eq!(
+            first_sentence("No terminal period at all"),
+            "No terminal period at all"
+        );
         assert_eq!(
             first_sentence("Multi\nline doc\ncomment. Tail."),
             "Multi line doc comment."
@@ -1641,7 +1651,10 @@ struct Tuple(String);
                     .extend(registration.methods.into_iter().map(|entry| entry.method));
             }
         }
-        api_doc_count += routes.values().map(std::collections::BTreeSet::len).sum::<usize>();
+        api_doc_count += routes
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum::<usize>();
         let (_, endpoints_count) =
             crate::generate_endpoints_doc(&root).expect("endpoints doc must build");
         assert_eq!(api_doc_count, endpoints_count);

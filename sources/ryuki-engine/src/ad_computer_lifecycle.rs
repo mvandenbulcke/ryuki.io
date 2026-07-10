@@ -1,9 +1,7 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const VALID_OU_PREFIXES: &[&str] = &[
     "OU=Servers",
@@ -54,29 +52,33 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn computer_name_parts(name: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = name.rsplitn(3, '-');
+    let number = parts.next()?;
+    let role = parts.next()?;
+    let site = parts.next()?;
+    (!site.is_empty() && !role.is_empty() && !number.is_empty()).then_some((site, role, number))
+}
+
 fn validate_naming_convention(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Computer name cannot be empty".into());
     }
-    let parts: Vec<&str> = name.split('-').collect();
-    if parts.len() != 3 {
+    let Some((site, role, number)) = computer_name_parts(name) else {
         return Err(format!(
             "Invalid computer name '{}': must match pattern SITE-ROLE-NN (e.g. DEFRA-SRV-01)",
             name
         ));
-    }
-    let site = parts[0];
-    if !VALID_SITES.contains(&site) {
+    };
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site code '{}' in computer name", site));
     }
-    let role = parts[1];
     if !["SRV", "WS", "DC", "MGMT", "TEST", "DEV"].contains(&role) {
         return Err(format!(
             "Unknown role code '{}' in computer name. Must be SRV, WS, DC, MGMT, TEST, or DEV",
             role
         ));
     }
-    let number = parts[2];
     if number.len() < 2 || number.len() > 4 || !number.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!(
             "Invalid sequence number '{}' in computer name. Must be 2-4 digits",
@@ -106,7 +108,7 @@ pub fn prestage_computer(name: &str, site: &str, ou_path: &str) -> Result<ADComp
     if name.is_empty() {
         return Err("Computer name cannot be empty".into());
     }
-    if site.is_empty() || !VALID_SITES.contains(&site) {
+    if site.is_empty() || !site_registry::is_valid_site(site) {
         return Err(format!("Unknown or empty site: {}", site));
     }
     if ou_path.is_empty() {
@@ -152,14 +154,15 @@ pub fn validate_computer(name: &str) -> Result<ValidationResult, String> {
             .push("Rename the computer to match SITE-ROLE-NN format (e.g. DEFRA-SRV-01)".into());
     }
 
-    let parts: Vec<&str> = name.split('-').collect();
-    if parts.len() == 3 {
-        let site = parts[0];
-        if !VALID_SITES.contains(&site) {
-            errors.push(format!("Unknown site code '{}' in computer name", site));
-            failed_rules.push("p0-site-code-valid".into());
-            remediation.push(format!("Use a valid site code from: {:?}", VALID_SITES));
-        }
+    if let Some((site, _, _)) = computer_name_parts(name)
+        && !site_registry::is_valid_site(site)
+    {
+        errors.push(format!("Unknown site code '{}' in computer name", site));
+        failed_rules.push("p0-site-code-valid".into());
+        remediation.push(format!(
+            "Use an active site code from: {:?}",
+            site_registry::get_active_site_codes().unwrap_or_default()
+        ));
     }
 
     warnings.push("DRY-RUN: No live AD validation performed".into());
@@ -184,13 +187,12 @@ pub fn move_computer(name: &str, target_ou: &str) -> Result<ADComputer, String> 
     validate_ou_path(target_ou)?;
     validate_naming_convention(name)?;
 
-    let parts: Vec<&str> = name.split('-').collect();
-    let site = parts[0].to_string();
+    let (site, _, _) = computer_name_parts(name).expect("validated computer name");
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
-        site,
+        site: site.to_string(),
         ou_path: target_ou.to_string(),
         status: ComputerStatus::Active,
         last_logon: now_iso(),
@@ -220,13 +222,12 @@ pub fn disable_computer(name: &str, reason: &str) -> Result<ADComputer, String> 
     }
     validate_naming_convention(name)?;
 
-    let parts: Vec<&str> = name.split('-').collect();
-    let site = parts[0].to_string();
+    let (site, _, _) = computer_name_parts(name).expect("validated computer name");
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
-        site,
+        site: site.to_string(),
         ou_path: "OU=Disabled,DC=corp,DC=local".to_string(),
         status: ComputerStatus::Disabled,
         last_logon: now_iso(),
@@ -253,13 +254,12 @@ pub fn enable_computer(name: &str) -> Result<ADComputer, String> {
     }
     validate_naming_convention(name)?;
 
-    let parts: Vec<&str> = name.split('-').collect();
-    let site = parts[0].to_string();
+    let (site, _, _) = computer_name_parts(name).expect("validated computer name");
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
-        site,
+        site: site.to_string(),
         ou_path: "OU=Servers,DC=corp,DC=local".to_string(),
         status: ComputerStatus::Active,
         last_logon: now_iso(),
@@ -379,7 +379,7 @@ pub struct ReconciliationResult {
 }
 
 pub fn reconcile_computers(site: &str) -> Result<ReconciliationResult, String> {
-    if site.is_empty() || !VALID_SITES.contains(&site) {
+    if site.is_empty() || !site_registry::is_valid_site(site) {
         return Err(format!("Unknown or empty site: {}", site));
     }
 
@@ -443,7 +443,7 @@ pub fn reconcile_computers(site: &str) -> Result<ReconciliationResult, String> {
 }
 
 pub fn get_orphaned(site: &str) -> Result<Vec<ADComputer>, String> {
-    if site.is_empty() || !VALID_SITES.contains(&site) {
+    if site.is_empty() || !site_registry::is_valid_site(site) {
         return Err(format!("Unknown or empty site: {}", site));
     }
 
@@ -597,6 +597,27 @@ mod tests {
         assert_eq!(computer.site, "DEFRA");
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("prestaged"));
+    }
+
+    #[test]
+    fn test_prestage_accepts_registered_hyphenated_custom_site() {
+        const SITE: &str = "LEGACY-AD-CUSTOM";
+        site_registry::upsert_site(
+            site_registry::SiteEntry {
+                unlocode: SITE.into(),
+                name: "Legacy AD custom test site".into(),
+                country: "Test country".into(),
+                country_code: "ZZ".into(),
+                timezone: "UTC".into(),
+                active: true,
+            },
+            site_registry::SiteCodeSystem::Custom,
+        )
+        .unwrap();
+
+        let name = format!("{SITE}-SRV-01");
+        let computer = prestage_computer(&name, SITE, "OU=Servers,DC=corp,DC=local").unwrap();
+        assert_eq!(computer.site, SITE);
     }
 
     #[test]

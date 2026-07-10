@@ -77,23 +77,19 @@
   <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/register</span></code></pre>
 <h2 class="ep-h" id="post-api-agents-agent-id-heartbeat"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/heartbeat</code></h2>
 <p class="badges"><span class="badge">agent tier</span></p>
-<p class="ep-summary">POST /api/agents/{agent_id}/heartbeat Updates last_seen_at on the agent row.</p>
-<p>POST /api/agents/{agent_id}/heartbeat</p>
-<p>Updates last_seen_at on the agent row. Optionally records the running job.</p>
+<p class="ep-missing">No description extracted yet.</p>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>HeartbeatBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>running_job_id</code></td><td><code>Uuid</code></td><td>optional</td><td>Currently running job id, if any.</td></tr></tbody></table>
+<p class="ep-struct">Structure: <code>AgentHeartbeat</code></p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>running_job_id</code></td><td><code>Uuid</code></td><td>optional</td><td></td></tr><tr><td><code>attempt_id</code></td><td><code>Uuid</code></td><td>optional</td><td></td></tr><tr><td><code>lease_generation</code></td><td><code>u64</code></td><td>optional</td><td></td></tr><tr><td><code>fencing_token</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
 <h3 class="ep-sub">Example request</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
   <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"running_job_id": "&lt;uuid&gt;"}'</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"running_job_id": "&lt;uuid&gt;", "attempt_id": "&lt;uuid&gt;", "lease_generation": 0, "fencing_token": "&lt;string&gt;"}'</span> \
   <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/{agent_id}/heartbeat</span></code></pre>
 <h2 class="ep-h" id="get-api-agents-agent-id-jobs"><span class="method-chip m-get">GET</span><code>/api/agents/{agent_id}/jobs</code></h2>
 <p class="badges"><span class="badge">agent tier</span></p>
-<p class="ep-summary">GET /api/agents/{agent_id}/jobs Authenticated (bearer token + approved).</p>
-<p>GET /api/agents/{agent_id}/jobs</p>
-<p>Authenticated (bearer token + approved). Atomically leases the next Pending job for this agent's platform using SELECT … FOR UPDATE SKIP LOCKED, then returns the full Job with its JobLease (including cp_nonce + fencing_token). Returns 204 when no Pending job is available.</p>
+<p class="ep-missing">No description extracted yet.</p>
 <h3 class="ep-sub">Example request</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/agents/{agent_id}/jobs</code></pre>
 <h2 class="ep-h" id="post-api-agents-agent-id-jobs-job-id-ack"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/jobs/{job_id}/ack</code></h2>
@@ -114,7 +110,7 @@
 <p class="badges"><span class="badge">agent tier</span></p>
 <p class="ep-summary">Verifies and records the signed <code>JobResult</code> from an agent.</p>
 <p>Verifies and records the signed <code>JobResult</code> from an agent.</p>
-<p>The full 9-step verifier runs FAIL-CLOSED: every check that fails returns 4xx and mutates nothing. The terminal UPDATE is a single atomic conditional statement guarded on (id, attempt_id, lease_generation, status IN ('Leased','Running')). A repeat POST with the same (job_id, attempt_id, result_id) returns idempotent 200.</p>
+<p>The full 9-step verifier runs FAIL-CLOSED: every check that fails returns 4xx and mutates nothing. The terminal UPDATE is a single atomic conditional statement guarded on (id, attempt_id, lease_generation, status IN ('Leased','Running'), unexpired database-clock lease). A repeat POST with the same (job_id, attempt_id, result_id) returns idempotent 200.</p>
 <h3 class="ep-sub">Request body</h3>
 <p class="ep-struct">Structure: <code>ResultBody</code></p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>job_result</code></td><td><code>JobResult</code></td><td>required</td><td></td></tr><tr><td><code>evidence</code></td><td><code>Vec&lt;u8&gt;</code></td><td>optional</td><td>Raw evidence bytes (the payload whose SHA-256 is <code>evidence_digest</code>).
@@ -127,7 +123,7 @@ Stored as JSONB for query convenience; never trusted for authz.</td></tr></tbody
   <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
   <span class="hl-cmd">-d</span> <span class="hl-s">'{"job_result": "&lt;JobResult&gt;", "evidence": [], "evidence_json": "&lt;serde_json::Value&gt;"}'</span> \
   <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/{agent_id}/jobs/{job_id}/result</span></code></pre>
-<div class="page-meta">Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
 </main>
 </div>
 <script>

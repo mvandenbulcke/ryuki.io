@@ -1,3 +1,4 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,8 +29,6 @@ pub struct GoldenImage {
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
 const VALID_OS_FAMILIES: &[&str] = &["Windows", "Linux"];
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -55,10 +54,12 @@ pub fn initiate_build(
             VALID_OS_FAMILIES.join(", ")
         ));
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!(
             "Unknown site: {site}. Valid values: {}",
-            VALID_SITES.join(", ")
+            site_registry::get_active_site_codes()
+                .unwrap_or_default()
+                .join(", ")
         ));
     }
     if distro.is_empty() {
@@ -154,10 +155,12 @@ pub fn schedule_monthly_build(
     os_family: &str,
     distro: &str,
 ) -> Result<GoldenImage, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!(
             "Unknown site: {site}. Valid values: {}",
-            VALID_SITES.join(", ")
+            site_registry::get_active_site_codes()
+                .unwrap_or_default()
+                .join(", ")
         ));
     }
     if !VALID_OS_FAMILIES.contains(&os_family) {

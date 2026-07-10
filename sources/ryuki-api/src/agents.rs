@@ -13,11 +13,13 @@
 //!
 //! # Lease / fencing invariants
 //!
-//! - Lease TTL is 5 minutes (CP DB time; no client clock).
+//! - Initial/non-live lease TTL is 5 minutes (CP DB time; no client clock).
+//!   Exact Running live-job renewals extend past the runner's bounded call.
 //! - cp_nonce + fencing_token are generated as UUIDs (128-bit CSPRNG; unguessable).
 //! - The SKIP LOCKED lease query is the single atomically-safe dispatch path.
+//! - Ack, renewal, and result recording all reject an expired DB-clock lease.
 //! - Lease expiry: OfflineDryRun / LivePlan → re-Pending (new attempt);
-//!   LiveApply → ReconcileRequired (never auto-redispatched).
+//!   LiveApply / LiveDestroy → ReconcileRequired (never auto-redispatched).
 
 use axum::{
     extract::{Extension, Path, Query},
@@ -42,15 +44,27 @@ use crate::database::get_db;
 use crate::sha256_hex;
 use ryuki_protocol::{
     crypto::{sign_vlc, verify_vlc},
-    Capabilities, Job, JobLease, JobMode, JobResult, JobResultStatus, JobSpec, JobStatus,
-    VerifiedLiveContext,
+    AgentHeartbeat, AgentHeartbeatResponse, Capabilities, Job, JobLease, JobMode, JobResult,
+    JobResultStatus, JobSpec, JobStatus, VerifiedLiveContext,
 };
 
 // ---------------------------------------------------------------------------
 // Lease TTL (seconds)
 // ---------------------------------------------------------------------------
 
-const LEASE_TTL_SECS: i64 = 300; // 5 minutes
+// Initial and non-live lease duration: five minutes.
+const LEASE_TTL_SECS: i64 = 300;
+// A live executor call is synchronous at the agent boundary and may run three
+// sequential Terraform subprocesses, each capped at 600s (plan:
+// init/plan/show; apply: init/apply/post-apply plan). Extending a successfully
+// fenced Running live lease beyond that whole bound prevents the CP from
+// expiring/reassigning the job while a timed subprocess can still mutate.
+const MAX_LIVE_EXECUTOR_CALL_SECS: i64 = 3 * 600;
+const LIVE_LEASE_TTL_SECS: i64 = MAX_LIVE_EXECUTOR_CALL_SECS + 600;
+const _: () = {
+    assert!(LIVE_LEASE_TTL_SECS > MAX_LIVE_EXECUTOR_CALL_SECS);
+    assert!(LIVE_LEASE_TTL_SECS > LEASE_TTL_SECS);
+};
 
 // ---------------------------------------------------------------------------
 // DB row types
@@ -94,6 +108,13 @@ const AGENT_JOB_COLUMNS: &str = "id, request_id, platform, spec, mode, status, \
     agent_id, attempt_id, lease_generation, fencing_token, cp_nonce, \
     lease_deadline, live_context, created_at, updated_at";
 
+pub(crate) struct LeasedAgentJob {
+    row: AgentJobRow,
+    attempt_id: Uuid,
+    fencing_token: String,
+    cp_nonce: String,
+}
+
 // ---------------------------------------------------------------------------
 // Wire types (request / response bodies)
 // ---------------------------------------------------------------------------
@@ -136,13 +157,6 @@ pub struct ApproveBody {
 pub struct AckBody {
     pub attempt_id: Uuid,
     pub fencing_token: String,
-}
-
-/// Body for POST /api/agents/{id}/heartbeat.
-#[derive(Debug, Deserialize)]
-pub struct HeartbeatBody {
-    /// Currently running job id, if any.
-    pub running_job_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +560,101 @@ pub async fn admin_revoke_agent(
 /// Pending job for this agent's platform using SELECT … FOR UPDATE SKIP LOCKED,
 /// then returns the full Job with its JobLease (including cp_nonce +
 /// fencing_token). Returns 204 when no Pending job is available.
+pub(crate) async fn lease_pending_job(
+    pool: &PgPool,
+    agent_id: &str,
+    platform: &str,
+) -> Result<Option<LeasedAgentJob>, sqlx::Error> {
+    let attempt_id = Uuid::new_v4();
+    let fencing_token = Uuid::new_v4().to_string();
+    let cp_nonce = Uuid::new_v4().to_string();
+
+    // A stateful live job is pinned to the first agent that leases its state
+    // key. Later plan/apply/destroy jobs, retries, and admin requeues may only
+    // return to that agent. The oldest pending live job is the sole unbound
+    // affinity anchor, preventing concurrent first leases of sibling jobs from
+    // establishing different agents for one key.
+    let row = sqlx::query_as::<_, AgentJobRow>(&format!(
+        "UPDATE agent_jobs \
+         SET status = 'Leased', \
+             agent_id = $1, \
+             attempt_id = $2, \
+             lease_generation = lease_generation + 1, \
+             fencing_token = $3, \
+             cp_nonce = $4, \
+             lease_deadline = NOW() + make_interval(secs => $5), \
+             updated_at = NOW() \
+         WHERE id = ( \
+             SELECT pending.id FROM agent_jobs AS pending \
+             WHERE pending.platform = $6 AND pending.status = 'Pending' \
+               AND ( \
+                 NOT ( \
+                   pending.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') \
+                   OR COALESCE(pending.spec->>'mode', '') \
+                      IN ('live_plan', 'live_apply', 'live_destroy') \
+                 ) \
+                 OR NULLIF(pending.spec->>'state_key', '') IS NULL \
+                 OR ( \
+                   NOT EXISTS ( \
+                     SELECT 1 FROM agent_jobs AS conflicting \
+                     WHERE conflicting.agent_id IS NOT NULL \
+                       AND conflicting.agent_id <> $1 \
+                       AND conflicting.spec->>'state_key' = pending.spec->>'state_key' \
+                       AND ( \
+                         conflicting.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') \
+                         OR COALESCE(conflicting.spec->>'mode', '') \
+                            IN ('live_plan', 'live_apply', 'live_destroy') \
+                       ) \
+                   ) \
+                   AND ( \
+                     EXISTS ( \
+                       SELECT 1 FROM agent_jobs AS affinity \
+                       WHERE affinity.agent_id = $1 \
+                         AND affinity.spec->>'state_key' = pending.spec->>'state_key' \
+                         AND ( \
+                           affinity.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') \
+                           OR COALESCE(affinity.spec->>'mode', '') \
+                              IN ('live_plan', 'live_apply', 'live_destroy') \
+                         ) \
+                     ) \
+                     OR pending.id = ( \
+                       SELECT anchor.id FROM agent_jobs AS anchor \
+                       WHERE anchor.status = 'Pending' \
+                         AND anchor.spec->>'state_key' = pending.spec->>'state_key' \
+                         AND ( \
+                           anchor.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') \
+                           OR COALESCE(anchor.spec->>'mode', '') \
+                              IN ('live_plan', 'live_apply', 'live_destroy') \
+                         ) \
+                       ORDER BY anchor.created_at, anchor.id \
+                       LIMIT 1 \
+                     ) \
+                   ) \
+                 ) \
+               ) \
+             ORDER BY pending.priority DESC, pending.created_at, pending.id \
+             FOR UPDATE OF pending SKIP LOCKED \
+             LIMIT 1 \
+         ) \
+         RETURNING {AGENT_JOB_COLUMNS}"
+    ))
+    .bind(agent_id)
+    .bind(attempt_id)
+    .bind(&fencing_token)
+    .bind(&cp_nonce)
+    .bind(LEASE_TTL_SECS as f64)
+    .bind(platform)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| LeasedAgentJob {
+        row,
+        attempt_id,
+        fencing_token,
+        cp_nonce,
+    }))
+}
+
 pub async fn poll_job(
     _pv: ProtocolVersion,
     Path(agent_id): Path<String>,
@@ -576,44 +685,12 @@ pub async fn poll_job(
             .into_response();
     }
 
-    let new_attempt_id = Uuid::new_v4();
-    let fencing_token = Uuid::new_v4().to_string();
-    let cp_nonce = Uuid::new_v4().to_string();
-
     // Atomically lease the next Pending job for this platform.
     // SKIP LOCKED ensures two concurrent polls cannot double-lease the same row.
     // lease_deadline is computed entirely in DB time (NOW() + interval) so all
     // lease timing uses the canonical Postgres clock, not the API server clock.
-    let row = sqlx::query_as::<_, AgentJobRow>(&format!(
-        "UPDATE agent_jobs \
-         SET status = 'Leased', \
-             agent_id = $1, \
-             attempt_id = $2, \
-             lease_generation = lease_generation + 1, \
-             fencing_token = $3, \
-             cp_nonce = $4, \
-             lease_deadline = NOW() + make_interval(secs => $5), \
-             updated_at = NOW() \
-         WHERE id = ( \
-             SELECT id FROM agent_jobs \
-             WHERE platform = $6 AND status = 'Pending' \
-             ORDER BY priority DESC, created_at, id \
-             FOR UPDATE SKIP LOCKED \
-             LIMIT 1 \
-         ) \
-         RETURNING {AGENT_JOB_COLUMNS}"
-    ))
-    .bind(&agent_id)
-    .bind(new_attempt_id)
-    .bind(&fencing_token)
-    .bind(&cp_nonce)
-    .bind(LEASE_TTL_SECS as f64)
-    .bind(&agent.platform)
-    .fetch_optional(pool)
-    .await;
-
-    let row = match row {
-        Ok(Some(r)) => r,
+    let leased = match lease_pending_job(pool, &agent_id, &agent.platform).await {
+        Ok(Some(leased)) => leased,
         Ok(None) => {
             // No Pending job available — 204 No Content.
             return StatusCode::NO_CONTENT.into_response();
@@ -627,6 +704,12 @@ pub async fn poll_job(
                 .into_response();
         }
     };
+    let LeasedAgentJob {
+        row,
+        attempt_id: new_attempt_id,
+        fencing_token,
+        cp_nonce,
+    } = leased;
 
     let spec: JobSpec = match serde_json::from_value(row.spec.0.clone()) {
         Ok(s) => s,
@@ -853,7 +936,12 @@ fn result_status_label(s: &JobResultStatus) -> &'static str {
 // JobResultStatus → terminal agent_jobs.status
 // ---------------------------------------------------------------------------
 
-fn map_result_status_to_job_status(s: &JobResultStatus) -> &'static str {
+fn map_result_status_to_job_status(mode: &JobMode, s: &JobResultStatus) -> &'static str {
+    if matches!(mode, JobMode::LiveApply | JobMode::LiveDestroy)
+        && matches!(s, JobResultStatus::Failed)
+    {
+        return "ReconcileRequired";
+    }
     match s {
         JobResultStatus::CheckOk
         | JobResultStatus::Planned
@@ -907,6 +995,287 @@ fn compute_evidence_json_for_storage(
     } else {
         evidence_json.clone()
     }
+}
+
+/// Sanitized, server-derived review of a digest-verified Terraform LivePlan.
+/// Raw plan JSON is deliberately never serialized through this type.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LivePlanReview {
+    digest_verified: bool,
+    state_key: String,
+    placement: LivePlanPlacement,
+    managed_changes: Vec<ManagedPlanChange>,
+    counts: PlanChangeCounts,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LivePlanPlacement {
+    name: String,
+    cpu: u32,
+    memory_gb: u32,
+    disk_size_gb: u32,
+    datacenter: String,
+    cluster: String,
+    datastore: String,
+    network: String,
+    template: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ManagedPlanChange {
+    resource_type: &'static str,
+    logical_name: String,
+    action: &'static str,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct PlanChangeCounts {
+    create: u32,
+    update: u32,
+    delete: u32,
+    replace: u32,
+}
+
+#[derive(Debug, Default)]
+struct PlannedPlacementNames {
+    datacenter: Option<String>,
+    cluster: Option<String>,
+    datastore: Option<String>,
+    network: Option<String>,
+    template: Option<String>,
+}
+
+#[derive(Debug)]
+struct PlannedVmShape {
+    name: String,
+    cpu: u32,
+    memory_gb: u32,
+    disk_size_gb: u32,
+}
+
+fn safe_plan_review_value(
+    vars: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    let value = vars.get(key)?.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+        || value.contains("://")
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn live_plan_placement(spec: &JobSpec) -> Option<LivePlanPlacement> {
+    let offering = spec.iac_ref.split('@').next()?;
+    if !matches!(
+        offering,
+        "linux-server-deployment" | "windows-server-deployment"
+    ) {
+        return None;
+    }
+
+    let memory_mb = safe_plan_review_value(&spec.vars, "memory_mb")
+        .and_then(|value| value.parse::<u32>().ok())?;
+    if memory_mb == 0 || memory_mb % 1024 != 0 {
+        return None;
+    }
+
+    Some(LivePlanPlacement {
+        name: safe_plan_review_value(&spec.vars, "vm_name")?,
+        cpu: safe_plan_review_value(&spec.vars, "num_cpus")?
+            .parse()
+            .ok()
+            .filter(|value| *value > 0)?,
+        memory_gb: memory_mb / 1024,
+        disk_size_gb: safe_plan_review_value(&spec.vars, "disk_size_gb")?
+            .parse()
+            .ok()
+            .filter(|value| *value > 0)?,
+        datacenter: safe_plan_review_value(&spec.vars, "datacenter")?,
+        cluster: safe_plan_review_value(&spec.vars, "cluster")?,
+        datastore: safe_plan_review_value(&spec.vars, "datastore")?,
+        network: safe_plan_review_value(&spec.vars, "network")?,
+        template: safe_plan_review_value(&spec.vars, "template")?,
+    })
+}
+
+fn classify_managed_plan_action(actions: &[Value]) -> Option<Option<&'static str>> {
+    let labels: Option<Vec<&str>> = actions.iter().map(Value::as_str).collect();
+    match labels?.as_slice() {
+        ["no-op"] | ["read"] => Some(None),
+        ["create"] => Some(Some("create")),
+        ["update"] => Some(Some("update")),
+        ["delete"] => Some(Some("delete")),
+        ["delete", "create"] | ["create", "delete"] => Some(Some("replace")),
+        _ => None,
+    }
+}
+
+fn plan_u32(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
+}
+
+fn planned_vm_shape(after: &Value) -> Option<PlannedVmShape> {
+    let after = after.as_object()?;
+    let memory_mb = plan_u32(after.get("memory")?)?;
+    let cpu = plan_u32(after.get("num_cpus")?)?;
+    let disk_size_gb = plan_u32(after.get("disk")?.as_array()?.first()?.get("size")?)?;
+    if memory_mb == 0 || memory_mb % 1024 != 0 || cpu == 0 || disk_size_gb == 0 {
+        return None;
+    }
+    let disks = after.get("disk")?.as_array()?;
+    let [disk] = disks.as_slice() else {
+        return None;
+    };
+    if disk.get("label").and_then(Value::as_str) != Some("disk0") {
+        return None;
+    }
+    Some(PlannedVmShape {
+        name: after.get("name")?.as_str()?.to_string(),
+        cpu,
+        memory_gb: memory_mb / 1024,
+        disk_size_gb,
+    })
+}
+
+fn record_planned_placement_name(
+    names: &mut PlannedPlacementNames,
+    resource_type: &str,
+    logical_name: &str,
+    after: &Value,
+) -> Option<()> {
+    let value = after.get("name")?.as_str()?.to_string();
+    let slot = match (resource_type, logical_name) {
+        ("vsphere_datacenter", "dc") => &mut names.datacenter,
+        ("vsphere_compute_cluster", "cluster") => &mut names.cluster,
+        ("vsphere_datastore", "ds") => &mut names.datastore,
+        ("vsphere_network", "net") => &mut names.network,
+        ("vsphere_virtual_machine", "template") => &mut names.template,
+        _ => return None,
+    };
+    if slot.is_some() {
+        return None;
+    }
+    *slot = Some(value);
+    Some(())
+}
+
+/// Parse only the small allowlisted portion needed for an approval decision.
+/// Unknown mutating resource types/actions fail closed and suppress the review
+/// rather than reflecting raw Terraform/provider data.
+fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanReview> {
+    let state_key = spec.state_key.clone()?;
+    if !ryuki_protocol::is_safe_state_key(&state_key) {
+        return None;
+    }
+    let expected_placement = live_plan_placement(spec)?;
+    let expected_resource_name = match spec.iac_ref.split('@').next()? {
+        "linux-server-deployment" => "linux_server",
+        "windows-server-deployment" => "windows_server",
+        _ => return None,
+    };
+    let plan: Value = serde_json::from_slice(evidence).ok()?;
+    let resource_changes = plan.get("resource_changes")?.as_array()?;
+    let mut managed_changes = Vec::new();
+    let mut counts = PlanChangeCounts::default();
+    let mut placement_names = PlannedPlacementNames::default();
+    let mut vm_shape: Option<PlannedVmShape> = None;
+
+    for resource in resource_changes {
+        let resource_mode = resource.get("mode").and_then(Value::as_str)?;
+        let change = resource.get("change")?;
+        let actions = change.get("actions")?.as_array()?;
+        let action = classify_managed_plan_action(actions)?;
+
+        if resource_mode == "data" {
+            // Data sources must be read-only and must be the exact five
+            // placement lookups used by the reviewed vSphere bundle. Their
+            // planned `after.name` values are the only plan-side representation
+            // of the operator-facing placement names (the managed VM stores
+            // provider object ids instead).
+            if action.is_some() {
+                return None;
+            }
+            record_planned_placement_name(
+                &mut placement_names,
+                resource.get("type")?.as_str()?,
+                resource.get("name")?.as_str()?,
+                change.get("after")?,
+            )?;
+            continue;
+        }
+        if resource_mode != "managed" {
+            return None;
+        }
+        // A no-op managed resource proves this state already owns
+        // infrastructure outside the one reviewed create. Approval would then
+        // produce a state the guarded single-VM cleanup must refuse.
+        let action = action?;
+        if resource.get("type").and_then(Value::as_str) != Some("vsphere_virtual_machine")
+            || resource.get("name").and_then(Value::as_str) != Some(expected_resource_name)
+        {
+            return None;
+        }
+        if vm_shape.is_some() {
+            return None;
+        }
+        vm_shape = Some(planned_vm_shape(change.get("after")?)?);
+        match action {
+            "create" => counts.create += 1,
+            "update" => counts.update += 1,
+            "delete" => counts.delete += 1,
+            "replace" => counts.replace += 1,
+            _ => return None,
+        }
+        managed_changes.push(ManagedPlanChange {
+            resource_type: "virtual_machine",
+            logical_name: expected_resource_name.to_string(),
+            action,
+        });
+    }
+
+    let vm_shape = vm_shape?;
+    let actual_placement = LivePlanPlacement {
+        name: vm_shape.name,
+        cpu: vm_shape.cpu,
+        memory_gb: vm_shape.memory_gb,
+        disk_size_gb: vm_shape.disk_size_gb,
+        datacenter: placement_names.datacenter?,
+        cluster: placement_names.cluster?,
+        datastore: placement_names.datastore?,
+        network: placement_names.network?,
+        template: placement_names.template?,
+    };
+    if actual_placement != expected_placement {
+        return None;
+    }
+
+    Some(LivePlanReview {
+        digest_verified: true,
+        state_key,
+        placement: actual_placement,
+        managed_changes,
+        counts,
+    })
+}
+
+pub(crate) fn server_live_plan_is_safe_to_approve(spec: &JobSpec, evidence: &[u8]) -> bool {
+    let Some(review) = derive_live_plan_review(spec, evidence) else {
+        return false;
+    };
+    review.counts
+        == (PlanChangeCounts {
+            create: 1,
+            update: 0,
+            delete: 0,
+            replace: 0,
+        })
+        && review.managed_changes.len() == 1
+        && review.managed_changes[0].action == "create"
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,9 +1613,9 @@ fn protocol_version_is_supported(v: u32) -> bool {
 /// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
 ///
 /// The resolved value is then ALWAYS checked against
-/// `SUPPORTED_PROTOCOL_VERSIONS`, so an absent header is a non-breaking backfill,
-/// NOT a bypass: the day `1` leaves the allowlist, an absent header is rejected
-/// too. Used by the [`ProtocolVersion`] extractor.
+/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v2-only allowlist therefore
+/// rejects an absent header as legacy v1; omission is never a compatibility
+/// bypass. Used by the [`ProtocolVersion`] extractor.
 fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
     let mut values = headers
         .get_all(ryuki_protocol::PROTOCOL_VERSION_HEADER)
@@ -1305,8 +1674,8 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ProtocolVersion {
 /// The full 9-step verifier runs FAIL-CLOSED: every check that fails returns
 /// 4xx and mutates nothing. The terminal UPDATE is a single atomic conditional
 /// statement guarded on (id, attempt_id, lease_generation, status IN
-/// ('Leased','Running')). A repeat POST with the same (job_id, attempt_id,
-/// result_id) returns idempotent 200.
+/// ('Leased','Running'), unexpired database-clock lease). A repeat POST with the
+/// same (job_id, attempt_id, result_id) returns idempotent 200.
 pub async fn post_job_result(
     _pv: ProtocolVersion,
     Path((agent_id, job_id_str)): Path<(String, String)>,
@@ -1410,11 +1779,13 @@ async fn advance_request_out_of_executing(
     // happened. Actor is the machine identity of the agent whose result this
     // is; no human session exists on this path.
     if advanced == 1 {
-        let agent_id: Option<String> =
-            sqlx::query_scalar("SELECT agent_id FROM agent_jobs WHERE id = $1")
-                .bind(job_id)
-                .fetch_optional(&mut **tx)
-                .await?;
+        let agent_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT agent_id FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
         let agent_principal = agent_id.as_deref().unwrap_or("unknown");
         let actor = ryuki_engine::auth::AuthSession {
             user_id: format!("agent:{agent_principal}"),
@@ -1442,6 +1813,104 @@ async fn advance_request_out_of_executing(
                     "success": success,
                 }),
                 outcome: "applied",
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Record a successful single-job LivePlan without completing execution.
+///
+/// A plan is review evidence, not proof that infrastructure was applied. The
+/// request therefore remains `executing`/`execute` until an approved LiveApply
+/// result arrives. The signed result metadata is still copied onto the execute
+/// stage and into the audit trail so the approval pause is durable and visible.
+async fn record_live_plan_awaiting_apply(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: uuid::Uuid,
+    stages_val: serde_json::Value,
+    job_id: uuid::Uuid,
+    result_status_str: &str,
+    evidence_digest: &str,
+) -> Result<(), sqlx::Error> {
+    let stages_json =
+        match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(stages_val.clone()) {
+            Ok(mut stages) => {
+                if let Some(stage) = stages.iter_mut().find(|stage| stage.name == "execute") {
+                    stage.status = ryuki_engine::models::StageStatus::InProgress;
+                    stage.completed_at = None;
+                    stage
+                        .metadata
+                        .insert("live_plan_job_id".into(), job_id.to_string());
+                    stage.metadata.insert(
+                        "live_plan_result_status".into(),
+                        result_status_str.to_string(),
+                    );
+                    stage.metadata.insert(
+                        "live_plan_evidence_digest".into(),
+                        evidence_digest.to_string(),
+                    );
+                }
+                serde_json::to_value(&stages).unwrap_or(stages_val)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    parse_error = ?error.classify(),
+                    request_id = %request_id,
+                    "request.stages could not be parsed while recording a successful live plan; \
+                     preserving the existing stages JSONB"
+                );
+                stages_val
+            }
+        };
+
+    let recorded = sqlx::query(
+        "UPDATE requests SET stages = $1::jsonb, updated_at = NOW() \
+         WHERE id = $2 AND status = 'executing'",
+    )
+    .bind(&stages_json)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if recorded == 1 {
+        let agent_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT agent_id FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+        let agent_principal = agent_id.as_deref().unwrap_or("unknown");
+        let actor = ryuki_engine::auth::AuthSession {
+            user_id: format!("agent:{agent_principal}"),
+            display_name: format!("Execution agent {agent_principal} (signed job result)"),
+            roles: Vec::new(),
+            token_valid: false,
+            provider_mode: "agent-result".to_string(),
+            ..Default::default()
+        };
+        let request_id_str = request_id.to_string();
+        crate::audit::record_audit_tx(
+            tx,
+            &actor,
+            &crate::audit::AuditRecord {
+                action: "request.live-plan-result",
+                request_id: Some(&request_id_str),
+                from_status: Some("executing"),
+                to_status: "executing",
+                from_stage: Some("execute"),
+                to_stage: "execute",
+                detail: serde_json::json!({
+                    "agent_job_id": job_id.to_string(),
+                    "result_status": result_status_str,
+                    "evidence_digest": evidence_digest,
+                    "awaiting_live_apply_approval": true,
+                }),
+                outcome: "planned",
             },
         )
         .await?;
@@ -1519,9 +1988,11 @@ async fn fail_request_with_teardown(
 /// slice 2 / #42 slice 2b, extended by slice B1a). When a dispatched request
 /// is still `executing`:
 ///
-/// - **No step plan** (`job_steps` empty): today's single-job behavior —
-///   advance the request directly (`executing` -> `verifying` on success,
-///   otherwise `-> failed`).
+/// - **No step plan** (`job_steps` empty): OfflineDryRun and LiveApply advance
+///   the request directly (`executing` -> `verifying` on success, otherwise
+///   `-> failed`). A successful LivePlan records its signed result but leaves
+///   the request `executing` for explicit human approval; a plan alone is not
+///   verification evidence.
 /// - **Step plan present, completing job's `mode == OfflineDryRun`**:
 ///   UNCHANGED #42 slice 2b behavior. Mark the step linked to this job
 ///   `Succeeded`/`Failed`. On step failure, fail the request immediately (a
@@ -1602,7 +2073,17 @@ async fn backlink_request_execution(
     }
 
     if plan.is_empty() {
-        // Today's exact single-job path — unaffected by step-plan support.
+        if matches!(mode, JobMode::LivePlan) && success {
+            return record_live_plan_awaiting_apply(
+                tx,
+                request_id,
+                stages_val,
+                job_id,
+                result_status_str,
+                evidence_digest,
+            )
+            .await;
+        }
         return advance_request_out_of_executing(
             tx,
             request_id,
@@ -2086,6 +2567,11 @@ async fn post_job_result_with_pool(
             "Verified is not an agent-reportable result status",
         ));
     }
+    if !ryuki_protocol::job_result_status_allowed(&stored_mode, &env.status) {
+        return Err(bad_request(
+            "agent result status is not valid for the dispatched execution mode",
+        ));
+    }
     if result.evidence_digest != env.evidence_digest {
         return Err(bad_request(
             "outer result.evidence_digest does not match envelope.evidence_digest",
@@ -2215,6 +2701,15 @@ async fn post_job_result_with_pool(
                 verify_vlc(&grant, &cp_vk)
                     .map_err(|_| bad_request("approval grant signature is invalid"))?;
 
+                // The grant authorizes the exact stored JobSpec, including its
+                // mode, IaC digest/variables, and Terraform state key. This is
+                // the CP-side mirror of the agent's pre-mutation check.
+                if grant.job_spec_digest != recomputed_spec_digest {
+                    return Err(bad_request(
+                        "approval grant job_spec_digest does not match the dispatched job spec",
+                    ));
+                }
+
                 // Plan-then-apply digest — the ONLY place LiveApply and
                 // LiveDestroy diverge:
                 if is_apply {
@@ -2259,13 +2754,10 @@ async fn post_job_result_with_pool(
                 // IDENTITY invariant, enforced unconditionally including on an
                 // idempotent replay.
                 //
-                // For LiveApply a `None` (legacy whole-request) grant is allowed
-                // — UNCHANGED. For LiveDestroy a `None` grant is REJECTED: a VLC
-                // signature does not bind the grant's purpose/mode, so a valid
-                // request-scoped LiveApply grant could otherwise authorise a
-                // LiveDestroy for the same request (which has no digest gate).
-                // LiveDestroy's safety bound IS the step binding, so it must be
-                // present.
+                // For LiveApply a `None` whole-request grant is allowed. For
+                // LiveDestroy it is rejected: the signed JobSpec digest already
+                // binds mode, and this additional policy ties every destructive
+                // rollback to one dispatched orchestration step.
                 match grant.step_job_id {
                     Some(bound_id) if bound_id != job_id => {
                         return Err(bad_request(
@@ -2315,9 +2807,10 @@ async fn post_job_result_with_pool(
     // ── Step 9: atomic terminal UPDATE ───────────────────────────────────────
     //
     // Single UPDATE conditioned on (id, attempt_id, lease_generation, status IN
-    // ('Leased','Running')). rows_affected == 0 means the attempt was superseded,
-    // expired, or already terminal.
-    let new_job_status = map_result_status_to_job_status(&env.status);
+    // ('Leased','Running'), lease_deadline > DB NOW). rows_affected == 0 means
+    // the attempt was superseded, expired, or already terminal.
+    let new_job_status = map_result_status_to_job_status(&stored_mode, &env.status);
+    let requires_reconciliation = new_job_status == "ReconcileRequired";
     let result_status_str = result_status_label(&env.status);
 
     // ── #43 post-apply verification verdict (LiveApply + Applied only) ────────
@@ -2351,6 +2844,12 @@ async fn post_job_result_with_pool(
         ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES,
     )
     .is_offloaded();
+    // A successful LivePlan is also retained in the content-addressed blob
+    // store even when small. The admin review endpoint reparses these exact
+    // digest-covered bytes into a safe projection; it never trusts the
+    // agent-submitted evidence_json convenience field.
+    let retain_verified_plan_bytes =
+        stored_mode == JobMode::LivePlan && env.status == JobResultStatus::Planned;
     let evidence_json_for_storage = compute_evidence_json_for_storage(
         offload_evidence,
         body.evidence.len(),
@@ -2368,7 +2867,7 @@ async fn post_job_result_with_pool(
     // at a missing blob. Content-addressed by the already-verified digest
     // (step 6) — identical evidence across jobs dedups via ON CONFLICT DO
     // NOTHING instead of storing duplicate copies.
-    if offload_evidence {
+    if offload_evidence || retain_verified_plan_bytes {
         sqlx::query(
             "INSERT INTO evidence_blobs (digest, bytes, size_bytes) \
              VALUES ($1, $2, $3) \
@@ -2396,6 +2895,7 @@ async fn post_job_result_with_pool(
            AND attempt_id = $8 \
            AND lease_generation = $9 \
            AND status IN ('Leased', 'Running') \
+           AND lease_deadline > NOW() \
          RETURNING id",
     )
     .bind(new_job_status)
@@ -2417,17 +2917,40 @@ async fn post_job_result_with_pool(
         // raw agent_jobs.request_id column, which create_agent_job does not pin
         // to the spec. This prevents a result from advancing the wrong request
         // if the column and the dispatched spec ever diverge.
-        backlink_request_execution(
-            &mut tx,
-            stored_spec.request_id,
-            &env.status,
-            &stored_mode,
-            effective_result_status,
-            &env.evidence_digest,
-            job_id,
-        )
-        .await
-        .map_err(db_err)?;
+        if !requires_reconciliation {
+            backlink_request_execution(
+                &mut tx,
+                stored_spec.request_id,
+                &env.status,
+                &stored_mode,
+                effective_result_status,
+                &env.evidence_digest,
+                job_id,
+            )
+            .await
+            .map_err(db_err)?;
+        } else {
+            let job_id_string = job_id.to_string();
+            crate::repos::domain_events::insert(
+                &mut *tx,
+                crate::repos::domain_events::NewEvent {
+                    event_type: "job.reconcile_required",
+                    aggregate_type: "agent_job",
+                    aggregate_id: &job_id_string,
+                    site: None,
+                    environment: None,
+                    actor: "system",
+                    payload: json!({
+                        "to_status": "reconcile-required",
+                        "platform": &row.platform,
+                        "request_id": stored_spec.request_id.to_string(),
+                        "note": "live mutation reported failure; provider and state reconciliation required",
+                    }),
+                },
+            )
+            .await
+            .map_err(db_err)?;
+        }
 
         // #43: emit the post-apply verification event (converged → verified,
         // pending change → drift) in the SAME transaction as the terminal record,
@@ -2629,13 +3152,80 @@ fn parse_job_mode(mode_str: &str) -> ApiResult<JobMode> {
 
 /// POST /api/agents/{agent_id}/heartbeat
 ///
-/// Updates last_seen_at on the agent row. Optionally records the running job.
+/// Updates `last_seen_at` for an idle agent. A running heartbeat also renews
+/// the exact acknowledged job lease; all fencing fields are mandatory and the
+/// renewal is rejected once the database-clock deadline has been reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningLeaseFence {
+    job_id: Uuid,
+    attempt_id: Uuid,
+    lease_generation: i64,
+    fencing_token: String,
+}
+
+fn parse_running_lease_fence(body: AgentHeartbeat) -> ApiResult<Option<RunningLeaseFence>> {
+    match (
+        body.running_job_id,
+        body.attempt_id,
+        body.lease_generation,
+        body.fencing_token,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(job_id), Some(attempt_id), Some(lease_generation), Some(fencing_token)) => {
+            let lease_generation = i64::try_from(lease_generation)
+                .map_err(|_| bad_request("lease_generation is out of range"))?;
+            Ok(Some(RunningLeaseFence {
+                job_id,
+                attempt_id,
+                lease_generation,
+                fencing_token,
+            }))
+        }
+        _ => Err(bad_request(
+            "running heartbeat requires running_job_id, attempt_id, lease_generation, and fencing_token",
+        )),
+    }
+}
+
+async fn renew_running_job_lease(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent_id: &str,
+    fence: &RunningLeaseFence,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar::<_, DateTime<Utc>>(
+        "UPDATE agent_jobs \
+         SET lease_deadline = NOW() + make_interval( \
+             secs => CASE \
+                 WHEN mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') THEN $6 \
+                 ELSE $7 \
+             END \
+         ) \
+         WHERE id = $1 \
+           AND agent_id = $2 \
+           AND status = 'Running' \
+           AND attempt_id = $3 \
+           AND lease_generation = $4 \
+           AND fencing_token = $5 \
+           AND lease_deadline > NOW() \
+         RETURNING lease_deadline",
+    )
+    .bind(fence.job_id)
+    .bind(agent_id)
+    .bind(fence.attempt_id)
+    .bind(fence.lease_generation)
+    .bind(&fence.fencing_token)
+    .bind(LIVE_LEASE_TTL_SECS as f64)
+    .bind(LEASE_TTL_SECS as f64)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 pub async fn heartbeat(
     pv: ProtocolVersion,
     Path(agent_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<HeartbeatBody>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<AgentHeartbeat>,
+) -> ApiResult<Json<AgentHeartbeatResponse>> {
     let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
     let agent = authenticate_agent(&headers, pool).await?;
 
@@ -2643,28 +3233,53 @@ pub async fn heartbeat(
         return Err(forbidden("token does not match agent_id"));
     }
 
+    let lease_fence = parse_running_lease_fence(body)?;
+
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    let lease_deadline = if let Some(fence) = lease_fence.as_ref() {
+        match renew_running_job_lease(&mut tx, &agent.agent_id, fence)
+            .await
+            .map_err(db_err)?
+        {
+            Some(deadline) => Some(deadline),
+            None => {
+                tx.rollback().await.ok();
+                return Err(conflict("running job lease ownership lost or expired"));
+            }
+        }
+    } else {
+        None
+    };
+
     // Refresh the recorded protocol version from the live header so the stored
     // baseline follows an in-place agent-binary upgrade (audit/observability
     // only — the enforcing gate is the per-request extractor, not this row).
-    sqlx::query(
-        "UPDATE agents SET last_seen_at = NOW(), updated_at = NOW(), protocol_version = $2 WHERE id = $1",
+    // For a running job this shares the lease-renewal transaction: a failed
+    // fence does not refresh agent liveness and cannot look healthy.
+    let last_seen_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "UPDATE agents SET last_seen_at = NOW(), updated_at = NOW(), protocol_version = $2 \
+         WHERE id = $1 RETURNING last_seen_at",
     )
     .bind(agent.id)
     .bind(i64::from(pv.0))
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
 
+    tx.commit().await.map_err(db_err)?;
+
     tracing::debug!(
         agent_id = %agent_id,
-        running_job = ?body.running_job_id,
+        running_job = ?lease_fence.as_ref().map(|fence| fence.job_id),
         "heartbeat"
     );
 
-    Ok(Json(json!({
-        "agent_id": agent_id,
-        "last_seen_at": Utc::now().to_rfc3339(),
-    })))
+    Ok(Json(AgentHeartbeatResponse {
+        agent_id,
+        last_seen_at,
+        lease_deadline,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2673,7 +3288,8 @@ pub async fn heartbeat(
 // Call periodically (background task, cron, or on each poll).
 // Non-mutating modes (OfflineDryRun / LivePlan): return to Pending with a
 // fresh attempt, resetting all fencing fields.
-// LiveApply: → ReconcileRequired (operator must reconcile before re-dispatch).
+// LiveApply / LiveDestroy: → ReconcileRequired (operator must reconcile;
+// live mutations are never auto-redispatched).
 // ---------------------------------------------------------------------------
 
 /// #23 poison-job cap: a non-mutating job is redispatched at most this many
@@ -2799,7 +3415,9 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let redispatched = sqlx::query(
         "UPDATE agent_jobs \
          SET status = 'Pending', \
-             agent_id = NULL, \
+             agent_id = CASE \
+                 WHEN mode = 'LivePlan' OR COALESCE(spec->>'mode', '') = 'live_plan' \
+                 THEN agent_id ELSE NULL END, \
              attempt_id = NULL, \
              fencing_token = NULL, \
              cp_nonce = NULL, \
@@ -2878,19 +3496,15 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
     .fetch_all(&mut *tx)
     .await?;
     for job in &expired_destroys {
-        sqlx::query(
-            "UPDATE job_steps SET status = 'Failed', updated_at = NOW() \
-             WHERE agent_job_id = $1 AND status = 'TearingDown'",
+        backlink_request_execution(
+            &mut tx,
+            job.request_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveDestroy,
+            "reconcile_required",
+            "lease-expired-no-result",
+            job.id,
         )
-        .bind(job.id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE requests SET status = 'failed', updated_at = NOW() \
-             WHERE id = $1 AND status = 'executing'",
-        )
-        .bind(job.request_id)
-        .execute(&mut *tx)
         .await?;
         let job_id_str = job.id.to_string();
         let request_id_str = job.request_id.to_string();
@@ -3196,7 +3810,26 @@ pub fn validate_live_apply_params(spec: &JobSpec, request_id: Uuid) -> Result<()
     if spec.request_id != request_id {
         return Err("spec.request_id must equal the supplied request_id");
     }
+    validate_request_live_state_key(spec, request_id)?;
     Ok(())
+}
+
+fn validate_request_live_state_key(spec: &JobSpec, request_id: Uuid) -> Result<(), &'static str> {
+    let expected = crate::contracts::request_state_key(request_id);
+    if spec.state_key.as_deref() == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err("live request job state_key must be owned by its request")
+    }
+}
+
+fn validate_step_live_state_key(spec: &JobSpec, step_id: Uuid) -> Result<(), &'static str> {
+    let expected = crate::contracts::step_state_key(step_id);
+    if spec.state_key.as_deref() == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err("live step job state_key must be owned by its persisted step")
+    }
 }
 
 /// Maximum lifetime of a LiveApply approval grant. A grant longer than this is
@@ -3298,10 +3931,10 @@ pub async fn create_live_apply_job(
     // Fail closed: never mint a LiveApply grant for a request that has CONCLUDED
     // (Completed, the post-completion lifecycle Protecting/Operational/Retired, or
     // any terminal state). This gate lives in the SHARED minting choke point so it
-    // covers EVERY path — the request-scoped approval AND the operator/admin
-    // endpoint (/api/admin/agents/live-apply-jobs), which would otherwise bypass
-    // the request-scoped status check entirely. A stale plan can therefore never
-    // re-open a concluded request to infrastructure mutation. The exhaustive
+    // covers every active minting path. The legacy caller-supplied admin endpoint
+    // is disabled below because request-scoped approval must derive its spec and
+    // digest from stored plan evidence. A stale plan can therefore never re-open
+    // a concluded request to infrastructure mutation. The exhaustive
     // is_concluded() classifier is the single source of truth.
     // Lock the request row for the duration of the mint so it cannot CONCLUDE
     // between this status check and the grant-minting INSERT below. Without the
@@ -3377,6 +4010,7 @@ pub async fn create_live_apply_job(
     // function's contract is unchanged by slice A.
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
         approver: approver.to_string(),
         expiry,
@@ -3466,6 +4100,7 @@ pub async fn create_live_apply_job(
 pub async fn create_step_live_job(
     tx: &mut sqlx::PgConnection,
     request_id: Uuid,
+    step_id: Uuid,
     platform: &str,
     spec: &JobSpec,
     approved_plan_digest: &str,
@@ -3485,6 +4120,7 @@ pub async fn create_step_live_job(
             "spec.request_id must equal the supplied request_id",
         ));
     }
+    validate_step_live_state_key(spec, step_id).map_err(CreateLiveApplyJobError::Invalid)?;
 
     // Fail closed: never mint a live-apply grant for a CONCLUDED request. Lock
     // the request row so it cannot conclude between this check and the INSERT
@@ -3505,6 +4141,20 @@ pub async fn create_step_live_job(
             return Err(CreateLiveApplyJobError::RequestConcluded);
         }
         Some(_) => {}
+    }
+
+    // The state namespace is derived from a persisted orchestration step, not
+    // merely from a caller-provided UUID. Prove that the step belongs to this
+    // request before signing a grant that can mutate its state.
+    let step_request_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT request_id FROM job_steps WHERE id = $1")
+            .bind(step_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if step_request_id != Some(request_id) {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "live step state owner does not belong to the supplied request",
+        ));
     }
 
     // Validate grant fields before signing (a signed grant is authoritative).
@@ -3537,6 +4187,7 @@ pub async fn create_step_live_job(
     let job_id = Uuid::new_v4();
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
         approver: approver.to_string(),
         expiry,
@@ -3685,7 +4336,7 @@ pub const AGENT_ROUTE_PATHS: &[(&str, &str)] = &[
 // POST /api/admin/agents/live-apply-jobs — operator live-apply approval
 // ---------------------------------------------------------------------------
 
-/// Request body for the operator live-apply approval endpoint.
+/// Request derived by the safe request-scoped live-apply approval handler.
 ///
 /// The `approver` identity is always taken from the verified session — it MUST
 /// NOT appear in this body so that a caller cannot forge the approving principal.
@@ -3759,9 +4410,11 @@ pub async fn approve_live_apply_with(
 
 /// POST /api/admin/agents/live-apply-jobs
 ///
-/// Operator-gated endpoint that mints a CP-signed LiveApply grant and enqueues
-/// the job for dispatch. The approver identity is taken exclusively from the
-/// verified session — the request body cannot override it.
+/// Disabled legacy endpoint. Its caller-supplied platform, spec, and plan
+/// digest could bypass the request-scoped safe plan-review derivation. Live
+/// apply approval is available only through
+/// `POST /api/requests/{id}/approve-live-apply`, which derives every
+/// mutation-authorizing field from a successful stored LivePlan.
 ///
 /// ## Auth posture
 ///
@@ -3770,11 +4423,10 @@ pub async fn approve_live_apply_with(
 /// call below is defense-in-depth: it fires if the middleware assumption ever
 /// changes or the handler is composed without it.
 ///
-/// Returns 503 if the database pool or CP signing key was not initialised
-/// at startup (degraded mode).
+/// Returns `410 Gone` for every authorized caller. No request body is accepted
+/// and no database or signing-key state is consulted.
 pub async fn admin_approve_live_apply_job(
     Extension(session): Extension<AuthSession>,
-    Json(body): Json<ApproveLiveApplyBody>,
 ) -> ApiResult<Json<Value>> {
     // Defense-in-depth: the /api/admin RBAC middleware already blocks non-admins,
     // but we re-check here so a future re-mount cannot bypass the gate.
@@ -3782,47 +4434,12 @@ pub async fn admin_approve_live_apply_job(
         return Err(forbidden("admin permission required"));
     }
 
-    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
-
-    let cp_key = cp_identity::cp_signing_key()
-        .ok_or_else(|| service_unavailable("control plane not configured to sign grants"))?;
-
-    // The approver MUST come from the verified session — never from the request body.
-    let approver = session.user_id.as_str();
-
-    // #10: enforce the `write-execution-blocked-when-degraded` rule on the admin
-    // grant path too — this is the second grant-minting chokepoint alongside
-    // `requests_approve_live_apply`. Resolve the target site from the request row
-    // and refuse if the site is degraded/unreachable. An unknown request_id (no
-    // row) is left to `create_live_apply_job` to reject with its proper error.
-    let site_env: Option<(String, String)> =
-        sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
-            .bind(body.request_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_err)?;
-
-    // run-5 A0: a SCOPED principal may mint a live-apply grant only for an IN-SCOPE
-    // request. 404 an out-of-scope OR unknown request with one message (no oracle),
-    // BEFORE the degradation check and grant mint. Unrestricted principals are
-    // unchanged: an unknown request_id is still left to create_live_apply_job to
-    // reject with its proper error.
-    if is_scoped(&session) {
-        match site_env.as_ref() {
-            Some((site, env)) if row_scope_permits(&session, site, env) => {}
-            _ => {
-                return Err(not_found(format!(
-                    "request '{}' not found",
-                    body.request_id
-                )))
-            }
-        }
-    }
-    if let Some((site, _)) = site_env.as_ref() {
-        crate::contracts::enforce_site_operational(pool, site).await?;
-    }
-
-    approve_live_apply_with(pool, cp_key, approver, &body).await
+    Err((
+        StatusCode::GONE,
+        Json(json!({
+            "error": "this caller-supplied live-apply endpoint is disabled; use POST /api/requests/{id}/approve-live-apply after reviewing the stored plan"
+        })),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4276,15 +4893,16 @@ pub async fn admin_requeue_dead_lettered_job(
     //    the LIVE executor by spec.mode — the column mode is not load-bearing).
     let spec: JobSpec = serde_json::from_value(spec_json.0)
         .map_err(|_| conflict("job spec is malformed; cannot requeue"))?;
-    match spec.mode {
-        JobMode::OfflineDryRun | JobMode::LivePlan => {}
+    let preserve_affinity = match spec.mode {
+        JobMode::OfflineDryRun => false,
+        JobMode::LivePlan => true,
         JobMode::LiveApply | JobMode::LiveDestroy => {
             return Err(conflict(
                 "a live-mutating job (LiveApply/LiveDestroy) cannot be requeued \
                  (it reconciles, it does not redispatch)",
             ));
         }
-    }
+    };
     let exec_request_id = spec.request_id;
 
     // 3. PARENT-REQUEST GUARD on spec.request_id (the request the agent will act on).
@@ -4316,12 +4934,15 @@ pub async fn admin_requeue_dead_lettered_job(
     //    rows). spec.mode was validated above, so no column-mode predicate is needed.
     let updated = sqlx::query(
         "UPDATE agent_jobs \
-         SET status = 'Pending', agent_id = NULL, attempt_id = NULL, \
+         SET status = 'Pending', \
+             agent_id = CASE WHEN $2 THEN agent_id ELSE NULL END, \
+             attempt_id = NULL, \
              fencing_token = NULL, cp_nonce = NULL, lease_deadline = NULL, \
              delivery_attempts = 0, updated_at = NOW() \
          WHERE id = $1 AND status = 'DeadLettered'",
     )
     .bind(uid)
+    .bind(preserve_affinity)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?
@@ -4389,18 +5010,19 @@ pub struct ReconcileBody {
 
 /// POST /api/admin/agents/jobs/{job_id}/reconcile
 ///
-/// Resolves a terminal-dead-end `ReconcileRequired` agent job (a LiveApply whose
-/// lease expired mid-run, leaving real provider infra in an unknown state) to the
-/// terminal `Failed` once an operator has reconciled out-of-band. `Failed` is the
-/// conservative truth — the CP cannot verify the interrupted apply succeeded — and
-/// the operator's reconciliation is captured in the audited `reason`. Admin-only.
+/// Resolves a terminal-dead-end `ReconcileRequired` live-mutation job to terminal
+/// `Failed` once an operator has reconciled provider and state out-of-band. `Failed`
+/// is the conservative truth: the CP cannot verify that an interrupted mutation
+/// reached its intended state. The operator's reconciliation is captured in the
+/// audited `reason`. Admin-only.
 /// A non-alerting `job.reconcile_resolved` domain event closes the
-/// reconcile-required alert lifecycle (it does NOT page). The STRANDED PARENT
-/// REQUEST is left `Executing` (job-scoped): the operator concludes it with
-/// `POST /api/requests/{id}/fail`. There is NO in-place retry — the request's
-/// single LiveApply slot is permanently consumed (the no-double-apply index is
-/// all-statuses); re-attempting requires a fresh request (see
-/// `create_live_apply_job`).
+/// reconcile-required alert lifecycle (it does NOT page). A LiveApply parent stays
+/// `Executing` for explicit operator conclusion through
+/// `POST /api/requests/{id}/fail`; resolving a LiveDestroy also fails its
+/// `TearingDown` step and parent request so rollback cannot remain wedged. There is
+/// NO in-place LiveApply retry: its request slot is permanently consumed (the
+/// no-double-apply index is all-statuses), so re-attempting requires a fresh request
+/// (see `create_live_apply_job`).
 pub async fn admin_resolve_reconcile_required_job(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -4436,7 +5058,10 @@ pub async fn admin_resolve_reconcile_required_job(
                 .await
                 .map_err(db_err)?;
         let in_scope = match spec_row {
-            None => return Err(not_found(format!("agent job '{job_id}' not found"))),
+            None => {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(not_found(format!("agent job '{job_id}' not found")));
+            }
             Some(spec_json) => match serde_json::from_value::<JobSpec>(spec_json.0) {
                 Ok(spec) => {
                     let row: Option<(String, String)> =
@@ -4451,23 +5076,25 @@ pub async fn admin_resolve_reconcile_required_job(
             },
         };
         if !in_scope {
+            tx.rollback().await.map_err(db_err)?;
             return Err(not_found(format!("agent job '{job_id}' not found")));
         }
     }
 
-    // CAS: only a ReconcileRequired job resolves. RETURNING the request_id + platform
-    // for the audit/event/response. A concurrent double-resolve collapses to one
+    // CAS: only a ReconcileRequired job resolves. Return the dispatched spec because
+    // its request_id and mode are authoritative; the agent executes the spec, not the
+    // denormalized scalar columns. A concurrent double-resolve collapses to one
     // success (the second sees 'Failed' and 0 rows → 409).
-    let updated: Option<(String, String)> = sqlx::query_as(
+    let updated: Option<(String, Value)> = sqlx::query_as(
         "UPDATE agent_jobs SET status = 'Failed', updated_at = NOW() \
          WHERE id = $1 AND status = 'ReconcileRequired' \
-         RETURNING request_id::text, platform",
+         RETURNING platform, spec",
     )
     .bind(uid)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
-    let Some((request_id, platform)) = updated else {
+    let Some((platform, spec_json)) = updated else {
         // Distinguish not-found (404) from wrong-status (409) with a clean re-read.
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
@@ -4475,13 +5102,58 @@ pub async fn admin_resolve_reconcile_required_job(
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        return match existing {
-            None => Err(not_found(format!("agent job '{job_id}' not found"))),
-            Some(status) => Err(conflict(format!(
+        let error = match existing {
+            None => not_found(format!("agent job '{job_id}' not found")),
+            Some(status) => conflict(format!(
                 "job is in status '{status}'; only ReconcileRequired jobs can be resolved"
-            ))),
+            )),
         };
+        tx.rollback().await.map_err(db_err)?;
+        return Err(error);
     };
+    let spec: JobSpec = match serde_json::from_value(spec_json) {
+        Ok(spec) => spec,
+        Err(error) => {
+            tracing::error!(%error, job_id = %job_id, "agent job has a malformed stored spec");
+            tx.rollback().await.map_err(db_err)?;
+            if is_scoped(&session) {
+                return Err(not_found(format!("agent job '{job_id}' not found")));
+            }
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "agent job has a malformed spec"})),
+            ));
+        }
+    };
+    let exec_request_id = spec.request_id;
+    let request_id = exec_request_id.to_string();
+    let is_live_destroy = spec.mode == JobMode::LiveDestroy;
+    let mode = match &spec.mode {
+        JobMode::OfflineDryRun => "OfflineDryRun",
+        JobMode::LivePlan => "LivePlan",
+        JobMode::LiveApply => "LiveApply",
+        JobMode::LiveDestroy => "LiveDestroy",
+    };
+
+    // A reconciled LiveDestroy is the terminal stop for an automated rollback.
+    // Route through the same teardown-aware backlink as a terminal failed result:
+    // it updates the step plan, request stages/status, and execution audit in this
+    // transaction. If lease expiry already performed that transition, the
+    // backlink's request-status guard makes this an idempotent no-op. LiveApply
+    // remains job-scoped so the operator can inspect and conclude it explicitly.
+    if is_live_destroy {
+        backlink_request_execution(
+            &mut tx,
+            exec_request_id,
+            &JobResultStatus::Failed,
+            &JobMode::LiveDestroy,
+            "reconcile_resolved",
+            "operator-reconciled-no-result",
+            uid,
+        )
+        .await
+        .map_err(db_err)?;
+    }
 
     // Audit the operator action — the free-text reason lives ONLY here.
     crate::audit::record_audit_tx(
@@ -4495,6 +5167,7 @@ pub async fn admin_resolve_reconcile_required_job(
                 "job_id": &job_id,
                 "request_id": request_id,
                 "platform": platform,
+                "mode": mode,
                 "reason": reason,
             }),
         ),
@@ -4521,6 +5194,7 @@ pub async fn admin_resolve_reconcile_required_job(
             payload: json!({
                 "to_status": "reconcile-resolved",
                 "platform": platform,
+                "mode": mode,
                 "request_id": request_id,
                 "note": "operator reconciled out-of-band; job closed as Failed",
             }),
@@ -4536,7 +5210,11 @@ pub async fn admin_resolve_reconcile_required_job(
         "request_id": request_id,
         "status": "Failed",
         "resolved": true,
-        "note": "the parent request remains Executing; conclude it with POST /api/requests/{id}/fail. A live-apply cannot be retried in place (its slot is permanently consumed); re-attempting requires a fresh request",
+        "note": if is_live_destroy {
+            "the failed teardown step and parent request were marked Failed after operator reconciliation"
+        } else {
+            "the parent request remains Executing; conclude it with POST /api/requests/{id}/fail. A live-apply cannot be retried in place (its slot is permanently consumed); re-attempting requires a fresh request"
+        },
     })))
 }
 
@@ -4591,7 +5269,10 @@ pub async fn admin_cancel_pending_job(
                 .await
                 .map_err(db_err)?;
         let in_scope = match spec_row {
-            None => return Err(not_found(format!("agent job '{job_id}' not found"))),
+            None => {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(not_found(format!("agent job '{job_id}' not found")));
+            }
             Some(spec_json) => match serde_json::from_value::<JobSpec>(spec_json.0) {
                 Ok(spec) => {
                     let row: Option<(String, String)> =
@@ -4606,6 +5287,7 @@ pub async fn admin_cancel_pending_job(
             },
         };
         if !in_scope {
+            tx.rollback().await.map_err(db_err)?;
             return Err(not_found(format!("agent job '{job_id}' not found")));
         }
     }
@@ -4637,7 +5319,7 @@ pub async fn admin_cancel_pending_job(
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        return match existing {
+        let error = match existing {
             None => Err(not_found(format!("agent job '{job_id}' not found"))),
             Some((status, mode)) if mode == "LiveDestroy" => Err(conflict(format!(
                 "job is a LiveDestroy auto-teardown job (status '{status}'); teardown jobs \
@@ -4647,6 +5329,8 @@ pub async fn admin_cancel_pending_job(
                 "job is in status '{status}'; only Pending jobs can be cancelled"
             ))),
         };
+        tx.rollback().await.map_err(db_err)?;
+        return error;
     };
 
     // Audit the operator action — the free-text reason lives ONLY here.
@@ -5121,12 +5805,14 @@ pub async fn admin_agent_queue_depth(
     Ok(Json(json!({ "queues": queues })))
 }
 
-/// One agent job's stored result — the SIGNED ATTESTATION + result metadata. The SELECT
-/// deliberately OMITS `evidence_json` (agent-submitted free-form; no server-side redaction
-/// guarantee), `spec`, and `live_context` (secret-bearing) — same hygiene as the
-/// dead-lettered list.
+/// One agent job's stored result. `spec` is selected only to re-verify the
+/// signed job-spec digest and derive an allowlisted plan-review projection; it
+/// is never returned. `evidence_json` and `live_context` remain excluded.
 #[derive(sqlx::FromRow)]
 struct JobResultRow {
+    mode: String,
+    status: String,
+    spec: sqlx::types::Json<Value>,
     result_status: Option<String>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     result_id: Option<String>,
@@ -5137,10 +5823,12 @@ struct JobResultRow {
 /// GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result
 /// attestation + metadata (#agent-job-result). Admin-only. The `signed_envelope` is a pure
 /// cryptographic attestation (digests + signature + ids, NO raw evidence); the raw
-/// agent-submitted `evidence_json` is NEVER exposed (no server-side redaction guarantee — a
-/// redacted-evidence view is a separate slice). 404 if the job is unknown OR has no result
-/// yet (`signed_envelope IS NULL`). Scoped principals see only jobs whose parent request
-/// falls within their site/environment scope (run-5 A0).
+/// agent-submitted `evidence_json` is NEVER exposed. For a successful Terraform
+/// LivePlan, `plan_review` is reparsed server-side from the exact bytes whose
+/// digest is carried by the signed envelope and contains only an allowlisted
+/// action/placement projection. 404 if the job is unknown OR has no result yet
+/// (`signed_envelope IS NULL`). Scoped principals see only jobs whose parent
+/// request falls within their site/environment scope (run-5 A0).
 pub async fn admin_agent_job_result(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -5155,8 +5843,8 @@ pub async fn admin_agent_job_result(
         .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
     let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
     let row: Option<JobResultRow> = sqlx::query_as(
-        "SELECT result_status, completed_at, result_id::text AS result_id, \
-                evidence_digest, signed_envelope \
+        "SELECT mode, status, spec, result_status, completed_at, \
+                result_id::text AS result_id, evidence_digest, signed_envelope \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(uid)
@@ -5226,6 +5914,44 @@ pub async fn admin_agent_job_result(
             Json(json!({"error": "stored signed envelope failed validation"})),
         ));
     }
+    if row.evidence_digest.as_deref() != Some(envelope.evidence_digest.as_str()) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "stored result digest failed validation"})),
+        ));
+    }
+    let plan_review = if row.mode == "LivePlan"
+        && row.status == "Succeeded"
+        && row.result_status.as_deref() == Some("planned")
+    {
+        let stored_spec: JobSpec = serde_json::from_value(row.spec.0).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored job spec failed validation"})),
+            )
+        })?;
+        if ryuki_protocol::job_spec_digest(&stored_spec) != envelope.job_spec_digest {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored job spec failed validation"})),
+            ));
+        }
+        let evidence: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT bytes FROM evidence_blobs WHERE digest = $1")
+                .bind(&envelope.evidence_digest)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_err)?;
+        evidence.and_then(|bytes| {
+            if ryuki_protocol::sha256_hex(&bytes) != envelope.evidence_digest {
+                return None;
+            }
+            derive_live_plan_review(&stored_spec, &bytes)
+        })
+    } else {
+        None
+    };
+
     Ok(Json(json!({
         "job_id": job_id,
         "result_status": row.result_status,
@@ -5233,6 +5959,7 @@ pub async fn admin_agent_job_result(
         "result_id": row.result_id,
         "evidence_digest": row.evidence_digest,
         "signed_envelope": serde_json::to_value(&envelope).unwrap_or_default(),
+        "plan_review": plan_review,
     })))
 }
 
@@ -5429,6 +6156,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_live_mutations_require_reconciliation() {
+        for mode in [JobMode::LiveApply, JobMode::LiveDestroy] {
+            assert_eq!(
+                map_result_status_to_job_status(&mode, &JobResultStatus::Failed),
+                "ReconcileRequired"
+            );
+        }
+        assert_eq!(
+            map_result_status_to_job_status(&JobMode::LivePlan, &JobResultStatus::Failed),
+            "Failed"
+        );
+    }
+
+    #[test]
+    fn idle_heartbeat_has_no_running_lease_fence() {
+        assert_eq!(
+            parse_running_lease_fence(AgentHeartbeat::idle()).expect("idle heartbeat"),
+            None
+        );
+    }
+
+    #[test]
+    fn running_heartbeat_requires_complete_exact_fence() {
+        let attempt_id = Uuid::new_v4();
+        let body = AgentHeartbeat {
+            running_job_id: Some(Uuid::new_v4()),
+            attempt_id: Some(attempt_id),
+            lease_generation: Some(4),
+            fencing_token: None,
+        };
+        let err = parse_running_lease_fence(body).expect_err("partial fence must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let job_id = Uuid::new_v4();
+        let fence = parse_running_lease_fence(AgentHeartbeat {
+            running_job_id: Some(job_id),
+            attempt_id: Some(attempt_id),
+            lease_generation: Some(4),
+            fencing_token: Some("exact-token".to_owned()),
+        })
+        .expect("complete fence")
+        .expect("running fence");
+        assert_eq!(
+            fence,
+            RunningLeaseFence {
+                job_id,
+                attempt_id,
+                lease_generation: 4,
+                fencing_token: "exact-token".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn running_heartbeat_rejects_generation_outside_database_range() {
+        let err = parse_running_lease_fence(AgentHeartbeat {
+            running_job_id: Some(Uuid::new_v4()),
+            attempt_id: Some(Uuid::new_v4()),
+            lease_generation: Some(u64::MAX),
+            fencing_token: Some("token".to_owned()),
+        })
+        .expect_err("u64 generation above BIGINT range must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_live_apply_endpoint_is_gone() {
+        let result = admin_approve_live_apply_job(Extension(AuthSession::static_dry_run())).await;
+        let Err((status, Json(body))) = result else {
+            panic!("legacy live-apply endpoint must remain disabled");
+        };
+        assert_eq!(status, StatusCode::GONE);
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("approve-live-apply")));
+    }
+
     // -----------------------------------------------------------------------
     // Wire protocol version — enforcement logic (the ProtocolVersion extractor
     // delegates verbatim to resolve_protocol_version, so testing the helper
@@ -5445,10 +6250,20 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_absent_header_resolves_to_legacy() {
-        // No header at all → the legacy backfill (1), which is still allowlist-checked.
-        let v = resolve_protocol_version(&HeaderMap::new()).expect("absent header is accepted");
-        assert_eq!(v, ryuki_protocol::PROTOCOL_VERSION_LEGACY);
+    fn protocol_version_absent_header_is_rejected_as_legacy_v1() {
+        // No header at all resolves to legacy v1, which is intentionally outside
+        // the v2-only allowlist because v1 agents do not enforce state isolation.
+        let err = resolve_protocol_version(&HeaderMap::new())
+            .expect_err("an absent header must be rejected as legacy protocol v1");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&format!(
+                "unsupported protocol_version: {}",
+                ryuki_protocol::PROTOCOL_VERSION_LEGACY
+            )),
+            "message must identify rejected legacy protocol v1: {msg}"
+        );
     }
 
     #[test]
@@ -5598,6 +6413,240 @@ mod tests {
         );
     }
 
+    fn reviewable_live_plan_spec() -> JobSpec {
+        JobSpec {
+            request_id: Uuid::new_v4(),
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "a".repeat(64),
+            vars: std::collections::BTreeMap::from([
+                ("vm_name".to_string(), "first-test-vm".to_string()),
+                ("num_cpus".to_string(), "2".to_string()),
+                ("memory_mb".to_string(), "4096".to_string()),
+                ("disk_size_gb".to_string(), "80".to_string()),
+                ("datacenter".to_string(), "Primary DC".to_string()),
+                ("cluster".to_string(), "Compute A".to_string()),
+                ("datastore".to_string(), "General Storage".to_string()),
+                ("network".to_string(), "Server Network".to_string()),
+                ("template".to_string(), "Linux Golden".to_string()),
+            ]),
+            state_key: Some(format!("request-{}", Uuid::new_v4())),
+            mode: JobMode::LivePlan,
+        }
+    }
+
+    fn reviewable_live_plan(actions: &[&str]) -> Value {
+        json!({
+            "format_version": "1.2",
+            "resource_changes": [
+                {
+                    "mode": "data",
+                    "type": "vsphere_datacenter",
+                    "name": "dc",
+                    "change": {"actions": ["read"], "after": {"name": "Primary DC"}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_compute_cluster",
+                    "name": "cluster",
+                    "change": {"actions": ["read"], "after": {"name": "Compute A"}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_datastore",
+                    "name": "ds",
+                    "change": {"actions": ["read"], "after": {"name": "General Storage"}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_network",
+                    "name": "net",
+                    "change": {"actions": ["read"], "after": {"name": "Server Network"}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_virtual_machine",
+                    "name": "template",
+                    "change": {"actions": ["read"], "after": {"name": "Linux Golden"}}
+                },
+                {
+                    "address": "vsphere_virtual_machine.linux_server",
+                    "mode": "managed",
+                    "type": "vsphere_virtual_machine",
+                    "name": "linux_server",
+                    "change": {
+                        "actions": actions,
+                        "after": {
+                            "name": "first-test-vm",
+                            "num_cpus": 2,
+                            "memory": 4096,
+                            "disk": [{"label": "disk0", "size": 80}],
+                            "id": "vm-987654",
+                            "private_ip": "10.25.4.9",
+                            "provider_detail": "MUST-NOT-LEAK"
+                        }
+                    }
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn live_plan_review_exposes_only_allowlisted_digest_bound_fields() {
+        let spec = reviewable_live_plan_spec();
+        let raw_plan = reviewable_live_plan(&["create"]);
+        let review = derive_live_plan_review(
+            &spec,
+            &serde_json::to_vec(&raw_plan).expect("serialize plan"),
+        )
+        .expect("supported vSphere plan has a safe review");
+        assert!(review.digest_verified);
+        assert_eq!(review.placement.name, "first-test-vm");
+        assert_eq!(review.counts.create, 1);
+        assert_eq!(review.managed_changes[0].resource_type, "virtual_machine");
+        assert_eq!(review.managed_changes[0].action, "create");
+
+        let rendered = serde_json::to_string(&review).expect("serialize review");
+        for forbidden in [
+            "vm-987654",
+            "10.25.4.9",
+            "MUST-NOT-LEAK",
+            "vsphere_virtual_machine.linux_server",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "safe projection must not expose raw plan value {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_plan_review_fails_closed_on_unknown_mutating_resource() {
+        let spec = reviewable_live_plan_spec();
+        let raw_plan = json!({
+            "resource_changes": [{
+                "type": "unknown_provider_object",
+                "change": { "actions": ["create"] }
+            }]
+        });
+        assert!(
+            derive_live_plan_review(&spec, &serde_json::to_vec(&raw_plan).unwrap()).is_none(),
+            "unknown provider mutations must not produce an approvable projection"
+        );
+    }
+
+    #[test]
+    fn server_live_plan_approval_requires_exactly_one_expected_create() {
+        let spec = reviewable_live_plan_spec();
+        let create = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        assert!(server_live_plan_is_safe_to_approve(&spec, &create));
+        for actions in [
+            vec!["update"],
+            vec!["delete"],
+            vec!["delete", "create"],
+            vec!["no-op"],
+        ] {
+            let evidence = serde_json::to_vec(&reviewable_live_plan(&actions)).unwrap();
+            assert!(
+                !server_live_plan_is_safe_to_approve(&spec, &evidence),
+                "server approval accepted actions {actions:?}"
+            );
+        }
+
+        let mut two_creates = reviewable_live_plan(&["create"]);
+        let duplicate = two_creates["resource_changes"][5].clone();
+        two_creates["resource_changes"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(!server_live_plan_is_safe_to_approve(
+            &spec,
+            &serde_json::to_vec(&two_creates).unwrap()
+        ));
+
+        let mut existing_managed = reviewable_live_plan(&["create"]);
+        existing_managed["resource_changes"]
+            .as_array_mut()
+            .unwrap()
+            .insert(
+                5,
+                json!({
+                    "mode": "managed",
+                    "type": "vsphere_virtual_machine",
+                    "name": "existing_server",
+                    "change": {"actions": ["no-op"], "after": {}}
+                }),
+            );
+        assert!(!server_live_plan_is_safe_to_approve(
+            &spec,
+            &serde_json::to_vec(&existing_managed).unwrap()
+        ));
+
+        let data_and_create = reviewable_live_plan(&["create"]);
+        assert!(server_live_plan_is_safe_to_approve(
+            &spec,
+            &serde_json::to_vec(&data_and_create).unwrap()
+        ));
+    }
+
+    #[test]
+    fn server_live_plan_approval_rejects_missing_or_mismatched_after_values() {
+        let spec = reviewable_live_plan_spec();
+        for (pointer, replacement) in [
+            ("/resource_changes/5/change/after/name", json!("other-vm")),
+            ("/resource_changes/5/change/after/num_cpus", json!(8)),
+            ("/resource_changes/5/change/after/memory", json!(8192)),
+            ("/resource_changes/5/change/after/disk/0/size", json!(120)),
+            ("/resource_changes/0/change/after/name", json!("Other DC")),
+            (
+                "/resource_changes/1/change/after/name",
+                json!("Other Cluster"),
+            ),
+            (
+                "/resource_changes/2/change/after/name",
+                json!("Other Store"),
+            ),
+            (
+                "/resource_changes/3/change/after/name",
+                json!("Other Network"),
+            ),
+            (
+                "/resource_changes/4/change/after/name",
+                json!("Other Template"),
+            ),
+        ] {
+            let mut plan = reviewable_live_plan(&["create"]);
+            *plan.pointer_mut(pointer).expect("fixture pointer") = replacement;
+            assert!(
+                !server_live_plan_is_safe_to_approve(&spec, &serde_json::to_vec(&plan).unwrap()),
+                "approval accepted mismatched planned value at {pointer}"
+            );
+        }
+
+        let mut missing_after = reviewable_live_plan(&["create"]);
+        missing_after["resource_changes"][5]["change"]
+            .as_object_mut()
+            .unwrap()
+            .remove("after");
+        assert!(!server_live_plan_is_safe_to_approve(
+            &spec,
+            &serde_json::to_vec(&missing_after).unwrap()
+        ));
+    }
+
+    #[test]
+    fn live_apply_review_rejects_unsupported_non_server_offerings() {
+        let mut spec = reviewable_live_plan_spec();
+        spec.iac_ref = "patch-maintenance@v1".to_string();
+        assert!(
+            !server_live_plan_is_safe_to_approve(
+                &spec,
+                &serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap(),
+            ),
+            "a digest alone must not make an unsupported Terraform or Ansible offering approvable"
+        );
+    }
+
     // ── #44 agent liveness — auth + bounds (run before any pool access) ──
 
     #[tokio::test]
@@ -5697,11 +6746,24 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode: ryuki_protocol::JobMode::OfflineDryRun,
         };
         create_agent_job(pool, Uuid::new_v4(), platform, &spec, "OfflineDryRun")
             .await
             .expect("seed job")
+    }
+
+    fn stateful_test_spec(request_id: Uuid, state_key: &str, mode: JobMode) -> JobSpec {
+        JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            state_key: Some(state_key.to_string()),
+            mode,
+        }
     }
 
     async fn cleanup_agent(pool: &PgPool, agent_id: &str) {
@@ -6313,47 +7375,141 @@ mod tests {
         let token = seed_agent(&pool, &agent_id, &platform, "approved").await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
-        // Direct authenticate + lease query (mirrors poll_job logic).
+        // Direct authenticate + the production lease helper used by poll_job.
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
 
         let _agent = authenticate_agent(&headers, &pool).await.expect("auth ok");
 
-        let new_attempt = Uuid::new_v4();
-        let fencing = Uuid::new_v4().to_string();
-        let nonce = Uuid::new_v4().to_string();
-        let deadline = Utc::now() + Duration::seconds(LEASE_TTL_SECS);
-
-        let row = sqlx::query_as::<_, AgentJobRow>(&format!(
-            "UPDATE agent_jobs \
-             SET status = 'Leased', agent_id = $1, attempt_id = $2, \
-                 lease_generation = lease_generation + 1, fencing_token = $3, \
-                 cp_nonce = $4, lease_deadline = $5, updated_at = NOW() \
-             WHERE id = ( \
-                 SELECT id FROM agent_jobs WHERE platform = $6 AND status = 'Pending' \
-                 ORDER BY priority DESC, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1 \
-             ) RETURNING {AGENT_JOB_COLUMNS}"
-        ))
-        .bind(&agent_id)
-        .bind(new_attempt)
-        .bind(&fencing)
-        .bind(&nonce)
-        .bind(deadline)
-        .bind(&platform)
-        .fetch_optional(&pool)
-        .await
-        .expect("lease query")
-        .expect("must return a row");
+        let leased = lease_pending_job(&pool, &agent_id, &platform)
+            .await
+            .expect("lease query")
+            .expect("must return a row");
+        let row = leased.row;
 
         assert_eq!(row.status, "Leased");
-        assert_eq!(row.attempt_id, Some(new_attempt));
-        assert!(row.fencing_token.is_some());
-        assert!(row.cp_nonce.is_some());
+        assert_eq!(row.attempt_id, Some(leased.attempt_id));
+        assert_eq!(row.fencing_token.as_deref(), Some(&*leased.fencing_token));
+        assert_eq!(row.cp_nonce.as_deref(), Some(&*leased.cp_nonce));
         assert!(row.lease_deadline.is_some());
         assert!(row.lease_generation >= 1);
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_live_state_key_stays_on_one_agent_across_retry_apply_and_destroy() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!("plt-affinity-{}", Uuid::new_v4().simple());
+        let agent_a = format!("agent-a-{}", Uuid::new_v4());
+        let agent_b = format!("agent-b-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_a, &platform, "approved").await;
+        seed_agent(&pool, &agent_b, &platform, "approved").await;
+
+        let request_id = Uuid::new_v4();
+        let state_key = format!("request-{request_id}");
+        let plan_spec = stateful_test_spec(request_id, &state_key, JobMode::LivePlan);
+        let plan_id = create_agent_job(&pool, request_id, &platform, &plan_spec, "LivePlan")
+            .await
+            .expect("seed live plan");
+
+        let first = lease_pending_job(&pool, &agent_a, &platform)
+            .await
+            .expect("first lease")
+            .expect("plan is leaseable");
+        assert_eq!(first.row.id, plan_id);
+        assert_eq!(first.row.agent_id.as_deref(), Some(agent_a.as_str()));
+
+        sqlx::query(
+            "UPDATE agent_jobs SET lease_deadline = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(plan_id)
+        .execute(&pool)
+        .await
+        .expect("expire plan lease");
+        expire_leases(&pool).await.expect("redispatch expired plan");
+
+        let (status, assigned_agent): (String, Option<String>) =
+            sqlx::query_as("SELECT status, agent_id FROM agent_jobs WHERE id = $1")
+                .bind(plan_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read redispatched plan");
+        assert_eq!(status, "Pending");
+        assert_eq!(assigned_agent.as_deref(), Some(agent_a.as_str()));
+        assert!(
+            lease_pending_job(&pool, &agent_b, &platform)
+                .await
+                .expect("agent B poll")
+                .is_none(),
+            "a retry must not move to another agent-local backend"
+        );
+        assert_eq!(
+            lease_pending_job(&pool, &agent_a, &platform)
+                .await
+                .expect("agent A retry")
+                .expect("plan retry remains available")
+                .row
+                .id,
+            plan_id
+        );
+        sqlx::query("UPDATE agent_jobs SET status = 'Succeeded' WHERE id = $1")
+            .bind(plan_id)
+            .execute(&pool)
+            .await
+            .expect("complete plan");
+
+        let apply_spec = stateful_test_spec(request_id, &state_key, JobMode::LiveApply);
+        let apply_id = create_agent_job(&pool, request_id, &platform, &apply_spec, "LiveApply")
+            .await
+            .expect("seed live apply");
+        assert!(lease_pending_job(&pool, &agent_b, &platform)
+            .await
+            .expect("agent B apply poll")
+            .is_none());
+        assert_eq!(
+            lease_pending_job(&pool, &agent_a, &platform)
+                .await
+                .expect("agent A apply poll")
+                .expect("apply remains available to agent A")
+                .row
+                .id,
+            apply_id
+        );
+        sqlx::query("UPDATE agent_jobs SET status = 'Succeeded' WHERE id = $1")
+            .bind(apply_id)
+            .execute(&pool)
+            .await
+            .expect("complete apply");
+
+        let destroy_spec = stateful_test_spec(request_id, &state_key, JobMode::LiveDestroy);
+        let destroy_id =
+            create_agent_job(&pool, request_id, &platform, &destroy_spec, "LiveDestroy")
+                .await
+                .expect("seed live destroy");
+        assert!(lease_pending_job(&pool, &agent_b, &platform)
+            .await
+            .expect("agent B destroy poll")
+            .is_none());
+        assert_eq!(
+            lease_pending_job(&pool, &agent_a, &platform)
+                .await
+                .expect("agent A destroy poll")
+                .expect("destroy remains available to agent A")
+                .row
+                .id,
+            destroy_id
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_a).await;
+        cleanup_agent(&pool, &agent_b).await;
         pool.close().await;
     }
 
@@ -7556,6 +8712,91 @@ mod tests {
         .expect("ack to running");
     }
 
+    #[tokio::test]
+    async fn db_running_lease_renewal_requires_exact_unexpired_fence() {
+        let _expiry_guard = EXPIRE_TEST_LOCK.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("renew-{}", Uuid::new_v4());
+        let agent_id = format!("renew-agent-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_id, &platform, "approved").await;
+
+        let request_id = Uuid::new_v4();
+        let spec = stateful_test_spec(
+            request_id,
+            &format!("request-{request_id}"),
+            JobMode::LiveApply,
+        );
+        create_agent_job(&pool, request_id, &platform, &spec, "LiveApply")
+            .await
+            .expect("seed live job");
+        let (attempt_id, fencing_token, _nonce, generation, row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, row.id, attempt_id, &fencing_token).await;
+
+        let fence = RunningLeaseFence {
+            job_id: row.id,
+            attempt_id,
+            lease_generation: generation,
+            fencing_token: fencing_token.clone(),
+        };
+        let mut tx = pool.begin().await.expect("renew tx");
+        let deadline = renew_running_job_lease(&mut tx, &agent_id, &fence)
+            .await
+            .expect("renew query")
+            .expect("exact live fence renews");
+        tx.commit().await.expect("commit renewal");
+        assert!(
+            deadline > Utc::now() + Duration::seconds(LIVE_LEASE_TTL_SECS - 60),
+            "live renewal must cover the runner's whole bounded synchronous call"
+        );
+
+        let mut stale_generation = fence.clone();
+        stale_generation.lease_generation = generation + 1;
+        let mut tx = pool.begin().await.expect("stale tx");
+        assert!(
+            renew_running_job_lease(&mut tx, &agent_id, &stale_generation)
+                .await
+                .expect("stale query")
+                .is_none(),
+            "a superseded generation must not renew"
+        );
+        tx.rollback().await.ok();
+
+        stale_generation.lease_generation = generation;
+        stale_generation.fencing_token = Uuid::new_v4().to_string();
+        let mut tx = pool.begin().await.expect("wrong-token tx");
+        assert!(
+            renew_running_job_lease(&mut tx, &agent_id, &stale_generation)
+                .await
+                .expect("wrong-token query")
+                .is_none(),
+            "a wrong fencing token must not renew"
+        );
+        tx.rollback().await.ok();
+
+        sqlx::query("UPDATE agent_jobs SET lease_deadline = NOW() WHERE id = $1")
+            .bind(row.id)
+            .execute(&pool)
+            .await
+            .expect("expire lease at database clock");
+        let mut tx = pool.begin().await.expect("expired tx");
+        assert!(
+            renew_running_job_lease(&mut tx, &agent_id, &fence)
+                .await
+                .expect("expired query")
+                .is_none(),
+            "renewal at or after the deadline must fail"
+        );
+        tx.rollback().await.ok();
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
     /// Build a valid signed `JobResult` for `job_row` using the given signing key.
     #[allow(clippy::too_many_arguments)]
     fn make_job_result(
@@ -8468,6 +9709,67 @@ mod tests {
         pool.close().await;
     }
 
+    #[tokio::test]
+    async fn db_s3b_result_at_or_after_lease_deadline_is_rejected() {
+        let _expiry_guard = EXPIRE_TEST_LOCK.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-expired-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, generation, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            generation as u64,
+            &key,
+            &spec,
+            b"expired-attempt-evidence",
+            JobResultStatus::CheckOk,
+        );
+
+        sqlx::query("UPDATE agent_jobs SET lease_deadline = NOW() WHERE id = $1")
+            .bind(job_row.id)
+            .execute(&pool)
+            .await
+            .expect("expire lease at database clock");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let response = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            headers,
+            ResultBody {
+                job_result,
+                evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        let (status, _) = response.expect_err("expired attempt result must be fenced");
+        assert_eq!(status, StatusCode::CONFLICT);
+        let stored = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(stored.status, "Running");
+        assert!(stored.result_id.is_none());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
     // ── S3b: outer != signed field → reject ──────────────────────────────
 
     #[tokio::test]
@@ -8615,6 +9917,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode: JobMode::LiveApply,
         };
         let live_job_id = create_agent_job(&pool, Uuid::new_v4(), &platform, &spec_la, "LiveApply")
@@ -9606,10 +10909,12 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: ryuki_protocol::JobMode::LiveApply,
         };
         let unsigned = VerifiedLiveContext {
             request_id: grant_request_id.unwrap_or(request_id),
+            job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
             approved_plan_digest: approved_plan_digest.to_string(),
             approver: "ops-test".to_string(),
             expiry: grant_expiry,
@@ -9932,6 +11237,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
 
@@ -9972,6 +11278,11 @@ mod tests {
         );
         assert_eq!(grant.approved_plan_digest, plan_digest);
         assert_eq!(grant.request_id, request_id);
+        assert_eq!(
+            grant.job_spec_digest,
+            ryuki_protocol::job_spec_digest(&spec),
+            "grant must bind the exact request-owned JobSpec"
+        );
 
         sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
             .bind(job_id)
@@ -10011,6 +11322,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
 
@@ -10077,6 +11389,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
 
@@ -10177,6 +11490,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
 
@@ -10264,6 +11578,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::OfflineDryRun, // NOT LiveApply
         };
 
@@ -10279,6 +11594,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LivePlan, // also NOT LiveApply
         };
         let result2 = validate_live_apply_params(&liveplan_spec, request_id);
@@ -10294,10 +11610,26 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
         let result3 = validate_live_apply_params(&valid_spec, request_id);
         assert!(result3.is_ok(), "LiveApply spec must pass validation");
+
+        let mut missing_state_key = valid_spec.clone();
+        missing_state_key.state_key = None;
+        assert!(validate_live_apply_params(&missing_state_key, request_id).is_err());
+
+        let mut foreign_state_key = valid_spec.clone();
+        foreign_state_key.state_key = Some(format!("request-{}", Uuid::new_v4()));
+        assert!(
+            validate_live_apply_params(&foreign_state_key, request_id).is_err(),
+            "a syntactically safe key owned by another request must be rejected"
+        );
+
+        let mut unsafe_state_key = valid_spec;
+        unsafe_state_key.state_key = Some("../shared".to_string());
+        assert!(validate_live_apply_params(&unsafe_state_key, request_id).is_err());
     }
 
     /// Pubkey endpoint returns the initialised CP public key.
@@ -10429,6 +11761,7 @@ mod tests {
         let expired_grant = sign_vlc(
             VerifiedLiveContext {
                 request_id: spec.request_id,
+                job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
                 approved_plan_digest: digest.clone(),
                 approver: "ops-test".to_string(),
                 expiry: Utc::now() - Duration::hours(1),
@@ -10561,6 +11894,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(crate::contracts::request_state_key(request_id)),
             mode: JobMode::LiveApply,
         };
         let good = proto_sha256(b"plan");
@@ -10899,23 +12233,69 @@ mod tests {
         .await
         .expect("seed executing request");
 
-        let spec = JobSpec {
+        let mut conn = pool.acquire().await.expect("acquire connection");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            request_id,
+            &[
+                ("step-one", vec![], "linux-server-deployment"),
+                ("step-two", vec![], "linux-server-deployment"),
+            ],
+        )
+        .await
+        .expect("seed persisted steps");
+        drop(conn);
+        let steps = crate::repos::job_steps::load_plan(&pool, request_id)
+            .await
+            .expect("load persisted steps");
+        let step_one = steps
+            .iter()
+            .find(|step| step.step_key == "step-one")
+            .expect("step one");
+        let step_two = steps
+            .iter()
+            .find(|step| step.step_key == "step-two")
+            .expect("step two");
+        let make_spec = |step_id| JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(crate::contracts::step_state_key(step_id)),
             mode: JobMode::LiveApply,
         };
+        let spec_one = make_spec(step_one.id);
+        let spec_two = make_spec(step_two.id);
 
         // Mint TWO step-scoped LiveApply grants for the SAME request — this is
         // the case the single-job unique index would have rejected.
         let mut tx = pool.begin().await.unwrap();
+        let nonexistent_step_id = Uuid::new_v4();
+        let nonexistent_step_spec = make_spec(nonexistent_step_id);
+        let foreign_owner = create_step_live_job(
+            &mut tx,
+            request_id,
+            nonexistent_step_id,
+            &platform,
+            &nonexistent_step_spec,
+            &digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(
+            matches!(foreign_owner, Err(CreateLiveApplyJobError::Invalid(_))),
+            "a syntactically valid key without a request-owned step must be rejected"
+        );
+
         let job1 = create_step_live_job(
             &mut tx,
             request_id,
+            step_one.id,
             &platform,
-            &spec,
+            &spec_one,
             &digest,
             "ops-alice",
             Utc::now() + Duration::hours(1),
@@ -10926,8 +12306,9 @@ mod tests {
         let job2 = create_step_live_job(
             &mut tx,
             request_id,
+            step_two.id,
             &platform,
-            &spec,
+            &spec_two,
             &digest,
             "ops-alice",
             Utc::now() + Duration::hours(1),
@@ -10943,7 +12324,10 @@ mod tests {
             step_scoped: bool,
             live_context: Option<sqlx::types::Json<VerifiedLiveContext>>,
         }
-        for jid in [job1, job2] {
+        for (jid, expected_spec_digest) in [
+            (job1, ryuki_protocol::job_spec_digest(&spec_one)),
+            (job2, ryuki_protocol::job_spec_digest(&spec_two)),
+        ] {
             let row: Row =
                 sqlx::query_as("SELECT step_scoped, live_context FROM agent_jobs WHERE id = $1")
                     .bind(jid)
@@ -10964,6 +12348,10 @@ mod tests {
             assert_eq!(
                 grant.approved_plan_digest, digest,
                 "grant carries the digest"
+            );
+            assert_eq!(
+                grant.job_spec_digest, expected_spec_digest,
+                "grant binds the exact persisted step JobSpec"
             );
         }
 
@@ -11106,6 +12494,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
 
@@ -11190,6 +12579,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
@@ -11226,6 +12616,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
@@ -11262,6 +12653,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
@@ -11298,6 +12690,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::OfflineDryRun,
         };
         let body = ApproveLiveApplyBody {
@@ -11344,6 +12737,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
@@ -11380,6 +12774,11 @@ mod tests {
             "grant.approver must come from the approver param (session), not the body"
         );
         assert!(verify_vlc(&grant, &cp_vk).is_ok(), "grant must verify");
+        assert_eq!(
+            grant.job_spec_digest,
+            ryuki_protocol::job_spec_digest(&body.spec),
+            "admin-created grants must bind the exact request-owned JobSpec"
+        );
 
         sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
             .bind(job_id)
@@ -12769,14 +14168,9 @@ mod tests {
                 "summary": "Destroy complete! Resources: 1 destroyed."
             })),
         };
-        let agent_body = ryuki_agent::result::build_signed_result(
-            &identity,
-            &agent_id,
-            &job,
-            &evidence,
-            None,
-        )
-        .expect("build_signed_result for a LiveDestroy Applied result must succeed");
+        let agent_body =
+            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence, None)
+                .expect("build_signed_result for a LiveDestroy Applied result must succeed");
 
         // Cross the crate boundary and feed the REAL CP verifier.
         let cp_body: ResultBody =
@@ -13033,12 +14427,30 @@ mod tests {
             "Failed",
             "the stuck teardown step is halted to Failed"
         );
-        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
-            .bind(req_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(req_status, "failed", "the request is failed (needs operator)");
+        let (req_status, stages): (String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            req_status, "failed",
+            "the request is failed (needs operator)"
+        );
+        let execute = stages
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "execute"))
+            .expect("execute stage remains in the durable stage history");
+        assert_eq!(execute["status"], "Failed");
+        let execution_audit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 \
+             AND action = 'request.execution-result' AND to_status = 'failed'",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count lease-expiry lifecycle audit");
+        assert_eq!(execution_audit, 1);
         let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
             .bind(job_a)
             .fetch_one(&pool)
@@ -13457,6 +14869,67 @@ mod tests {
         pool.close().await;
     }
 
+    /// A successful single-job LivePlan is a human approval pause, not an
+    /// execution completion. Only the later LiveApply may move the request to
+    /// `verifying`.
+    #[tokio::test]
+    async fn db_single_live_plan_stays_executing_for_approval() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_executing_request(&pool).await;
+        let job_id = Uuid::new_v4();
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            &JobMode::LivePlan,
+            "planned",
+            "deadbeefdeadbeef",
+            job_id,
+        )
+        .await
+        .expect("backlink live plan");
+        tx.commit().await.unwrap();
+
+        let (status, stage, stages): (String, String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stage, stages FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "executing");
+        assert_eq!(stage, "execute");
+        let execute = stages
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "execute"))
+            .expect("execute stage");
+        assert_eq!(execute["status"], "InProgress");
+        assert_eq!(
+            execute["metadata"]["live_plan_evidence_digest"],
+            "deadbeefdeadbeef"
+        );
+
+        let (from_status, to_status, outcome): (String, String, String) = sqlx::query_as(
+            "SELECT from_status, to_status, outcome FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.live-plan-result' \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(req_id)
+        .fetch_one(&pool)
+        .await
+        .expect("live-plan audit row");
+        assert_eq!(from_status, "executing");
+        assert_eq!(to_status, "executing");
+        assert_eq!(outcome, "planned");
+
+        cleanup_step_2b_request(&pool, req_id).await;
+        pool.close().await;
+    }
+
     /// Concurrency reconciliation: independent roots 'a' and 'b', with 'c'
     /// depending only on 'b'. Completing 'b' (success) dispatches 'c' while the
     /// request is still executing; THEN 'a' fails. The failing request must
@@ -13595,6 +15068,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: std::collections::BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode,
         }
     }
@@ -14578,6 +16052,104 @@ mod tests {
         cleanup_request_row(pool, req).await;
     }
 
+    #[tokio::test]
+    async fn reconcile_resolved_live_destroy_halts_teardown_step_and_request() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-rec-destroy-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let stages = json!([{
+            "name": "execute", "status": "InProgress",
+            "started_at": null, "completed_at": null,
+            "evidence": [], "metadata": {}
+        }]);
+        sqlx::query("UPDATE requests SET stages = $2::jsonb WHERE id = $1")
+            .bind(req)
+            .bind(&stages)
+            .execute(pool)
+            .await
+            .expect("seed execute stage history");
+        let mut conn = pool.acquire().await.expect("step-plan connection");
+        crate::repos::job_steps::insert_plan(
+            &mut conn,
+            req,
+            &[("destroy-me", vec![], "linux-server-deployment")],
+        )
+        .await
+        .expect("seed teardown step");
+        drop(conn);
+
+        let spec = dead_letter_spec(req, JobMode::LiveDestroy);
+        let job: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, step_scoped) \
+             VALUES ($1, $2, $3, 'LiveDestroy', 'ReconcileRequired', TRUE) RETURNING id",
+        )
+        .bind(req)
+        .bind(&platform)
+        .bind(serde_json::to_value(spec).expect("spec serialises"))
+        .fetch_one(pool)
+        .await
+        .expect("seed reconcile-required destroy");
+        sqlx::query(
+            "UPDATE job_steps SET status = 'TearingDown', agent_job_id = $2 \
+             WHERE request_id = $1 AND step_key = 'destroy-me'",
+        )
+        .bind(req)
+        .bind(job)
+        .execute(pool)
+        .await
+        .expect("link teardown job");
+
+        let Json(out) = admin_resolve_reconcile_required_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody {
+                reason: "provider and state dispositions reconciled".into(),
+            }),
+        )
+        .await
+        .expect("resolve destroy reconciliation");
+        assert_eq!(out["status"], "Failed");
+
+        let step_status: String = sqlx::query_scalar(
+            "SELECT status FROM job_steps WHERE request_id = $1 AND step_key = 'destroy-me'",
+        )
+        .bind(req)
+        .fetch_one(pool)
+        .await
+        .expect("step status");
+        assert_eq!(step_status, "Failed");
+        let (request_status, stages_after): (String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+                .bind(req)
+                .fetch_one(pool)
+                .await
+                .expect("request status");
+        assert_eq!(request_status, "failed");
+        let execute = stages_after
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "execute"))
+            .expect("execute stage");
+        assert_eq!(execute["status"], "Failed");
+        let lifecycle_audit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 \
+             AND action = 'request.execution-result' AND to_status = 'failed'",
+        )
+        .bind(req)
+        .fetch_one(pool)
+        .await
+        .expect("count lifecycle audit");
+        assert_eq!(lifecycle_audit, 1);
+
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
     /// run-7 lifecycle contract: a TERMINAL non-Succeeded LiveApply PERMANENTLY
     /// consumes the request's single live-apply slot. The all-statuses index
     /// (`idx_agent_jobs_unique_live_apply`, migration 057) blocks a re-mint even
@@ -14607,6 +16179,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{req}")),
             mode: JobMode::LiveApply,
         };
         let plan_digest = proto_sha256(b"approved-plan-bytes");
@@ -15148,6 +16721,89 @@ mod tests {
         cleanup_jobs_for_platform(pool, &platform).await;
     }
 
+    #[tokio::test]
+    async fn agent_job_result_derives_safe_live_plan_review_from_verified_bytes() {
+        use ryuki_protocol::{SignedEnvelope, REDACTION_POLICY_VERSION};
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-plan-review-{}", Uuid::new_v4().simple());
+        let job = seed_pending_job(pool, &platform).await;
+        let spec = reviewable_live_plan_spec();
+        let mut raw_plan = reviewable_live_plan(&["create"]);
+        raw_plan["resource_changes"][5]["change"]["after"]["id"] = json!("vm-raw-provider-id");
+        raw_plan["resource_changes"][5]["change"]["after"]["secret"] = json!("RAW-SENTINEL");
+        let evidence = serde_json::to_vec(&raw_plan).unwrap();
+        let digest = ryuki_protocol::sha256_hex(&evidence);
+        let result_id = Uuid::new_v4();
+        let envelope = SignedEnvelope {
+            agent_id: "agent-x".into(),
+            platform: platform.clone(),
+            job_id: job,
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::LivePlan,
+            status: JobResultStatus::Planned,
+            job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
+            approved_plan_digest: None,
+            evidence_digest: digest.clone(),
+            redaction_policy_version: REDACTION_POLICY_VERSION.into(),
+            timestamp: Utc::now(),
+            key_id: "key-1".into(),
+            cp_nonce: "nonce-1".into(),
+            signature: "sig".into(),
+        };
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO UPDATE SET bytes = EXCLUDED.bytes, size_bytes = EXCLUDED.size_bytes",
+        )
+        .bind(&digest)
+        .bind(&evidence)
+        .bind(evidence.len() as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agent_jobs SET spec = $1::jsonb, mode = 'LivePlan', status = 'Succeeded', \
+             result_status = 'planned', completed_at = NOW(), result_id = $2, \
+             evidence_digest = $3, signed_envelope = $4::jsonb WHERE id = $5",
+        )
+        .bind(serde_json::to_value(&spec).unwrap())
+        .bind(result_id)
+        .bind(&digest)
+        .bind(serde_json::to_value(&envelope).unwrap())
+        .bind(job)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let Json(out) = admin_agent_job_result(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("reviewable result");
+        assert_eq!(out["plan_review"]["digest_verified"], true);
+        assert_eq!(out["plan_review"]["counts"]["create"], 1);
+        assert_eq!(out["plan_review"]["placement"]["name"], "first-test-vm");
+        let rendered = out.to_string();
+        assert!(!rendered.contains("vm-raw-provider-id"));
+        assert!(!rendered.contains("RAW-SENTINEL"));
+        assert!(out.get("evidence_json").is_none());
+        assert!(out.get("spec").is_none());
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        sqlx::query("DELETE FROM evidence_blobs WHERE digest = $1")
+            .bind(&digest)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     /// #agent-job-result: defense-in-depth (codex re-review #2) — a row stored BEFORE the
     /// Step 5b ingestion guard (mig 055 predates it) whose signed_envelope carries an
     /// unrecognised redaction_policy_version must NOT ride into the read view. The read side
@@ -15323,6 +16979,48 @@ mod tests {
 
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
+    }
+
+    #[tokio::test]
+    async fn db_requeue_live_plan_preserves_agent_affinity() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-requeue-affinity-{}", Uuid::new_v4().simple());
+        let agent_id = format!("agent-requeue-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, &platform, "approved").await;
+        let request_id = seed_request_row(pool, "executing").await;
+        let job =
+            seed_dead_lettered_job_full(pool, &platform, request_id, request_id, JobMode::LivePlan)
+                .await;
+        sqlx::query("UPDATE agent_jobs SET agent_id = $2 WHERE id = $1")
+            .bind(job)
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .expect("bind dead-lettered live plan");
+
+        let _ = admin_requeue_dead_lettered_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("requeue live plan");
+
+        let (status, assigned_agent): (String, Option<String>) =
+            sqlx::query_as("SELECT status, agent_id FROM agent_jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(pool)
+                .await
+                .expect("read requeued live plan");
+        assert_eq!(status, "Pending");
+        assert_eq!(assigned_agent.as_deref(), Some(agent_id.as_str()));
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_agent(pool, &agent_id).await;
+        cleanup_request_row(pool, request_id).await;
     }
 
     /// requeue rejects a non-DeadLettered job (and is idempotent: a second requeue

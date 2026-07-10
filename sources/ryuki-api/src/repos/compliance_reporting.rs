@@ -419,9 +419,11 @@ pub async fn count_controls(
     site: &str,
 ) -> Result<i64, sqlx::Error> {
     let count: i64 = match (framework_id.is_empty(), site.is_empty()) {
-        (true, true) => sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls")
-            .fetch_one(pool)
-            .await?,
+        (true, true) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls")
+                .fetch_one(pool)
+                .await?
+        }
         (false, true) => {
             sqlx::query_scalar("SELECT COUNT(*) FROM compliance_controls WHERE framework_id = $1")
                 .bind(framework_id)
@@ -434,13 +436,15 @@ pub async fn count_controls(
                 .fetch_one(pool)
                 .await?
         }
-        (false, false) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM compliance_controls WHERE framework_id = $1 AND site = $2",
-        )
-        .bind(framework_id)
-        .bind(site)
-        .fetch_one(pool)
-        .await?,
+        (false, false) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM compliance_controls WHERE framework_id = $1 AND site = $2",
+            )
+            .bind(framework_id)
+            .bind(site)
+            .fetch_one(pool)
+            .await?
+        }
     };
     Ok(count)
 }
@@ -756,37 +760,45 @@ pub async fn list_findings(
 /// paged set.
 pub async fn count_findings(pool: &PgPool, site: &str, severity: &str) -> Result<i64, sqlx::Error> {
     let count: i64 = match (site.is_empty(), severity.is_empty()) {
-        (true, true) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM compliance_findings f \
+        (true, true) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id",
-        )
-        .fetch_one(pool)
-        .await?,
-        (false, true) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM compliance_findings f \
+            )
+            .fetch_one(pool)
+            .await?
+        }
+        (false, true) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE r.site = $1",
-        )
-        .bind(site)
-        .fetch_one(pool)
-        .await?,
-        (true, false) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM compliance_findings f \
+            )
+            .bind(site)
+            .fetch_one(pool)
+            .await?
+        }
+        (true, false) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE f.severity = $1",
-        )
-        .bind(severity)
-        .fetch_one(pool)
-        .await?,
-        (false, false) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM compliance_findings f \
+            )
+            .bind(severity)
+            .fetch_one(pool)
+            .await?
+        }
+        (false, false) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM compliance_findings f \
              JOIN compliance_reports r ON r.id = f.report_id \
              WHERE r.site = $1 AND f.severity = $2",
-        )
-        .bind(site)
-        .bind(severity)
-        .fetch_one(pool)
-        .await?,
+            )
+            .bind(site)
+            .bind(severity)
+            .fetch_one(pool)
+            .await?
+        }
     };
     Ok(count)
 }
@@ -1222,7 +1234,11 @@ mod compliance_reporting_db_tests {
         assert_eq!(page1.len(), 2, "LIMIT 2 bounds the first page");
         let p1_ids: Vec<&str> = page1.iter().map(|c| c.id.as_str()).collect();
         let p2_ids: Vec<&str> = page2.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(p1_ids, ordered[0..2], "page 1 is the first 2 of the full order");
+        assert_eq!(
+            p1_ids,
+            ordered[0..2],
+            "page 1 is the first 2 of the full order"
+        );
         assert_eq!(
             p2_ids,
             ordered[2..(ordered.len().min(4))],
@@ -1236,7 +1252,11 @@ mod compliance_reporting_db_tests {
         let pci = list_controls_page(&pool, "cf-pci-dss", "", 1000, 0)
             .await
             .expect("list pci");
-        assert_eq!(pci.len() as i64, pci_total, "framework-filtered count matches");
+        assert_eq!(
+            pci.len() as i64,
+            pci_total,
+            "framework-filtered count matches"
+        );
 
         let defra_total = count_controls(&pool, "", "DEFRA")
             .await
@@ -1244,7 +1264,11 @@ mod compliance_reporting_db_tests {
         let defra = list_controls_page(&pool, "", "DEFRA", 1000, 0)
             .await
             .expect("list DEFRA");
-        assert_eq!(defra.len() as i64, defra_total, "site-filtered count matches");
+        assert_eq!(
+            defra.len() as i64,
+            defra_total,
+            "site-filtered count matches"
+        );
 
         let both_total = count_controls(&pool, "cf-pci-dss", "DEFRA")
             .await

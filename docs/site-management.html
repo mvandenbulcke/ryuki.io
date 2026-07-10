@@ -43,7 +43,17 @@
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link" data-sections="prerequisites
 quick start
 authentication modes
-project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="stack
+project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="authority and scope
+required roles and target
+tool and provider prerequisites
+request contract
+gate 1: repository checks
+gate 2: proving-ground readiness
+gate 3: offline rehearsal
+gate 4: live plan and state isolation
+gate 5: live apply and verification
+gate 6: mandatory cleanup
+result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
 network policy
@@ -60,10 +70,11 @@ how it works
 permissions by role
 environment configuration
 important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link active" aria-current="page" data-sections="un/locode
-site selection flow
+custom codes
+site selection
 managing sites
-current active sites
-important notes" href="/site-management.html">Site Management</a><ul class="sb-sections"><li><a href="#un-locode">UN/LOCODE</a></li><li><a href="#site-selection-flow">Site Selection Flow</a></li><li><a href="#managing-sites">Managing Sites</a></li><li><a href="#current-active-sites">Current Active Sites</a></li><li><a href="#important-notes">Important Notes</a></li></ul></li><li><a class="sb-link" data-sections="roles and permission tiers
+seeded active sites
+important notes" href="/site-management.html">Site Management</a><ul class="sb-sections"><li><a href="#un-locode">UN/LOCODE</a></li><li><a href="#custom-codes">Custom Codes</a></li><li><a href="#site-selection">Site Selection</a></li><li><a href="#managing-sites">Managing Sites</a></li><li><a href="#seeded-active-sites">Seeded Active Sites</a></li><li><a href="#important-notes">Important Notes</a></li></ul></li><li><a class="sb-link" data-sections="roles and permission tiers
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
@@ -94,9 +105,10 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <main id="main">
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Site Management</span></nav>
 <h1 id="site-management">Site Management</h1>
-<p>Sites represent physical locations managed by the platform. Ryuki uses <strong>UN/LOCODE</strong> (United Nations Code for Trade and Transport Locations) as the standard site identifier.</p>
+<p>Sites represent physical locations managed by the platform. Ryuki recommends <strong>UN/LOCODE</strong> (United Nations Code for Trade and Transport Locations) because it provides a portable public identifier. Administrators can instead register an organization-specific custom site code.</p>
 <h2 id="un-locode">UN/LOCODE</h2>
-<p>UN/LOCODE codes are 5-character identifiers: a 2-character <strong>ISO 3166-1 alpha-2</strong> country code followed by a 3-character location code.</p>
+<p>UN/LOCODE codes are 5-character identifiers: a 2-character <strong>ISO 3166-1 alpha-2</strong> country code followed by a 3-character location code. Ryuki stores them without the optional display space and in uppercase, so <code>JP TYO</code> becomes <code>JPTYO</code>.</p>
+<p>Registration validates this shape and requires <code>countryCode</code> to match the first two characters. It does <strong>not</strong> query or certify membership in the authoritative UNECE UN/LOCODE publication. The registering administrator is asserting that the code, location name, country, and timezone are correct; use an independently reviewed UNECE release when authoritative membership matters.</p>
 <table><thead><tr><th>Code</th><th>City</th><th>Country</th></tr></thead><tbody>
 <tr><td>DEBER</td><td>Berlin</td><td>Germany</td></tr>
 <tr><td>DEFRA</td><td>Frankfurt</td><td>Germany</td></tr>
@@ -105,22 +117,54 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <tr><td>FRPAR</td><td>Paris</td><td>France</td></tr>
 <tr><td>USASH</td><td>Ashburn</td><td>United States</td></tr>
 <tr><td>SGSIN</td><td>Singapore</td><td>Singapore</td></tr>
-<tr><td>JP TYO</td><td>Tokyo</td><td>Japan</td></tr>
+<tr><td>JPTYO</td><td>Tokyo</td><td>Japan</td></tr>
 </tbody></table>
-<p>The reference registry contains <strong>89 locations across 33 countries</strong> covering Europe, North America, Asia-Pacific, Middle East, South America, and Africa.</p>
-<h2 id="site-selection-flow">Site Selection Flow</h2>
-<p>Users select sites through a <strong>country → city → UN/LOCODE</strong> flow:</p>
+<p>The bundled reference registry covers locations in Europe, North America, Asia-Pacific, the Middle East, South America, and Africa.</p>
+<h2 id="custom-codes">Custom Codes</h2>
+<p>Custom codes are first-class registry entries. They use 2-32 ASCII letters, digits, dots, underscores, or hyphens, start and end with a letter or digit, and are stored in uppercase. For example, <code>dc-eu-01</code> is stored as <code>DC-EU-01</code>.</p>
+<p>Every canonical code is globally unique across both code systems. A custom code cannot alias an existing UN/LOCODE, and a code cannot be re-registered with a different meaning. Site-scoped roles and records use this canonical value.</p>
+<h2 id="site-selection">Site Selection</h2>
+<p>The admin API exposes the reference set as a <strong>country → city → UN/LOCODE</strong> hierarchy, so a future site-management client can browse instead of memorizing codes:</p>
 <ol>
 <li>Pick a country from the ISO 3166 list</li>
 <li>Browse available cities in that country</li>
-<li>The UN/LOCODE is auto-populated</li>
+<li>Use the compact UN/LOCODE as the site code</li>
 </ol>
-<pre><code>GET /api/admin/sites/countries          → List 33 countries with site counts
+<p>The current request form is an editable site-code input with five recommended UN/LOCODE suggestions. It also accepts a custom code typed by the requester, but it does not yet load all registered codes into its datalist. Entering an unknown or inactive code does not bypass request validation.</p>
+<pre><code>GET /api/admin/sites/countries          → List 49 seeded countries with site counts
 GET /api/admin/sites/countries/DE/cities → Berlin, Frankfurt, München, Hamburg, Düsseldorf</code></pre>
 <h2 id="managing-sites">Managing Sites</h2>
-<h3 id="list-reference-sites">List Reference Sites</h3>
-<pre><code>GET /api/admin/sites          → All 89 reference locations
+<p>Registration and activation are currently API operations. The portal does not yet provide an admin site-registration panel.</p>
+<h3 id="list-registered-sites">List Registered Sites</h3>
+<pre><code>GET /api/admin/sites          → Reference and custom sites
 GET /api/admin/sites?active=true → Currently active sites only</code></pre>
+<p>Responses expose <code>code</code> and <code>code_system</code>. The existing <code>unlocode</code> response field remains as a compatibility alias for <code>code</code>, including for custom entries.</p>
+<h3 id="register-a-site">Register a Site</h3>
+<p>UN/LOCODE is the recommended code system:</p>
+<pre><code class="lang-http">POST /api/admin/sites
+Content-Type: application/json
+
+{
+  "code": "BEBRU",
+  "codeSystem": "unlocode",
+  "name": "Brussels",
+  "country": "Belgium",
+  "countryCode": "BE",
+  "timezone": "Europe/Brussels",
+  "active": false
+}</code></pre>
+<p><code>codeSystem</code> is required. For <code>unlocode</code>, <code>countryCode</code> must match the first two characters of the canonical code; the example therefore binds <code>BEBRU</code> to <code>BE</code>.</p>
+<p>An organization-specific code uses the same endpoint with an explicit code system:</p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"code"</span>: <span class="hl-s">"DC-EU-01"</span>,
+  <span class="hl-k">"codeSystem"</span>: <span class="hl-s">"custom"</span>,
+  <span class="hl-k">"name"</span>: <span class="hl-s">"Primary EU datacenter"</span>,
+  <span class="hl-k">"country"</span>: <span class="hl-s">"Belgium"</span>,
+  <span class="hl-k">"countryCode"</span>: <span class="hl-s">"BE"</span>,
+  <span class="hl-k">"timezone"</span>: <span class="hl-s">"Europe/Brussels"</span>,
+  <span class="hl-k">"active"</span>: <span class="hl-n">false</span>
+}</code></pre>
+<p>The optional <code>active</code> field defaults to <code>false</code>. Keep it false until the site's policy, capacity, and scoping configuration is ready, then activate it as a separate admin operation.</p>
 <h3 id="activate-a-site">Activate a Site</h3>
 <pre><code>POST /api/admin/sites/NLRTM/activate
 → Rotterdam is now available for engine operations</code></pre>
@@ -128,10 +172,11 @@ GET /api/admin/sites?active=true → Currently active sites only</code></pre>
 <pre><code>POST /api/admin/sites/NLRTM/deactivate
 → Rotterdam is no longer available for new operations</code></pre>
 <h3 id="search">Search</h3>
-<pre><code>GET /api/admin/sites/search?q=Frankfurt  → Search by city name
+<pre><code>GET /api/admin/sites/search?q=DC-EU-01   → Search by site code
+GET /api/admin/sites/search?q=Frankfurt  → Search by city name
 GET /api/admin/sites/search?q=DE         → Search by country code
 GET /api/admin/sites/search?q=Netherlands → Search by country name</code></pre>
-<h2 id="current-active-sites">Current Active Sites</h2>
+<h2 id="seeded-active-sites">Seeded Active Sites</h2>
 <table><thead><tr><th>UN/LOCODE</th><th>City</th><th>Country</th></tr></thead><tbody>
 <tr><td>DEBER</td><td>Berlin</td><td>Germany</td></tr>
 <tr><td>DEFRA</td><td>Frankfurt</td><td>Germany</td></tr>
@@ -141,10 +186,11 @@ GET /api/admin/sites/search?q=Netherlands → Search by country name</code></pre
 </tbody></table>
 <h2 id="important-notes">Important Notes</h2>
 <ul>
-<li><strong>No hardcoded data</strong>: Zero site-specific data exists in the repository. All sites are managed through the admin API.</li>
-<li><strong>Reference vs active</strong>: The registry contains 89 reference locations. Only activated sites are available for engine operations.</li>
-<li><strong>UN/LOCODE standard</strong>: Follows ISO 3166-1 country codes and UN/LOCODE location identifiers.</li>
-<li><strong>Multi-tenancy</strong>: RBAC via Entra ID app roles controls which users can manage which sites.</li>
+<li><strong>Reference vs custom</strong>: The repository includes a UN/LOCODE seed set; administrators can add durable custom entries through the API.</li>
+<li><strong>Registered vs active</strong>: Membership and operational availability are separate. Only active registered sites pass request validation for new operations.</li>
+<li><strong>Canonical identity</strong>: Codes are normalized before storage and authorization checks. Configure role site scopes with the canonical uppercase code.</li>
+<li><strong>Governance</strong>: Site registration, activation, and deactivation are admin operations and are audit-recorded when the database is enabled.</li>
+<li><strong>Registry vs placement policy</strong>: Registration and activation make a code available to request validation and scoping; they do not create provider placement, capacity, agent, OU/folder derivation, or policy-guardrail bindings. The bundled <code>catalog/site-catalog.yaml</code> covers only its reviewed policy-bound subset. Add and review those operational bindings separately before a custom or newly registered site runs a workflow that depends on them.</li>
 </ul>
 <div class="page-meta">Last updated 2026-06-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/site-management.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/entra-app-registration.html">&larr; Entra App Registration</a><a href="/rbac-and-scoping.html">RBAC & Scoping &rarr;</a></nav>
 </main>

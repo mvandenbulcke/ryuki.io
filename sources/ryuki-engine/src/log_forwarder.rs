@@ -1,7 +1,6 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LogSourceType {
@@ -220,7 +219,7 @@ pub fn onboard_host(
     if source_types.is_empty() {
         return Err("source_types cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -365,7 +364,7 @@ pub fn verify_forwarding(
 /// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
 /// fallback). This function is PURE — it performs no I/O.
 pub fn get_coverage_report(site: &str, hosts: &[LogSource]) -> Result<CoverageReport, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -402,7 +401,7 @@ pub fn get_coverage_report(site: &str, hosts: &[LogSource]) -> Result<CoverageRe
 /// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
 /// fallback). This function is PURE — it performs no I/O.
 pub fn get_gap_report(site: &str, hosts: &[LogSource]) -> Result<GapReport, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -452,7 +451,7 @@ pub fn get_gap_report(site: &str, hosts: &[LogSource]) -> Result<GapReport, Stri
 /// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
 /// fallback). This function is PURE — it performs no I/O.
 pub fn get_volume_report(site: &str, hosts: &[LogSource]) -> Result<VolumeReport, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -488,7 +487,7 @@ pub fn get_volume_report(site: &str, hosts: &[LogSource]) -> Result<VolumeReport
 /// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
 /// fallback). This function is PURE — it performs no I/O.
 pub fn get_retention_status(site: &str, hosts: &[LogSource]) -> Result<RetentionStatus, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 

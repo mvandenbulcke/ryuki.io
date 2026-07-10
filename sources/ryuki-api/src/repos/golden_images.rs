@@ -251,13 +251,15 @@ pub async fn count_superseded(pool: &PgPool, sites: Option<&[String]>) -> Result
                 .fetch_one(pool)
                 .await
         }
-        Some(sites) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM golden_images \
+        Some(sites) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM golden_images \
              WHERE status = 'superseded' AND site_scope = ANY($1)",
-        )
-        .bind(sites)
-        .fetch_one(pool)
-        .await,
+            )
+            .bind(sites)
+            .fetch_one(pool)
+            .await
+        }
     }
 }
 
@@ -541,7 +543,9 @@ mod golden_images_db_tests {
             "only the 3 superseded rows count — the promoted one is excluded"
         );
         assert_eq!(
-            count_superseded(&pool, None).await.expect("count all after"),
+            count_superseded(&pool, None)
+                .await
+                .expect("count all after"),
             raw_all + 3,
             "None counts every site's superseded rows"
         );
@@ -550,7 +554,11 @@ mod golden_images_db_tests {
         let all_defra = list_superseded_page(&pool, Some(&defra), 1000, 0)
             .await
             .expect("list defra");
-        assert_eq!(all_defra.len() as i64, total, "full DEFRA page == its count");
+        assert_eq!(
+            all_defra.len() as i64,
+            total,
+            "full DEFRA page == its count"
+        );
         assert!(
             all_defra
                 .iter()

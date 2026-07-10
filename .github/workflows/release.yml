@@ -1,7 +1,7 @@
 name: Release
 
 # Cuts a release on a semver tag. Re-runs the CI gate (build, test, lint,
-# secret scan) so a tag can never ship code that would not pass main's CI
+# secret scan, validator) so a tag can never ship code that would not pass main's CI
 # (.github/workflows/ci.yml), then builds both app images, pushes them to GHCR
 # pinned by digest, and publishes a GitHub release whose notes are the
 # changelog section for this tag.
@@ -35,6 +35,20 @@ jobs:
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: ryuki_ci
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ryuki_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -47,6 +61,26 @@ jobs:
         run: cargo build --workspace
       - name: Test workspace
         run: cargo test --workspace
+      - name: Test API against PostgreSQL 18
+        timeout-minutes: 30
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: ryuki_ci
+          PGUSER: postgres
+        run: |
+          set -euo pipefail
+          test_log="$(mktemp)"
+          trap 'rm -f "$test_log"' EXIT
+          export RYUKI_DATABASE_URL
+          RYUKI_DATABASE_URL="$(printf 'postgresql://%s@%s:%s/%s' \
+            "$PGUSER" "$PGHOST" "$PGPORT" "$PGDATABASE")"
+          cargo test -p ryuki-api -- --test-threads=1 --nocapture \
+            2>&1 | tee "$test_log"
+          if grep -Eqi 'SKIP: (RYUKI_DATABASE_URL|DB (connect failed|unavailable|not available)|no seeded|seed .* not present|no DEFRA)|RYUKI_DATABASE_URL not set|skipping (DB|database) tests' "$test_log"; then
+            echo "::error::A PostgreSQL-backed test skipped instead of asserting its fixture"
+            exit 1
+          fi
 
   lint:
     name: Lint
@@ -60,12 +94,8 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-      # Advisory only, NON-BLOCKING — see ci.yml: known repo-wide rustfmt drift, standing
-      # policy is to not run `cargo fmt`. Visible in logs but must not block. Clippy is the
-      # enforced gate.
-      - name: Check formatting (advisory, non-blocking)
+      - name: Check formatting
         run: cargo fmt --check --all
-        continue-on-error: true
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -80,11 +110,24 @@ jobs:
       - name: Run secret scan
         run: ./scripts/no-secret-scan.sh
 
+  validate:
+    name: Validator
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run validator
+        run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
+
   # ── Image build & push (digest-pinned) ────────────────────────────────────
   images:
     name: Build & Push Images
     runs-on: ubuntu-latest
-    needs: [build-test, lint, security]
+    needs: [build-test, lint, security, validate]
     permissions:
       contents: read
       # Required to push images to GitHub Container Registry (GHCR).

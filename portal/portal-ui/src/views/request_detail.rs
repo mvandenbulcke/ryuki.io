@@ -1,5 +1,8 @@
 use crate::api::{platform_summary_path, request_detail_path};
-use crate::models::{audit_rows_to_csv, condense_timestamp, AuthSession, EvidencePackExport};
+use crate::models::{
+    audit_rows_to_csv, condense_timestamp, AuthSession, EvidencePackExport, ExecutionJob,
+    LivePlanReview,
+};
 use crate::server_boundary::{
     approve_live_apply_request, approve_request, approve_step_live_apply, cancel_request,
     execute_request, execute_request_live_plan, get_request_audit, get_request_detail,
@@ -107,6 +110,25 @@ pub(crate) fn stage_label(stage: &str) -> &'static str {
 /// highlight (the operator retries via a new validate/plan action).
 fn is_terminal_stage(stage: &str) -> bool {
     matches!(stage, "failed" | "rejected" | "cancelled")
+}
+
+/// The request detail needs background refreshes only while an agent-driven
+/// transition can still change without a user action. A pending/running latest
+/// job keeps polling active even when the request is already `verifying` (the
+/// request-level status deliberately spans LivePlan and LiveApply).
+pub(crate) fn should_poll_request_execution(
+    request_status: &str,
+    job: Option<&ExecutionJob>,
+) -> bool {
+    request_status.eq_ignore_ascii_case("executing")
+        || job.is_some_and(|current| !current.is_terminal())
+}
+
+/// Ordinary request verification is safe only after the latest execution job
+/// reached the terminal result required by its mode. In particular, a
+/// successful LivePlan is an approval checkpoint, not verification evidence.
+pub(crate) fn latest_job_permits_verification(job: Option<&ExecutionJob>) -> bool {
+    job.is_some_and(ExecutionJob::permits_request_verification)
 }
 
 /// The ordered forward milestone sequence for the stage-progression rail.
@@ -299,6 +321,106 @@ pub(crate) fn audit_action_label(action: &str) -> &'static str {
     }
 }
 
+/// Render only the control-plane allowlisted LivePlan projection. The raw plan
+/// and provider identifiers are never present in this model.
+fn render_live_plan_review(review: LivePlanReview) -> impl IntoView {
+    let counts = review.counts;
+    let placement = review.placement;
+    let changes = review.managed_changes;
+    let digest_class = if review.digest_verified {
+        "badge good"
+    } else {
+        "badge bad"
+    };
+    let digest_label = if review.digest_verified {
+        "Digest verified"
+    } else {
+        "Digest mismatch"
+    };
+
+    view! {
+        <section class="request-plan" aria-label="Live plan review">
+            <div class="timeline-row-head">
+                <h3>"Live Plan Review"</h3>
+                <span class=digest_class>{digest_label}</span>
+            </div>
+            <div class="request-info-grid">
+                <div class="request-info-item">
+                    <strong>"State key"</strong>
+                    <code class="evidence-item-key">{review.state_key}</code>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Create"</strong>
+                    <span>{counts.create}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Update"</strong>
+                    <span>{counts.update}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Delete"</strong>
+                    <span>{counts.delete}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Replace"</strong>
+                    <span>{counts.replace}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"VM name"</strong>
+                    <span>{placement.name}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"CPU"</strong>
+                    <span>{placement.cpu}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Memory"</strong>
+                    <span>{placement.memory_gb} " GB"</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Disk"</strong>
+                    <span>{placement.disk_size_gb} " GB"</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Datacenter"</strong>
+                    <span>{placement.datacenter}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Cluster"</strong>
+                    <span>{placement.cluster}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Datastore"</strong>
+                    <span>{placement.datastore}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Network"</strong>
+                    <span>{placement.network}</span>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Template"</strong>
+                    <span>{placement.template}</span>
+                </div>
+            </div>
+            <h3>"Managed Changes"</h3>
+            <ol class="approval-route-list">
+                {changes
+                    .into_iter()
+                    .map(|change| {
+                        view! {
+                            <li>
+                                <strong>{change.action}</strong>
+                                " "
+                                <span>{change.resource_type} " / " {change.logical_name}</span>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ol>
+        </section>
+    }
+}
+
 #[component]
 pub fn RequestDetail() -> impl IntoView {
     // The request id arrives from the `/requests/:id` route, so request
@@ -321,6 +443,71 @@ pub fn RequestDetail() -> impl IntoView {
     let audit_resource = Resource::new(move || request_id.get(), get_request_audit);
     // Execution-agent job for this request (None when not yet dispatched).
     let execution_job_resource = Resource::new(move || request_id.get(), get_request_execution_job);
+    let (execution_polling, set_execution_polling) = signal(false);
+    #[cfg(not(feature = "hydrate"))]
+    let _ = execution_polling;
+
+    // Agent execution is asynchronous. During hydration, refresh the request,
+    // job, and audit views until the request/job pair reaches a human checkpoint
+    // or a terminal outcome. Hidden tabs make no requests and catch up
+    // immediately when visible again.
+    #[cfg(feature = "hydrate")]
+    {
+        use std::time::Duration;
+
+        const EXECUTION_POLL_PERIOD: Duration = Duration::from_secs(3);
+
+        fn document_hidden() -> bool {
+            web_sys::window()
+                .and_then(|window| window.document())
+                .map(|document| document.hidden())
+                .unwrap_or(false)
+        }
+
+        let poll_handle: StoredValue<Option<IntervalHandle>> = StoredValue::new(None);
+        let start_poll = move || {
+            if poll_handle.get_value().is_none() {
+                let started = set_interval_with_handle(
+                    move || {
+                        if execution_polling.get_untracked() && !document_hidden() {
+                            detail_resource.refetch();
+                            execution_job_resource.refetch();
+                            audit_resource.refetch();
+                        }
+                    },
+                    EXECUTION_POLL_PERIOD,
+                );
+                if let Ok(handle) = started {
+                    poll_handle.set_value(Some(handle));
+                }
+            }
+        };
+        let stop_poll = move || {
+            if let Some(handle) = poll_handle.get_value() {
+                handle.clear();
+                poll_handle.set_value(None);
+            }
+        };
+        let visibility_listener = window_event_listener_untyped("visibilitychange", move |_| {
+            if document_hidden() {
+                stop_poll();
+            } else {
+                if execution_polling.get_untracked() {
+                    detail_resource.refetch();
+                    execution_job_resource.refetch();
+                    audit_resource.refetch();
+                }
+                start_poll();
+            }
+        });
+        if !document_hidden() {
+            start_poll();
+        }
+        on_cleanup(move || {
+            stop_poll();
+            visibility_listener.remove();
+        });
+    }
 
     #[allow(deprecated)]
     let (action_feedback, set_action_feedback) = create_signal(String::new());
@@ -366,6 +553,7 @@ pub fn RequestDetail() -> impl IntoView {
         set_apply_armed.set(false);
         set_retire_armed.set(false);
         set_step_apply_armed.set(None);
+        set_execution_polling.set(false);
     });
 
     let validate_action = Action::new(move |id: &String| {
@@ -786,6 +974,10 @@ pub fn RequestDetail() -> impl IntoView {
                         // panel renders a "not dispatched" note rather than
                         // blocking the whole detail view.
                         let execution_job = execution_job_resource.await.unwrap_or(None);
+                        set_execution_polling.set(should_poll_request_execution(
+                            &detail.status,
+                            execution_job.as_ref(),
+                        ));
                         let synthetic_timeline = detail.timeline.clone();
 
                         let status_class = status_badge_class(&detail.status);
@@ -800,32 +992,32 @@ pub fn RequestDetail() -> impl IntoView {
                         let terminal_label = stage_label(&current_stage);
                         // Gate each stage-available action on its capability,
                         // using the same action->permission map as the engine.
+                        let verification_ready =
+                            latest_job_permits_verification(execution_job.as_ref());
                         let actions: Vec<String> = detail
                             .actions_available
                             .iter()
                             .filter(|action| session_can(&session, action_capability(action)))
+                            // A LivePlan result moves the request to Verifying,
+                            // but it has not applied anything. Keep Verify hidden
+                            // until the latest OfflineDryRun/LiveApply job has the
+                            // matching successful terminal result.
+                            .filter(|action| action.as_str() != "verify" || verification_ready)
                             .cloned()
                             .collect();
-                        // "Run live plan" is a synthetic admin-only action: shown when
-                        // "execute" is available (request is Locked) and the session
-                        // holds the "admin" capability (PlatformAdmin / BreakGlassAdmin).
-                        let show_live_plan = detail
-                            .actions_available
-                            .iter()
-                            .any(|a| a == "execute")
+                        // LivePlan can be dispatched only from the Locked
+                        // checkpoint. Once execution begins the background poll
+                        // owns progress and this command disappears.
+                        let show_live_plan = detail.status.eq_ignore_ascii_case("locked")
+                            && detail.actions_available.iter().any(|a| a == "execute")
                             && session_can(&session, "admin");
-                        // "Approve & apply" is an admin-only action that mints a
-                        // CP-signed LiveApply grant from the request's completed
-                        // LivePlan. The API endpoint itself 409s if no live plan
-                        // has been completed yet, so we use the same gate as
-                        // show_live_plan for portal-side visibility: execute
-                        // available (request is Locked) and admin session. The
-                        // API enforces state correctness.
-                        let show_approve_apply = detail
-                            .actions_available
-                            .iter()
-                            .any(|a| a == "execute")
-                            && session_can(&session, "admin");
+                        // Live apply is offered only from the latest completed,
+                        // accepted LivePlan and only after its safe projection
+                        // was digest-verified by the control plane.
+                        let show_approve_apply = session_can(&session, "admin")
+                            && execution_job
+                                .as_ref()
+                                .is_some_and(ExecutionJob::can_approve_live_apply);
                         let request_id_for_action = detail.id.clone();
 
                         // Persisted-state fields surfaced in the detail panel.
@@ -1174,6 +1366,10 @@ pub fn RequestDetail() -> impl IntoView {
                                 // Hidden when no job has been dispatched yet.
                                 {match execution_job {
                                     Some(job) => {
+                                        let successful_plan_without_review =
+                                            job.is_successful_live_plan()
+                                                && job.live_plan_review.is_none();
+                                        let plan_review = job.live_plan_review.clone();
                                         let result_status_display = if job.result_status.is_empty() {
                                             "—".to_string()
                                         } else {
@@ -1192,7 +1388,7 @@ pub fn RequestDetail() -> impl IntoView {
                                         };
                                         view! {
                                             <div
-                                                class="execution-job-panel"
+                                                class="request-plan execution-job-panel"
                                                 aria-label="Execution job"
                                             >
                                                 <h3>"Execution Job"</h3>
@@ -1224,13 +1420,27 @@ pub fn RequestDetail() -> impl IntoView {
                                                         <span>{completed_display}</span>
                                                     </div>
                                                 </div>
+                                                {match plan_review {
+                                                    Some(review) => {
+                                                        render_live_plan_review(review).into_any()
+                                                    }
+                                                    None if successful_plan_without_review => {
+                                                        view! {
+                                                            <p class="form-feedback form-error" role="alert">
+                                                                "Safe plan review unavailable; live apply is blocked."
+                                                            </p>
+                                                        }
+                                                            .into_any()
+                                                    }
+                                                    None => ().into_any(),
+                                                }}
                                             </div>
                                         }
                                             .into_any()
                                     }
                                     None => view! {
                                         <div
-                                            class="execution-job-panel"
+                                            class="request-plan execution-job-panel"
                                             aria-label="Execution job"
                                         >
                                             <h3>"Execution Job"</h3>
@@ -1357,11 +1567,10 @@ pub fn RequestDetail() -> impl IntoView {
                                                 </Show>
                                             }
                                         }
-                                        // "Approve & apply" — admin-only, shown when the
-                                        // request is Locked (same gate as "Run live plan").
-                                        // Mints a CP-signed LiveApply grant from the
-                                        // request's completed LivePlan. The API 409s if no
-                                        // live plan has been completed yet.
+                                        // "Approve & apply" — admin-only and shown only
+                                        // after the latest LivePlan completed successfully
+                                        // with a digest-verified safe review projection.
+                                        // Mints a CP-signed LiveApply grant from that plan.
                                         {
                                             let approve_apply_id = request_id_for_action.clone();
                                             view! {
@@ -1799,8 +2008,10 @@ fn RequestEvidencePanel() -> impl IntoView {
 mod tests {
     use super::{
         action_capability, data_url, digest_slug, effective_stage_for_rail,
-        step_status_badge_class, step_status_label, stage_step_state, STAGE_MILESTONES,
+        latest_job_permits_verification, should_poll_request_execution, stage_step_state,
+        step_status_badge_class, step_status_label, STAGE_MILESTONES,
     };
+    use crate::models::ExecutionJob;
 
     // ── evidence-pack download wiring (#50) ──────────────────────────────────
 
@@ -1920,6 +2131,52 @@ mod tests {
     }
 
     // ── orchestration step chips (#42) ──────────────────────────────────────
+
+    fn execution_job(mode: &str, status: &str, result_status: &str) -> ExecutionJob {
+        ExecutionJob {
+            request_id: "request-test".to_string(),
+            mode: mode.to_string(),
+            status: status.to_string(),
+            result_status: result_status.to_string(),
+            evidence_digest_short: String::new(),
+            created_at: "2026-07-10 10:00".to_string(),
+            completed_at: if status == "Succeeded" {
+                "2026-07-10 10:01".to_string()
+            } else {
+                String::new()
+            },
+            verification_ready: status == "Succeeded"
+                && (mode == "OfflineDryRun"
+                    || (mode == "LiveApply" && result_status == "verified")),
+            live_plan_review: None,
+        }
+    }
+
+    #[test]
+    fn execution_polling_tracks_agent_driven_states_only() {
+        let running = execution_job("LiveApply", "Running", "");
+        let completed = execution_job("LiveApply", "Succeeded", "verified");
+
+        assert!(should_poll_request_execution("executing", None));
+        assert!(should_poll_request_execution("verifying", Some(&running)));
+        assert!(!should_poll_request_execution(
+            "verifying",
+            Some(&completed)
+        ));
+        assert!(!should_poll_request_execution("locked", None));
+    }
+
+    #[test]
+    fn plan_only_result_never_exposes_request_verification() {
+        let plan = execution_job("LivePlan", "Succeeded", "planned");
+        let dry = execution_job("OfflineDryRun", "Succeeded", "check_ok");
+        let apply = execution_job("LiveApply", "Succeeded", "verified");
+
+        assert!(!latest_job_permits_verification(Some(&plan)));
+        assert!(latest_job_permits_verification(Some(&dry)));
+        assert!(latest_job_permits_verification(Some(&apply)));
+        assert!(!latest_job_permits_verification(None));
+    }
 
     /// Every `job_steps.status` value maps to an explicit chip class — landed
     /// outcomes green, failure red, in-flight/human-gated amber, at-rest

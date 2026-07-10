@@ -1,9 +1,7 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const VALID_TIERS: &[TierType] = &[TierType::Front, TierType::Mid, TierType::Back];
 
@@ -189,7 +187,7 @@ pub fn plan_environment(
     if app_name.is_empty() {
         return Err("app_name cannot be empty".into());
     }
-    if site.is_empty() || !VALID_SITES.contains(&site) {
+    if site.is_empty() || !site_registry::is_valid_site(site) {
         return Err(format!("Unknown or empty site: {}", site));
     }
 
@@ -252,10 +250,13 @@ pub fn validate_environment(env: &AppEnvironment) -> Result<ValidationResult, St
         errors.push("Missing site".into());
         failed_rules.push("p0-site-required".into());
         remediation.push("Provide a valid site code.".into());
-    } else if !VALID_SITES.contains(&env.site.as_str()) {
+    } else if !site_registry::is_valid_site(&env.site) {
         errors.push(format!("Unknown site: {}", env.site));
         failed_rules.push("p0-site-ou-catalog-match".into());
-        remediation.push(format!("Select a known site from: {:?}", VALID_SITES));
+        remediation.push(format!(
+            "Select an active site from: {:?}",
+            site_registry::get_active_site_codes().unwrap_or_default()
+        ));
     }
 
     if env.network_zone.is_empty() {
@@ -775,8 +776,8 @@ mod tests {
 
     #[test]
     fn test_all_environments_work_at_all_sites() {
-        for site in VALID_SITES {
-            let result = plan_environment("testapp", EnvironmentType::Prod, site);
+        for site in site_registry::get_active_site_codes().unwrap() {
+            let result = plan_environment("testapp", EnvironmentType::Prod, &site);
             assert!(result.is_ok(), "Failed at site: {}", site);
         }
     }

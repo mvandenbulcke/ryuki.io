@@ -82,30 +82,43 @@ under a control-plane-signed grant.
 
 | Mode | Who can dispatch | What runs |
 | --- | --- | --- |
-| `OfflineDryRun` (default) | `execute` tier | `terraform validate` / `ansible-playbook --check` in an isolated workspace, embedded IaC only, no credentials. |
-| `LivePlan` | `admin` tier | Real `terraform init` → `plan` → `show -json` against the backend. Produces a plan + a `plan_digest`; **no mutation**. |
-| `LiveApply` | minted by an `admin` via `approve-live-apply`, never dispatched directly | `terraform apply` of the **exact** approved plan, on an agent that accepts the signed grant. |
+| `OfflineDryRun` (default) | `execute` tier | Terraform `init`, `validate`, and a best-effort credential-free plan, or `ansible-playbook --check`, in an isolated workspace. Registry downloads may occur; no provider credentials or mutation authority are supplied. |
+| `LivePlan` | `admin` tier | Real `terraform init` → `plan` → `show -json` against the backend. Produces a plan + a `plan_digest` without applying provider resources; backend initialization, locking, and state metadata can still change. |
+| `LiveApply` | minted by an `admin` via `approve-live-apply`, never dispatched directly | Creates a fresh plan, requires its canonical digest to match the reviewed plan, then applies that matching binary plan. |
+| `LiveDestroy` | system compensation after a failed multi-step live run | `terraform destroy` against the exact step state, authorized by a step-scoped signed grant. |
+
+The vSphere bundles pin `vmware/vsphere` at `2.16.1` and carry generated
+multi-platform checksum locks. Every Terraform execution mode initializes with
+`-lockfile=readonly`, so dependency selection is part of the digest-bound IaC
+rather than mutable job-local state.
 
 ### Live-apply trust chain
 
 1. An operator dispatches a `LivePlan` (admin-only). The agent runs the plan and
    returns scrubbed evidence plus the plan digest.
-2. An `admin` approves via `POST /api/requests/{id}/approve-live-apply`. The
+2. The control plane derives a digest-verified, allowlisted Plan Review from the
+   stored plan bytes. It exposes managed actions and request placement, never
+   raw Terraform JSON or provider object identifiers. Server apply approval is
+   refused if this projection cannot be derived.
+3. An `admin` approves via `POST /api/requests/{id}/approve-live-apply`. The
    control plane mints a `LiveApply` grant **signed with its Ed25519 key**,
-   binding the request id, the approved plan digest, the approver, and a
-   short expiry (≤ 24 h). A unique constraint prevents a second request-level
+   binding the request id, approved plan digest, full JobSpec digest (including
+   mode and state key), approver, and a short expiry (<= 24 h). A unique constraint prevents a second request-level
    live apply; in orchestrated multi-step runs each step gets exactly one
    step-scoped `LiveApply`, gated by the step's `FOR UPDATE` approval lock
    (migration 153).
-3. The agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true` and it has pinned the
-   control-plane public key. It re-plans, then refuses unless **all** hold:
-   the grant signature verifies against the pinned CP key; the grant is for this
-   request; it has not expired; and the freshly computed plan digest **matches**
-   the approved one. Any mismatch → a signed refusal is reported and `apply` is
-   never called.
-4. On success the agent applies the saved plan bytes (not a re-plan), so the
-   applied change is exactly what was approved (closes the plan-then-apply TOCTOU
-   gap). Terraform errors if live state has since drifted.
+4. The protocol-v2 agent only acts if `RYUKI_AGENT_ALLOW_LIVE=true` and it has
+   pinned the control-plane public key. It verifies the embedded IaC digest and
+   refuses unless **all** hold: the grant signature verifies; its full JobSpec
+   digest matches this exact job; request, step, mode, and state ownership match;
+   it has not expired; and the freshly computed plan digest **matches** the
+   approved one. Any mismatch produces a signed refusal and mutation is never
+   called. Plan, apply, and destroy for a state key are pinned to the same agent.
+5. On success the LiveApply job applies the fresh binary plan whose canonical
+   JSON digest matched the reviewed plan. Binary `tfplan` bytes are not carried
+   between jobs; digest equality is the approval invariant that closes the
+   plan-then-apply TOCTOU gap. A post-apply plan must confirm convergence before
+   the vSphere request can be verified as completed.
 
 Credentials never reach the control plane; the agent resolves them locally and
 all command output is scrubbed before it becomes signed evidence.
@@ -114,18 +127,25 @@ all command output is scrubbed before it becomes signed evidence.
 
 | Flag | Side | Effect |
 | --- | --- | --- |
-| `RYUKI_AGENT_ALLOW_LIVE` | Agent | `true`/`1` unlocks `LivePlan`/`LiveApply`; anything else = dry-run only. Cleartext non-loopback URLs are rejected at startup. |
+| `RYUKI_AGENT_ALLOW_LIVE` | Agent | `true`/`1` unlocks `LivePlan`/`LiveApply`/`LiveDestroy`; anything else = dry-run only. Cleartext non-loopback URLs are rejected at startup. |
 | `RYUKI_AGENT_CP_URL` / `RYUKI_AGENT_TOKEN` / `RYUKI_AGENT_KEY_PATH` | Agent | CP endpoint (HTTPS for live), enrolment token, and the agent signing key. |
-| `RYUKI_AGENT_BACKEND_HCL` | Agent | Durable Terraform state backend for production applies. |
+| `RYUKI_AGENT_BACKEND_HCL` | Agent | Durable Terraform backend template. The active path/key attribute must contain `{STATE_KEY}` for per-request/per-step isolation; comments and unrelated attributes do not satisfy the gate. Remote authentication must work within the agent's minimal environment because arbitrary backend credential variables are not passed through. |
 | `RYUKI_CP_SIGNING_KEY_PATH` | Control plane | CP Ed25519 grant-signing key (created at `0600` on first boot). |
 
 ### Maturity
 
 The dry-run pipeline, the full live trust gate (grant signing/verification,
 plan-digest integrity, refusal reporting, no-double-apply), agent-side
-`LiveApply` and `LiveDestroy` execution, the end-to-end credential seam, and a
-Vault KV v2 resolver are all implemented and tested. Running a real apply
-against live infrastructure is operator-owned: it requires a deployed agent
-with `RYUKI_AGENT_ALLOW_LIVE=true`, real provider credentials via
-`RYUKI_LIVE_CRED_<NAME>`, and a durable state backend. The vendor-API adapters
-for a given provider are enabled per integration as you go live.
+`LiveApply` and `LiveDestroy` execution, the provider credential-injection path,
+and a Vault KV v2 resolver are covered by repository and CI tests. A
+provider-connected vSphere run is not accepted until the operator-owned gates
+in [First Test Acceptance](first-test.md) pass against an approved disposable
+target. It requires a deployed agent with `RYUKI_AGENT_ALLOW_LIVE=true`, real
+provider credentials via `RYUKI_LIVE_CRED_<NAME>`, and a durable isolated state
+backend. The vendor-API adapters for a given provider are enabled per
+integration as you go live.
+
+Automatic `LiveDestroy` is compensation for a failed multi-step run. There is
+not yet an operator-triggered destroy endpoint for a successful single-job
+request, so the first live test must approve and rehearse a state-keyed cleanup
+procedure before apply. See [First Test Acceptance](first-test.md).

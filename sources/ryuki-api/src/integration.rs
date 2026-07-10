@@ -39,7 +39,11 @@ use ryuki_engine::integration_connections::{
 fn load_encryption_key() -> Result<[u8; 32], CredError> {
     let raw = std::env::var("RYUKI_INTEGRATION__ENCRYPTION_KEY")
         .map_err(|_| CredError::KeyUnavailable)?;
-    let raw = raw.trim();
+    parse_encryption_key(Some(&raw))
+}
+
+fn parse_encryption_key(raw: Option<&str>) -> Result<[u8; 32], CredError> {
+    let raw = raw.ok_or(CredError::KeyUnavailable)?.trim();
 
     // FIX-4: try hex FIRST (when input is exactly 64 hex chars), then base64.
     // Previously, base64 was tried first. A 64-char hex string is also valid
@@ -83,7 +87,15 @@ pub fn encrypt_secret(
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, String), CredError> {
     let key_bytes = load_encryption_key()?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    encrypt_secret_with_key(connection_id, plaintext, &key_bytes)
+}
+
+fn encrypt_secret_with_key(
+    connection_id: &str,
+    plaintext: &[u8],
+    key_bytes: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>, String), CredError> {
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
 
     let mut nonce_bytes = [0u8; 12]; // 96-bit nonce for GCM
@@ -123,7 +135,19 @@ pub fn decrypt_secret(
         return Err(CredError::NonceLength(nonce_bytes.len()));
     }
     let key_bytes = load_encryption_key()?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    decrypt_secret_with_key(connection_id, ciphertext, nonce_bytes, &key_bytes)
+}
+
+fn decrypt_secret_with_key(
+    connection_id: &str,
+    ciphertext: &[u8],
+    nonce_bytes: &[u8],
+    key_bytes: &[u8; 32],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, CredError> {
+    if nonce_bytes.len() != 12 {
+        return Err(CredError::NonceLength(nonce_bytes.len()));
+    }
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(nonce_bytes);
     let aad = connection_id.as_bytes();
@@ -355,9 +379,7 @@ impl VaultKv2Resolver {
 
         // KV v2 read shape: { "data": { "data": { <field>: <value>, … }, "metadata": … } }
         let body: serde_json::Value = resp.json().await.map_err(|_| {
-            CredError::Vault(format!(
-                "vault response for '{handle}' is not valid JSON"
-            ))
+            CredError::Vault(format!("vault response for '{handle}' is not valid JSON"))
         })?;
         let data = body
             .pointer("/data/data")
@@ -2540,12 +2562,13 @@ pub async fn integration_circuit_record(
     let mut tx = pool.begin().await.map_err(db_err)?;
     // Lock the parent connection: serializes concurrent record() for this
     // connection AND yields a clean 404 for an unknown one. tx rolls back on drop.
-    let exists: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE")
-            .bind(&id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
+    let exists: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
     let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
     };
@@ -2616,12 +2639,13 @@ pub async fn integration_circuit_reset(
     };
 
     let mut tx = pool.begin().await.map_err(db_err)?;
-    let exists: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE")
-            .bind(&id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
+    let exists: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, site_scope FROM integration_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
     let Some((_, site_scope)) = exists else {
         return Err(integration_not_found(&id));
     };
@@ -3255,7 +3279,7 @@ pub mod integration_db_tests {
             }),
         )
         .await
-            .expect("list ok");
+        .expect("list ok");
         assert_eq!(resp.0["source"], serde_json::json!("db"));
         let breakers = resp.0["breakers"].as_array().expect("breakers array");
 
@@ -5624,39 +5648,32 @@ mod unit_tests {
 
     #[test]
     fn encrypt_without_key_fails_with_key_unavailable() {
-        let original = std::env::var("RYUKI_INTEGRATION__ENCRYPTION_KEY").ok();
-        std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
-        let result = encrypt_secret("conn-123", b"my secret");
+        let result = parse_encryption_key(None);
         assert!(
             matches!(result, Err(CredError::KeyUnavailable)),
             "expected KeyUnavailable, got {:?}",
             result
         );
-        if let Some(k) = original {
-            std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", k);
-        }
     }
 
     #[test]
     fn encrypt_decrypt_round_trip_with_base64_key() {
         // Use an obviously-fake 32-byte test key (all 0x42 bytes = 'B').
         let key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
-        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", &key);
+        let key = parse_encryption_key(Some(&key)).unwrap();
 
         let conn_id = "conn-unit-test-001";
         let plaintext = b"unit-test-secret-fixture";
-        let (ciphertext, nonce, _key_id) = encrypt_secret(conn_id, plaintext).unwrap();
+        let (ciphertext, nonce, _key_id) =
+            encrypt_secret_with_key(conn_id, plaintext, &key).unwrap();
 
         // Ciphertext must differ from plaintext.
         assert_ne!(ciphertext, plaintext.to_vec());
 
         // Decrypt must recover plaintext.
-        let decrypted = decrypt_secret(conn_id, &ciphertext, &nonce).unwrap();
+        let decrypted = decrypt_secret_with_key(conn_id, &ciphertext, &nonce, &key).unwrap();
         let decrypted_slice: &[u8] = &decrypted;
         assert_eq!(decrypted_slice, plaintext.as_ref());
-
-        // Clean up.
-        std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
     }
 
     // -----------------------------------------------------------------------
@@ -5802,7 +5819,7 @@ mod unit_tests {
             }),
         )
         .await
-            .expect("no DB returns an empty list, not an error");
+        .expect("no DB returns an empty list, not an error");
         assert_eq!(resp.0["source"], serde_json::json!("no-db"));
         assert_eq!(resp.0["breakers"], serde_json::json!([]));
     }
@@ -5873,35 +5890,31 @@ mod unit_tests {
     #[test]
     fn encrypt_decrypt_wrong_connection_id_fails() {
         let key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
-        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", &key);
+        let key = parse_encryption_key(Some(&key)).unwrap();
 
-        let (ciphertext, nonce, _) = encrypt_secret("conn-aaa", b"secret-fixture").unwrap();
+        let (ciphertext, nonce, _) =
+            encrypt_secret_with_key("conn-aaa", b"secret-fixture", &key).unwrap();
 
         // Decrypt with a DIFFERENT connection_id (AAD mismatch) must fail.
-        let result = decrypt_secret("conn-bbb", &ciphertext, &nonce);
+        let result = decrypt_secret_with_key("conn-bbb", &ciphertext, &nonce, &key);
         assert!(
             matches!(result, Err(CredError::DecryptionFailed)),
             "AAD mismatch must cause decryption failure, got: {:?}",
             result
         );
-
-        std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
     }
 
     #[test]
     fn wrong_key_length_returns_key_length_error() {
         // 16 bytes base64 → 22 chars — wrong length.
         let short_key = base64::engine::general_purpose::STANDARD.encode([0x01u8; 16]);
-        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", &short_key);
 
-        let result = encrypt_secret("conn-x", b"data");
+        let result = parse_encryption_key(Some(&short_key));
         assert!(
             matches!(result, Err(CredError::KeyLength(16))),
             "expected KeyLength(16), got: {:?}",
             result
         );
-
-        std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
     }
 
     #[test]
@@ -5944,32 +5957,25 @@ mod unit_tests {
     // FIX-4: hex key (64 chars) loads correctly and round-trips.
     #[test]
     fn hex_key_loads_and_round_trips() {
-        let original = std::env::var("RYUKI_INTEGRATION__ENCRYPTION_KEY").ok();
-
         // 32 bytes of obviously-fake key encoded as 64 hex chars.
         let hex_key: String = "cd".repeat(32); // 0xCD * 32
         assert_eq!(hex_key.len(), 64);
-        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", &hex_key);
+        let key = parse_encryption_key(Some(&hex_key)).expect("hex key must load");
 
         let conn_id = "conn-fix4-hex";
         let plaintext = b"hex-key-unit-test-fixture";
         let (ciphertext, nonce, _) =
-            encrypt_secret(conn_id, plaintext).expect("hex key must encrypt");
+            encrypt_secret_with_key(conn_id, plaintext, &key).expect("hex key must encrypt");
         assert_ne!(ciphertext, plaintext.to_vec(), "ciphertext must differ");
 
-        let decrypted = decrypt_secret(conn_id, &ciphertext, &nonce).expect("hex key must decrypt");
+        let decrypted = decrypt_secret_with_key(conn_id, &ciphertext, &nonce, &key)
+            .expect("hex key must decrypt");
         let decrypted_slice: &[u8] = &decrypted;
         assert_eq!(
             decrypted_slice,
             plaintext.as_ref(),
             "hex-key round-trip must recover plaintext"
         );
-
-        if let Some(k) = original {
-            std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", k);
-        } else {
-            std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
-        }
     }
 
     // FIX-5: CreateConnectionRequest and UpdateConnectionRequest Debug output
@@ -6145,14 +6151,14 @@ mod unit_tests {
         );
         // Rejected shapes — each must fail closed with a handle-shape error.
         for bad in [
-            "no-slash",       // no mount/path separator
-            "secret/x#",      // empty field selector
-            "secret/x#a#b",   // multiple selectors
-            "/x",             // empty mount
-            "secret/",        // empty path
-            "secret/x/",      // trailing slash (empty leaf)
-            "#field",         // selector only
-            "",               // empty
+            "no-slash",     // no mount/path separator
+            "secret/x#",    // empty field selector
+            "secret/x#a#b", // multiple selectors
+            "/x",           // empty mount
+            "secret/",      // empty path
+            "secret/x/",    // trailing slash (empty leaf)
+            "#field",       // selector only
+            "",             // empty
         ] {
             assert!(
                 VaultKv2Resolver::parse_handle(bad).is_err(),
@@ -6195,7 +6201,10 @@ mod unit_tests {
             !debug.contains("VERY-SECRET-VAULT-TOKEN"),
             "Debug must redact the token: {debug}"
         );
-        assert!(debug.contains("[REDACTED]"), "Debug must say [REDACTED]: {debug}");
+        assert!(
+            debug.contains("[REDACTED]"),
+            "Debug must say [REDACTED]: {debug}"
+        );
         assert!(
             debug.contains("vault.internal"),
             "the non-secret addr may appear: {debug}"

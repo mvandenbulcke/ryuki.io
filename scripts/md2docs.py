@@ -31,6 +31,8 @@ DOCS = ROOT / "docs"
 PAGES = [
     ("getting-started", "Getting Started",
      "Prerequisites, database setup, first build and run."),
+    ("first-test", "First Test Acceptance",
+     "Normative dry-run and live vSphere test gates, evidence, and cleanup."),
     ("architecture", "Architecture",
      "The stack, component diagram, key decisions and network policy."),
     ("configuration", "Configuration",
@@ -50,7 +52,7 @@ PAGES = [
     ("using-the-api", "Using the API",
      "Authentication, conventions, and a complete request lifecycle with curl."),
     ("api-reference", "API Reference",
-     "Every HTTP endpoint the control plane serves, generated from the route registrations."),
+     "Route-by-area control-plane reference, plus a bounded machine-readable OpenAPI subset."),
 ]
 
 # Pages whose markdown source lives outside docs/<name>.md.
@@ -1045,8 +1047,10 @@ def api_hub_content(api, openapi_available) -> str:
     openapi_p = ""
     if openapi_available:
         openapi_p = ('<p>Machine-readable spec: <a href="/openapi.json">'
-                     '<code>openapi.json</code></a> — the same surface as these '
-                     'pages, for tooling.</p>')
+                     '<code>openapi.json</code></a>. It covers the bounded agent, '
+                     'public, and operations-read subset for tooling; it is not a '
+                     'schema for the full route-by-area surface documented on these '
+                     'pages.</p>')
     return (
         "<h1>API Reference</h1>"
         f"<p>The control plane serves <strong>{total} routes</strong> across "
