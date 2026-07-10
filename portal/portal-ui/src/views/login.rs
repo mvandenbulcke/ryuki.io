@@ -69,7 +69,6 @@ pub fn LoginView() -> impl IntoView {
     let entra_pending = entra_action.pending();
     let entra_result = entra_action.value();
 
-
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let username_value = username.get();

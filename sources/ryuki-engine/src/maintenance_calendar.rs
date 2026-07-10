@@ -1,12 +1,10 @@
-use crate::models::PatchWave;
+use crate::{models::PatchWave, site_registry};
 use chrono::{DateTime, Datelike, Days, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaintenanceWindow {
@@ -76,7 +74,7 @@ pub fn validate_window_inputs(
     reason: &str,
     affected_cis: Vec<String>,
 ) -> Result<MaintenanceWindow, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
     if parse_iso_time(start_time).is_none() {

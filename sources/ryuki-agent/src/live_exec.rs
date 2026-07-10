@@ -81,6 +81,8 @@ pub enum LiveExecError {
     PlanBuild(String),
     #[error("credential resolution error: {0}")]
     CredResolution(String),
+    #[error("Terraform state isolation error: {0}")]
+    BackendIsolation(String),
     /// The plan step did not complete cleanly (non-zero exit or timeout).
     /// A digest MUST NOT be computed or exposed for a non-clean plan.
     /// Applies to both Terraform (`terraform plan`) and Ansible (`--check`).
@@ -158,11 +160,11 @@ pub trait LiveExecutor: Send + Sync {
 ///
 /// ## `backend_config`
 ///
-/// If the operator supplies a durable state-backend override HCL via
-/// `RYUKI_AGENT_BACKEND_CONFIG_<OFFERING>` or the generic
-/// `RYUKI_AGENT_BACKEND_HCL` env var, it is forwarded to the runner.
-/// Production operators should always provide a backend config for `LiveApply`
-/// so Terraform can persist and lock state.
+/// The operator must supply a durable state-backend HCL template through
+/// `RYUKI_AGENT_BACKEND_HCL`. The template must contain the exact
+/// `{STATE_KEY}` token. Before every Terraform live operation, the executor
+/// replaces that token with `JobSpec.state_key`; a missing template, missing
+/// key, unsafe key, or missing placeholder fails closed before Terraform.
 ///
 /// ## Credential seam (wired — operator provisions the values)
 ///
@@ -179,8 +181,8 @@ pub trait LiveExecutor: Send + Sync {
 /// refusal.  The offline dry-run path keeps an empty declaration and empty
 /// material — it never sees credentials.
 pub struct RunnerLiveExecutor {
-    /// Optional backend HCL override forwarded to the runner.
-    /// Populated from `RYUKI_AGENT_BACKEND_HCL` at construction time.
+    /// Backend HCL template populated from `RYUKI_AGENT_BACKEND_HCL`.
+    /// Terraform live jobs require it to contain `{STATE_KEY}`.
     pub backend_config: Option<String>,
 }
 
@@ -246,6 +248,29 @@ impl RunnerLiveExecutor {
         })
     }
 
+    /// Instantiate the operator backend template for this spec's CP-owned key.
+    fn isolated_backend(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<ryuki_runner::IsolatedBackendConfig, LiveExecError> {
+        let template = self.backend_config.as_deref().ok_or_else(|| {
+            LiveExecError::BackendIsolation(
+                "RYUKI_AGENT_BACKEND_HCL is not set; live Terraform requires an isolated \
+                 durable backend template containing {STATE_KEY}"
+                    .to_string(),
+            )
+        })?;
+        let state_key = spec.state_key.as_deref().ok_or_else(|| {
+            LiveExecError::BackendIsolation(
+                "job spec has no state_key (legacy specs may decode but cannot execute live \
+                 Terraform)"
+                    .to_string(),
+            )
+        })?;
+        ryuki_runner::IsolatedBackendConfig::from_template(template, state_key)
+            .map_err(|e| LiveExecError::BackendIsolation(e.to_string()))
+    }
+
     /// Build a `RunPlan` from a `JobSpec` with `RunMode::Live`.
     ///
     /// The `runner_kind` is derived from the offering slug via
@@ -267,6 +292,24 @@ impl RunnerLiveExecutor {
                 ))
             })?
             .to_string();
+
+        // Live provider execution has no digest compatibility fallback. The
+        // exact embedded bundle must match the CP-authored JobSpec before the
+        // agent resolves credentials or invokes any runner. This blocks stale
+        // or tampered agent binaries from executing different IaC than the CP
+        // dispatched and approved.
+        let approved_digest =
+            crate::executor::real_iac_digest(&spec.iac_digest).ok_or_else(|| {
+                LiveExecError::PlanBuild(
+                    "live execution requires a non-zero lowercase SHA-256 IaC digest".to_string(),
+                )
+            })?;
+        let resolved_digest = ryuki_runner::iac::offering_iac_digest(&offering_slug);
+        if resolved_digest.as_deref() != Some(approved_digest) {
+            return Err(LiveExecError::PlanBuild(format!(
+                "IaC digest mismatch for live offering {offering_slug:?}; refusing provider execution"
+            )));
+        }
 
         // Classify runner kind from the offering slug — Ansible keywords resolve
         // to RunnerKind::Ansible, everything else to RunnerKind::Terraform.
@@ -303,12 +346,19 @@ impl LiveExecutor for RunnerLiveExecutor {
         }
 
         let run_plan = Self::make_run_plan(spec)?;
+        let backend = match run_plan.runner_kind {
+            RunnerKind::Terraform => Some(self.isolated_backend(spec)?),
+            RunnerKind::Ansible => None,
+        };
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
         match run_plan.runner_kind {
             RunnerKind::Terraform => {
-                let artifacts =
-                    ryuki_runner::run_live_plan(&run_plan, &creds, self.backend_config.as_deref())?;
+                let artifacts = ryuki_runner::run_live_plan(
+                    &run_plan,
+                    &creds,
+                    backend.as_ref().expect("Terraform branch builds backend"),
+                )?;
 
                 // FAIL CLOSED: return Err when the plan is not clean.
                 // A non-Planned status means a step failed — do NOT compute a digest.
@@ -393,13 +443,17 @@ impl LiveExecutor for RunnerLiveExecutor {
         }
 
         let run_plan = Self::make_run_plan(spec)?;
+        let backend = match run_plan.runner_kind {
+            RunnerKind::Terraform => Some(self.isolated_backend(spec)?),
+            RunnerKind::Ansible => None,
+        };
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
         let outcome = match run_plan.runner_kind {
             RunnerKind::Terraform => ryuki_runner::run_live_apply(
                 &run_plan,
                 &creds,
-                self.backend_config.as_deref(),
+                backend.as_ref().expect("Terraform branch builds backend"),
                 tfplan,
             )?,
 
@@ -439,13 +493,17 @@ impl LiveExecutor for RunnerLiveExecutor {
         }
 
         let run_plan = Self::make_run_plan(spec)?;
+        let backend = match run_plan.runner_kind {
+            RunnerKind::Terraform => Some(self.isolated_backend(spec)?),
+            RunnerKind::Ansible => None,
+        };
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
         let outcome = match run_plan.runner_kind {
             RunnerKind::Terraform => ryuki_runner::run_live_destroy(
                 &run_plan,
                 &creds,
-                self.backend_config.as_deref(),
+                backend.as_ref().expect("Terraform branch builds backend"),
             )?,
 
             RunnerKind::Ansible => {
@@ -667,14 +725,24 @@ mod tests {
     use uuid::Uuid;
 
     fn make_spec(mode: JobMode) -> JobSpec {
+        let iac_digest = ryuki_runner::iac::offering_iac_digest("patch-maintenance")
+            .expect("test offering has embedded IaC");
         JobSpec {
             request_id: Uuid::new_v4(),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
-            iac_digest: "0".repeat(64),
+            iac_digest,
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode,
         }
+    }
+
+    fn absolute_local_backend_template() -> String {
+        format!(
+            "terraform {{\n  backend \"local\" {{\n    path = \"{}/ryuki-agent-terraform-{{STATE_KEY}}.tfstate\"\n  }}\n}}",
+            std::env::temp_dir().display()
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -786,6 +854,67 @@ mod tests {
     }
 
     #[test]
+    fn terraform_live_jobs_fail_closed_without_isolated_backend_inputs() {
+        let valid_template = absolute_local_backend_template();
+
+        let mut missing_key = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
+        missing_key.state_key = None;
+        let exec = RunnerLiveExecutor {
+            backend_config: Some(valid_template.clone()),
+        };
+        assert!(matches!(
+            exec.plan(&missing_key),
+            Err(LiveExecError::BackendIsolation(_))
+        ));
+
+        let valid_spec = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
+        let no_template = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        assert!(matches!(
+            no_template.plan(&valid_spec),
+            Err(LiveExecError::BackendIsolation(_))
+        ));
+
+        let fixed_template = RunnerLiveExecutor {
+            backend_config: Some("# fixed shared backend".to_string()),
+        };
+        assert!(matches!(
+            fixed_template.plan(&valid_spec),
+            Err(LiveExecError::BackendIsolation(_))
+        ));
+
+        let mut unsafe_key = valid_spec;
+        unsafe_key.state_key = Some("../shared".to_string());
+        assert!(matches!(
+            exec.plan(&unsafe_key),
+            Err(LiveExecError::BackendIsolation(_))
+        ));
+    }
+
+    #[test]
+    fn executor_preserves_control_plane_state_key_when_rendering_backend() {
+        let exec = RunnerLiveExecutor {
+            backend_config: Some(absolute_local_backend_template()),
+        };
+        let mut request_a = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
+        request_a.state_key = Some("request-a".to_string());
+        let mut request_b = request_a.clone();
+        request_b.request_id = Uuid::new_v4();
+        request_b.state_key = Some("request-b".to_string());
+
+        let backend_a = exec
+            .isolated_backend(&request_a)
+            .expect("request A backend");
+        let backend_b = exec
+            .isolated_backend(&request_b)
+            .expect("request B backend");
+        assert_eq!(backend_a.state_key(), "request-a");
+        assert_eq!(backend_b.state_key(), "request-b");
+        assert_ne!(backend_a.state_key(), backend_b.state_key());
+    }
+
+    #[test]
     fn runner_live_executor_apply_rejects_live_plan() {
         let exec = RunnerLiveExecutor {
             backend_config: None,
@@ -824,7 +953,11 @@ mod tests {
         let exec = RunnerLiveExecutor {
             backend_config: None,
         };
-        for mode in [JobMode::LiveApply, JobMode::LivePlan, JobMode::OfflineDryRun] {
+        for mode in [
+            JobMode::LiveApply,
+            JobMode::LivePlan,
+            JobMode::OfflineDryRun,
+        ] {
             let spec = make_spec(mode.clone());
             let result = exec.destroy(&spec);
             assert!(
@@ -855,10 +988,8 @@ mod tests {
         }
     }
 
-    /// Terraform-offering destroy path does not panic and is not UnsupportedMode.
-    /// With terraform absent the runner reports RunnerUnavailable inside the
-    /// evidence; with terraform present a no-backend destroy is a no-op on an
-    /// empty state — both are Ok(Evidence), never a panic.
+    /// Terraform-offering destroy path reaches the backend-isolation gate and
+    /// never falls back to shared/local state when the template is missing.
     #[test]
     fn runner_live_executor_destroy_routes_terraform_offering() {
         let exec = RunnerLiveExecutor {
@@ -866,35 +997,19 @@ mod tests {
         };
         let spec = make_spec_with_iac_ref(JobMode::LiveDestroy, "request-preflight@v1.0.0");
         let result = exec.destroy(&spec);
-        assert!(
-            !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
-            "valid LiveDestroy mode must not return UnsupportedMode: {result:?}"
-        );
+        assert!(matches!(result, Err(LiveExecError::BackendIsolation(_))));
     }
 
-    /// When terraform is absent the runner returns RunnerUnavailable (not Err),
-    /// which the executor wraps into Evidence { status: RunnerUnavailable }.
-    /// This test proves the plan() path does not panic and returns Ok for a
-    /// valid LivePlan spec when terraform is absent.
+    /// A Terraform live plan without the operator template fails closed before
+    /// checking whether Terraform is installed.
     #[test]
-    fn runner_live_executor_plan_returns_ok_when_terraform_absent() {
-        // patch-maintenance IaC exists, terraform absent → RunnerUnavailable.
+    fn runner_live_executor_plan_rejects_missing_backend_template() {
         let exec = RunnerLiveExecutor {
             backend_config: None,
         };
-        let spec = make_spec(JobMode::LivePlan);
-        // This will try the real `terraform` binary — if it is absent it returns
-        // RunnerUnavailable (not Err). If terraform IS installed in CI this test
-        // will attempt a real plan and may fail for unrelated reasons; that is
-        // acceptable for a live-path test.
+        let spec = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
         let result = exec.plan(&spec);
-        // Either Ok (RunnerUnavailable) or Err(Runner(…)) from a real terraform
-        // failure is both valid — the important assertion is no panic.
-        // We only assert "is not UnsupportedMode".
-        assert!(
-            !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
-            "valid mode must not return UnsupportedMode"
-        );
+        assert!(matches!(result, Err(LiveExecError::BackendIsolation(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -902,12 +1017,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_spec_with_iac_ref(mode: JobMode, iac_ref: &str) -> JobSpec {
+        let offering_slug = iac_ref.split('@').next().unwrap_or_default();
+        let iac_digest =
+            ryuki_runner::iac::offering_iac_digest(offering_slug).unwrap_or_else(|| "0".repeat(64));
         JobSpec {
             request_id: Uuid::new_v4(),
             offering_id: Uuid::new_v4(),
             iac_ref: iac_ref.to_string(),
-            iac_digest: "0".repeat(64),
+            iac_digest,
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode,
         }
     }
@@ -948,6 +1067,21 @@ mod tests {
             "linux-server-deployment must produce RunnerKind::Terraform (keyword is linux-server-deployment-playbook); got {:?}",
             lsd_plan.runner_kind
         );
+    }
+
+    #[test]
+    fn make_run_plan_refuses_missing_or_mismatched_iac_digest() {
+        let mut spec = make_spec_with_iac_ref(JobMode::LivePlan, "linux-server-deployment@v1.0.0");
+
+        spec.iac_digest = "0".repeat(64);
+        let missing = RunnerLiveExecutor::make_run_plan(&spec)
+            .expect_err("a live job cannot use the all-zero digest placeholder");
+        assert!(missing.to_string().contains("requires a non-zero"));
+
+        spec.iac_digest = "a".repeat(64);
+        let mismatch = RunnerLiveExecutor::make_run_plan(&spec)
+            .expect_err("a live job cannot execute a different embedded bundle");
+        assert!(mismatch.to_string().contains("IaC digest mismatch"));
     }
 
     // -----------------------------------------------------------------------
@@ -1020,7 +1154,7 @@ mod tests {
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "it-pass-value");
 
         let exec = RunnerLiveExecutor {
-            backend_config: None,
+            backend_config: Some(absolute_local_backend_template()),
         };
         let cases: [(JobMode, &str); 3] = [
             (JobMode::LivePlan, "plan"),
@@ -1065,17 +1199,19 @@ mod tests {
         let names = vec!["VSPHERE_USER".to_string()];
 
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "");
-        let empty_err = RunnerLiveExecutor::resolve_creds(&names)
-            .expect_err("empty value must fail closed");
+        let empty_err =
+            RunnerLiveExecutor::resolve_creds(&names).expect_err("empty value must fail closed");
         assert!(
-            empty_err.to_string().contains("RYUKI_LIVE_CRED_VSPHERE_USER")
+            empty_err
+                .to_string()
+                .contains("RYUKI_LIVE_CRED_VSPHERE_USER")
                 && empty_err.to_string().contains("EMPTY"),
             "empty-value refusal must name the variable: {empty_err}"
         );
 
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "with,comma");
-        let comma_err = RunnerLiveExecutor::resolve_creds(&names)
-            .expect_err("comma value must fail closed");
+        let comma_err =
+            RunnerLiveExecutor::resolve_creds(&names).expect_err("comma value must fail closed");
         let msg = comma_err.to_string();
         assert!(
             msg.contains("RYUKI_LIVE_CRED_VSPHERE_USER") && msg.contains("comma"),
@@ -1100,10 +1236,11 @@ mod tests {
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "p-val");
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_SERVER", "s-val");
 
-        let names: Vec<String> = ryuki_runner::iac::live_secret_var_names("linux-server-deployment")
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> =
+            ryuki_runner::iac::live_secret_var_names("linux-server-deployment")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         let creds = RunnerLiveExecutor::resolve_creds(&names).expect("all creds provisioned");
         assert_eq!(
             creds.material, b"u-val,p-val,s-val",

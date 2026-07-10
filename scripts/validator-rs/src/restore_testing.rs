@@ -1278,9 +1278,38 @@ fn contains_prohibited_value(text: &str) -> bool {
         || lower.contains("client_secret")
         || lower.contains("access_token")
         || lower.contains("refresh_token")
-        || lower.contains("bearer ")
+        || contains_bearer_credential(text)
         || contains_private_ip(&lower)
         || contains_uuid_like(&lower)
+}
+
+fn contains_bearer_credential(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.match_indices("bearer ").any(|(index, _)| {
+        let candidate: String = text[index + "bearer ".len()..]
+            .trim_start_matches(|character: char| {
+                character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '`')
+            })
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || "._~+/-=".contains(*character)
+            })
+            .collect();
+        let word = candidate.to_ascii_lowercase();
+        let prose = [
+            "authentication",
+            "authorization",
+            "credential",
+            "credentials",
+            "header",
+            "headers",
+            "scheme",
+            "token",
+            "tokens",
+        ];
+
+        candidate.len() >= 8 && !prose.contains(&word.as_str())
+    })
 }
 
 fn contains_private_ip(text: &str) -> bool {
@@ -1478,5 +1507,23 @@ fn is_ident(byte: u8) -> bool {
 fn expect(condition: bool, errors: &mut Vec<String>, message: impl AsRef<str>) {
     if !condition {
         errors.push(message.as_ref().to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_detection_distinguishes_prose_from_credentials() {
+        assert!(!contains_bearer_credential(
+            "Requests use bearer authentication without exposing token values."
+        ));
+        assert!(!contains_bearer_credential(
+            "Never persist bearer tokens in documentation."
+        ));
+        assert!(contains_bearer_credential(
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"
+        ));
     }
 }

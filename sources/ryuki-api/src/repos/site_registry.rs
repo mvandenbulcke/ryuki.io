@@ -26,6 +26,7 @@ use sqlx::PgPool;
 #[allow(dead_code)]
 pub struct SiteEntryRow {
     pub unlocode: String,
+    pub code_system: String,
     pub name: String,
     pub country: String,
     pub country_code: String,
@@ -56,7 +57,7 @@ pub async fn set_active(
 #[allow(dead_code)]
 pub async fn get(pool: &PgPool, unlocode: &str) -> Result<Option<SiteEntryRow>, sqlx::Error> {
     sqlx::query_as::<_, SiteEntryRow>(
-        "SELECT unlocode, name, country, country_code, timezone, active \
+        "SELECT unlocode, code_system, name, country, country_code, timezone, active \
          FROM site_registry WHERE unlocode = $1",
     )
     .bind(unlocode)
@@ -64,7 +65,44 @@ pub async fn get(pool: &PgPool, unlocode: &str) -> Result<Option<SiteEntryRow>, 
     .await
 }
 
-/// Load all (unlocode, active) pairs — used by startup hydration.
+/// Insert a new governed site code. Returns `false` on a canonical-code
+/// collision; callers map that to 409 rather than silently changing an
+/// existing site's meaning.
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    entry: &SiteEntryRow,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO site_registry \
+         (unlocode, code_system, name, country, country_code, timezone, active) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (unlocode) DO NOTHING",
+    )
+    .bind(&entry.unlocode)
+    .bind(&entry.code_system)
+    .bind(&entry.name)
+    .bind(&entry.country)
+    .bind(&entry.country_code)
+    .bind(&entry.timezone)
+    .bind(entry.active)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Load the complete registry for startup hydration, including operator-defined
+/// codes. Loading only active flags would drop custom entries after a restart.
+pub async fn list_all(pool: &PgPool) -> Result<Vec<SiteEntryRow>, sqlx::Error> {
+    sqlx::query_as::<_, SiteEntryRow>(
+        "SELECT unlocode, code_system, name, country, country_code, timezone, active \
+         FROM site_registry ORDER BY unlocode",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Load all (code, active) pairs for the hydration regression tests.
+#[cfg(test)]
 pub async fn list_active_states(pool: &PgPool) -> Result<Vec<(String, bool)>, sqlx::Error> {
     let rows: Vec<(String, bool)> = sqlx::query_as("SELECT unlocode, active FROM site_registry")
         .fetch_all(pool)
@@ -130,6 +168,39 @@ mod site_registry_db_tests {
         set_active(pool, "DEFRA", true).await.unwrap();
         let row2 = get(pool, "DEFRA").await.unwrap().expect("row must exist");
         assert!(row2.active, "DEFRA must be active again after restore");
+    }
+
+    #[tokio::test]
+    async fn custom_site_insert_is_durable_and_canonical_code_is_unique() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let entry = SiteEntryRow {
+            unlocode: "TEST-DB-SITE-01".into(),
+            code_system: "custom".into(),
+            name: "DB test site".into(),
+            country: "Belgium".into(),
+            country_code: "BE".into(),
+            timezone: "Europe/Brussels".into(),
+            active: false,
+        };
+
+        assert!(insert(&mut *tx, &entry).await.unwrap());
+        assert!(
+            !insert(&mut *tx, &entry).await.unwrap(),
+            "a canonical code collision must not replace the existing row"
+        );
+        let stored: (String, String) =
+            sqlx::query_as("SELECT unlocode, code_system FROM site_registry WHERE unlocode = $1")
+                .bind(&entry.unlocode)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(stored, (entry.unlocode.clone(), "custom".into()));
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]

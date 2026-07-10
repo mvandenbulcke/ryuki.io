@@ -1768,7 +1768,9 @@ pub struct RequestIntakeForm {
 }
 
 pub fn request_intake_form_fallback() -> RequestIntakeForm {
-    use crate::views::request_create::{ENVIRONMENT_OPTIONS, REQUEST_TYPE_OPTIONS, SITE_OPTIONS};
+    use crate::views::request_create::{
+        ENVIRONMENT_OPTIONS, RECOMMENDED_SITE_OPTIONS, REQUEST_TYPE_OPTIONS,
+    };
 
     RequestIntakeForm {
         title: "Request Intake".to_string(),
@@ -1785,14 +1787,14 @@ pub fn request_intake_form_fallback() -> RequestIntakeForm {
                 placeholder: "Select request type".to_string(),
             },
             RequestFormField {
-                label: "Site".to_string(),
-                field_type: "select".to_string(),
+                label: "Site code".to_string(),
+                field_type: "text".to_string(),
                 required: true,
-                options: SITE_OPTIONS
+                options: RECOMMENDED_SITE_OPTIONS
                     .iter()
                     .map(|(value, _)| value.to_string())
                     .collect(),
-                placeholder: "Select site".to_string(),
+                placeholder: "e.g. DEFRA or DC-EU-01".to_string(),
             },
             RequestFormField {
                 label: "Environment".to_string(),
@@ -2191,14 +2193,12 @@ pub struct ApiRequestStage {
 
 impl From<ApiRequestDetail> for RequestDetail {
     fn from(detail: ApiRequestDetail) -> Self {
-        // A terminal status overrides the stage column for display so a
-        // rejected request (which keeps `stage='approve'`) renders as a
-        // terminal "rejected" step rather than a still-open approval stage.
-        let stage = match detail.status.as_str() {
-            "rejected" => "rejected".to_string(),
-            "cancelled" => "cancelled".to_string(),
-            _ => normalize_api_stage(&detail.stage),
-        };
+        // Status is the lifecycle authority. The DB `stage` column names the
+        // transition currently associated with that status, so `stage=verify`
+        // can mean either an active Verifying request or an already Completed
+        // request. Deriving actions from that column alone can therefore expose
+        // Protect before verification, or hide Verify after an agent result.
+        let stage = request_stage_from_status(&detail.status, &detail.stage);
         // The real trail is fetched separately via `get_request_audit`; this
         // single synthetic entry is a clearly-labeled SSR/unreachable
         // fallback only and is replaced by the persisted timeline in the view.
@@ -2379,6 +2379,19 @@ pub fn normalize_api_stage(stage: &str) -> String {
     .to_string()
 }
 
+/// Resolve a request's portal lifecycle stage from its authoritative status,
+/// falling back to the legacy action-name `stage` column only for an unknown
+/// status. Both DB lowercase and engine PascalCase status labels are accepted.
+pub fn request_stage_from_status(status: &str, stage: &str) -> String {
+    let normalized_status = status.to_ascii_lowercase();
+    match normalized_status.as_str() {
+        "draft" | "intake" | "validated" | "planned" | "approved" | "locked" | "executing"
+        | "verifying" | "completed" | "protecting" | "operational" | "retired" | "failed"
+        | "rejected" | "cancelled" => normalized_status,
+        _ => normalize_api_stage(stage),
+    }
+}
+
 /// Lifecycle actions the portal offers for a request in the given (portal
 /// vocabulary) stage. Shared by the static fallback detail and the live
 /// detail mapping.
@@ -2397,8 +2410,13 @@ pub fn actions_for_stage(stage: &str) -> Vec<String> {
         ],
         "approved" => vec!["lock".to_string(), "cancel".to_string()],
         "locked" => vec!["execute".to_string(), "cancel".to_string()],
-        "executed" => vec!["verify".to_string()],
-        "failed" => vec!["validate".to_string(), "plan".to_string()],
+        // Executing advances only from a signed agent result; there is no
+        // operator transition while the job is in flight. Verifying is the
+        // explicit human checkpoint after that terminal result.
+        "executing" => vec![],
+        "executed" | "verifying" => vec!["verify".to_string()],
+        // Failed is terminal. Recovery is a new request, not an in-place rewind.
+        "failed" => vec![],
         // Post-completion governed lifecycle (Theme 8). A fully-completed request
         // is the entry point of the post-completion lifecycle: `protect` is valid
         // only from Completed, `publish` only from Protecting, `retire` only from
@@ -2502,14 +2520,89 @@ pub struct ApiExecutionJob {
     pub result_status: Option<String>,
     #[serde(default)]
     pub evidence_digest: Option<String>,
+    #[serde(default)]
+    pub verification_ready: bool,
     pub created_at: String,
     #[serde(default)]
     pub completed_at: Option<String>,
 }
 
+/// Safe, server-derived counts of managed Terraform mutations. Data-source
+/// reads and raw provider identifiers are intentionally absent.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct LivePlanChangeCounts {
+    #[serde(default)]
+    pub create: u32,
+    #[serde(default)]
+    pub update: u32,
+    #[serde(default)]
+    pub delete: u32,
+    #[serde(default)]
+    pub replace: u32,
+}
+
+/// One managed Terraform change safe for operator review. `resource_type` and
+/// `logical_name` come from the source-controlled module, never provider IDs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct LivePlanManagedChange {
+    pub resource_type: String,
+    pub logical_name: String,
+    pub action: String,
+}
+
+/// Allowlisted request values used to build the live Terraform job.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct LivePlanPlacement {
+    pub name: String,
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_size_gb: u32,
+    pub datacenter: String,
+    pub cluster: String,
+    pub datastore: String,
+    pub network: String,
+    pub template: String,
+}
+
+/// Digest-bound review projection returned only for a completed LivePlan.
+/// Raw Terraform JSON and provider object identifiers never cross this API.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct LivePlanReview {
+    #[serde(default)]
+    pub digest_verified: bool,
+    pub state_key: String,
+    #[serde(default)]
+    pub placement: LivePlanPlacement,
+    #[serde(default)]
+    pub managed_changes: Vec<LivePlanManagedChange>,
+    #[serde(default)]
+    pub counts: LivePlanChangeCounts,
+}
+
+impl LivePlanReview {
+    pub fn is_single_vm_create(&self) -> bool {
+        self.digest_verified
+            && self.counts.create == 1
+            && self.counts.update == 0
+            && self.counts.delete == 0
+            && self.counts.replace == 0
+            && self.managed_changes.len() == 1
+            && self.managed_changes[0].resource_type == "virtual_machine"
+            && self.managed_changes[0].action == "create"
+    }
+}
+
+/// Minimal projection of `GET /api/admin/agents/jobs/{job_id}/result` used by
+/// the portal. All attestation internals and raw evidence are ignored.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ApiAdminAgentJobResult {
+    #[serde(default)]
+    pub plan_review: Option<LivePlanReview>,
+}
+
 /// Portal-facing projection of an execution-agent job — display-ready fields
-/// only. `agent_job_id` is intentionally omitted (the API returns it as an
-/// internal handle; the portal has no UI action that needs it).
+/// only. The server boundary uses `agent_job_id` to fetch the admin-only review
+/// projection, then discards that internal handle before this reaches the UI.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExecutionJob {
     pub request_id: String,
@@ -2530,6 +2623,13 @@ pub struct ExecutionJob {
     /// RFC 3339 completion timestamp, condensed to `YYYY-MM-DD HH:MM`, or
     /// an empty string when the job has not yet completed.
     pub completed_at: String,
+    /// Server-authoritative eligibility for the request Verify transition.
+    /// This distinguishes a converged vSphere apply from a merely applied or
+    /// drifted result without exposing the job spec to the browser.
+    pub verification_ready: bool,
+    /// Safe, digest-bound review data for a successful LivePlan.
+    #[serde(default)]
+    pub live_plan_review: Option<LivePlanReview>,
 }
 
 impl From<ApiExecutionJob> for ExecutionJob {
@@ -2551,7 +2651,62 @@ impl From<ApiExecutionJob> for ExecutionJob {
                 .as_deref()
                 .map(condense_timestamp)
                 .unwrap_or_default(),
+            verification_ready: api.verification_ready,
+            live_plan_review: None,
         }
+    }
+}
+
+impl ExecutionJob {
+    pub fn with_live_plan_review(mut self, review: Option<LivePlanReview>) -> Self {
+        self.live_plan_review = review;
+        self
+    }
+
+    /// True only for the latest terminal LivePlan result that the control plane
+    /// accepted as a usable plan.
+    pub fn is_successful_live_plan(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("LivePlan")
+            && self.status.eq_ignore_ascii_case("Succeeded")
+            && matches!(self.result_status.as_str(), "planned" | "check_ok")
+            && !self.completed_at.is_empty()
+    }
+
+    /// The current live-apply milestone supports only a digest-verified safe
+    /// vSphere single-VM review. Other Terraform and Ansible plans remain
+    /// non-mutation previews until a typed review projection is implemented.
+    pub fn can_approve_live_apply(&self) -> bool {
+        self.is_successful_live_plan()
+            && self
+                .live_plan_review
+                .as_ref()
+                .is_some_and(LivePlanReview::is_single_vm_create)
+    }
+
+    /// Whether the latest job permits the request's explicit Verify action.
+    /// A LivePlan alone never does: live requests must first complete LiveApply.
+    pub fn permits_request_verification(&self) -> bool {
+        if !self.status.eq_ignore_ascii_case("Succeeded") || self.completed_at.is_empty() {
+            return false;
+        }
+        self.verification_ready
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.to_ascii_lowercase().as_str(),
+            "succeeded"
+                | "failed"
+                | "expired"
+                | "reconcilerequired"
+                | "reconcile_required"
+                | "liverefused"
+                | "live_refused"
+                | "deadlettered"
+                | "dead_lettered"
+                | "cancelled"
+                | "canceled"
+        )
     }
 }
 
@@ -3783,7 +3938,7 @@ mod ssr_tests {
     #[test]
     fn intake_fallback_vocabulary_matches_canonical_request_create_lists() {
         use crate::views::request_create::{
-            ENVIRONMENT_OPTIONS, REQUEST_TYPE_OPTIONS, SITE_OPTIONS,
+            ENVIRONMENT_OPTIONS, RECOMMENDED_SITE_OPTIONS, REQUEST_TYPE_OPTIONS,
         };
         let form = request_intake_form_fallback();
         let field = |label: &str| {
@@ -3800,11 +3955,11 @@ mod ssr_tests {
             "fallback request types drifted from canonical"
         );
 
-        let sites: Vec<&str> = SITE_OPTIONS.iter().map(|(v, _)| *v).collect();
+        let sites: Vec<&str> = RECOMMENDED_SITE_OPTIONS.iter().map(|(v, _)| *v).collect();
         assert_eq!(
-            field("Site").options,
+            field("Site code").options,
             sites,
-            "fallback sites drifted from canonical"
+            "fallback site recommendations drifted from canonical"
         );
 
         let envs: Vec<&str> = ENVIRONMENT_OPTIONS.iter().map(|(v, _)| *v).collect();
@@ -4157,7 +4312,10 @@ mod tests {
         assert_eq!(contract.source, "static-seed");
         assert!(contract.redaction_required);
         assert!(!contract.export_without_redaction_allowed);
-        assert_eq!(contract.redaction_states, vec!["pending", "redacted", "blocked"]);
+        assert_eq!(
+            contract.redaction_states,
+            vec!["pending", "redacted", "blocked"]
+        );
         assert_eq!(contract.retention_classes.len(), 2);
 
         let snapshot = EvidenceRetentionSnapshot::from_live(contract);
@@ -4230,10 +4388,25 @@ mod tests {
         // one action; the request-less platform row is scanned but produces
         // no directory entry.
         let rows = vec![
-            feed_row("request.approve", Some("REQ-2"), "2026-06-13T08:12:00Z", true),
-            feed_row("platform.settings.update", None, "2026-06-13T08:10:00Z", true),
+            feed_row(
+                "request.approve",
+                Some("REQ-2"),
+                "2026-06-13T08:12:00Z",
+                true,
+            ),
+            feed_row(
+                "platform.settings.update",
+                None,
+                "2026-06-13T08:10:00Z",
+                true,
+            ),
             feed_row("request.plan", Some("REQ-2"), "2026-06-13T08:06:00Z", true),
-            feed_row("request.create", Some("REQ-1"), "2026-06-13T08:00:00Z", false),
+            feed_row(
+                "request.create",
+                Some("REQ-1"),
+                "2026-06-13T08:00:00Z",
+                false,
+            ),
         ];
         let directory = evidence_pack_directory_from_rows(true, rows);
         assert!(directory.live);
@@ -4504,6 +4677,21 @@ mod tests {
         let mapped = RequestDetail::from(detail);
         assert_eq!(mapped.stage, "cancelled");
         assert!(mapped.actions_available.is_empty());
+    }
+
+    #[test]
+    fn request_status_disambiguates_active_verify_from_completed_verify_stage() {
+        let active = r#"{"request_id":"r1","request_type":"VM","status":"verifying","stage":"verify","site":"s","environment":"test","name":"n","cpu":2,"memory_gb":8,"created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(active).expect("decode active");
+        let mapped = RequestDetail::from(detail);
+        assert_eq!(mapped.stage, "verifying");
+        assert_eq!(mapped.actions_available, vec!["verify".to_string()]);
+
+        let completed = r#"{"request_id":"r1","request_type":"VM","status":"completed","stage":"verify","site":"s","environment":"test","name":"n","cpu":2,"memory_gb":8,"created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(completed).expect("decode completed");
+        let mapped = RequestDetail::from(detail);
+        assert_eq!(mapped.stage, "completed");
+        assert_eq!(mapped.actions_available, vec!["protect".to_string()]);
     }
 
     #[test]
@@ -4968,6 +5156,7 @@ mod tests {
             status: "Succeeded".to_string(),
             result_status: Some("applied".to_string()),
             evidence_digest: Some("abcdef1234567890aabbccddeeff0011".to_string()),
+            verification_ready: true,
             created_at: "2026-06-15T10:00:00+00:00".to_string(),
             completed_at: Some("2026-06-15T10:05:30+00:00".to_string()),
         };
@@ -4980,6 +5169,7 @@ mod tests {
         assert_eq!(job.evidence_digest_short, "abcdef1234567890");
         assert_eq!(job.created_at, "2026-06-15 10:00");
         assert_eq!(job.completed_at, "2026-06-15 10:05");
+        assert!(job.verification_ready);
     }
 
     /// `ExecutionJob::from` handles null/absent optional fields gracefully.
@@ -4992,6 +5182,7 @@ mod tests {
             status: "Pending".to_string(),
             result_status: None,
             evidence_digest: None,
+            verification_ready: false,
             created_at: "2026-06-15T08:00:00+00:00".to_string(),
             completed_at: None,
         };
@@ -5002,6 +5193,108 @@ mod tests {
     }
 
     // ── evidence-pack audit CSV export (#50) ─────────────────────────────────
+
+    #[test]
+    fn live_plan_review_is_safe_typed_and_gates_apply() {
+        let response: ApiAdminAgentJobResult = serde_json::from_str(
+            r#"{
+                "plan_review": {
+                    "digest_verified": true,
+                    "state_key": "request-7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                    "placement": {
+                        "name": "first-test-vm",
+                        "cpu": 2,
+                        "memory_gb": 4,
+                        "disk_size_gb": 80,
+                        "datacenter": "DC-TEST",
+                        "cluster": "Compute-Test",
+                        "datastore": "Datastore-Test",
+                        "network": "Test-Network",
+                        "template": "rhel-9-test"
+                    },
+                    "managed_changes": [{
+                        "resource_type": "virtual_machine",
+                        "logical_name": "linux_server",
+                        "action": "create"
+                    }],
+                    "counts": {"create": 1, "update": 0, "delete": 0, "replace": 0}
+                },
+                "signed_envelope": {"must_not_be_mapped": true},
+                "raw_plan": {"must_not_be_mapped": true}
+            }"#,
+        )
+        .expect("safe review response must decode");
+        let review = response.plan_review.expect("review");
+        assert!(review.digest_verified);
+        assert_eq!(review.counts.create, 1);
+        assert_eq!(review.managed_changes[0].logical_name, "linux_server");
+
+        let api = ApiExecutionJob {
+            request_id: "REQ-PLAN".to_string(),
+            agent_job_id: "job-plan".to_string(),
+            mode: "LivePlan".to_string(),
+            status: "Succeeded".to_string(),
+            result_status: Some("planned".to_string()),
+            evidence_digest: Some("a".repeat(64)),
+            verification_ready: false,
+            created_at: "2026-07-10T10:00:00Z".to_string(),
+            completed_at: Some("2026-07-10T10:01:00Z".to_string()),
+        };
+        let job = ExecutionJob::from(api);
+        assert!(job.is_successful_live_plan());
+        assert!(
+            !job.can_approve_live_apply(),
+            "missing review must fail closed"
+        );
+        let mut unsafe_review = review.clone();
+        unsafe_review.counts = LivePlanChangeCounts {
+            create: 0,
+            update: 0,
+            delete: 1,
+            replace: 0,
+        };
+        unsafe_review.managed_changes[0].action = "delete".to_string();
+        assert!(!job
+            .clone()
+            .with_live_plan_review(Some(unsafe_review))
+            .can_approve_live_apply());
+        assert!(job
+            .with_live_plan_review(Some(review))
+            .can_approve_live_apply());
+    }
+
+    #[test]
+    fn only_terminal_execution_modes_permit_request_verification() {
+        let make =
+            |mode: &str, status: &str, result: &str, completed: bool, ready: bool| ExecutionJob {
+                request_id: "REQ".to_string(),
+                mode: mode.to_string(),
+                status: status.to_string(),
+                result_status: result.to_string(),
+                evidence_digest_short: String::new(),
+                created_at: "2026-07-10 10:00".to_string(),
+                completed_at: if completed {
+                    "2026-07-10 10:01".to_string()
+                } else {
+                    String::new()
+                },
+                verification_ready: ready,
+                live_plan_review: None,
+            };
+
+        assert!(make("OfflineDryRun", "Succeeded", "check_ok", true, true)
+            .permits_request_verification());
+        assert!(
+            make("LiveApply", "Succeeded", "verified", true, true).permits_request_verification()
+        );
+        assert!(
+            !make("LiveApply", "Succeeded", "applied", true, false).permits_request_verification()
+        );
+        assert!(
+            !make("LivePlan", "Succeeded", "planned", true, false).permits_request_verification()
+        );
+        assert!(!make("LiveApply", "Running", "", false, false).permits_request_verification());
+    }
 
     fn sample_audit_row() -> AuditEventRow {
         AuditEventRow {

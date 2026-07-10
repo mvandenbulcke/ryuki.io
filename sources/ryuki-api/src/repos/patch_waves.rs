@@ -263,10 +263,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<PatchWave>, sqlx::Err
 /// BRANCH — never a `($n IS NULL OR ...)` over the column (the generic-plan
 /// seq-scan trap). Column names are compile-time literals; every value is a
 /// bound parameter (injection-safe).
-fn scope_preds(
-    sites: Option<&[String]>,
-    environments: Option<&[String]>,
-) -> (String, Vec<String>) {
+fn scope_preds(sites: Option<&[String]>, environments: Option<&[String]>) -> (String, Vec<String>) {
     let mut preds: Vec<String> = Vec::new();
     let mut binds: Vec<String> = Vec::new();
     if let Some(s) = sites {

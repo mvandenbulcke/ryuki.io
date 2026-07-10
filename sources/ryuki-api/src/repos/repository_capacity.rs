@@ -462,7 +462,10 @@ mod repository_capacity_db_tests {
                 .await
                 .expect("raw baseline");
         let fn_baseline = count_by_site(pool, "DEFRA").await.expect("count baseline");
-        assert_eq!(fn_baseline, raw_baseline, "count_by_site matches a raw COUNT(*)");
+        assert_eq!(
+            fn_baseline, raw_baseline,
+            "count_by_site matches a raw COUNT(*)"
+        );
 
         // Seed 3 repos in DEFRA (unique names → unique (site,name)).
         let uid = Uuid::new_v4().to_string();
@@ -477,7 +480,11 @@ mod repository_capacity_db_tests {
                 .expect("insert must succeed");
         }
         let total = count_by_site(pool, "DEFRA").await.expect("count total");
-        assert_eq!(total, fn_baseline + 3, "seeding 3 adds exactly 3 to the total");
+        assert_eq!(
+            total,
+            fn_baseline + 3,
+            "seeding 3 adds exactly 3 to the total"
+        );
 
         let all = list_by_site_page(pool, "DEFRA", 1000, 0)
             .await
@@ -490,16 +497,16 @@ mod repository_capacity_db_tests {
         let ordered: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
 
         // LIMIT bounds the page; OFFSET yields the EXACT next slice (name, id).
-        let page1 = list_by_site_page(pool, "DEFRA", 2, 0)
-            .await
-            .expect("page1");
-        let page2 = list_by_site_page(pool, "DEFRA", 2, 2)
-            .await
-            .expect("page2");
+        let page1 = list_by_site_page(pool, "DEFRA", 2, 0).await.expect("page1");
+        let page2 = list_by_site_page(pool, "DEFRA", 2, 2).await.expect("page2");
         let p1_ids: Vec<&str> = page1.iter().map(|r| r.id.as_str()).collect();
         let p2_ids: Vec<&str> = page2.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(p1_ids.len(), 2, "LIMIT 2 bounds the first page");
-        assert_eq!(p1_ids, ordered[0..2], "page 1 is the first 2 of the full order");
+        assert_eq!(
+            p1_ids,
+            ordered[0..2],
+            "page 1 is the first 2 of the full order"
+        );
         assert_eq!(
             p2_ids,
             ordered[2..(ordered.len().min(4))],

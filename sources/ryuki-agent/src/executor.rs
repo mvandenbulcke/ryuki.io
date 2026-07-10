@@ -239,7 +239,7 @@ impl JobExecutor for StubExecutor {
 /// digest is set by the trusted control plane, so a bad value is a CP bug, not
 /// an attack). `bundle_digest` always emits lowercase hex, so a genuine approved
 /// digest always satisfies this.
-fn real_iac_digest(digest: &str) -> Option<&str> {
+pub(crate) fn real_iac_digest(digest: &str) -> Option<&str> {
     let is_lower_hex = digest.len() == 64
         && digest
             .bytes()
@@ -291,6 +291,7 @@ mod tests {
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode,
         }
     }

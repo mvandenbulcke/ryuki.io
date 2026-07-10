@@ -338,16 +338,18 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-91", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
+        let name = format!("DEFRA-SRV-{sequence:04}");
+        let computer =
+            prestage_computer(&name, "DEFRA", "OU=Servers,DC=corp,DC=local").expect("prestage");
 
         let persisted = insert(&pool, &computer).await.expect("insert");
-        assert_eq!(persisted.name, "DEFRA-SRV-91");
+        assert_eq!(persisted.name, name);
         assert_eq!(persisted.site, "DEFRA");
         assert_eq!(persisted.status, ComputerStatus::Active);
         assert_eq!(persisted.ou_path, "OU=Servers,DC=corp,DC=local");
 
-        let (fetched, _) = get_by_name(&pool, "DEFRA-SRV-91")
+        let (fetched, _) = get_by_name(&pool, &name)
             .await
             .expect("get_by_name")
             .expect("row exists");

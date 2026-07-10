@@ -255,6 +255,7 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            job_spec_digest: ryuki_protocol::sha256_hex(b"job-spec"),
             approved_plan_digest: "abc123".to_string(),
             approver: "ops-test".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),

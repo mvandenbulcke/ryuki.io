@@ -8,7 +8,7 @@
 //! admit-to-place; a separately-approved workflow performs any live placement.
 //!
 //! Three of the guards are DATA-BACKED, not mere presence checks:
-//! - `site-known` validates the site against the [`site_registry`] UN/LOCODE set.
+//! - `site-known` validates the site against the governed [`site_registry`].
 //! - `folder-policy-known` confirms the site is a GOVERNED catalog site (its OU /
 //!   folder pattern is derivable via [`customization_spec_governance`]).
 //! - `cluster-capacity-admitted` requires the capacity decision to be an actual
@@ -120,7 +120,7 @@ fn input_present(input: &PlacementInput, guard: &str) -> bool {
     }
 }
 
-/// Trimmed, upper-cased site code. UN/LOCODEs are conventionally uppercase, and
+/// Trimmed, upper-cased site code. Canonical UN/LOCODE and custom codes are uppercase, and
 /// `site_registry::is_valid_site` is case-sensitive while
 /// `safe_facts_for_site` is case-insensitive; normalizing here means both
 /// data-backed site guards evaluate the SAME value and never disagree on case.
@@ -129,7 +129,7 @@ fn normalized_site(input: &PlacementInput) -> Option<String> {
     (!s.is_empty()).then(|| s.to_ascii_uppercase())
 }
 
-/// The site is a recognised UN/LOCODE in the site registry.
+/// The site is active and recognised in the site registry.
 fn site_known(input: &PlacementInput) -> bool {
     normalized_site(input).is_some_and(|s| site_registry::is_valid_site(&s))
 }

@@ -24,6 +24,20 @@ jobs:
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: ryuki_ci
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ryuki_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,6 +50,26 @@ jobs:
         run: cargo build --workspace
       - name: Test workspace
         run: cargo test --workspace
+      - name: Test API against PostgreSQL 18
+        timeout-minutes: 30
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: ryuki_ci
+          PGUSER: postgres
+        run: |
+          set -euo pipefail
+          test_log="$(mktemp)"
+          trap 'rm -f "$test_log"' EXIT
+          export RYUKI_DATABASE_URL
+          RYUKI_DATABASE_URL="$(printf 'postgresql://%s@%s:%s/%s' \
+            "$PGUSER" "$PGHOST" "$PGPORT" "$PGDATABASE")"
+          cargo test -p ryuki-api -- --test-threads=1 --nocapture \
+            2>&1 | tee "$test_log"
+          if grep -Eqi 'SKIP: (RYUKI_DATABASE_URL|DB (connect failed|unavailable|not available)|no seeded|seed .* not present|no DEFRA)|RYUKI_DATABASE_URL not set|skipping (DB|database) tests' "$test_log"; then
+            echo "::error::A PostgreSQL-backed test skipped instead of asserting its fixture"
+            exit 1
+          fi
 
   lint:
     name: Lint
@@ -49,13 +83,8 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-      # Advisory only, NON-BLOCKING: the repo carries known repo-wide rustfmt drift and
-      # the standing policy is to not run `cargo fmt` (it would churn a large diff that
-      # mixes with feature work). The check still runs so the drift stays visible in the
-      # logs, but it must not fail CI — Clippy below is the enforced style/lint gate.
-      - name: Check formatting (advisory, non-blocking)
+      - name: Check formatting
         run: cargo fmt --check --all
-        continue-on-error: true
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -73,15 +102,6 @@ jobs:
   validate:
     name: Validator
     runs-on: ubuntu-latest
-    # TODO(catalog-contract-documentation-integrity): most validator slices still
-    # assert the retired C# repository layout and fail against the current tree
-    # (116/121 failing at the time of writing; run-all currently reports them as
-    # JSON and exits 0). Run the validator for visibility, but do not block CI on
-    # it until the "Catalog, contract & documentation integrity" theme
-    # (docs/design/missing-features.md) makes the slices green; then make run-all
-    # exit non-zero on failures and remove continue-on-error to turn this into a
-    # hard gate.
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v5

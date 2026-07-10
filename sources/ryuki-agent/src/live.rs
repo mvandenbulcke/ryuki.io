@@ -9,13 +9,16 @@
 //!
 //! 1. `OfflineDryRun` — always allowed (no platform contact, no grant needed).
 //! 2. `LivePlan` — allowed iff `allow_live` is set (reads live state; no
-//!    mutation, no grant needed).
+//!    provider-resource mutation, though backend lock/state metadata may
+//!    change; no grant needed).
 //! 3. `LiveApply` — allowed iff ALL of:
 //!    - `allow_live` is true (operator must explicitly enable live execution),
 //!    - the job carries a CP-signed [`VerifiedLiveContext`] grant,
 //!    - the grant's signature verifies against the **pinned** CP verifying key
 //!      (the agent independently trusts only the signed grant, never the bare
 //!      `mode` field),
+//!    - `grant.job_spec_digest == job_spec_digest(job.spec)` (the grant binds
+//!      the exact mode, IaC, variables, and Terraform state key),
 //!    - `grant.request_id == job.spec.request_id` (the grant is for THIS job),
 //!    - `grant.expiry > Utc::now()` (the grant has not expired), and
 //!    - `replanned_plan_digest == Some(grant.approved_plan_digest)` (the plan
@@ -27,13 +30,9 @@
 //! [`JobResultStatus::LiveRefused`] signed result and POSTs it back to the CP so
 //! the CP records the refusal.
 //!
-//! NOTE for S5b-2 (CP-side gap): the current CP `LiveApply` result verifier
-//! requires a present, valid, matching, unexpired grant BEFORE it records any
-//! result. A refusal whose CAUSE is a missing/forged/expired/mismatched grant
-//! would therefore be rejected by that path rather than recorded as
-//! `LiveRefused`. S5b-2 must add a CP-side `LiveRefused` acceptance branch that
-//! records the refusal (and its reason) WITHOUT requiring grant validity — the
-//! refusal is itself the report that the grant was unusable.
+//! The CP records a signed `LiveRefused` result without requiring the unusable
+//! grant to pass validation; every non-refusal mutation result still requires
+//! the complete grant checks.
 //!
 //! ## TOFU note for `pin_cp_key`
 //!
@@ -51,7 +50,7 @@ use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
 use ryuki_protocol::{
-    crypto::{decode_verifying_key, verify_vlc, VerifyError},
+    crypto::{decode_verifying_key, job_spec_digest, verify_vlc, VerifyError},
     Job, JobMode,
 };
 
@@ -115,15 +114,16 @@ pub enum LiveDecision {
 ///   1. `allow_live` is `true`
 ///   2. `job.live_context` is `Some(grant)`
 ///   3. `verify_vlc(grant, cp_verifying_key)` succeeds
-///   4. `grant.request_id == job.spec.request_id`
-///   5. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
+///   4. `grant.job_spec_digest == job_spec_digest(job.spec)`
+///   5. `grant.request_id == job.spec.request_id`
+///   6. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
 ///      `bound_id == job.id` — a step-scoped grant only authorises the ONE
 ///      dispatched step job it was minted for, preventing replay across
 ///      steps and across re-dispatches (a re-dispatch mints a fresh job id).
 ///      `None` is the legacy/whole-request grant and is UNCHANGED: this check
 ///      is skipped entirely.
-///   6. `grant.expiry > Utc::now()`
-///   7. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
+///   7. `grant.expiry > Utc::now()`
+///   8. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 ///
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
@@ -137,9 +137,9 @@ pub fn evaluate_live_execution(
         // allow_live is irrelevant for this path.
         JobMode::OfflineDryRun => LiveDecision::Proceed,
 
-        // LivePlan reads live state but does not mutate.  No grant required,
-        // but live access (credentials + network path to the platform) must
-        // be explicitly enabled.
+        // LivePlan does not mutate provider resources, but Terraform may update
+        // backend lock/state metadata. No grant is required, while live access
+        // (credentials + network path to the platform) remains explicit.
         JobMode::LivePlan => {
             if allow_live {
                 LiveDecision::Proceed
@@ -160,6 +160,32 @@ pub fn evaluate_live_execution(
         // workspace state, not a pre-approved plan. `replanned_plan_digest` is
         // therefore irrelevant here.
         JobMode::LiveDestroy => evaluate_live_destroy(job, cp_verifying_key, allow_live),
+    }
+}
+
+/// Verify all mutation authority that is independent of Terraform output.
+/// LiveApply callers run this before `plan()` so a bad/expired/tampered grant
+/// cannot trigger backend or provider contact, then run
+/// [`evaluate_live_execution`] again with the fresh plan digest immediately
+/// before mutation. LiveDestroy has no plan digest and uses the same authority
+/// checks directly at its mutation boundary.
+pub fn evaluate_live_authority(
+    job: &Job,
+    cp_verifying_key: &VerifyingKey,
+    allow_live: bool,
+) -> LiveDecision {
+    let (mode, require_step_bound) = match job.spec.mode {
+        JobMode::LiveApply => ("LiveApply", false),
+        JobMode::LiveDestroy => ("LiveDestroy", true),
+        _ => {
+            return LiveDecision::Refused(
+                "live mutation authority requested for a non-mutating mode".to_owned(),
+            );
+        }
+    };
+    match verify_live_grant(job, cp_verifying_key, allow_live, mode, require_step_bound) {
+        Ok(_) => LiveDecision::Proceed,
+        Err(refused) => refused,
     }
 }
 
@@ -202,14 +228,24 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 4: the grant must be for THIS job's request.
+    // Check 4: the signed grant must authorize this EXACT canonical JobSpec.
+    // This binds mode, IaC, variables, and state_key before apply/destroy can
+    // run. The CP's later result-digest verification is too late to prevent a
+    // mutation, so the agent must enforce this independently up front.
+    if grant.job_spec_digest != job_spec_digest(&job.spec) {
+        return Err(LiveDecision::Refused(
+            "grant is for a different job specification".to_owned(),
+        ));
+    }
+
+    // Check 5: the grant must be for THIS job's request.
     if grant.request_id != job.spec.request_id {
         return Err(LiveDecision::Refused(
             "grant is for a different request".to_owned(),
         ));
     }
 
-    // Check 5 (#42 slice A / B2): the grant's step binding.
+    // Check 6 (#42 slice A / B2): the grant's step binding.
     //
     // A step-scoped grant (`step_job_id: Some`) may only be used against the ONE
     // dispatched step job it was minted for — closing cross-step replay (a grant
@@ -217,14 +253,10 @@ fn verify_live_grant<'g>(
     // re-dispatched step gets a fresh job id; a grant bound to the OLD id must
     // not authorise it).
     //
-    // `require_step_bound` (LiveDestroy, #42 B2) additionally REJECTS a legacy
-    // `None` grant. LiveApply tolerates `None` for backward compatibility with
-    // whole-request single-job grants — but a VLC signature does NOT bind the
-    // grant's purpose/mode, so a valid request-scoped `None` grant minted for a
-    // LiveApply could otherwise be presented against a LiveDestroy job for the
-    // same request and pass every other check (a destroy has no digest gate).
-    // LiveDestroy's safety bound IS the step binding, so an unbound grant must
-    // never authorise a destroy.
+    // `require_step_bound` (LiveDestroy, #42 B2) additionally rejects a
+    // whole-request `None` grant. The signed JobSpec digest already binds mode;
+    // this separate policy ensures every destructive rollback is also tied to
+    // one dispatched orchestration step.
     match grant.step_job_id {
         Some(bound_id) if bound_id != job.id => {
             return Err(LiveDecision::Refused(
@@ -241,7 +273,7 @@ fn verify_live_grant<'g>(
         }
     }
 
-    // Check 6: the grant must not be expired.
+    // Check 7: the grant must not be expired.
     if grant.expiry <= Utc::now() {
         return Err(LiveDecision::Refused("grant has expired".to_owned()));
     }
@@ -264,7 +296,7 @@ fn evaluate_live_apply(
         Err(refused) => return refused,
     };
 
-    // Check 7: plan-then-apply — the plan the agent just produced must match
+    // Check 8: plan-then-apply — the plan the agent just produced must match
     // the plan an operator reviewed and the CP signed off on.
     match replanned_plan_digest {
         None => LiveDecision::Refused("no plan digest available".to_owned()),
@@ -358,9 +390,11 @@ mod tests {
         cp_sk: &ed25519_dalek::SigningKey,
         request_id: Uuid,
         approved_plan_digest: &str,
+        spec: &JobSpec,
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
@@ -378,9 +412,11 @@ mod tests {
         request_id: Uuid,
         approved_plan_digest: &str,
         step_job_id: Uuid,
+        spec: &JobSpec,
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
@@ -413,6 +449,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1.0.0".to_owned(),
             iac_digest: sha256_hex(b"iac-content"),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
             mode,
         };
         Job {
@@ -492,13 +529,58 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"the-plan");
-        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest);
-        let job = make_job(JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
             LiveDecision::Proceed,
             "LiveApply happy path must Proceed"
+        );
+    }
+
+    #[test]
+    fn live_grant_refuses_state_key_tamper_before_mutation() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            &job.spec,
+        ));
+        job.spec.state_key = Some("request-another-state".to_string());
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant is for a different job specification".to_owned())
+        );
+    }
+
+    #[test]
+    fn live_grant_refuses_mode_tamper_before_destroy() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            &job.spec,
+        ));
+        job.spec.mode = JobMode::LiveDestroy;
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, None),
+            LiveDecision::Refused("grant is for a different job specification".to_owned())
         );
     }
 
@@ -511,8 +593,13 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"plan");
-        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest);
-        let job = make_job(JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, false, Some(&plan_digest)),
@@ -541,8 +628,10 @@ mod tests {
         let plan_digest = sha256_hex(b"plan");
 
         // Sign with the attacker key — verify_vlc against the real CP vk must fail.
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
             approver: "attacker".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
@@ -550,7 +639,7 @@ mod tests {
             signature: String::new(),
         };
         let forged_grant = sign_vlc(unsigned, &attacker_sk);
-        let job = make_job(JobMode::LiveApply, request_id, Some(forged_grant));
+        job.live_context = Some(forged_grant);
 
         let _ = cp_sk_real; // unused after vk_real extracted above
 
@@ -566,9 +655,15 @@ mod tests {
         let grant_request_id = Uuid::new_v4();
         let job_request_id = Uuid::new_v4(); // deliberately different
         let plan_digest = sha256_hex(b"plan");
-        let grant = make_valid_grant(&cp_sk, grant_request_id, &plan_digest);
-        // Job carries a request_id that does NOT match the grant.
-        let job = make_job(JobMode::LiveApply, job_request_id, Some(grant));
+        // Job carries a request_id that does NOT match the grant, while the
+        // grant still binds the exact JobSpec so this test reaches that check.
+        let mut job = make_job(JobMode::LiveApply, job_request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            grant_request_id,
+            &plan_digest,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
@@ -582,8 +677,10 @@ mod tests {
         let request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"plan");
         // Build and sign a grant that is already expired.
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() - Duration::seconds(1), // in the past
@@ -591,7 +688,7 @@ mod tests {
             signature: String::new(),
         };
         let expired_grant = sign_vlc(unsigned, &cp_sk);
-        let job = make_job(JobMode::LiveApply, request_id, Some(expired_grant));
+        job.live_context = Some(expired_grant);
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
@@ -604,8 +701,13 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"plan");
-        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest);
-        let job = make_job(JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, None),
@@ -619,8 +721,13 @@ mod tests {
         let request_id = Uuid::new_v4();
         let approved_digest = sha256_hex(b"approved-plan");
         let replanned_digest = sha256_hex(b"diverged-plan"); // different!
-        let grant = make_valid_grant(&cp_sk, request_id, &approved_digest);
-        let job = make_job(JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
+            request_id,
+            &approved_digest,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&replanned_digest)),
@@ -643,8 +750,14 @@ mod tests {
         let request_id = Uuid::new_v4();
         let step_job_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"the-plan");
-        let grant = make_valid_step_grant(&cp_sk, request_id, &plan_digest, step_job_id);
-        let job = make_job_with_id(step_job_id, JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job_with_id(step_job_id, JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_step_grant(
+            &cp_sk,
+            request_id,
+            &plan_digest,
+            step_job_id,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
@@ -665,13 +778,14 @@ mod tests {
         let actual_leased_job_id = Uuid::new_v4(); // deliberately different
         assert_ne!(bound_step_job_id, actual_leased_job_id);
         let plan_digest = sha256_hex(b"the-plan");
-        let grant = make_valid_step_grant(&cp_sk, request_id, &plan_digest, bound_step_job_id);
-        let job = make_job_with_id(
-            actual_leased_job_id,
-            JobMode::LiveApply,
+        let mut job = make_job_with_id(actual_leased_job_id, JobMode::LiveApply, request_id, None);
+        job.live_context = Some(make_valid_step_grant(
+            &cp_sk,
             request_id,
-            Some(grant),
-        );
+            &plan_digest,
+            bound_step_job_id,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
@@ -691,8 +805,14 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
-        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), job_id);
-        let job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, Some(grant));
+        let mut job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, None);
+        job.live_context = Some(make_valid_step_grant(
+            &cp_sk,
+            request_id,
+            &sha256_hex(b"plan"),
+            job_id,
+            &job.spec,
+        ));
 
         // No plan digest supplied — LiveDestroy must still Proceed.
         assert_eq!(
@@ -710,8 +830,14 @@ mod tests {
         let bound = Uuid::new_v4();
         let leased = Uuid::new_v4();
         assert_ne!(bound, leased);
-        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), bound);
-        let job = make_job_with_id(leased, JobMode::LiveDestroy, request_id, Some(grant));
+        let mut job = make_job_with_id(leased, JobMode::LiveDestroy, request_id, None);
+        job.live_context = Some(make_valid_step_grant(
+            &cp_sk,
+            request_id,
+            &sha256_hex(b"plan"),
+            bound,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, None),
@@ -725,8 +851,14 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
-        let grant = make_valid_step_grant(&cp_sk, request_id, &sha256_hex(b"plan"), job_id);
-        let job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, Some(grant));
+        let mut job = make_job_with_id(job_id, JobMode::LiveDestroy, request_id, None);
+        job.live_context = Some(make_valid_step_grant(
+            &cp_sk,
+            request_id,
+            &sha256_hex(b"plan"),
+            job_id,
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, false, None),
@@ -735,24 +867,22 @@ mod tests {
     }
 
     /// SECURITY (#42 B2, Codex finding): a LiveDestroy must be refused if the
-    /// grant is UNBOUND (`step_job_id: None`, a legacy whole-request grant).
-    /// LiveApply tolerates such grants for backward compatibility, but a VLC
-    /// signature does not bind a grant's purpose/mode — so a valid request-
-    /// scoped LiveApply grant must NOT be reusable to authorise a destroy (which
-    /// has no digest gate). The step binding is LiveDestroy's safety bound.
+    /// grant is UNBOUND (`step_job_id: None`, a whole-request grant). The
+    /// JobSpec digest binds mode, while this additional policy ensures a destroy
+    /// is also tied to one dispatched orchestration step.
     #[test]
     fn live_destroy_unbound_grant_refused() {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         // make_valid_grant mints an UNBOUND grant (step_job_id: None) for the
         // request — exactly a legacy whole-request LiveApply grant.
-        let grant = make_valid_grant(&cp_sk, request_id, &sha256_hex(b"plan"));
-        let job = make_job_with_id(
-            Uuid::new_v4(),
-            JobMode::LiveDestroy,
+        let mut job = make_job_with_id(Uuid::new_v4(), JobMode::LiveDestroy, request_id, None);
+        job.live_context = Some(make_valid_grant(
+            &cp_sk,
             request_id,
-            Some(grant),
-        );
+            &sha256_hex(b"plan"),
+            &job.spec,
+        ));
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, None),
@@ -768,10 +898,11 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(b"the-plan");
-        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest);
-        assert_eq!(grant.step_job_id, None);
         // Use an arbitrary job id — a None grant must not care what it is.
-        let job = make_job_with_id(Uuid::new_v4(), JobMode::LiveApply, request_id, Some(grant));
+        let mut job = make_job_with_id(Uuid::new_v4(), JobMode::LiveApply, request_id, None);
+        let grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        assert_eq!(grant.step_job_id, None);
+        job.live_context = Some(grant);
 
         assert_eq!(
             evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),

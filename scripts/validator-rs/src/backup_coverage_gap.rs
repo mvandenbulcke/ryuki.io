@@ -1262,9 +1262,10 @@ fn keyword_call_or_value(text: &str, keyword: &str) -> bool {
         return false;
     };
     rest.is_empty()
-        || rest.as_bytes().first().is_some_and(|byte| {
-            byte.is_ascii_whitespace() || b"(<[{".contains(byte)
-        })
+        || rest
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_whitespace() || b"(<[{".contains(byte))
 }
 
 fn prohibited_value(value: &str) -> bool {

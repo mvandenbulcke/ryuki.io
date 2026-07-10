@@ -7,12 +7,12 @@
 //!
 //! ## Backend config (durable LOCKED state backend)
 //!
-//! An optional `backend_config` string is written into the workspace as
-//! `backend_override.tf` BEFORE `terraform init`.  The operator provides the
-//! HCL for a durable, platform-local state backend (Postgres, S3, Consul, …);
-//! the agent does not hardcode one.  If `backend_config` is `None`, Terraform
-//! uses whatever backend is declared in the IaC bundle itself (typically local
-//! state, which is sufficient for dry-run/plan but not for production apply).
+//! An [`IsolatedBackendConfig`] is written into the workspace as
+//! `backend_override.tf` BEFORE `terraform init`. The config can only be built
+//! from an operator template containing the exact `{STATE_KEY}` placeholder
+//! and a validated control-plane state key. Live Terraform has no unisolated
+//! fallback: missing templates, missing placeholders, and unsafe keys fail
+//! before any Terraform subprocess is invoked.
 //!
 //! ## terraform-absent guarantee
 //!
@@ -81,6 +81,7 @@
 //! - `TF_LOG` is never set to `trace` or any verbose level.
 //! - Raw `tfplan` bytes are opaque binary data and MUST NOT be logged.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -118,7 +119,7 @@ use super::{
     scrub::{scrub, scrub_output, truncate_log},
     terraform::{
         apply_env_allowlist, combine_output, credential_components, pin_home_tmpdir_to_workspace,
-        validate_offering_slug, validate_var_name,
+        validate_offering_slug, validate_var_name, TERRAFORM_INIT_ARGS,
     },
     workspace::Workspace,
 };
@@ -129,6 +130,400 @@ const LIVE_RUNNER_TIMEOUT: Duration = Duration::from_secs(600); // 10 min per st
 
 /// Default binary name; overridable for tests via a custom path in tests.
 const DEFAULT_BINARY: &str = "terraform";
+
+/// Exact token an operator backend template must contain.
+pub const STATE_KEY_PLACEHOLDER: &str = "{STATE_KEY}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackendHclToken {
+    Ident(String),
+    Quoted(String),
+    Equals,
+    OpenBrace,
+    CloseBrace,
+}
+
+fn tokenize_backend_hcl(template: &str) -> Result<Vec<BackendHclToken>, RunnerError> {
+    let bytes = template.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut closed = false;
+                while index + 1 < bytes.len() {
+                    if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        index += 2;
+                        closed = true;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !closed {
+                    return Err(RunnerError::Spawn(
+                        "live Terraform backend template has an unterminated block comment"
+                            .to_string(),
+                    ));
+                }
+            }
+            b'"' => {
+                index += 1;
+                let start = index;
+                let mut closed = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index = (index + 2).min(bytes.len()),
+                        b'"' => {
+                            tokens
+                                .push(BackendHclToken::Quoted(template[start..index].to_string()));
+                            index += 1;
+                            closed = true;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+                if !closed {
+                    return Err(RunnerError::Spawn(
+                        "live Terraform backend template has an unterminated quoted string"
+                            .to_string(),
+                    ));
+                }
+            }
+            b'{' => {
+                tokens.push(BackendHclToken::OpenBrace);
+                index += 1;
+            }
+            b'}' => {
+                tokens.push(BackendHclToken::CloseBrace);
+                index += 1;
+            }
+            b'=' => {
+                tokens.push(BackendHclToken::Equals);
+                index += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
+                {
+                    index += 1;
+                }
+                tokens.push(BackendHclToken::Ident(template[start..index].to_string()));
+            }
+            _ => index += 1,
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn matching_hcl_brace(tokens: &[BackendHclToken], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            BackendHclToken::OpenBrace => depth += 1,
+            BackendHclToken::CloseBrace => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn direct_attribute_contains(
+    tokens: &[BackendHclToken],
+    open: usize,
+    close: usize,
+    attribute_names: &[&str],
+) -> bool {
+    let mut depth = 0usize;
+    let mut index = open + 1;
+    while index < close {
+        if depth == 0 {
+            if let (
+                Some(BackendHclToken::Ident(name)),
+                Some(BackendHclToken::Equals),
+                Some(BackendHclToken::Quoted(value)),
+            ) = (
+                tokens.get(index),
+                tokens.get(index + 1),
+                tokens.get(index + 2),
+            ) {
+                if attribute_names.contains(&name.as_str()) && value.contains(STATE_KEY_PLACEHOLDER)
+                {
+                    return true;
+                }
+            }
+        }
+
+        match &tokens[index] {
+            BackendHclToken::OpenBrace => depth += 1,
+            BackendHclToken::CloseBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn direct_attribute_value<'a>(
+    tokens: &'a [BackendHclToken],
+    open: usize,
+    close: usize,
+    attribute_name: &str,
+) -> Option<&'a str> {
+    let mut depth = 0usize;
+    let mut index = open + 1;
+    while index < close {
+        if depth == 0
+            && matches!(tokens.get(index), Some(BackendHclToken::Ident(name)) if name == attribute_name)
+            && matches!(tokens.get(index + 1), Some(BackendHclToken::Equals))
+        {
+            if let Some(BackendHclToken::Quoted(value)) = tokens.get(index + 2) {
+                return Some(value);
+            }
+        }
+
+        match &tokens[index] {
+            BackendHclToken::OpenBrace => depth += 1,
+            BackendHclToken::CloseBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn remote_workspace_contains_state_key(
+    tokens: &[BackendHclToken],
+    open: usize,
+    close: usize,
+) -> bool {
+    let mut depth = 0usize;
+    let mut index = open + 1;
+    while index < close {
+        if depth == 0
+            && matches!(tokens.get(index), Some(BackendHclToken::Ident(name)) if name == "workspaces")
+            && matches!(tokens.get(index + 1), Some(BackendHclToken::OpenBrace))
+        {
+            if let Some(workspaces_close) = matching_hcl_brace(tokens, index + 1) {
+                return direct_attribute_contains(
+                    tokens,
+                    index + 1,
+                    workspaces_close,
+                    &["name", "prefix"],
+                );
+            }
+        }
+
+        match &tokens[index] {
+            BackendHclToken::OpenBrace => depth += 1,
+            BackendHclToken::CloseBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn backend_location_contains_state_key(
+    backend_type: &str,
+    tokens: &[BackendHclToken],
+    open: usize,
+    close: usize,
+) -> Option<bool> {
+    let direct_attributes: &[&str] = match backend_type {
+        "local" => &["path"],
+        "s3" | "azurerm" | "oss" | "cos" => &["key"],
+        "gcs" | "etcdv3" => &["prefix"],
+        "consul" => &["path"],
+        "pg" => &["schema_name"],
+        "kubernetes" => &["secret_suffix"],
+        "http" => &["address"],
+        "remote" => return Some(remote_workspace_contains_state_key(tokens, open, close)),
+        _ => return None,
+    };
+    Some(direct_attribute_contains(
+        tokens,
+        open,
+        close,
+        direct_attributes,
+    ))
+}
+
+fn validate_backend_template(template: &str) -> Result<(), RunnerError> {
+    let tokens = tokenize_backend_hcl(template)?;
+    let mut backends = Vec::new();
+    let mut index = 0usize;
+    let mut root_depth = 0usize;
+
+    while index + 1 < tokens.len() {
+        let is_terraform = root_depth == 0
+            && matches!(&tokens[index], BackendHclToken::Ident(name) if name == "terraform")
+            && matches!(tokens.get(index + 1), Some(BackendHclToken::OpenBrace));
+        if !is_terraform {
+            match &tokens[index] {
+                BackendHclToken::OpenBrace => root_depth += 1,
+                BackendHclToken::CloseBrace => root_depth = root_depth.saturating_sub(1),
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+
+        let terraform_open = index + 1;
+        let terraform_close = matching_hcl_brace(&tokens, terraform_open).ok_or_else(|| {
+            RunnerError::Spawn(
+                "live Terraform backend template has an unterminated terraform block".to_string(),
+            )
+        })?;
+        let mut depth = 0usize;
+        let mut cursor = terraform_open + 1;
+        while cursor < terraform_close {
+            if depth == 0 {
+                if let (
+                    Some(BackendHclToken::Ident(name)),
+                    Some(BackendHclToken::Quoted(backend_type)),
+                    Some(BackendHclToken::OpenBrace),
+                ) = (
+                    tokens.get(cursor),
+                    tokens.get(cursor + 1),
+                    tokens.get(cursor + 2),
+                ) {
+                    if name == "backend" {
+                        let backend_open = cursor + 2;
+                        let backend_close = matching_hcl_brace(&tokens, backend_open).ok_or_else(
+                            || {
+                                RunnerError::Spawn(
+                                    "live Terraform backend template has an unterminated backend block"
+                                        .to_string(),
+                                )
+                            },
+                        )?;
+                        backends.push((backend_type.clone(), backend_open, backend_close));
+                        cursor = backend_close + 1;
+                        continue;
+                    }
+                }
+            }
+
+            match &tokens[cursor] {
+                BackendHclToken::OpenBrace => depth += 1,
+                BackendHclToken::CloseBrace => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            cursor += 1;
+        }
+        index = terraform_close + 1;
+    }
+
+    let [(backend_type, open, close)] = backends.as_slice() else {
+        return Err(RunnerError::Spawn(
+            "live Terraform backend template must contain exactly one active terraform backend block"
+                .to_string(),
+        ));
+    };
+
+    if backend_type == "local" {
+        let Some(path) = direct_attribute_value(&tokens, *open, *close, "path") else {
+            return Err(RunnerError::Spawn(format!(
+                "live Terraform {backend_type:?} backend state-location attribute must contain the exact {STATE_KEY_PLACEHOLDER} placeholder"
+            )));
+        };
+        if !path.contains(STATE_KEY_PLACEHOLDER) {
+            return Err(RunnerError::Spawn(format!(
+                "live Terraform {backend_type:?} backend state-location attribute must contain the exact {STATE_KEY_PLACEHOLDER} placeholder"
+            )));
+        }
+        if !Path::new(path).is_absolute() {
+            return Err(RunnerError::Spawn(
+                "live Terraform \"local\" backend path must be absolute so state persists across fresh workspaces"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    match backend_location_contains_state_key(backend_type, &tokens, *open, *close) {
+        Some(true) => Ok(()),
+        Some(false) => Err(RunnerError::Spawn(format!(
+            "live Terraform {backend_type:?} backend state-location attribute must contain the exact {STATE_KEY_PLACEHOLDER} placeholder"
+        ))),
+        None => Err(RunnerError::Spawn(format!(
+            "live Terraform backend type {backend_type:?} is unsupported because its state-location attribute cannot be proven isolated"
+        ))),
+    }
+}
+
+/// A backend HCL config whose state-key placeholder has been safely rendered.
+///
+/// The fields stay private so live Terraform callers cannot bypass
+/// [`IsolatedBackendConfig::from_template`] with arbitrary shared backend HCL.
+pub struct IsolatedBackendConfig {
+    hcl: String,
+    state_key: String,
+}
+
+impl IsolatedBackendConfig {
+    /// Render an operator backend-HCL template for one control-plane state key.
+    ///
+    /// The key is deliberately restricted to an ASCII identifier alphabet so
+    /// substitution is safe inside a quoted HCL path/key/schema value. The
+    /// backend's active state-location attribute must contain the exact
+    /// placeholder; comments and unrelated attributes do not establish isolation.
+    /// A local backend path must also be absolute so it survives the separate
+    /// temporary workspaces used by plan, apply, and destroy.
+    pub fn from_template(template: &str, state_key: &str) -> Result<Self, RunnerError> {
+        validate_state_key(state_key)?;
+        validate_backend_template(template)?;
+
+        Ok(Self {
+            hcl: template.replace(STATE_KEY_PLACEHOLDER, state_key),
+            state_key: state_key.to_string(),
+        })
+    }
+
+    /// The validated control-plane key represented by this backend config.
+    pub fn state_key(&self) -> &str {
+        &self.state_key
+    }
+}
+
+fn validate_state_key(state_key: &str) -> Result<(), RunnerError> {
+    let safe = !state_key.is_empty()
+        && state_key.len() <= 128
+        && state_key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if !safe {
+        return Err(RunnerError::Spawn(
+            "live Terraform state key must be 1..=128 ASCII letters, digits, '-' or '_'; \
+             refusing unsafe backend substitution"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // run_live_plan
@@ -157,7 +552,7 @@ const DEFAULT_BINARY: &str = "terraform";
 pub fn run_live_plan(
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
 ) -> Result<LivePlanArtifacts, RunnerError> {
     if plan.mode != RunMode::Live {
         return Err(RunnerError::Spawn(format!(
@@ -195,7 +590,7 @@ pub fn run_live_plan(
 pub fn run_live_apply(
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
     tfplan: &[u8],
 ) -> Result<RunOutcome, RunnerError> {
     if plan.mode != RunMode::Live {
@@ -222,14 +617,10 @@ pub fn run_live_apply(
 /// TempDir) workspace, is the source of truth for what exists and therefore
 /// for what gets destroyed.
 ///
-/// The agent passes the same `backend_config` value to apply and destroy
-/// (`RunnerLiveExecutor.backend_config`, read once from the environment), so
-/// the destroy targets the state lineage the apply wrote. OPERATOR NOTE: if no
-/// durable backend is configured anywhere (no `backend_config` and no backend
-/// in the bundle), the apply's local state died with its TempDir — a destroy
-/// then initialises an EMPTY state and exits 0 with "Resources: 0 destroyed"
-/// (a visible no-op in the evidence, not an error). A durable backend is an
-/// operator requirement for live execution, same as for apply.
+/// The agent instantiates the same backend template with the step's stable
+/// state key for plan, apply, and destroy, so every phase attaches to exactly
+/// one state lineage. This API requires an [`IsolatedBackendConfig`]; there is
+/// no local-state fallback for live Terraform.
 ///
 /// ## `-auto-approve` — deliberate difference from apply
 ///
@@ -257,7 +648,7 @@ pub fn run_live_apply(
 pub fn run_live_destroy(
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
 ) -> Result<RunOutcome, RunnerError> {
     if plan.mode != RunMode::Live {
         return Err(RunnerError::Spawn(format!(
@@ -361,7 +752,7 @@ pub(crate) fn live_terraform_plan(
     binary: &str,
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
 ) -> Result<LivePlanArtifacts, RunnerError> {
     // Validate inputs before any workspace or process creation.
     validate_offering_slug(&plan.offering_id)?;
@@ -424,14 +815,9 @@ pub(crate) fn live_terraform_plan(
         ws.write_file(filename, content.as_bytes())?;
     }
 
-    // Write optional backend config override — operator-provided HCL for a
-    // durable, platform-local state backend (Postgres / S3 / Consul / …).
-    // Written BEFORE init so terraform init picks it up.
-    if let Some(backend_hcl) = backend_config {
-        // 0600: backend HCL routinely carries state-backend credentials
-        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
-        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
-    }
+    // 0600: backend HCL routinely carries state-backend credentials
+    // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+    ws.write_file_0600("backend_override.tf", backend_config.hcl.as_bytes())?;
 
     // Write non-secret vars.
     if !plan.vars.is_empty() {
@@ -443,7 +829,7 @@ pub(crate) fn live_terraform_plan(
     // FAIL CLOSED: non-zero exit → Failed, no digest computed.
     let init_outcome = run_tf_step(
         binary,
-        &["init", "-input=false"],
+        TERRAFORM_INIT_ARGS,
         ws.path(),
         &plan.secret_var_names,
         &cred_str,
@@ -592,7 +978,7 @@ pub(crate) fn live_terraform_apply(
     binary: &str,
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
     tfplan: &[u8],
 ) -> Result<RunOutcome, RunnerError> {
     // Validate inputs.
@@ -649,11 +1035,9 @@ pub(crate) fn live_terraform_apply(
         ws.write_file(filename, content.as_bytes())?;
     }
 
-    if let Some(backend_hcl) = backend_config {
-        // 0600: backend HCL routinely carries state-backend credentials
-        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
-        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
-    }
+    // 0600: backend HCL routinely carries state-backend credentials
+    // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+    ws.write_file_0600("backend_override.tf", backend_config.hcl.as_bytes())?;
 
     if !plan.vars.is_empty() {
         let vars_json = vars_to_json(&plan.vars);
@@ -667,7 +1051,7 @@ pub(crate) fn live_terraform_apply(
     // --- Step 1: terraform init ---
     let init_outcome = run_tf_step(
         binary,
-        &["init", "-input=false"],
+        TERRAFORM_INIT_ARGS,
         ws.path(),
         &plan.secret_var_names,
         &cred_str,
@@ -801,7 +1185,7 @@ pub(crate) fn live_terraform_destroy(
     binary: &str,
     plan: &RunPlan,
     creds: &ResolvedCredentials,
-    backend_config: Option<&str>,
+    backend_config: &IsolatedBackendConfig,
 ) -> Result<RunOutcome, RunnerError> {
     // Validate inputs before any workspace or process creation.
     validate_offering_slug(&plan.offering_id)?;
@@ -863,11 +1247,9 @@ pub(crate) fn live_terraform_destroy(
         ws.write_file(filename, content.as_bytes())?;
     }
 
-    if let Some(backend_hcl) = backend_config {
-        // 0600: backend HCL routinely carries state-backend credentials
-        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
-        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
-    }
+    // 0600: backend HCL routinely carries state-backend credentials
+    // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+    ws.write_file_0600("backend_override.tf", backend_config.hcl.as_bytes())?;
 
     if !plan.vars.is_empty() {
         let vars_json = vars_to_json(&plan.vars);
@@ -878,7 +1260,7 @@ pub(crate) fn live_terraform_destroy(
     // FAIL CLOSED: non-zero exit → Failed, destroy is never attempted.
     let init_outcome = run_tf_step(
         binary,
-        &["init", "-input=false"],
+        TERRAFORM_INIT_ARGS,
         ws.path(),
         &plan.secret_var_names,
         &cred_str,
@@ -1133,6 +1515,9 @@ fn extract_destroy_summary(log: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STATE_KEY: AtomicU64 = AtomicU64::new(1);
 
     fn dummy_creds() -> ResolvedCredentials {
         ResolvedCredentials {
@@ -1149,6 +1534,16 @@ mod tests {
             vars: BTreeMap::new(),
             secret_var_names: vec![],
         }
+    }
+
+    fn test_backend() -> IsolatedBackendConfig {
+        let key = format!("test-{}", NEXT_STATE_KEY.fetch_add(1, Ordering::Relaxed));
+        let template = format!(
+            "terraform {{\n  backend \"local\" {{\n    path = \"{}/ryuki-runner-state-{{STATE_KEY}}.tfstate\"\n  }}\n}}",
+            std::env::temp_dir().display()
+        );
+        IsolatedBackendConfig::from_template(&template, &key)
+            .expect("test backend template is valid")
     }
 
     // -----------------------------------------------------------------------
@@ -1211,7 +1606,8 @@ mod tests {
             return;
         }
         let plan = live_plan("request-preflight");
-        let a1 = live_terraform_plan("terraform", &plan, &dummy_creds(), None)
+        let backend = test_backend();
+        let a1 = live_terraform_plan("terraform", &plan, &dummy_creds(), &backend)
             .expect("live plan must not error");
         if a1.outcome.status == RunStatus::RunnerUnavailable {
             eprintln!("SKIP: terraform reported unavailable");
@@ -1243,7 +1639,7 @@ mod tests {
 
         // Determinism: a second identical plan yields the SAME canonical digest
         // input despite terraform stamping a fresh timestamp each run.
-        let a2 = live_terraform_plan("terraform", &plan, &dummy_creds(), None)
+        let a2 = live_terraform_plan("terraform", &plan, &dummy_creds(), &backend)
             .expect("second live plan must not error");
         assert_eq!(
             a1.outcome.log, a2.outcome.log,
@@ -1259,7 +1655,7 @@ mod tests {
     fn run_live_plan_rejects_dry_run_mode() {
         let mut plan = live_plan("patch-maintenance");
         plan.mode = RunMode::DryRun;
-        let result = run_live_plan(&plan, &dummy_creds(), None);
+        let result = run_live_plan(&plan, &dummy_creds(), &test_backend());
         assert!(result.is_err(), "run_live_plan must reject RunMode::DryRun");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1272,7 +1668,7 @@ mod tests {
     fn run_live_apply_rejects_dry_run_mode() {
         let mut plan = live_plan("patch-maintenance");
         plan.mode = RunMode::DryRun;
-        let result = run_live_apply(&plan, &dummy_creds(), None, b"fake-plan");
+        let result = run_live_apply(&plan, &dummy_creds(), &test_backend(), b"fake-plan");
         assert!(
             result.is_err(),
             "run_live_apply must reject RunMode::DryRun"
@@ -1286,7 +1682,7 @@ mod tests {
     #[test]
     fn run_live_plan_fails_closed_on_missing_iac() {
         let plan = live_plan("no-such-offering-xyz");
-        let result = run_live_plan(&plan, &dummy_creds(), None);
+        let result = run_live_plan(&plan, &dummy_creds(), &test_backend());
         assert!(
             result.is_err(),
             "run_live_plan must fail closed when IaC is missing"
@@ -1301,7 +1697,7 @@ mod tests {
     #[test]
     fn run_live_apply_fails_closed_on_missing_iac() {
         let plan = live_plan("no-such-offering-xyz");
-        let result = run_live_apply(&plan, &dummy_creds(), None, b"fake-plan");
+        let result = run_live_apply(&plan, &dummy_creds(), &test_backend(), b"fake-plan");
         assert!(
             result.is_err(),
             "run_live_apply must fail closed when IaC is missing"
@@ -1320,7 +1716,7 @@ mod tests {
             "/nonexistent/terraform-fake-live",
             &plan,
             &dummy_creds(),
-            None,
+            &test_backend(),
         );
         assert!(result.is_ok(), "absent terraform must not return Err");
         assert_eq!(
@@ -1337,7 +1733,7 @@ mod tests {
             "/nonexistent/terraform-fake-live",
             &plan,
             &dummy_creds(),
-            None,
+            &test_backend(),
             b"fake-tfplan-bytes",
         );
         assert!(
@@ -1355,6 +1751,117 @@ mod tests {
     // backend_config is written into the workspace before init
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn backend_template_renders_distinct_keys_and_reuses_one_key_exactly() {
+        let template =
+            "terraform { backend \"local\" { path = \"/var/lib/ryuki/terraform-{STATE_KEY}.tfstate\" } }";
+        let request_a = IsolatedBackendConfig::from_template(template, "request-a").unwrap();
+        let request_b = IsolatedBackendConfig::from_template(template, "request-b").unwrap();
+        assert_ne!(request_a.hcl, request_b.hcl);
+        assert!(request_a.hcl.contains("terraform-request-a.tfstate"));
+        assert!(request_b.hcl.contains("terraform-request-b.tfstate"));
+
+        let plan = IsolatedBackendConfig::from_template(template, "step-one").unwrap();
+        let apply = IsolatedBackendConfig::from_template(template, "step-one").unwrap();
+        let destroy = IsolatedBackendConfig::from_template(template, "step-one").unwrap();
+        assert_eq!(plan.hcl, apply.hcl);
+        assert_eq!(apply.hcl, destroy.hcl);
+        assert_eq!(plan.state_key(), "step-one");
+        assert!(!plan.hcl.contains(STATE_KEY_PLACEHOLDER));
+    }
+
+    #[test]
+    fn backend_template_fails_closed_without_placeholder_or_with_unsafe_key() {
+        let fixed = "terraform { backend \"local\" { path = \"shared.tfstate\" } }";
+        assert!(IsolatedBackendConfig::from_template(fixed, "request-a").is_err());
+
+        let template = "# state {STATE_KEY}";
+        for unsafe_key in ["", "../shared", "request/a", "quoted\"key", "space key"] {
+            assert!(
+                IsolatedBackendConfig::from_template(template, unsafe_key).is_err(),
+                "unsafe state key must be rejected: {unsafe_key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_template_ignores_placeholders_outside_active_location() {
+        let in_comment = r#"terraform {
+  # path = "state-{STATE_KEY}.tfstate"
+  backend "local" { path = "shared.tfstate" }
+}"#;
+        let unrelated_attribute = r#"terraform {
+  backend "local" {
+    path = "shared.tfstate"
+    description = "state-{STATE_KEY}"
+  }
+}"#;
+        let sibling_block = r#"terraform {
+  backend "local" { path = "shared.tfstate" }
+}
+resource "terraform_data" "decoy" {
+  input = "{STATE_KEY}"
+}"#;
+
+        for template in [in_comment, unrelated_attribute, sibling_block] {
+            assert!(
+                IsolatedBackendConfig::from_template(template, "request-a").is_err(),
+                "non-location placeholder must not prove isolation: {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_template_accepts_backend_specific_state_locations() {
+        let local = r#"terraform { backend "local" { path = "/var/lib/ryuki/state-{STATE_KEY}.tfstate" } }"#;
+        let s3 = r#"terraform { backend "s3" { bucket = "state" key = "jobs/{STATE_KEY}.tfstate" region = "eu-west-1" } }"#;
+        let pg = r#"terraform { backend "pg" { conn_str = "postgresql://localhost/state" schema_name = "{STATE_KEY}" } }"#;
+        let remote = r#"terraform { backend "remote" { organization = "example" workspaces { name = "{STATE_KEY}" } } }"#;
+
+        for template in [local, s3, pg, remote] {
+            assert!(
+                IsolatedBackendConfig::from_template(template, "request-a").is_ok(),
+                "active backend location should prove isolation: {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_template_rejects_relative_local_state_paths() {
+        for path in [
+            "state-{STATE_KEY}.tfstate",
+            "./state-{STATE_KEY}.tfstate",
+            "states/{STATE_KEY}.tfstate",
+        ] {
+            let template = format!(r#"terraform {{ backend "local" {{ path = "{path}" }} }}"#);
+            let error = match IsolatedBackendConfig::from_template(&template, "request-a") {
+                Ok(_) => panic!("relative local state path must be rejected: {path}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("must be absolute"),
+                "error must explain the persistence requirement: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_template_rejects_unknown_backend_and_multiple_backends() {
+        let unknown = r#"terraform { backend "future" { path = "state-{STATE_KEY}.tfstate" } }"#;
+        let nested_decoy = r#"
+resource "terraform_data" "decoy" {
+  terraform { backend "local" { path = "state-{STATE_KEY}.tfstate" } }
+}
+"#;
+        let multiple = r#"
+terraform { backend "local" { path = "one-{STATE_KEY}.tfstate" } }
+terraform { backend "local" { path = "two-{STATE_KEY}.tfstate" } }
+"#;
+        assert!(IsolatedBackendConfig::from_template(unknown, "request-a").is_err());
+        assert!(IsolatedBackendConfig::from_template(nested_decoy, "request-a").is_err());
+        assert!(IsolatedBackendConfig::from_template(multiple, "request-a").is_err());
+    }
+
     /// We can't easily verify the file was passed to terraform without a real
     /// binary, but we CAN verify that supplying a backend_config string does
     /// not cause an error (workspace write succeeds) when the binary is absent.
@@ -1365,14 +1872,17 @@ mod tests {
         let backend_hcl = r#"terraform {
   backend "pg" {
     conn_str = "postgresql://localhost/tfstate"
+    schema_name = "{STATE_KEY}"
   }
 }"#;
+        let backend = IsolatedBackendConfig::from_template(backend_hcl, "request-test")
+            .expect("backend template");
         // Binary absent → RunnerUnavailable, but no error from backend_config write.
         let result = live_terraform_plan(
             "/nonexistent/terraform-fake-live-backend",
             &plan,
             &dummy_creds(),
-            Some(backend_hcl),
+            &backend,
         );
         assert!(
             result.is_ok(),
@@ -1384,12 +1894,12 @@ mod tests {
     #[test]
     fn run_live_apply_accepts_backend_config_without_error() {
         let plan = live_plan("patch-maintenance");
-        let backend_hcl = "# dummy backend config for test";
+        let backend = test_backend();
         let result = live_terraform_apply(
             "/nonexistent/terraform-fake-live-backend-apply",
             &plan,
             &dummy_creds(),
-            Some(backend_hcl),
+            &backend,
             b"fake-tfplan-bytes",
         );
         assert!(
@@ -1409,13 +1919,16 @@ mod tests {
         // "tfplan" file so the plan step's read succeeds, then exits 0 for all.
         let ws_probe = super::super::workspace::Workspace::new().expect("ws");
         let shim = ws_probe.path().join("fake-tf-live-iac");
+        let probe_dir = ws_probe.path().to_string_lossy();
         // The shim writes a stub tfplan file on every invocation (in case this
         // invocation is the plan step) and exits 0.
         // `show -json` must emit valid JSON — the digest layer now fails closed
         // on non-canonical plan output. Other steps just list files and exit 0.
         std::fs::write(
             &shim,
-            "#!/bin/sh\nif [ \"$1\" = show ]; then echo '{\"format_version\":\"1.2\",\"resource_changes\":[]}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nls\nexit 0\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{probe_dir}/args-$1\"\nif [ \"$1\" = show ]; then echo '{{\"format_version\":\"1.2\",\"resource_changes\":[]}}'; exit 0; fi\ntouch \"$PWD/tfplan\"\nls\nexit 0\n"
+            ),
         )
         .expect("write shim");
         #[cfg(unix)]
@@ -1425,7 +1938,12 @@ mod tests {
         }
 
         let plan = live_plan("patch-maintenance");
-        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &dummy_creds(), None);
+        let result = live_terraform_plan(
+            &shim.to_string_lossy(),
+            &plan,
+            &dummy_creds(),
+            &test_backend(),
+        );
         // The shim exits 0 for all steps and writes the tfplan stub → Planned.
         assert!(result.is_ok(), "shim-based plan must not error: {result:?}");
         let artifacts = result.unwrap();
@@ -1434,6 +1952,12 @@ mod tests {
             RunStatus::Planned,
             "shim exits 0 → Planned; got: {:?}",
             artifacts.outcome.status
+        );
+        let init_args = std::fs::read_to_string(ws_probe.path().join("args-init"))
+            .expect("live init argv must be captured");
+        assert_eq!(
+            init_args.lines().collect::<Vec<_>>(),
+            ["init", "-input=false", "-lockfile=readonly"]
         );
     }
 
@@ -1473,7 +1997,12 @@ esac
         }
 
         let plan = live_plan("patch-maintenance");
-        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &dummy_creds(), None);
+        let result = live_terraform_plan(
+            &shim.to_string_lossy(),
+            &plan,
+            &dummy_creds(),
+            &test_backend(),
+        );
         // Must be Ok (not Err), but status must be Failed — not Planned.
         assert!(
             result.is_ok(),
@@ -1550,7 +2079,7 @@ esac
             &shim.to_string_lossy(),
             &plan,
             &dummy_creds(),
-            None,
+            &test_backend(),
             fake_tfplan,
         );
         assert!(result.is_ok(), "apply shim must not error: {result:?}");
@@ -1594,7 +2123,7 @@ esac
                 &shim.to_string_lossy(),
                 &plan,
                 &dummy_creds(),
-                None,
+                &test_backend(),
                 b"fake-tfplan",
             )
             .expect("apply must not error");
@@ -1655,13 +2184,8 @@ esac
         }
 
         let plan = live_plan("patch-maintenance");
-        let backend_hcl = "# ryuki-test backend override";
-        let result = live_terraform_plan(
-            &shim.to_string_lossy(),
-            &plan,
-            &dummy_creds(),
-            Some(backend_hcl),
-        );
+        let backend = test_backend();
+        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &dummy_creds(), &backend);
         assert!(
             result.is_ok(),
             "backend_config write must not error: {result:?}"
@@ -1678,7 +2202,7 @@ esac
     fn run_live_destroy_rejects_dry_run_mode() {
         let mut plan = live_plan("patch-maintenance");
         plan.mode = RunMode::DryRun;
-        let result = run_live_destroy(&plan, &dummy_creds(), None);
+        let result = run_live_destroy(&plan, &dummy_creds(), &test_backend());
         assert!(
             result.is_err(),
             "run_live_destroy must reject RunMode::DryRun"
@@ -1693,7 +2217,7 @@ esac
     #[test]
     fn run_live_destroy_fails_closed_on_missing_iac() {
         let plan = live_plan("no-such-offering-xyz");
-        let result = run_live_destroy(&plan, &dummy_creds(), None);
+        let result = run_live_destroy(&plan, &dummy_creds(), &test_backend());
         assert!(
             result.is_err(),
             "run_live_destroy must fail closed when IaC is missing"
@@ -1712,7 +2236,7 @@ esac
             "/nonexistent/terraform-fake-live-destroy",
             &plan,
             &dummy_creds(),
-            None,
+            &test_backend(),
         );
         assert!(
             result.is_ok(),
@@ -1728,12 +2252,12 @@ esac
     #[test]
     fn run_live_destroy_accepts_backend_config_without_error() {
         let plan = live_plan("patch-maintenance");
-        let backend_hcl = "# dummy backend config for destroy test";
+        let backend = test_backend();
         let result = live_terraform_destroy(
             "/nonexistent/terraform-fake-live-backend-destroy",
             &plan,
             &dummy_creds(),
-            Some(backend_hcl),
+            &backend,
         );
         assert!(
             result.is_ok(),
@@ -1791,8 +2315,12 @@ esac
         }
 
         let plan = live_plan("patch-maintenance");
-        let result =
-            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None);
+        let result = live_terraform_destroy(
+            &shim.to_string_lossy(),
+            &plan,
+            &dummy_creds(),
+            &test_backend(),
+        );
         assert!(result.is_ok(), "destroy shim must not error: {result:?}");
         let outcome = result.unwrap();
         assert_eq!(
@@ -1836,9 +2364,13 @@ esac
         }
 
         let plan = live_plan("patch-maintenance");
-        let outcome =
-            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None)
-                .expect("shim destroy failure must not be Err");
+        let outcome = live_terraform_destroy(
+            &shim.to_string_lossy(),
+            &plan,
+            &dummy_creds(),
+            &test_backend(),
+        )
+        .expect("shim destroy failure must not be Err");
         assert_eq!(
             outcome.status,
             RunStatus::Failed,
@@ -1877,9 +2409,13 @@ esac
         }
 
         let plan = live_plan("patch-maintenance");
-        let outcome =
-            live_terraform_destroy(&shim.to_string_lossy(), &plan, &dummy_creds(), None)
-                .expect("init failure must not be Err");
+        let outcome = live_terraform_destroy(
+            &shim.to_string_lossy(),
+            &plan,
+            &dummy_creds(),
+            &test_backend(),
+        )
+        .expect("init failure must not be Err");
         assert_eq!(
             outcome.status,
             RunStatus::Failed,
@@ -1918,18 +2454,22 @@ esac
 
         // Shared durable state location (outlives all three run workspaces).
         let state_dir = super::super::workspace::Workspace::new().expect("state dir");
-        let state_path = state_dir.path().join("terraform.tfstate");
-        let backend_hcl = format!(
+        let state_path = state_dir.path().join("terraform-step-e2e.tfstate");
+        let backend_template = format!(
             "terraform {{\n  backend \"local\" {{\n    path = \"{}\"\n  }}\n}}\n",
-            state_path.display()
+            state_dir
+                .path()
+                .join("terraform-{STATE_KEY}.tfstate")
+                .display()
         );
+        let backend = IsolatedBackendConfig::from_template(&backend_template, "step-e2e")
+            .expect("isolated backend");
 
         let plan = live_plan("request-preflight");
 
         // Phase 1: live plan (fresh workspace #1) — produces the saved tfplan.
-        let artifacts =
-            live_terraform_plan("terraform", &plan, &dummy_creds(), Some(&backend_hcl))
-                .expect("live plan must not error");
+        let artifacts = live_terraform_plan("terraform", &plan, &dummy_creds(), &backend)
+            .expect("live plan must not error");
         if artifacts.outcome.status == RunStatus::RunnerUnavailable {
             eprintln!("SKIP: terraform reported unavailable");
             return;
@@ -1948,7 +2488,7 @@ esac
             "terraform",
             &plan,
             &dummy_creds(),
-            Some(&backend_hcl),
+            &backend,
             &artifacts.tfplan,
         )
         .expect("live apply must not error");
@@ -1973,9 +2513,8 @@ esac
 
         // Phase 3: live destroy (fresh workspace #3) — reconstructs the same
         // IaC + backend, attaches to the SAME state, destroys what it holds.
-        let destroyed =
-            live_terraform_destroy("terraform", &plan, &dummy_creds(), Some(&backend_hcl))
-                .expect("live destroy must not error");
+        let destroyed = live_terraform_destroy("terraform", &plan, &dummy_creds(), &backend)
+            .expect("live destroy must not error");
         assert_eq!(
             destroyed.status,
             RunStatus::Applied,
@@ -2041,8 +2580,10 @@ esac
             "Destroy complete! Resources: 3 destroyed."
         );
         // Empty-state destroy variants.
-        assert!(extract_destroy_summary("No changes. No objects need to be destroyed.")
-            .starts_with("No changes."));
+        assert!(
+            extract_destroy_summary("No changes. No objects need to be destroyed.")
+                .starts_with("No changes.")
+        );
         // Fallback when terraform output has neither line.
         assert_eq!(
             extract_destroy_summary("something else"),
@@ -2156,7 +2697,10 @@ esac
         assert_eq!(
             secret_env_pairs(&names, "admin@vsphere.local,hunter2"),
             vec![
-                ("VSPHERE_USER".to_string(), "admin@vsphere.local".to_string()),
+                (
+                    "VSPHERE_USER".to_string(),
+                    "admin@vsphere.local".to_string()
+                ),
                 (
                     "TF_VAR_vsphere_user".to_string(),
                     "admin@vsphere.local".to_string()
@@ -2222,16 +2766,32 @@ esac
         };
 
         assert_refused(
-            live_terraform_plan("/nonexistent/terraform-arity", &plan, &creds, None)
-                .map(|a| a.outcome),
+            live_terraform_plan(
+                "/nonexistent/terraform-arity",
+                &plan,
+                &creds,
+                &test_backend(),
+            )
+            .map(|a| a.outcome),
             "plan",
         );
         assert_refused(
-            live_terraform_apply("/nonexistent/terraform-arity", &plan, &creds, None, b"tfplan"),
+            live_terraform_apply(
+                "/nonexistent/terraform-arity",
+                &plan,
+                &creds,
+                &test_backend(),
+                b"tfplan",
+            ),
             "apply",
         );
         assert_refused(
-            live_terraform_destroy("/nonexistent/terraform-arity", &plan, &creds, None),
+            live_terraform_destroy(
+                "/nonexistent/terraform-arity",
+                &plan,
+                &creds,
+                &test_backend(),
+            ),
             "destroy",
         );
     }
@@ -2277,7 +2837,7 @@ esac
             descriptor: "test:vsphere".to_string(),
         };
 
-        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &creds, None)
+        let result = live_terraform_plan(&shim.to_string_lossy(), &plan, &creds, &test_backend())
             .expect("env-dump shim plan must not error");
         assert_eq!(result.outcome.status, RunStatus::Planned);
 

@@ -267,11 +267,7 @@ async fn main() {
 /// whose existing behavior already warn-tolerates 403s until the admin
 /// approval flips them to 2xx. An interactive operator gets an explicit,
 /// unmissable "pending approval" hand-off instead of a silent warn-loop.
-async fn self_register_and_exit(
-    cfg: &AgentConfig,
-    identity: &AgentIdentity,
-    agent_id: &str,
-) -> ! {
+async fn self_register_and_exit(cfg: &AgentConfig, identity: &AgentIdentity, agent_id: &str) -> ! {
     info!(
         agent_id,
         platform = %cfg.platform,

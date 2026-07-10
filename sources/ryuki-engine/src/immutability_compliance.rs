@@ -1,3 +1,4 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,8 +69,6 @@ pub struct RemediationPlan {
     pub priority: String,
     pub estimated_effort: String,
 }
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 /// Test fixture: returns a set of seed repositories for use in unit tests.
 /// Production code loads from the database via the repo layer.
@@ -226,7 +225,7 @@ pub fn verify_all_repositories(
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -254,7 +253,7 @@ pub fn get_compliance_report(
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 

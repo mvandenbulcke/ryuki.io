@@ -818,26 +818,17 @@ mod oidc_callback_db_tests {
         }
     }
 
-    // ─── Config bootstrap (runs at most once per process) ─────────────────
-
-    static CONFIG_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // ─── Per-test config bootstrap ────────────────────────────────────────
 
     fn ensure_config() {
-        CONFIG_INIT.get_or_init(|| {
-            let mut cfg = ryuki_core::config::RyukiConfig::default();
-            cfg.oidc.enabled = true;
-            cfg.oidc.issuer = TEST_ISS.to_string();
-            cfg.oidc.client_id = TEST_AUD.to_string();
-            cfg.oidc.client_secret = "test-secret".to_string(); // secret-scan-allow: test fixture
-            cfg.oidc.redirect_uri = "http://localhost:8080/api/auth/oidc/callback".to_string();
-            cfg.oidc.roles_claim = "roles".to_string();
-            // init_with_config panics if called twice; we guard it with the
-            // OnceLock.  If another test already called it, we lose the set
-            // (the OnceLock guards ensure we only try once from this module).
-            let _ = std::panic::catch_unwind(|| {
-                crate::config_store::init_with_config("oidc-callback-test-config.json", &cfg);
-            });
-        });
+        let mut cfg = ryuki_core::config::RyukiConfig::default();
+        cfg.oidc.enabled = true;
+        cfg.oidc.issuer = TEST_ISS.to_string();
+        cfg.oidc.client_id = TEST_AUD.to_string();
+        cfg.oidc.client_secret = "test-secret".to_string(); // secret-scan-allow: test fixture
+        cfg.oidc.redirect_uri = "http://localhost:8080/api/auth/oidc/callback".to_string();
+        cfg.oidc.roles_claim = "roles".to_string();
+        crate::config_store::init_with_config("oidc-callback-test-config.json", &cfg);
     }
 
     // ─── Test router builder ──────────────────────────────────────────────

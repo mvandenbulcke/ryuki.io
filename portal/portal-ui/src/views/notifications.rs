@@ -133,15 +133,14 @@ pub fn NotificationBell() -> impl IntoView {
         // `visibilitychange` fires at the document and bubbles to the window
         // (HTML spec), so the window-level helper observes it in every engine
         // that can run this wasm bundle.
-        let visibility_listener =
-            window_event_listener_untyped("visibilitychange", move |_| {
-                if document_hidden() {
-                    stop_poll();
-                } else {
-                    unread.refetch();
-                    start_poll();
-                }
-            });
+        let visibility_listener = window_event_listener_untyped("visibilitychange", move |_| {
+            if document_hidden() {
+                stop_poll();
+            } else {
+                unread.refetch();
+                start_poll();
+            }
+        });
 
         // Component setup runs in the browser during hydration. If the tab is
         // already hidden (e.g. opened in the background) the listener starts

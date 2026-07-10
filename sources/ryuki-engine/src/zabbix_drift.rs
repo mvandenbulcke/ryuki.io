@@ -1,9 +1,7 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriftReport {
@@ -90,7 +88,7 @@ impl DriftStatus {
 /// RETURNING clause assigns the real UUID on INSERT) and does not touch any
 /// global store.
 pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 

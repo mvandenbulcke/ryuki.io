@@ -452,6 +452,7 @@ mod tests {
             iac_ref: "patch-maintenance@v1".to_string(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode: JobMode::OfflineDryRun,
         };
         let spec_digest = job_spec_digest(&spec);

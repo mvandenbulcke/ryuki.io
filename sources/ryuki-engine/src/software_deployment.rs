@@ -1,9 +1,7 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 static PACKAGE_STORE: OnceLock<Mutex<Vec<ApprovedPackage>>> = OnceLock::new();
 static DEPLOYMENT_STORE: OnceLock<Mutex<Vec<DeploymentRecord>>> = OnceLock::new();
@@ -516,7 +514,7 @@ pub fn get_deployment_history(server_name: &str) -> Vec<DeploymentRecord> {
 }
 
 pub fn get_package_compliance(site: &str) -> Result<Value, String> {
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -576,7 +574,7 @@ pub fn get_software_contract() -> Value {
         "liveExecutionAllowed": false,
         "supportedWorkflows": ["get-packages", "validate", "plan", "approve", "execute", "verify", "history", "compliance"],
         "validPackageTypes": ["msi", "exe", "apt", "rpm", "script"],
-        "validSites": ["DEFRA","GBLON","FRPAR","NLAMS","DEBER","DEFRA","FRPAR","GBLON","NLAMS","DEBER","GBLON","FRPAR","NLAMS"],
+        "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
         "requiredInputs": ["serverName", "packageId", "targetVersion", "requester"],
         "requiredGuards": ["package-approved", "server-online", "no-conflicting-deployments", "approval-route-assigned", "evidence-redacted"],
         "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "package-not-approved", "server-offline", "conflicting-deployment", "approval-missing", "evidence-not-redacted"],

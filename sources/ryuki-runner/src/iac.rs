@@ -25,6 +25,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 /// A bundle of IaC files for one offering.
 ///
@@ -49,6 +50,10 @@ const ZABBIX_ONBOARDING_PLAYBOOK: &str =
 /// Embedded Terraform IaC for the `linux-server-deployment` offering.
 const LINUX_SERVER_DEPLOYMENT_MAIN_TF: &str = include_str!("iac/linux-server-deployment/main.tf");
 
+/// Generated provider selections and checksums for Linux server deployment.
+const LINUX_SERVER_DEPLOYMENT_LOCK_HCL: &str =
+    include_str!("iac/linux-server-deployment/.terraform.lock.hcl");
+
 /// Embedded Ansible playbook for the `linux-server-deployment` offering.
 const LINUX_SERVER_DEPLOYMENT_PLAYBOOK: &str =
     include_str!("iac/linux-server-deployment/linux-server-deployment.yml");
@@ -56,6 +61,10 @@ const LINUX_SERVER_DEPLOYMENT_PLAYBOOK: &str =
 /// Embedded Terraform IaC for the `windows-server-deployment` offering.
 const WINDOWS_SERVER_DEPLOYMENT_MAIN_TF: &str =
     include_str!("iac/windows-server-deployment/main.tf");
+
+/// Generated provider selections and checksums for Windows server deployment.
+const WINDOWS_SERVER_DEPLOYMENT_LOCK_HCL: &str =
+    include_str!("iac/windows-server-deployment/.terraform.lock.hcl");
 
 /// Embedded Ansible playbook for the `controlled-restore-request` offering.
 const CONTROLLED_RESTORE_REQUEST_PLAYBOOK: &str =
@@ -131,7 +140,10 @@ const OFFERINGS: &[OfferingIac] = &[
     },
     OfferingIac {
         id: "linux-server-deployment",
-        terraform: &[("main.tf", LINUX_SERVER_DEPLOYMENT_MAIN_TF)],
+        terraform: &[
+            ("main.tf", LINUX_SERVER_DEPLOYMENT_MAIN_TF),
+            (".terraform.lock.hcl", LINUX_SERVER_DEPLOYMENT_LOCK_HCL),
+        ],
         ansible: &[(
             "linux-server-deployment.yml",
             LINUX_SERVER_DEPLOYMENT_PLAYBOOK,
@@ -141,7 +153,10 @@ const OFFERINGS: &[OfferingIac] = &[
     },
     OfferingIac {
         id: "windows-server-deployment",
-        terraform: &[("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF)],
+        terraform: &[
+            ("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF),
+            (".terraform.lock.hcl", WINDOWS_SERVER_DEPLOYMENT_LOCK_HCL),
+        ],
         ansible: &[],
         binding: VarBinding::ServerDeployment,
         live_secret_env: VSPHERE_LIVE_SECRET_ENV,
@@ -388,10 +403,76 @@ pub struct DeploymentInputs<'a> {
     pub metadata: &'a HashMap<String, String>,
 }
 
-/// Metadata keys passed through to module variables of the same name for the
-/// server-deployment offerings (placement inputs the request may carry).
-const SERVER_DEPLOYMENT_PASSTHROUGH: &[&str] =
-    &["network", "datacenter", "cluster", "datastore", "template"];
+/// Required vSphere placement keys. Intake payload keys, request metadata keys,
+/// rendered JobSpec vars, and Terraform variable names deliberately use these
+/// exact names so the live path has no translation layer that can drift.
+pub const SERVER_DEPLOYMENT_PLACEMENT_KEYS: &[&str] = &[
+    "datacenter",
+    "cluster",
+    "datastore",
+    "network",
+    "template",
+    "disk_size_gb",
+];
+
+/// A server-deployment JobSpec is not safe to submit to a live provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivePlacementError {
+    /// One or more required placement variables are absent or blank.
+    Missing(Vec<&'static str>),
+    /// `disk_size_gb` is present but is not a positive integer.
+    InvalidDiskSize,
+}
+
+impl fmt::Display for LivePlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(keys) => write!(
+                f,
+                "live server deployment is missing required placement variables: {}",
+                keys.join(", ")
+            ),
+            Self::InvalidDiskSize => write!(
+                f,
+                "live server deployment has invalid placement variable: disk_size_gb must be a positive integer"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LivePlacementError {}
+
+/// Fail closed before a live server-deployment JobSpec is dispatched. Offline
+/// validation intentionally does not call this gate: Terraform can validate a
+/// module with required-but-unassigned variables without contacting vSphere.
+pub fn validate_live_placement_vars(
+    offering_id: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), LivePlacementError> {
+    if !matches!(
+        lookup(offering_id).map(|offering| offering.binding),
+        Some(VarBinding::ServerDeployment)
+    ) {
+        return Ok(());
+    }
+
+    let missing: Vec<&'static str> = SERVER_DEPLOYMENT_PLACEMENT_KEYS
+        .iter()
+        .copied()
+        .filter(|key| vars.get(*key).is_none_or(|value| value.trim().is_empty()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(LivePlacementError::Missing(missing));
+    }
+
+    let disk_size = vars
+        .get("disk_size_gb")
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    if disk_size.is_none_or(|size| size == 0) {
+        return Err(LivePlacementError::InvalidDiskSize);
+    }
+    Ok(())
+}
 
 /// Render the Terraform variables (written as `ryuki.auto.tfvars.json`) for an
 /// offering from a request's logical inputs. PURE.
@@ -424,9 +505,9 @@ pub fn render_vars(inputs: &DeploymentInputs) -> BTreeMap<String, String> {
             vars.insert("site".to_string(), inputs.site.to_string());
             vars.insert("environment".to_string(), inputs.environment.to_string());
             vars.insert("request_id".to_string(), inputs.request_id.to_string());
-            for key in SERVER_DEPLOYMENT_PASSTHROUGH {
+            for key in SERVER_DEPLOYMENT_PLACEMENT_KEYS {
                 if let Some(value) = inputs.metadata.get(*key) {
-                    vars.insert((*key).to_string(), value.clone());
+                    vars.insert((*key).to_string(), value.trim().to_string());
                 }
             }
             vars
@@ -741,6 +822,18 @@ mod tests {
             content.contains("vmware/vsphere"),
             "linux-server-deployment main.tf must use vmware/vsphere provider source"
         );
+        assert!(
+            content.contains("version = \"2.16.1\""),
+            "linux-server-deployment must pin the reviewed vSphere provider version"
+        );
+        let (_, lock) = files
+            .iter()
+            .find(|(name, _)| *name == ".terraform.lock.hcl")
+            .expect("linux-server-deployment must embed its Terraform dependency lock");
+        assert!(lock.contains("version     = \"2.16.1\""));
+        assert!(lock.contains("constraints = \"2.16.1\""));
+        assert!(lock.contains("h1:"), "lock must include platform hashes");
+        assert!(lock.contains("zh:"), "lock must include release hashes");
         // Credentials are injected at apply time (TF_VAR_vsphere_password / the
         // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
         // the secret scan. Guard against regression of all three.
@@ -786,6 +879,18 @@ mod tests {
             content.contains("vmware/vsphere"),
             "windows-server-deployment main.tf must use vmware/vsphere provider source"
         );
+        assert!(
+            content.contains("version = \"2.16.1\""),
+            "windows-server-deployment must pin the reviewed vSphere provider version"
+        );
+        let (_, lock) = files
+            .iter()
+            .find(|(name, _)| *name == ".terraform.lock.hcl")
+            .expect("windows-server-deployment must embed its Terraform dependency lock");
+        assert!(lock.contains("version     = \"2.16.1\""));
+        assert!(lock.contains("constraints = \"2.16.1\""));
+        assert!(lock.contains("h1:"), "lock must include platform hashes");
+        assert!(lock.contains("zh:"), "lock must include release hashes");
         // Credentials are injected at apply time (TF_VAR_vsphere_password / the
         // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
         // the secret scan. Guard against regression of all three.
@@ -1041,7 +1146,12 @@ mod tests {
     #[test]
     fn render_vars_binds_server_deployment_inputs() {
         let metadata = HashMap::from([
+            ("datacenter".to_string(), "DC-PROD".to_string()),
+            ("cluster".to_string(), "Compute-01".to_string()),
+            ("datastore".to_string(), "Datastore-01".to_string()),
             ("network".to_string(), "VLAN-210".to_string()),
+            ("template".to_string(), "rhel-9-approved".to_string()),
+            ("disk_size_gb".to_string(), " 80 ".to_string()),
             ("unmapped".to_string(), "ignored".to_string()),
         ]);
         let vars = render_vars(&DeploymentInputs {
@@ -1063,10 +1173,69 @@ mod tests {
             Some("production")
         );
         assert_eq!(vars.get("request_id").map(String::as_str), Some("req-1"));
-        assert_eq!(vars.get("network").map(String::as_str), Some("VLAN-210"));
+        for (key, expected) in [
+            ("datacenter", "DC-PROD"),
+            ("cluster", "Compute-01"),
+            ("datastore", "Datastore-01"),
+            ("network", "VLAN-210"),
+            ("template", "rhel-9-approved"),
+            ("disk_size_gb", "80"),
+        ] {
+            assert_eq!(vars.get(key).map(String::as_str), Some(expected));
+        }
+        assert_eq!(
+            validate_live_placement_vars("linux-server-deployment", &vars),
+            Ok(())
+        );
         assert!(
             !vars.contains_key("unmapped"),
             "non-allow-listed metadata must not pass through for a bound offering"
+        );
+    }
+
+    #[test]
+    fn live_server_deployment_rejects_missing_placement() {
+        let vars = BTreeMap::from([("datacenter".to_string(), "DC-PROD".to_string())]);
+        let error = validate_live_placement_vars("linux-server-deployment", &vars)
+            .expect_err("partial placement must fail closed");
+
+        assert_eq!(
+            error,
+            LivePlacementError::Missing(vec![
+                "cluster",
+                "datastore",
+                "network",
+                "template",
+                "disk_size_gb",
+            ])
+        );
+        assert!(error
+            .to_string()
+            .contains("missing required placement variables"));
+    }
+
+    #[test]
+    fn live_server_deployment_rejects_invalid_disk_size() {
+        let vars = BTreeMap::from([
+            ("datacenter".to_string(), "DC-PROD".to_string()),
+            ("cluster".to_string(), "Compute-01".to_string()),
+            ("datastore".to_string(), "Datastore-01".to_string()),
+            ("network".to_string(), "VLAN-210".to_string()),
+            ("template".to_string(), "rhel-9-approved".to_string()),
+            ("disk_size_gb".to_string(), "zero".to_string()),
+        ]);
+
+        assert_eq!(
+            validate_live_placement_vars("windows-server-deployment", &vars),
+            Err(LivePlacementError::InvalidDiskSize)
+        );
+    }
+
+    #[test]
+    fn live_placement_gate_ignores_non_server_offerings() {
+        assert_eq!(
+            validate_live_placement_vars("patch-maintenance", &BTreeMap::new()),
+            Ok(())
         );
     }
 

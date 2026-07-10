@@ -231,13 +231,13 @@ impl AgentConfig {
 
         let platform = require(&get, "RYUKI_AGENT_PLATFORM")?;
         // platform is interpolated into URL path segments, so constrain it to a
-        // safe slug (alphanumeric, '-', '_') — no slashes, spaces, or other
+        // safe slug (alphanumeric, '.', '-', '_') — no slashes, spaces, or other
         // characters that could alter the request path.
         if !is_slug(&platform) {
             return Err(ConfigError::InvalidEnv {
                 var: "RYUKI_AGENT_PLATFORM",
                 value: platform,
-                reason: "must be a slug: ASCII alphanumeric, '-' or '_' only".to_owned(),
+                reason: "must be a slug: ASCII alphanumeric, '.', '-' or '_' only".to_owned(),
             });
         }
 
@@ -390,11 +390,11 @@ fn is_loopback_url(url: &str) -> bool {
         .any(|h| authority == *h || authority.starts_with(&format!("{h}:")))
 }
 
-/// True if `s` is a non-empty ASCII slug (alphanumeric, '-' or '_').
+/// True if `s` is a non-empty ASCII slug (alphanumeric, '.', '-' or '_').
 fn is_slug(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 fn optional_u64(
@@ -599,6 +599,18 @@ mod tests {
             ),
             "platform with a slash must be rejected"
         );
+    }
+
+    #[test]
+    fn accepts_custom_site_platform_with_dot() {
+        let cfg = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "DC.EU-01"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+        ]))
+        .expect("custom site codes containing dots must be valid agent platforms");
+
+        assert_eq!(cfg.platform, "DC.EU-01");
     }
 
     #[test]

@@ -1,9 +1,6 @@
-<svg role="img" aria-label="Ryuki logo — the coiled ryū guarding its pearl" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-  <style>:root{--r:#8B0000;--g:#d4a017}@media (prefers-color-scheme:dark){:root{--r:#c0392b;--g:#FFD700}}</style>
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--r)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--r)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--r)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--r)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--g)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--g)"/>
+<svg role="img" aria-label="Ryuki Closed Orbit mark — three governed rails around one witnessed pearl" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <path fill="#ece4d2" d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z"/>
+  <path fill="#ece4d2" d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z" transform="rotate(120 50 50)"/>
+  <path fill="#ece4d2" d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z" transform="rotate(240 50 50)"/>
+  <circle cx="50" cy="50" r="9" fill="#e45525"/>
 </svg>

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 const CATALOG_PATH: &str = "catalog/hardware-lifecycle-contract.yaml";
-const PROGRAM_PATH: &str = "api/Ryuki.Platform.Api/Program.cs";
+const PROGRAM_PATH: &str = "sources/ryuki-api/src/contracts.rs";
 const API_README_PATH: &str = "api/Ryuki.Platform.Api/README.md";
 const DOC_PATH: &str = "docs/workflows/hardware-lifecycle.md";
 const ENDPOINT: &str = "/api/operations/hardware-lifecycle-contract";
@@ -279,7 +279,9 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
         CATALOG_PATH,
         &mut errors,
     );
-    scan_prohibited_value(&Value::String(context.program), PROGRAM_PATH, &mut errors);
+    // `program` is the shared Rust API source. Safety validation above extracts
+    // this endpoint's payload; scanning the whole monolith would attribute
+    // unrelated endpoint fixtures to this contract.
     scan_prohibited_value(
         &Value::String(context.api_readme),
         API_README_PATH,
@@ -629,6 +631,7 @@ fn validate_program_text(program: &str, _catalog: &Value, errors: &mut Vec<Strin
     ) else {
         return;
     };
+    scan_prohibited_value(&payload, PROGRAM_PATH, errors);
     expect(
         payload.get("lifecycleMode").and_then(Value::as_str) == Some("metadata-only"),
         errors,
@@ -2014,6 +2017,51 @@ mod tests {
 
         assert!(stripped.contains("https://provider.example.invalid/path"));
         assert!(!stripped.contains("comment"));
+    }
+
+    #[test]
+    fn url_detection_covers_single_letter_schemes() {
+        assert!(contains_url("h://s"));
+        assert!(contains_url("https://provider.example.invalid/path"));
+    }
+
+    #[test]
+    fn program_validation_ignores_unrelated_private_ip_fixtures() {
+        let program = r#"
+            fn unrelated_test() { let _fixture = "10.0.0.1"; }
+            fn operations_hardware_lifecycle() -> Json<Value> {
+                Json(json!({"source":"static-seed","lifecycleMode":"metadata-only","providerCallsEnabled":false}))
+            }
+            fn routes() { Router::new().route("/api/operations/hardware-lifecycle-contract", get(operations_hardware_lifecycle)); }
+        "#;
+        let mut errors = Vec::new();
+
+        validate_program_text(program, &Value::Null, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn program_validation_rejects_prohibited_values_in_endpoint_payload() {
+        let program = r#"
+            fn operations_hardware_lifecycle() -> Json<Value> {
+                Json(json!({
+                    "source":"static-seed",
+                    "lifecycleMode":"metadata-only",
+                    "providerCallsEnabled":false,
+                    "callback":"x://sensitive-target"
+                }))
+            }
+            fn routes() { Router::new().route("/api/operations/hardware-lifecycle-contract", get(operations_hardware_lifecycle)); }
+        "#;
+        let mut errors = Vec::new();
+
+        validate_program_text(program, &Value::Null, &mut errors);
+
+        assert!(
+            errors.iter().any(|error| error.contains("prohibited")),
+            "{errors:?}"
+        );
     }
 
     #[test]

@@ -13,17 +13,16 @@ use crate::api::{
     admin_tokens_path, admin_worker_capability_path, approval_decision_readiness_path,
     approvals_pending_path, auth_entra_authorize_url_path, auth_local_login_path,
     auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
-    boundary_status_path,
-    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
-    cluster_capacity_admission_path, cmdb_export_path, cmdb_file_exchange_path, cmdb_import_path,
-    cmdb_reconcile_path, cmdb_reconciliation_path, cmdb_relationship_graph_path,
-    datacenter_check_cooling_path, datacenter_check_power_path, datacenter_check_rack_space_path,
-    datacenter_check_switchports_path, datacenter_failing_checks_path,
-    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
-    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
-    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
-    hardware_inventory_path, integrations_path, inventory_ownership_risk_path,
-    inventory_resource_overview_path,
+    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
+    catalog_request_form_path, cluster_capacity_admission_path, cmdb_export_path,
+    cmdb_file_exchange_path, cmdb_import_path, cmdb_reconcile_path, cmdb_reconciliation_path,
+    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
+    datacenter_check_rack_space_path, datacenter_check_switchports_path,
+    datacenter_failing_checks_path, datacenter_full_readiness_path,
+    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
+    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
+    evidence_export_retention_path, evidence_summary_path, hardware_inventory_path,
+    integrations_path, inventory_ownership_risk_path, inventory_resource_overview_path,
     notifications_path, notifications_read_all_path, notifications_unread_count_path,
     operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
     platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
@@ -44,8 +43,8 @@ use crate::api::{
 // `test` build (no ssr feature) free of unused-import warnings.
 #[cfg(feature = "ssr")]
 use crate::api::{
-    integration_id_path, integration_test_path, request_approve_live_apply_path,
-    request_execution_job_path,
+    admin_agent_job_result_path, integration_id_path, integration_test_path,
+    request_approve_live_apply_path, request_execution_job_path,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -67,11 +66,11 @@ use crate::models::{
     evidence_compliance_fallback, evidence_pack_directory_from_rows, evidence_retention_fallback,
     hardware_inventory_fallback, offering_catalog_fallback, platform_health_fallback,
     platform_status_fallback, platform_summary_context_fallback, rbac_role_catalog_fallback,
-    servicenow_queue_fallback, shift_queue_fallback, ApiAdminSessionList, ApiAdminTokenList,
-    ApiAuditTrail, ApiCmdbReconcileReport, ApiEvidenceComplianceContract, ApiEvidencePack,
-    ApiEvidenceRetentionContract, ApiExecutionJob, ApiLoginSession, ApiOfferingCatalog,
-    ApiPlatformSummary, ApiRbacRole, ApiRequestDetail, ApiRequestSummary, ApiServiceNowQueue,
-    ApiShiftItemsPage, ApiShiftSummary, HardwareAssetSummary,
+    servicenow_queue_fallback, shift_queue_fallback, ApiAdminAgentJobResult, ApiAdminSessionList,
+    ApiAdminTokenList, ApiAuditTrail, ApiCmdbReconcileReport, ApiEvidenceComplianceContract,
+    ApiEvidencePack, ApiEvidenceRetentionContract, ApiExecutionJob, ApiLoginSession,
+    ApiOfferingCatalog, ApiPlatformSummary, ApiRbacRole, ApiRequestDetail, ApiRequestSummary,
+    ApiServiceNowQueue, ApiShiftItemsPage, ApiShiftSummary, HardwareAssetSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -85,15 +84,14 @@ use crate::models::{
     AgentSummary, AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbActionResult,
     CmdbFileExchangeSummary, CmdbReconciliationSnapshot, CmdbReconciliationSummary,
     CmdbRelationshipSummary, CreateIntegrationPayload, CreateRequestPayload, CreateTokenPayload,
-    CreateTokenResult,
-    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
-    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
-    EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot, EvidencePackExport,
-    EvidenceRetentionSnapshot, EvidenceSummary, ExecutionJob, HardwareInventorySnapshot,
-    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, NotificationSummary,
-    OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth, PlatformSettingsSummary,
-    PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome,
-    RbacRoleCatalogSnapshot, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
+    CreateTokenResult, DatacenterFailingChecksSummary, DatacenterFullReadiness,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
+    DryRunPlanSummary, EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot,
+    EvidencePackExport, EvidenceRetentionSnapshot, EvidenceSummary, ExecutionJob,
+    HardwareInventorySnapshot, IntegrationSummary, IntegrationTestResult, InventoryResourceSummary,
+    NotificationSummary, OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth,
+    PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
+    PolicyOutcome, RbacRoleCatalogSnapshot, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
     RequestSummary, RevokeResult, SecretReferenceSummary, ServiceNowQueueSnapshot,
     ShiftQueueSnapshot, StageActionResponse, UpdateIntegrationPayload,
 };
@@ -459,6 +457,21 @@ fn is_allowed_admin_agent_revoke_path(path: &str) -> bool {
     matches!((segments.next(), segments.next()), (Some("revoke"), None))
 }
 
+/// Validates `/api/admin/agents/jobs/{job_id}/result`. This read is used only
+/// to hydrate the server-derived, digest-bound LivePlan projection; the portal
+/// never requests raw evidence or accepts an arbitrary admin path.
+fn is_allowed_admin_agent_job_result_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/admin/agents/jobs/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(job_id) = segments.next() else {
+        return false;
+    };
+    is_safe_dynamic_path_segment(job_id)
+        && matches!((segments.next(), segments.next()), (Some("result"), None))
+}
+
 /// Validates `/api/notifications/{id}/read` — the per-item mark-read path, which
 /// carries a notification id and a static `read` suffix and so cannot live in the
 /// static allowlist. Only a single safe id segment is accepted, and the suffix
@@ -590,6 +603,18 @@ impl PortalServerBoundary {
     ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if is_allowed_admin_agent_revoke_path(guarded) {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    /// Validates the admin-only safe job-result projection read.
+    pub fn validate_admin_agent_job_result_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_admin_agent_job_result_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -1868,7 +1893,7 @@ pub async fn save_platform_settings(
             return Err(ServerFnError::new(api_error_text(
                 &response,
                 "admin platform settings fetch failed",
-            )))
+            )));
         }
         Err(_) => return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE)),
     };
@@ -2240,9 +2265,7 @@ pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = boundary
         .validate_platform_api_path(auth_entra_authorize_url_path())
-        .map_err(|_| {
-            ServerFnError::new("entra authorize URL API path failed same-origin guard")
-        })?;
+        .map_err(|_| ServerFnError::new("entra authorize URL API path failed same-origin guard"))?;
     let upstream = upstream_context();
     if !upstream.live() {
         // Static demo builds have no IdP to hand the browser to.
@@ -2798,7 +2821,32 @@ pub async fn get_request_execution_job(
     let api_job: ApiExecutionJob = response
         .json()
         .map_err(|_| ServerFnError::new("execution-job response was malformed"))?;
-    Ok(Some(ExecutionJob::from(api_job)))
+    let job_id = api_job.agent_job_id.clone();
+    let mut job = ExecutionJob::from(api_job);
+
+    // The request-scoped read intentionally carries no plan body. For a
+    // completed successful LivePlan, ask the admin-only result endpoint for its
+    // safe server-derived projection. Any 403/404/malformed response leaves the
+    // review absent, which also keeps live-apply approval hidden fail-closed.
+    if job.is_successful_live_plan() {
+        if let Ok(result_path) = admin_agent_job_result_path(&job_id) {
+            if boundary
+                .validate_admin_agent_job_result_path(&result_path)
+                .is_ok()
+            {
+                if let Ok(result_response) = upstream.get(&result_path, session_id.as_deref()).await
+                {
+                    if result_response.is_success() {
+                        if let Ok(result) = result_response.json::<ApiAdminAgentJobResult>() {
+                            job = job.with_live_plan_review(result.plan_review);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Some(job))
 }
 
 #[cfg(any(feature = "ssr", test))]
@@ -3617,8 +3665,7 @@ pub async fn get_servicenow_publish_queue() -> Result<ServiceNowQueueSnapshot, S
 /// that is unreachable surfaces an error so the view renders an explicit
 /// degraded state rather than a fabricated report.
 #[server(prefix = "/portal/api", endpoint = "cmdb-reconciliation-report")]
-pub async fn get_cmdb_reconciliation_report(
-) -> Result<CmdbReconciliationSnapshot, ServerFnError> {
+pub async fn get_cmdb_reconciliation_report() -> Result<CmdbReconciliationSnapshot, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = boundary
         .validate_platform_api_path(cmdb_reconcile_path())
@@ -3674,7 +3721,7 @@ pub async fn get_shift_queue_overview() -> Result<ShiftQueueSnapshot, ServerFnEr
             return Err(ServerFnError::new(api_error_text(
                 &response,
                 "shift summary fetch failed",
-            )))
+            )));
         }
         // Live mode never substitutes preview items for an unreachable API;
         // the Operations view renders an explicit degraded state instead.
@@ -3694,7 +3741,7 @@ pub async fn get_shift_queue_overview() -> Result<ShiftQueueSnapshot, ServerFnEr
             return Err(ServerFnError::new(api_error_text(
                 &response,
                 "shift items fetch failed",
-            )))
+            )));
         }
         Err(_) => return Err(ServerFnError::new("API unreachable")),
     };
@@ -3793,8 +3840,8 @@ pub async fn get_evidence_retention_contract() -> Result<EvidenceRetentionSnapsh
 /// API that is unreachable surfaces an error so the Evidence view renders an
 /// explicit degraded state rather than a stale contract.
 #[server(prefix = "/portal/api", endpoint = "evidence-compliance-contract-data")]
-pub async fn get_evidence_compliance_contract(
-) -> Result<EvidenceComplianceSnapshot, ServerFnError> {
+pub async fn get_evidence_compliance_contract() -> Result<EvidenceComplianceSnapshot, ServerFnError>
+{
     let boundary = PortalServerBoundary::static_dry_run();
     let path = boundary
         .validate_platform_api_path(evidence_compliance_dashboard_path())
@@ -4868,6 +4915,34 @@ mod tests {
         assert!(admin_agent_revoke_path("").is_err());
         assert!(admin_agent_revoke_path("..").is_err());
         assert!(admin_agent_revoke_path("a/b").is_err());
+    }
+
+    #[test]
+    fn boundary_allows_only_the_exact_admin_job_result_read() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let id = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+        let path =
+            crate::api::admin_agent_job_result_path(id).expect("admin job result path must build");
+        assert_eq!(
+            boundary.validate_admin_agent_job_result_path(&path),
+            Ok(path.as_str())
+        );
+
+        for unsafe_path in [
+            "/api/admin/agents/jobs",
+            "/api/admin/agents/jobs/id",
+            "/api/admin/agents/jobs/id/state",
+            "/api/admin/agents/jobs/id/result/extra",
+            "/api/admin/agents/jobs/../result",
+            "/api/admin/agents/jobs/id?x=1/result",
+            "/api/admin/agents/id/result",
+        ] {
+            assert_eq!(
+                boundary.validate_admin_agent_job_result_path(unsafe_path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {unsafe_path} must be rejected"
+            );
+        }
     }
 
     #[test]

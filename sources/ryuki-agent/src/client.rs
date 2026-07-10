@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use ryuki_protocol::{AgentRegistration, Job};
+use ryuki_protocol::{AgentHeartbeat, AgentHeartbeatResponse, AgentRegistration, Job, JobLease};
 
 // ---------------------------------------------------------------------------
 // Wire types mirroring ryuki-api/src/agents.rs
@@ -60,12 +60,6 @@ impl std::fmt::Debug for RegisterResponse {
 struct AckBody {
     pub attempt_id: Uuid,
     pub fencing_token: String,
-}
-
-/// Mirrors `agents::HeartbeatBody` exactly.
-#[derive(Debug, Serialize)]
-struct HeartbeatBody {
-    pub running_job_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +139,7 @@ fn parse_advertised_protocol_version(body: &serde_json::Value) -> Result<u32, Cl
 /// Authenticated control-plane HTTP client.
 ///
 /// All methods append to `base_url`; the URL is stored without a trailing slash.
+#[derive(Clone)]
 pub struct CpClient {
     http: Client,
     base_url: String,
@@ -261,13 +256,30 @@ impl CpClient {
 
     /// POST /api/agents/{agent_id}/heartbeat
     ///
-    /// `running_job_id` is `None` if the agent is idle (no active job).
-    pub async fn heartbeat(&self, running_job_id: Option<Uuid>) -> Result<(), ClientError> {
+    /// Send an idle agent heartbeat. Running jobs use [`Self::renew_lease`]
+    /// because a job id without its exact fencing material must never extend a
+    /// lease.
+    pub async fn heartbeat(&self) -> Result<(), ClientError> {
         let url = format!("{}/api/agents/{}/heartbeat", self.base_url, self.agent_id);
-        let body = HeartbeatBody { running_job_id };
+        let body = AgentHeartbeat::idle();
         let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
         require_2xx(resp).await?;
         Ok(())
+    }
+
+    /// Renew an acknowledged running job lease using its full ownership fence.
+    /// A stale/expired/superseded lease receives a non-2xx response and callers
+    /// must stop execution rather than treating this as a best-effort heartbeat.
+    pub async fn renew_lease(
+        &self,
+        job_id: Uuid,
+        lease: &JobLease,
+    ) -> Result<AgentHeartbeatResponse, ClientError> {
+        let url = format!("{}/api/agents/{}/heartbeat", self.base_url, self.agent_id);
+        let body = AgentHeartbeat::renewing(job_id, lease);
+        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let resp = require_2xx(resp).await?;
+        Ok(resp.json().await?)
     }
 
     /// GET /api/agents/cp-public-key
@@ -437,8 +449,23 @@ mod tests {
 
     #[test]
     fn advertised_version_valid_is_returned() {
-        let body = serde_json::json!({ "public_key": "abc", "protocol_version": 1 });
-        assert_eq!(parse_advertised_protocol_version(&body).unwrap(), 1);
+        let body = serde_json::json!({
+            "public_key": "abc",
+            "protocol_version": ryuki_protocol::PROTOCOL_VERSION
+        });
+        assert_eq!(
+            parse_advertised_protocol_version(&body).unwrap(),
+            ryuki_protocol::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_v1_is_not_supported_after_state_isolation_upgrade() {
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION_LEGACY, 1);
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&1));
+        assert!(
+            ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
+        );
     }
 
     #[test]
@@ -546,18 +573,27 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_body_serialises_none_and_some() {
-        let idle = HeartbeatBody {
-            running_job_id: None,
-        };
+    fn heartbeat_body_serialises_idle_and_exact_renewal_fence() {
+        let idle = AgentHeartbeat::idle();
         let json = serde_json::to_value(&idle).expect("serialise");
         assert!(json["running_job_id"].is_null());
+        assert!(json["attempt_id"].is_null());
+        assert!(json["lease_generation"].is_null());
+        assert!(json["fencing_token"].is_null());
 
-        let running = HeartbeatBody {
-            running_job_id: Some(Uuid::nil()),
+        let lease = JobLease {
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 7,
+            fencing_token: "fence-exact".to_owned(),
+            deadline: Utc::now() + chrono::Duration::minutes(5),
+            cp_nonce: Uuid::new_v4().to_string(),
         };
+        let running = AgentHeartbeat::renewing(Uuid::nil(), &lease);
         let json = serde_json::to_value(&running).expect("serialise");
         assert_eq!(json["running_job_id"], serde_json::json!(Uuid::nil()));
+        assert_eq!(json["attempt_id"], serde_json::json!(lease.attempt_id));
+        assert_eq!(json["lease_generation"], serde_json::json!(7));
+        assert_eq!(json["fencing_token"], serde_json::json!("fence-exact"));
     }
 
     /// Verify that a `Job` body returned by the CP deserialises correctly via
@@ -570,6 +606,7 @@ mod tests {
             iac_ref: "linux-server-deployment@v1".to_owned(),
             iac_digest: "a".repeat(64),
             vars: BTreeMap::new(),
+            state_key: Some("request-test".to_string()),
             mode: JobMode::OfflineDryRun,
         };
         let lease = JobLease {

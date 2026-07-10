@@ -1,8 +1,6 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn supported_distro_catalog() -> Vec<LinuxDistroInfo> {
     vec![
@@ -175,7 +173,7 @@ pub fn plan_linux_deployment(
     network: &str,
     hardening_profile: HardeningProfile,
 ) -> Result<LinuxDeploymentRequest, String> {
-    if site.is_empty() || !VALID_SITES.contains(&site) {
+    if site.is_empty() || !site_registry::is_valid_site(site) {
         return Err(format!("Unknown or empty site: {}", site));
     }
     if hostname.is_empty() {
@@ -297,10 +295,13 @@ pub fn validate_linux_deployment(
         errors.push("Missing site".into());
         failed_rules.push("p0-site-required".into());
         remediation.push("Provide a valid site code.".into());
-    } else if !VALID_SITES.contains(&request.site.as_str()) {
+    } else if !site_registry::is_valid_site(&request.site) {
         errors.push(format!("Unknown site: {}", request.site));
         failed_rules.push("p0-site-ou-catalog-match".into());
-        remediation.push(format!("Select a known site from: {:?}", VALID_SITES));
+        remediation.push(format!(
+            "Select an active site from: {:?}",
+            site_registry::get_active_site_codes().unwrap_or_default()
+        ));
     }
 
     if request.hostname.is_empty() {

@@ -711,7 +711,9 @@ mod storage_provisioning_db_tests {
             .expect("list_volumes DEFRA failed");
         assert_eq!(defra.len(), 2, "DEFRA has 2 seeded volumes");
         assert_eq!(
-            count_volumes(&db, "DEFRA").await.expect("count_volumes DEFRA"),
+            count_volumes(&db, "DEFRA")
+                .await
+                .expect("count_volumes DEFRA"),
             2,
             "#14: site-filtered count matches the site page"
         );
@@ -721,7 +723,10 @@ mod storage_provisioning_db_tests {
         let page1 = list_volumes(&db, "", 3, 0).await.expect("page1");
         let page2 = list_volumes(&db, "", 3, 3).await.expect("page2");
         assert_eq!(page1.len(), 3, "LIMIT 3 bounds the first page");
-        assert!(!page2.is_empty() && page2.len() <= 3, "second page continues");
+        assert!(
+            !page2.is_empty() && page2.len() <= 3,
+            "second page continues"
+        );
         assert!(
             page1.iter().all(|v| page2.iter().all(|w| w.id != v.id)),
             "offset page is disjoint from the first (stable id order)"

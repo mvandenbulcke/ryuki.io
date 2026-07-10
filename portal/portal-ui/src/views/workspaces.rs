@@ -15,25 +15,23 @@ use crate::api_client::{
 };
 use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, catalog_contract_fallbacks,
-    catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session,
-    normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
-    rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
-    AdminTokenSummary, AgentSummary, ApiRbacRole, AuditEventRow, AuthSession, CatalogOffering,
-    CmdbActionResult, CmdbCiDrift, CmdbReconciliationSnapshot, CreateTokenPayload,
-    EvidenceComplianceSnapshot, EvidencePackDirectorySnapshot, EvidencePackRef,
-    EvidenceRetentionSnapshot, HardwareAssetSummary, HardwareInventorySnapshot,
-    OfferingCatalogSnapshot, PlatformSettingsSummary, RbacRoleCatalogSnapshot,
-    ServiceNowQueueItem, ServiceNowQueueSnapshot, ShiftQueueItem, ShiftQueueSnapshot,
-    ALL_APP_ROLES,
+    catalog_readiness_fallbacks, condense_timestamp, degraded_auth_session, normalize_api_stage,
+    operation_run_fallbacks, platform_settings_summary_fallback, rbac_role_summary_fallbacks,
+    request_intake_form_fallback, AdminSessionSummary, AdminTokenSummary, AgentSummary,
+    ApiRbacRole, AuditEventRow, AuthSession, CatalogOffering, CmdbActionResult, CmdbCiDrift,
+    CmdbReconciliationSnapshot, CreateTokenPayload, EvidenceComplianceSnapshot,
+    EvidencePackDirectorySnapshot, EvidencePackRef, EvidenceRetentionSnapshot,
+    HardwareAssetSummary, HardwareInventorySnapshot, OfferingCatalogSnapshot,
+    PlatformSettingsSummary, RbacRoleCatalogSnapshot, ServiceNowQueueItem, ServiceNowQueueSnapshot,
+    ShiftQueueItem, ShiftQueueSnapshot, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
     get_admin_agents, get_admin_platform_settings, get_admin_rbac_roles, get_auth_session,
     get_boundary_status, get_catalog_offerings, get_cmdb_reconciliation_report,
-    get_evidence_compliance_contract, get_evidence_pack_directory,
-    get_evidence_retention_contract, get_hardware_inventory, get_platform_health,
-    get_platform_status, get_servicenow_publish_queue, get_shift_queue_overview,
-    load_admin_sessions, load_admin_tokens,
+    get_evidence_compliance_contract, get_evidence_pack_directory, get_evidence_retention_contract,
+    get_hardware_inventory, get_platform_health, get_platform_status, get_servicenow_publish_queue,
+    get_shift_queue_overview, load_admin_sessions, load_admin_tokens,
     load_portal_activity_run_state, load_portal_evidence_summary_status,
     load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
     revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
@@ -151,18 +149,27 @@ pub fn DashboardWorkspaceView() -> impl IntoView {
     view! {
         <section class="hero" aria-labelledby="dashboard-title">
             <div>
-                <span class="eyebrow">"Dashboard"</span>
-                <h1 id="dashboard-title">"Operational control plane"</h1>
+                <span class="eyebrow">"Control room / witnessed state"</span>
+                <h1 id="dashboard-title">"Change control, at a glance."</h1>
                 <p>
-                    "Safe summaries for platform health, readiness, protected workloads, monitoring coverage, and blocked execution."
+                    "One operator view for what is healthy, what needs a decision, and what cannot execute."
                 </p>
             </div>
             <a class="primary-action" href=activity_href>{activity_action_label}</a>
         </section>
 
         <DashboardView/>
-        <div class="workspace-area">
-            <WorkspaceSummaryCards/>
+        <div class="workspace-area dashboard-workspace-area">
+            <details class="workspace-directory">
+                <summary>
+                    <span>
+                        <span class="eyebrow">"Workspace registry"</span>
+                        <strong>"Open a specialist control room"</strong>
+                    </span>
+                    <small>"Role-filtered routes / expand"</small>
+                </summary>
+                <WorkspaceSummaryCards/>
+            </details>
         </div>
     }
 }

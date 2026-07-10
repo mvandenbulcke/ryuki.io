@@ -1,8 +1,6 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn generate_backup_coverage_report(
     site_scope: &[String],
@@ -13,7 +11,7 @@ pub fn generate_backup_coverage_report(
     }
 
     for site in site_scope {
-        if !VALID_SITES.contains(&site.as_str()) {
+        if !site_registry::is_valid_site(site) {
             return Err(format!("Unknown site in scope: {}", site));
         }
     }
@@ -97,7 +95,7 @@ pub fn plan_restore(
     if restore_point.is_empty() {
         return Err("restore_point cannot be empty".into());
     }
-    if !VALID_SITES.contains(&target_site) {
+    if !site_registry::is_valid_site(target_site) {
         return Err(format!("Unknown site: {}", target_site));
     }
 
@@ -237,6 +235,21 @@ pub fn execute_restore(restore: &RestoreRequest) -> Result<Vec<EvidenceItem>, St
 mod tests {
     use super::*;
 
+    fn register_backup_test_site(code: &str, active: bool) {
+        site_registry::upsert_site(
+            site_registry::SiteEntry {
+                unlocode: code.into(),
+                name: format!("Backup test site {code}"),
+                country: "Test country".into(),
+                country_code: "ZZ".into(),
+                timezone: "UTC".into(),
+                active,
+            },
+            site_registry::SiteCodeSystem::Custom,
+        )
+        .unwrap();
+    }
+
     fn make_site_scope() -> Vec<String> {
         vec!["DEFRA".into(), "GBLON".into()]
     }
@@ -260,6 +273,29 @@ mod tests {
     #[test]
     fn test_generate_report_unknown_site_fails() {
         assert!(generate_backup_coverage_report(&["UNKNOWN".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn registered_custom_site_is_admitted_but_inactive_and_unknown_sites_are_rejected() {
+        const ACTIVE: &str = "LEGACY-BACKUP-ACTIVE";
+        const INACTIVE: &str = "LEGACY-BACKUP-INACTIVE";
+        register_backup_test_site(ACTIVE, true);
+        register_backup_test_site(INACTIVE, false);
+
+        assert!(generate_backup_coverage_report(&[ACTIVE.into()], &[]).is_ok());
+        assert!(
+            plan_restore(
+                "ci-custom-001",
+                RestoreType::FullVm,
+                "2026-07-10T00:00:00Z",
+                ACTIVE,
+                "test",
+                "backup-test",
+            )
+            .is_ok()
+        );
+        assert!(generate_backup_coverage_report(&[INACTIVE.into()], &[]).is_err());
+        assert!(generate_backup_coverage_report(&["LEGACY-BACKUP-UNKNOWN".into()], &[]).is_err());
     }
 
     #[test]

@@ -114,32 +114,15 @@ fn write_opt_str(buf: &mut Vec<u8>, value: &Option<String>) {
     }
 }
 
-/// Append an `Option<Uuid>` to the VLC signing buffer using an
-/// ASYMMETRIC encoding that is DELIBERATELY DIFFERENT from
-/// [`write_opt_str`]'s presence-tag scheme:
+/// Append an `Option<Uuid>` to the VLC signing buffer using the established
+/// asymmetric step-binding encoding:
 ///
 ///   `None`    → appends NOTHING (zero bytes).
 ///   `Some(u)` → `0x01 || u64_le(len) || hyphenated-uuid-bytes`.
 ///
-/// This is the load-bearing trick that makes `step_job_id: None` grants sign
-/// to EXACTLY the same bytes as a `VerifiedLiveContext` built before this
-/// field existed: `signing_bytes_vlc` calls this fn last, so when the value
-/// is `None` the function is a no-op and the buffer produced is
-/// byte-for-byte what the pre-`step_job_id` code produced for the same
-/// `request_id`/`approved_plan_digest`/`approver`/`expiry`. A real presence
-/// tag (like [`write_opt_str`] uses for `SignedEnvelope::approved_plan_digest`)
-/// would append a `0x00` byte even when absent, which changes the signed
-/// bytes for every existing grant and breaks byte-for-byte backward
-/// compatibility — that trade-off is fine for `SignedEnvelope` (that field
-/// was introduced together with a `ryuki-v1` → `ryuki-v2` domain-separator
-/// bump, so old v1 signatures are recognised as a DIFFERENT domain rather
-/// than silently reinterpreted) but is NOT acceptable here: slice A's
-/// contract is "existing single-job grants verify unchanged," with no domain
-/// bump. `Some(u)` still starts with `0x01` (never `0x00`), so a byte stream
-/// that ends in a `Some` value can never be confused with one that ends
-/// after `expiry` with no step_job_id field at all — the two cases are
-/// distinguished by length, and no valid `Some` encoding is a prefix of the
-/// `None` (empty) encoding.
+/// `None` contributes no trailing bytes; `Some(u)` begins with `0x01`, so a
+/// step-bound v2 grant cannot be confused with a whole-request v2 grant. The
+/// v2 VLC domain separately prevents compatibility with pre-v2 grants.
 #[inline]
 fn write_opt_uuid(buf: &mut Vec<u8>, value: &Option<uuid::Uuid>) {
     if let Some(u) = value {
@@ -261,22 +244,18 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// Returns the canonical bytes for a [`VerifiedLiveContext`].
 ///
 /// Field order (fixed):
-/// domain, request_id, approved_plan_digest, approver, expiry, step_job_id.
+/// domain, request_id, job_spec_digest, approved_plan_digest, approver, expiry,
+/// step_job_id.
 ///
-/// **Backward compatibility (#42 slice A):** `step_job_id` is appended via
-/// [`write_opt_uuid`], which contributes ZERO bytes when the value is `None`.
-/// A grant with `step_job_id: None` therefore produces the EXACT SAME bytes
-/// as a `VerifiedLiveContext` built before this field existed — no domain
-/// separator bump was needed, and every pre-existing single-job grant's
-/// signature still verifies unchanged. A grant with `step_job_id: Some(id)`
-/// appends extra signed bytes, so it is bound to that id (see
-/// `write_opt_uuid` for why this asymmetric encoding, rather than a normal
-/// presence tag, is required to hit the byte-identical goal for `None`).
+/// The v2 domain makes the new required `job_spec_digest` an explicit protocol
+/// boundary: a v1 grant cannot authorize a v2 live mutation. `step_job_id`
+/// retains its asymmetric optional encoding within this new domain.
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    write_bytes(&mut buf, b"ryuki-v1/verified-live-context");
+    write_bytes(&mut buf, b"ryuki-v2/verified-live-context");
     write_str(&mut buf, &ctx.request_id.hyphenated().to_string());
+    write_str(&mut buf, &ctx.job_spec_digest);
     write_str(&mut buf, &ctx.approved_plan_digest);
     write_str(&mut buf, &ctx.approver);
     write_str(&mut buf, &datetime_bytes(&ctx.expiry));
@@ -394,6 +373,7 @@ mod tests {
     fn make_vlc(key: &SigningKey) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
@@ -505,11 +485,44 @@ mod tests {
                 m.insert("vm_name".to_string(), "web-prod-01".to_string());
                 m
             },
+            state_key: Some(format!("request-{}", Uuid::new_v4())),
             mode: JobMode::OfflineDryRun,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let decoded: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, decoded);
+    }
+
+    #[test]
+    fn legacy_job_spec_without_state_key_still_decodes() {
+        let request_id = Uuid::new_v4();
+        let offering_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "request_id": request_id,
+            "offering_id": offering_id,
+            "iac_ref": "request-preflight@v1",
+            "iac_digest": sha256_hex(b"iac"),
+            "mode": "live_plan"
+        });
+
+        let decoded: JobSpec = serde_json::from_value(json).expect("legacy wire decode");
+        assert_eq!(decoded.request_id, request_id);
+        assert_eq!(decoded.offering_id, offering_id);
+        assert_eq!(decoded.state_key, None);
+    }
+
+    #[test]
+    fn state_key_safety_accepts_generated_keys_and_rejects_injection() {
+        assert!(is_safe_state_key(
+            "request-123e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert!(is_safe_state_key(
+            "step-123e4567-e89b-12d3-a456-426614174000"
+        ));
+        for unsafe_key in ["", "../shared", "request/a", "quoted\"key", "space key"] {
+            assert!(!is_safe_state_key(unsafe_key), "accepted {unsafe_key:?}");
+        }
+        assert!(!is_safe_state_key(&"a".repeat(129)));
     }
 
     #[test]
@@ -537,6 +550,7 @@ mod tests {
             iac_ref: "patch-maintenance@v2.0.0".to_string(),
             iac_digest: sha256_hex(b"iac"),
             vars: BTreeMap::new(),
+            state_key: Some(format!("request-{}", Uuid::new_v4())),
             mode: JobMode::LivePlan,
         };
         let vlc = make_vlc(&key);
@@ -789,6 +803,11 @@ mod tests {
     }
 
     #[test]
+    fn tamper_vlc_job_spec_digest_fails() {
+        tamper_vlc!(job_spec_digest, sha256_hex(b"different-job-spec"));
+    }
+
+    #[test]
     fn tamper_vlc_approved_plan_digest_fails() {
         tamper_vlc!(approved_plan_digest, sha256_hex(b"forged"));
     }
@@ -804,26 +823,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #42 slice A — step_job_id backward compatibility
+    // v2 grant layout and step binding
     // -----------------------------------------------------------------------
 
-    /// REGRESSION (backward-compat): a `step_job_id: None` grant's canonical
-    /// signing bytes are BYTE-FOR-BYTE identical to what `signing_bytes_vlc`
-    /// produced before `step_job_id` existed. This is proven by hand-encoding
-    /// the pre-`step_job_id` byte layout (domain, request_id,
-    /// approved_plan_digest, approver, expiry — nothing else) and asserting
-    /// `signing_bytes_vlc` on a `None` grant matches it exactly. If this test
-    /// ever fails, every LiveApply grant issued before this change stops
-    /// verifying — that is the single most important invariant in this slice.
+    /// Pin the v2 signing layout, including the exact JobSpec digest binding.
     #[test]
-    fn vlc_none_step_job_id_signing_bytes_match_pre_field_baseline() {
+    fn vlc_v2_signing_bytes_bind_job_spec_digest() {
         let request_id = Uuid::new_v4();
+        let job_spec_digest = sha256_hex(b"job-spec");
         let approved_plan_digest = sha256_hex(b"plan-bytes");
         let approver = "ops-alice".to_string();
         let expiry = Utc::now() + chrono::Duration::hours(1);
 
         let vlc = VerifiedLiveContext {
             request_id,
+            job_spec_digest: job_spec_digest.clone(),
             approved_plan_digest: approved_plan_digest.clone(),
             approver: approver.clone(),
             expiry,
@@ -831,12 +845,11 @@ mod tests {
             signature: String::new(),
         };
 
-        // Hand-rolled baseline using the SAME primitives, but WITHOUT ever
-        // touching step_job_id — this is exactly what signing_bytes_vlc did
-        // before this field was introduced.
+        // Hand-roll the canonical v2 field order to catch accidental drift.
         let mut baseline: Vec<u8> = Vec::new();
-        write_bytes(&mut baseline, b"ryuki-v1/verified-live-context");
+        write_bytes(&mut baseline, b"ryuki-v2/verified-live-context");
         write_str(&mut baseline, &request_id.hyphenated().to_string());
+        write_str(&mut baseline, &job_spec_digest);
         write_str(&mut baseline, &approved_plan_digest);
         write_str(&mut baseline, &approver);
         write_str(&mut baseline, &datetime_bytes(&expiry));
@@ -844,16 +857,11 @@ mod tests {
         assert_eq!(
             signing_bytes_vlc(&vlc),
             baseline,
-            "a None step_job_id must not change the signed bytes at all"
+            "v2 signing bytes must include the exact JobSpec digest"
         );
     }
 
-    /// REGRESSION (backward-compat, wire format): a `step_job_id: None` grant
-    /// serialises to JSON with NO `step_job_id` key present at all (absent,
-    /// not `null`) — proving `#[serde(skip_serializing_if = "Option::is_none")]`
-    /// is wired correctly. This is the JSON-level half of the backward-compat
-    /// proof; the byte-level half is
-    /// `vlc_none_step_job_id_signing_bytes_match_pre_field_baseline` above.
+    /// A whole-request grant omits the optional step binding from JSON.
     #[test]
     fn vlc_none_step_job_id_omitted_from_json() {
         let key = generate_keypair(&mut OsRng);
@@ -883,6 +891,7 @@ mod tests {
         let step_job_id = Uuid::new_v4();
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
@@ -917,6 +926,7 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
@@ -944,6 +954,7 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
@@ -1037,6 +1048,7 @@ mod tests {
                 m.insert("vcpu".to_string(), "4".to_string());
                 m
             },
+            state_key: Some(format!("request-{}", Uuid::new_v4())),
             mode: JobMode::OfflineDryRun,
         };
         let d1 = job_spec_digest(&spec);

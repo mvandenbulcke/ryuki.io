@@ -1,13 +1,16 @@
 # Site catalog seed data only. Do not add real hostnames, private IPs,
 # credentials, tokens, tenant IDs, object IDs, live endpoints, or URLs.
 #
-# Source of truth: this file lists the governed site codes (UN/LOCODE) the
-# platform recognises for policy binding and OU derivation, plus the canonical
+# Source of truth for the bundled policy-bound UN/LOCODE subset: this file lists
+# codes the platform recognises for OU derivation, plus the canonical
 # safe Windows customization facts. At runtime the API serves the
 # database-backed registry seeded from the UN/LOCODE reference set in
 # sources/ryuki-engine/src/site_registry.rs; the codes below are the subset that
 # carry policy guardrail bindings (catalog/policy-guardrails.yaml siteBindings)
 # and must stay in lockstep with those bindings.
+# The registry also accepts administrator-defined custom codes. A custom code
+# needs its own reviewed placement-policy binding before workflows that derive
+# OU or folder placement from this catalog can use it.
 #
 # Note: the legacy `site-catalog-contract` validator slice (feature 6 / chunk 9
 # in the design doc) additionally demands `*Allowed` safety-flag keys such as

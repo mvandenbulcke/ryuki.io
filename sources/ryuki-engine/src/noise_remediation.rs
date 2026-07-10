@@ -1,3 +1,4 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
@@ -129,21 +130,33 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
     })
 }
 
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+fn active_sites_by_match_priority() -> Vec<String> {
+    let mut sites = site_registry::get_active_site_codes().unwrap_or_default();
+    sites.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    sites
+}
 
-fn site_from_host(host: &str) -> &str {
-    for site in VALID_SITES {
-        if host.to_lowercase().contains(&site.to_lowercase()) {
+fn active_site_code(site: &str) -> Result<String, String> {
+    let code = site_registry::normalize_site_code_for_lookup(site)?;
+    if site_registry::is_valid_site(&code) {
+        Ok(code)
+    } else {
+        Err(format!("Unknown site: {code}"))
+    }
+}
+
+fn site_from_host(host: &str) -> String {
+    let lower = host.to_lowercase();
+    for site in active_sites_by_match_priority() {
+        if lower.contains(&site.to_lowercase()) {
             return site;
         }
     }
-    "DEFRA"
+    "DEFRA".into()
 }
 
 pub fn detect_noise(site: &str) -> Result<Vec<NoisyTrigger>, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let site = active_site_code(site)?;
     let store = noise_store().lock().map_err(|e| e.to_string())?;
     let noisy: Vec<NoisyTrigger> = store
         .iter()
@@ -154,9 +167,7 @@ pub fn detect_noise(site: &str) -> Result<Vec<NoisyTrigger>, String> {
 }
 
 pub fn detect_flapping(site: &str) -> Result<Vec<NoisyTrigger>, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let site = active_site_code(site)?;
     let store = noise_store().lock().map_err(|e| e.to_string())?;
     let flapping: Vec<NoisyTrigger> = store
         .iter()
@@ -270,9 +281,7 @@ pub fn resolve_noise(trigger_id: &str, resolution: &str) -> Result<NoisyTrigger,
 }
 
 pub fn get_noise_report(site: &str) -> Result<Value, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
+    let site = active_site_code(site)?;
     let store = noise_store().lock().map_err(|e| e.to_string())?;
     let site_triggers: Vec<&NoisyTrigger> = store
         .iter()
@@ -347,6 +356,37 @@ pub fn get_noise_contract() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register_noise_test_site(code: &str, active: bool) {
+        site_registry::upsert_site(
+            site_registry::SiteEntry {
+                unlocode: code.into(),
+                name: format!("Noise test site {code}"),
+                country: "Test country".into(),
+                country_code: "ZZ".into(),
+                timezone: "UTC".into(),
+                active,
+            },
+            site_registry::SiteCodeSystem::Custom,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn active_custom_site_drives_admission_and_host_classification() {
+        const ACTIVE: &str = "LEGACY-NOISE-ACTIVE";
+        const INACTIVE: &str = "LEGACY-NOISE-INACTIVE";
+        register_noise_test_site(ACTIVE, true);
+        register_noise_test_site(INACTIVE, false);
+
+        assert_eq!(
+            site_from_host("srv-legacy-noise-active-app01.example.test"),
+            ACTIVE
+        );
+        assert!(detect_noise(ACTIVE).is_ok());
+        assert!(detect_flapping(INACTIVE).is_err());
+        assert!(get_noise_report("LEGACY-NOISE-UNKNOWN").is_err());
+    }
 
     #[test]
     fn test_detect_noise_returns_noisy_triggers() {

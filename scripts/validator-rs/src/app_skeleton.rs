@@ -779,14 +779,9 @@ fn validate_portal(
 ) {
     let active_app = strip_rust_comments(app_rs);
     let active_app_without_strings = strip_rust_string_literals(&active_app);
-    // relaxed (favicon format): the original check pinned the favicon to a
-    // base64-encoded PNG (`data:image/png;base64`). The portal team (owns
-    // portal/portal-ui/src/app.rs, off-limits here) replaced it with an inline
-    // SVG dragon icon (`data:image/svg+xml,...` on the `<Link rel="icon">` in
-    // the App component). Both are self-contained data URIs that keep the
-    // favicon same-origin with no external fetch, so we now accept either an
-    // inline PNG or an inline SVG data URI. The SSR shell, hydration, and
-    // metadata assertions are unchanged.
+    // Favicon ownership stays in App metadata. Accept a self-contained PNG/SVG
+    // data URI or the portal's same-origin `/favicon.svg` asset; all three keep
+    // the icon inside the application boundary with no third-party fetch.
     expect(
         active_app.contains("pub fn shell(options: LeptosOptions)")
             && active_app.contains("<!DOCTYPE html>")
@@ -795,7 +790,8 @@ fn validate_portal(
             && active_app.contains("MetaTags")
             && active_app.contains(r#"rel="icon""#)
             && (active_app.contains("data:image/png;base64")
-                || active_app.contains("data:image/svg+xml"))
+                || active_app.contains("data:image/svg+xml")
+                || active_app.contains(r#"href="/favicon.svg""#))
             && active_app.contains("<App/>"),
         errors,
         "portal app.rs must own the SSR HTML shell, hydration scripts, and favicon metadata",
@@ -1527,7 +1523,8 @@ fn validate_portal(
             && evidence_workspace_detail_code
                 .contains("let export_allowed = snapshot.export_allowed.to_string();")
             && evidence_workspace_detail_code.contains("let evidence_http_request_allowed")
-            && evidence_workspace_detail_code.contains("snapshot.http_request_allowed.to_string();")
+            && evidence_workspace_detail_code
+                .contains("snapshot.http_request_allowed.to_string();")
             && evidence_workspace_detail_code.contains("let evidence_provider_calls_allowed")
             && evidence_workspace_detail_code
                 .contains("snapshot.provider_calls_allowed.to_string();")

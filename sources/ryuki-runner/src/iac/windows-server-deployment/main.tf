@@ -15,8 +15,9 @@
 terraform {
   required_providers {
     vsphere = {
-      source  = "vmware/vsphere"
-      version = "~> 2.0"
+      source = "vmware/vsphere"
+      # Exact pin keeps plan, apply, and out-of-band cleanup on one provider build.
+      version = "2.16.1"
     }
   }
 }
@@ -54,31 +55,51 @@ variable "vsphere_password" {
 variable "datacenter" {
   description = "vSphere datacenter name."
   type        = string
-  default     = "dc-main"
+
+  validation {
+    condition     = trimspace(var.datacenter) != ""
+    error_message = "datacenter must name an explicit vSphere datacenter."
+  }
 }
 
 variable "cluster" {
   description = "vSphere compute cluster name."
   type        = string
-  default     = "cluster-prod"
+
+  validation {
+    condition     = trimspace(var.cluster) != ""
+    error_message = "cluster must name an explicit vSphere compute cluster."
+  }
 }
 
 variable "datastore" {
   description = "vSphere datastore name."
   type        = string
-  default     = "ds-ssd-01"
+
+  validation {
+    condition     = trimspace(var.datastore) != ""
+    error_message = "datastore must name an explicit vSphere datastore."
+  }
 }
 
 variable "network" {
   description = "vSphere network (port group) name."
   type        = string
-  default     = "VM Network"
+
+  validation {
+    condition     = trimspace(var.network) != ""
+    error_message = "network must name an explicit vSphere network."
+  }
 }
 
 variable "template" {
   description = "Source VM template name to clone from."
   type        = string
-  default     = "windows-server2022-template"
+
+  validation {
+    condition     = trimspace(var.template) != ""
+    error_message = "template must name an explicit source VM template."
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -106,7 +127,11 @@ variable "memory_mb" {
 variable "disk_size_gb" {
   description = "OS disk size in gigabytes (thin-provisioned)."
   type        = number
-  default     = 100
+
+  validation {
+    condition     = var.disk_size_gb > 0
+    error_message = "disk_size_gb must be greater than zero."
+  }
 }
 
 # ---------------------------------------------------------------------------

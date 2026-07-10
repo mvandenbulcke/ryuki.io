@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>First Test Acceptance · Ryuki</title>
+<meta name="description" content="Normative dry-run and live vSphere test gates, evidence, and cleanup.">
+<link rel="canonical" href="https://ryuki.io/first-test.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/first-test.html">
+<meta property="og:title" content="First Test Acceptance · Ryuki">
+<meta property="og:description" content="Normative dry-run and live vSphere test gates, evidence, and cleanup.">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/assets/docs.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+<div class="docs-shell">
+<button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><ul class="sb-list"><li><a class="sb-link" data-sections="prerequisites
+quick start
+authentication modes
+project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link active" aria-current="page" data-sections="authority and scope
+required roles and target
+tool and provider prerequisites
+request contract
+gate 1: repository checks
+gate 2: proving-ground readiness
+gate 3: offline rehearsal
+gate 4: live plan and state isolation
+gate 5: live apply and verification
+gate 6: mandatory cleanup
+result and evidence" href="/first-test.html">First Test Acceptance</a><ul class="sb-sections"><li><a href="#authority-and-scope">Authority and scope</a></li><li><a href="#required-roles-and-target">Required roles and target</a></li><li><a href="#tool-and-provider-prerequisites">Tool and provider prerequisites</a></li><li><a href="#request-contract">Request contract</a></li><li><a href="#gate-1-repository-checks">Gate 1: repository checks</a></li><li><a href="#gate-2-proving-ground-readiness">Gate 2: proving-ground readiness</a></li><li><a href="#gate-3-offline-rehearsal">Gate 3: offline rehearsal</a></li><li><a href="#gate-4-live-plan-and-state-isolation">Gate 4: live plan and state isolation</a></li><li><a href="#gate-5-live-apply-and-verification">Gate 5: live apply and verification</a></li><li><a href="#gate-6-mandatory-cleanup">Gate 6: mandatory cleanup</a></li><li><a href="#result-and-evidence">Result and evidence</a></li></ul></li><li><a class="sb-link" data-sections="stack
+component diagram
+key decisions
+network policy
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+core environment variables
+infrastructure providers
+nested configuration groups
+validation
+entra id app registration
+postgresql
+admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+app roles definition
+how it works
+permissions by role
+environment configuration
+important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
+custom codes
+site selection
+managing sites
+seeded active sites
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
+scopes
+enforcement semantics
+platform-wide rows and nullable axes
+managing api tokens
+authentication modes
+a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a></li><li><a class="sb-link" data-sections="how an agent joins the platform
+execution modes
+the live-apply trust chain
+where to see results
+credentials never reach the control plane
+auto-teardown on failed multi-step runs
+running a live apply against real infrastructure
+what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
+how a stepped request runs
+per-step live apply
+automatic teardown
+honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
+recipients and read state
+api
+the portal bell
+delivery channels
+known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
+authentication
+authorization
+conventions
+walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
+areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
+<main id="main">
+<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ First Test Acceptance</span></nav>
+<h1 id="first-test-acceptance-specification">First Test Acceptance Specification</h1>
+<p>This document defines what "ready for a first test" means for Ryuki. A goal session, tracker entry, review, commit, or successful build is supporting evidence, not acceptance by itself.</p>
+<p>The first test has two milestones:</p>
+<ol>
+<li><strong>Platform rehearsal</strong> proves the governed lifecycle with <code>OfflineDryRun</code>.</li>
+</ol>
+<p>   It must complete before any provider-connected work.</p>
+<ol>
+<li><strong>First live vSphere test</strong> proves plan, approval, apply, verification, state</li>
+</ol>
+<p>   isolation, and cleanup against one approved disposable target.</p>
+<p>The live milestone is optional until an operator approves the target and credentials. It is blocked, not failed, when those external prerequisites are unavailable. It must never be redirected to production merely to make the test runnable.</p>
+<h2 id="authority-and-scope">Authority and scope</h2>
+<p>This document is normative for first-test scope and acceptance. Runtime protocol types, lifecycle code, and migrations are the evidence for what is implemented; they do not silently weaken an acceptance criterion. If the implementation and this document disagree, the affected gate is blocked until both are reconciled.</p>
+<p>Use the remaining documentation in this order:</p>
+<ol>
+<li><a href="agents-and-live-execution.html">Agents &amp; Live Execution</a>,</li>
+</ol>
+<p>   <a href="orchestration.html">Multi-Step Orchestration</a>, and    <code>deploy/proving-ground/README.md</code> define operator procedures.</p>
+<ol>
+<li>Files under <code>docs/design/</code> and goal-session trackers are historical design</li>
+</ol>
+<p>   records. They do not override implemented behavior or this acceptance gate.</p>
+<p>The first live test is one <strong>single-job Linux server deployment</strong>. Do not set <code>deployment_profile=managed-onboarding</code>; multi-step orchestration, Windows, Ansible, production targets, provider API adapters, high availability, and performance testing are outside this acceptance scope.</p>
+<h2 id="required-roles-and-target">Required roles and target</h2>
+<table><thead><tr><th>Item</th><th>Requirement</th></tr></thead><tbody>
+<tr><td>Requester</td><td>A principal with <code>Requester</code>; creates the request, records its ID, signs out, and cannot run operator or approval transitions.</td></tr>
+<tr><td>Approver/operator</td><td>A different principal with <code>PlatformAdmin</code>; approves the agent and drives every post-create transition, including request approval and live apply.</td></tr>
+<tr><td>Agent</td><td>Approved for platform <code>DEFRA</code>, with Terraform installed and network access to the test vCenter.</td></tr>
+<tr><td>Target</td><td>An explicitly approved, disposable vSphere target where one test VM can be created and removed. Approval includes the selected cluster's root resource pool and default VM folder used by the bundled IaC.</td></tr>
+<tr><td>Credentials</td><td>Present only on the agent host as <code>RYUKI_LIVE_CRED_VSPHERE_USER</code>, <code>RYUKI_LIVE_CRED_VSPHERE_PASSWORD</code>, and <code>RYUKI_LIVE_CRED_VSPHERE_SERVER</code>.</td></tr>
+<tr><td>State</td><td>A durable backend template containing <code>{STATE_KEY}</code>. The local proving ground also uses <code>{STATE_DIR}</code>.</td></tr>
+<tr><td>Cleanup</td><td>The exact state-keyed destroy command is reviewed before live apply. A successful apply without a rehearsed cleanup path is not permitted.</td></tr>
+</tbody></table>
+<p>Use <code>deploy/proving-ground</code>, which supplies isolated Compose volumes, local authentication, <code>/ready</code> health gating, literal environment parsing, and agent state under its gitignored <code>agent-state/</code> directory.</p>
+<h2 id="tool-and-provider-prerequisites">Tool and provider prerequisites</h2>
+<p>Before Gate 1, require all of the following on the operator/agent host:</p>
+<ul>
+<li>Rust stable with Cargo, rustfmt, and Clippy. <code>cargo-leptos</code> and the</li>
+</ul>
+<p>  <code>wasm32-unknown-unknown</code> target are required only for a direct host portal   build, not for the repository gates or the Compose portal image;</p>
+<ul>
+<li>Bash, Docker with Compose v2, Terraform, <code>curl</code>, <code>jq</code>, and <code>shasum</code>;</li>
+<li>outbound access to the Terraform registry for the exact, checksum-locked</li>
+</ul>
+<p>  <code>vmware/vsphere</code> 2.16.1 provider embedded in both server bundles;</p>
+<ul>
+<li>a vSphere 8.x or 9.x target, matching the provider release's documented</li>
+</ul>
+<p>  support matrix. A vSphere 7.x target blocks this revision; select and lock a   reviewed compatible provider in source, then rerun Gate 1 instead of   overriding the dependency lock;</p>
+<ul>
+<li>a trusted TLS chain for vCenter. The bundled provider sets</li>
+</ul>
+<p>  <code>allow_unverified_ssl=false</code>; do not bypass certificate verification;</p>
+<ul>
+<li>a least-privilege vSphere account that can read the selected inventory and</li>
+</ul>
+<p>  clone, configure, power, and delete a VM only in the approved disposable   target;</p>
+<ul>
+<li>an isolated approved test port group and a generalized clone-safe template:</li>
+</ul>
+<p>  no retained static IP, hostname, or machine identity; DHCP/cloud-init or an   equivalent first-boot identity mechanism must prevent a network conflict;</p>
+<ul>
+<li>synchronized UTC time on the host running the agent and the control plane.</li>
+</ul>
+<p>  Record the time source and prove absolute skew from a trusted source is at   most five seconds immediately before live mode is enabled;</p>
+<ul>
+<li>enough local disk to preserve the control-plane volumes, agent identity,</li>
+</ul>
+<p>  Terraform state, and value-free evidence until cleanup is accepted.</p>
+<p>Record the tool versions, vCenter major version, exact provider version, and approved vSphere privilege scope. A missing tool, unsupported vCenter, registry path, trusted CA, or delete privilege blocks the live gate.</p>
+<h2 id="request-contract">Request contract</h2>
+<p>Prepare four distinct requests and record their IDs with these exact operator labels:</p>
+<table><thead><tr><th>Label</th><th>Purpose</th><th>Required disposition</th></tr></thead><tbody>
+<tr><td><code>DRY_RUN_REQUEST_ID</code></td><td>Complete the credential-free, provider-connection-free lifecycle.</td><td><code>completed</code> in Gate 3.</td></tr>
+<tr><td><code>LIVE_REFUSAL_REQUEST_ID</code></td><td>Prove that <code>LivePlan</code> refuses while live mode is disabled.</td><td>Terminal failure in Gate 3; never reuse it.</td></tr>
+<tr><td><code>PRIMARY_LIVE_REQUEST_ID</code></td><td>Plan, apply, verify, and clean up the disposable VM.</td><td><code>completed</code> before Gate 6 cleanup.</td></tr>
+<tr><td><code>ISOLATION_REQUEST_ID</code></td><td>Prove a second plan resolves to a different state key.</td><td>Explicitly failed after its plan; never approve live apply.</td></tr>
+</tbody></table>
+<p>Use a different approved VM name for every request and record it as the matching <code>*_VM_NAME</code> value. The placement may be shared. Record the following approved inputs before creating any request:</p>
+<table><thead><tr><th>Field</th><th>Rule</th></tr></thead><tbody>
+<tr><td><code>request_type</code></td><td><code>server-deployment</code></td></tr>
+<tr><td><code>site</code></td><td><code>DEFRA</code></td></tr>
+<tr><td><code>environment</code></td><td><code>test</code></td></tr>
+<tr><td><code>name</code></td><td>Unique ASCII test VM name, at most 160 bytes, approved for the disposable target.</td></tr>
+<tr><td><code>cpu</code></td><td>Positive integer within the target policy.</td></tr>
+<tr><td><code>memory_gb</code></td><td>Positive integer within the target policy.</td></tr>
+<tr><td><code>justification</code></td><td>Names the approved first-test change record; contains no secret or provider data.</td></tr>
+<tr><td><code>fields.operating_system</code></td><td><code>RHEL 9</code></td></tr>
+<tr><td><code>fields.datacenter</code></td><td>Exact ASCII vSphere inventory name, at most 160 bytes.</td></tr>
+<tr><td><code>fields.cluster</code></td><td>Exact ASCII vSphere inventory name, at most 160 bytes.</td></tr>
+<tr><td><code>fields.datastore</code></td><td>Exact ASCII vSphere inventory name, at most 160 bytes.</td></tr>
+<tr><td><code>fields.network</code></td><td>Exact ASCII name of the approved isolated test port group, at most 160 bytes.</td></tr>
+<tr><td><code>fields.template</code></td><td>Exact ASCII name of the approved generalized, clone-safe Linux template, at most 160 bytes.</td></tr>
+<tr><td><code>fields.disk_size_gb</code></td><td>Decimal digits encoded as a JSON string; the resulting positive integer must not shrink the template disk.</td></tr>
+</tbody></table>
+<p>VM and placement values must not contain control characters or <code>://</code>; the safe Plan Review intentionally refuses values it cannot project without ambiguity. Every value inside the <code>fields</code> object is encoded as a JSON string, including <code>disk_size_gb</code> (for example, <code>"disk_size_gb": "80"</code>). The top-level <code>cpu</code> and <code>memory_gb</code> values remain JSON numbers. Placement values and Ryuki's requester, approver, agent, request, and job IDs are non-secret test evidence. Credentials, raw-provider tenant or object IDs, private addresses, and raw provider payloads never belong in the request, audit notes, screenshots, or committed test evidence.</p>
+<p>Before Gate 1, initialize one operator shell with the repository paths and exact approved inputs below, and keep that shell through Gate 6. After Gate 2, write each local login response's <code>session_id</code> to the matching mode-<code>0600</code> header file; unsafe API methods require <code>X-Ryuki-Session-Id</code> and reject cookie-only authorization. Session IDs are credentials: never print or commit them. Assign each <code>*_REQUEST_ID</code> immediately after that request is created in its stated gate.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">BASE=http://127.0.0.1:18081</span>
+<span class="hl-cmd">umask</span> 077
+<span class="hl-cmd">REPO_ROOT=</span>$(git rev-parse <span class="hl-f">--show-toplevel)</span>
+<span class="hl-cmd">PROVING_GROUND_DIR=</span><span class="hl-s">"$REPO_ROOT/deploy/proving-ground"</span>
+<span class="hl-cmd">TEST_REVISION=</span>$(git <span class="hl-f">-C</span> <span class="hl-s">"$REPO_ROOT"</span> rev-parse HEAD)
+<span class="hl-cmd">AUTH_DIR=</span>$(mktemp <span class="hl-f">-d</span> <span class="hl-s">"${TMPDIR:-/tmp}/ryuki-first-test.XXXXXX"</span>)
+<span class="hl-cmd">REQUESTER_HEADERS=</span><span class="hl-s">"$AUTH_DIR/requester.headers"</span>
+<span class="hl-cmd">ADMIN_HEADERS=</span><span class="hl-s">"$AUTH_DIR/admin.headers"</span>
+
+<span class="hl-cmd">login_local()</span> {
+  <span class="hl-cmd">local</span> username=<span class="hl-v">$1</span>
+  <span class="hl-cmd">local</span> header_file=<span class="hl-v">$2</span>
+  <span class="hl-cmd">local</span> password login session_id
+  <span class="hl-cmd">printf</span> <span class="hl-s">'%s password: '</span> <span class="hl-s">"$username"</span> &gt;&amp;2
+  <span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> password &lt;/dev/tty
+  <span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
+  <span class="hl-cmd">login=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$password"</span> | <span class="hl-cmd">\</span>
+    <span class="hl-cmd">jq</span> <span class="hl-f">-Rs</span> <span class="hl-f">--arg</span> username <span class="hl-s">"$username"</span> <span class="hl-s">'{username: $username, password: .}'</span> | <span class="hl-cmd">\</span>
+    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/login"</span> \
+      <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
+  <span class="hl-cmd">unset</span> password
+  <span class="hl-cmd">session_id=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+  <span class="hl-cmd">unset</span> login
+  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_id"</span> &gt; <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">unset</span> session_id
+<span class="hl-cmd">}</span>
+
+<span class="hl-cmd">logout_local()</span> {
+  <span class="hl-cmd">local</span> header_file=<span class="hl-v">$1</span>
+  <span class="hl-cmd">local</span> logout_status=0
+  <span class="hl-cmd">if</span> test <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>; <span class="hl-cmd">then</span>
+    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/logout"</span> \
+      <span class="hl-cmd">-H</span> <span class="hl-s">"@$header_file"</span> &gt;/dev/null || <span class="hl-cmd">logout_status=</span>$?
+    <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">fi</span>
+  <span class="hl-cmd">return</span> <span class="hl-s">"$logout_status"</span>
+<span class="hl-cmd">}</span>
+
+<span class="hl-cmd">cleanup_auth()</span> {
+  <span class="hl-cmd">logout_local</span> <span class="hl-s">"$REQUESTER_HEADERS"</span> || <span class="hl-cmd">true</span>
+  <span class="hl-cmd">logout_local</span> <span class="hl-s">"$ADMIN_HEADERS"</span> || <span class="hl-cmd">true</span>
+  <span class="hl-cmd">rm</span> <span class="hl-f">-rf</span> <span class="hl-s">"$AUTH_DIR"</span>
+<span class="hl-cmd">}</span>
+<span class="hl-cmd">trap</span> cleanup_auth EXIT
+
+<span class="hl-cmd">DRY_RUN_REQUEST_ID=</span><span class="hl-s">'&lt;dry-run-request-uuid&gt;'</span>
+<span class="hl-cmd">LIVE_REFUSAL_REQUEST_ID=</span><span class="hl-s">'&lt;live-refusal-request-uuid&gt;'</span>
+<span class="hl-cmd">PRIMARY_LIVE_REQUEST_ID=</span><span class="hl-s">'&lt;primary-live-request-uuid&gt;'</span>
+<span class="hl-cmd">ISOLATION_REQUEST_ID=</span><span class="hl-s">'&lt;isolation-request-uuid&gt;'</span>
+<span class="hl-cmd">DRY_RUN_VM_NAME=</span><span class="hl-s">'&lt;approved-dry-run-vm-name&gt;'</span>
+<span class="hl-cmd">LIVE_REFUSAL_VM_NAME=</span><span class="hl-s">'&lt;approved-live-refusal-vm-name&gt;'</span>
+<span class="hl-cmd">PRIMARY_LIVE_VM_NAME=</span><span class="hl-s">'&lt;approved-primary-vm-name&gt;'</span>
+<span class="hl-cmd">ISOLATION_VM_NAME=</span><span class="hl-s">'&lt;approved-isolation-vm-name&gt;'</span>
+<span class="hl-cmd">CPU=</span><span class="hl-s">'&lt;approved-cpu-count&gt;'</span>
+<span class="hl-cmd">MEMORY_GB=</span><span class="hl-s">'&lt;approved-memory-gb&gt;'</span>
+<span class="hl-cmd">DISK_SIZE_GB=</span><span class="hl-s">'&lt;approved-disk-size-gb&gt;'</span>
+<span class="hl-cmd">DATACENTER=</span><span class="hl-s">'&lt;approved-datacenter-name&gt;'</span>
+<span class="hl-cmd">CLUSTER=</span><span class="hl-s">'&lt;approved-cluster-name&gt;'</span>
+<span class="hl-cmd">DATASTORE=</span><span class="hl-s">'&lt;approved-datastore-name&gt;'</span>
+<span class="hl-cmd">NETWORK=</span><span class="hl-s">'&lt;approved-network-name&gt;'</span>
+<span class="hl-cmd">TEMPLATE=</span><span class="hl-s">'&lt;approved-template-name&gt;'</span></code></pre>
+<h2 id="gate-1-repository-checks">Gate 1: repository checks</h2>
+<p>Run from a clean checkout of the exact revision to be tested:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$REPO_ROOT"</span>
+<span class="hl-cmd">test</span> <span class="hl-f">-n</span> <span class="hl-s">"$TEST_REVISION"</span>
+<span class="hl-cmd">test</span> <span class="hl-s">"$(git rev-parse HEAD)"</span> = <span class="hl-s">"$TEST_REVISION"</span>
+<span class="hl-cmd">test</span> <span class="hl-f">-z</span> <span class="hl-s">"$(git status --porcelain=v1 --untracked-files=all)"</span>
+<span class="hl-cmd">cargo</span> build <span class="hl-f">--workspace</span>
+<span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span>
+<span class="hl-cmd">(</span>
+  <span class="hl-cmd">set</span> <span class="hl-f">-euo</span> pipefail
+  <span class="hl-cmd">DB_TEST_CONTAINER=</span><span class="hl-s">"ryuki-gate1-db-${TEST_REVISION:0:12}-$$"</span>
+  <span class="hl-cmd">DB_TEST_LOG=</span><span class="hl-s">"$(mktemp)"</span>
+  <span class="hl-cmd">cleanup_gate1_db()</span> {
+    <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$DB_TEST_LOG"</span>
+    <span class="hl-cmd">docker</span> stop <span class="hl-s">"$DB_TEST_CONTAINER"</span> &gt;/dev/null 2&gt;&amp;1 || <span class="hl-cmd">true</span>
+  <span class="hl-cmd">}</span>
+  <span class="hl-cmd">trap</span> cleanup_gate1_db EXIT
+  <span class="hl-cmd">docker</span> run <span class="hl-f">--detach</span> <span class="hl-f">--rm</span> <span class="hl-f">--name</span> <span class="hl-s">"$DB_TEST_CONTAINER"</span> \
+    <span class="hl-cmd">--env</span> POSTGRES_DB=ryuki_ci \
+    <span class="hl-cmd">--env</span> POSTGRES_USER=postgres \
+    <span class="hl-cmd">--env</span> POSTGRES_HOST_AUTH_METHOD=trust \
+    <span class="hl-cmd">--publish</span> 127.0.0.1::5432 postgres:18
+  <span class="hl-cmd">for</span> _ in {1..30}; do
+    <span class="hl-cmd">docker</span> exec <span class="hl-s">"$DB_TEST_CONTAINER"</span> \
+      <span class="hl-cmd">pg_isready</span> <span class="hl-f">--username</span> postgres <span class="hl-f">--dbname</span> ryuki_ci &amp;&amp; <span class="hl-cmd">break</span>
+    <span class="hl-cmd">sleep</span> 1
+  <span class="hl-cmd">done</span>
+  <span class="hl-cmd">docker</span> exec <span class="hl-s">"$DB_TEST_CONTAINER"</span> \
+    <span class="hl-cmd">pg_isready</span> <span class="hl-f">--username</span> postgres <span class="hl-f">--dbname</span> ryuki_ci
+  <span class="hl-cmd">DB_TEST_BINDING=</span><span class="hl-s">"$(docker port "</span><span class="hl-v">$DB_TEST_CONTAINER</span><span class="hl-s">" 5432/tcp)"</span>
+  <span class="hl-cmd">DB_TEST_PORT=</span><span class="hl-s">"${DB_TEST_BINDING##*:}"</span>
+  <span class="hl-cmd">DB_TEST_URL=</span>"$(printf <span class="hl-s">'postgresql://%s@%s:%s/%s'</span> \
+    <span class="hl-cmd">postgres</span> 127.0.0.1 <span class="hl-s">"$DB_TEST_PORT"</span> ryuki_ci)"
+  <span class="hl-cmd">RYUKI_DATABASE_URL=</span><span class="hl-s">"$DB_TEST_URL"</span> \
+    <span class="hl-cmd">cargo</span> test <span class="hl-f">-p</span> ryuki-api <span class="hl-f">--</span> <span class="hl-f">--test-threads=1</span> <span class="hl-f">--nocapture</span> \
+    <span class="hl-cmd">2&gt;&amp;1</span> | <span class="hl-cmd">tee</span> <span class="hl-s">"$DB_TEST_LOG"</span>
+  <span class="hl-cmd">!</span> grep <span class="hl-f">-Eqi</span> \
+    <span class="hl-s">'SKIP: (RYUKI_DATABASE_URL|DB (connect failed|unavailable|not available)|no seeded|seed .* not present|no DEFRA)|RYUKI_DATABASE_URL not set|skipping (DB|database) tests'</span> \
+    <span class="hl-s">"$DB_TEST_LOG"</span>
+<span class="hl-cmd">)</span>
+<span class="hl-cmd">cargo</span> fmt <span class="hl-f">--check</span> <span class="hl-f">--all</span>
+<span class="hl-cmd">cargo</span> clippy <span class="hl-f">--workspace</span> <span class="hl-f">--all-targets</span> <span class="hl-f">--</span> <span class="hl-f">-D</span> warnings
+<span class="hl-cmd">cargo</span> run <span class="hl-f">--manifest-path</span> scripts/validator-rs/Cargo.toml <span class="hl-f">--</span> run-all <span class="hl-f">--root</span> .
+<span class="hl-cmd">./scripts/no-secret-scan.sh</span>
+<span class="hl-cmd">git</span> diff <span class="hl-f">--check</span></code></pre>
+<p>Every command must exit <code>0</code>. The PostgreSQL block starts an ephemeral PostgreSQL 18 container on a Docker-assigned loopback port, serializes the API tests, fails if a database-backed test reports that it skipped for lack of a database or fixture, and removes the container and test log on exit. Record <code>TEST_REVISION</code> and the command results. Do not waive a failure as pre-existing; fix it or mark the test blocked. Do not switch revisions or edit tracked/untracked source through Gate 6: the agent binary embeds the tested IaC, while the cleanup helper reads the current bundle from the checkout.</p>
+<h2 id="gate-2-proving-ground-readiness">Gate 2: proving-ground readiness</h2>
+<p>Follow <code>deploy/proving-ground/README.md</code> to create the gitignored <code>.env</code>. Keep <code>PG_AGENT_ALLOW_LIVE=false</code> initially, then run:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>
+<span class="hl-cmd">./validate.sh</span> .env
+<span class="hl-cmd">docker</span> compose <span class="hl-f">-f</span> ../compose/compose.yaml build platform-api portal-ui
+<span class="hl-cmd">docker</span> compose down
+<span class="hl-cmd">docker</span> compose up <span class="hl-f">-d</span> <span class="hl-f">--wait</span> <span class="hl-f">--force-recreate</span>
+<span class="hl-cmd">curl</span> <span class="hl-f">--fail</span> http://localhost:18081/ready
+<span class="hl-cmd">docker</span> image inspect ryuki/platform-api:rust-dev ryuki/portal-ui:rust-dev \
+  <span class="hl-cmd">--format</span> <span class="hl-s">'{{.Id}}'</span></code></pre>
+<p>Acceptance requires:</p>
+<ul>
+<li><code>.env</code> contains distinct requester and admin accounts.</li>
+<li><code>PG_AGENT_PLATFORM</code> is exactly <code>DEFRA</code>.</li>
+<li>the active backend state-location attribute contains <code>{STATE_KEY}</code>; a comment or</li>
+</ul>
+<p>  unrelated attribute does not satisfy the validator.</p>
+<ul>
+<li>no database, Vault, or local-account placeholder remains. Provider</li>
+</ul>
+<p>  credentials may stay empty until the live gate.</p>
+<ul>
+<li><code>/ready</code> succeeds; <code>/health</code> alone is not sufficient.</li>
+<li>API and portal images were rebuilt from <code>TEST_REVISION</code>, force-recreated, and</li>
+</ul>
+<p>  their image IDs were recorded; a previously built <code>rust-dev</code> image is not   acceptance evidence.</p>
+<ul>
+<li>the agent self-registers once, persists its token, exits pending approval,</li>
+</ul>
+<p>  and enters its poll loop only after the admin approves it;</p>
+<ul>
+<li>control plane and agent negotiate protocol v2. Missing or v1 protocol headers</li>
+</ul>
+<p>  are rejected rather than treated as compatible. Record the approved agent's   startup log entry <code>CP wire protocol is compatible</code> with both   <code>cp_protocol_version=2</code> and <code>agent_protocol_version=2</code>; the protocol rejection   tests in Gate 1 are the evidence for missing/v1 fail-closed behavior.</p>
+<ul>
+<li>direct vSphere inventory inspection proves all four recorded VM names are</li>
+</ul>
+<p>  absent from the approved target folder/placement before any LivePlan;</p>
+<ul>
+<li>the host/control-plane clock evidence satisfies the five-second skew bound.</li>
+</ul>
+<p>For API-driven steps, run <code>login_local requester "$REQUESTER_HEADERS"</code> before each requester create and <code>logout_local "$REQUESTER_HEADERS"</code> immediately after recording the request ID. Run <code>login_local admin "$ADMIN_HEADERS"</code> for post-create actions and <code>logout_local "$ADMIN_HEADERS"</code> before returning to the requester. Re-login after each handoff. Removing a header file without calling logout does not revoke its server-side session. Portal-driven steps require the equivalent explicit sign-out/sign-in handoff.</p>
+<h2 id="gate-3-offline-rehearsal">Gate 3: offline rehearsal</h2>
+<p>Keep live mode disabled for this entire gate.</p>
+<ol>
+<li>Sign in as the requester and create the dry-run request using the complete</li>
+</ol>
+<p>   request contract above. Record its <code>intake</code> status and request ID, then sign    out.</p>
+<ol>
+<li>Sign in as the admin. Run <code>validate</code> and <code>plan</code>. The observable request</li>
+</ol>
+<p>   statuses become <code>validated</code>, then <code>planned</code>.</p>
+<ol>
+<li>Review the plan, approve the request, and lock it. The statuses become</li>
+</ol>
+<p>   <code>approved</code>, then <code>locked</code>.</p>
+<ol>
+<li>As the same admin, dispatch the default <code>OfflineDryRun</code>. The request becomes</li>
+</ol>
+<p>   <code>executing</code>.</p>
+<ol>
+<li>Wait for the signed agent result. Do not call <code>verify</code> while the request is</li>
+</ol>
+<p>   still <code>executing</code>. A successful result moves it to <code>verifying</code>.</p>
+<ol>
+<li>Run <code>verify</code> and require <code>completed</code>.</li>
+</ol>
+<p>Pass only when the audit trail attributes creation and approval to different principals, the job result signature is accepted, evidence is redacted, and no provider resource or Terraform state was created.</p>
+<p>As the fail-closed check, create and record the separate <code>LIVE_REFUSAL_REQUEST_ID</code> as the requester. As the admin, govern it through lock, then dispatch <code>LivePlan</code> while live mode is still disabled. Require a signed refusal, a terminal failed request, and no provider or state mutation. <code>LiveApply</code> cannot be approved without a successful plan and <code>LiveDestroy</code> is not an operator action, so <code>LivePlan</code> is the refusal directly testable here. Do not reuse either Gate 3 request in the live gates.</p>
+<h2 id="gate-4-live-plan-and-state-isolation">Gate 4: live plan and state isolation</h2>
+<p>Stop the agent, set <code>PG_AGENT_ALLOW_LIVE=true</code>, fill the three vSphere credential values, recheck the recorded revision and clean worktree, prove the five-second clock-skew bound, rerun <code>./validate.sh .env</code>, and restart the agent:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">test</span> <span class="hl-s">"$(git -C "</span><span class="hl-v">$REPO_ROOT</span><span class="hl-s">" rev-parse HEAD)"</span> = <span class="hl-s">"$TEST_REVISION"</span>
+<span class="hl-cmd">test</span> <span class="hl-f">-z</span> <span class="hl-s">"$(git -C "</span><span class="hl-v">$REPO_ROOT</span><span class="hl-s">" status --porcelain=v1 --untracked-files=all)"</span>
+<span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>
+
+<span class="hl-c"># Compare both the host and control-plane clocks with a TLS-authenticated</span>
+<span class="hl-c"># external Date value. A value inside the sampling interval has zero measured</span>
+<span class="hl-c"># skew; otherwise interval_skew reports its nearest-boundary gap.</span>
+<span class="hl-cmd">interval_skew()</span> {
+  <span class="hl-cmd">local</span> value=<span class="hl-v">$1</span> lower=<span class="hl-v">$2</span> upper=<span class="hl-v">$3</span>
+  <span class="hl-cmd">if</span> (( value &lt; lower )); then
+    <span class="hl-cmd">printf</span> <span class="hl-s">'%s\n'</span> <span class="hl-s">"$((lower - value))"</span>
+  <span class="hl-cmd">elif</span> (( value &gt; upper )); then
+    <span class="hl-cmd">printf</span> <span class="hl-s">'%s\n'</span> <span class="hl-s">"$((value - upper))"</span>
+  <span class="hl-cmd">else</span>
+    <span class="hl-cmd">printf</span> <span class="hl-s">'0\n'</span>
+  <span class="hl-cmd">fi</span>
+<span class="hl-cmd">}</span>
+
+<span class="hl-cmd">TRUSTED_TIME_URL=https://www.cloudflare.com/</span>
+<span class="hl-cmd">HOST_TRUST_BEFORE=</span>$(date <span class="hl-f">-u</span> +%s)
+<span class="hl-cmd">TRUSTED_DATE=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sSI</span> <span class="hl-s">"$TRUSTED_TIME_URL"</span> | <span class="hl-cmd">\</span>
+  <span class="hl-cmd">awk</span> <span class="hl-s">'tolower($1) == "date:" { sub(/\r$/, ""); sub(/^[^:]*:[[:space:]]*/, ""); print; exit }'</span>)
+<span class="hl-cmd">HOST_TRUST_AFTER=</span>$(date <span class="hl-f">-u</span> +%s)
+<span class="hl-cmd">test</span> <span class="hl-f">-n</span> <span class="hl-s">"$TRUSTED_DATE"</span>
+<span class="hl-cmd">TRUSTED_EPOCH=</span>$(docker compose exec <span class="hl-f">-T</span> platform-api \
+  <span class="hl-cmd">date</span> <span class="hl-f">-u</span> <span class="hl-f">--date=</span><span class="hl-s">"$TRUSTED_DATE"</span> +%s)
+<span class="hl-cmd">TRUSTED_SKEW=</span>$(interval_skew \
+  <span class="hl-s">"$TRUSTED_EPOCH"</span> <span class="hl-s">"$HOST_TRUST_BEFORE"</span> <span class="hl-s">"$HOST_TRUST_AFTER"</span>)
+
+<span class="hl-cmd">HOST_CP_BEFORE=</span>$(date <span class="hl-f">-u</span> +%s)
+<span class="hl-cmd">CP_EPOCH=</span>$(docker compose exec <span class="hl-f">-T</span> platform-api date <span class="hl-f">-u</span> +%s)
+<span class="hl-cmd">HOST_CP_AFTER=</span>$(date <span class="hl-f">-u</span> +%s)
+<span class="hl-cmd">CP_SKEW=</span>$(interval_skew <span class="hl-s">"$CP_EPOCH"</span> <span class="hl-s">"$HOST_CP_BEFORE"</span> <span class="hl-s">"$HOST_CP_AFTER"</span>)
+<span class="hl-cmd">CP_TRUSTED_SKEW_BOUND=</span>$((TRUSTED_SKEW + CP_SKEW))
+
+<span class="hl-cmd">printf</span> <span class="hl-s">'clock_evidence trusted_source=%s trusted_date=%s host_trusted_skew_seconds=%s cp_host_skew_seconds=%s cp_trusted_skew_bound_seconds=%s\n'</span> \
+  <span class="hl-s">"$TRUSTED_TIME_URL"</span> <span class="hl-s">"$TRUSTED_DATE"</span> <span class="hl-s">"$TRUSTED_SKEW"</span> <span class="hl-s">"$CP_SKEW"</span> \
+  <span class="hl-s">"$CP_TRUSTED_SKEW_BOUND"</span>
+<span class="hl-cmd">test</span> <span class="hl-s">"$TRUSTED_SKEW"</span> <span class="hl-f">-le</span> 5
+<span class="hl-cmd">test</span> <span class="hl-s">"$CP_TRUSTED_SKEW_BOUND"</span> <span class="hl-f">-le</span> 5
+<span class="hl-cmd">unset</span> TRUSTED_DATE TRUSTED_TIME_URL
+
+<span class="hl-cmd">./validate.sh</span> .env</code></pre>
+<p>Retain the single <code>clock_evidence</code> line. It contains the source, timestamp, measured host skew, and conservative control-plane-to-trusted skew bound, not credentials. If organizational policy designates a different trusted HTTPS time endpoint, substitute that approved endpoint and record it with the evidence; do not waive either comparison.</p>
+<p>Keep the variable-bearing operator shell free for the remaining commands. In a separate terminal, run the agent in the foreground and retain that terminal as the stop handle:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$(git rev-parse --show-toplevel)/deploy/proving-ground"</span>
+<span class="hl-cmd">./run-agent.sh</span></code></pre>
+<p>Stop it with <code>Ctrl-C</code> before changing <code>.env</code>, switching revisions, or starting Gate 6. Before accepting live work, retain an agent log entry whose message is <code>fenced lease renewal succeeded</code>, whose <code>renewal_phase</code> is <code>initial</code>, and whose job ID, attempt ID, lease generation, and renewed deadline match that running attempt. The log deliberately excludes the fencing token.</p>
+<p>The first test uses the bundled local backend template exactly as supplied; authenticated remote backends are outside this proving-ground gate. Create and record <code>PRIMARY_LIVE_REQUEST_ID</code> as the requester, then validate, plan, approve, and lock it with the same role handoff used in the rehearsal.</p>
+<p>Before dispatching the primary LivePlan, require its UUID-derived state path to be new. If it exists, stop and investigate; do not delete or reuse unfamiliar state to make this check pass.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">PRIMARY_STATE=</span><span class="hl-s">"$PROVING_GROUND_DIR/agent-state/terraform-request-$PRIMARY_LIVE_REQUEST_ID.tfstate"</span>
+<span class="hl-cmd">test</span> ! <span class="hl-f">-e</span> <span class="hl-s">"$PRIMARY_STATE"</span></code></pre>
+<p>The admin dispatches <code>LivePlan</code> and waits for its terminal job result. A successful plan leaves the request at <code>executing</code> because it is waiting for human approval; it does not advance to <code>verifying</code>. In the portal, review the Execution Job's server-derived Plan Review before approving live apply. Require all of the following:</p>
+<ul>
+<li>the job is <code>Succeeded</code>, its result is <code>planned</code>, and it has a plan digest;</li>
+<li>the Plan Review says <code>digest_verified=true</code> and reports exactly one</li>
+</ul>
+<p>  <code>virtual_machine</code> create, with zero update, delete, or replace actions;</p>
+<ul>
+<li>the plan contains no other managed resource, including a managed <code>no-op</code>;</li>
+</ul>
+<p>  read-only inventory data sources are the only additional entries allowed;</p>
+<ul>
+<li>name, CPU, memory, disk, datacenter, cluster, datastore, network, and template</li>
+</ul>
+<p>  in the Plan Review match the recorded request exactly; the control plane   derives the VM shape from the managed resource's actual <code>change.after</code> and   the placement names from the five expected data-source <code>change.after.name</code>   values, and rejects missing or mismatched values;</p>
+<ul>
+<li>the Plan Review state key is <code>request-$PRIMARY_LIVE_REQUEST_ID</code>;</li>
+<li>the resolved local backend path is absolute and ends with</li>
+</ul>
+<p>  <code>agent-state/terraform-request-$PRIMARY_LIVE_REQUEST_ID.tfstate</code>;</p>
+<ul>
+<li>no generic or shared Terraform state path is used;</li>
+<li><code>agent-state/provider-context.sha256</code> exists and remains unchanged from plan</li>
+</ul>
+<p>  through apply and cleanup, binding the vCenter endpoint/account without   recording either value;</p>
+<ul>
+<li>raw Terraform JSON, provider object identifiers, and credentials are absent</li>
+</ul>
+<p>  from the portal/API projection, evidence export, screenshots, and   operator-collected acceptance record. Exact digest-covered plan bytes remain   restricted internal control-plane storage for re-deriving this projection.</p>
+<p>The API refuses server live-apply approval when this digest-verified safe review cannot be derived. Do not substitute raw Terraform output to bypass that gate.</p>
+<p>Before any apply, rehearse the exact Gate 6 cleanup invocation by adding <code>--preflight</code>. Use <code>PRIMARY_LIVE_REQUEST_ID</code>, <code>PRIMARY_LIVE_VM_NAME</code>, and every recorded original input. The command must pass before continuing; it validates the arguments, tools, environment, backend rendering, and Terraform input file without initializing Terraform or contacting vSphere.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>
+<span class="hl-cmd">./destroy-state.sh</span> <span class="hl-f">--preflight</span> \
+  <span class="hl-cmd">--state-key</span> <span class="hl-s">"request-$PRIMARY_LIVE_REQUEST_ID"</span> \
+  <span class="hl-cmd">--offering</span> linux-server-deployment \
+  <span class="hl-cmd">--request-id</span> <span class="hl-s">"$PRIMARY_LIVE_REQUEST_ID"</span> \
+  <span class="hl-cmd">--vm-name</span> <span class="hl-s">"$PRIMARY_LIVE_VM_NAME"</span> \
+  <span class="hl-cmd">--site</span> DEFRA \
+  <span class="hl-cmd">--environment</span> test \
+  <span class="hl-cmd">--cpu</span> <span class="hl-s">"$CPU"</span> \
+  <span class="hl-cmd">--memory-gb</span> <span class="hl-s">"$MEMORY_GB"</span> \
+  <span class="hl-cmd">--disk-size-gb</span> <span class="hl-s">"$DISK_SIZE_GB"</span> \
+  <span class="hl-cmd">--datacenter</span> <span class="hl-s">"$DATACENTER"</span> \
+  <span class="hl-cmd">--cluster</span> <span class="hl-s">"$CLUSTER"</span> \
+  <span class="hl-cmd">--datastore</span> <span class="hl-s">"$DATASTORE"</span> \
+  <span class="hl-cmd">--network</span> <span class="hl-s">"$NETWORK"</span> \
+  <span class="hl-cmd">--template</span> <span class="hl-s">"$TEMPLATE"</span></code></pre>
+<p>For isolation evidence, the requester creates <code>ISOLATION_REQUEST_ID</code> with its own VM name and the admin governs it through a successful <code>LivePlan</code>. Never approve its live apply. Before that second plan, require its own state path to be absent. Also run the following against the primary state file; repeat it afterward and require byte-for-byte identical output. A plan-only run may legitimately leave an unused local state absent.</p>
+<pre><code class="lang-bash"><span class="hl-cmd">ISOLATION_STATE=</span><span class="hl-s">"$PROVING_GROUND_DIR/agent-state/terraform-request-$ISOLATION_REQUEST_ID.tfstate"</span>
+<span class="hl-cmd">test</span> ! <span class="hl-f">-e</span> <span class="hl-s">"$ISOLATION_STATE"</span>
+<span class="hl-cmd">if</span> test <span class="hl-f">-f</span> <span class="hl-s">"$PRIMARY_STATE"</span>; <span class="hl-cmd">then</span>
+  <span class="hl-cmd">shasum</span> <span class="hl-f">-a</span> 256 <span class="hl-s">"$PRIMARY_STATE"</span>
+<span class="hl-cmd">else</span>
+  <span class="hl-cmd">printf</span> <span class="hl-s">'absent  %s\n'</span> <span class="hl-s">"$PRIMARY_STATE"</span>
+<span class="hl-cmd">fi</span></code></pre>
+<p>Also require the second Plan Review to report <code>request-$ISOLATION_REQUEST_ID</code>; derive its corresponding different backend path from the locked local template. Conclude the isolation probe while it is still <code>executing</code>:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$ISOLATION_REQUEST_ID/fail"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"First-test state-isolation probe concluded without apply"}'</span></code></pre>
+<p>From this point onward, every apply, verify, and cleanup action targets only <code>PRIMARY_LIVE_REQUEST_ID</code>; do not reuse a generic <code>REQUEST_ID</code> variable.</p>
+<h2 id="gate-5-live-apply-and-verification">Gate 5: live apply and verification</h2>
+<ol>
+<li>The admin approves live apply only after reviewing Gate 4 evidence. This</li>
+</ol>
+<p>   mints the control-plane-signed grant; <code>live-apply</code> is never dispatched via    the generic execute endpoint. Capture its job ID for status and any required    reconciliation:</p>
+<p>   ``<code>bash    LIVE_APPLY=$(curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \      -X POST "$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/approve-live-apply")    APPLY_JOB_ID=$(printf '%s' "$LIVE_APPLY" | jq -er '.job_id')    </code>``</p>
+<ol>
+<li>Wait for the latest <code>LiveApply</code> job to finish. During plan review and apply,</li>
+</ol>
+<p>   the request remains <code>executing</code>; only an accepted apply result advances it to    <code>verifying</code>.</p>
+<ol>
+<li>Require a <code>Succeeded</code> job with result <code>verified</code>, a matching approved-plan</li>
+</ol>
+<p>   digest, an exact job-spec/grant binding, a successful Terraform apply    summary, and a clean post-apply re-plan.</p>
+<ol>
+<li>Inspect vSphere directly. Confirm exactly one VM exists with the recorded</li>
+</ol>
+<p>   placement and sizing.</p>
+<ol>
+<li>Run request verification only after the converged apply job and provider</li>
+</ol>
+<p>   check pass. The API rejects plan-only, unbound, inconclusive, and drifted    live executions even if a stale client offers the action.    Require final request status <code>completed</code> and a sealed, redacted evidence    pack.</p>
+<p>After every <code>LiveApply</code> attempt, successful or not, record both the isolated Terraform-state disposition and a direct vSphere disposition. Any plan drift, expired or invalid grant, missing credential, digest mismatch, unexpected provider object, or uncertain disposition is a hard stop. Do not retry live apply on the same request.</p>
+<p>If the job is <code>ReconcileRequired</code>, inspect the isolated state and vSphere out of band before resolving it. When the state contains the expected VM resource, use the guarded Gate 6 destroy procedure. When the state is absent or mismatched but vSphere contains an object, do not force this script against unrelated state; use a separately approved provider-recovery procedure and retain only value-free evidence. After the provider and state dispositions are known, the admin resolves the job with a non-sensitive reason:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/admin/agents/jobs/$APPLY_JOB_ID/reconcile"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"Provider and isolated state reconciled under the approved recovery record"}'</span></code></pre>
+<p>That moves the job to <code>Failed</code> but deliberately leaves the parent request at <code>executing</code>. Conclude it separately:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+  <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/fail"</span> \
+  <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"Live apply did not complete with a provable successful disposition"}'</span></code></pre>
+<p>For any other unsuccessful LiveApply status, perform the same state/provider inspection and recovery, then call request <code>fail</code> if it is not already terminal. A new attempt requires a fresh request, plan, review, and approval.</p>
+<h2 id="gate-6-mandatory-cleanup">Gate 6: mandatory cleanup</h2>
+<p>The control plane currently emits <code>LiveDestroy</code> only as compensation after a failed multi-step run. It does not expose operator destroy for this successful single-job request. Use the reviewed out-of-band procedure immediately after Gate 5. Stop the polling agent first so it cannot start another job against the same backend, but keep the control plane, database, and <code>agent-state/</code> intact:</p>
+<pre><code class="lang-bash"><span class="hl-cmd">test</span> <span class="hl-s">"$(git -C "</span><span class="hl-v">$REPO_ROOT</span><span class="hl-s">" rev-parse HEAD)"</span> = <span class="hl-s">"$TEST_REVISION"</span>
+<span class="hl-cmd">test</span> <span class="hl-f">-z</span> <span class="hl-s">"$(git -C "</span><span class="hl-v">$REPO_ROOT</span><span class="hl-s">" status --porcelain=v1 --untracked-files=all)"</span>
+<span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>
+<span class="hl-cmd">./destroy-state.sh</span> \
+  <span class="hl-cmd">--state-key</span> <span class="hl-s">"request-$PRIMARY_LIVE_REQUEST_ID"</span> \
+  <span class="hl-cmd">--offering</span> linux-server-deployment \
+  <span class="hl-cmd">--request-id</span> <span class="hl-s">"$PRIMARY_LIVE_REQUEST_ID"</span> \
+  <span class="hl-cmd">--vm-name</span> <span class="hl-s">"$PRIMARY_LIVE_VM_NAME"</span> \
+  <span class="hl-cmd">--site</span> DEFRA \
+  <span class="hl-cmd">--environment</span> test \
+  <span class="hl-cmd">--cpu</span> <span class="hl-s">"$CPU"</span> \
+  <span class="hl-cmd">--memory-gb</span> <span class="hl-s">"$MEMORY_GB"</span> \
+  <span class="hl-cmd">--disk-size-gb</span> <span class="hl-s">"$DISK_SIZE_GB"</span> \
+  <span class="hl-cmd">--datacenter</span> <span class="hl-s">"$DATACENTER"</span> \
+  <span class="hl-cmd">--cluster</span> <span class="hl-s">"$CLUSTER"</span> \
+  <span class="hl-cmd">--datastore</span> <span class="hl-s">"$DATASTORE"</span> \
+  <span class="hl-cmd">--network</span> <span class="hl-s">"$NETWORK"</span> \
+  <span class="hl-cmd">--template</span> <span class="hl-s">"$TEMPLATE"</span></code></pre>
+<p>Use the exact original values. The script refuses unless the state contains exactly one managed resource, the offering's expected VM, plus only the five allowlisted read-only inventory data sources from the bundle. It shows a saved destroy plan, requires the exact state key as confirmation, and applies only that plan. Do not use <code>--yes</code> for the first test.</p>
+<p>Cleanup passes only when:</p>
+<ul>
+<li>Terraform reports no managed resources in the isolated state;</li>
+<li>direct vSphere inspection confirms the VM is absent;</li>
+<li>after direct vSphere inspection, the value-free cleanup record under</li>
+</ul>
+<p>  <code>agent-state/</code> contains <code>provider_verification=absent</code>, a nonempty   <code>provider_verified_by</code>, and an RFC 3339 UTC <code>provider_verified_at</code>;</p>
+<ul>
+<li>the control-plane database and <code>agent-state/</code> remain available until the</li>
+</ul>
+<p>  result is reviewed.</p>
+<p>Only then may the operator reset Compose volumes or remove <code>agent-state/</code>. <code>docker compose down -v</code> does not destroy provider resources.</p>
+<p>If the guarded destroy command or either absence check fails, mark the live test <code>FAIL</code> and stop. Preserve the database, <code>agent-state/</code>, cleanup output, and provider object. Inspect state and vSphere, then use a separately approved recovery procedure; never reset volumes, delete state, or blindly rerun destroy.</p>
+<h2 id="result-and-evidence">Result and evidence</h2>
+<p>Report each gate as <code>PASS</code>, <code>FAIL</code>, or <code>BLOCKED</code> with:</p>
+<ul>
+<li>tested Git revision and timestamps;</li>
+<li>requester, approver, agent, request, and job identifiers;</li>
+<li>command exit results without secrets or raw provider output;</li>
+<li>plan and apply summaries plus their digests;</li>
+<li>state key and backend object/path;</li>
+<li>request audit/evidence references;</li>
+<li>direct provider create and removal observations;</li>
+<li>cleanup record path and final managed-resource count.</li>
+</ul>
+<p>The operator changes the cleanup record from <code>pending</code> to the exact accepted provider-verification values only after directly confirming the VM is absent.</p>
+<p>The first platform rehearsal is accepted when Gates 1 through 3 pass. The first live vSphere test is accepted only when all six gates pass, including cleanup. An applied VM that was not removed is a failed test, regardless of request status.</p>
+<div class="page-meta"><a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/first-test.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/getting-started.html">&larr; Getting Started</a><a href="/architecture.html">Architecture &rarr;</a></nav>
+</main>
+</div>
+<script>
+(function(){
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){
+    tg.addEventListener('click',function(){
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){
+    var byId={};
+    var targets=[];
+    secLinks.forEach(function(l){
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){byId[id]=l;targets.push(el)}
+    });
+    if(targets.length){
+      var spy=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          if(en.isIntersecting){
+            secLinks.forEach(function(l){l.classList.remove('active')});
+            byId[en.target.id].classList.add('active');
+          }
+        });
+      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      targets.forEach(function(t){spy.observe(t)});
+    }
+  }
+
+  /* sidebar: heading filter + lazy full-text search */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    };
+    var renderHits=function(q){
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }
+      scored.sort(function(a,b){return b[0]-a[0]});
+      scored.slice(0,8).forEach(function(pair){
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' › ':'');
+        if(e.s){
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'…':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'…';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }
+        sbResults.appendChild(a);
+        hitCount++;
+      });
+    };
+    var runSearch=function(q){
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){return r.ok?r.json():null}).then(function(j){
+          if(j){sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}
+        }).catch(function(){});
+      }
+      renderHits(q);
+    };
+    sbFilter.addEventListener('input',function(){
+      var q=sbFilter.value.trim().toLowerCase();
+      listShown=0;
+      sbItems.forEach(function(li){
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        });
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)listShown++;
+      });
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    });
+    sbFilter.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }
+    });
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }
+      sbFilter.focus();
+    });
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
+  }
+})();
+</script>
+</body>
+</html>

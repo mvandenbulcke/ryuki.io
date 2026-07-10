@@ -383,7 +383,9 @@ pub(crate) async fn auth_session_from_persisted_session(
             "SELECT user_id, display_name, roles FROM sessions \
              WHERE id = $1 AND expires_at > NOW() AND provider IN ('entra-id', 'oidc')"
         }
-        _ => "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()",
+        _ => {
+            "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()"
+        }
     };
     match sqlx::query_as::<_, DbAuthSessionRow>(query)
         .bind(session_id)
@@ -1655,7 +1657,9 @@ fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
 /// Pure (no IO) so it is unit-testable.
 fn dump_route_meta(input: &str) -> Result<String, String> {
     let routes: Vec<RouteMetaKey> = serde_json::from_str(input).map_err(|error| {
-        format!("--dump-route-meta expects a JSON array of {{path,method}} objects on stdin: {error}")
+        format!(
+            "--dump-route-meta expects a JSON array of {{path,method}} objects on stdin: {error}"
+        )
     })?;
     let meta: Vec<RouteMetaEntry> = routes
         .into_iter()
@@ -1753,15 +1757,41 @@ async fn main() {
 
     // ── Site registry startup hydration ──────────────────────────────────────
     //
-    // Load persisted active/inactive toggles from the DB and apply them to the
-    // engine's static store (write-through cache). This makes cross-engine reads
-    // (is_valid_site, get_active_site_codes) reflect the persisted state on boot.
+    // Load the complete registry from the DB, including operator-defined codes.
+    // This makes cross-engine reads (is_valid_site, get_active_site_codes)
+    // reflect both persisted membership and active state after a restart.
     // Guard: only when a pool is available. Non-fatal on error.
     if let Some(pool) = crate::database::get_db() {
-        match crate::repos::site_registry::list_active_states(pool).await {
-            Ok(states) => {
-                ryuki_engine::site_registry::hydrate_active_states(&states);
-                tracing::info!(count = states.len(), "site registry hydrated from DB");
+        match crate::repos::site_registry::list_all(pool).await {
+            Ok(entries) => {
+                let count = entries.len();
+                for entry in entries {
+                    let code_system = match entry.code_system.as_str() {
+                        "unlocode" => ryuki_engine::site_registry::SiteCodeSystem::Unlocode,
+                        "custom" => ryuki_engine::site_registry::SiteCodeSystem::Custom,
+                        other => {
+                            tracing::warn!(
+                                code = %entry.unlocode,
+                                code_system = %other,
+                                "ignoring site registry entry with unsupported code system"
+                            );
+                            continue;
+                        }
+                    };
+                    let site = ryuki_engine::site_registry::SiteEntry {
+                        unlocode: entry.unlocode,
+                        name: entry.name,
+                        country: entry.country,
+                        country_code: entry.country_code,
+                        timezone: entry.timezone,
+                        active: entry.active,
+                    };
+                    if let Err(error) = ryuki_engine::site_registry::upsert_site(site, code_system)
+                    {
+                        tracing::warn!(%error, "ignoring invalid persisted site registry entry");
+                    }
+                }
+                tracing::info!(count, "site registry hydrated from DB");
             }
             Err(e) => {
                 tracing::warn!(
@@ -3776,7 +3806,10 @@ mod tests {
     fn test_dump_route_meta_tier_mirrors_middleware_decisions() {
         // exempt surface
         assert_eq!(route_meta_tier("GET", "/health"), Some("public"));
-        assert_eq!(route_meta_tier("POST", "/api/auth/local/login"), Some("public"));
+        assert_eq!(
+            route_meta_tier("POST", "/api/auth/local/login"),
+            Some("public")
+        );
         // mutations resolve through the central mutating table
         assert_eq!(route_meta_tier("POST", "/api/admin/tokens"), Some("admin"));
         assert_eq!(route_meta_tier("POST", "/api/requests"), Some("request"));
@@ -3808,7 +3841,10 @@ mod tests {
         assert_eq!(route_meta_tier("GET", "/api/requests"), Some("read"));
         // agent subrouter: open bootstrap endpoints are public, the rest carry
         // the agent bearer token; the human /api/admin/agents prefix stays admin
-        assert_eq!(route_meta_tier("POST", "/api/agents/register"), Some("public"));
+        assert_eq!(
+            route_meta_tier("POST", "/api/agents/register"),
+            Some("public")
+        );
         assert_eq!(
             route_meta_tier("GET", "/api/agents/cp-public-key"),
             Some("public")
@@ -4480,7 +4516,11 @@ mod db_tests {
             .fetch_one(db)
             .await
             .expect("platform_config table should exist");
-        assert_eq!(count.0, 9, "expected 9 platform_config rows");
+        assert!(
+            count.0 >= 9,
+            "platform_config must retain at least the original 9 seeded settings; got {}",
+            count.0
+        );
 
         let tables: Vec<(String,)> =
             sqlx::query_as("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")

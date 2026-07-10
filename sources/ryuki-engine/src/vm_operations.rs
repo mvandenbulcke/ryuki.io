@@ -1,8 +1,6 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn plan_vm_day2_change(
     target_ci_key: &str,
@@ -22,7 +20,7 @@ pub fn plan_vm_day2_change(
     if owner.is_empty() {
         return Err("owner cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
 
@@ -117,12 +115,12 @@ pub fn validate_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<Validatio
         remediation.push("Provide a valid platform CI key.".into());
     }
 
-    if !VALID_SITES.contains(&change.site.as_str()) {
+    if !site_registry::is_valid_site(&change.site) {
         errors.push(format!("Unknown site: {}", change.site));
         failed_rules.push("p0-site-ou-catalog-match".into());
         remediation.push(format!(
-            "Select a known site. Valid sites: {:?}",
-            VALID_SITES
+            "Select an active site. Valid sites: {:?}",
+            site_registry::get_active_site_codes().unwrap_or_default()
         ));
     }
 

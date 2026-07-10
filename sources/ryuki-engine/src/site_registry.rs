@@ -2,14 +2,99 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 
+pub const SITE_CODE_MAX_LEN: usize = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SiteEntry {
+    /// Canonical site code. The legacy field name is retained for API and
+    /// persistence compatibility; custom site codes are stored here as well.
     pub unlocode: String,
     pub name: String,
     pub country: String,
     pub country_code: String,
     pub timezone: String,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteCodeSystem {
+    Unlocode,
+    Custom,
+}
+
+impl SiteCodeSystem {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unlocode => "unlocode",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredSite {
+    site: SiteEntry,
+    code_system: SiteCodeSystem,
+}
+
+/// Return the canonical identifier used for storage, scoping and comparison.
+///
+/// UN/LOCODE inputs accept the published `CC LLL` display form but are stored
+/// compact (`CCLLL`). Custom identifiers use 2-32 ASCII letters, digits, dots,
+/// underscores or hyphens, must start/end with an alphanumeric character, and
+/// are upper-cased. This excludes URL/path delimiters and case aliases.
+pub fn normalize_site_code(input: &str, code_system: SiteCodeSystem) -> Result<String, String> {
+    let upper = input.trim().to_ascii_uppercase();
+    let code = match code_system {
+        SiteCodeSystem::Unlocode => {
+            let compact = if upper.len() == 6 && upper.as_bytes().get(2) == Some(&b' ') {
+                format!("{}{}", &upper[..2], &upper[3..])
+            } else {
+                upper
+            };
+            let bytes = compact.as_bytes();
+            if bytes.len() != 5
+                || !bytes[..2].iter().all(u8::is_ascii_alphabetic)
+                || !bytes[2..].iter().all(u8::is_ascii_alphanumeric)
+            {
+                return Err(
+                    "UN/LOCODE must contain a two-letter country code and three alphanumeric location characters"
+                        .into(),
+                );
+            }
+            compact
+        }
+        SiteCodeSystem::Custom => {
+            let bytes = upper.as_bytes();
+            if !(2..=SITE_CODE_MAX_LEN).contains(&bytes.len()) {
+                return Err(format!(
+                    "custom site code must be 2-{SITE_CODE_MAX_LEN} ASCII characters"
+                ));
+            }
+            if !bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return Err(
+                    "custom site code must start and end with a letter or digit and contain only ASCII letters, digits, '.', '_' or '-'"
+                        .into(),
+                );
+            }
+            upper
+        }
+    };
+    Ok(code)
+}
+
+/// Normalize an identifier whose registered code system is not yet known.
+/// Compact/display-form UN/LOCODEs and custom codes share one canonical lookup
+/// namespace, so a code cannot resolve to two different sites.
+pub fn normalize_site_code_for_lookup(input: &str) -> Result<String, String> {
+    normalize_site_code(input, SiteCodeSystem::Unlocode)
+        .or_else(|_| normalize_site_code(input, SiteCodeSystem::Custom))
 }
 
 // ─── UN/LOCODE reference data (ISO 3166-1 alpha-2 country codes) ───
@@ -784,78 +869,139 @@ fn reference_sites() -> Vec<SiteEntry> {
     ]
 }
 
-static SITE_STORE: std::sync::LazyLock<Mutex<Vec<SiteEntry>>> =
-    std::sync::LazyLock::new(|| Mutex::new(reference_sites()));
+static SITE_STORE: std::sync::LazyLock<Mutex<Vec<RegisteredSite>>> =
+    std::sync::LazyLock::new(|| {
+        let sites = reference_sites()
+            .into_iter()
+            .map(|mut site| {
+                site.unlocode = normalize_site_code(&site.unlocode, SiteCodeSystem::Unlocode)
+                    .expect("built-in UN/LOCODE seed must be valid");
+                RegisteredSite {
+                    site,
+                    code_system: SiteCodeSystem::Unlocode,
+                }
+            })
+            .collect();
+        Mutex::new(sites)
+    });
 
-fn site_store() -> &'static Mutex<Vec<SiteEntry>> {
+fn site_store() -> &'static Mutex<Vec<RegisteredSite>> {
     &SITE_STORE
+}
+
+fn site_json(entry: &RegisteredSite) -> Value {
+    json!({
+        "code": entry.site.unlocode,
+        "code_system": entry.code_system.as_str(),
+        // Backward-compatible alias for existing API clients.
+        "unlocode": entry.site.unlocode,
+        "name": entry.site.name,
+        "country": entry.site.country,
+        "country_code": entry.site.country_code,
+        "timezone": entry.site.timezone,
+        "active": entry.site.active
+    })
+}
+
+fn normalize_registration(
+    mut site: SiteEntry,
+    code_system: SiteCodeSystem,
+) -> Result<RegisteredSite, String> {
+    site.unlocode = normalize_site_code(&site.unlocode, code_system)?;
+    Ok(RegisteredSite { site, code_system })
+}
+
+/// Register a site in the process-local store. Codes share one canonical
+/// namespace across systems, so case/spelling aliases and cross-system
+/// collisions are rejected.
+pub fn register_site(site: SiteEntry, code_system: SiteCodeSystem) -> Result<Value, String> {
+    let entry = normalize_registration(site, code_system)?;
+    let mut store = site_store().lock().map_err(|e| e.to_string())?;
+    if store
+        .iter()
+        .any(|existing| existing.site.unlocode == entry.site.unlocode)
+    {
+        return Err(format!("Site '{}' already exists", entry.site.unlocode));
+    }
+    let mut result = site_json(&entry);
+    result["source"] = json!("dry-run");
+    store.push(entry);
+    Ok(result)
+}
+
+/// Replace or insert a site loaded from durable storage. Used during startup
+/// hydration and immediately after a committed database registration.
+pub fn upsert_site(site: SiteEntry, code_system: SiteCodeSystem) -> Result<(), String> {
+    let entry = normalize_registration(site, code_system)?;
+    let mut store = site_store().lock().map_err(|e| e.to_string())?;
+    if let Some(existing) = store
+        .iter_mut()
+        .find(|existing| existing.site.unlocode == entry.site.unlocode)
+    {
+        *existing = entry;
+    } else {
+        store.push(entry);
+    }
+    Ok(())
 }
 
 pub fn list_sites(active_only: bool) -> Result<Value, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
     let sites: Vec<Value> = store
         .iter()
-        .filter(|s| !active_only || s.active)
-        .map(|s| {
-            json!({
-                "unlocode": s.unlocode,
-                "name": s.name,
-                "country": s.country,
-                "country_code": s.country_code,
-                "timezone": s.timezone,
-                "active": s.active
-            })
-        })
+        .filter(|entry| !active_only || entry.site.active)
+        .map(site_json)
         .collect();
     Ok(json!({"source": "dry-run", "count": sites.len(), "sites": sites}))
 }
 
-pub fn get_site(unlocode: &str) -> Result<Value, String> {
+pub fn get_site(code: &str) -> Result<Value, String> {
+    let code = normalize_site_code_for_lookup(code)?;
     let store = site_store().lock().map_err(|e| e.to_string())?;
-    let site = store
+    let entry = store
         .iter()
-        .find(|s| s.unlocode == unlocode)
-        .ok_or_else(|| format!("Site '{}' not found", unlocode))?;
-    Ok(json!({
-        "source": "dry-run",
-        "unlocode": site.unlocode,
-        "name": site.name,
-        "country": site.country,
-        "country_code": site.country_code,
-        "timezone": site.timezone,
-        "active": site.active
-    }))
+        .find(|entry| entry.site.unlocode == code)
+        .ok_or_else(|| format!("Site '{}' not found", code))?;
+    let mut result = site_json(entry);
+    result["source"] = json!("dry-run");
+    Ok(result)
 }
 
-pub fn activate_site(unlocode: &str) -> Result<Value, String> {
+pub fn activate_site(code: &str) -> Result<Value, String> {
+    let code = normalize_site_code_for_lookup(code)?;
     let mut store = site_store().lock().map_err(|e| e.to_string())?;
-    let site = store
+    let entry = store
         .iter_mut()
-        .find(|s| s.unlocode == unlocode)
-        .ok_or_else(|| format!("Site '{}' not found in reference list", unlocode))?;
-    site.active = true;
+        .find(|entry| entry.site.unlocode == code)
+        .ok_or_else(|| format!("Site '{}' not found in registry", code))?;
+    entry.site.active = true;
     Ok(json!({
         "source": "dry-run",
-        "unlocode": site.unlocode,
-        "name": site.name,
+        "code": entry.site.unlocode,
+        "code_system": entry.code_system.as_str(),
+        "unlocode": entry.site.unlocode,
+        "name": entry.site.name,
         "active": true,
-        "message": format!("Site {} ({}) activated", site.unlocode, site.name)
+        "message": format!("Site {} ({}) activated", entry.site.unlocode, entry.site.name)
     }))
 }
 
-pub fn deactivate_site(unlocode: &str) -> Result<Value, String> {
+pub fn deactivate_site(code: &str) -> Result<Value, String> {
+    let code = normalize_site_code_for_lookup(code)?;
     let mut store = site_store().lock().map_err(|e| e.to_string())?;
-    let site = store
+    let entry = store
         .iter_mut()
-        .find(|s| s.unlocode == unlocode)
-        .ok_or_else(|| format!("Site '{}' not found", unlocode))?;
-    site.active = false;
+        .find(|entry| entry.site.unlocode == code)
+        .ok_or_else(|| format!("Site '{}' not found", code))?;
+    entry.site.active = false;
     Ok(json!({
         "source": "dry-run",
-        "unlocode": site.unlocode,
-        "name": site.name,
+        "code": entry.site.unlocode,
+        "code_system": entry.code_system.as_str(),
+        "unlocode": entry.site.unlocode,
+        "name": entry.site.name,
         "active": false,
-        "message": format!("Site {} ({}) deactivated", site.unlocode, site.name)
+        "message": format!("Site {} ({}) deactivated", entry.site.unlocode, entry.site.name)
     }))
 }
 
@@ -864,22 +1010,13 @@ pub fn search_sites(query: &str) -> Result<Value, String> {
     let q = query.to_lowercase();
     let matches: Vec<Value> = store
         .iter()
-        .filter(|s| {
-            s.unlocode.to_lowercase().contains(&q)
-                || s.name.to_lowercase().contains(&q)
-                || s.country.to_lowercase().contains(&q)
-                || s.country_code.to_lowercase() == q
+        .filter(|entry| {
+            entry.site.unlocode.to_lowercase().contains(&q)
+                || entry.site.name.to_lowercase().contains(&q)
+                || entry.site.country.to_lowercase().contains(&q)
+                || entry.site.country_code.to_lowercase() == q
         })
-        .map(|s| {
-            json!({
-                "unlocode": s.unlocode,
-                "name": s.name,
-                "country": s.country,
-                "country_code": s.country_code,
-                "timezone": s.timezone,
-                "active": s.active
-            })
-        })
+        .map(site_json)
         .collect();
     Ok(json!({"source": "dry-run", "query": query, "count": matches.len(), "matches": matches}))
 }
@@ -890,7 +1027,8 @@ pub fn list_countries() -> Result<Value, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
     let mut countries: std::collections::BTreeMap<String, (String, usize)> =
         std::collections::BTreeMap::new();
-    for s in store.iter() {
+    for entry in store.iter() {
+        let s = &entry.site;
         let entry = countries
             .entry(s.country_code.clone())
             .or_insert((s.country.clone(), 0));
@@ -910,17 +1048,8 @@ pub fn list_cities_by_country(country_code: &str) -> Result<Value, String> {
     let cc = country_code.to_uppercase();
     let cities: Vec<Value> = store
         .iter()
-        .filter(|s| s.country_code.to_uppercase() == cc)
-        .map(|s| {
-            json!({
-                "unlocode": s.unlocode,
-                "name": s.name,
-                "country": s.country,
-                "country_code": s.country_code,
-                "timezone": s.timezone,
-                "active": s.active
-            })
-        })
+        .filter(|entry| entry.site.country_code.to_uppercase() == cc)
+        .map(site_json)
         .collect();
     if cities.is_empty() {
         return Err(format!("No sites found for country code '{}'", cc));
@@ -932,8 +1061,8 @@ pub fn get_active_site_codes() -> Result<Vec<String>, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
     Ok(store
         .iter()
-        .filter(|s| s.active)
-        .map(|s| s.unlocode.clone())
+        .filter(|entry| entry.site.active)
+        .map(|entry| entry.site.unlocode.clone())
         .collect())
 }
 
@@ -941,29 +1070,39 @@ pub fn get_active_site_names() -> Result<Vec<String>, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
     Ok(store
         .iter()
-        .filter(|s| s.active)
-        .map(|s| s.name.clone())
+        .filter(|entry| entry.site.active)
+        .map(|entry| entry.site.name.clone())
         .collect())
 }
 
-pub fn is_valid_site(unlocode: &str) -> bool {
+pub fn is_valid_site(code: &str) -> bool {
+    let Ok(code) = normalize_site_code_for_lookup(code) else {
+        return false;
+    };
     site_store()
         .lock()
-        .map(|store| store.iter().any(|s| s.unlocode == unlocode && s.active))
+        .map(|store| {
+            store
+                .iter()
+                .any(|entry| entry.site.unlocode == code && entry.site.active)
+        })
         .unwrap_or(false)
 }
 
-/// True when `unlocode` is a RECOGNISED site in the registry, regardless of its
+/// True when `code` is a RECOGNISED site in the registry, regardless of its
 /// active status — i.e. membership only. Unlike [`is_valid_site`] (which also
-/// requires the site to be ACTIVE/operational), this answers "is this a real,
-/// known UN/LOCODE?". A CMDB record can legitimately reference a recognised but
+/// requires the site to be ACTIVE/operational), this answers "is this a known,
+/// governed site code?". A CMDB record can legitimately reference a recognised but
 /// currently-inactive site, so import validation uses this rather than the
 /// active-only check. Membership is also stable against runtime activate/
 /// deactivate toggling of the registry.
-pub fn is_known_site(unlocode: &str) -> bool {
+pub fn is_known_site(code: &str) -> bool {
+    let Ok(code) = normalize_site_code_for_lookup(code) else {
+        return false;
+    };
     site_store()
         .lock()
-        .map(|store| store.iter().any(|s| s.unlocode == unlocode))
+        .map(|store| store.iter().any(|entry| entry.site.unlocode == code))
         .unwrap_or(false)
 }
 
@@ -978,8 +1117,11 @@ pub fn hydrate_active_states(states: &[(String, bool)]) {
         return;
     };
     for (unlocode, active) in states {
-        if let Some(entry) = store.iter_mut().find(|s| &s.unlocode == unlocode) {
-            entry.active = *active;
+        let Ok(code) = normalize_site_code_for_lookup(unlocode) else {
+            continue;
+        };
+        if let Some(entry) = store.iter_mut().find(|entry| entry.site.unlocode == code) {
+            entry.site.active = *active;
         }
     }
 }
@@ -1021,6 +1163,60 @@ mod tests {
     #[test]
     fn test_get_site_not_found() {
         assert!(get_site("NONEXISTENT").is_err());
+    }
+
+    #[test]
+    fn site_codes_have_one_safe_canonical_spelling() {
+        assert_eq!(
+            normalize_site_code(" jp tyo ", SiteCodeSystem::Unlocode).unwrap(),
+            "JPTYO"
+        );
+        assert_eq!(
+            normalize_site_code(" dc-eu_01.prod ", SiteCodeSystem::Custom).unwrap(),
+            "DC-EU_01.PROD"
+        );
+        for invalid in ["A", "DC/EU", "-DC01", "DC01-", "DC EU", "DÇ01"] {
+            assert!(
+                normalize_site_code(invalid, SiteCodeSystem::Custom).is_err(),
+                "{invalid} must not be accepted as a custom site code"
+            );
+        }
+    }
+
+    #[test]
+    fn active_custom_site_is_registered_in_the_same_governed_namespace() {
+        let code = "TEST-REGISTRY-01";
+        let _ = register_site(
+            SiteEntry {
+                unlocode: code.into(),
+                name: "Registry test site".into(),
+                country: "Belgium".into(),
+                country_code: "BE".into(),
+                timezone: "Europe/Brussels".into(),
+                active: true,
+            },
+            SiteCodeSystem::Custom,
+        );
+        assert!(is_known_site("test-registry-01"));
+        assert!(is_valid_site(code));
+        let result = get_site(code).unwrap();
+        assert_eq!(result["code_system"], "custom");
+        assert_eq!(result["code"], code);
+        assert!(
+            register_site(
+                SiteEntry {
+                    unlocode: code.to_ascii_lowercase(),
+                    name: "Alias".into(),
+                    country: "Belgium".into(),
+                    country_code: "BE".into(),
+                    timezone: "Europe/Brussels".into(),
+                    active: false,
+                },
+                SiteCodeSystem::Custom,
+            )
+            .is_err(),
+            "case aliases must collide with the canonical code"
+        );
     }
 
     #[test]

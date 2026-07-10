@@ -301,7 +301,11 @@ mod firewall_rule_sets_db_tests {
             insert(&pool, &rs).await.expect("insert");
         }
         let total = count(&pool, Some(&defra)).await.expect("count defra after");
-        assert_eq!(total, raw_defra + 3, "3 DEFRA rows added to the site subset");
+        assert_eq!(
+            total,
+            raw_defra + 3,
+            "3 DEFRA rows added to the site subset"
+        );
         assert_eq!(
             count(&pool, None).await.expect("count all after"),
             raw_all + 3,
@@ -312,7 +316,11 @@ mod firewall_rule_sets_db_tests {
         let all_defra = list_page(&pool, Some(&defra), 1000, 0)
             .await
             .expect("list defra");
-        assert_eq!(all_defra.len() as i64, total, "full DEFRA page == its count");
+        assert_eq!(
+            all_defra.len() as i64,
+            total,
+            "full DEFRA page == its count"
+        );
         assert!(
             all_defra.iter().all(|r| r.site == "DEFRA"),
             "Some(&[DEFRA]) must filter to DEFRA only"

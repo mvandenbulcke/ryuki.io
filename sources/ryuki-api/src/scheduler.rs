@@ -219,6 +219,17 @@ async fn prune_resolved_shift_queue(
     Ok(deleted)
 }
 
+/// A scheduled drift recheck may only reuse a spec whose state namespace is
+/// owned by the same request as the source job row. This explicitly rejects
+/// malformed or pre-v2 historical specs before they become a new LivePlan.
+fn live_recheck_spec_matches_request(
+    spec: &ryuki_protocol::JobSpec,
+    request_id: uuid::Uuid,
+) -> bool {
+    let expected_state_key = crate::contracts::request_state_key(request_id);
+    spec.request_id == request_id && spec.state_key.as_deref() == Some(expected_state_key.as_str())
+}
+
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -706,12 +717,12 @@ async fn run_job(
             // is a DB timestamp, so reading NOW() from the same tx keeps the age
             // computation apples-to-apples and immune to app-host clock skew (which
             // could otherwise flag every fresh deployment overdue at once).
-            let now: chrono::DateTime<chrono::Utc> =
-                sqlx::query_scalar("SELECT NOW()").fetch_one(&mut **tx).await?;
-            let rows = crate::repos::drift_scan::operational_deployments_for_drift_recheck(
-                &mut **tx,
-            )
-            .await?;
+            let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT NOW()")
+                .fetch_one(&mut **tx)
+                .await?;
+            let rows =
+                crate::repos::drift_scan::operational_deployments_for_drift_recheck(&mut **tx)
+                    .await?;
             let mut overdue: u64 = 0;
             let mut enqueued: u64 = 0;
             for row in &rows {
@@ -728,8 +739,7 @@ async fn run_job(
                 }
                 overdue += 1;
                 let age_days = (now - row.last_verified).num_days();
-                let priority =
-                    ryuki_engine::drift_scan::drift_recheck_priority(age_days, interval);
+                let priority = ryuki_engine::drift_scan::drift_recheck_priority(age_days, interval);
                 let title = format!("Drift re-check overdue: request {request_id}");
                 let description = format!(
                     "Operational deployment {request_id} ({} / {}) has not had a successful \
@@ -762,7 +772,9 @@ async fn run_job(
             }
             Ok((
                 "succeeded".to_string(),
-                Some(format!("{overdue} deployment(s) overdue, {enqueued} enqueued")),
+                Some(format!(
+                    "{overdue} deployment(s) overdue, {enqueued} enqueued"
+                )),
             ))
         }
         "drift_recheck_dispatch_scan" => {
@@ -828,11 +840,11 @@ async fn run_job(
                     skipped_bad_spec += 1;
                     continue;
                 };
-                // Fail-safe: the derived recheck must target THIS request. A stored
-                // spec whose request_id disagrees with the job row is corrupt —
-                // never dispatch agent work bound to the wrong request (its result
-                // would backlink onto a different request on ingest).
-                if spec.request_id != row.request_id {
+                // Fail-safe: the derived recheck must target THIS request and
+                // its exact request-owned state namespace. A malformed or
+                // historical spec with a foreign state key is never promoted
+                // into a fresh LivePlan job.
+                if !live_recheck_spec_matches_request(&spec, row.request_id) {
                     skipped_bad_spec += 1;
                     continue;
                 }
@@ -6647,6 +6659,7 @@ mod db_tests {
             "iac_ref": "linux-server-deployment@v1",
             "iac_digest": "0".repeat(64),
             "vars": {},
+            "state_key": format!("request-{request_id}"),
             "mode": "live_apply",
         });
         let sql = format!(
@@ -6710,6 +6723,35 @@ mod db_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn drift_recheck_spec_requires_exact_request_state_owner() {
+        use std::collections::BTreeMap;
+
+        let request_id = uuid::Uuid::new_v4();
+        let mut spec = ryuki_protocol::JobSpec {
+            request_id,
+            offering_id: uuid::Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            state_key: Some(crate::contracts::request_state_key(request_id)),
+            mode: ryuki_protocol::JobMode::LiveApply,
+        };
+        assert!(live_recheck_spec_matches_request(&spec, request_id));
+
+        spec.state_key = Some(crate::contracts::request_state_key(uuid::Uuid::new_v4()));
+        assert!(
+            !live_recheck_spec_matches_request(&spec, request_id),
+            "a safe but foreign request state key must not be promoted to LivePlan"
+        );
+
+        spec.state_key = Some(crate::contracts::request_state_key(request_id));
+        assert!(!live_recheck_spec_matches_request(
+            &spec,
+            uuid::Uuid::new_v4()
+        ));
     }
 
     /// An operational deployment overdue for a drift re-check gets exactly one

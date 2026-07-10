@@ -39,7 +39,7 @@ implementing **all 66**. This file tracks execution.
 | 7 | [x] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
 | 8 | [x] | Agent enrollment approve/revoke from portal | Portal | M | H | `0edc1ea`+`14e8e87` — revoke (API+portal): terminal revocation, atomic audit on approve+revoke, admin re-check, idempotent; approve was already shipped `6d6fb5b` |
 | 9 | [ ] | Outbound notifications (email/webhook/callback/chat) | Roadmap | L | H | ✓ |
-| 10 | [ ] | Destroy/teardown execution mode (live decommission) | Exec | L | H | — |
+| 10 | [~] | Destroy/teardown execution mode (live decommission) | Exec | L | H | Terraform `LiveDestroy` is implemented for system-authorized reverse-order compensation after a failed multi-step live run. A successful request still has no operator-governed destroy endpoint; the first test therefore requires the reviewed state-keyed cleanup procedure in `docs/first-test.md`. |
 | 11 | [x] | Pre-dispatch policy gate for unsafe IaC | Exec | M | H | SHIPPED — pure `ryuki_engine::iac_policy::evaluate_iac_bundle` (no-IO) refuses live-mode IaC with unsafe constructs: TF `provisioner` blocks + `data "external"` (line-based HCL scan, comment/block-comment aware); Ansible `check_mode` non-truthy override + legacy `always_run`, `raw`/`script` (incl. FQCN + `action`/`local_action` first-token resolution), external `include/import_*`/`roles`/`import_playbook` (fail-closed as Unscannable), YAML merge-keys resolved via `apply_merge` before scan, non-`.tf`/`.yml` files fail-closed. Wired into all 4 runner live entry points (TF+Ansible plan/apply) BEFORE init/providers → `RunStatus::Failed` + `POLICY-REFUSED` summary. Conformance test: every bundled offering passes. GPT-5.5 Codex (xhigh) found 5 Ansible bypasses on round 1 (check_mode `0`/`"n"`, action-mapping inline args, action-wrapped includes, `<<` merge keys, top-level import_playbook) — ALL fixed + regression-tested; round 2 re-review confirmed closed |
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
 | 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
@@ -71,7 +71,7 @@ implementing **all 66**. This file tracks execution.
 | 39 | [x] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | `9e1d425` — scheduled maintain_review_scan flags due Operational requests via request.maintain-review-due domain events (atomic FOR UPDATE SKIP LOCKED claim+advance, 90d, mig 119); reuses #40 pattern; codex-approved plan+impl. Follow-ups: alert-feed promotion + per-criticality interval |
 | 40 | [x] | Scheduled/recurring synthetic health checks | Observ | S | M | `715f126` — durable scheduler runs synthetic_health_run (first safe-internal-write kind: job_is_schedulable allowlist); hourly seed (mig 116) + tx-aware result writes |
 | 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
-| 42 | [x] | Multi-step orchestration / job dependencies | Exec | L | M | REACHABLE end-to-end. Slice 1 `5459724` (pure job_orchestration: validate_plan/ready_steps/cycle-detect). Slice 2a `4473f68` (job_steps mig 151 + execute materializes INITIAL ready steps, OfflineDryRun-only). Slice 2b `26f35a9` (step-success backlink dispatches next-ready + gates verifying/failed; FOR UPDATE + fail_inflight_steps reconciliation). Slice 3 `e201af5` — offering-template AUTHORING: offering_step_template + resolve_offering_id(deployment_profile=managed-onboarding → composite preflight→deploy→monitor); plan materialized into job_steps at CREATION (pre-approval, same tx as request INSERT, immutable after), surfaced in requests_get for approvers; live-apply mint rejects a stepped request (multi-step = OfflineDryRun-only). All 4 slices GPT-5.5-Codex-xhigh clean, live-DB tested. Follow-up (bigger, separate): live-apply-PER-STEP with per-step approval |
+| 42 | [x] | Multi-step orchestration / job dependencies | Exec | L | M | REACHABLE end to end. The immutable `job_steps` DAG is materialized at request creation and surfaced in request detail. Offline steps dispatch by dependency. In live mode, each step runs `LivePlan`, parks at `AwaitingApproval`, receives its own admin-approved, exact-spec/step/state-bound `LiveApply` grant, and unlocks dependents only after apply. A later failure triggers reverse-order, system-authorized `LiveDestroy`; a destroy failure halts for reconciliation. The portal renders statuses and two-click per-step approval. See `docs/orchestration.md`. |
 | 43 | [x] | Post-apply verification (re-plan → Verified) | Exec | M | M | `349b152`/`e5c7b52`/`2f5ee2b` — engine classifier (post_apply.rs) → runner re-plan verdict in RunOutcome → CP derives verdict from digest-verified evidence, transitions Applied→Verified + emits scoped request.post-apply-drift (Critical). All Codex-xhigh reviewed |
 | 44 | [x] | Agent liveness sweep + offline detection | Exec | M | M | ALREADY DONE — spawn_agent_offline_scan (main.rs, 60s/180s) + agent_offline_scan_once emits agent.offline/agent.online on state transitions, deduped via offline_alerted (mig 114), with notifications + to_status warning alert. (A durable-scheduler port was scoped but abandoned as redundant — codex plan-review caught the existing emitter.) |
 | 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
@@ -108,6 +108,12 @@ A Fable 5 goal-session ran a 5-agent adversarial review (api / engine / live-exe
 live-infra test (real terraform + a docker-provider apply/destroy). **24 commits**
 (`bab5c13..6268f26`), each GPT-5.5 Codex (xhigh/high) reviewed and pushed:
 
+This is historical evidence for that revision and provider, not acceptance of a
+current vSphere test. In particular, the Docker-provider exercise did not prove
+vSphere placement, per-request backend isolation, the current agent protocol,
+or successful-request cleanup. Current readiness is defined only by
+[First Test Acceptance](../first-test.md); a code/spec mismatch blocks its gate.
+
 - **Live-exec integrity:** `aee5b3e` full-plan digest (32 KiB-truncation hole);
   `f163f2b` `ack_job` cross-agent state oracle; `5ddc5be` `software_execute`
   audit attribution + tx-release.
@@ -140,13 +146,13 @@ The loop was then run to CONVERGENCE with three more adversarial passes:
   arg construction / portal server-boundary): **1** confirmed — `73697c1` the same
   chrono `+Days` overflow class in `dns_ipam::build_reservation` (IPAM reserve TTL).
 
-Marginal finding rate tapered 0 → 7 → 1 (the last a known-class repeat), so the
-review-and-fix loop is **converged/exhausted** for the current surface (~16 distinct
-defects fixed, **31 commits** `bab5c13..73697c1`). Remaining `[ ]` rows above are
-greenfield features (destroy mode #10, post-apply verify #43, drift-scan #31,
-multi-step orchestration #42, inbound webhooks #18, CMDB reconcile #27, AD adapter
-#28, DR failover #29, access recert #48, evidence blob store #60, OpenAPI #64, AI
-narrative #65), each best built in a focused SDD session. Open design call:
+Marginal finding rate tapered 0 → 7 → 1 (the last a known-class repeat), so that
+review-and-fix loop was considered **converged/exhausted for the reviewed
+revision** (~16 distinct defects fixed, **31 commits**
+`bab5c13..73697c1`). It is not a claim that later changes or a different
+provider path need no review. Several features listed as future work at that
+time were subsequently implemented; the table above, not this historical
+paragraph, carries their current tracker state. Open design call:
 `software_approve` SoD. Recurring class to watch in new code: chrono
 `+Days`/`+Duration` on a caller-supplied count — bound it (36_500) + checked_add.
 

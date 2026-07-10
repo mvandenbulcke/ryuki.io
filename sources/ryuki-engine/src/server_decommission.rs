@@ -1,8 +1,6 @@
-use crate::models::*;
+use crate::{models::*, site_registry};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const DEPENDENCY_CATEGORIES: &[&str] = &[
     "backup-retention",
@@ -32,7 +30,7 @@ pub fn plan_decommission(
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
-    if !VALID_SITES.contains(&site) {
+    if !site_registry::is_valid_site(site) {
         return Err(format!("Unknown site: {}", site));
     }
     if quarantine_days == 0 {
@@ -100,12 +98,12 @@ pub fn validate_decommission(request: &DecommissionRequest) -> Result<Validation
         remediation.push("Provide a valid server name.".into());
     }
 
-    if !VALID_SITES.contains(&request.site.as_str()) {
+    if !site_registry::is_valid_site(&request.site) {
         errors.push(format!("Unknown site: {}", request.site));
         failed_rules.push("p0-site-ou-catalog-match".into());
         remediation.push(format!(
-            "Select a known site. Valid sites: {:?}",
-            VALID_SITES
+            "Select an active site. Valid sites: {:?}",
+            site_registry::get_active_site_codes().unwrap_or_default()
         ));
     }
 
