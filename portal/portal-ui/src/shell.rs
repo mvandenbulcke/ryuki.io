@@ -8,42 +8,29 @@ use leptos_router::components::Outlet;
 use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::NavigateOptions;
 
-/// The ryū logo mark shared with the ryuki.io landing page. Colors come from
-/// the shared `--logo-red`/`--logo-gold` tokens, which do not vary by theme;
-/// they ride on `style` because SVG presentation attributes do not reliably
-/// resolve `var()` in every browser.
+/// The Closed Orbit mark shared with ryuki.io: three governed rails around one
+/// witnessed pearl. Theme-aware colors ride on `style` because SVG
+/// presentation attributes do not reliably resolve `var()` in every browser.
 #[component]
 pub fn BrandMark() -> impl IntoView {
     view! {
         <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+            <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
                 <path
-                    d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2"
-                    fill="none"
-                    style="stroke: var(--logo-red)"
-                    stroke-width="7.5"
-                    stroke-linecap="round"
+                    d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z"
+                    style="fill: var(--logo-rail)"
                 />
                 <path
-                    d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2"
-                    fill="none"
-                    style="stroke: var(--logo-red)"
-                    stroke-width="2.7"
-                    stroke-linecap="round"
+                    d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z"
+                    transform="rotate(120 50 50)"
+                    style="fill: var(--logo-rail)"
                 />
                 <path
-                    d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3"
-                    fill="none"
-                    style="stroke: var(--logo-red)"
-                    stroke-width="3"
-                    stroke-linecap="round"
+                    d="M30 14H65C68 14 70 15 72 17L83 28C85 30 86 32 86 35V43H75V36C75 34 74 33 73 32L67 26C66 25 64 24 62 24H30Z"
+                    transform="rotate(240 50 50)"
+                    style="fill: var(--logo-rail)"
                 />
-                <path
-                    d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z"
-                    style="fill: var(--logo-red)"
-                />
-                <circle cx="48.4" cy="13.2" r="1.6" style="fill: var(--logo-gold)" />
-                <circle cx="32" cy="35" r="5.8" style="fill: var(--logo-gold)" />
+                <circle cx="50" cy="50" r="9" style="fill: var(--logo-pearl)" />
             </svg>
         </span>
     }
@@ -93,12 +80,6 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
     let route_live_execution_allowed = route_snapshot.live_execution_allowed.to_string();
     let route_raw_state_allowed = route_snapshot.raw_route_state_allowed.to_string();
     let user_scope_label = format!("User: {}", auth_session.display_name);
-    let user_roles = if auth_session.roles.is_empty() {
-        "none".to_string()
-    } else {
-        auth_session.roles.join(", ")
-    };
-
     let session_resource = use_context::<SessionResource>();
     let logout_action = Action::new(move |_: &()| async move {
         let _ = perform_logout().await;
@@ -253,9 +234,9 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
             <header class="topbar" aria-label="Product shell">
                 <a class="brand" href="/" aria-label="Ryuki Infrastructure Platform home">
                     <BrandMark/>
-                    <span>
-                        <span class="brand-kicker">"Ryuki"</span>
-                        <strong>"Infrastructure Platform"</strong>
+                    <span class="brand-copy">
+                        <strong><span>"ryuki"</span><span class="brand-io">".io"</span></strong>
+                        <span class="brand-kicker">"Infrastructure control"</span>
                     </span>
                 </a>
                 <form class="search" role="search" on:submit=on_search_submit>
@@ -263,7 +244,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                     <input
                         id="global-search"
                         type="search"
-                        placeholder="Search requests…"
+                        placeholder="Find a request…"
                         aria-label="Search requests"
                         prop:value=move || search_value.get()
                         on:input=move |ev| set_search_value.set(event_target_value(&ev))
@@ -277,7 +258,6 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                     </div>
                     <div class="session-info" aria-label="Session info">
                         <span class="pill user">{user_scope_label}</span>
-                        <span class="table-note">"Roles: " {user_roles}</span>
                         <button
                             class="signout-button"
                             on:click=on_signout_click
@@ -307,6 +287,10 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
             </Show>
 
             <nav class="nav" aria-label="Primary navigation">
+                <div class="nav-head" aria-hidden="true">
+                    <span>"Control rooms"</span>
+                    <small>"Role-scoped"</small>
+                </div>
                 {PRIMARY_NAV_ITEMS
                     .iter()
                     .filter(|item| role_satisfies(&auth_session, item.required_role))

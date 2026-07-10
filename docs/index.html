@@ -1,1570 +1,453 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ryuki · Governed Infrastructure Control Plane</title>
-<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable, dry-run-first workflows with 17 provider adapters: VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ryuki · Infrastructure Changes, With Witnesses</title>
+<meta name="description" content="Ryuki is the open-source Rust control plane for governed, dry-run-first infrastructure operations across multiple sites. Every request produces reviewable evidence; live execution stays behind a signed human gate.">
 <link rel="canonical" href="https://ryuki.io/">
-<meta name="theme-color" content="#0b0d12">
+<meta name="theme-color" content="#090b0a">
 
-<!-- Open Graph / Twitter -->
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://ryuki.io/">
-<meta property="og:title" content="Ryuki · Governed Infrastructure Control Plane">
-<meta property="og:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure. Request, operate, evidence, and retire — with audit-ready evidence at every stage.">
+<meta property="og:title" content="Ryuki · Infrastructure Changes, With Witnesses">
+<meta property="og:description" content="Governed, dry-run-first infrastructure operations. Signed plans, human-gated live execution, and reviewable evidence across every site.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Ryuki · Governed Infrastructure Control Plane">
-<meta name="twitter:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure.">
+<meta name="twitter:title" content="Ryuki · Infrastructure Changes, With Witnesses">
+<meta name="twitter:description" content="Open-source, Rust-powered, dry-run-first infrastructure governance.">
 <meta name="twitter:image" content="https://ryuki.io/assets/og.jpg">
 
-<!-- Icons -->
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-<link rel="preload" as="image" href="/assets/ryu.webp" type="image/webp">
-<script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Ryuki","url":"https://ryuki.io/","applicationCategory":"DeveloperApplication","operatingSystem":"Linux, Kubernetes","description":"Open-source, Rust-powered governed control plane for multi-site datacenter infrastructure.","license":"https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE","sameAs":["https://github.com/mvandenbulcke/ryuki.io"],"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
-</script>
-
-<!-- JS flag: enables script-driven effects -->
-<script>document.documentElement.classList.add('js');</script>
-
-<!-- Typography -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap">
+<link rel="preload" as="image" href="/assets/portal-dashboard.webp" type="image/webp">
+<script>document.documentElement.classList.add('js')</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Ryuki","url":"https://ryuki.io/","applicationCategory":"DeveloperApplication","operatingSystem":"Linux, Kubernetes","description":"Open-source Rust control plane for governed, dry-run-first infrastructure operations across multiple sites.","license":"https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE","sameAs":["https://github.com/mvandenbulcke/ryuki.io"],"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+</script>
 
 <style>
-/* ── Reset ──────────────────────────────────────────────── */
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
-body{min-height:100vh;line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
-img,svg{display:block;max-width:100%}
-pre,code{font-family:var(--mono)}
-section[id]{scroll-margin-top:76px}
-
-/* ── Tokens ─────────────────────────────────────────────── */
 :root{
-  --font:'Inter',system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
-  --radius:10px;
-  --radius-sm:8px;
-  --transition:220ms ease;
-  --ease-out:cubic-bezier(.16,1,.3,1);
-  --grad-accent:linear-gradient(135deg,#c0392b 0%,#8B0000 100%);
+  --g950:#090b0a;--g900:#101311;--g850:#151916;--g800:#1b201c;
+  --line:#343a34;--line-strong:#60675e;
+  --cream:#ece4d2;--cream-dim:#b9b2a3;--cream-faint:#86877d;
+  --orange:#e45525;--orange-dark:#963719;--green:#91c98f;
+  --display:"Barlow Condensed","Arial Narrow","Avenir Next Condensed",sans-serif;
+  --mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;
+  --pad:clamp(18px,3.2vw,52px);--max:1720px;
 }
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:auto;-webkit-text-size-adjust:100%}
+@media(prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
+body{margin:0;background:var(--g950);color:var(--cream);font-family:var(--mono);line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+img{display:block;max-width:100%}
+a{color:inherit}
+button,input{font:inherit}
+::selection{background:var(--orange);color:var(--g950)}
+:focus-visible{outline:2px solid var(--cream);outline-offset:4px}
+.skip-link{position:fixed;left:12px;top:-80px;z-index:100;padding:10px 14px;background:var(--cream);color:var(--g950);font-size:12px;font-weight:700;text-decoration:none;text-transform:uppercase}
+.skip-link:focus{top:12px}
+.site-frame{width:min(100%,var(--max));margin:0 auto;overflow:clip;border-inline:1px solid var(--line);background:var(--g900)}
+.utility-rail{min-height:34px;display:grid;grid-template-columns:1fr auto;align-items:center;gap:18px;padding:0 var(--pad);border-bottom:1px solid var(--line);background:var(--g950);color:var(--cream-dim);font-size:10px;letter-spacing:.13em;text-transform:uppercase}
+.utility-rail .bus{color:var(--orange);font-weight:600;text-align:right}
+.site-header{position:sticky;top:0;z-index:40;background:var(--g900);border-bottom:1px solid var(--line-strong)}
+.topbar{min-height:78px;display:grid;grid-template-columns:minmax(220px,.85fr) 1.65fr minmax(230px,.8fr);align-items:stretch}
+.brand,.site-nav,.gate-state{display:flex;align-items:center;padding-inline:var(--pad)}
+.brand{gap:14px;border-right:1px solid var(--line);font:800 25px/1 var(--display);letter-spacing:.01em;text-decoration:none;text-transform:uppercase}
+.brand img{width:36px;height:36px}
+.brand .io,.footer-brand .io{color:var(--orange)}
+.site-nav{justify-content:center;gap:clamp(10px,1.9vw,30px)}
+.site-nav a{min-height:44px;display:inline-flex;align-items:center;color:var(--cream-dim);font-size:11px;font-weight:600;letter-spacing:.09em;text-decoration:none;text-transform:uppercase;border-bottom:2px solid transparent;transition:color 140ms ease,border-color 140ms ease}
+.site-nav a:hover,.site-nav a.active{color:var(--cream);border-bottom-color:var(--orange)}
+.gate-state{justify-content:flex-end;gap:10px;border-left:1px solid var(--line);color:var(--cream-dim);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+.nav-toggle{display:none;min-width:48px;min-height:48px;border:1px solid var(--line-strong);background:transparent;color:var(--cream);cursor:pointer;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.lamp{width:9px;height:9px;flex:0 0 9px;border:1px solid currentColor;border-radius:50%;background:currentColor}
+.lamp.orange{color:var(--orange)}.lamp.green{color:var(--green)}.lamp.dim{color:var(--cream-faint);background:transparent}
+section[id]{scroll-margin-top:90px}
 
-/* palette (dark only) */
-:root{
-  --bg:            #0b0d12;
-  --bg-secondary:  #11141b;
-  --bg-tertiary:   #181c25;
-  --text:          #e7eaf1;
-  --text-secondary:#9aa2b2;
-  --text-muted:    #646c7d;
-  --border:        #222734;
-  --border-strong: #313848;
-  --accent:        #e25d5d;
-  --accent-strong: #ec7b7b;
-  --accent-hover:  #ea6f6f;
-  --accent-bg:     #3a1313;
-  --accent-glow:   rgba(226,93,93,.22);
-  --code-bg:       #0d1119;
-  --code-text:     #d6deeb;
-  --card-bg:       #11141b;
-  --card-border:   #232936;
-  --card-shadow:   0 1px 3px rgba(0,0,0,.35);
-  --card-shadow-hover:0 14px 32px -10px rgba(0,0,0,.55),0 0 0 1px rgba(226,93,93,.07);
-  --header-bg:     #0b0d12;
-  --logo-red:      #c0392b;
-  --logo-gold:     #FFD700;
-  --dragon-line:   rgba(255,255,255,.09);
-  --dragon-line-strong:rgba(255,255,255,.16);
-  --dragon-reveal: #ffd966;
-  --tag-bg:        #2c1717;
-  --tag-text:      #dda3a3;
-  --section-alt:   #0e1117;
-  --pill-border:   #4a2424;
-}
+.hero{min-height:560px;display:grid;grid-template-columns:minmax(0,1.68fr) minmax(390px,.82fr);border-bottom:1px solid var(--line-strong)}
+.hero-copy{min-width:0;display:grid;grid-template-rows:auto 1fr auto;padding:32px var(--pad);position:relative;border-right:1px solid var(--line-strong)}
+.hero-copy::before,.hero-copy::after{content:"";position:absolute;width:15px;height:15px;border-color:var(--orange)}
+.hero-copy::before{top:18px;left:18px;border-top:1px solid;border-left:1px solid}.hero-copy::after{right:18px;bottom:18px;border-right:1px solid;border-bottom:1px solid}
+.eyebrow{display:flex;align-items:center;gap:12px;color:var(--cream-dim);font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase}
+.eyebrow::before{content:"06";display:grid;place-items:center;width:34px;height:25px;border:1px solid var(--orange);color:var(--orange);letter-spacing:0}
+.hero h1{max-width:900px;margin:40px 0 32px;font:800 clamp(72px,6.4vw,112px)/.84 var(--display);letter-spacing:-.035em;text-wrap:balance;text-transform:uppercase}
+.hero h1 em{color:var(--orange);font-style:normal}
+.copy-bottom{display:grid;grid-template-columns:minmax(290px,1fr) auto;gap:42px;align-items:end;padding-top:26px;border-top:1px solid var(--line)}
+.lede{max-width:720px;margin:0;color:var(--cream-dim);font-size:15px;line-height:1.65}
+.actions{display:flex;align-items:stretch;white-space:nowrap}
+.action{min-height:50px;display:inline-flex;align-items:center;justify-content:center;padding:0 20px;border:1px solid var(--line-strong);color:var(--cream);font-size:11px;font-weight:600;letter-spacing:.08em;text-decoration:none;text-transform:uppercase;transition:background 140ms ease,color 140ms ease,border-color 140ms ease}
+.action.primary{border-color:var(--orange);background:var(--orange);color:var(--g950);font-weight:700}.action.primary::after{content:"↗";margin-left:13px}.action.secondary{border-left:0}
+.action:hover{background:var(--cream);border-color:var(--cream);color:var(--g950)}
+.console{display:grid;grid-template-rows:auto auto 1fr auto;background:var(--g850)}
+.console-head{min-height:56px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 25px;border-bottom:1px solid var(--line-strong);color:var(--cream-dim);font-size:11px;letter-spacing:.13em;text-transform:uppercase}.console-head strong{color:var(--cream);font-weight:600}
+.lock-band{min-height:66px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:13px;padding:0 25px;border-bottom:1px solid var(--line);background:var(--orange);color:var(--g950);font-size:12px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}.lock-band .lamp{color:var(--g950);background:transparent}.lock-band small{font-size:10px;opacity:.78}
+.telemetry{display:grid;align-content:center;padding:14px 25px}
+.telemetry-row{min-height:62px;display:grid;grid-template-columns:88px 1fr auto;align-items:center;gap:14px;border-bottom:1px solid var(--line);font-size:12px}.telemetry-row:last-child{border-bottom:0}.telemetry-row .label{color:var(--cream-faint);letter-spacing:.08em;text-transform:uppercase}.telemetry-row .value{color:var(--cream)}.telemetry-row .state{color:var(--cream-dim);font-size:11px;letter-spacing:.07em}.telemetry-row .state.warn{color:var(--orange)}.telemetry-row .state.ready{color:var(--green)}
+.evidence-strip{min-height:52px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 25px;border-top:1px solid var(--line-strong);color:var(--cream-faint);font-size:10px;letter-spacing:.08em;text-transform:uppercase}.evidence-strip strong{color:var(--cream);font-weight:500;letter-spacing:.03em;text-transform:none}
+.proof{min-height:74px;display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1px solid var(--line-strong);background:var(--cream);color:var(--g950)}
+.proof div{display:grid;align-content:center;justify-items:center;padding:12px 18px;border-right:1px solid color-mix(in srgb,var(--g950) 24%,transparent);text-align:center}.proof div:last-child{border-right:0}.proof strong{font:800 26px/1 var(--display);letter-spacing:-.01em;text-transform:uppercase}.proof span{margin-top:5px;font-size:9px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}
 
-/* ── Base ───────────────────────────────────────────────── */
-body{
-  font-family:var(--font);
-  background:var(--bg);
-  color:var(--text);
-  transition:background var(--transition),color var(--transition);
-  overflow-x:hidden;
-}
-::selection{background:var(--accent);color:#fff}
-.skip-link{position:absolute;left:-9999px;top:0;z-index:300;background:#fff;
-  color:#0b0d12;padding:.6rem 1.1rem;border-radius:0 0 8px 0;font-weight:700;text-decoration:none;font-size:.9rem}
-.skip-link:focus{left:0}
+.section{padding:68px var(--pad);border-bottom:1px solid var(--line-strong)}
+.section-head{display:grid;grid-template-columns:minmax(180px,.36fr) 1fr;gap:clamp(28px,5vw,84px);margin-bottom:44px}
+.section-code{color:var(--cream-faint);font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase}.section-code strong{display:block;margin-top:11px;color:var(--orange);font-size:13px}
+.section-title{max-width:920px;margin:0;font:800 clamp(48px,5vw,82px)/.9 var(--display);letter-spacing:-.025em;text-transform:uppercase}.section-title em{color:var(--orange);font-style:normal}
+.section-intro{max-width:800px;margin:22px 0 0;color:var(--cream-dim);font-size:14px}
+.plate{border:1px solid var(--line-strong);background:var(--g850)}
+.plate-head{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:0 18px;border-bottom:1px solid var(--line-strong);color:var(--cream-faint);font-size:10px;letter-spacing:.11em;text-transform:uppercase}.plate-head strong{color:var(--green);font-weight:600}
+.portal-plate{margin:0}.portal-plate img{width:100%;height:auto}.portal-plate figcaption{padding:13px 18px;border-top:1px solid var(--line);color:var(--cream-dim);font-size:11px}
+.operations{display:grid;grid-template-columns:repeat(2,1fr);margin-top:42px;border-top:1px solid var(--line-strong);border-left:1px solid var(--line-strong)}
+.operation{min-height:190px;display:grid;grid-template-columns:58px 1fr;border-right:1px solid var(--line-strong);border-bottom:1px solid var(--line-strong)}
+.operation-code{padding:20px 14px;border-right:1px solid var(--line);color:var(--orange);font-size:11px;font-weight:600;letter-spacing:.1em;writing-mode:vertical-rl;text-orientation:mixed}
+.operation-body{display:grid;grid-template-rows:auto 1fr auto;padding:22px}.operation h3{margin:0;font:700 30px/1 var(--display);letter-spacing:.01em;text-transform:uppercase}.operation p{margin:13px 0;color:var(--cream-dim);font-size:13px}.provider-line{padding-top:13px;border-top:1px solid var(--line);color:var(--cream-faint);font-size:10px;line-height:1.5;letter-spacing:.04em;text-transform:uppercase}
+.lifecycle-section{background:var(--g850)}
+.lifecycle-label{display:flex;justify-content:space-between;gap:18px;margin-bottom:15px;color:var(--cream-faint);font-size:11px;letter-spacing:.11em;text-transform:uppercase}.lifecycle-label strong{color:var(--cream-dim)}
+.lifecycle-grid{display:grid;grid-template-columns:repeat(9,1fr);margin:0;padding:0;border:1px solid var(--line-strong);list-style:none}
+.lifecycle-grid li{min-width:0;border-right:1px solid var(--line)}.lifecycle-grid li:last-child{border-right:0}
+.stage-button{width:100%;min-height:100px;display:grid;grid-template-columns:1fr auto;align-content:space-between;gap:12px;padding:14px;border:0;background:transparent;color:var(--cream);text-align:left;cursor:pointer;transition:background 140ms ease,color 140ms ease;position:relative}.stage-button:hover{background:var(--g800)}.stage-button[aria-pressed="true"]{background:var(--orange);color:var(--g950)}
+.stage-button .num{color:var(--cream-faint);font-size:10px;letter-spacing:.1em}.stage-button[aria-pressed="true"] .num{color:var(--g950)}.stage-button .name{grid-column:1/-1;align-self:end;font:700 19px/1 var(--display);text-transform:uppercase}.stage-button .lamp{align-self:start}
+.stage-readout{min-height:122px;display:grid;grid-template-columns:minmax(180px,.35fr) 1fr auto;gap:28px;align-items:center;padding:24px;border:1px solid var(--line-strong);border-top:0;background:var(--g900)}
+.stage-readout .readout-id{color:var(--orange);font-size:11px;letter-spacing:.1em;text-transform:uppercase}.stage-readout h3{margin:4px 0 0;font:700 30px/1 var(--display);text-transform:uppercase}.stage-readout p{margin:0;color:var(--cream-dim);font-size:13px}.stage-readout .emits{color:var(--green);font-size:10px;letter-spacing:.08em;text-align:right;text-transform:uppercase}
+.roadmap-label{margin-top:34px}.roadmap-grid{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line-strong)}
+.roadmap-stage{min-height:90px;padding:14px 16px;border-right:1px solid var(--line);position:relative}.roadmap-stage:last-child{border-right:0}.roadmap-stage::before{content:"ROADMAP";display:block;margin-bottom:13px;color:var(--cream-faint);font-size:9px;letter-spacing:.12em}.roadmap-stage strong{display:block;font:700 22px/1 var(--display);text-transform:uppercase}.roadmap-stage span{display:block;margin-top:7px;color:var(--cream-faint);font-size:10px}
 
-.container{max-width:1140px;margin:0 auto;padding:0 1.5rem}
-section{padding:5.5rem 0;position:relative}
-section.alt{background:var(--section-alt);transition:background var(--transition)}
+.architecture-grid{display:grid;grid-template-columns:.9fr 1.1fr;border:1px solid var(--line-strong)}
+.architecture-map{padding:28px;border-right:1px solid var(--line-strong);background:var(--g850)}
+.arch-rail{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line-strong)}
+.arch-node{min-height:105px;display:grid;align-content:space-between;padding:14px;border-right:1px solid var(--line);position:relative}.arch-node:last-child{border-right:0}.arch-node:not(:last-child)::after{content:"";position:absolute;right:-6px;top:50%;width:10px;height:10px;border-top:1px solid var(--orange);border-right:1px solid var(--orange);background:var(--g850);transform:translateY(-50%) rotate(45deg);z-index:2}.arch-node .num{color:var(--cream-faint);font-size:10px}.arch-node strong{font:700 18px/1 var(--display);text-transform:uppercase}
+.arch-deps{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:25px;border:1px solid var(--line-strong)}.arch-dep{min-height:82px;display:grid;align-content:center;gap:5px;padding:13px;border-right:1px solid var(--line)}.arch-dep:last-child{border-right:0}.arch-dep small{color:var(--orange);font-size:9px;letter-spacing:.1em}.arch-dep strong{font:700 17px/1 var(--display);text-transform:uppercase}
+.arch-note{margin:24px 0 0;color:var(--cream-dim);font-size:13px}
+.registry{min-width:0}.registry-head{min-height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--line-strong);color:var(--cream-faint);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.registry-head strong{color:var(--green)}
+.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:13px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--cream-faint);font-size:10px;letter-spacing:.08em;text-transform:uppercase}td:first-child{color:var(--cream);font-weight:600;white-space:nowrap}td:nth-child(2){color:var(--orange);white-space:nowrap}td:last-child{color:var(--cream-dim)}
 
-/* ── Brand mark ─────────────────────────────────────────── */
-.mark{flex:none}
+.execution{padding:0;border-bottom:1px solid var(--line-strong);background:var(--g850)}
+.execution-lock{min-height:70px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:16px;padding:0 var(--pad);background:var(--orange);color:var(--g950);font-size:12px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}.execution-lock small{font-size:10px}
+.execution-grid{display:grid;grid-template-columns:.82fr 1.18fr}
+.execution-intro{padding:58px var(--pad);border-right:1px solid var(--line-strong)}.execution-intro h2{margin:0;font:800 clamp(50px,5vw,84px)/.88 var(--display);letter-spacing:-.02em;text-transform:uppercase}.execution-intro h2 span{color:var(--orange)}.execution-intro p{max-width:620px;margin:24px 0;color:var(--cream-dim);font-size:14px}.execution-intro .actions{margin-top:30px}.execution-facts{margin-top:32px;border-top:1px solid var(--line-strong)}.execution-fact{display:grid;grid-template-columns:145px 1fr;gap:18px;padding:13px 0;border-bottom:1px solid var(--line);font-size:11px}.execution-fact strong{color:var(--orange);text-transform:uppercase}.execution-fact span{color:var(--cream-dim)}
+.execution-steps{margin:0;padding:0;list-style:none}.execution-step{min-height:150px;display:grid;grid-template-columns:74px 1fr;gap:0;border-bottom:1px solid var(--line)}.execution-step:last-child{border-bottom:0}.execution-step .step-num{display:grid;place-items:center;border-right:1px solid var(--line);color:var(--orange);font:700 26px/1 var(--display)}.execution-step .step-body{padding:25px}.execution-step h3{margin:0;font:700 25px/1 var(--display);text-transform:uppercase}.execution-step p{margin:10px 0 0;color:var(--cream-dim);font-size:12px}
 
-/* ── Header ─────────────────────────────────────────────── */
-.site-header{
-  position:sticky;top:0;z-index:100;
-  background:var(--header-bg);
-  border-bottom:1px solid transparent;
-  transition:background var(--transition),border-color var(--transition),box-shadow var(--transition);
-}
-.site-header.scrolled{border-bottom-color:var(--border);box-shadow:0 1px 12px rgba(0,0,0,.35)}
-.header-inner{
-  max-width:1140px;margin:0 auto;padding:0 1.5rem;
-  display:flex;align-items:center;justify-content:space-between;height:60px;gap:1rem;
-}
-.brand{
-  display:flex;align-items:center;gap:.6rem;
-  font-size:1.15rem;font-weight:700;letter-spacing:-.02em;
-  color:var(--text);text-decoration:none;
-}
-.brand .mark{width:27px;height:27px}
-.brand .io{color:var(--accent)}
-.site-nav{display:flex;align-items:center;gap:.25rem}
-.nav-link{
-  color:var(--text-secondary);text-decoration:none;
-  font-size:.875rem;font-weight:500;
-  padding:.4rem .7rem;border-radius:var(--radius-sm);
-  transition:color var(--transition),background var(--transition);
-}
-.nav-link:hover{color:var(--text);background:var(--bg-tertiary)}
-.nav-link.active{color:var(--text);background:var(--bg-tertiary)}
-.header-right{display:flex;align-items:center;gap:.6rem}
-.nav-toggle{
-  display:none;flex-direction:column;align-items:center;justify-content:center;gap:4px;
-  width:38px;height:34px;padding:0;cursor:pointer;
-  background:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
-}
-.nav-toggle-bar{width:16px;height:2px;border-radius:2px;background:var(--text);transition:transform .2s ease,opacity .2s ease}
-.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(1){transform:translateY(6px) rotate(45deg)}
-.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(2){opacity:0}
-.nav-toggle[aria-expanded="true"] .nav-toggle-bar:nth-child(3){transform:translateY(-6px) rotate(-45deg)}
-.gh-btn{
-  display:inline-flex;align-items:center;gap:.45rem;
-  font-size:.8125rem;font-weight:600;color:var(--text);text-decoration:none;
-  padding:.42rem .85rem;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
-  transition:border-color var(--transition),background var(--transition),transform var(--transition);
-  white-space:nowrap;
-}
-.gh-btn:hover{border-color:var(--accent);background:var(--accent-bg)}
-.gh-btn svg{width:15px;height:15px}
-.star-chip{font-size:.7rem;font-weight:700;color:var(--logo-gold);
-  border-left:1px solid var(--border-strong);padding-left:.5rem}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
-  clip:rect(0,0,0,0);white-space:pre;border:0}
+.quickstart-grid{display:grid;grid-template-columns:.78fr 1.22fr;border:1px solid var(--line-strong)}
+.quickstart-copy{padding:34px;border-right:1px solid var(--line-strong)}.quickstart-copy h3{margin:0;font:800 clamp(44px,4vw,68px)/.9 var(--display);text-transform:uppercase}.quickstart-copy p{margin:20px 0;color:var(--cream-dim);font-size:13px}.quick-links{display:grid;margin-top:26px;border-top:1px solid var(--line)}.quick-links a{min-height:48px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);color:var(--cream);font-size:11px;font-weight:600;letter-spacing:.07em;text-decoration:none;text-transform:uppercase}.quick-links a::after{content:"↗";color:var(--orange)}
+.terminal{min-width:0;background:var(--g950)}.terminal-head{min-height:50px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--line-strong);color:var(--cream-faint);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.copy-btn{min-height:34px;padding:0 12px;border:1px solid var(--line-strong);background:transparent;color:var(--cream);cursor:pointer;font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.copy-btn:hover{background:var(--cream);color:var(--g950)}
+pre{margin:0;padding:26px;overflow:auto;color:var(--cream-dim);font:12px/1.75 var(--mono);white-space:pre}code{font-family:var(--mono)}.cmd{color:var(--cream)}.comment{color:var(--cream-faint)}.prompt{color:var(--orange)}
+.final-call{display:grid;grid-template-columns:1.2fr .8fr;border-bottom:1px solid var(--line-strong)}.final-copy{padding:60px var(--pad);border-right:1px solid var(--line-strong)}.final-copy h2{max-width:760px;margin:0;font:800 clamp(52px,5.2vw,88px)/.88 var(--display);text-transform:uppercase}.final-copy h2 em{color:var(--orange);font-style:normal}.final-copy p{max-width:680px;margin:24px 0;color:var(--cream-dim);font-size:14px}.final-actions{display:flex}
+.field-manifest{display:grid;align-content:space-between;padding:32px var(--pad);background:var(--cream);color:var(--g950)}.field-manifest .manifest-code{font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}.field-manifest blockquote{margin:28px 0;font:700 38px/1 var(--display);text-transform:uppercase}.field-manifest .seal{width:150px;min-height:44px;display:grid;place-items:center;border:2px solid var(--orange);color:var(--orange-dark);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;transform:rotate(-2deg)}
 
-/* ── Scroll progress ────────────────────────────────────── */
-#scroll-progress{
-  position:fixed;top:0;left:0;height:2.5px;width:0;z-index:200;
-  background:var(--grad-accent);pointer-events:none;
-  box-shadow:0 0 8px var(--accent-glow);
-}
+.site-footer{padding:34px var(--pad);background:var(--g950)}.footer-top{display:grid;grid-template-columns:1fr auto;gap:30px;align-items:start}.footer-brand{display:flex;align-items:center;gap:13px;font:700 23px/1 var(--display);text-transform:uppercase}.footer-brand img{width:34px;height:34px}.footer-links{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px 24px}.footer-links a{min-height:38px;display:inline-flex;align-items:center;color:var(--cream-dim);font-size:11px;text-decoration:none;text-transform:uppercase}.footer-links a:hover{color:var(--orange)}.footer-bottom{display:flex;justify-content:space-between;gap:24px;margin-top:30px;padding-top:18px;border-top:1px solid var(--line);color:var(--cream-faint);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
 
-/* ── Hero ───────────────────────────────────────────────── */
-.hero{
-  position:relative;
-  padding:6.5rem 0 5rem;
-  text-align:center;
-  overflow:hidden;
-}
-/* ── Hero backdrop: the hidden ryū ────────────────────────
-   The dragon (ivory line art on alpha, /assets/ryu.webp) is
-   layered twice: a faint base and a gold-recolored copy seen
-   through a soft-edged radial mask. On load the gold lights up
-   from the center and expands to the sides, then fades; after
-   that it follows the cursor (or sweeps on its own on touch).
-   The PNG is inverted so its dark outlines render as light
-   strokes on the dark page; the lit copy is tinted gold. */
-.hero-bg{position:absolute;inset:0;pointer-events:none;overflow:hidden}
-.dragon-art{
-  position:absolute;inset:-8% 0 -4%;
-  --ryu-spot-x:50%;--ryu-spot-y:50%;--ryu-spot-r:0px;
-  --ryu-base-opacity:.22;
-  --ryu-reveal-opacity:.9;
-  will-change:transform;
-}
-.dragon-art::before,
-.dragon-art::after{
-  content:"";position:absolute;inset:0;
-  background:url("/assets/ryu.webp") center/contain no-repeat;
-}
-.dragon-art::before{opacity:var(--ryu-base-opacity);filter:invert(1)}
-.dragon-art::after{
-  opacity:calc(var(--ryu-reveal-opacity)*var(--ryu-fade,1));
-  filter:invert(1) sepia(1) saturate(3) hue-rotate(-10deg) brightness(1.08);
-  -webkit-mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
-  mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
-}
-.dragon-art.play-ink::before{animation:ryu-arrive 1.4s var(--ease-out) both,ryu-breathe 5.5s ease-in-out 2s infinite alternate}
-.js .hero-bg{animation:ryu-swell 5.5s ease-in-out 2s infinite alternate;transform-origin:50% 58%;will-change:transform}
-@keyframes ryu-swell{from{transform:scale(1)}to{transform:scale(1.022)}}
-@keyframes ryu-breathe{from{opacity:var(--ryu-base-opacity)}to{opacity:calc(var(--ryu-base-opacity)*2.3)}}
-@keyframes ryu-arrive{from{opacity:0;transform:translateY(18px) scale(.99)}to{opacity:var(--ryu-base-opacity);transform:none}}
-@media (prefers-reduced-motion:reduce){
-  .dragon-art::after{display:none}
-  .dragon-art{--ryu-base-opacity:.26}
-}
-
-.hero-inner{position:relative;z-index:1}
-/* Text scrim: when the gold reveal sweeps behind the headline the
-   line art competes with the copy. This radial wash darkens the
-   dragon directly under the text and fades out, so the reveal
-   stays vivid at the edges while the words stay readable. */
-.hero-inner::before{
-  content:"";position:absolute;z-index:-1;pointer-events:none;
-  left:50%;top:47%;transform:translate(-50%,-50%);
-  width:min(1020px,116%);height:138%;
-  background:radial-gradient(ellipse closest-side,
-    rgba(11,13,18,.94) 0%,rgba(11,13,18,.78) 50%,rgba(11,13,18,.42) 76%,transparent 100%);
-}
-.hero h1{text-shadow:0 1px 3px rgba(11,13,18,.85),0 4px 22px rgba(11,13,18,.55)}
-/* no text-shadow on clipped-gradient text — it bleeds through the
-   transparent fill; a drop-shadow filter separates it instead */
-.hero h1 .grad{text-shadow:none;filter:drop-shadow(0 2px 12px rgba(11,13,18,.6))}
-.hero .tagline{text-shadow:0 1px 2px rgba(11,13,18,.95),0 2px 18px rgba(11,13,18,.75)}
-.hero .mark{width:74px;height:74px;margin:0 auto 1.6rem;filter:drop-shadow(0 10px 26px var(--accent-glow))}
-.js .hero .mark{cursor:pointer}
-@keyframes markPop{0%{transform:scale(1)}35%{transform:scale(1.16) rotate(-5deg)}70%{transform:scale(.97)}100%{transform:scale(1)}}
-.hero .mark.pop{animation:fadeUp .01s linear forwards,markPop .6s var(--ease-out)}
-.hero-pill{
-  display:inline-flex;align-items:center;gap:.5rem;
-  font-size:.78rem;font-weight:600;color:var(--text-secondary);
-  border:1px solid var(--pill-border);border-radius:100px;
-  padding:.32rem .85rem;margin-bottom:1.5rem;
-  background:var(--bg);
-  transition:background var(--transition),border-color var(--transition);
-}
-.hero-pill .dot{
-  width:7px;height:7px;border-radius:50%;background:#34c98e;flex:none;
-  box-shadow:0 0 0 0 rgba(52,201,142,.5);
-}
-.js .hero-pill .dot{animation:pulse-dot 2.4s ease-out infinite}
-@keyframes pulse-dot{0%{box-shadow:0 0 0 0 rgba(52,201,142,.45)}70%{box-shadow:0 0 0 7px rgba(52,201,142,0)}100%{box-shadow:0 0 0 0 rgba(52,201,142,0)}}
-.hero h1{
-  font-size:clamp(2.4rem,5.4vw,3.9rem);
-  font-weight:800;letter-spacing:-.035em;line-height:1.08;
-  max-width:820px;margin:0 auto 1.25rem;
-  text-wrap:balance;
-}
-.hero h1 .grad{color:#eab308}
-.hero .tagline{
-  font-size:1.1rem;color:var(--text-secondary);
-  max-width:660px;margin:0 auto 2.4rem;line-height:1.7;
-}
-.hero-links{display:flex;gap:.9rem;justify-content:center;flex-wrap:wrap}
-
-/* hero entrance animation */
-.js .fx{opacity:0;animation:fadeUp .85s var(--ease-out) forwards;animation-delay:var(--d,0s)}
-@keyframes fadeUp{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:none}}
-
-/* ── Buttons ────────────────────────────────────────────── */
-.btn{
-  display:inline-flex;align-items:center;gap:.5rem;
-  padding:.68rem 1.5rem;border-radius:var(--radius-sm);
-  font-size:.9rem;font-weight:600;text-decoration:none;white-space:nowrap;
-  transition:transform var(--transition),box-shadow var(--transition),background var(--transition),border-color var(--transition),color var(--transition);
-}
-.btn svg{width:15px;height:15px;transition:transform var(--transition)}
-.btn-primary{
-  background:var(--grad-accent);color:#fff;border:1px solid transparent;
-  box-shadow:0 4px 16px -4px var(--accent-glow);
-}
-.btn-primary:hover{box-shadow:0 8px 22px -6px var(--accent-glow)}
-.btn-primary:hover .arrow{transform:translateX(3px)}
-.btn-secondary{
-  background:var(--card-bg);color:var(--text);border:1px solid var(--border-strong);
-}
-.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
-
-/* ── Stats band ─────────────────────────────────────────── */
-.stats{border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:0;background:var(--section-alt);transition:background var(--transition),border-color var(--transition)}
-.stats-grid{
-  display:grid;grid-template-columns:repeat(4,1fr);
-  max-width:1140px;margin:0 auto;padding:0 1.5rem;
-}
-.stat{
-  text-align:center;padding:2.2rem 1rem;
-  border-left:1px solid var(--border);
-  transition:border-color var(--transition);
-}
-.stat:first-child{border-left:none}
-.stat-value{
-  font-size:2.3rem;font-weight:800;letter-spacing:-.03em;line-height:1.1;
-  font-variant-numeric:tabular-nums;
-  color:#eab308;
-}
-.stat-label{font-size:.82rem;font-weight:500;color:var(--text-muted);margin-top:.35rem}
-
-/* ── Product shot ───────────────────────────────────────── */
-.product-shot{padding:4.2rem 0 0}
-.product-shot figure{margin:0}
-.product-shot img{
-  display:block;width:100%;height:auto;
-  border-radius:var(--radius);border:1px solid var(--card-border);
-}
-.product-shot figcaption{margin-top:.8rem;text-align:center;font-size:.8rem;color:var(--text-muted)}
-
-/* ── Section headings ───────────────────────────────────── */
-.section-label{
-  display:inline-flex;align-items:center;gap:.5rem;
-  font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
-  color:var(--accent);margin-bottom:.8rem;
-}
-.section-label::before{content:"";width:22px;height:2px;border-radius:2px;background:var(--grad-accent)}
-.section-title{font-size:clamp(1.6rem,3.2vw,2.25rem);font-weight:800;letter-spacing:-.025em;margin-bottom:.9rem;line-height:1.15}
-.section-subtitle{font-size:1rem;color:var(--text-secondary);max-width:640px;line-height:1.7}
-
-/* ── Features grid ──────────────────────────────────────── */
-.features-grid{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));
-  gap:1.1rem;margin-top:2.6rem;
-}
-.feature-card{
-  position:relative;
-  background:var(--card-bg);border:1px solid var(--card-border);
-  border-radius:var(--radius);padding:1.5rem;
-  box-shadow:var(--card-shadow);
-  transition:transform var(--transition),box-shadow var(--transition),border-color var(--transition),background var(--transition);
-  overflow:hidden;
-}
-.feature-card::before{
-  content:"";position:absolute;top:0;left:0;right:0;height:2px;
-  background:var(--grad-accent);opacity:0;transition:opacity var(--transition);
-}
-.feature-card:hover{border-color:var(--border-strong)}
-.feature-card:hover::before{opacity:1}
-.feature-icon{
-  width:42px;height:42px;border-radius:var(--radius-sm);
-  background:var(--accent-bg);color:var(--accent);
-  display:flex;align-items:center;justify-content:center;margin-bottom:1.05rem;
-  transition:background var(--transition),color var(--transition),transform var(--transition);
-}
-.feature-card:hover .feature-icon{background:var(--grad-accent);color:#fff}
-.feature-card h3{font-size:.98rem;font-weight:700;letter-spacing:-.01em;margin-bottom:.45rem}
-.feature-card p{font-size:.86rem;color:var(--text-secondary);line-height:1.55}
-.feature-tags{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.85rem}
-.tag{
-  font-size:.68rem;font-weight:600;padding:.16rem .55rem;border-radius:100px;
-  background:var(--tag-bg);color:var(--tag-text);
-  transition:background var(--transition),color var(--transition);
-}
-
-/* ── Lifecycle pipeline ─────────────────────────────────── */
-.pipeline-wrap{margin-top:3rem;overflow-x:auto;padding:1.2rem .2rem;scrollbar-width:none}
-.pipeline-wrap::-webkit-scrollbar{display:none}
-.pipeline{
-  position:relative;list-style:none;
-  display:flex;align-items:center;justify-content:space-between;
-  gap:.5rem;min-width:860px;
-}
-.pipeline::before{
-  content:"";position:absolute;left:1.5%;right:1.5%;top:50%;height:2px;margin-top:-1px;
-  background-color:var(--border-strong);border-radius:2px;
-  background-image:linear-gradient(90deg,transparent 0%,var(--accent) 50%,transparent 100%);
-  background-size:22% 100%;background-repeat:no-repeat;background-position:-30% 0;
-}
-.js .pipeline::before{animation:sweep 8.8s linear infinite}
-@keyframes sweep{from{background-position:-30% 0}to{background-position:130% 0}}
-.stage{
-  position:relative;z-index:1;
-  display:flex;flex-direction:column;align-items:center;gap:.45rem;
-  font-size:.78rem;font-weight:600;color:var(--text-secondary);
-  background:var(--bg);border:1px solid var(--border-strong);border-radius:var(--radius-sm);
-  padding:.62rem .8rem;min-width:84px;
-  transition:background var(--transition),border-color var(--transition);
-}
-section.alt .stage{background:var(--section-alt)}
-.stage .stage-num{
-  font-family:var(--mono);font-size:.6rem;font-weight:600;color:var(--text-muted);
-  letter-spacing:.06em;
-}
-.js .stage{animation:stagePulse 8.8s infinite;animation-delay:calc(var(--i)*.8s)}
-@keyframes stagePulse{
-  0%,100%{border-color:var(--border-strong);color:var(--text-secondary);box-shadow:0 0 0 0 transparent}
-  4%{border-color:var(--accent);color:var(--accent);box-shadow:0 0 18px -2px var(--accent-glow)}
-  9%{border-color:var(--border-strong);color:var(--text-secondary);box-shadow:0 0 0 0 transparent}
-}
-.js .stage{cursor:pointer}
-.js .stage:hover{animation-play-state:paused;border-color:var(--accent);color:var(--accent)}
-.stage:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.pipeline.roadmap-row{min-width:0;justify-content:center;flex-wrap:wrap;margin-top:.9rem}
-.pipeline.roadmap-row::before{display:none}
-.roadmap-label{
-  display:flex;align-items:center;gap:.8rem;margin-top:1.6rem;
-  font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
-  color:var(--text-muted);
-}
-.roadmap-label::before,.roadmap-label::after{
-  content:"";height:1px;flex:1;
-  background-image:repeating-linear-gradient(90deg,var(--border-strong) 0 6px,transparent 6px 12px);
-}
-.js .pipeline.quiet .stage{animation:none}
-.js .pipeline.quiet::before{animation:none;background-position:-30% 0}
-.js .stage.active{
-  animation:none;
-  border-color:var(--accent);color:var(--accent);
-  box-shadow:0 0 18px -2px var(--accent-glow);
-  transform:translateY(-2px);
-}
-.pipeline-detail{
-  margin-top:1.5rem;text-align:center;font-size:.9rem;color:var(--text-secondary);
-  min-height:1.7em;transition:opacity .2s ease;
-}
-.pipeline-detail strong{color:var(--accent);font-weight:700}
-.pipeline-detail.swap{opacity:0}
-.tour-wrap{text-align:center}
-.tour-btn{
-  display:none;align-items:center;gap:.45rem;margin:1.4rem auto 0;
-  background:transparent;border:1px solid var(--border-strong);border-radius:100px;
-  color:var(--text-secondary);font-family:var(--font);font-size:.8rem;font-weight:600;
-  padding:.4rem 1.1rem;cursor:pointer;
-  transition:color var(--transition),border-color var(--transition);
-}
-.js .tour-btn{display:inline-flex}
-.tour-btn:hover{color:var(--accent);border-color:var(--accent)}
-.tour-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.tour-btn svg{width:11px;height:11px}
-.pipeline-note{
-  margin-top:.8rem;text-align:center;font-size:.84rem;color:var(--text-muted);
-}
-.pipeline-note code{
-  font-size:.78rem;background:var(--bg-tertiary);border:1px solid var(--border);
-  border-radius:5px;padding:.1rem .4rem;color:var(--text-secondary);
-}
-
-/* ── Architecture ───────────────────────────────────────── */
-.arch-diagram{
-  display:flex;align-items:stretch;justify-content:center;gap:0;
-  margin:2.8rem 0 1rem;flex-wrap:nowrap;
-}
-.arch-node{
-  flex:1;max-width:200px;
-  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius);
-  box-shadow:var(--card-shadow);
-  padding:1.05rem .9rem;text-align:center;
-  transition:border-color var(--transition),box-shadow var(--transition),background var(--transition);
-}
-.arch-node:hover{border-color:var(--accent);box-shadow:var(--card-shadow-hover)}
-.arch-node .node-icon{
-  width:34px;height:34px;margin:0 auto .55rem;border-radius:8px;
-  background:var(--accent-bg);color:var(--accent);
-  display:flex;align-items:center;justify-content:center;
-}
-.arch-node .node-icon svg{width:17px;height:17px}
-.arch-node h3{font-size:.86rem;font-weight:700;letter-spacing:-.01em}
-.arch-node p{font-size:.7rem;color:var(--text-muted);margin-top:.15rem;line-height:1.45}
-.arch-link{
-  flex:none;width:54px;display:flex;align-items:center;position:relative;align-self:center;height:2px;
-}
-.arch-link::before{
-  content:"";position:absolute;left:6px;right:12px;top:0;height:2px;
-  background-image:repeating-linear-gradient(90deg,var(--accent) 0 5px,transparent 5px 11px);
-  opacity:.75;
-}
-.js .arch-link::before{animation:dashflow 1.1s linear infinite}
-@keyframes dashflow{from{background-position:0 0}to{background-position:11px 0}}
-.arch-link::after{
-  content:"";position:absolute;right:4px;top:-3px;
-  border-left:7px solid var(--accent);border-top:4px solid transparent;border-bottom:4px solid transparent;
-  opacity:.85;
-}
-.arch-sub{
-  display:flex;justify-content:center;gap:1rem;margin-top:.4rem;
-}
-.arch-drop{
-  display:flex;flex-direction:column;align-items:center;
-}
-.arch-vlink{position:relative;width:2px;height:40px}
-.arch-vlink::before{
-  content:"";position:absolute;top:4px;bottom:10px;left:0;width:2px;
-  background-image:repeating-linear-gradient(180deg,var(--accent) 0 5px,transparent 5px 11px);
-  opacity:.75;
-}
-.js .arch-vlink::before{animation:dashflowv 1.1s linear infinite}
-@keyframes dashflowv{from{background-position:0 0}to{background-position:0 11px}}
-.arch-vlink::after{
-  content:"";position:absolute;bottom:2px;left:-3px;
-  border-top:7px solid var(--accent);border-left:4px solid transparent;border-right:4px solid transparent;
-  opacity:.85;
-}
-.arch-mini{
-  display:flex;align-items:center;gap:.5rem;
-  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius-sm);
-  box-shadow:var(--card-shadow);
-  padding:.55rem .95rem;font-size:.8rem;font-weight:600;
-  transition:border-color var(--transition),background var(--transition);
-}
-.arch-mini:hover{border-color:var(--accent)}
-.js .arch-node{cursor:pointer}
-.arch-node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.arch-node.lit{border-color:var(--logo-gold);box-shadow:0 0 18px -4px rgba(255,215,0,.35)}
-.arch-mini.lit{border-color:var(--logo-gold)}
-.arch-table tbody tr.hl{background:var(--accent-bg)}
-.arch-link.firing::before,.arch-vlink.firing::before,
-.arch-link.firing::after,.arch-vlink.firing::after{opacity:1;filter:brightness(1.7)}
-.arch-mini svg{width:15px;height:15px;color:var(--accent)}
-.arch-caption{text-align:center;font-size:.78rem;color:var(--text-muted);margin-top:1.4rem}
-
-/* architecture table */
-.arch-wrap{
-  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius);
-  overflow:hidden;box-shadow:var(--card-shadow);margin-top:2.6rem;
-  transition:background var(--transition),border-color var(--transition);
-}
-.arch-table{width:100%;border-collapse:collapse;font-size:.875rem}
-.arch-table th,.arch-table td{padding:.8rem 1.1rem;text-align:left;border-bottom:1px solid var(--border)}
-.arch-table th{
-  font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
-  color:var(--text-muted);background:var(--bg-secondary);
-}
-.arch-table td{color:var(--text-secondary)}
-.arch-table td:first-child{font-weight:600;color:var(--accent);white-space:nowrap;font-family:var(--mono);font-size:.8rem}
-.arch-table tr:last-child td{border-bottom:none}
-
-/* ── Live execution steps ───────────────────────────────── */
-.exec-steps{
-  margin-top:2.2rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1.1rem;
-  counter-reset:exec;list-style:none;padding:0;
-}
-.exec-steps li{
-  background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius);
-  padding:1.3rem 1.3rem 1.2rem;font-size:.9rem;line-height:1.65;color:var(--text-secondary);
-  counter-increment:exec;
-}
-.exec-steps li::before{
-  content:"0" counter(exec);display:block;
-  font-family:var(--mono);font-size:.75rem;color:var(--accent);
-  margin-bottom:.55rem;letter-spacing:.08em;
-}
-.exec-steps li strong{color:var(--text)}
-.exec-steps li code{overflow-wrap:anywhere}
-.exec-note{margin-top:1.6rem;font-size:.85rem;color:var(--text-muted);max-width:720px;line-height:1.7}
-.arch-table tbody tr{transition:background var(--transition)}
-.arch-table tbody tr:hover{background:var(--bg-secondary)}
-
-/* ── Quick start ────────────────────────────────────────── */
-.code-block{
-  background:var(--code-bg);border:1px solid var(--border);border-radius:var(--radius);
-  margin-top:2.4rem;overflow:hidden;
-  box-shadow:0 16px 40px -16px rgba(10,20,45,.35);
-  transition:border-color var(--transition);
-}
-.code-block-header{
-  display:flex;align-items:center;gap:.45rem;
-  padding:.7rem 1rem;border-bottom:1px solid rgba(255,255,255,.07);
-  font-size:.72rem;font-weight:600;color:#7d8699;
-}
-.code-dots{display:flex;gap:.38rem;margin-right:.5rem}
-.code-dots span{width:11px;height:11px;border-radius:50%}
-.code-dots span:nth-child(1){background:#ff5f57}
-.code-dots span:nth-child(2){background:#febc2e}
-.code-dots span:nth-child(3){background:#28c840}
-.copy-btn{
-  margin-left:auto;display:inline-flex;align-items:center;gap:.4rem;
-  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
-  color:#aeb7c7;font-size:.7rem;font-weight:600;font-family:var(--font);
-  border-radius:6px;padding:.3rem .65rem;cursor:pointer;
-  transition:background var(--transition),color var(--transition);
-}
-.copy-btn:hover{background:rgba(255,255,255,.12);color:#fff}
-.copy-btn svg{width:12px;height:12px}
-.copy-btn.copied{color:#34c98e;border-color:rgba(52,201,142,.4)}
-.code-block pre .out{color:#7d8699}
-.code-block pre .prompt{color:#e0a050}
-.code-block pre{
-  padding:1.3rem 1.2rem;overflow-x:auto;
-  font-size:.8125rem;line-height:1.75;color:var(--code-text);
-}
-.code-block .c{color:#637292}
-.code-block .cmd{color:#82d9b6}
-
-/* ── CTA ────────────────────────────────────────────────── */
-.cta-panel{
-  position:relative;overflow:hidden;text-align:center;
-  background:var(--card-bg);
-  border:1px solid var(--card-border);border-radius:18px;
-  padding:4.2rem 2rem;
-}
-.cta-panel::before{
-  content:"";position:absolute;inset:0;
-  background-image:
-    linear-gradient(rgba(226,93,93,.05) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(226,93,93,.05) 1px,transparent 1px);
-  background-size:40px 40px;
-  -webkit-mask-image:radial-gradient(ellipse 75% 90% at 50% 110%,#000 30%,transparent 75%);
-  mask-image:radial-gradient(ellipse 75% 90% at 50% 110%,#000 30%,transparent 75%);
-}
-.cta-panel .mark{width:52px;height:52px;margin:0 auto 1.3rem;position:relative}
-.cta-panel h2{
-  position:relative;font-size:clamp(1.5rem,3vw,2.1rem);font-weight:800;
-  letter-spacing:-.025em;color:var(--text);margin-bottom:.7rem;
-}
-.cta-panel p{position:relative;color:var(--text-secondary);font-size:.98rem;max-width:520px;margin:0 auto 2.1rem}
-.cta-panel .btn-group{position:relative;display:flex;gap:.9rem;justify-content:center;flex-wrap:wrap}
-
-/* ── Footer ─────────────────────────────────────────────── */
-.site-footer{
-  border-top:1px solid var(--border);padding:3rem 0 2.4rem;
-  font-size:.84rem;color:var(--text-muted);
-  transition:border-color var(--transition);
-}
-.footer-inner{
-  max-width:1140px;margin:0 auto;padding:0 1.5rem;
-  display:flex;align-items:flex-start;justify-content:space-between;gap:2rem;flex-wrap:wrap;
-}
-.footer-brand{display:flex;flex-direction:column;gap:.7rem;max-width:300px}
-.footer-brand .brand{font-size:1.05rem}
-.footer-brand .brand .mark{width:23px;height:23px}
-.footer-links{display:flex;gap:3.5rem;flex-wrap:wrap}
-.footer-col{display:flex;flex-direction:column;gap:.55rem}
-.footer-col h5{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text-secondary)}
-.footer-col a{color:var(--text-muted);text-decoration:none;font-size:.84rem;transition:color var(--transition)}
-.footer-col a:hover{color:var(--accent)}
-.footer-bottom{
-  max-width:1140px;margin:2.4rem auto 0;padding:1.4rem 1.5rem 0;
-  border-top:1px solid var(--border);
-  display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;font-size:.78rem;
-  transition:border-color var(--transition);
-}
-
-/* ── Reduced motion ─────────────────────────────────────── */
-@media (prefers-reduced-motion: reduce){
-  html{scroll-behavior:auto}
-  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
-  .js .fx{opacity:1;animation:none}
-}
-
-/* ── Responsive ─────────────────────────────────────────── */
-@media(max-width:900px){
-  .nav-toggle{display:inline-flex}
-  .site-nav{
-    display:none;position:absolute;top:100%;left:0;right:0;
-    flex-direction:column;align-items:stretch;gap:.15rem;
-    background:var(--bg);border-bottom:1px solid var(--border);
-    padding:.6rem .9rem .9rem;box-shadow:0 12px 24px rgba(0,0,0,.35);
-  }
-  .site-nav.open{display:flex}
-  .site-nav .nav-link{padding:.65rem .6rem}
-  .arch-diagram{flex-direction:column;align-items:center;gap:0}
-  .arch-node{max-width:300px;width:100%}
-  .arch-link{width:2px;height:46px;justify-content:center}
-  .arch-link::before{
-    left:0;right:auto;top:6px;bottom:12px;width:2px;height:auto;
-    background-image:repeating-linear-gradient(180deg,var(--accent) 0 5px,transparent 5px 11px);
-  }
-  .js .arch-link::before{animation:dashflowv 1.1s linear infinite}
-  .arch-link::after{
-    right:auto;left:-2.5px;top:auto;bottom:4px;
-    border-top:7px solid var(--accent);border-left:4px solid transparent;border-right:4px solid transparent;border-bottom:none;
-  }
-}
-@media(max-width:768px){
-  section{padding:3.6rem 0}
-  .hero{padding:4.5rem 0 3.5rem}
-  .stats-grid{grid-template-columns:repeat(2,1fr)}
-  .stat{padding:1.5rem .5rem}
-  .stat:nth-child(3){border-left:none}
-  .stat:nth-child(n+3){border-top:1px solid var(--border)}
-  .stat-value{font-size:1.8rem}
-  .features-grid{grid-template-columns:1fr 1fr}
-  .gh-btn .gh-label{display:none}
-  .gh-btn{padding:.42rem .6rem}
-}
-@media(max-width:560px){
-  .features-grid{grid-template-columns:1fr}
-  .hero .tagline{font-size:.97rem}
-  .hero-pill{font-size:.7rem;padding:.28rem .7rem}
-  .footer-links{gap:2rem}
-}
+@keyframes signal{0%,82%,100%{opacity:1}88%{opacity:.35}}
+.gate-state .lamp,.lifecycle-grid li:last-child .lamp{animation:signal 3.8s steps(1,end) infinite}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+@media(max-width:1180px){.topbar{grid-template-columns:210px 1fr 205px}.hero{grid-template-columns:minmax(0,1.25fr) minmax(380px,.85fr)}.hero h1{font-size:clamp(66px,7.2vw,86px)}.copy-bottom{grid-template-columns:1fr;gap:22px}.actions{justify-self:start}.lifecycle-grid{grid-template-columns:repeat(3,1fr)}.lifecycle-grid li{border-bottom:1px solid var(--line)}.lifecycle-grid li:nth-child(3n){border-right:0}.lifecycle-grid li:nth-last-child(-n+3){border-bottom:0}.architecture-grid{grid-template-columns:1fr}.architecture-map{border-right:0;border-bottom:1px solid var(--line-strong)}}
+@media(max-width:900px){.topbar{grid-template-columns:1fr auto}.brand{grid-column:1;grid-row:1;min-height:68px;border-right:0}.gate-state{grid-column:2;grid-row:1;min-height:68px}.site-nav{grid-column:1/-1;grid-row:2;min-height:52px;justify-content:flex-start;overflow:auto;border-top:1px solid var(--line)}.hero{grid-template-columns:1fr}.hero-copy{min-height:590px;border-right:0;border-bottom:1px solid var(--line-strong)}.console{min-height:430px}.section-head{grid-template-columns:1fr;gap:18px}.operations{grid-template-columns:1fr}.stage-readout{grid-template-columns:1fr}.stage-readout .emits{text-align:left}.execution-grid,.quickstart-grid,.final-call{grid-template-columns:1fr}.execution-intro,.quickstart-copy,.final-copy{border-right:0;border-bottom:1px solid var(--line-strong)}.final-copy{padding-bottom:48px}}
+@media(max-width:640px){.utility-rail{grid-template-columns:1fr}.utility-rail .bus{display:none}.site-header{position:relative}.topbar{grid-template-columns:1fr auto auto}.brand{padding-inline:18px}.gate-state{grid-column:2;grid-row:1;padding-inline:14px;border-left:1px solid var(--line);font-size:0}.gate-state .lamp{margin:0}.js .nav-toggle{display:block;grid-column:3;grid-row:1;align-self:center;margin-right:14px}.site-nav{grid-column:1/-1;grid-row:2;padding:8px 18px 14px;gap:0;flex-direction:column;align-items:stretch;overflow:visible}.js .site-nav{display:none}.js .site-nav.open{display:flex}.site-nav a{width:100%;justify-content:space-between;border-bottom:1px solid var(--line)}.hero-copy{min-height:610px;padding-inline:18px}.hero h1{font-size:clamp(54px,17vw,72px);margin-top:48px}.copy-bottom{gap:20px}.lede{font-size:13px}.actions{width:100%;flex-direction:column}.action{width:100%}.action.secondary{border-left:1px solid var(--line-strong);border-top:0}.telemetry-row{grid-template-columns:78px 1fr}.telemetry-row .state{grid-column:2}.evidence-strip{align-items:flex-start;flex-direction:column;gap:4px;padding-block:13px}.proof{grid-template-columns:1fr}.proof div{min-height:68px;border-right:0;border-bottom:1px solid color-mix(in srgb,var(--g950) 24%,transparent)}.proof div:last-child{border-bottom:0}.section{padding:52px 18px}.section-title{font-size:48px}.operation{grid-template-columns:45px 1fr}.operation-body{padding:18px}.lifecycle-grid{grid-template-columns:repeat(2,1fr)}.lifecycle-grid li:nth-child(3n){border-right:1px solid var(--line)}.lifecycle-grid li:nth-child(2n){border-right:0}.lifecycle-grid li:nth-last-child(-n+3){border-bottom:1px solid var(--line)}.lifecycle-grid li:last-child{grid-column:1/-1;border-bottom:0}.roadmap-grid{grid-template-columns:repeat(2,1fr)}.roadmap-stage:nth-child(2){border-right:0}.roadmap-stage:nth-child(-n+2){border-bottom:1px solid var(--line)}.arch-rail{grid-template-columns:1fr}.arch-node{min-height:70px;border-right:0;border-bottom:1px solid var(--line)}.arch-node:last-child{border-bottom:0}.arch-node::after{display:none}.arch-deps{grid-template-columns:1fr}.arch-dep{border-right:0;border-bottom:1px solid var(--line)}.arch-dep:last-child{border-bottom:0}.execution-step{grid-template-columns:58px 1fr}.quickstart-copy,.field-manifest{padding:26px 18px}.terminal pre{padding:20px 16px;font-size:11px}.final-copy{padding:48px 18px}.final-actions{flex-direction:column}.footer-top{grid-template-columns:1fr}.footer-links{justify-content:flex-start}.footer-bottom{flex-direction:column;gap:8px}}
 </style>
 </head>
 <body>
-
 <a class="skip-link" href="#main">Skip to content</a>
-
-<div id="scroll-progress" aria-hidden="true"></div>
-
-<header class="site-header" id="site-header">
-  <div class="header-inner">
-    <a href="/" class="brand" aria-label="Ryuki home">
-      <svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ryuki logo">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg>
-      <span>ryuki<span class="io">.io</span></span>
-    </a>
-    <nav class="site-nav" id="site-nav" aria-label="Main">
-      <a href="#features" class="nav-link">Features</a>
-      <a href="#lifecycle" class="nav-link">Lifecycle</a>
-      <a href="#architecture" class="nav-link">Architecture</a>
-      <a href="#execution" class="nav-link">Live Execution</a>
-      <a href="#quickstart" class="nav-link">Quick Start</a>
-      <a href="/documentation.html" class="nav-link">Docs</a>
-    </nav>
-    <div class="header-right">
-      <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Menu">
-        <span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span>
-      </button>
-      <a href="https://github.com/mvandenbulcke/ryuki.io" class="gh-btn" target="_blank" rel="noopener">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-        <span class="gh-label">GitHub</span>
-      </a>
-    </div>
+<div class="site-frame">
+  <div class="utility-rail">
+    <span>Open source / Rust / MIT</span>
+    <span class="bus">Control bus / dry-run first</span>
   </div>
-</header>
 
-<main id="main">
-
-<!-- ── Hero ─────────────────────────────────────────────── -->
-<section class="hero">
-  <div class="hero-bg" aria-hidden="true">
-<div class="dragon-art" aria-hidden="true"></div>
-  </div>
-  <div class="container hero-inner">
-    <svg class="mark fx" id="hero-mark" style="--d:.05s" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ryuki logo">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg>
-    <div>
-      <span class="hero-pill fx" style="--d:.15s"><span class="dot"></span>Open source &middot; Rust-powered &middot; MIT licensed</span>
-    </div>
-    <h1 class="fx" style="--d:.25s">The <span class="grad">governed control plane</span> for multi&#8209;site infrastructure</h1>
-    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong>; live execution is operator&#8209;gated.</p>
-    <div class="hero-links fx" style="--d:.55s">
-      <a href="/getting-started.html" class="btn btn-primary">
-        Get Started
-        <svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-      </a>
-      <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-        View on GitHub
-      </a>
-    </div>
-  </div>
-</section>
-
-<!-- ── Stats ────────────────────────────────────────────── -->
-<div class="stats">
-  <div class="stats-grid">
-    <div class="stat">
-      <div class="stat-value">13</div>
-      <div class="stat-label">Governed lifecycle stages</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">17</div>
-      <div class="stat-label">Provider adapters</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">110+</div>
-      <div class="stat-label">Catalog contracts</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">3,900+</div>
-      <div class="stat-label">Tests in CI</div>
-    </div>
-  </div>
-</div>
-
-<!-- ── Product shot ─────────────────────────────────────── -->
-<section class="product-shot" aria-label="Portal screenshot">
-  <div class="container">
-    <figure>
-      <img src="/assets/portal-dashboard.webp" width="1512" height="900" loading="lazy" decoding="async"
-           alt="The Ryuki portal dashboard: role-filtered navigation with platform health, site readiness, open requests, failed operations, backup risk, and monitoring gap tiles.">
-      <figcaption>The portal dashboard, captured from a running instance in mock-dry-run mode.</figcaption>
-    </figure>
-  </div>
-</section>
-
-<!-- ── Features ─────────────────────────────────────────── -->
-<section id="features">
-  <div class="container">
-    <div>
-      <div class="section-label">Features</div>
-      <h2 class="section-title">Everything your platform team operates</h2>
-      <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure: governed by default, evidenced at every step. Each workflow plans, validates, and records its change against the named providers in a <strong>dry-run-first</strong> model; live provider execution is opt-in and operator-gated.</p>
-    </div>
-    <div class="features-grid">
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        </div>
-        <h3>VM Lifecycle</h3>
-        <p>Provision, resize, migrate, and retire VMs across six hypervisors, with capacity governance and placement policies per cluster.</p>
-        <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span><span class="tag">Nutanix AHV</span><span class="tag">Xen</span><span class="tag">KVM</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        </div>
-        <h3>Monitoring &amp; Alerting</h3>
-        <p>Host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts, on the monitoring stack you already run.</p>
-        <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">Prometheus</span><span class="tag">Datadog</span><span class="tag">Grafana</span><span class="tag">SolarWinds</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        </div>
-        <h3>Backup &amp; Recovery</h3>
-        <p>Backup coverage tracking, restore testing, DR orchestration, and repository health across sites, whichever backup platform protects them.</p>
-        <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">Commvault</span><span class="tag">Rubrik</span><span class="tag">Cohesity</span><span class="tag">NetBackup</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-        </div>
-        <h3>CMDB &amp; Inventory</h3>
-        <p>CMDB governance: CI reconciliation, drift tracking, and import/export, with dry-run publish to ServiceNow (no live CMDB write until the integration is enabled).</p>
-        <div class="feature-tags"><span class="tag">ServiceNow</span><span class="tag">Excel</span><span class="tag">Graph</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-        </div>
-        <h3>OS Patching &amp; Compliance</h3>
-        <p>Windows and Linux deployment, scheduled patching with approval gates, and OS baseline compliance reporting across the fleet.</p>
-        <div class="feature-tags"><span class="tag">Windows</span><span class="tag">Linux</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-        </div>
-        <h3>Image Factory</h3>
-        <p>Monthly golden image pipeline: template construction, automated testing, promotion through environments, and publishing.</p>
-        <div class="feature-tags"><span class="tag">Packer</span><span class="tag">Windows</span><span class="tag">Linux</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        </div>
-        <h3>Evidence &amp; Audit</h3>
-        <p>Redacted evidence packs per work item, approval chain lineage, shift handover reports, and audit-ready export without exposing credentials.</p>
-        <div class="feature-tags"><span class="tag">Audit</span><span class="tag">Compliance</span><span class="tag">RBAC</span></div>
-      </div>
-
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-        </div>
-        <h3>Datacenter Fabric</h3>
-        <p>Hardware lifecycle management, firmware baselines, switchport/VLAN readiness checks, and physical asset tracking across sites.</p>
-        <div class="feature-tags"><span class="tag">Network</span><span class="tag">Firmware</span><span class="tag">Lifecycle</span></div>
-      </div>
-
-    </div>
-  </div>
-</section>
-
-<!-- ── Lifecycle ────────────────────────────────────────── -->
-<section id="lifecycle" class="alt">
-  <div class="container">
-    <div>
-      <div class="section-label">Request Lifecycle</div>
-      <h2 class="section-title">Thirteen governed stages</h2>
-      <p class="section-subtitle">Every infrastructure request flows through the same pipeline, from draft through completion and into the post-completion lifecycle of protect, publish, maintain, and retire. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
-    </div>
-    <div class="pipeline-wrap">
-      <ol class="pipeline">
-        <li class="stage" style="--i:0"><span class="stage-num">01</span>Draft</li>
-        <li class="stage" style="--i:1"><span class="stage-num">02</span>Intake</li>
-        <li class="stage" style="--i:2"><span class="stage-num">03</span>Validate</li>
-        <li class="stage" style="--i:3"><span class="stage-num">04</span>Plan</li>
-        <li class="stage" style="--i:4"><span class="stage-num">05</span>Approve</li>
-        <li class="stage" style="--i:5"><span class="stage-num">06</span>Lock</li>
-        <li class="stage" style="--i:6"><span class="stage-num">07</span>Execute</li>
-        <li class="stage" style="--i:7"><span class="stage-num">08</span>Verify</li>
-        <li class="stage" style="--i:8"><span class="stage-num">09</span>Complete</li>
-      </ol>
-      <div class="roadmap-label" aria-hidden="true">Post-completion lifecycle</div>
-      <ol class="pipeline roadmap-row" aria-label="Post-completion lifecycle stages">
-        <li class="stage"><span class="stage-num">10</span>Protect</li>
-        <li class="stage"><span class="stage-num">11</span>Publish</li>
-        <li class="stage"><span class="stage-num">12</span>Maintain</li>
-        <li class="stage"><span class="stage-num">13</span>Retire</li>
-      </ol>
-    </div>
-    <div class="tour-wrap">
-      <button class="tour-btn" id="tour-btn" type="button">
-        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
-        <span id="tour-label">Play the lifecycle</span>
-      </button>
-    </div>
-    <p class="pipeline-detail" id="pipeline-detail" aria-live="polite">Select a stage to see what it governs.</p>
-    <p class="pipeline-note">A failed request is terminal and keeps its full evidence trail. Break-glass emergency changes follow the same pipeline: <code>no bypass on evidence</code>.</p>
-  </div>
-</section>
-
-<!-- ── Architecture ─────────────────────────────────────── -->
-<section id="architecture">
-  <div class="container">
-    <div>
-      <div class="section-label">Architecture</div>
-      <h2 class="section-title">Full-stack Rust control plane</h2>
-      <p class="section-subtitle">SSR portal behind a same-origin boundary, a governed API, and a domain engine, with secrets isolated in Vault. The browser never talks to a provider directly.</p>
-    </div>
-
-    <div class="arch-diagram">
-      <div class="arch-node">
-        <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-        <h3>Browser</h3>
-        <p>Ingress over TLS only</p>
-      </div>
-      <div class="arch-link" aria-hidden="true"></div>
-      <div class="arch-node">
-        <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>
-        <h3>Portal UI</h3>
-        <p>Leptos / Axum SSR, same-origin boundary</p>
-      </div>
-      <div class="arch-link" aria-hidden="true"></div>
-      <div class="arch-node">
-        <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
-        <h3>Platform API</h3>
-        <p>Axum, Entra ID SSO, request lifecycle</p>
-      </div>
-      <div class="arch-link" aria-hidden="true"></div>
-      <div class="arch-node">
-        <div class="node-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="m6.3 6.3 2.9 2.9"/><path d="M2 12h4"/><path d="m6.3 17.7 2.9-2.9"/><path d="M12 22v-4"/><path d="m17.7 17.7-2.9-2.9"/><path d="M22 12h-4"/><path d="m17.7 6.3-2.9 2.9"/><circle cx="12" cy="12" r="2"/></svg></div>
-        <h3>Engine</h3>
-        <p>Domain models, evidence, adapters</p>
-      </div>
-    </div>
-
-    <div class="arch-sub">
-      <div class="arch-drop">
-        <div class="arch-vlink" aria-hidden="true"></div>
-        <div class="arch-mini">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-          PostgreSQL
-        </div>
-      </div>
-      <div class="arch-drop">
-        <div class="arch-vlink" aria-hidden="true"></div>
-        <div class="arch-mini">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          Vault
-        </div>
-      </div>
-    </div>
-    <p class="arch-caption">Provider access is brokered through the API alone; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
-
-    <div class="arch-wrap">
-    <table class="arch-table">
-      <thead>
-        <tr><th>Component</th><th>Stack</th><th>Description</th></tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>portal-ui</td>
-          <td>Rust / Leptos / Axum</td>
-          <td>Full-stack SSR portal with role-filtered navigation. Same-origin isolation; it never calls provider APIs directly.</td>
-        </tr>
-        <tr>
-          <td>ryuki-api</td>
-          <td>Rust / Axum / sqlx</td>
-          <td>Control plane API with Entra ID SSO, role-based access, and the governed request lifecycle.</td>
-        </tr>
-        <tr>
-          <td>ryuki-engine</td>
-          <td>Rust</td>
-          <td>Domain models, evidence generation, health probes, and provider adapters.</td>
-        </tr>
-        <tr>
-          <td>ryuki-core</td>
-          <td>Rust</td>
-          <td>Shared types, utilities, secret scanning, and cross-cutting configuration.</td>
-        </tr>
-        <tr>
-          <td>ryuki-validator</td>
-          <td>Rust</td>
-          <td>Self-contained static validation engine (129 modules with a registry-enforced coverage table) for pre-commit and CI guardrails.</td>
-        </tr>
-        <tr>
-          <td>ryuki-agent</td>
-          <td>Rust</td>
-          <td>Operator-deployed execution agent. Runs Terraform and Ansible on the operator's own infrastructure and refuses any live apply whose signed grant or plan digest fails verification.</td>
-        </tr>
-        <tr>
-          <td>ryuki-runner</td>
-          <td>Rust</td>
-          <td>Process-spawning layer for Terraform and Ansible runs, shared by the agent's dry-run and live paths.</td>
-        </tr>
-        <tr>
-          <td>ryuki-protocol</td>
-          <td>Rust</td>
-          <td>Wire contract between the control plane and agents: pure types plus Ed25519 signature primitives, no IO.</td>
-        </tr>
-        <tr>
-          <td>PostgreSQL</td>
-          <td>CloudNativePG / Docker</td>
-          <td>Control plane database with schema migrations via <code>sqlx</code>.</td>
-        </tr>
-        <tr>
-          <td>Vault</td>
-          <td>HashiCorp Vault</td>
-          <td>Secrets resolver for provider credentials, referenced by handle, never committed or logged. Vault-backed in production; a mock resolver runs by default.</td>
-        </tr>
-      </tbody>
-    </table>
-    </div>
-  </div>
-</section>
-
-<!-- ── Live Execution ───────────────────────────────────── -->
-<section id="execution" class="alt">
-  <div class="container">
-    <div>
-      <div class="section-label">Live Execution</div>
-      <h2 class="section-title">One gated path to live infrastructure</h2>
-      <p class="section-subtitle">Every domain plans, validates, and records evidence without touching live systems. The single live path runs Terraform and Ansible through an operator-deployed agent, and every step of it is signed.</p>
-    </div>
-    <ol class="exec-steps">
-      <li><strong>Plan.</strong> An admin dispatches a live plan. The agent runs <code>terraform plan</code> against the real backend and returns scrubbed evidence with a plan digest. Nothing mutates.</li>
-      <li><strong>Approve.</strong> An admin approves that exact plan. The control plane mints a grant signed with its Ed25519 key, binding the request, the plan digest, the approver, and an expiry under 24 hours. Each request gets one live apply, or exactly one per step in an orchestrated run, enforced at the database.</li>
-      <li><strong>Verify.</strong> The agent acts only with <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and a pinned control-plane public key. It re-plans and refuses on any mismatch: bad signature, wrong request, expired grant, or a changed plan digest. Refusals are signed and reported.</li>
-      <li><strong>Apply.</strong> On success the agent applies the saved plan bytes, not a re-plan, so what changes is exactly what was approved. Credentials never reach the control plane.</li>
-    </ol>
-    <p class="exec-note">The dry-run pipeline and the full trust gate are implemented and tested. Pointing an agent at production stays operator-owned: real provider credentials, a durable state backend, and <code>RYUKI_AGENT_ALLOW_LIVE</code> set on purpose.</p>
-  </div>
-</section>
-
-<!-- ── Quick Start ──────────────────────────────────────── -->
-<section id="quickstart">
-  <div class="container">
-    <div>
-      <div class="section-label">Quick Start</div>
-      <h2 class="section-title">Running in minutes</h2>
-      <p class="section-subtitle">Database up, API built and running, health check green. The transcript below is from a real session.</p>
-    </div>
-    <div class="code-block">
-      <div class="code-block-header">
-        <div class="code-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-        <span>shell</span>
-        <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy commands">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-          <span>Copy</span>
-        </button>
-      </div>
-      <pre id="quickstart-code" data-src="docker compose -f deploy/compose/compose.yaml up -d platform-db&#10;cp .env.example .env&#10;cargo build -p ryuki-api&#10;./target/debug/ryuki-api &amp;&#10;curl -s localhost:8081/health"><code><span class="c"># Start PostgreSQL via Docker Compose</span>
-<span class="prompt">$ </span><span class="cmd">docker compose -f deploy/compose/compose.yaml up -d platform-db</span>
-<span class="out"> ✔ Container ryuki-infrastructure-platform-platform-db-1  Started</span>
-
-<span class="c"># Configure, build, run</span>
-<span class="prompt">$ </span><span class="cmd">cp .env.example .env</span>
-<span class="prompt">$ </span><span class="cmd">cargo build -p ryuki-api</span>
-<span class="out">    Finished `dev` profile [unoptimized + debuginfo] target(s)</span>
-<span class="prompt">$ </span><span class="cmd">./target/debug/ryuki-api &amp;</span>
-
-<span class="c"># The control plane is up</span>
-<span class="prompt">$ </span><span class="cmd">curl -s localhost:8081/health</span>
-<span class="out">{"auth_mode":"local","config":{"errors":[],"valid":true,"warnings":[]},"database":{"connected":true,"provider":"postgres-local"},"rate_limit_enabled":false,"status":"healthy"}</span></code></pre>
-    </div>
-  </div>
-</section>
-
-<!-- ── CTA ──────────────────────────────────────────────── -->
-<section class="cta">
-  <div class="container">
-    <div class="cta-panel">
-      <svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg>
-      <h2>Run your infrastructure governed</h2>
-      <p>Self-hosted, open source, audit-first. Deploy the control plane and bring governance to every request.</p>
-      <div class="btn-group">
-        <a href="/getting-started.html" class="btn btn-primary">
-          Read the Docs
-          <svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-        </a>
-        <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
-      </div>
-    </div>
-  </div>
-</section>
-
-</main>
-
-<footer class="site-footer">
-  <div class="footer-inner">
-    <div class="footer-brand">
-      <a href="/" class="brand" aria-label="Ryuki home">
-        <svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg>
+  <header class="site-header">
+    <div class="topbar">
+      <a class="brand" href="/" aria-label="Ryuki home">
+        <img src="/assets/logo.svg" alt="">
         <span>ryuki<span class="io">.io</span></span>
       </a>
-      <p>Governed infrastructure operations for multi-site datacenters. Request, operate, evidence, retire.</p>
-    </div>
-    <div class="footer-links">
-      <div class="footer-col">
-        <h5>Project</h5>
-        <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
-        <a href="/documentation.html">Documentation</a>
-        <a href="https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
-      </div>
-      <div class="footer-col">
-        <h5>Explore</h5>
-        <a href="#features">Features</a>
+      <nav class="site-nav" id="site-nav" aria-label="Primary navigation">
+        <a href="#features">Operations</a>
         <a href="#lifecycle">Lifecycle</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#quickstart">Quick Start</a>
-      </div>
+        <a href="#execution">Live gate</a>
+        <a href="/documentation.html">Docs</a>
+      </nav>
+      <div class="gate-state"><span class="lamp green" aria-hidden="true"></span><span>Evidence bus online</span></div>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
     </div>
-  </div>
-  <div class="footer-bottom">
-    <span>&copy; 2026 Ryuki &middot; MIT License</span>
-    <span title="Ryuki — the Dragon Knight">Built with Rust &middot; 竜騎</span>
-  </div>
-</footer>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <div class="eyebrow">Change control / witnessed systems</div>
+        <h1 id="hero-title">Infrastructure changes, with <em>witnesses.</em></h1>
+        <div class="copy-bottom">
+          <p class="lede">Ryuki turns requests into signed, reviewable evidence across every site—from draft to retire. Dry-run first. Live execution only after a human gate.</p>
+          <div class="actions">
+            <a class="action primary" href="/getting-started.html">Read the field guide</a>
+            <a class="action secondary" href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">View source</a>
+          </div>
+        </div>
+      </div>
+
+      <aside class="console" aria-label="Illustrative dry-run change record">
+        <div class="console-head"><span>Example / dry-run record</span><strong>RYK-DEMO-042</strong></div>
+        <div class="lock-band"><span class="lamp" aria-hidden="true"></span><span>Live execution locked</span><small>Human gate</small></div>
+        <div class="telemetry">
+          <div class="telemetry-row"><span class="label">Request</span><span class="value">linux-server/042</span><span class="state">SIGNED</span></div>
+          <div class="telemetry-row"><span class="label">Plan</span><span class="value">catalog + policy</span><span class="state ready">SEALED</span></div>
+          <div class="telemetry-row"><span class="label">Operator</span><span class="value">awaiting approval</span><span class="state">HOLD</span></div>
+        </div>
+        <div class="evidence-strip" aria-label="Evidence witnesses">
+          <span>Evidence / 03 witnesses</span>
+          <strong>request.json · plan.sha256 · human.gate</strong>
+        </div>
+      </aside>
+    </section>
+
+    <div class="proof" aria-label="Project facts">
+      <div><strong>17</strong><span>Provider adapters</span></div>
+      <div><strong>110+</strong><span>Catalog contracts</span></div>
+      <div><strong>3,900+</strong><span>Tests · 100% Rust</span></div>
+    </div>
+
+    <section class="section" id="features" aria-labelledby="features-title">
+      <div class="section-head">
+        <div class="section-code">Operations registry<strong>Readout / 01</strong></div>
+        <div>
+          <h2 class="section-title" id="features-title">The infrastructure your team already <em>operates.</em></h2>
+          <p class="section-intro">One governed path for the four jobs that matter: operate, protect, observe, and prove. Named integrations stay visible because infrastructure claims should be inspectable.</p>
+        </div>
+      </div>
+
+      <figure class="portal-plate plate">
+        <div class="plate-head"><span>Portal capture / running instance</span><strong>Mock-dry-run mode</strong></div>
+        <img src="/assets/portal-dashboard.webp" width="1512" height="900" loading="eager" decoding="async" alt="Ryuki portal dashboard showing platform health, site readiness, requests, failed operations, backup risk, and monitoring coverage.">
+        <figcaption>Role-filtered portal dashboard captured from a running instance in mock-dry-run mode. The browser stays behind the same-origin portal boundary.</figcaption>
+      </figure>
+
+      <div class="operations">
+        <article class="operation"><div class="operation-code">OPS / 01</div><div class="operation-body"><h3>Operate</h3><p>Provision, patch, image, place, and retire compute under capacity and approval policy.</p><div class="provider-line">VMware · Hyper-V · Proxmox · Nutanix AHV · Xen · KVM · Packer</div></div></article>
+        <article class="operation"><div class="operation-code">OPS / 02</div><div class="operation-body"><h3>Protect</h3><p>Track backup coverage, test restores, orchestrate recovery, and expose repository risk.</p><div class="provider-line">Veeam · Commvault · Rubrik · Cohesity · NetBackup</div></div></article>
+        <article class="operation"><div class="operation-code">OPS / 03</div><div class="operation-body"><h3>Observe</h3><p>Enroll hosts, route alerts, open maintenance windows, and detect drift across the fleet.</p><div class="provider-line">Zabbix · Prometheus · Datadog · Grafana · SolarWinds</div></div></article>
+        <article class="operation"><div class="operation-code">OPS / 04</div><div class="operation-body"><h3>Prove</h3><p>Reconcile inventory and seal approval, execution, CMDB, and physical-site evidence.</p><div class="provider-line">ServiceNow · CMDB graph · audit packs · site registry</div></div></article>
+      </div>
+    </section>
+
+    <section class="section lifecycle-section" id="lifecycle" aria-labelledby="lifecycle-title">
+      <div class="section-head">
+        <div class="section-code">Change switchboard<strong>Readout / 02</strong></div>
+        <div>
+          <h2 class="section-title" id="lifecycle-title">Nine governed states. <em>No evidence bypass.</em></h2>
+          <p class="section-intro">Every request moves through the same implemented control path. A failed request is terminal and keeps its evidence. Break-glass changes move faster, but they do not become invisible.</p>
+        </div>
+      </div>
+      <div class="lifecycle-label"><strong>Draft → Intake → Validated → Planned → Approved → Locked → Executing → Verifying → Completed</strong><span>Switchboard / 01—09</span></div>
+      <ol class="lifecycle-grid">
+        <li><button class="stage-button" type="button" data-stage="0" aria-pressed="false"><span class="num">01 / INPUT</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Draft</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="1" aria-pressed="false"><span class="num">02 / OWNER</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Intake</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="2" aria-pressed="false"><span class="num">03 / POLICY</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Validated</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="3" aria-pressed="false"><span class="num">04 / DRY-RUN</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Planned</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="4" aria-pressed="true"><span class="num">05 / HUMAN</span><span class="lamp orange" aria-hidden="true"></span><span class="name">Approved</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="5" aria-pressed="false"><span class="num">06 / WINDOW</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Locked</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="6" aria-pressed="false"><span class="num">07 / CONTROL</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Executing</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="7" aria-pressed="false"><span class="num">08 / PROBE</span><span class="lamp dim" aria-hidden="true"></span><span class="name">Verifying</span></button></li>
+        <li><button class="stage-button" type="button" data-stage="8" aria-pressed="false"><span class="num">09 / LEDGER</span><span class="lamp green" aria-hidden="true"></span><span class="name">Completed</span></button></li>
+      </ol>
+      <div class="stage-readout" id="stage-readout" aria-live="polite">
+        <div><div class="readout-id">State / 05</div><h3>Approved</h3></div>
+        <p>An attributed role-based decision binds the reviewed plan to the change record before a live grant can exist.</p>
+        <div class="emits">Emits<br>approval lineage</div>
+      </div>
+      <div class="lifecycle-label roadmap-label"><strong>Post-completion lifecycle</strong><span>Roadmap / 10—13</span></div>
+      <div class="roadmap-grid" aria-label="Post-completion roadmap phases">
+        <div class="roadmap-stage"><strong>Protect</strong><span>Backup coverage + monitoring enrollment</span></div>
+        <div class="roadmap-stage"><strong>Publish</strong><span>CMDB + service catalogue visibility</span></div>
+        <div class="roadmap-stage"><strong>Maintain</strong><span>Patching + compliance + ownership</span></div>
+        <div class="roadmap-stage"><strong>Retire</strong><span>Governed decommission + final evidence</span></div>
+      </div>
+    </section>
+
+    <section class="section" id="architecture" aria-labelledby="architecture-title">
+      <div class="section-head">
+        <div class="section-code">System boundary<strong>Readout / 03</strong></div>
+        <div>
+          <h2 class="section-title" id="architecture-title">Provider access stays <em>behind the plane.</em></h2>
+          <p class="section-intro">The browser never calls a provider. The portal keeps a same-origin boundary; the API owns policy and request state; secrets resolve by handle; agents execute on infrastructure the operator controls.</p>
+        </div>
+      </div>
+      <div class="architecture-grid">
+        <div class="architecture-map">
+          <div class="lifecycle-label"><strong>Primary control path</strong><span>TLS / same origin</span></div>
+          <div class="arch-rail" aria-label="Primary architecture flow">
+            <div class="arch-node"><span class="num">01 / TLS</span><strong>Browser</strong></div>
+            <div class="arch-node"><span class="num">02 / SSR</span><strong>Portal UI</strong></div>
+            <div class="arch-node"><span class="num">03 / POLICY</span><strong>Platform API</strong></div>
+            <div class="arch-node"><span class="num">04 / DOMAIN</span><strong>Engine</strong></div>
+          </div>
+          <div class="arch-deps">
+            <div class="arch-dep"><small>STATE / SQLX</small><strong>PostgreSQL</strong></div>
+            <div class="arch-dep"><small>SECRETS / HANDLE</small><strong>Vault</strong></div>
+            <div class="arch-dep"><small>EXECUTION / SIGNED</small><strong>Agent</strong></div>
+          </div>
+          <p class="arch-note">Default deny. Explicit egress only to PostgreSQL, Vault, the execution agent, and approved provider endpoints. Provider credentials do not pass through the browser or control-plane evidence.</p>
+        </div>
+        <div class="registry">
+          <div class="registry-head"><span>Boundary registry</span><strong>4 enforced edges</strong></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Component</th><th>Stack</th><th>Control responsibility</th></tr></thead>
+              <tbody>
+                <tr><td>Portal boundary</td><td>Leptos / Axum</td><td>SSR, role-filtered navigation, and same-origin browser access.</td></tr>
+                <tr><td>Policy plane</td><td>Axum / Rust</td><td>Authorization, validation, request state, and evidence generation.</td></tr>
+                <tr><td>Execution edge</td><td>Agent / Runner</td><td>Operator-deployed execution using short-lived signed grants.</td></tr>
+                <tr><td>State &amp; secrets</td><td>PostgreSQL / Vault</td><td>Durable records and secret handles without browser credential flow.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="execution" id="execution" aria-labelledby="execution-title">
+      <div class="execution-lock"><span class="lamp dim" aria-hidden="true"></span><span>One gated path to live infrastructure</span><small>Operator-owned boundary</small></div>
+      <div class="execution-grid">
+        <div class="execution-intro">
+          <h2 id="execution-title">Nothing applies until the exact plan is <span>witnessed.</span></h2>
+          <p>Every domain can plan, validate, and record evidence without touching live systems. Live Terraform and Ansible execution runs through an operator-deployed agent only after the trust gate closes around one reviewed plan.</p>
+          <div class="execution-facts">
+            <div class="execution-fact"><strong>Grant</strong><span>Signed with the control plane's Ed25519 key.</span></div>
+            <div class="execution-fact"><strong>Binding</strong><span>Request, plan digest, approver, and expiry under 24 hours.</span></div>
+            <div class="execution-fact"><strong>Credentials</strong><span>Remain on operator-owned infrastructure.</span></div>
+          </div>
+          <div class="actions"><a class="action primary" href="/agents-and-live-execution.html">Inspect the trust gate</a></div>
+        </div>
+        <ol class="execution-steps">
+          <li class="execution-step"><div class="step-num">01</div><div class="step-body"><h3>Plan</h3><p>The agent runs a live plan against the real backend and returns scrubbed evidence plus a digest. Nothing mutates.</p></div></li>
+          <li class="execution-step"><div class="step-num">02</div><div class="step-body"><h3>Approve</h3><p>An admin approves that exact digest. The control plane mints a short-lived signed grant bound to the request and approver.</p></div></li>
+          <li class="execution-step"><div class="step-num">03</div><div class="step-body"><h3>Verify</h3><p>The agent refuses bad signatures, wrong requests, expired grants, digest changes, or disabled live mode—and reports the refusal.</p></div></li>
+          <li class="execution-step"><div class="step-num">04</div><div class="step-body"><h3>Apply</h3><p>The agent applies the saved plan bytes, then returns redacted result evidence. Production access remains an operator decision.</p></div></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section" id="quickstart" aria-labelledby="quickstart-title">
+      <div class="section-head">
+        <div class="section-code">Operator field guide<strong>Readout / 04</strong></div>
+        <div><h2 class="section-title" id="quickstart-title">Start dry. Verify the <em>boundary.</em></h2><p class="section-intro">Bring up PostgreSQL and verify the workspace build. The field guide carries the full API, portal, configuration, and first-test sequence.</p></div>
+      </div>
+      <div class="quickstart-grid">
+        <div class="quickstart-copy">
+          <h3>Local control plane</h3>
+          <p>The default posture is safe for evaluation. Real provider credentials and live execution remain opt-in, explicitly configured, and operator-owned.</p>
+          <div class="quick-links">
+            <a href="/getting-started.html">Getting started</a>
+            <a href="/first-test.html">First test acceptance</a>
+            <a href="/configuration.html">Configuration</a>
+            <a href="/documentation.html">All documentation</a>
+          </div>
+        </div>
+        <div class="terminal">
+          <div class="terminal-head"><span>Shell / build baseline</span><button class="copy-btn" id="copy-btn" type="button">Copy commands</button></div>
+          <pre id="quickstart-code"><code><span class="comment"># Clone, start state, and verify the workspace</span>
+<span class="prompt">$</span> <span class="cmd">git clone https://github.com/mvandenbulcke/ryuki.io.git &amp;&amp; cd ryuki.io</span>
+<span class="prompt">$</span> <span class="cmd">docker compose -f deploy/compose/compose.yaml up -d platform-db</span>
+<span class="prompt">$</span> <span class="cmd">cp .env.example .env</span>
+<span class="prompt">$</span> <span class="cmd">cargo build --workspace</span></code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="final-call" aria-labelledby="final-title">
+      <div class="final-copy">
+        <h2 id="final-title">Make every change leave a <em>record.</em></h2>
+        <p>Self-hosted, open source, and built for the system engineers who have to explain what changed after the maintenance window closes.</p>
+        <div class="final-actions actions"><a class="action primary" href="/getting-started.html">Read the field guide</a><a class="action secondary" href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">Inspect source</a></div>
+      </div>
+      <div class="field-manifest">
+        <div class="manifest-code">Custodian mark / RY-06</div>
+        <blockquote>Request. Plan. Approve. Execute. Evidence.</blockquote>
+        <div class="seal">Reviewable / signed</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-top">
+      <div class="footer-brand"><img src="/assets/logo.svg" alt=""><span>ryuki<span class="io">.io</span></span></div>
+      <nav class="footer-links" aria-label="Footer navigation"><a href="/documentation.html">Documentation</a><a href="/api-reference.html">API reference</a><a href="/architecture.html">Architecture</a><a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a><a href="https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE" target="_blank" rel="noopener">MIT license</a></nav>
+    </div>
+    <div class="footer-bottom"><span>© 2026 Ryuki · governed infrastructure operations</span><span>Built with Rust · 竜騎</span></div>
+  </footer>
+</div>
 
 <script>
 (function(){
   'use strict';
 
-  /* ── Header shadow + scroll progress ── */
-  var header=document.getElementById('site-header');
-  var prog=document.getElementById('scroll-progress');
-  function onScroll(){
-    header.classList.toggle('scrolled',window.scrollY>8);
-    if(prog){
-      var de=document.documentElement;
-      var max=de.scrollHeight-de.clientHeight;
-      prog.style.width=max>0?(window.scrollY/max*100).toFixed(2)+'%':'0';
-    }
+  var toggle=document.getElementById('nav-toggle');
+  var nav=document.getElementById('site-nav');
+  function setNav(open){
+    if(!toggle||!nav)return;
+    nav.classList.toggle('open',open);
+    toggle.setAttribute('aria-expanded',open?'true':'false');
   }
-  window.addEventListener('scroll',onScroll,{passive:true});
-  window.addEventListener('resize',onScroll,{passive:true});
-  onScroll();
-
-  var reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  /* ── Copy quick-start commands ── */
-  var copyBtn=document.getElementById('copy-btn');
-  if(copyBtn){
-    copyBtn.addEventListener('click',function(){
-      var code=document.getElementById('quickstart-code');
-      var text=(code.getAttribute('data-src')||code.innerText).split('\n').filter(function(l){return l&&l.charAt(0)!=='#'}).join('\n');
-      function done(){
-        copyBtn.classList.add('copied');
-        copyBtn.querySelector('span').textContent='Copied';
-        setTimeout(function(){
-          copyBtn.classList.remove('copied');
-          copyBtn.querySelector('span').textContent='Copy';
-        },1800);
-      }
-      if(navigator.clipboard&&navigator.clipboard.writeText){
-        navigator.clipboard.writeText(text).then(done).catch(function(){});
-      }
-    });
+  if(toggle&&nav){
+    toggle.addEventListener('click',function(){setNav(!nav.classList.contains('open'))});
+    nav.addEventListener('click',function(event){if(event.target.closest('a'))setNav(false)});
+    document.addEventListener('keydown',function(event){if(event.key==='Escape'&&nav.classList.contains('open')){setNav(false);toggle.focus()}});
   }
 
-  /* ── The ryū engine: load light-up + cursor spotlight ─────
-     On load the line work turns gold from the center outward —
-     an expanding circle — until the whole dragon is lit, holds
-     a beat, then fades back to the faint base. Afterwards the
-     spotlight follows the cursor (or keeps sweeping on touch
-     screens). Clicking the hero mark makes the whole dragon
-     flare; typing "ryu" replays the center-out light-up. */
-  var fine=window.matchMedia('(pointer: fine)').matches;
-  var art=document.querySelector('.dragon-art');
-  var heroEl=document.querySelector('.hero');
-
-  if(fine&&!reduced)document.documentElement.classList.add('fine');
-  if(art&&!reduced)art.classList.add('play-ink');
-
-  if(art&&!reduced){
-    var sx=0,sy=0,sr=0,tx=0,ty=0,tr=0,fade=1,spotRaf=null;
-    var introStart=null,introDone=false;
-    var GROW=1700,HOLD=400,FADE=900;
-    var sweeping=!fine,heroVisible=true,roaring=false;
-
-    var setSpot=function(){
-      art.style.setProperty('--ryu-spot-x',sx.toFixed(1)+'px');
-      art.style.setProperty('--ryu-spot-y',sy.toFixed(1)+'px');
-      art.style.setProperty('--ryu-spot-r',Math.max(0,sr).toFixed(1)+'px');
-      art.style.setProperty('--ryu-fade',Math.max(0,Math.min(1,fade)).toFixed(3));
-    };
-    var spotFrame=function(ts){
-      var rect=art.getBoundingClientRect();
-      var R=Math.max(170,rect.width*.16);
-      if(!introDone&&!roaring){
-        if(introStart===null){
-          introStart=ts;
-          sx=tx=rect.width*.5;sy=ty=rect.height*.5;sr=tr=0;fade=1;
-        }
-        var el=ts-introStart;
-        var Rcover=Math.sqrt(rect.width*rect.width+rect.height*rect.height)*.5+60;
-        tx=rect.width*.5;ty=rect.height*.5;
-        if(el<GROW){
-          var p=el/GROW;
-          sr=tr=Rcover*(1-Math.pow(1-p,3));
-          fade=1;
-        }else if(el<GROW+HOLD){
-          sr=tr=Rcover;
-          fade=1;
-        }else if(el<GROW+HOLD+FADE){
-          sr=tr=Rcover;
-          fade=1-(el-GROW-HOLD)/FADE;
-        }else{
-          introDone=true;
-          fade=1;
-          sr=tr=fine?0:R*1.15;
-        }
-      }else if(sweeping&&!roaring){
-        tx=rect.width*.5+rect.width*.34*Math.sin(ts*.00031);
-        ty=rect.height*.5+rect.height*.27*Math.sin(ts*.00052+1.4);
-        tr=heroVisible?R:0;
-      }
-      sx+=(tx-sx)*(introDone?.16:.25);
-      sy+=(ty-sy)*(introDone?.16:.25);
-      sr+=(tr-sr)*.12;
-      setSpot();
-      if(!introDone||roaring||(sweeping&&heroVisible)||Math.abs(tx-sx)+Math.abs(ty-sy)>.5||Math.abs(tr-sr)>.5){
-        spotRaf=requestAnimationFrame(spotFrame);
-      }else{
-        spotRaf=null;
-      }
-    };
-    var wakeSpot=function(){if(spotRaf===null)spotRaf=requestAnimationFrame(spotFrame)};
-    wakeSpot();
-
-    if(fine){
-      document.addEventListener('mousemove',function(e){
-        if(!introDone||roaring)return;
-        var rect=art.getBoundingClientRect();
-        var x=e.clientX-rect.left,y=e.clientY-rect.top;
-        if(x>-60&&x<rect.width+60&&y>-60&&y<rect.height+60){
-          tx=x;ty=y;tr=Math.max(170,rect.width*.16);
-        }else{tr=0}
-        wakeSpot();
-      },{passive:true});
-    }else if(heroEl&&'IntersectionObserver' in window){
-      var sweepIo=new IntersectionObserver(function(entries){
-        heroVisible=entries[0].isIntersecting;
-        if(heroVisible)wakeSpot();
-      },{threshold:.15});
-      sweepIo.observe(heroEl);
-    }
-
-    /* roar: the whole dragon flares for a moment */
-    var roar=function(){
-      var rect=art.getBoundingClientRect();
-      roaring=true;fade=1;
-      tx=rect.width*.5;ty=rect.height*.45;tr=rect.width*.8;
-      wakeSpot();
-      setTimeout(function(){
-        roaring=false;
-        if(fine&&introDone)tr=0;
-        wakeSpot();
-      },1150);
-    };
-    var heroMark=document.getElementById('hero-mark');
-    if(heroMark){
-      heroMark.addEventListener('click',function(){
-        heroMark.classList.remove('pop');
-        heroMark.getBoundingClientRect();
-        heroMark.classList.add('pop');
-        roar();
-      });
-    }
-    /* type "ryu": the dragon lights up again, center outward */
-    var buf='';
-    document.addEventListener('keydown',function(e){
-      if(e.key.length!==1)return;
-      buf=(buf+e.key.toLowerCase()).slice(-3);
-      if(buf==='ryu'){
-        art.classList.remove('play-ink');
-        art.getBoundingClientRect();
-        art.classList.add('play-ink');
-        introStart=null;introDone=false;
-        wakeSpot();
-      }
-    });
-  }
-
-  /* -- Hero parallax: the dragon drifts with scroll and cursor -- */
-  if(art&&!reduced){
-    var pdx=0,pdy=0;
-    var applyPar=function(){
-      var sc=Math.min(110,window.scrollY*.1);
-      art.style.transform='translate3d('+pdx.toFixed(1)+'px,'+(pdy+sc).toFixed(1)+'px,0)';
-    };
-    window.addEventListener('scroll',applyPar,{passive:true});
-    if(fine){
-      document.addEventListener('mousemove',function(e){
-        pdx=(e.clientX/window.innerWidth-.5)*18;
-        pdy=(e.clientY/window.innerHeight-.5)*10;
-        applyPar();
-      },{passive:true});
-    }
-    applyPar();
-  }
-
-  /* ── Lifecycle pipeline: pick a stage to see what it governs ── */
-  var stageInfo=[
-    'Drafted from a catalog offering. Nothing executes yet.',
-    'Request captured with owner, purpose, environment, and target site.',
-    'Static checks against catalog contracts, naming, and capacity.',
-    'Execution plan rendered with impact analysis and a rollback path.',
-    'Role-based approval chain: CAB-ready, fully attributed.',
-    'Change window locked, resources reserved, conflicts blocked.',
-    'Adapters execute against approved provider endpoints only.',
-    'Post-change health probes and configuration drift checks.',
-    'Evidence pack sealed, CMDB reconciled, request closed.',
-    'Backup coverage confirmed after completion, dry-run first.',
-    'CMDB publication for the delivered request, dry-run until the integration is enabled.',
-    'Ongoing operations: patching, compliance, and ownership through the service life.',
-    'Governed decommission planned dry-run first: quarantine, final evidence, teardown plan.'
+  var stageData=[
+    ['Draft','A catalogue offering becomes a request shell. No plan exists and nothing can execute.','request draft'],
+    ['Intake','Owner, purpose, environment, target site, and scope are captured before policy evaluation begins.','attributed intake'],
+    ['Validated','Static checks test the request against catalogue contracts, naming rules, capacity, and policy.','validation report'],
+    ['Planned','The platform renders a dry-run execution plan with impact analysis and a rollback path.','sealed plan digest'],
+    ['Approved','An attributed role-based decision binds the reviewed plan to the change record before a live grant can exist.','approval lineage'],
+    ['Locked','The change window and resources are locked; conflicts are blocked before execution starts.','lock record'],
+    ['Executing','Approved adapters run only against configured endpoints and only within the accepted plan.','execution events'],
+    ['Verifying','Post-change health probes and drift checks compare the result with the approved intent.','verification evidence'],
+    ['Completed','The evidence pack is sealed, the request is closed, and downstream reconciliation can begin.','final evidence pack']
   ];
-  var stages=document.querySelectorAll('.pipeline .stage');
-  var detail=document.getElementById('pipeline-detail');
-  var tourBtn=document.getElementById('tour-btn');
-  var tourLabel=document.getElementById('tour-label');
-  var tourTimer=null;
-  if(stages.length&&detail){
-    var defaultMsg=detail.innerHTML;
-    var pipelineEl=document.querySelector('.pipeline');
-    var swapSeq=0;
-    var showStage=function(idx){
-      if(pipelineEl)pipelineEl.classList.toggle('quiet',idx!==null||tourTimer!==null);
-      Array.prototype.forEach.call(stages,function(s){
-        s.classList.remove('active');
-        s.setAttribute('aria-pressed','false');
-      });
-      detail.classList.add('swap');
-      var my=++swapSeq;
-      setTimeout(function(){
-        if(my!==swapSeq)return;
-        if(idx===null){
-          detail.innerHTML=defaultMsg;
-        }else{
-          var li=stages[idx];
-          li.classList.add('active');
-          li.setAttribute('aria-pressed','true');
-          var name=li.textContent.replace(/^\s*\d+\s*/,'').trim();
-          detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> · '+stageInfo[idx];
-        }
-        detail.classList.remove('swap');
-      },150);
-    };
-    var stopTour=function(){
-      if(tourTimer!==null){clearInterval(tourTimer);tourTimer=null}
-      detail.setAttribute('aria-live','polite');
-      if(tourBtn)tourLabel.textContent='Play the lifecycle';
-    };
-    Array.prototype.forEach.call(stages,function(li,idx){
-      li.setAttribute('tabindex','0');
-      li.setAttribute('role','button');
-      li.setAttribute('aria-pressed','false');
-      var activate=function(){
-        stopTour();
-        showStage(li.classList.contains('active')?null:idx);
-      };
-      li.addEventListener('click',activate);
-      li.addEventListener('keydown',function(e){
-        if(e.key==='Enter'||e.key===' '){e.preventDefault();activate()}
-      });
-    });
-    /* the tour: walk every stage */
-    if(tourBtn){
-      tourBtn.addEventListener('click',function(){
-        if(tourTimer!==null){stopTour();showStage(null);return}
-        var i=0;
-        var tourLen=document.querySelectorAll('.pipeline .stage').length;
-        detail.setAttribute('aria-live','off');
-        showStage(0);
-        tourLabel.textContent='Stop the tour';
-        tourTimer=setInterval(function(){
-          i++;
-          if(i>=tourLen){stopTour();showStage(null)}
-          else{showStage(i)}
-        },1600);
-      });
-    }
+  var buttons=Array.prototype.slice.call(document.querySelectorAll('.stage-button'));
+  var readout=document.getElementById('stage-readout');
+  function showStage(index){
+    if(!readout||!stageData[index])return;
+    buttons.forEach(function(button,i){button.setAttribute('aria-pressed',i===index?'true':'false')});
+    var data=stageData[index];
+    readout.innerHTML='<div><div class="readout-id">State / '+String(index+1).padStart(2,'0')+'</div><h3>'+data[0]+'</h3></div><p>'+data[1]+'</p><div class="emits">Emits<br>'+data[2]+'</div>';
   }
+  buttons.forEach(function(button){button.addEventListener('click',function(){showStage(Number(button.getAttribute('data-stage')))})});
 
-  /* ── Architecture: nodes light their table row; click runs
-     a governed request across the plane ── */
-  var archNodes=[].slice.call(document.querySelectorAll('.arch-node'));
-  var archMinis=[].slice.call(document.querySelectorAll('.arch-mini'));
-  var archRows=[].slice.call(document.querySelectorAll('.arch-table tbody tr'));
-  var archCaption=document.querySelector('.arch-caption');
-  if(archNodes.length&&archRows.length){
-    if(archCaption)archCaption.setAttribute('aria-live','polite');
-    var rowFor=function(name){
-      for(var ri=0;ri<archRows.length;ri++){
-        var td=archRows[ri].querySelector('td');
-        if(td&&td.textContent.trim()===name)return archRows[ri];
+  var copy=document.getElementById('copy-btn');
+  var code=document.getElementById('quickstart-code');
+  function copied(){
+    copy.textContent='Copied';
+    window.setTimeout(function(){copy.textContent='Copy commands'},1600);
+  }
+  if(copy&&code){
+    copy.addEventListener('click',function(){
+      var text=code.innerText.replace(/^\$ /gm,'').split('\n').filter(function(line){return line.trim()&&line.trim().charAt(0)!=='#'}).join('\n');
+      if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(copied).catch(function(){})}
+      else{
+        var area=document.createElement('textarea');
+        area.value=text;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();
+        try{if(document.execCommand('copy'))copied()}catch(error){}
+        document.body.removeChild(area);
       }
-      return null;
-    };
-    var nodeRow={'Portal UI':'portal-ui','Platform API':'ryuki-api','Engine':'ryuki-engine','PostgreSQL':'PostgreSQL','Vault':'Vault'};
-    var bindHl=function(el,title){
-      var row=nodeRow[title]?rowFor(nodeRow[title]):null;
-      if(!row)return;
-      var on=function(){row.classList.add('hl')};
-      var off=function(){row.classList.remove('hl')};
-      el.addEventListener('mouseenter',on);
-      el.addEventListener('mouseleave',off);
-      if(el.hasAttribute('tabindex')){
-        el.addEventListener('focus',on);
-        el.addEventListener('blur',off);
-      }
-    };
-    archNodes.forEach(function(n){
-      var h=n.querySelector('h4');
-      n.setAttribute('tabindex','0');
-      n.setAttribute('role','button');
-      n.setAttribute('aria-label',(h?h.textContent.trim()+' \u2014 ':'')+'run a governed request across the plane');
-      bindHl(n,h?h.textContent.trim():'');
-    });
-    archMinis.forEach(function(m){bindHl(m,m.textContent.trim())});
-    var archLinks=[].slice.call(document.querySelectorAll('.arch-diagram .arch-link'));
-    var archVlinks=[].slice.call(document.querySelectorAll('.arch-vlink'));
-    var archFiring=false;
-    var archTimers=[];
-    var fire=function(){
-      if(archFiring)return;
-      archFiring=true;
-      var capDefault=archCaption?archCaption.textContent:'';
-      var step=360;
-      archNodes.forEach(function(n,i){
-        archTimers.push(setTimeout(function(){n.classList.add('lit')},i*step));
-        if(archLinks[i])archTimers.push(setTimeout(function(){archLinks[i].classList.add('firing')},i*step+step/2));
-      });
-      var tEnd=archNodes.length*step;
-      archVlinks.forEach(function(v){archTimers.push(setTimeout(function(){v.classList.add('firing')},tEnd))});
-      archMinis.forEach(function(m){archTimers.push(setTimeout(function(){m.classList.add('lit')},tEnd+step/2))});
-      if(archCaption){
-        archTimers.push(setTimeout(function(){
-          archCaption.textContent='Request executed under governance \u2014 evidence pack written \u2713';
-        },tEnd+step));
-      }
-      archTimers.push(setTimeout(function(){
-        archNodes.forEach(function(n){n.classList.remove('lit')});
-        archMinis.forEach(function(m){m.classList.remove('lit')});
-        archLinks.forEach(function(l){l.classList.remove('firing')});
-        archVlinks.forEach(function(v){v.classList.remove('firing')});
-        if(archCaption)archCaption.textContent=capDefault;
-        archTimers=[];
-        archFiring=false;
-      },tEnd+2800));
-    };
-    archNodes.forEach(function(n){
-      n.addEventListener('click',fire);
-      n.addEventListener('keydown',function(e){
-        if(e.key==='Enter'||e.key===' '){e.preventDefault();fire()}
-      });
     });
   }
 
-  /* ── GitHub stars in the header button (cached, silent) ── */
-  (function(){
-    var gh=document.querySelector('.gh-btn');
-    if(!gh||!window.fetch)return;
-    var KEY='ryuki-stars',cached=null;
-    try{cached=JSON.parse(sessionStorage.getItem(KEY)||'null')}catch(e){}
-    var show=function(n){
-      if(typeof n!=='number'||n<1)return;
-      var s=document.createElement('span');
-      s.className='star-chip';
-      s.textContent='\u2605 '+(n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':n);
-      gh.appendChild(s);
-    };
-    if(cached&&Date.now()-cached.t<36e5){show(cached.n);return}
-    fetch('https://api.github.com/repos/mvandenbulcke/ryuki.io')
-      .then(function(r){return r.ok?r.json():null})
-      .then(function(j){
-        if(!j||typeof j.stargazers_count!=='number')return;
-        try{sessionStorage.setItem(KEY,JSON.stringify({n:j.stargazers_count,t:Date.now()}))}catch(e){}
-        show(j.stargazers_count);
-      })
-      .catch(function(){});
-  })();
-
-  /* ── Header nav: highlight the section in view ── */
-  var navMap={};
-  ['features','lifecycle','architecture','execution','quickstart'].forEach(function(id){
-    var a=document.querySelector('.site-nav a[href="#'+id+'"]');
-    var s=document.getElementById(id);
-    if(a&&s)navMap[id]={a:a,s:s};
-  });
-  var navIds=Object.keys(navMap);
-  if(navIds.length&&'IntersectionObserver' in window){
-    var inBand={};
-    var navIo=new IntersectionObserver(function(entries){
-      entries.forEach(function(en){inBand[en.target.id]=en.isIntersecting});
-      var current=navIds.filter(function(k){return inBand[k]});
-      navIds.forEach(function(k){navMap[k].a.classList.remove('active')});
-      if(current.length)navMap[current[current.length-1]].a.classList.add('active');
-    },{rootMargin:'-40% 0px -55% 0px',threshold:0});
-    navIds.forEach(function(k){navIo.observe(navMap[k].s)});
+  var navLinks=Array.prototype.slice.call(document.querySelectorAll('.site-nav a[href^="#"]'));
+  if('IntersectionObserver' in window&&navLinks.length){
+    var sections=navLinks.map(function(link){return document.querySelector(link.getAttribute('href'))}).filter(Boolean);
+    var observer=new IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        if(!entry.isIntersecting)return;
+        navLinks.forEach(function(link){link.classList.toggle('active',link.getAttribute('href')==='#'+entry.target.id)});
+      });
+    },{rootMargin:'-35% 0px -58% 0px',threshold:0});
+    sections.forEach(function(section){observer.observe(section)});
   }
-
-  /* ── Mobile nav toggle ── */
-  var navToggle=document.getElementById('nav-toggle');
-  var siteNav=document.getElementById('site-nav');
-  if(navToggle&&siteNav){
-    function setNav(open){
-      siteNav.classList.toggle('open',open);
-      navToggle.setAttribute('aria-expanded',open?'true':'false');
-    }
-    navToggle.addEventListener('click',function(){
-      var open=!siteNav.classList.contains('open');
-      setNav(open);
-      if(open){
-        var first=siteNav.querySelector('a');
-        if(first)first.focus();
-      }
-    });
-    siteNav.addEventListener('click',function(e){
-      var t=e.target;
-      while(t&&t!==siteNav){
-        if(t.tagName==='A'){setNav(false);break}
-        t=t.parentNode;
-      }
-    });
-    document.addEventListener('keydown',function(e){
-      if(e.key==='Escape'&&siteNav.classList.contains('open')){setNav(false);navToggle.focus()}
-    });
-  }
-
-
-  try{console.log('%c竜騎 Ryuki%c — the dragon is in the details. (psst: type "ryu")','font-weight:700;color:#c0392b','color:inherit')}catch(e){}
 })();
 </script>
-
 </body>
 </html>

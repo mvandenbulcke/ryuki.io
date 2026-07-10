@@ -945,54 +945,94 @@ pub fn DashboardView() -> impl IntoView {
 
         <section class="cards" aria-label="Dashboard summary cards">
             <article class="card healthy">
-                <span class="label">"Platform health"</span>
+                <span class="label">"Platform state"</span>
                 <strong>"7 healthy / 2 warning"</strong>
-                <p>"Portal, API, queue, workers, database, ingress, adapter readiness."</p>
-                <span class="badge good">"Healthy"</span>
+                <p>"Portal, API, queue, workers, database, ingress, and adapters."</p>
+                <span class="badge good">"Operating"</span>
             </article>
             <article class="card warning">
-                <span class="label">"Site readiness"</span>
-                <strong>"9 ready / 2 blocked"</strong>
-                <p>"Capacity, network, placement, firmware, and support coverage."</p>
+                <span class="label">"Decision queue"</span>
+                <strong>"6 waiting / 4 at risk"</strong>
+                <p>"6 awaiting approval, 4 at SLA risk, 1 emergency change."</p>
                 <span class="badge warn">"Review"</span>
             </article>
-            <article class="card">
-                <span class="label">"Open requests"</span>
-                <strong>"31 open"</strong>
-                <p>"6 awaiting approval, 4 at SLA risk, 1 emergency change."</p>
-                <span class="badge neutral">"Approval"</span>
-            </article>
             <article class="card critical">
-                <span class="label">"Failed operations"</span>
+                <span class="label">"Failed work"</span>
                 <strong>"5 failed / 2 retry-safe"</strong>
                 <p>"Safe summaries only; evidence redacted before handover."</p>
-                <span class="badge bad">"Failed"</span>
+                <span class="badge bad">"Attention"</span>
             </article>
             <article class="card warning">
-                <span class="label">"Backup risk"</span>
+                <span class="label">"Protection posture"</span>
                 <strong>"18 gaps / 3 critical"</strong>
-                <p>"Repository pressure, replica gaps, app-aware checks, restore tests."</p>
+                <p>"Backup coverage, monitoring enrollment, and stale inventory."</p>
                 <span class="badge warn">"Gap"</span>
-            </article>
-            <article class="card warning">
-                <span class="label">"Monitoring gaps"</span>
-                <strong>"42 assets"</strong>
-                <p>"Host, template, proxy, owner, and alert-route reviews."</p>
-                <span class="badge warn">"Drift"</span>
-            </article>
-            <article class="card stale">
-                <span class="label">"Stale data"</span>
-                <strong>"4 sources tracked"</strong>
-                <p>"Freshness state controls whether workflows stay read-only."</p>
-                <span class="badge stale">"Read-only if stale"</span>
             </article>
         </section>
 
-        <PlatformStatusSection/>
+        <section class="control-board" aria-label="Operator attention and live execution state">
+            <article class="control-panel attention-panel">
+                <div class="control-panel-head">
+                    <div>
+                        <span class="eyebrow">"Operator attention"</span>
+                        <h2>"Three queues. One next decision."</h2>
+                    </div>
+                    <span class="table-note">"Prioritized by risk"</span>
+                </div>
+                <div class="control-list">
+                    <a href="/approvals">
+                        <span class="control-index">"01"</span>
+                        <span><strong>"Approval decisions"</strong><small>"6 waiting / 4 at SLA risk"</small></span>
+                        <span class="badge warn">"Review"</span>
+                    </a>
+                    <a href="/operations">
+                        <span class="control-index">"02"</span>
+                        <span><strong>"Failed operations"</strong><small>"5 failed / 2 retry-safe"</small></span>
+                        <span class="badge bad">"Handover"</span>
+                    </a>
+                    <a href="/inventory">
+                        <span class="control-index">"03"</span>
+                        <span><strong>"Protection gaps"</strong><small>"18 unprotected / 42 monitoring gaps"</small></span>
+                        <span class="badge warn">"Resolve"</span>
+                    </a>
+                </div>
+            </article>
 
-        <AuthStatusSection/>
+            <article class="control-panel live-gate-panel">
+                <div class="gate-band">
+                    <span class="gate-lamp" aria-hidden="true"></span>
+                    <strong>"Live execution locked"</strong>
+                    <small>"Human gate"</small>
+                </div>
+                <div class="gate-copy">
+                    <span class="eyebrow">"Trust boundary"</span>
+                    <h2>"The reviewed plan is the unit of change."</h2>
+                    <p>"A live grant can bind only one request, plan digest, approver, and short expiry."</p>
+                </div>
+                <ol class="change-lane" aria-label="Live execution control sequence">
+                    <li class="complete"><span>"01"</span><strong>"Plan"</strong></li>
+                    <li class="current"><span>"02"</span><strong>"Approve"</strong></li>
+                    <li><span>"03"</span><strong>"Verify"</strong></li>
+                    <li><span>"04"</span><strong>"Apply"</strong></li>
+                </ol>
+                <a class="control-link" href="/agents">"Inspect execution edge"</a>
+            </article>
+        </section>
 
-        <PortalRequestPreflightStatus/>
+        <details class="diagnostic-drawer">
+            <summary>
+                <span>
+                    <span class="eyebrow">"Contract diagnostics"</span>
+                    <strong>"Boundary, auth, catalog, policy, evidence, and run state"</strong>
+                </span>
+                <small>"Expand technical readouts"</small>
+            </summary>
+            <div class="diagnostic-stack">
+                <PlatformStatusSection/>
+
+                <AuthStatusSection/>
+
+                <PortalRequestPreflightStatus/>
 
         <section class="contract-grid catalog-contract-grid" aria-label="Catalog contract summaries">
             <article class="panel contract-panel" data-api-path=catalog_api_path data-recommendations-path=catalog_recommendations_api_path data-form-path=catalog_request_form_api_path>
@@ -1386,8 +1426,10 @@ pub fn DashboardView() -> impl IntoView {
             </div>
         </section>
 
-        <footer class="command-hint">
-            "Command palette hint: search, request, runbook, server, app, incident, evidence."
-        </footer>
+                <footer class="command-hint">
+                    "Command palette hint: search, request, runbook, server, app, incident, evidence."
+                </footer>
+            </div>
+        </details>
     }
 }
