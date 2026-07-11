@@ -46,160 +46,708 @@
 <h1>Metrics API</h1>
 <p>Metrics budgets (create, update, delete, status) and commitment/consumption readouts.</p>
 <p class="area-count">17 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-budgets"><span class="method-chip m-get">GET</span><code>/api/metrics/budgets</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/budgets — list all defined budgets.</p>
-<p>GET /api/metrics/budgets — list all defined budgets. Request-tier read.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">List all defined budgets.</p>
+<p>Request-tier read.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/budgets</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
-<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/budgets</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Maximum number of results requested.</td></tr><tr><td><code>offset</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Number of results to skip before returning the page.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>budgets</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>budgets</code> returned in the response body.</td></tr><tr><td><code>durable</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>durable</code> returned in the response body.</td></tr><tr><td><code>total</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Total number of matching items before the returned page is applied.</td></tr><tr><td><code>limit</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Page-size limit applied to this response.</td></tr><tr><td><code>offset</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Number of matching items skipped before this response page.</td></tr></tbody></table>
+<p>Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/budgets'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"budgets"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"durable"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"total"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"limit"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"offset"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-metrics-budgets"><span class="method-chip m-post">POST</span><code>/api/metrics/budgets</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">POST /api/metrics/budgets — define a budget threshold on a metric.</p>
-<p>POST /api/metrics/budgets — define a budget threshold on a metric. Execute-tier. 503 when no database is configured.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Define a budget threshold on a metric.</p>
+<p>Execute-tier. 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/metrics/budgets</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>MetricBudgetCreateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>threshold</code></td><td><code>f64</code></td><td>required</td><td></td></tr><tr><td><code>comparison</code></td><td><code>String</code></td><td>optional</td><td>"above" (cost/usage cap, default) or "below" (capacity floor).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"metric_key": "&lt;string&gt;", "site": "&lt;string&gt;", "environment": "&lt;string&gt;", "threshold": 0.0, "comparison": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metrics/budgets</span></code></pre>
+<p>JSON structure: <code>MetricBudgetCreateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> in the JSON request body.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site code targeted by the request.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment targeted by the request.</td></tr><tr><td><code>threshold</code></td><td><code>number</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>threshold</code> in the JSON request body.</td></tr><tr><td><code>comparison</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>"above" (cost/usage cap, default) or "below" (capacity floor).</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>created</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>created</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"metric_key":"&lt;string&gt;","threshold":0.0}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/budgets'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"created"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-budgets-status"><span class="method-chip m-get">GET</span><code>/api/metrics/budgets/status</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/budgets/status — evaluate every ENABLED budget against its metric series, reporting current and projected breaches.</p>
-<p>GET /api/metrics/budgets/status — evaluate every ENABLED budget against its metric series, reporting current and projected breaches. Request-tier read. 503 when no database is configured.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/budgets/status</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Evaluate every ENABLED budget against its metric series, reporting current and projected breaches.</p>
+<p>Request-tier read. 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/budgets/status</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>budgets</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>budgets</code> returned in the response body.</td></tr><tr><td><code>breached_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>breached_count</code> returned in the response body.</td></tr><tr><td><code>errored_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>errored_count</code> returned in the response body.</td></tr><tr><td><code>overall_status</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>overall_status</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/budgets/status'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"budgets"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"breached_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"errored_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"overall_status"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="delete-api-metrics-budgets-id"><span class="method-chip m-delete">DELETE</span><code>/api/metrics/budgets/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">DELETE /api/metrics/budgets/{id} — remove a budget definition (swarm #19, CRUD completion).</p>
-<p>DELETE /api/metrics/budgets/{id} — remove a budget definition (swarm #19, CRUD completion). Execute-tier (same as create). 404 if absent; 503 no DB.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/budgets/{id}</code></pre>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Remove a budget definition (swarm #19, CRUD completion).</p>
+<p>Execute-tier (same as create). 404 if absent; 503 no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>DELETE https://&lt;your-host&gt;/api/metrics/budgets/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>deleted</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>deleted</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> DELETE \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/budgets/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"deleted"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="put-api-metrics-budgets-id"><span class="method-chip m-put">PUT</span><code>/api/metrics/budgets/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold, comparison, enabled); omitted fields are left unchanged (PATCH semantics, swarm #19).</p>
-<p>PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold, comparison, enabled); omitted fields are left unchanged (PATCH semantics, swarm #19). Execute-tier (same as create/delete). 404 if absent; 503 no DB. The identity/scope fields are immutable here — recreate to re-scope.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Update a budget's mutable fields (threshold, comparison, enabled); omitted fields are left unchanged (PATCH semantics, swarm #19).</p>
+<p>Execute-tier (same as create/delete). 404 if absent; 503 no DB. The identity/scope fields are immutable here — recreate to re-scope.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>PUT https://&lt;your-host&gt;/api/metrics/budgets/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>MetricBudgetUpdateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>threshold</code></td><td><code>f64</code></td><td>optional</td><td></td></tr><tr><td><code>comparison</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>enabled</code></td><td><code>bool</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"threshold": 0.0, "comparison": "&lt;string&gt;", "enabled": true}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metrics/budgets/{id}</span></code></pre>
+<p>JSON structure: <code>MetricBudgetUpdateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>threshold</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>threshold</code> in the JSON request body.</td></tr><tr><td><code>comparison</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>comparison</code> in the JSON request body.</td></tr><tr><td><code>enabled</code></td><td><code>boolean</code></td><td><span class="req req-optional">Optional</span></td><td>Whether the requested capability should be enabled.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>updated</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>updated</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> PUT \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/budgets/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"updated"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-commitment"><span class="method-chip m-get">GET</span><code>/api/metrics/commitment</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/commitment — model the cost of a reserved/committed capacity level vs pure on-demand for a metric.</p>
-<p>GET /api/metrics/commitment — model the cost of a reserved/committed capacity level vs pure on-demand for a metric. <code>metric_key</code>, <code>on_demand_rate</code>, <code>commitment_rate</code>, and <code>committed_units</code> are required; <code>usage</code> defaults to the metric's mean. Request-tier read. 503 when no database is configured.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Model the cost of a reserved/committed capacity level vs pure on-demand for a metric.</p>
+<p><code>metric_key</code>, <code>on_demand_rate</code>, <code>commitment_rate</code>, and <code>committed_units</code> are required; <code>usage</code> defaults to the metric's mean. Request-tier read. 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/commitment</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>on_demand_rate</code></td><td><code>f64</code></td><td>optional</td><td></td></tr><tr><td><code>commitment_rate</code></td><td><code>f64</code></td><td>optional</td><td></td></tr><tr><td><code>committed_units</code></td><td><code>f64</code></td><td>optional</td><td></td></tr><tr><td><code>usage</code></td><td><code>f64</code></td><td>optional</td><td>Optional usage override; when absent, the series mean is used.</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/commitment</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>on_demand_rate</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>on_demand_rate</code> query parameter.</td></tr><tr><td><code>commitment_rate</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>commitment_rate</code> query parameter.</td></tr><tr><td><code>committed_units</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>committed_units</code> query parameter.</td></tr><tr><td><code>usage</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Optional usage override; when absent, the series mean is used.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>usage_source</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>usage_source</code> returned in the response body.</td></tr><tr><td><code>model</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>model</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/commitment'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"usage_source"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"model"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-insights"><span class="method-chip m-get">GET</span><code>/api/metrics/insights</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/insights — anomaly + waste detection over one metric series (pure <code>ryuki_engine::metric_anomaly</code>).</p>
-<p>GET /api/metrics/insights — anomaly + waste detection over one metric series (pure <code>ryuki_engine::metric_anomaly</code>). <code>metric_key</code> is required; <code>site</code>/ <code>environment</code> scope the (single, coherent) series; <code>z</code> is the anomaly z-threshold; <code>waste_threshold</code>/<code>waste_fraction</code> configure waste detection. Request-tier read. 503 when no database is configured; 500 on a query error (never a falsely-empty result).</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Anomaly + waste detection over one metric series (pure <code>ryuki_engine::metric_anomaly</code>).</p>
+<p><code>metric_key</code> is required; <code>site</code>/ <code>environment</code> scope the (single, coherent) series; <code>z</code> is the anomaly z-threshold; <code>waste_threshold</code>/<code>waste_fraction</code> configure waste detection. Request-tier read. 503 when no database is configured; 500 on a query error (never a falsely-empty result).</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/insights</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>z</code></td><td><code>f64</code></td><td>optional</td><td>Anomaly z-score threshold (default 3.0).</td></tr><tr><td><code>waste_threshold</code></td><td><code>f64</code></td><td>optional</td><td>Waste threshold: samples at or below this count toward waste (default 10.0).</td></tr><tr><td><code>waste_fraction</code></td><td><code>f64</code></td><td>optional</td><td>Fraction of samples at/below the threshold to flag waste (default 0.8).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/insights</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>z</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Anomaly z-score threshold (default 3.0).</td></tr><tr><td><code>waste_threshold</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Waste threshold: samples at or below this count toward waste (default 10.0).</td></tr><tr><td><code>waste_fraction</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Fraction of samples at/below the threshold to flag waste (default 0.8).</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>sample_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>sample_count</code> returned in the response body.</td></tr><tr><td><code>summary</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>summary</code> returned in the response body.</td></tr><tr><td><code>anomalies</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>anomalies</code> returned in the response body.</td></tr><tr><td><code>waste</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>waste</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/insights'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"sample_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"summary"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"anomalies"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"waste"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-metrics-insights-generate"><span class="method-chip m-post">POST</span><code>/api/metrics/insights/generate</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">POST /api/metrics/insights/generate — run detection over a metric series and PERSIST the resulting suggestions into <code>aiops_suggestions</code> (the existing suggestion surface).</p>
-<p>POST /api/metrics/insights/generate — run detection over a metric series and PERSIST the resulting suggestions into <code>aiops_suggestions</code> (the existing suggestion surface). Execute-tier (it writes). Each suggestion is deduped: it is skipped when an OPEN (New/Reviewed) suggestion with the same site+title already exists, so repeated calls do not pile up duplicates. Returns the suggestions that were newly persisted. 503 when no database is configured.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Run detection over a metric series and PERSIST the resulting suggestions into <code>aiops_suggestions</code> (the existing suggestion surface).</p>
+<p>Execute-tier (it writes). Each suggestion is deduped: it is skipped when an OPEN (New/Reviewed) suggestion with the same site+title already exists, so repeated calls do not pile up duplicates. Returns the suggestions that were newly persisted. 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/metrics/insights/generate</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>z</code></td><td><code>f64</code></td><td>optional</td><td>Anomaly z-score threshold (default 3.0).</td></tr><tr><td><code>waste_threshold</code></td><td><code>f64</code></td><td>optional</td><td>Waste threshold: samples at or below this count toward waste (default 10.0).</td></tr><tr><td><code>waste_fraction</code></td><td><code>f64</code></td><td>optional</td><td>Fraction of samples at/below the threshold to flag waste (default 0.8).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/insights/generate</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>metrics_generate_suggestions</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>z</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Anomaly z-score threshold (default 3.0).</td></tr><tr><td><code>waste_threshold</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Waste threshold: samples at or below this count toward waste (default 10.0).</td></tr><tr><td><code>waste_fraction</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Fraction of samples at/below the threshold to flag waste (default 0.8).</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>generated</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>generated</code> returned in the response body.</td></tr><tr><td><code>persisted</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>persisted</code> returned in the response body.</td></tr><tr><td><code>suggestions</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>suggestions</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/insights/generate'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"generated"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"persisted"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"suggestions"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-metrics-samples"><span class="method-chip m-post">POST</span><code>/api/metrics/samples</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">POST /api/metrics/samples — record one time-series metric sample.</p>
-<p>POST /api/metrics/samples — record one time-series metric sample. Execute-tier (operators/collectors push samples). 503 when no database is configured.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Record one time-series metric sample.</p>
+<p>Execute-tier (operators/collectors push samples). 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/metrics/samples</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>MetricSampleRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>value</code></td><td><code>f64</code></td><td>required</td><td></td></tr><tr><td><code>observed_at</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"metric_key": "&lt;string&gt;", "site": "&lt;string&gt;", "environment": "&lt;string&gt;", "value": 0.0, "observed_at": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metrics/samples</span></code></pre>
+<p>JSON structure: <code>MetricSampleRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> in the JSON request body.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site code targeted by the request.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment targeted by the request.</td></tr><tr><td><code>value</code></td><td><code>number</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>value</code> in the JSON request body.</td></tr><tr><td><code>observed_at</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>observed_at</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>recorded</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>recorded</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"metric_key":"&lt;string&gt;","value":0.0}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/samples'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"recorded"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-series"><span class="method-chip m-get">GET</span><code>/api/metrics/series</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/series — return one metric's ordered series plus a summary, trend, and a linear forecast (pure <code>ryuki_engine::metric_forecast</code>).</p>
-<p>GET /api/metrics/series — return one metric's ordered series plus a summary, trend, and a linear forecast (pure <code>ryuki_engine::metric_forecast</code>). <code>metric_key</code> is required; <code>site</code>/<code>environment</code> narrow the scope; <code>horizon</code> (default 3, capped 100) is the number of points to project. Request-tier read (metrics are non-sensitive aggregates). 503 when no database is configured.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Return one metric's ordered series plus a summary, trend, and a linear forecast (pure <code>ryuki_engine::metric_forecast</code>).</p>
+<p><code>metric_key</code> is required; <code>site</code>/<code>environment</code> narrow the scope; <code>horizon</code> (default 3, capped 100) is the number of points to project. Request-tier read (metrics are non-sensitive aggregates). 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/series</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>horizon</code></td><td><code>usize</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/series</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>horizon</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>horizon</code> query parameter.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>series</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>series</code> returned in the response body.</td></tr><tr><td><code>summary</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>summary</code> returned in the response body.</td></tr><tr><td><code>trend</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>trend</code> returned in the response body.</td></tr><tr><td><code>forecast</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>forecast</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/series'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"series"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"summary"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"trend"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"forecast"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-series-aggregated"><span class="method-chip m-get">GET</span><code>/api/metrics/series/aggregated</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/series/aggregated — time-bucketed (hourly/daily/weekly/monthly) MIN/MAX/MEAN/COUNT rollups of a metric series for historical trend analysis.</p>
-<p>GET /api/metrics/series/aggregated — time-bucketed (hourly/daily/weekly/monthly) MIN/MAX/MEAN/COUNT rollups of a metric series for historical trend analysis. Mirrors <code>metrics_series</code>'s gating + #2 coherent-scope handling. Buckets are NON-EMPTY only (no gap filling); <code>weekly</code> is the ISO-8601 Monday-start week at UTC. <code>request</code>-tier (a metrics read). The scan is bounded to the last <code>limit</code> buckets' worth of time.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Time-bucketed (hourly/daily/weekly/monthly) MIN/MAX/MEAN/COUNT rollups of a metric series for historical trend analysis.</p>
+<p>Mirrors <code>metrics_series</code>'s gating + #2 coherent-scope handling. Buckets are NON-EMPTY only (no gap filling); <code>weekly</code> is the ISO-8601 Monday-start week at UTC. <code>request</code>-tier (a metrics read). The scan is bounded to the last <code>limit</code> buckets' worth of time.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/series/aggregated</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>granularity</code></td><td><code>String</code></td><td>optional</td><td>hourly | daily | weekly | monthly (allowlisted → a Postgres date_trunc field).</td></tr><tr><td><code>limit</code></td><td><code>usize</code></td><td>optional</td><td>Max buckets (default 365, clamped 1..=2000). Also bounds the scan window.</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/series/aggregated</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>granularity</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>hourly | daily | weekly | monthly (allowlisted → a Postgres date_trunc field).</td></tr><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Max buckets (default 365, clamped 1..=2000). Also bounds the scan window.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>granularity</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>granularity</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>buckets</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>buckets</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/series/aggregated'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"granularity"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"buckets"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metrics-slo"><span class="method-chip m-get">GET</span><code>/api/metrics/slo</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/slo — list SLO definitions.</p>
-<p>GET /api/metrics/slo — list SLO definitions. Request-tier read.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/slo</code></pre>
-<h2 class="ep-h" id="post-api-metrics-slo"><span class="method-chip m-post">POST</span><code>/api/metrics/slo</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">POST /api/metrics/slo — define an SLO.</p>
-<p>POST /api/metrics/slo — define an SLO. Execute-tier. 503 when no DB. <code>good_metric_key</code>/<code>total_metric_key</code> MUST be COUNTER-style event-count metrics — the status endpoint SUMs them over the window, which is only meaningful for additive samples (a gauge would produce nonsense compliance).</p>
-<h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>SloCreateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>target</code></td><td><code>f64</code></td><td>required</td><td></td></tr><tr><td><code>window_days</code></td><td><code>i32</code></td><td>optional</td><td></td></tr><tr><td><code>good_metric_key</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>total_metric_key</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "target": 0.0, "window_days": 0, "good_metric_key": "&lt;string&gt;", "total_metric_key": "&lt;string&gt;", "site": "&lt;string&gt;", "environment": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metrics/slo</span></code></pre>
-<h2 class="ep-h" id="get-api-metrics-slo-status"><span class="method-chip m-get">GET</span><code>/api/metrics/slo/status</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/slo/status — evaluate every enabled SLO over its window (sum good/total from metric_samples, compute attainment + error-budget burn).</p>
-<p>GET /api/metrics/slo/status — evaluate every enabled SLO over its window (sum good/total from metric_samples, compute attainment + error-budget burn). Request-tier. Alerting-safe: a per-SLO query failure marks it <code>error</code> (never a false <code>compliant</code>), and a window with no events is <code>insufficient-data</code>.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/slo/status</code></pre>
-<h2 class="ep-h" id="delete-api-metrics-slo-id"><span class="method-chip m-delete">DELETE</span><code>/api/metrics/slo/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">DELETE /api/metrics/slo/{id} — remove an SLO definition (swarm #20, CRUD completion).</p>
-<p>DELETE /api/metrics/slo/{id} — remove an SLO definition (swarm #20, CRUD completion). Execute-tier. 404 if absent; 503 no DB.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/slo/{id}</code></pre>
-<h2 class="ep-h" id="put-api-metrics-slo-id"><span class="method-chip m-put">PUT</span><code>/api/metrics/slo/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-summary">PUT /api/metrics/slo/{id} — update an SLO's mutable fields (name, target, window_days, enabled); omitted fields are left unchanged (PATCH semantics, swarm #20).</p>
-<p>PUT /api/metrics/slo/{id} — update an SLO's mutable fields (name, target, window_days, enabled); omitted fields are left unchanged (PATCH semantics, swarm #20). Execute-tier. 404 if absent; 503 no DB. The metric keys and scope are immutable here — recreate to re-target or re-scope.</p>
-<h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>SloUpdateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>target</code></td><td><code>f64</code></td><td>optional</td><td></td></tr><tr><td><code>window_days</code></td><td><code>i32</code></td><td>optional</td><td></td></tr><tr><td><code>enabled</code></td><td><code>bool</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"name": "&lt;string&gt;", "target": 0.0, "window_days": 0, "enabled": true}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metrics/slo/{id}</span></code></pre>
-<h2 class="ep-h" id="get-api-metrics-what-if"><span class="method-chip m-get">GET</span><code>/api/metrics/what-if</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metrics/what-if — project a metric forward under a hypothetical growth factor and report whether/when it would breach a capacity/cost ceiling (pure <code>ryuki_engine::metric_planning</code>).</p>
-<p>GET /api/metrics/what-if — project a metric forward under a hypothetical growth factor and report whether/when it would breach a capacity/cost ceiling (pure <code>ryuki_engine::metric_planning</code>). <code>metric_key</code> and <code>ceiling</code> are required. Request-tier read. 503 when no database is configured; 500 on a query error.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">List SLO definitions.</p>
+<p>Request-tier read.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/slo</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>horizon</code></td><td><code>usize</code></td><td>optional</td><td>Periods to project forward (default 6, capped 100).</td></tr><tr><td><code>growth</code></td><td><code>f64</code></td><td>optional</td><td>Hypothetical load/cost multiplier on the projection (default 1.0).</td></tr><tr><td><code>ceiling</code></td><td><code>f64</code></td><td>optional</td><td>Capacity/cost ceiling to test the projection against (required).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metrics/what-if</code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-metering.html">&larr; Metering</a><a href="/api-monitoring.html">Monitoring &rarr;</a></nav>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>slos</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>slos</code> returned in the response body.</td></tr><tr><td><code>durable</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>durable</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/slo'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"slos"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"durable"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="post-api-metrics-slo"><span class="method-chip m-post">POST</span><code>/api/metrics/slo</code></h2>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Define an SLO.</p>
+<p>Execute-tier. 503 when no DB. <code>good_metric_key</code>/<code>total_metric_key</code> MUST be COUNTER-style event-count metrics — the status endpoint SUMs them over the window, which is only meaningful for additive samples (a gauge would produce nonsense compliance).</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/metrics/slo</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>JSON structure: <code>SloCreateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Client-supplied name for the resource or operation.</td></tr><tr><td><code>target</code></td><td><code>number</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>target</code> in the JSON request body.</td></tr><tr><td><code>window_days</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>window_days</code> in the JSON request body.</td></tr><tr><td><code>good_metric_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>good_metric_key</code> in the JSON request body.</td></tr><tr><td><code>total_metric_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>total_metric_key</code> in the JSON request body.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site code targeted by the request.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment targeted by the request.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>created</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>created</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"name":"&lt;string&gt;","target":0.0,"good_metric_key":"&lt;string&gt;","total_metric_key":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/slo'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"created"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-metrics-slo-status"><span class="method-chip m-get">GET</span><code>/api/metrics/slo/status</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Evaluate every enabled SLO over its window (sum good/total from metric_samples, compute attainment + error-budget burn).</p>
+<p>Request-tier. Alerting-safe: a per-SLO query failure marks it <code>error</code> (never a false <code>compliant</code>), and a window with no events is <code>insufficient-data</code>.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/slo/status</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>slos</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>slos</code> returned in the response body.</td></tr><tr><td><code>breached_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>breached_count</code> returned in the response body.</td></tr><tr><td><code>errored_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>errored_count</code> returned in the response body.</td></tr><tr><td><code>overall_status</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>overall_status</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/slo/status'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"slos"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"breached_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"errored_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"overall_status"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="delete-api-metrics-slo-id"><span class="method-chip m-delete">DELETE</span><code>/api/metrics/slo/{id}</code></h2>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Remove an SLO definition (swarm #20, CRUD completion).</p>
+<p>Execute-tier. 404 if absent; 503 no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>DELETE https://&lt;your-host&gt;/api/metrics/slo/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>deleted</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>deleted</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> DELETE \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/slo/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"deleted"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="put-api-metrics-slo-id"><span class="method-chip m-put">PUT</span><code>/api/metrics/slo/{id}</code></h2>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Update an SLO's mutable fields (name, target, window_days, enabled); omitted fields are left unchanged (PATCH semantics, swarm #20).</p>
+<p>Execute-tier. 404 if absent; 503 no DB. The metric keys and scope are immutable here — recreate to re-target or re-scope.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>PUT https://&lt;your-host&gt;/api/metrics/slo/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>JSON structure: <code>SloUpdateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>name</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Client-supplied name for the resource or operation.</td></tr><tr><td><code>target</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>target</code> in the JSON request body.</td></tr><tr><td><code>window_days</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>window_days</code> in the JSON request body.</td></tr><tr><td><code>enabled</code></td><td><code>boolean</code></td><td><span class="req req-optional">Optional</span></td><td>Whether the requested capability should be enabled.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>updated</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>updated</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> PUT \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/slo/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"updated"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-metrics-what-if"><span class="method-chip m-get">GET</span><code>/api/metrics/what-if</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Project a metric forward under a hypothetical growth factor and report whether/when it would breach a capacity/cost ceiling (pure <code>ryuki_engine::metric_planning</code>).</p>
+<p><code>metric_key</code> and <code>ceiling</code> are required. Request-tier read. 503 when no database is configured; 500 on a query error.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metrics/what-if</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>metric_key</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>horizon</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Periods to project forward (default 6, capped 100).</td></tr><tr><td><code>growth</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Hypothetical load/cost multiplier on the projection (default 1.0).</td></tr><tr><td><code>ceiling</code></td><td><code>number</code></td><td><span class="req req-optional">Optional</span></td><td>Capacity/cost ceiling to test the projection against (required).</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>metric_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metric_key</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>ceiling</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ceiling</code> returned in the response body.</td></tr><tr><td><code>growth_factor</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>growth_factor</code> returned in the response body.</td></tr><tr><td><code>breaches</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>breaches</code> returned in the response body.</td></tr><tr><td><code>first_breach_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>first_breach_at</code> returned in the response body.</td></tr><tr><td><code>peak_projected</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>peak_projected</code> returned in the response body.</td></tr><tr><td><code>headroom</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>headroom</code> returned in the response body.</td></tr><tr><td><code>projected</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>projected</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metrics/what-if'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"metric_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"ceiling"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"growth_factor"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"breaches"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"first_breach_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"peak_projected"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"headroom"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"projected"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-metering.html">&larr; Metering</a><a href="/api-monitoring.html">Monitoring &rarr;</a></nav>
 </main>
 </div>
 <script>

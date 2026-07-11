@@ -74,7 +74,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+route access classes
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
@@ -98,6 +99,7 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
 authentication
+request headers
 authorization
 conventions
 walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
@@ -175,7 +177,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="what-is-implemented-and-what-stays-yours">What is implemented, and what stays yours</h2>
 <p>Implemented and tested: the dry-run pipeline; protocol-v2-only negotiation; the live trust gate (exact-spec grant binding, IaC and plan digest integrity, state-owner validation, agent affinity, refusal reporting, no-double-apply); the safe plan-review projection; agent-side <code>LiveApply</code> and <code>LiveDestroy</code> execution; the credential seam end to end; and a real Vault KV v2 resolver on the control plane.</p>
 <p>Operator-owned: real provider credentials, a durable state backend, placement identifiers, approval of the first target, and cleanup of a successful single-job apply. Automatic <code>LiveDestroy</code> exists only as compensation for a failed multi-step run; it is not a general operator destroy endpoint.</p>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/agents-and-live-execution.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/rbac-and-scoping.html">&larr; RBAC & Scoping</a><a href="/orchestration.html">Multi-Step Orchestration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/agents-and-live-execution.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/rbac-and-scoping.html">&larr; RBAC & Scoping</a><a href="/orchestration.html">Multi-Step Orchestration &rarr;</a></nav>
 </main>
 </div>
 <script>

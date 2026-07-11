@@ -2960,6 +2960,8 @@ fn active_route_registrations(source: &str) -> BTreeSet<String> {
 }
 
 const RUST_API_AGENTS_PATH: &str = "sources/ryuki-api/src/agents.rs";
+const RUST_API_INTEGRATION_PATH: &str = "sources/ryuki-api/src/integration.rs";
+const RUST_API_INBOUND_WEBHOOKS_PATH: &str = "sources/ryuki-api/src/inbound_webhooks.rs";
 const RUST_API_ROUTE_SOURCES: &[&str] = &[
     RUST_API_CONTRACTS_PATH,
     RUST_API_MAIN_PATH,
@@ -2969,6 +2971,10 @@ const RUST_API_ROUTE_SOURCES: &[&str] = &[
     // routers in this file re-register the same production paths, so they
     // dedupe by path exactly like the other sources' test routers.
     RUST_API_AGENTS_PATH,
+    // Integration connection management is built in its own production
+    // router, as is the sibling pre-human-auth inbound webhook receiver.
+    RUST_API_INTEGRATION_PATH,
+    RUST_API_INBOUND_WEBHOOKS_PATH,
 ];
 const ROUTE_METHOD_TOKENS: &[(&str, &str)] = &[
     ("get(", "GET"),
@@ -3011,10 +3017,11 @@ fn generate_endpoints_doc(root: &Path) -> Result<(String, usize), String> {
         "The control plane serves {route_count} routes across {} areas. Most routes \
          require an authenticated session or an API bearer token; a small set is \
          deliberately unauthenticated, such as health probes, agent registration, and \
-         the control-plane public key. Authorization is tiered per route (admin, \
-         approve, execute, request, audit) and reads are narrowed by the caller's \
-         site and environment scopes; [RBAC & Scoping](rbac-and-scoping.md) documents \
-         the enforcement semantics.\n\n",
+         the control-plane public key. Access metadata covers the five human \
+         permissions (admin, approve, execute, request, audit) plus effective read, \
+         public, agent, and webhook classes; reads are narrowed by the caller's site \
+         and environment scopes. [RBAC & Scoping](rbac-and-scoping.md) documents the \
+         enforcement semantics.\n\n",
         sections.len()
     ));
     document.push_str(

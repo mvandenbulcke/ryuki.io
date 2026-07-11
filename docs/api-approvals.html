@@ -46,22 +46,119 @@
 <h1>Approvals API</h1>
 <p>Cross-domain approval worklist: the pending-approvals queue and the approval decision-readiness contract.</p>
 <p class="area-count">2 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-approvals-decision-readiness-contract"><span class="method-chip m-get">GET</span><code>/api/approvals/decision-readiness-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/approvals/decision-readiness-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Approvals decision readiness.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/approvals/decision-readiness-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>approvalReadinessMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalReadinessMode</code> returned in the response body.</td></tr><tr><td><code>identityProvider</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>identityProvider</code> returned in the response body.</td></tr><tr><td><code>configuredForProduction</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>configuredForProduction</code> returned in the response body.</td></tr><tr><td><code>decisionQueueReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>decisionQueueReadOnly</code> returned in the response body.</td></tr><tr><td><code>routeCatalogReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>routeCatalogReadOnly</code> returned in the response body.</td></tr><tr><td><code>evidenceRequired</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidenceRequired</code> returned in the response body.</td></tr><tr><td><code>localMockAuthAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>localMockAuthAllowed</code> returned in the response body.</td></tr><tr><td><code>providerCallsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsAllowed</code> returned in the response body.</td></tr><tr><td><code>liveAuthenticationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveAuthenticationAllowed</code> returned in the response body.</td></tr><tr><td><code>graphCallsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>graphCallsAllowed</code> returned in the response body.</td></tr><tr><td><code>entraGroupLookupAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>entraGroupLookupAllowed</code> returned in the response body.</td></tr><tr><td><code>serviceNowApprovalMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>serviceNowApprovalMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>approvalExecutionAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalExecutionAllowed</code> returned in the response body.</td></tr><tr><td><code>approvalQueueMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalQueueMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>approvalDecisionMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalDecisionMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>notificationDispatchAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>notificationDispatchAllowed</code> returned in the response body.</td></tr><tr><td><code>workflowMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>workflowMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>rawApproverDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawApproverDataAllowed</code> returned in the response body.</td></tr><tr><td><code>rawApprovalPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawApprovalPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRequestPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRequestPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRecipientDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRecipientDataAllowed</code> returned in the response body.</td></tr><tr><td><code>rawProviderPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawProviderPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawLogContentAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawLogContentAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>tenantIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tenantIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>objectIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>objectIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>principalIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>principalIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>groupIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>groupIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>serviceNowIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>serviceNowIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>privateNetworkValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>privateNetworkValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>credentialValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>credentialValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tokenValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tokenValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>approvalRoutes</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalRoutes</code> returned in the response body.</td></tr><tr><td><code>decisionStates</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>decisionStates</code> returned in the response body.</td></tr><tr><td><code>decisionTypes</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>decisionTypes</code> returned in the response body.</td></tr><tr><td><code>routeStages</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>routeStages</code> returned in the response body.</td></tr><tr><td><code>approvalScopes</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approvalScopes</code> returned in the response body.</td></tr><tr><td><code>escalationStates</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>escalationStates</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr><tr><td><code>rules</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rules</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/approvals/decision-readiness-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"approvalReadinessMode"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"identityProvider"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"configuredForProduction"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"decisionQueueReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"routeCatalogReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"evidenceRequired"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"localMockAuthAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"providerCallsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveAuthenticationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"graphCallsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"entraGroupLookupAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"serviceNowApprovalMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"approvalExecutionAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"approvalQueueMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"approvalDecisionMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"notificationDispatchAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"workflowMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawApproverDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawApprovalPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRequestPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRecipientDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawProviderPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawLogContentAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tenantIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"objectIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"principalIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"groupIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"serviceNowIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"privateNetworkValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"credentialValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tokenValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"approvalRoutes"</span>: [],
+  <span class="hl-k">"decisionStates"</span>: [],
+  <span class="hl-k">"decisionTypes"</span>: [],
+  <span class="hl-k">"routeStages"</span>: [],
+  <span class="hl-k">"approvalScopes"</span>: [],
+  <span class="hl-k">"escalationStates"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: [],
+  <span class="hl-k">"rules"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-approvals-pending"><span class="method-chip m-get">GET</span><code>/api/approvals/pending</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
+<p class="badges"><span class="badge">read access</span></p>
 <p class="ep-summary">Returns the list of requests pending approval by the calling approver.</p>
-<p>Returns the list of requests pending approval by the calling approver.</p>
-<p>A request is "pending my approval" iff ALL hold: 1. <code>status = 'planned'</code> (the only approvable from-state), AND 2. NO decision row exists in <code>request_approval_decisions</code> for <code>(request_id, role)</code>.</p>
+<p>A request is "pending my approval" iff ALL hold:</p>
+<ol class="ep-doc-list"><li><code>status = 'planned'</code> (the only approvable from-state), AND</li><li>NO decision row exists in <code>request_approval_decisions</code> for <code>(request_id, role)</code>.</li></ol>
 <p>NOTE: The <code>approval_route @&gt;</code> containment filter is intentionally NOT applied here. The request lifecycle does not populate <code>approval_route</code> with canonical role constants before the approval step: new requests start with <code>approval_route = []</code> and the plan transition does not push any role into it. Filtering on <code>approval_route</code> would therefore return nothing for real data. Per-request approver-type routing is a documented follow-up (resolve the display-vs-canonical role-string mismatch and have the lifecycle push canonical roles into <code>approval_route</code> per required-approver-per-type if that model is adopted). Until then, an approver's inbox = all planned requests they have not yet decided.</p>
 <p>The role constant <code>$1</code> IS used in the <code>NOT EXISTS</code> sub-query — that sub-query is correct because the approve/reject handlers write <code>request_approval_decisions</code> rows keyed on the same <code>approval_role_for</code> canonical constant.</p>
 <p>CRITICAL AUTHZ NOTE: this is a GET, so the central read middleware admits any "request"/"audit" role holder through (it treats all non-sensitive GETs as ordinary reads). The <code>approve</code>-only requirement MUST be enforced here in the handler — exactly mirroring <code>requests_approve</code> and <code>requests_reject</code>.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/approvals/pending</code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-analytics.html">&larr; Analytics</a><a href="/api-audit.html">Audit &rarr;</a></nav>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/approvals/pending</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/approvals/pending'</span></code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-analytics.html">&larr; Analytics</a><a href="/api-audit.html">Audit &rarr;</a></nav>
 </main>
 </div>
 <script>

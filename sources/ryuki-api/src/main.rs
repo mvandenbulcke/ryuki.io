@@ -1580,12 +1580,12 @@ async fn shutdown_signal(timeout_secs: u64) {
 //   {"meta":    [{"path","method","tier","auth_exempt"}, ...],
 //    "openapi": <openapi::openapi_document()>}
 //
-// `tier`/`auth_exempt` are computed by CALLING the same functions the auth
-// middleware runs (`is_auth_exempt_path`, `is_self_service_mutation`,
-// `route_permission_for`, `is_audit_read_path`, `read_permission_for`), so
-// the generated reference can never drift from enforcement. The `openapi`
-// half carries the curated public/agent-protocol spec verbatim so the docs
-// site can publish it as machine-readable JSON.
+// Human tiers call the same functions the auth middleware runs
+// (`is_auth_exempt_path`, `is_self_service_mutation`, `route_permission_for`,
+// `is_audit_read_path`, `read_permission_for`). The effective metadata also
+// accounts for sibling agent/webhook routers and exact handler-level admin
+// guards. The `openapi` half carries the curated public/agent-protocol spec
+// verbatim so the docs site can publish it as machine-readable JSON.
 
 #[derive(serde::Deserialize)]
 struct RouteMetaKey {
@@ -1601,10 +1601,13 @@ struct RouteMetaEntry {
     auth_exempt: bool,
 }
 
-/// The effective permission tier for one (method, path) route, exactly as
-/// `auth_middleware` enforces it:
+/// The effective access class for one (method, path) route, following the
+/// human middleware, sibling-router topology, and explicit handler gates:
 ///
 /// * `public`  — auth-exempt (reachable without a session);
+/// * `agent` / `webhook` — bypass human sessions but require their named
+///   protocol credential;
+/// * integration management — explicit handler-level `admin` guards;
 /// * mutations — `route_permission_for` (admin/approve/execute/request/...),
 ///   unless the mutation is self-service (gated like a read);
 /// * audit-grade reads — `audit` specifically;
@@ -1640,6 +1643,16 @@ fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
     if path.starts_with("/api/agents/") {
         return Some("agent");
     }
+    if method == Method::POST && path == "/api/integrations/{connection_id}/webhook" {
+        return Some("webhook");
+    }
+    // The separately mounted integration connection-management router is an
+    // exact 16-operation admin surface. Keep this method-and-template matcher
+    // deliberately closed: contracts.rs also owns unrelated routes below
+    // /api/integrations, which retain their ordinary runtime classification.
+    if is_integration_management_route(&method, path) {
+        return Some("admin");
+    }
     if is_unsafe_method(&method) && !is_self_service_mutation(&method, path) {
         return Some(route_permission_for(&method, path));
     }
@@ -1653,6 +1666,28 @@ fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
     })
 }
 
+fn is_integration_management_route(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (&Method::POST, "/api/integrations")
+            | (&Method::GET, "/api/integrations")
+            | (&Method::GET, "/api/integrations/{id}")
+            | (&Method::PUT, "/api/integrations/{id}")
+            | (&Method::DELETE, "/api/integrations/{id}")
+            | (&Method::POST, "/api/integrations/{id}/webhook-secret")
+            | (&Method::POST, "/api/integrations/{id}/test")
+            | (&Method::GET, "/api/integrations/{id}/health")
+            | (&Method::POST, "/api/integrations/{id}/credential-expiry")
+            | (&Method::GET, "/api/integrations/credentials/expiring")
+            | (&Method::GET, "/api/integrations/circuits")
+            | (&Method::GET, "/api/integrations/{id}/circuit")
+            | (&Method::POST, "/api/integrations/{id}/circuit/record")
+            | (&Method::POST, "/api/integrations/{id}/circuit/reset")
+            | (&Method::GET, "/api/integrations/capabilities")
+            | (&Method::GET, "/api/integrations/capabilities/{vendor_type}")
+    )
+}
+
 /// Builds the `--dump-route-meta` JSON envelope from the stdin payload.
 /// Pure (no IO) so it is unit-testable.
 fn dump_route_meta(input: &str) -> Result<String, String> {
@@ -1663,11 +1698,17 @@ fn dump_route_meta(input: &str) -> Result<String, String> {
     })?;
     let meta: Vec<RouteMetaEntry> = routes
         .into_iter()
-        .map(|key| RouteMetaEntry {
-            tier: route_meta_tier(&key.method, &key.path),
-            auth_exempt: is_auth_exempt_path(&key.path),
-            path: key.path,
-            method: key.method,
+        .map(|key| {
+            let tier = route_meta_tier(&key.method, &key.path);
+            RouteMetaEntry {
+                // `auth_exempt` means no authentication at all, not merely
+                // bypassing HUMAN session middleware. Agent/webhook tiers use
+                // their own required credentials and therefore stay false.
+                auth_exempt: tier == Some("public"),
+                tier,
+                path: key.path,
+                method: key.method,
+            }
         })
         .collect();
     let envelope = serde_json::json!({
@@ -3854,14 +3895,70 @@ mod tests {
             Some("agent")
         );
         assert_eq!(route_meta_tier("GET", "/api/admin/agents"), Some("admin"));
+        // The separately mounted integration management router is an exact
+        // admin surface; unrelated contracts.rs integration routes are not
+        // blanket-promoted by prefix.
+        assert_eq!(route_meta_tier("GET", "/api/integrations"), Some("admin"));
+        assert_eq!(
+            route_meta_tier("POST", "/api/integrations/{id}/circuit/reset"),
+            Some("admin")
+        );
+        assert_eq!(
+            route_meta_tier("GET", "/api/integrations/readiness"),
+            Some("read")
+        );
+        assert_eq!(
+            route_meta_tier("POST", "/api/integrations/{connection_id}/webhook"),
+            Some("webhook")
+        );
         // the synthetic ANY placeholder cannot be attested
         assert_eq!(route_meta_tier("ANY", "/api/requests"), None);
     }
 
     #[test]
+    fn test_integration_management_route_meta_is_exactly_admin() {
+        let routes = [
+            ("POST", "/api/integrations"),
+            ("GET", "/api/integrations"),
+            ("GET", "/api/integrations/{id}"),
+            ("PUT", "/api/integrations/{id}"),
+            ("DELETE", "/api/integrations/{id}"),
+            ("POST", "/api/integrations/{id}/webhook-secret"),
+            ("POST", "/api/integrations/{id}/test"),
+            ("GET", "/api/integrations/{id}/health"),
+            ("POST", "/api/integrations/{id}/credential-expiry"),
+            ("GET", "/api/integrations/credentials/expiring"),
+            ("GET", "/api/integrations/circuits"),
+            ("GET", "/api/integrations/{id}/circuit"),
+            ("POST", "/api/integrations/{id}/circuit/record"),
+            ("POST", "/api/integrations/{id}/circuit/reset"),
+            ("GET", "/api/integrations/capabilities"),
+            ("GET", "/api/integrations/capabilities/{vendor_type}"),
+        ];
+        assert_eq!(routes.len(), 16);
+        for (method, path) in routes {
+            assert_eq!(
+                route_meta_tier(method, path),
+                Some("admin"),
+                "{method} {path} must remain admin"
+            );
+        }
+        assert_eq!(
+            route_meta_tier("GET", "/api/integrations/readiness"),
+            Some("read")
+        );
+    }
+
+    #[test]
     fn test_dump_route_meta_envelope_shape() {
         let output = dump_route_meta(
-            r#"[{"path":"/health","method":"GET"},{"path":"/api/admin/tokens","method":"POST"}]"#,
+            r#"[
+                {"path":"/health","method":"GET"},
+                {"path":"/api/admin/tokens","method":"POST"},
+                {"path":"/api/agents/register","method":"POST"},
+                {"path":"/api/agents/{agent_id}/heartbeat","method":"POST"},
+                {"path":"/api/integrations/{connection_id}/webhook","method":"POST"}
+            ]"#,
         )
         .expect("dump must succeed");
         let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
@@ -3870,6 +3967,15 @@ mod tests {
         assert_eq!(value["meta"][0]["auth_exempt"], true);
         assert_eq!(value["meta"][1]["tier"], "admin");
         assert_eq!(value["meta"][1]["auth_exempt"], false);
+        // Public agent bootstrap requires no credential at all; protocol
+        // agent and webhook routes bypass human auth but require their own
+        // credentials, so auth_exempt remains false for those tiers.
+        assert_eq!(value["meta"][2]["tier"], "public");
+        assert_eq!(value["meta"][2]["auth_exempt"], true);
+        assert_eq!(value["meta"][3]["tier"], "agent");
+        assert_eq!(value["meta"][3]["auth_exempt"], false);
+        assert_eq!(value["meta"][4]["tier"], "webhook");
+        assert_eq!(value["meta"][4]["auth_exempt"], false);
         // the curated OpenAPI document rides along verbatim
         assert_eq!(value["openapi"]["openapi"], "3.1.0");
         // malformed stdin fails with a clear message instead of panicking

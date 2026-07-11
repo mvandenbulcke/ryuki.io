@@ -42,7 +42,7 @@ PAGES = [
     ("site-management", "Site Management",
      "UN/LOCODE locations, activation and the admin API."),
     ("rbac-and-scoping", "RBAC & Scoping",
-     "Roles, permission tiers, site/environment scopes and their enforcement semantics."),
+     "Roles, route access classes, site/environment scopes and their enforcement semantics."),
     ("agents-and-live-execution", "Agents & Live Execution",
      "Enrolling execution agents and the signed approval chain that gates a live apply."),
     ("orchestration", "Multi-Step Orchestration",
@@ -71,21 +71,20 @@ GENERATED_API_NOTE = "Generated from the API route registrations."
 API_HUB_SECTIONS = [("conventions", "Conventions"), ("areas", "Areas")]
 
 # Conventions strip: (label, one-liner, guide anchor or None). The links
-# point INTO the guides instead of duplicating them. Pagination has no
-# guide section yet, so its tile stays unlinked until one exists.
+# point INTO the guides instead of duplicating them.
 API_CONVENTIONS = [
     ("Authentication",
      "Sessions or API bearer tokens; four auth modes.",
      "/rbac-and-scoping.html#authentication-modes"),
-    ("Permission tiers",
-     "Each route is gated by one of five tiers, `admin` through `audit`.",
-     "/rbac-and-scoping.html#roles-and-permission-tiers"),
+    ("Access & permissions",
+     "Human routes use `admin`, `approve`, `execute`, `request`, `audit`, or `read`; `public`, `agent`, and `webhook` use distinct credentials.",
+     "/rbac-and-scoping.html#route-access-classes"),
     ("Scoping",
      "Site and environment scopes narrow what a principal sees and touches.",
      "/rbac-and-scoping.html#scopes"),
     ("Pagination",
-     "List endpoints accept `limit` and `offset` and report filtered totals.",
-     None),
+     "List routes document their own offset or cursor pagination contract.",
+     "/using-the-api.html#pagination"),
     ("Errors",
      "Out-of-scope reads return `404`; explicit cross-scope writes return `403`.",
      "/rbac-and-scoping.html#enforcement-semantics"),
@@ -459,8 +458,18 @@ td code{white-space:nowrap}
 .ep-summary{color:var(--text);font-weight:500}
 .ep-missing{color:var(--text-secondary);font-style:italic}
 .ep-doc-heading{color:var(--text);font-weight:600;margin-top:1rem}
+.ep-doc-list{margin:.45rem 0 .9rem;padding-left:1.35rem;color:var(--text-secondary)}
+.ep-doc-list li+li{margin-top:.28rem}
 h3.ep-sub{font-size:.78rem;font-weight:700;text-transform:uppercase;
   letter-spacing:.08em;color:var(--text-secondary);margin:1.5rem 0 .45rem}
+.ep-operation{padding-bottom:.35rem}
+.ep-operation h4{font-size:.85rem;margin-top:1.15rem}
+.ep-note{border-left:3px solid var(--border-strong);padding:.45rem .8rem;
+  margin:.7rem 0;color:var(--text-secondary);background:var(--bg-secondary)}
+.ep-note code{white-space:normal}
+.req{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.req-required{color:#82d9b6}
+.req-optional{color:var(--text-secondary)}
 .area-count{font-size:.78rem;font-weight:600;text-transform:uppercase;
   letter-spacing:.06em;color:var(--text-secondary)}
 .sb-sections a.sb-ep{overflow-wrap:anywhere}
@@ -855,126 +864,756 @@ def area_endpoints(area):
     return out
 
 
-def _json_placeholder(ty: str) -> str:
-    """Mechanical JSON placeholder for a field type. Types are named,
-    never guessed: unknown types render as "<TypeName>"."""
-    t = (ty or "").strip()
-    m = re.match(r"^Option<(.*)>$", t)
-    if m:
-        t = m.group(1).strip()
-    low = t.lower()
+_COMMON_QUERY_DESCRIPTIONS = {
+    "limit": "Maximum number of results requested.",
+    "offset": "Number of results to skip before returning the page.",
+    "q": "Search text used to match results.",
+    "sort": "Field or expression used to order results.",
+    "direction": "Direction used to order results.",
+    "site": "Site identifier used to scope or filter the operation.",
+    "environment": "Environment identifier used to scope or filter the operation.",
+    "id": "Identifier used to filter the operation.",
+}
+_COMMON_REQUEST_FIELD_DESCRIPTIONS = {
+    "name": "Client-supplied name for the resource or operation.",
+    "description": "Client-supplied human-readable description.",
+    "reason": "Human-readable reason recorded with the operation and its audit trail.",
+    "site": "Site code targeted by the request.",
+    "environment": "Environment targeted by the request.",
+    "roles": "Application role names assigned by the request.",
+    "enabled": "Whether the requested capability should be enabled.",
+}
+_COMMON_RESPONSE_FIELD_DESCRIPTIONS = {
+    "id": "Identifier of the returned resource.",
+    "status": "Current operation or resource status.",
+    "count": "Number of items represented in this response.",
+    "total": "Total number of matching items before the returned page is applied.",
+    "limit": "Page-size limit applied to this response.",
+    "offset": "Number of matching items skipped before this response page.",
+    "items": "Resources returned by this operation.",
+    "results": "Results returned by this operation.",
+    "created_at": "RFC 3339 timestamp when the resource was created.",
+    "updated_at": "RFC 3339 timestamp when the resource was last updated.",
+    "expires_at": "RFC 3339 expiry timestamp when one applies.",
+    "last_seen_at": "RFC 3339 timestamp of the most recent recorded observation.",
+    "request_id": "Request correlation or lifecycle identifier.",
+    "error": "Stable machine-readable error code or compact error value.",
+    "message": "Human-readable error or result message.",
+    "detail": "Optional diagnostic detail safe to return to the caller.",
+    "source": "Origin or authority of the returned data.",
+}
+_UNIVERSAL_RESPONSE_HEADERS = {
+    "x-api-version", "x-request-id", "traceresponse",
+}
+_SIGNIFICANT_OPTIONAL_HEADERS = {
+    "idempotency-key", "if-match", "if-none-match", "prefer",
+}
+
+
+def _field_required(field, default=False) -> bool:
+    """Read both the new `required` shape and the legacy `optional` shape."""
+    if "required" in field:
+        return bool(field.get("required"))
+    if "optional" in field:
+        return not bool(field.get("optional"))
+    return default
+
+
+def _field_description(field, context: str) -> str:
+    explicit = str(field.get("description") or field.get("doc") or "").strip()
+    if explicit:
+        return explicit
+    name = str(field.get("name") or "value").strip() or "value"
+    low = name.lower()
+    semantic = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower().replace("-", "_")
+    if context == "query" and semantic in _COMMON_QUERY_DESCRIPTIONS:
+        return _COMMON_QUERY_DESCRIPTIONS[semantic]
+    if context == "path":
+        if low == "id" or low.endswith("_id"):
+            return "Identifier of the target resource in the request path."
+        return f"Value of the `{name}` request-path segment."
+    if context == "request_header":
+        return f"Value supplied in the `{name}` request header."
+    if context == "response_header":
+        return f"Metadata returned in the `{name}` response header."
+    if context == "request_body":
+        if semantic in _COMMON_REQUEST_FIELD_DESCRIPTIONS:
+            return _COMMON_REQUEST_FIELD_DESCRIPTIONS[semantic]
+        return f"Value of `{name}` in the JSON request body."
+    if context == "response_body":
+        if semantic in _COMMON_RESPONSE_FIELD_DESCRIPTIONS:
+            return _COMMON_RESPONSE_FIELD_DESCRIPTIONS[semantic]
+        return f"Value of `{name}` returned in the response body."
+    return f"Value supplied for the `{name}` query parameter."
+
+
+def _fields_table(fields, context="query", default_required=False) -> str:
+    rows = []
+    for field in fields or []:
+        if not isinstance(field, dict):
+            continue
+        name = html_mod.escape(str(field.get("name") or ""), quote=False)
+        ty = html_mod.escape(_wire_type(str(field.get("type") or "")), quote=False)
+        required = _field_required(field, default=default_required)
+        req_label = "Required" if required else "Optional"
+        req_class = "required" if required else "optional"
+        description = _field_description(field, context)
+        rows.append(
+            f"<tr><td><code>{name}</code></td><td><code>{ty}</code></td>"
+            f'<td><span class="req req-{req_class}">{req_label}</span></td>'
+            f"<td>{inline(description)}</td></tr>")
+    return ("<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th>"
+            "<th>Description</th></tr></thead><tbody>" + "".join(rows)
+            + "</tbody></table>")
+
+
+def _access_class(route) -> str:
+    tier = str(route.get("tier") or route.get("access_class") or "").strip().lower()
+    if tier:
+        return tier
+    return "public" if route.get("auth_exempt") else "authenticated"
+
+
+def _is_webhook(route) -> bool:
+    return _access_class(route) == "webhook"
+
+
+def _is_public(route) -> bool:
+    return bool(route.get("auth_exempt")) or _access_class(route) == "public"
+
+
+def _interactive_admin_only(route) -> bool:
+    return (str(route.get("method") or "").upper() == "POST"
+            and str(route.get("path") or "") == "/api/admin/tokens")
+
+
+def _auth_callback_cookie(route):
+    path = str(route.get("path") or "")
+    if path == "/api/auth/oidc/callback":
+        return "oidc_login_csrf"
+    if path == "/api/auth/entra/callback":
+        return "entra_login_csrf"
+    return None
+
+
+def _request_body_state(route) -> str:
+    state = str(route.get("request_body_state") or "").strip().lower()
+    if state in ("json", "none", "unknown", "raw"):
+        return state
+    if isinstance(route.get("request_body"), dict):
+        return "json"
+    # Before request_body_state existed, safe HTTP methods were reliably
+    # bodyless. A null body on a mutating method was ambiguous and stays so.
+    method = str(route.get("method") or "GET").upper()
+    return "none" if method in ("GET", "HEAD", "DELETE", "OPTIONS") else "unknown"
+
+
+def _query_params_state(route) -> str:
+    state = str(route.get("query_params_state") or "").strip().lower()
+    if state in ("known", "none", "unknown"):
+        return state
+    # Legacy contracts used null both for no Query extractor and for an
+    # unresolved extractor. Preserve honesty: only a concrete list proves the
+    # shape was known.
+    return "known" if isinstance(route.get("query_params"), list) else "unknown"
+
+
+def _path_params(route):
+    if "path_params" in route:
+        value = route.get("path_params")
+        return value if isinstance(value, list) else []
+    # Backward compatibility for api-doc.json files generated before path
+    # extraction was added. Braced names are facts present in the route path.
+    names = re.findall(r"\{([^{}]+)\}", str(route.get("path") or ""))
+    return [{"name": name, "type": "String", "required": True}
+            for name in dict.fromkeys(names)]
+
+
+def _declared_request_headers(route):
+    value = route.get("request_headers")
+    return [dict(h) for h in value if isinstance(h, dict)] \
+        if isinstance(value, list) else []
+
+
+def _auth_header(route):
+    if _is_public(route) or _is_webhook(route):
+        return None
+    if _access_class(route) == "agent":
+        description = ("Agent bearer credential. Use the enrolled agent token "
+                       "whose value starts with `rya_`.")
+    else:
+        description = "Session or API bearer credential for the calling principal."
+    return {"name": "Authorization", "type": "String", "required": True,
+            "description": description}
+
+
+def _effective_request_headers(route):
+    """Declared operation headers plus cross-cutting auth/content headers."""
+    declared = _declared_request_headers(route)
+    by_name = {str(h.get("name") or "").lower(): h for h in declared}
+    out, seen = [], set()
+
+    def add(header):
+        if not header:
+            return
+        key = str(header.get("name") or "").lower()
+        if not key or key in seen:
+            return
+        # Public and webhook access classes never get a synthesized or stale
+        # bearer header in examples.
+        if key == "authorization" and (_is_public(route) or _is_webhook(route)):
+            return
+        seen.add(key)
+        out.append(header)
+
+    add(by_name.get("authorization") or _auth_header(route))
+    if _request_body_state(route) == "json":
+        add(by_name.get("content-type") or {
+            "name": "Content-Type", "type": "String", "required": True,
+            "description": "Media type of the JSON request body; use `application/json`.",
+        })
+    elif "content-type" in by_name:
+        add(by_name["content-type"])
+    for header in declared:
+        add(header)
+    add({
+        "name": "traceparent", "type": "String", "required": False,
+        "description": ("Optional correlation input. When the second dash-separated "
+                        "segment has 32 characters, Ryuki reuses it as the request "
+                        "correlation identifier; this is not full W3C validation."),
+    })
+    return out
+
+
+def _permissions_table(route) -> str:
+    access = _access_class(route)
+    if _interactive_admin_only(route):
+        credential = ("An interactive administrator session or user bearer credential "
+                      "is required. Service API tokens (`ryk_...`) are rejected to "
+                      "prevent a token from minting another token.")
+        scope = "The verified interactive principal must hold the `admin` access class."
+    elif _is_webhook(route):
+        credential = ("The documented webhook signature header authenticates the "
+                      "exact request bytes; no bearer token is used.")
+        scope = "The integration identifier in the route selects the receiving scope."
+    elif _is_public(route):
+        credential = ("No user or agent bearer token is required. Operation-specific "
+                      "proof, when present, is documented below.")
+        scope = "No authenticated-principal scope is applied to this operation."
+    elif access == "agent":
+        credential = "An enrolled agent bearer token beginning with `rya_` is required."
+        scope = ("The credential represents the enrolled agent; request-path identifiers "
+                 "must address that agent's operation.")
+    else:
+        credential = "An authenticated session or API bearer token is required."
+        scope = ("The access class is enforced first; site and environment scopes narrow "
+                 "resources on scoped operations.")
+    access_html = html_mod.escape(access, quote=False)
+    return ("<table><thead><tr><th>Access class</th><th>Credential</th>"
+            "<th>Scoping</th></tr></thead><tbody><tr>"
+            f"<td><code>{access_html}</code></td><td>{inline(credential)}</td>"
+            f"<td>{inline(scope)}</td></tr></tbody></table>")
+
+
+def _unwrap_rust_type(ty: str) -> str:
+    value = (ty or "").strip()
+    while True:
+        match = re.match(r"^(?:Option|Box|Arc|Rc)<(.*)>$", value)
+        if not match:
+            return value
+        value = match.group(1).strip()
+
+
+def _split_generic_args(value: str):
+    depth, start, args = 0, 0, []
+    for index, char in enumerate(value):
+        if char == "<":
+            depth += 1
+        elif char == ">":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            args.append(value[start:index].strip())
+            start = index + 1
+    args.append(value[start:].strip())
+    return args
+
+
+def _wire_type(ty: str) -> str:
+    """Present Rust extraction facts as client-facing JSON wire types."""
+    value = _unwrap_rust_type(ty)
+    compact = re.sub(r"\s+", "", value)
+    low = compact.lower()
+    leaf = low.rsplit("::", 1)[-1]
+    if leaf in ("string", "str", "&str", "char"):
+        return "string"
+    if leaf in ("uuid",):
+        return "string (uuid)"
+    if "datetime<" in low or leaf in ("naivedatetime", "date"):
+        return "string (date-time)"
+    if leaf in ("bool", "boolean"):
+        return "boolean"
+    if leaf == "integer" or re.fullmatch(r"[iu](8|16|32|64|128|size)", leaf):
+        return "integer"
+    if leaf in ("f32", "f64", "number"):
+        return "number"
+    if leaf in ("object", "array"):
+        return leaf
+    if low in ("value", "serde_json::value", "jsonvalue"):
+        return "JSON value"
+    if low in ("null", "()"):
+        return "null"
+
+    generic = re.match(r"^(.*)<(.*)>$", value)
+    if generic:
+        container = generic.group(1).strip().lower().rsplit("::", 1)[-1]
+        args = _split_generic_args(generic.group(2))
+        if container in ("vec", "vecdeque", "hashset", "btreeset"):
+            item = _wire_type(args[0]) if args else "JSON value"
+            return f"array<{item}>"
+        if container in ("hashmap", "btreemap"):
+            mapped = _wire_type(args[1]) if len(args) > 1 else "JSON value"
+            return f"object<string, {mapped}>"
+        if container in ("result", "cow") and args:
+            return _wire_type(args[0])
+    if compact.startswith("[") and compact.endswith("]"):
+        return "array"
+    return f"object ({value})" if value else "JSON value"
+
+
+def _json_value(ty: str):
+    """Return a JSON-serializable, source-safe placeholder for a Rust type."""
+    value = _unwrap_rust_type(ty)
+    low = re.sub(r"\s+", "", value.lower())
     if low == "bool":
-        return "true"
+        # Generated examples must never opt into a live/safety-sensitive flag.
+        return False
     if re.fullmatch(r"[iu](8|16|32|64|128|size)", low):
-        return "0"
+        return 0
     if low in ("f32", "f64"):
-        return "0.0"
-    if low == "uuid":
-        return '"<uuid>"'
-    if low in ("string", "str", "&str"):
-        return '"<string>"'
-    if low.startswith("vec<"):
-        return "[]"
+        return 0.0
+    if low in ("string", "str", "&str") or low.endswith("::string"):
+        return "<string>"
+    if low in ("uuid", "uuid::uuid"):
+        return "<uuid>"
+    if low.startswith(("vec<", "vecdeque<", "hashset<", "btreeset<")) \
+            or (low.startswith("[") and low.endswith("]")):
+        return []
     if low.startswith(("hashmap<", "btreemap<")):
-        return "{}"
-    return f'"<{t}>"' if t else '"<value>"'
+        return {}
+    if low in ("value", "serde_json::value", "jsonvalue"):
+        # `null` is explicitly explained as an unresolved-type placeholder in
+        # schematic response bodies; `{}` would falsely assert an object.
+        return None
+    if low in ("serde_json::map",):
+        return {}
+    if low in ("()", "null"):
+        return None
+    # A named type is most safely represented as an object: rendering it as
+    # a string would fabricate a wire representation for a nested struct.
+    return {}
+
+
+def _json_object(fields, required_only=False):
+    obj = {}
+    for field in fields or []:
+        if not isinstance(field, dict):
+            continue
+        if required_only and not _field_required(field, default=True):
+            continue
+        name = str(field.get("name") or "").strip()
+        if name:
+            obj[name] = _json_value(str(field.get("type") or ""))
+    return obj
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _header_example_value(name: str, route) -> str:
+    low = name.lower()
+    if low == "authorization":
+        return ("Bearer rya_<agent-token>" if _access_class(route) == "agent"
+                else "Bearer <token>")
+    if low == "content-type":
+        return ("application/json" if _request_body_state(route) == "json"
+                else "<content-type>")
+    if low == "idempotency-key":
+        return "<idempotency-key>"
+    if low == "x-hub-signature-256":
+        return "sha256=<hmac-signature>"
+    if low == "x-ryuki-protocol-version":
+        return "2"
+    if low == "cookie" and _auth_callback_cookie(route):
+        return f"{_auth_callback_cookie(route)}=<browser-binding>"
+    if "signature" in low:
+        return "<signature>"
+    if "session" in low:
+        return "<session-id>"
+    return f"<{slug(name) or 'value'}>"
+
+
+def _header_in_curl(header, route) -> bool:
+    low = str(header.get("name") or "").lower()
+    # The human auth contract declares Authorization and the session/CSRF
+    # header as optional alternatives. Prefer bearer auth in a standalone
+    # example; the session-header flow remains documented in the table.
+    if low == "authorization":
+        return not (_is_public(route) or _is_webhook(route)
+                    or _interactive_admin_only(route))
+    if low == "x-ryuki-session-id" and _interactive_admin_only(route):
+        return True
+    if low == "cookie" and _auth_callback_cookie(route):
+        return True
+    if _field_required(header):
+        return True
+    if low in _SIGNIFICANT_OPTIONAL_HEADERS or "signature" in low:
+        return True
+    return low == "content-type" and _request_body_state(route) in ("json", "raw")
+
+
+def _example_url(route) -> str:
+    path = str(route.get("path") or "/")
+    path = re.sub(r"\{([^{}]+)\}", lambda m: f"<{m.group(1)}>", path)
+    required_query = [str(field.get("name") or "")
+                      for field in (route.get("query_params") or [])
+                      if isinstance(field, dict) and _field_required(field)
+                      and str(field.get("name") or "")]
+    if _auth_callback_cookie(route):
+        required_query = list(dict.fromkeys(["code", "state", *required_query]))
+    if required_query:
+        query = "&".join(f"{name}=<{name}>" for name in required_query)
+        path += ("&" if "?" in path else "?") + query
+    return f"https://<your-host>{path}"
 
 
 def curl_example(route) -> str:
-    """Synthesized mechanically from method/path/auth_exempt/request_body."""
-    method = (route.get("method") or "GET").upper()
-    url = f"https://<your-host>{route.get('path') or '/'}"
-    headers = []
-    if not route.get("auth_exempt"):
-        headers.append('-H "Authorization: Bearer <token>"')
-    fields = (route.get("request_body") or {}).get("fields") or []
-    if fields:
-        headers.append('-H "Content-Type: application/json"')
-        sketch = ", ".join(
-            f'"{f.get("name", "field")}": {_json_placeholder(str(f.get("type") or ""))}'
-            for f in fields)
-        lines = [f"curl -s -X {method} \\" if method != "GET" else "curl -s \\"]
-        lines += [f"  {h} \\" for h in headers]
-        lines.append(f"  -d '{{{sketch}}}' \\")
-        lines.append(f"  {url}")
-        return "\n".join(lines)
-    flat = ["curl", "-s"]
-    if method != "GET":
-        flat.append(f"-X {method}")
-    flat += headers
-    flat.append(url)
-    return " ".join(flat)
+    """Build an auth-aware curl request without URL globbing hazards."""
+    method = str(route.get("method") or "GET").upper()
+    state = _request_body_state(route)
+    lines = ["curl --silent --show-error --globoff \\",
+             f"  --request {method} \\"]
+    for header in _effective_request_headers(route):
+        if not _header_in_curl(header, route):
+            continue
+        name = str(header.get("name") or "")
+        value = _header_example_value(name, route)
+        lines.append(f"  --header {_shell_quote(f'{name}: {value}')} \\")
+
+    body = route.get("request_body") if isinstance(route.get("request_body"), dict) else {}
+    fields = body.get("fields") if isinstance(body.get("fields"), list) else []
+    if state == "json":
+        if fields:
+            payload = json.dumps(_json_object(fields, required_only=True),
+                                 separators=(",", ":"), ensure_ascii=False)
+            lines.append(f"  --data {_shell_quote(payload)} \\")
+        else:
+            lines.append("  --data-binary '@request.json' \\")
+    elif state == "raw":
+        lines.append("  --data-binary '@payload.bin' \\")
+    lines.append(f"  {_shell_quote(_example_url(route))}")
+    return "\n".join(lines)
 
 
-def _fields_table(fields) -> str:
+def _strip_operation_prefix(text: str, route) -> str:
+    text = (text or "").strip()
+    method = str(route.get("method") or "").upper()
+    path = str(route.get("path") or "")
+    if not text or not method or not path:
+        return text
+    match = re.match(rf"^`?{re.escape(method)}\s+{re.escape(path)}`?", text,
+                     flags=re.I)
+    if not match:
+        return text
+    remainder = text[match.end():]
+    if not remainder.strip():
+        return ""
+    separated = re.match(r"^\s*(?:—|–|-|:)\s*(.+)$", remainder, flags=re.S)
+    # Some older handler docs put a newline or plain space (rather than an
+    # em dash) between the operation and its prose. The exact method/path was
+    # still matched above, so stripping it is safe and avoids repeating the
+    # HTTP request as the human summary.
+    return separated.group(1).strip() if separated else remainder.strip()
+
+
+def _same_sentence(left: str, right: str) -> bool:
+    def normalized(value):
+        return re.sub(r"[.!?\s]+$", "", _plain(value)).strip()
+    return bool(normalized(left)) and normalized(left) == normalized(right)
+
+
+def _overview_parts(route):
+    """Clean generated operation prefixes and one duplicated first sentence."""
+    summary = _strip_operation_prefix(str(route.get("summary") or ""), route)
+    if summary and summary[0].isascii() and summary[0].islower():
+        summary = summary[0].upper() + summary[1:]
+    raw_desc = str(route.get("description") or "").strip()
+    blocks = ["\n".join(line.strip() for line in block.strip().splitlines())
+              for block in re.split(r"\n\s*\n", raw_desc) if block.strip()]
+    if blocks:
+        blocks[0] = _strip_operation_prefix(blocks[0], route)
+        blocks = [block for block in blocks if block]
+        if summary and blocks:
+            sentence = re.match(r"^(.+?[.!?])(?:\s+(.*))?$", blocks[0], flags=re.S)
+            first = sentence.group(1) if sentence else blocks[0]
+            if _same_sentence(summary, first):
+                blocks[0] = (sentence.group(2) or "").strip() if sentence else ""
+        blocks = [block for block in blocks if block]
+    return summary, blocks
+
+
+def _render_overview_block(block: str) -> list[str]:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines:
+        return []
+    if len(lines) == 1:
+        heading = re.match(r"^#{1,4}\s+(.*)$", lines[0])
+        if heading:
+            return [f'<p class="ep-doc-heading">{inline(heading.group(1))}</p>']
+        return [f"<p>{inline(lines[0])}</p>"]
+
+    for pattern, tag in (
+        (re.compile(r"^\d+\.\s+(.+)$"), "ol"),
+        (re.compile(r"^[-*]\s+(.+)$"), "ul"),
+    ):
+        first = next((index for index, line in enumerate(lines) if pattern.match(line)), None)
+        if first is None or not all(pattern.match(line) for line in lines[first:]):
+            continue
+        out = []
+        if first:
+            out.append(f"<p>{inline(' '.join(lines[:first]))}</p>")
+        items = "".join(f"<li>{inline(pattern.match(line).group(1))}</li>"
+                        for line in lines[first:])
+        out.append(f'<{tag} class="ep-doc-list">{items}</{tag}>')
+        return out
+    return [f"<p>{inline(' '.join(lines))}</p>"]
+
+
+def _render_request_body(route) -> list[str]:
+    state = _request_body_state(route)
+    body = route.get("request_body") if isinstance(route.get("request_body"), dict) else {}
+    fields = body.get("fields") if isinstance(body.get("fields"), list) else []
+    body_type = str(body.get("struct") or body.get("type") or "").strip()
+    out = ['<h3 class="ep-sub">Request body</h3>']
+    if state == "none":
+        out.append("<p>This operation does not accept a request body.</p>")
+    elif state == "raw":
+        out.append('<p class="ep-note">Supply the required opaque request bytes as-is. '
+                   'The exact bytes are covered by <code>X-Hub-Signature-256</code>; '
+                   "do not reserialize them after computing the signature.</p>")
+    elif state == "unknown":
+        out.append('<p class="ep-note">The route contract cannot determine whether this '
+                   "operation accepts a request body. Check the handler contract before "
+                   "sending one; no body shape is inferred here.</p>")
+    else:
+        if body_type:
+            out.append(f'<p>JSON structure: <code>{html_mod.escape(body_type, quote=False)}</code>.</p>')
+        if fields:
+            out.append(_fields_table(fields, "request_body", default_required=True))
+        else:
+            known = (f' The known body type is <code>{html_mod.escape(body_type, quote=False)}</code>.'
+                     if body_type else "")
+            out.append('<p class="ep-note">This operation accepts JSON, but its field '
+                       f"schema is not available.{known} No object shape is fabricated.</p>")
+    return out
+
+
+def _operation_response_headers(response):
+    headers = response.get("headers") if isinstance(response, dict) else []
+    return [h for h in (headers or []) if isinstance(h, dict)
+            and str(h.get("name") or "").lower() not in _UNIVERSAL_RESPONSE_HEADERS]
+
+
+def _response_body_state(response) -> str:
+    state = str(response.get("body_state") or "").strip().lower()
+    if state in ("json", "none", "unknown", "raw"):
+        return state
+    if isinstance(response.get("body"), dict):
+        return "json"
+    try:
+        status = int(response.get("status"))
+    except (TypeError, ValueError):
+        status = 0
+    return "none" if status in (204, 205) or 300 <= status <= 399 else "unknown"
+
+
+def _render_response(route) -> list[str]:
+    out = ['<h3 class="ep-sub">Response</h3>']
+    notes = str(route.get("response_notes") or "").strip()
+    if "success_responses" not in route:
+        if notes:
+            out.append(f"<p>{inline(notes)}</p>")
+        else:
+            out.append('<p class="ep-note">The legacy route contract does not include a '
+                       "structured success-response schema.</p>")
+        return out
+
+    responses = route.get("success_responses")
+    responses = [r for r in responses if isinstance(r, dict)] \
+        if isinstance(responses, list) else []
+    if not responses:
+        out.append('<p class="ep-note">No successful response schema was extracted for '
+                   "this operation.</p>")
+        if notes:
+            out.append(f"<p>{inline(notes)}</p>")
+        return out
+
     rows = []
-    for f in fields:
-        name = html_mod.escape(str(f.get("name") or ""), quote=False)
-        ty = html_mod.escape(str(f.get("type") or ""), quote=False)
-        req = "optional" if f.get("optional") else "required"
-        rows.append(f"<tr><td><code>{name}</code></td><td><code>{ty}</code></td>"
-                    f"<td>{req}</td><td>{inline(str(f.get('doc') or ''))}</td></tr>")
-    return ("<table><thead><tr><th>Name</th><th>Type</th><th>Required</th>"
-            "<th>Description</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+    for response in responses:
+        status = html_mod.escape(str(response.get("status") or "Success"), quote=False)
+        description = str(response.get("description") or "Successful response.").strip()
+        body = response.get("body")
+        body_state = _response_body_state(response)
+        if body_state == "none":
+            body_label = "No response body"
+        elif body_state == "raw":
+            body_label = "Raw or text response body"
+        elif body_state == "unknown":
+            body_label = "Response body schema unavailable"
+        elif isinstance(body, dict):
+            body_type = str(body.get("type") or "").strip()
+            body_label = (f'<code>{html_mod.escape(body_type, quote=False)}</code>'
+                          if body_type else "JSON response body")
+        else:
+            body_label = "Response body schema unavailable"
+        rows.append(f"<tr><td><code>{status}</code></td><td>{inline(description)}</td>"
+                    f"<td>{body_label}</td></tr>")
+    out.append("<table><thead><tr><th>Status</th><th>Description</th><th>Body</th>"
+               "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+
+    for response in responses:
+        status = html_mod.escape(str(response.get("status") or "Success"), quote=False)
+        body = response.get("body")
+        body_state = _response_body_state(response)
+        if isinstance(body, dict):
+            body_type = str(body.get("type") or "").strip()
+            fields = body.get("fields") if isinstance(body.get("fields"), list) else []
+            if fields:
+                out.append(f"<h4><code>{status}</code> response body</h4>")
+                if body_type:
+                    out.append(f'<p>Structure: <code>{html_mod.escape(body_type, quote=False)}</code>.</p>')
+                out.append(_fields_table(fields, "response_body", default_required=True))
+            elif body_type:
+                out.append(f'<p>For <code>{status}</code>, the known response body type is '
+                           f'<code>{html_mod.escape(body_type, quote=False)}</code>. Its '
+                           "field schema is unavailable, so no JSON shape is inferred.</p>")
+        elif body_state == "raw":
+            out.append(f'<p>For <code>{status}</code>, the operation returns a raw or '
+                       'text response body; no JSON shape applies.</p>')
+        elif body_state == "unknown":
+            out.append(f'<p class="ep-note">For <code>{status}</code>, the response '
+                       'body could not be resolved from the route contract. It is not '
+                       'documented as bodyless.</p>')
+        headers = _operation_response_headers(response)
+        if headers:
+            out.append(f"<h4><code>{status}</code> response headers</h4>")
+            out.append(_fields_table(headers, "response_header"))
+    if notes and not any(_same_sentence(notes, str(r.get("description") or ""))
+                         for r in responses):
+        out.append(f"<p>{inline(notes)}</p>")
+    return out
+
+
+def _response_shape_example(route):
+    responses = route.get("success_responses")
+    if not isinstance(responses, list):
+        return None
+    for response in responses:
+        if not isinstance(response, dict) or not isinstance(response.get("body"), dict):
+            continue
+        fields = response["body"].get("fields")
+        if isinstance(fields, list) and fields:
+            status = str(response.get("status") or "Success")
+            payload = json.dumps(_json_object(fields), indent=2, ensure_ascii=False)
+            return status, payload
+    return None
+
+
+def _render_errors() -> list[str]:
+    return [
+        '<h3 class="ep-sub">Errors</h3>',
+        '<p>JSON failures use one of the platform error envelopes and include the '
+        'request correlation metadata when routing reaches the API middleware. See '
+        '<a href="/using-the-api.html#errors">Errors</a> for the exact shapes, '
+        'authentication failures, retry guidance, and transport-level exceptions.</p>',
+    ]
 
 
 def render_route(route, anchor) -> str:
-    method = (route.get("method") or "?").upper()
+    method = str(route.get("method") or "?").upper()
+    path = str(route.get("path") or "")
     mclass = method.lower()
     if mclass not in ("get", "post", "put", "delete", "patch"):
         mclass = "other"
-    out = [f'<h2 class="ep-h" id="{anchor}">'
+    out = ['<section class="ep-operation">',
+           f'<h2 class="ep-h" id="{anchor}">'
            f'<span class="method-chip m-{mclass}">{html_mod.escape(method, quote=False)}</span>'
-           f'<code>{html_mod.escape(route.get("path") or "", quote=False)}</code></h2>']
+           f'<code>{html_mod.escape(path, quote=False)}</code></h2>']
     badges = []
     tier = str(route.get("tier") or "").strip()
     if tier:
-        badges.append(f'<span class="badge">{html_mod.escape(tier, quote=False)} tier</span>')
-    if route.get("auth_exempt"):
-        badges.append('<span class="badge badge-open">no auth required</span>')
+        badges.append(f'<span class="badge">{html_mod.escape(tier, quote=False)} access</span>')
+    if _is_public(route):
+        badges.append('<span class="badge badge-open">no bearer auth required</span>')
     if badges:
         out.append(f'<p class="badges">{"".join(badges)}</p>')
-    summary = str(route.get("summary") or "").strip()
+
+    summary, blocks = _overview_parts(route)
     if summary:
         out.append(f'<p class="ep-summary">{inline(summary)}</p>')
+    for para in blocks:
+        out.extend(_render_overview_block(para))
+    if not summary and not blocks:
+        out.append('<p class="ep-missing">No operation description is available yet.</p>')
+
+    out.append('<h3 class="ep-sub">Permissions</h3>')
+    out.append(_permissions_table(route))
+    out.append('<h3 class="ep-sub">HTTP request</h3>')
+    http_request = f"{method} https://<your-host>{path or '/'}"
+    out.append(f'<pre><code>{_esc(http_request)}</code></pre>')
+
+    out.append('<h3 class="ep-sub">Path parameters</h3>')
+    path_params = _path_params(route)
+    if path_params:
+        out.append(_fields_table(path_params, "path", default_required=True))
     else:
-        out.append('<p class="ep-missing">No description extracted yet.</p>')
-    desc = str(route.get("description") or "").strip()
-    if desc:
-        for para in re.split(r"\n\s*\n", desc):
-            para = " ".join(para.split())
-            if not para:
-                continue
-            # Handler doc comments sometimes use `##`/`#` subheadings; render
-            # them as bold sub-labels instead of leaking the literal marker.
-            heading = re.match(r"^#{1,4}\s+(.*)$", para)
-            if heading:
-                out.append(f'<p class="ep-doc-heading">{inline(heading.group(1))}</p>')
-            else:
-                out.append(f"<p>{inline(para)}</p>")
-    qp = route.get("query_params") or []
-    if qp:
-        out.append('<h3 class="ep-sub">Query parameters</h3>')
-        out.append(_fields_table(qp))
-    body = route.get("request_body") or {}
-    if body:
-        out.append('<h3 class="ep-sub">Request body</h3>')
-        struct = str(body.get("struct") or "").strip()
-        if struct:
-            out.append(f'<p class="ep-struct">Structure: '
-                       f'<code>{html_mod.escape(struct, quote=False)}</code></p>')
-        if body.get("fields"):
-            out.append(_fields_table(body["fields"]))
-    notes = str(route.get("response_notes") or "").strip()
-    if notes:
-        out.append(f'<p class="ep-notes"><strong>Response:</strong> {inline(notes)}</p>')
-    out.append('<h3 class="ep-sub">Example request</h3>')
+        out.append("<p>This operation has no path parameters.</p>")
+
+    out.append('<h3 class="ep-sub">Query parameters</h3>')
+    query_params = route.get("query_params") or []
+    if query_params:
+        out.append(_fields_table(query_params, "query"))
+    elif _query_params_state(route) == "unknown":
+        out.append('<p class="ep-note">This operation accepts query parameters, but '
+                   'their field schema could not be extracted. No parameter list is '
+                   'inferred here.</p>')
+    else:
+        out.append("<p>This operation has no query parameters.</p>")
+
+    out.append('<h3 class="ep-sub">Request headers</h3>')
+    request_headers = _effective_request_headers(route)
+    if request_headers:
+        out.append(_fields_table(request_headers, "request_header"))
+    else:
+        out.append("<p>No operation-specific request headers are required.</p>")
+
+    out.extend(_render_request_body(route))
+    out.extend(_render_response(route))
+    out.extend(_render_errors())
+
+    out.append('<h3 class="ep-sub">Examples</h3>')
+    out.append("<h4>Request</h4>")
     out.append(f'<pre><code class="lang-bash">{_hl_bash(curl_example(route))}</code></pre>')
-    if method in ("POST", "PUT", "PATCH") and not body.get("fields"):
-        handler = str(route.get("handler") or "").strip()
-        where = (f' — see handler <code>{html_mod.escape(handler, quote=False)}</code>'
-                 if handler else " — see the handler source")
-        out.append(f'<p class="ep-missing">Request body not extracted{where}.</p>')
+    response_example = _response_shape_example(route)
+    if response_example:
+        status, payload = response_example
+        out.append("<h4>Schematic response body</h4>")
+        out.append('<p class="ep-note">Illustrative shape generated from the extracted '
+                   'field types, not a recorded live response. Values are placeholders; '
+                   '<code>null</code> marks a field whose type could not be resolved.</p>')
+        out.append(f'<p>Success status: <code>{html_mod.escape(status, quote=False)}</code></p>')
+        out.append(f'<pre><code class="lang-json">{_hl_json(payload)}</code></pre>')
+    out.append("</section>")
     return "\n".join(out)
 
 
@@ -987,6 +1626,10 @@ def api_area_content(area) -> str:
         out.append(f"<p>{inline(desc)}</p>")
     n = len(eps)
     out.append(f'<p class="area-count">{n} route{"s" if n != 1 else ""}</p>')
+    out.append('<p class="ep-note"><strong>Response metadata:</strong> '
+               '<code>x-api-version</code>, <code>x-request-id</code>, and '
+               '<code>traceresponse</code> apply to normal routed responses and are omitted '
+               'from the per-operation header tables below.</p>')
     if not eps:
         out.append('<p class="ep-missing">No routes extracted for this area yet.</p>')
     for route, anchor, _ in eps:
@@ -1055,8 +1698,8 @@ def api_hub_content(api, openapi_available) -> str:
         "<h1>API Reference</h1>"
         f"<p>The control plane serves <strong>{total} routes</strong> across "
         f"<strong>{len(areas)} areas</strong>. Most routes require an authenticated "
-        "session or an API bearer token; a small set is deliberately unauthenticated, "
-        "such as health probes and agent registration. Pick an area below, or start "
+        "session or API bearer token; agent and webhook routes use their documented "
+        "protocol credentials, while a small bootstrap set is public. Pick an area below, or start "
         "with the conventions that apply everywhere.</p>"
         '<h2 id="conventions">Conventions</h2>'
         "<p>These rules hold across the whole surface; the tiles link to the guide "
@@ -1073,7 +1716,7 @@ def api_search_entries(api):
     total = sum(len(a.get("routes") or []) for a in areas)
     entries = [{"p": f"{API_HUB}.html", "t": "API Reference", "s": "", "a": "",
                 "x": _plain(f"the control plane serves {total} routes across "
-                            f"{len(areas)} areas. authentication, permission tiers, "
+                            f"{len(areas)} areas. authentication, access classes, "
                             "scoping, pagination, errors.")}]
     for area in areas:
         fname = area_filename(area)

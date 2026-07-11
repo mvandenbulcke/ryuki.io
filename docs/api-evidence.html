@@ -46,54 +46,279 @@
 <h1>Evidence API</h1>
 <p>Evidence-pack operations: collect, export, redact, and verify compliance evidence.</p>
 <p class="area-count">6 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-evidence-collect"><span class="method-chip m-post">POST</span><code>/api/evidence/collect</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/evidence/collect</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>evidence_collect</code>.</p>
-<h2 class="ep-h" id="get-api-evidence-compliance-dashboard-contract"><span class="method-chip m-get">GET</span><code>/api/evidence/compliance-dashboard-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/evidence/compliance-dashboard-contract</code></pre>
-<h2 class="ep-h" id="get-api-evidence-export"><span class="method-chip m-get">GET</span><code>/api/evidence/export</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Evidence collect.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/evidence/collect</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>format</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/evidence/export</code></pre>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>ryuki_engine::models::EvidencePack</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>ryuki_engine::models::EvidencePack</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>request_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Request correlation or lifecycle identifier.</td></tr><tr><td><code>items</code></td><td><code>array&lt;object (EvidenceItem)&gt;</code></td><td><span class="req req-required">Required</span></td><td>Resources returned by this operation.</td></tr><tr><td><code>redacted</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>redacted</code> returned in the response body.</td></tr><tr><td><code>created_at</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>RFC 3339 timestamp when the resource was created.</td></tr><tr><td><code>format</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>format</code> returned in the response body.</td></tr><tr><td><code>compliance_checks</code></td><td><code>array&lt;string&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>compliance_checks</code> returned in the response body.</td></tr><tr><td><code>metadata</code></td><td><code>object&lt;string, string&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>metadata</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/collect'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"request_id"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"items"</span>: [],
+  <span class="hl-k">"redacted"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"created_at"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"format"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"compliance_checks"</span>: [],
+  <span class="hl-k">"metadata"</span>: {}
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-evidence-compliance-dashboard-contract"><span class="method-chip m-get">GET</span><code>/api/evidence/compliance-dashboard-contract</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Evidence compliance dashboard.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/evidence/compliance-dashboard-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>complianceDashboardMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>complianceDashboardMode</code> returned in the response body.</td></tr><tr><td><code>evidenceRequired</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidenceRequired</code> returned in the response body.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveEvaluationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveEvaluationAllowed</code> returned in the response body.</td></tr><tr><td><code>evidenceMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidenceMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>exportMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>exportMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>retentionMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>retentionMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>workflowMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>workflowMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>notificationDispatchAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>notificationDispatchAllowed</code> returned in the response body.</td></tr><tr><td><code>rawEvidencePayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawEvidencePayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawControlRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawControlRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawAuditLogsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawAuditLogsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawUserDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawUserDataAllowed</code> returned in the response body.</td></tr><tr><td><code>rawProviderPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawProviderPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRecipientDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRecipientDataAllowed</code> returned in the response body.</td></tr><tr><td><code>credentialValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>credentialValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tokenValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tokenValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tenantIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tenantIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>objectIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>objectIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>principalIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>principalIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>privateNetworkValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>privateNetworkValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>domains</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>domains</code> returned in the response body.</td></tr><tr><td><code>statusBands</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>statusBands</code> returned in the response body.</td></tr><tr><td><code>trendWindows</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>trendWindows</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/compliance-dashboard-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"complianceDashboardMode"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"evidenceRequired"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveEvaluationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"evidenceMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"exportMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"retentionMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"workflowMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"notificationDispatchAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawEvidencePayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawControlRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawAuditLogsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawUserDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawProviderPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRecipientDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"credentialValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tokenValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tenantIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"objectIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"principalIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"privateNetworkValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"domains"</span>: [],
+  <span class="hl-k">"statusBands"</span>: [],
+  <span class="hl-k">"trendWindows"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-evidence-export"><span class="method-chip m-get">GET</span><code>/api/evidence/export</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Export evidence.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/evidence/export</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>format</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>format</code> query parameter.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/export'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-evidence-export-retention-contract"><span class="method-chip m-get">GET</span><code>/api/evidence/export-retention-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/evidence/export-retention-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Evidence export retention.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/evidence/export-retention-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>exportRetentionMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>exportRetentionMode</code> returned in the response body.</td></tr><tr><td><code>redactionRequired</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>redactionRequired</code> returned in the response body.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveEvidenceMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveEvidenceMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>exportPackageMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>exportPackageMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>retentionPolicyMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>retentionPolicyMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>liveAuditSearchAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveAuditSearchAllowed</code> returned in the response body.</td></tr><tr><td><code>auditSearchQueryAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>auditSearchQueryAllowed</code> returned in the response body.</td></tr><tr><td><code>evidencePayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidencePayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRequestPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRequestPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawProviderPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawProviderPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawEvidencePayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawEvidencePayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawLogContentAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawLogContentAllowed</code> returned in the response body.</td></tr><tr><td><code>unfilteredLogsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>unfilteredLogsAllowed</code> returned in the response body.</td></tr><tr><td><code>stackTracesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>stackTracesAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>serialNumbersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>serialNumbersAllowed</code> returned in the response body.</td></tr><tr><td><code>exportWithoutRedactionAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>exportWithoutRedactionAllowed</code> returned in the response body.</td></tr><tr><td><code>credentialValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>credentialValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>secretValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>secretValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tokenValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tokenValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tenantIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tenantIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>objectIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>objectIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>privateNetworkValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>privateNetworkValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRecipientDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRecipientDataAllowed</code> returned in the response body.</td></tr><tr><td><code>redactionStates</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>redactionStates</code> returned in the response body.</td></tr><tr><td><code>exportReadiness</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>exportReadiness</code> returned in the response body.</td></tr><tr><td><code>safeExportTargets</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>safeExportTargets</code> returned in the response body.</td></tr><tr><td><code>prohibitedContent</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>prohibitedContent</code> returned in the response body.</td></tr><tr><td><code>retentionClasses</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>retentionClasses</code> returned in the response body.</td></tr><tr><td><code>auditSearchStates</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>auditSearchStates</code> returned in the response body.</td></tr><tr><td><code>searchFacets</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>searchFacets</code> returned in the response body.</td></tr><tr><td><code>packageFields</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>packageFields</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/export-retention-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"exportRetentionMode"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"redactionRequired"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveEvidenceMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"exportPackageMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"retentionPolicyMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveAuditSearchAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"auditSearchQueryAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"evidencePayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRequestPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawProviderPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawEvidencePayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawLogContentAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"unfilteredLogsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"stackTracesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"serialNumbersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"exportWithoutRedactionAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"credentialValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"secretValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tokenValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tenantIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"objectIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"privateNetworkValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRecipientDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"redactionStates"</span>: [],
+  <span class="hl-k">"exportReadiness"</span>: [],
+  <span class="hl-k">"safeExportTargets"</span>: [],
+  <span class="hl-k">"prohibitedContent"</span>: [],
+  <span class="hl-k">"retentionClasses"</span>: [],
+  <span class="hl-k">"auditSearchStates"</span>: [],
+  <span class="hl-k">"searchFacets"</span>: [],
+  <span class="hl-k">"packageFields"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-evidence-redact"><span class="method-chip m-post">POST</span><code>/api/evidence/redact</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Evidence redact.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/evidence/redact</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>EvidenceRedactRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>pack</code></td><td><code>serde_json::Value</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"pack": "&lt;serde_json::Value&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/evidence/redact</span></code></pre>
+<p>JSON structure: <code>EvidenceRedactRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>pack</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>pack</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"pack":null}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/redact'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-evidence-verify-compliance"><span class="method-chip m-post">POST</span><code>/api/evidence/verify-compliance</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Evidence verify compliance.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/evidence/verify-compliance</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>EvidenceRedactRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>pack</code></td><td><code>serde_json::Value</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"pack": "&lt;serde_json::Value&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/evidence/verify-compliance</span></code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-events.html">&larr; Events</a><a href="/api-identity.html">Identity &rarr;</a></nav>
+<p>JSON structure: <code>EvidenceRedactRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>pack</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>pack</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"pack":null}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/evidence/verify-compliance'</span></code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-events.html">&larr; Events</a><a href="/api-identity.html">Identity &rarr;</a></nav>
 </main>
 </div>
 <script>

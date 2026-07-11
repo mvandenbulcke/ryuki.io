@@ -46,45 +46,179 @@
 <h1>Metering API</h1>
 <p>Usage metering and chargeback: usage reads, chargeback reports, and chargeback rate management.</p>
 <p class="area-count">4 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-metering-chargeback"><span class="method-chip m-get">GET</span><code>/api/metering/chargeback</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metering/chargeback — allocate cost per site by applying the per-request-type rates to the usage in the window.</p>
-<p>GET /api/metering/chargeback — allocate cost per site by applying the per-request-type rates to the usage in the window. AUDIT-tier (cross-site cost data). The window defaults to the last 90 days. NOTE: the totals assume a SINGLE currency across the active rates; a request type with no rate contributes 0 cost. 503 when no DB.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Allocate cost per site by applying the per-request-type rates to the usage in the window.</p>
+<p>AUDIT-tier (cross-site cost data). The window defaults to the last 90 days. NOTE: the totals assume a SINGLE currency across the active rates; a request type with no rate contributes 0 cost. 503 when no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metering/chargeback</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>since</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>until</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metering/chargeback</code></pre>
-<h2 class="ep-h" id="get-api-metering-chargeback-rates"><span class="method-chip m-get">GET</span><code>/api/metering/chargeback/rates</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metering/chargeback/rates — list the configured cost rates.</p>
-<p>GET /api/metering/chargeback/rates — list the configured cost rates. Audit-tier.</p>
-<h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
-<p class="ep-notes"><strong>Response:</strong> Returns a paginated JSON object with total/limit/offset keys.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metering/chargeback/rates</code></pre>
-<h2 class="ep-h" id="post-api-metering-chargeback-rates"><span class="method-chip m-post">POST</span><code>/api/metering/chargeback/rates</code></h2>
-<p class="badges"><span class="badge">admin tier</span></p>
-<p class="ep-summary">POST /api/metering/chargeback/rates — set (upsert) a request-type unit cost.</p>
-<p>POST /api/metering/chargeback/rates — set (upsert) a request-type unit cost. ADMIN-tier: billing rates must not be rewritable by any operator who can run workload. 503 when no DB.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>since</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>since</code> query parameter.</td></tr><tr><td><code>until</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>until</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>CostRateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>request_type</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>unit_cost</code></td><td><code>f64</code></td><td>required</td><td></td></tr><tr><td><code>currency</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"request_type": "&lt;string&gt;", "unit_cost": 0.0, "currency": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/metering/chargeback/rates</span></code></pre>
-<h2 class="ep-h" id="get-api-metering-usage"><span class="method-chip m-get">GET</span><code>/api/metering/usage</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/metering/usage — per-site usage, metered as the count of requests raised in the window, broken down by status.</p>
-<p>GET /api/metering/usage — per-site usage, metered as the count of requests raised in the window, broken down by status. AUDIT-tier: this exposes cross-site operational/chargeback volume, so it sits with the read-only reporting role, not every operator. The window defaults to the last 90 days when no <code>since</code> is given, so the query is always bounded (never a full-table scan an arbitrary caller could trigger). 503 when no database is configured.</p>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>sites</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>sites</code> returned in the response body.</td></tr><tr><td><code>total_cost</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>total_cost</code> returned in the response body.</td></tr><tr><td><code>currency</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>currency</code> returned in the response body.</td></tr><tr><td><code>unrated_request_types</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>unrated_request_types</code> returned in the response body.</td></tr><tr><td><code>complete</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>complete</code> returned in the response body.</td></tr><tr><td><code>basis</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>basis</code> returned in the response body.</td></tr><tr><td><code>window_since</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>window_since</code> returned in the response body.</td></tr><tr><td><code>window_until</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>window_until</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metering/chargeback'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"sites"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"total_cost"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"currency"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"unrated_request_types"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"complete"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"basis"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"window_since"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"window_until"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-metering-chargeback-rates"><span class="method-chip m-get">GET</span><code>/api/metering/chargeback/rates</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">List the configured cost rates.</p>
+<p>Audit-tier.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metering/chargeback/rates</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>since</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>until</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/metering/usage</code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-me.html">&larr; Me</a><a href="/api-metrics.html">Metrics &rarr;</a></nav>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Maximum number of results requested.</td></tr><tr><td><code>offset</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Number of results to skip before returning the page.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>rates</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rates</code> returned in the response body.</td></tr><tr><td><code>durable</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>durable</code> returned in the response body.</td></tr><tr><td><code>total</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Total number of matching items before the returned page is applied.</td></tr><tr><td><code>limit</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Page-size limit applied to this response.</td></tr><tr><td><code>offset</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Number of matching items skipped before this response page.</td></tr></tbody></table>
+<p>Returns a paginated JSON object with total/limit/offset keys.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metering/chargeback/rates'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"rates"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"durable"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"total"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"limit"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"offset"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="post-api-metering-chargeback-rates"><span class="method-chip m-post">POST</span><code>/api/metering/chargeback/rates</code></h2>
+<p class="badges"><span class="badge">admin access</span></p>
+<p class="ep-summary">Set (upsert) a request-type unit cost.</p>
+<p>ADMIN-tier: billing rates must not be rewritable by any operator who can run workload. 503 when no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>admin</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/metering/chargeback/rates</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>JSON structure: <code>CostRateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>request_type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>request_type</code> in the JSON request body.</td></tr><tr><td><code>unit_cost</code></td><td><code>number</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>unit_cost</code> in the JSON request body.</td></tr><tr><td><code>currency</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>currency</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>request_type</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>request_type</code> returned in the response body.</td></tr><tr><td><code>unit_cost</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>unit_cost</code> returned in the response body.</td></tr><tr><td><code>currency</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>currency</code> returned in the response body.</td></tr><tr><td><code>set</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>set</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"request_type":"&lt;string&gt;","unit_cost":0.0}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metering/chargeback/rates'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"request_type"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"unit_cost"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"currency"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"set"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-metering-usage"><span class="method-chip m-get">GET</span><code>/api/metering/usage</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Per-site usage, metered as the count of requests raised in the window, broken down by status.</p>
+<p>AUDIT-tier: this exposes cross-site operational/chargeback volume, so it sits with the read-only reporting role, not every operator. The window defaults to the last 90 days when no <code>since</code> is given, so the query is always bounded (never a full-table scan an arbitrary caller could trigger). 503 when no database is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/metering/usage</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>since</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>since</code> query parameter.</td></tr><tr><td><code>until</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>until</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>sites</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>sites</code> returned in the response body.</td></tr><tr><td><code>site_count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site_count</code> returned in the response body.</td></tr><tr><td><code>total_requests</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>total_requests</code> returned in the response body.</td></tr><tr><td><code>window_since</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>window_since</code> returned in the response body.</td></tr><tr><td><code>window_until</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>window_until</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/metering/usage'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"sites"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site_count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"total_requests"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"window_since"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"window_until"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-me.html">&larr; Me</a><a href="/api-metrics.html">Metrics &rarr;</a></nav>
 </main>
 </div>
 <script>

@@ -74,7 +74,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permission tiers
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+route access classes
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
@@ -98,6 +99,7 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
 authentication
+request headers
 authorization
 conventions
 walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
@@ -204,7 +206,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h3 id="maturity">Maturity</h3>
 <p>The dry-run pipeline, the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply), agent-side <code>LiveApply</code> and <code>LiveDestroy</code> execution, the provider credential-injection path, and a Vault KV v2 resolver are covered by repository and CI tests. A provider-connected vSphere run is not accepted until the operator-owned gates in <a href="first-test.html">First Test Acceptance</a> pass against an approved disposable target. It requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials via <code>RYUKI_LIVE_CRED_&lt;NAME&gt;</code>, and a durable isolated state backend. The vendor-API adapters for a given provider are enabled per integration as you go live.</p>
 <p>Automatic <code>LiveDestroy</code> is compensation for a failed multi-step run. There is not yet an operator-triggered destroy endpoint for a successful single-job request, so the first live test must approve and rehearse a state-keyed cleanup procedure before apply. See <a href="first-test.html">First Test Acceptance</a>.</p>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/first-test.html">&larr; First Test Acceptance</a><a href="/configuration.html">Configuration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/first-test.html">&larr; First Test Acceptance</a><a href="/configuration.html">Configuration &rarr;</a></nav>
 </main>
 </div>
 <script>
