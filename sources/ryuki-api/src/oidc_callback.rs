@@ -469,10 +469,18 @@ pub struct OidcCallbackDeps {
 
 #[derive(Deserialize)]
 pub(crate) struct OidcCallbackQuery {
+    /// Authorization code returned by the identity provider; required together
+    /// with `state` on the successful callback path.
     pub code: Option<String>,
+    /// Single-use state returned by the identity provider; required together
+    /// with `code` on the successful callback path.
     pub state: Option<String>,
+    /// Identity-provider error code. When present, the callback follows the
+    /// sanitized error-redirect path instead of the code-exchange path.
     pub error: Option<String>,
     #[allow(dead_code)]
+    /// Optional provider error detail. It is accepted for protocol compatibility
+    /// but is never forwarded to the browser.
     pub error_description: Option<String>,
 }
 

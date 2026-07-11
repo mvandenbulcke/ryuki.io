@@ -53,6 +53,8 @@ serde = { version = "1", features = ["derive"] }
 # plan-integrity gate). See ryuki-runner/src/live.rs::canonicalize_plan_json.
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "visit"] }
 figment = { version = "0.10", features = ["env", "json", "toml"] }
 governor = { version = "0.7", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["limit"] }

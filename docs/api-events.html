@@ -46,49 +46,170 @@
 <h1>Events API</h1>
 <p>The platform domain-event feed and alert surface: list events and alerts, and acknowledge alerts singly or in batch.</p>
 <p class="area-count">4 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-events"><span class="method-chip m-get">GET</span><code>/api/events</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/events — the operational domain-event feed (#11).</p>
-<p>GET /api/events — the operational domain-event feed (#11). Newest first, with optional <code>event_type</code> / <code>aggregate_id</code> filters. Distinct from the audit feed: this is the operational stream other subsystems consume (alert generation, dashboards). Request-tier read, site/environment-scoped (#2): a scoped principal sees only its own scope's events plus events that are platform-wide (NULL) on BOTH axes. The cross-scope rule is SYMMETRIC: a SITE-ONLY event (concrete site, NULL environment — e.g. a decommission) is NOT visible to an environment-scoped principal, and an ENV-ONLY event (NULL site, concrete environment) is NOT visible to a site-scoped one — in each case the mutating handlers fail closed for that principal, so the feed must not be more permissive. Empty + <code>durable:false</code> when no DB is configured.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">The operational domain-event feed (#11).</p>
+<p>Newest first, with optional <code>event_type</code> / <code>aggregate_id</code> filters. Distinct from the audit feed: this is the operational stream other subsystems consume (alert generation, dashboards). Request-tier read, site/environment-scoped (#2): a scoped principal sees only its own scope's events plus events that are platform-wide (NULL) on BOTH axes. The cross-scope rule is SYMMETRIC: a SITE-ONLY event (concrete site, NULL environment — e.g. a decommission) is NOT visible to an environment-scoped principal, and an ENV-ONLY event (NULL site, concrete environment) is NOT visible to a site-scoped one — in each case the mutating handlers fail closed for that principal, so the feed must not be more permissive. Empty + <code>durable:false</code> when no DB is configured.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/events</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>event_type</code></td><td><code>String</code></td><td>optional</td><td>Filter to one dotted event type, e.g. <code>request.approve</code>.</td></tr><tr><td><code>aggregate_id</code></td><td><code>String</code></td><td>optional</td><td>Filter to one aggregate's history (e.g. a request id).</td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td>Page size (default 50, capped 500).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/events</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>event_type</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Filter to one dotted event type, e.g. <code>request.approve</code>.</td></tr><tr><td><code>aggregate_id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Filter to one aggregate's history (e.g. a request id).</td></tr><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Page size (default 50, capped 500).</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>events</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>events</code> returned in the response body.</td></tr><tr><td><code>durable</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>durable</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/events'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"events"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"durable"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-events-alerts"><span class="method-chip m-get">GET</span><code>/api/events/alerts</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/events/alerts — the alert-worthy slice of the domain-event stream (#11 slice 2a).</p>
-<p>GET /api/events/alerts — the alert-worthy slice of the domain-event stream (#11 slice 2a). Reuses the scoped feed but keeps only events the pure <code>event_alerts</code> classifier flags — currently a request reaching a NEGATIVE terminal state: <code>failed</code>=critical, <code>rejected</code>=warning, <code>cancelled</code>=info — annotating each with its severity. The status filter is pushed into SQL (via the engine's authoritative status list) so the page is not short-counted when alerts are rare. Request-tier, site/environment-scoped. Persistent alert state + recipient routing are later slices. Empty + <code>durable:false</code> no DB.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">The alert-worthy slice of the domain-event stream (#11 slice 2a).</p>
+<p>Reuses the scoped feed but keeps only events the pure <code>event_alerts</code> classifier flags — currently a request reaching a NEGATIVE terminal state: <code>failed</code>=critical, <code>rejected</code>=warning, <code>cancelled</code>=info — annotating each with its severity. The status filter is pushed into SQL (via the engine's authoritative status list) so the page is not short-counted when alerts are rare. Request-tier, site/environment-scoped. Persistent alert state + recipient routing are later slices. Empty + <code>durable:false</code> no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/events/alerts</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>event_type</code></td><td><code>String</code></td><td>optional</td><td>Filter to one dotted event type, e.g. <code>request.approve</code>.</td></tr><tr><td><code>aggregate_id</code></td><td><code>String</code></td><td>optional</td><td>Filter to one aggregate's history (e.g. a request id).</td></tr><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td>Page size (default 50, capped 500).</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/events/alerts</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>event_type</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Filter to one dotted event type, e.g. <code>request.approve</code>.</td></tr><tr><td><code>aggregate_id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Filter to one aggregate's history (e.g. a request id).</td></tr><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Page size (default 50, capped 500).</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>alerts</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>alerts</code> returned in the response body.</td></tr><tr><td><code>durable</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>durable</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/events/alerts'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"alerts"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"durable"</span>: <span class="hl-n">false</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-events-alerts-batch-ack"><span class="method-chip m-post">POST</span><code>/api/events/alerts/batch/ack</code></h2>
-<p class="badges"><span class="badge">request tier</span></p>
-<p class="ep-summary">POST /api/events/alerts/batch/ack — acknowledge up to 100 alerts in one call (#19).</p>
-<p>POST /api/events/alerts/batch/ack — acknowledge up to 100 alerts in one call (#19). Mirrors the <code>requests_batch_*</code> (#17) shape: the <code>request</code> capability is checked ONCE up front, ids are deduped + capped at 100, then each id runs the SAME per-item scope/ack core (<code>ack_alert_one</code>) as the single endpoint — so a batch can NEVER ack an out-of-scope alert, and one bad id never aborts the rest. Per-item independent; partial success; HTTP 200 always with <code>{results, succeeded, failed}</code>.</p>
+<p class="badges"><span class="badge">request access</span></p>
+<p class="ep-summary">Acknowledge up to 100 alerts in one call (#19).</p>
+<p>Mirrors the <code>requests_batch_*</code> (#17) shape: the <code>request</code> capability is checked ONCE up front, ids are deduped + capped at 100, then each id runs the SAME per-item scope/ack core (<code>ack_alert_one</code>) as the single endpoint — so a batch can NEVER ack an out-of-scope alert, and one bad id never aborts the rest. Per-item independent; partial success; HTTP 200 always with <code>{results, succeeded, failed}</code>.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/events/alerts/batch/ack</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>BatchAlertAckBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>event_ids</code></td><td><code>Vec&lt;i64&gt;</code></td><td>required</td><td></td></tr><tr><td><code>note</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"event_ids": [], "note": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/events/alerts/batch/ack</span></code></pre>
+<p>JSON structure: <code>BatchAlertAckBody</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>event_ids</code></td><td><code>array&lt;integer&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>event_ids</code> in the JSON request body.</td></tr><tr><td><code>note</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>note</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>results</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Results returned by this operation.</td></tr><tr><td><code>succeeded</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>succeeded</code> returned in the response body.</td></tr><tr><td><code>failed</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>failed</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"event_ids":[]}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/events/alerts/batch/ack'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"results"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"succeeded"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"failed"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-events-alerts-event-id-ack"><span class="method-chip m-post">POST</span><code>/api/events/alerts/{event_id}/ack</code></h2>
-<p class="badges"><span class="badge">request tier</span></p>
-<p class="ep-summary">POST /api/events/alerts/{event_id}/ack — acknowledge an alert (#11 slice 2e).</p>
-<p>POST /api/events/alerts/{event_id}/ack — acknowledge an alert (#11 slice 2e). Marks the alert (a domain_events row) as seen by the acting principal; the feed then shows <code>acknowledged</code> + who/when. Re-acking updates in place. Request-tier (any authenticated operator). 404 when the event id is unknown, 400 on a control-character note, 503 with no DB.</p>
+<p class="badges"><span class="badge">request access</span></p>
+<p class="ep-summary">Acknowledge an alert (#11 slice 2e).</p>
+<p>Marks the alert (a domain_events row) as seen by the acting principal; the feed then shows <code>acknowledged</code> + who/when. Re-acking updates in place. Request-tier (any authenticated operator). 404 when the event id is unknown, 400 on a control-character note, 503 with no DB.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/events/alerts/{event_id}/ack</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>event_id</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AlertAckBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>note</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"note": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/events/alerts/{event_id}/ack</span></code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-datacenter.html">&larr; Datacenter</a><a href="/api-evidence.html">Evidence &rarr;</a></nav>
+<p>JSON structure: <code>AlertAckBody</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>note</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>note</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>acknowledged</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>acknowledged</code> returned in the response body.</td></tr><tr><td><code>event_id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>event_id</code> returned in the response body.</td></tr><tr><td><code>acknowledged_by</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>acknowledged_by</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/events/alerts/&lt;event_id&gt;/ack'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"acknowledged"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"event_id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"acknowledged_by"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-datacenter.html">&larr; Datacenter</a><a href="/api-evidence.html">Evidence &rarr;</a></nav>
 </main>
 </div>
 <script>

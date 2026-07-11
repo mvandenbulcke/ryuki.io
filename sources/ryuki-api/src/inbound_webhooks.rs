@@ -86,7 +86,9 @@ fn generic_500(
 /// PUBLIC — no human session, no agent bearer token. Authenticates ONLY via the
 /// `X-Hub-Signature-256` HMAC over the raw body, verified against the
 /// connection's webhook secret. See module docs for the fail-closed / no-oracle
-/// contract.
+/// contract. A verified delivery is recorded as a domain event and returns
+/// `202 Accepted` with `{ "status": "accepted", "event_id": "..." }`; the
+/// external payload itself is never echoed or stored verbatim.
 pub async fn webhook_receive(
     Path(connection_id): Path<String>,
     headers: HeaderMap,

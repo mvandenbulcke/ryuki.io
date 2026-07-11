@@ -1,110 +1,114 @@
 {
-  "generated_by": "hand-written sample mirroring the api-doc.json contract (ryuki-validator generate-api-doc)",
-  "route_count": 6,
+  "generated_by": "synthetic renderer fixture; these /api/example routes are not part of the live API",
+  "route_count": 2,
   "areas": [
     {
-      "key": "admin",
-      "title": "Admin",
-      "description": "Administrative surface: API tokens, principals, and platform settings.",
+      "key": "example",
+      "title": "Example",
+      "description": "Synthetic operations that demonstrate the api-doc.json contract without duplicating live route facts.",
       "routes": [
         {
           "method": "GET",
-          "path": "/api/admin/tokens",
-          "tier": "admin",
+          "path": "/api/example/widgets/{widget_id}",
+          "tier": "read",
           "auth_exempt": false,
-          "handler": "admin_tokens_list",
-          "summary": "List API tokens.",
-          "description": "Returns every token the caller may see, **including revoked ones**, newest first. Reads are narrowed by the caller's site and environment scopes; see [RBAC & Scoping](rbac-and-scoping.md).\n\nUse `limit` and `offset` to page through large fleets. The filtered total is reported alongside the page.",
-          "query_params": [
-            { "name": "limit", "type": "i64", "optional": true, "doc": "Page size; capped server-side." },
-            { "name": "offset", "type": "i64", "optional": true, "doc": "Rows to skip before the first result." },
-            { "name": "site", "type": "String", "optional": false, "doc": "Site code to filter on. Principals with multiple site scopes must name one." }
+          "handler": "synthetic_widget_get",
+          "summary": "Retrieve an example widget.",
+          "description": "Synthetic fixture only. The generated docs use docs/api/api-doc.json as their live source of truth.",
+          "path_params": [
+            {
+              "name": "widget_id",
+              "type": "Uuid",
+              "optional": false,
+              "doc": "Synthetic widget identifier."
+            }
           ],
+          "query_params_state": "known",
+          "query_params": [
+            {
+              "name": "expand",
+              "type": "Option<String>",
+              "optional": true,
+              "doc": "Synthetic related-resource selector."
+            }
+          ],
+          "request_headers": [
+            {
+              "name": "Authorization",
+              "type": "string",
+              "required": true,
+              "description": "Synthetic bearer credential."
+            }
+          ],
+          "request_body_state": "none",
           "request_body": null,
-          "response_notes": "Bare JSON array; the filtered total arrives in the `X-Total-Count` header."
+          "success_responses": [
+            {
+              "status": 200,
+              "description": "Returns the synthetic widget.",
+              "body_state": "json",
+              "body": {
+                "type": "ExampleWidget",
+                "fields": [
+                  {
+                    "name": "id",
+                    "type": "Uuid",
+                    "optional": false,
+                    "doc": "Synthetic widget identifier."
+                  },
+                  {
+                    "name": "name",
+                    "type": "String",
+                    "optional": false,
+                    "doc": "Synthetic display name."
+                  }
+                ]
+              },
+              "headers": []
+            }
+          ],
+          "response_notes": null
         },
         {
           "method": "POST",
-          "path": "/api/admin/tokens",
-          "tier": "admin",
+          "path": "/api/example/webhook",
+          "tier": "webhook",
           "auth_exempt": false,
-          "handler": "admin_tokens_create",
-          "summary": "Mint a scoped API token.",
-          "description": "Creates a token bound to the given roles and optional scopes. Tokens are create-and-revoke: there is no edit.",
+          "handler": "synthetic_webhook_receive",
+          "summary": "Receive a synthetic signed webhook.",
+          "description": "Synthetic fixture used to exercise raw-body and signature documentation.",
+          "path_params": [],
+          "query_params_state": "none",
           "query_params": null,
-          "request_body": {
-            "struct": "TokenCreateRequest",
-            "fields": [
-              { "name": "name", "type": "String", "optional": false, "doc": "Display name shown in the token list." },
-              { "name": "roles", "type": "Vec<String>", "optional": false, "doc": "Role names to grant." },
-              { "name": "site_scope", "type": "Option<String>", "optional": true, "doc": "Comma-separated site codes; empty means unrestricted." },
-              { "name": "expires_in_days", "type": "u32", "optional": true, "doc": "Days until expiry." },
-              { "name": "enabled", "type": "bool", "optional": false, "doc": "Whether the token is active on creation." }
-            ]
-          },
-          "response_notes": "Returns the token secret once; it is never shown again."
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/admin/tokens/{id}",
-          "tier": "admin",
-          "auth_exempt": false,
-          "handler": "admin_tokens_revoke",
-          "summary": "Revoke a token.",
-          "description": null,
-          "query_params": null,
-          "request_body": null,
-          "response_notes": null
-        }
-      ]
-    },
-    {
-      "key": "platform",
-      "title": "Platform",
-      "description": "Server inventory and lifecycle operations.",
-      "routes": [
-        {
-          "method": "GET",
-          "path": "/api/platform/health",
-          "tier": "audit",
-          "auth_exempt": true,
-          "handler": "platform_health",
-          "summary": "Liveness probe.",
-          "description": "Unauthenticated health probe for load balancers and uptime checks.",
-          "query_params": null,
-          "request_body": null,
-          "response_notes": "Plain `200 OK` with build metadata."
-        },
-        {
-          "method": "PUT",
-          "path": "/api/platform/servers/{id}",
-          "tier": "execute",
-          "auth_exempt": false,
-          "handler": "platform_server_update",
-          "summary": null,
-          "description": null,
-          "query_params": null,
-          "request_body": null,
-          "response_notes": null
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/platform/servers/{id}/labels",
-          "tier": "request",
-          "auth_exempt": false,
-          "handler": "platform_server_labels_patch",
-          "summary": "Replace a server's label map.",
-          "description": "Full replacement of the label map; omitted keys are removed.\n\nLabel writes are audited. The `dry_run` flag validates the payload without applying it.",
-          "query_params": [
-            { "name": "dry_run", "type": "bool", "optional": true, "doc": "Validate without applying." }
+          "request_headers": [
+            {
+              "name": "X-Example-Signature",
+              "type": "string",
+              "required": true,
+              "description": "Synthetic signature over the exact request bytes."
+            }
           ],
-          "request_body": {
-            "struct": "LabelPatch",
-            "fields": [
-              { "name": "labels", "type": "HashMap<String, String>", "optional": false, "doc": "Replacement label map." },
-              { "name": "reason", "type": "Option<String>", "optional": true, "doc": "Audit note attached to the change." }
-            ]
-          },
+          "request_body_state": "raw",
+          "request_body": null,
+          "success_responses": [
+            {
+              "status": 202,
+              "description": "Accepts the synthetic delivery.",
+              "body_state": "json",
+              "body": {
+                "type": "Value",
+                "fields": [
+                  {
+                    "name": "status",
+                    "type": "String",
+                    "optional": false,
+                    "doc": "Synthetic acceptance status."
+                  }
+                ]
+              },
+              "headers": []
+            }
+          ],
           "response_notes": null
         }
       ]

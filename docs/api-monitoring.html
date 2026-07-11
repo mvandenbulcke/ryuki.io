@@ -46,191 +46,742 @@
 <h1>Monitoring API</h1>
 <p>Monitoring configuration: alert-route management, alert reads, noise review, and Zabbix drift contracts.</p>
 <p class="area-count">23 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-alert-routes"><span class="method-chip m-get">GET</span><code>/api/monitoring/alert-routes</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/alert-routes</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">List alert routes.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/alert-routes</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routes'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-alert-routes"><span class="method-chip m-post">POST</span><code>/api/monitoring/alert-routes</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Create alert routes.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/alert-routes</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AlertRouteCreateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>severity</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>hostGroup</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>supportGroup</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>priority</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"triggerName": "&lt;string&gt;", "severity": "&lt;string&gt;", "hostGroup": "&lt;string&gt;", "supportGroup": "&lt;string&gt;", "priority": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/alert-routes</span></code></pre>
+<p>JSON structure: <code>AlertRouteCreateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>triggerName</code> in the JSON request body.</td></tr><tr><td><code>severity</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>severity</code> in the JSON request body.</td></tr><tr><td><code>hostGroup</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>hostGroup</code> in the JSON request body.</td></tr><tr><td><code>supportGroup</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportGroup</code> in the JSON request body.</td></tr><tr><td><code>priority</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>priority</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"triggerName":"&lt;string&gt;","severity":"&lt;string&gt;","hostGroup":"&lt;string&gt;","supportGroup":"&lt;string&gt;","priority":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routes'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="delete-api-monitoring-alert-routes-id"><span class="method-chip m-delete">DELETE</span><code>/api/monitoring/alert-routes/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> DELETE <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</code></pre>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Delete alert routes.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>DELETE https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>deleted</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>deleted</code> returned in the response body.</td></tr><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> DELETE \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routes/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"deleted"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-alert-routes-id"><span class="method-chip m-get">GET</span><code>/api/monitoring/alert-routes/{id}</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Get alert routes.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routes/&lt;id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="put-api-monitoring-alert-routes-id"><span class="method-chip m-put">PUT</span><code>/api/monitoring/alert-routes/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Update alert routes.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>PUT https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AlertRouteUpdateRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>severity</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>hostGroup</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>supportGroup</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>priority</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>enabled</code></td><td><code>bool</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> PUT \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"triggerName": "&lt;string&gt;", "severity": "&lt;string&gt;", "hostGroup": "&lt;string&gt;", "supportGroup": "&lt;string&gt;", "priority": "&lt;string&gt;", "enabled": true}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/alert-routes/{id}</span></code></pre>
+<p>JSON structure: <code>AlertRouteUpdateRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>triggerName</code> in the JSON request body.</td></tr><tr><td><code>severity</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>severity</code> in the JSON request body.</td></tr><tr><td><code>hostGroup</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>hostGroup</code> in the JSON request body.</td></tr><tr><td><code>supportGroup</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>supportGroup</code> in the JSON request body.</td></tr><tr><td><code>priority</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value of <code>priority</code> in the JSON request body.</td></tr><tr><td><code>enabled</code></td><td><code>boolean</code></td><td><span class="req req-optional">Optional</span></td><td>Whether the requested capability should be enabled.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> PUT \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routes/&lt;id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-alert-routing-contract"><span class="method-chip m-get">GET</span><code>/api/monitoring/alert-routing-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/alert-routing-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Monitoring alert routing contract.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/alert-routing-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveRoutingAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveRoutingAllowed</code> returned in the response body.</td></tr><tr><td><code>dryRunRequired</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dryRunRequired</code> returned in the response body.</td></tr><tr><td><code>supportedWorkflows</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedWorkflows</code> returned in the response body.</td></tr><tr><td><code>routeDimensions</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>routeDimensions</code> returned in the response body.</td></tr><tr><td><code>validSeverities</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>validSeverities</code> returned in the response body.</td></tr><tr><td><code>validPriorities</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>validPriorities</code> returned in the response body.</td></tr><tr><td><code>requiredInputs</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredInputs</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr><tr><td><code>rules</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rules</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alert-routing-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveRoutingAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"dryRunRequired"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"supportedWorkflows"</span>: [],
+  <span class="hl-k">"routeDimensions"</span>: [],
+  <span class="hl-k">"validSeverities"</span>: [],
+  <span class="hl-k">"validPriorities"</span>: [],
+  <span class="hl-k">"requiredInputs"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: [],
+  <span class="hl-k">"rules"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-alerts-resolve"><span class="method-chip m-post">POST</span><code>/api/monitoring/alerts/resolve</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Alert resolve.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/alerts/resolve</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AlertResolveRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>severity</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>hostGroup</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"triggerName": "&lt;string&gt;", "severity": "&lt;string&gt;", "hostGroup": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/alerts/resolve</span></code></pre>
+<p>JSON structure: <code>AlertResolveRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>triggerName</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>triggerName</code> in the JSON request body.</td></tr><tr><td><code>severity</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>severity</code> in the JSON request body.</td></tr><tr><td><code>hostGroup</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>hostGroup</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"triggerName":"&lt;string&gt;","severity":"&lt;string&gt;","hostGroup":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alerts/resolve'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-alerts-unrouted"><span class="method-chip m-get">GET</span><code>/api/monitoring/alerts/unrouted</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/alerts/unrouted</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Alert unrouted.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/alerts/unrouted</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/alerts/unrouted'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-noise-contract"><span class="method-chip m-get">GET</span><code>/api/monitoring/noise-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/noise-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Noise contract.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/noise-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise-contract'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-noise-detect"><span class="method-chip m-post">POST</span><code>/api/monitoring/noise/detect</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Noise detect.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/noise/detect</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>NoiseSiteRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/noise/detect</span></code></pre>
+<p>JSON structure: <code>NoiseSiteRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Site code targeted by the request.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"site":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/detect'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-noise-flapping"><span class="method-chip m-post">POST</span><code>/api/monitoring/noise/flapping</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Noise flapping detect.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/noise/flapping</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>NoiseSiteRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/noise/flapping</span></code></pre>
+<p>JSON structure: <code>NoiseSiteRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Site code targeted by the request.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"site":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/flapping'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-noise-report"><span class="method-chip m-get">GET</span><code>/api/monitoring/noise/report</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Noise report.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/noise/report</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/noise/report</code></pre>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/report'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-noise-resolve-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/noise/resolve/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Noise resolve.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/noise/resolve/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>NoiseResolveRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>resolution</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"resolution": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/noise/resolve/{id}</span></code></pre>
+<p>JSON structure: <code>NoiseResolveRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>resolution</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>resolution</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"resolution":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/resolve/&lt;id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-noise-suggest-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/noise/suggest/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/noise/suggest/{id}</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>noise_suggest</code>.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Noise suggest.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/noise/suggest/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/suggest/&lt;id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-noise-suppress-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/noise/suppress/{id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Noise suppress.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/noise/suppress/{id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>NoiseSuppressRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>duration_minutes</code></td><td><code>u32</code></td><td>required</td><td></td></tr><tr><td><code>reason</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"duration_minutes": 0, "reason": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/noise/suppress/{id}</span></code></pre>
+<p>JSON structure: <code>NoiseSuppressRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>duration_minutes</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>duration_minutes</code> in the JSON request body.</td></tr><tr><td><code>reason</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Human-readable reason recorded with the operation and its audit trail.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"duration_minutes":0,"reason":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/suppress/&lt;id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-monitoring-noise-suppressed"><span class="method-chip m-get">GET</span><code>/api/monitoring/noise/suppressed</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-summary">GET /api/monitoring/noise/suppressed — suppressed triggers.</p>
-<p>GET /api/monitoring/noise/suppressed — suppressed triggers. #14: paged in SQL; the body stays a bare array (backward-compatible) and the filtered total travels in the <code>X-Total-Count</code> header. <code>noisy_triggers</code> has no site column — the row's site is DERIVED from <code>host</code> — so the scope filter is pushed into SQL via [<code>site_from_host_sql_case</code>], the exact SQL twin of the Rust classifier. That keeps the page cut AFTER the site filter (a plain SQL page filtered in Rust afterwards would make page size and total drift), with no fetch cap needed.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Suppressed triggers.</p>
+<p>#14: paged in SQL; the body stays a bare array (backward-compatible) and the filtered total travels in the <code>X-Total-Count</code> header. <code>noisy_triggers</code> has no site column — the row's site is DERIVED from <code>host</code> — so the scope filter is pushed into SQL via [<code>site_from_host_sql_case</code>], the exact SQL twin of the Rust classifier. That keeps the page cut AFTER the site filter (a plain SQL page filtered in Rust afterwards would make page size and total drift), with no fetch cap needed.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/noise/suppressed</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>i64</code></td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><code>i64</code></td><td>optional</td><td></td></tr></tbody></table>
-<p class="ep-notes"><strong>Response:</strong> Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/noise/suppressed</code></pre>
-<h2 class="ep-h" id="get-api-monitoring-zabbix-drift-contract"><span class="method-chip m-get">GET</span><code>/api/monitoring/zabbix-drift-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix-drift-contract</code></pre>
-<h2 class="ep-h" id="get-api-monitoring-zabbix-drift"><span class="method-chip m-get">GET</span><code>/api/monitoring/zabbix/drift</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix/drift</code></pre>
-<h2 class="ep-h" id="post-api-monitoring-zabbix-drift-detect"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/detect</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Maximum number of results requested.</td></tr><tr><td><code>offset</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Number of results to skip before returning the page.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>ZabbixDriftSiteRequest</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"site": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/monitoring/zabbix/drift/detect</span></code></pre>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response headers</h4>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>X-Total-Count</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Filtered total before limit/offset pagination, returned alongside the successful bare JSON array.</td></tr></tbody></table>
+<p>Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/noise/suppressed'</span></code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-monitoring-zabbix-drift-contract"><span class="method-chip m-get">GET</span><code>/api/monitoring/zabbix-drift-contract</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Zabbix drift contract.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/zabbix-drift-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveRemediationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveRemediationAllowed</code> returned in the response body.</td></tr><tr><td><code>zabbixMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>zabbixMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>rawEventPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawEventPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>dryRunRequired</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dryRunRequired</code> returned in the response body.</td></tr><tr><td><code>workflows</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>workflows</code> returned in the response body.</td></tr><tr><td><code>signals</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>signals</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>endpoints</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>endpoints</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix-drift-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveRemediationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"zabbixMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawEventPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"dryRunRequired"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"workflows"</span>: [],
+  <span class="hl-k">"signals"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"endpoints"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-monitoring-zabbix-drift"><span class="method-chip m-get">GET</span><code>/api/monitoring/zabbix/drift</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Zabbix drift summary.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/monitoring/zabbix/drift</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift'</span></code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="post-api-monitoring-zabbix-drift-detect"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/detect</code></h2>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Zabbix drift detect.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/zabbix/drift/detect</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>JSON structure: <code>ZabbixDriftSiteRequest</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Site code targeted by the request.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"site":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift/detect'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-zabbix-drift-execute-drift-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/execute/{drift_id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix/drift/execute/{drift_id}</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>zabbix_drift_execute</code>.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Execute zabbix drift.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/zabbix/drift/execute/{drift_id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>drift_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift/execute/&lt;drift_id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-zabbix-drift-plan-drift-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/plan/{drift_id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix/drift/plan/{drift_id}</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>zabbix_drift_plan</code>.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Plan zabbix drift.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/zabbix/drift/plan/{drift_id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>drift_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift/plan/&lt;drift_id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-zabbix-drift-validate-drift-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/validate/{drift_id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix/drift/validate/{drift_id}</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>zabbix_drift_validate</code>.</p>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Validate zabbix drift.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/zabbix/drift/validate/{drift_id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>drift_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift/validate/&lt;drift_id&gt;'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-monitoring-zabbix-drift-verify-drift-id"><span class="method-chip m-post">POST</span><code>/api/monitoring/zabbix/drift/verify/{drift_id}</code></h2>
-<p class="badges"><span class="badge">execute tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/monitoring/zabbix/drift/verify/{drift_id}</code></pre>
-<p class="ep-missing">Request body not extracted — see handler <code>zabbix_drift_verify</code>.</p>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-metrics.html">&larr; Metrics</a><a href="/api-network.html">Network &rarr;</a></nav>
+<p class="badges"><span class="badge">execute access</span></p>
+<p class="ep-summary">Verify zabbix drift.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>execute</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/monitoring/zabbix/drift/verify/{drift_id}</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>drift_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/monitoring/zabbix/drift/verify/&lt;drift_id&gt;'</span></code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-metrics.html">&larr; Metrics</a><a href="/api-network.html">Network &rarr;</a></nav>
 </main>
 </div>
 <script>

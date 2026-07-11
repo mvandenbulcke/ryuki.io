@@ -3056,11 +3056,13 @@ name = "ryuki-validator"
 version = "0.1.0"
 dependencies = [
  "figment",
+ "proc-macro2",
  "rayon",
  "ryuki-core",
  "serde",
  "serde_json",
  "serde_yaml",
+ "syn",
  "toml 0.8.23",
 ]
 

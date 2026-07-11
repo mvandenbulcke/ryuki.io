@@ -258,9 +258,15 @@ pub struct JobLease {
 /// exact ownership fence before extending the database-clock lease deadline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHeartbeat {
+    /// Running job whose lease should be renewed. Omit together with every
+    /// other lease field for an idle heartbeat.
     pub running_job_id: Option<Uuid>,
+    /// Exact lease attempt identifier issued with `running_job_id`.
     pub attempt_id: Option<Uuid>,
+    /// Exact lease generation issued by the control plane.
     pub lease_generation: Option<u64>,
+    /// Exact opaque fencing token issued for this attempt. Partial or stale
+    /// four-field fences are rejected.
     pub fencing_token: Option<String>,
 }
 
@@ -288,8 +294,12 @@ impl AgentHeartbeat {
 /// request renewed an exact running-job lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHeartbeatResponse {
+    /// Identifier of the authenticated enrolled agent.
     pub agent_id: String,
+    /// Control-plane timestamp recorded for this heartbeat.
     pub last_seen_at: DateTime<Utc>,
+    /// Renewed database-clock lease deadline; present only for a valid running
+    /// job fence and omitted for an idle heartbeat.
     pub lease_deadline: Option<DateTime<Utc>>,
 }
 

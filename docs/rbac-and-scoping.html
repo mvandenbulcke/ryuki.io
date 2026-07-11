@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RBAC & Scoping · Ryuki</title>
-<meta name="description" content="Roles, permission tiers, site/environment scopes and their enforcement semantics.">
+<meta name="description" content="Roles, route access classes, site/environment scopes and their enforcement semantics.">
 <link rel="canonical" href="https://ryuki.io/rbac-and-scoping.html">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://ryuki.io/rbac-and-scoping.html">
 <meta property="og:title" content="RBAC & Scoping · Ryuki">
-<meta property="og:description" content="Roles, permission tiers, site/environment scopes and their enforcement semantics.">
+<meta property="og:description" content="Roles, route access classes, site/environment scopes and their enforcement semantics.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -74,13 +74,14 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link active" aria-current="page" data-sections="roles and permission tiers
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link active" aria-current="page" data-sections="roles and permissions
+route access classes
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
 managing api tokens
 authentication modes
-a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a><ul class="sb-sections"><li><a href="#roles-and-permission-tiers">Roles and permission tiers</a></li><li><a href="#scopes">Scopes</a></li><li><a href="#enforcement-semantics">Enforcement semantics</a></li><li><a href="#platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</a></li><li><a href="#managing-api-tokens">Managing API tokens</a></li><li><a href="#authentication-modes">Authentication modes</a></li><li><a href="#a-note-on-the-portal">A note on the portal</a></li></ul></li><li><a class="sb-link" data-sections="how an agent joins the platform
+a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a><ul class="sb-sections"><li><a href="#roles-and-permissions">Roles and permissions</a></li><li><a href="#route-access-classes">Route access classes</a></li><li><a href="#scopes">Scopes</a></li><li><a href="#enforcement-semantics">Enforcement semantics</a></li><li><a href="#platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</a></li><li><a href="#managing-api-tokens">Managing API tokens</a></li><li><a href="#authentication-modes">Authentication modes</a></li><li><a href="#a-note-on-the-portal">A note on the portal</a></li></ul></li><li><a class="sb-link" data-sections="how an agent joins the platform
 execution modes
 the live-apply trust chain
 where to see results
@@ -98,6 +99,7 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
 authentication
+request headers
 authorization
 conventions
 walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
@@ -105,18 +107,27 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <main id="main">
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ RBAC & Scoping</span></nav>
 <h1 id="rbac-scoping">RBAC &amp; Scoping</h1>
-<p>Authorization has two independent layers. Roles decide <strong>what</strong> a principal may do, through five permission tiers. Scopes decide <strong>where</strong> they may do it, along two axes: site and environment. A request must pass both.</p>
-<h2 id="roles-and-permission-tiers">Roles and permission tiers</h2>
-<p>Ryuki uses twelve fixed Entra app roles. Each maps to one or more permission tiers; coarse authorization checks tiers, while approval workflows additionally use canonical role names for approval routing and quorum bookkeeping. See <a href="entra-app-registration.html">Entra App Registration</a> for the full role-to-tier matrix and how the <code>roles</code> claim is issued.</p>
-<table><thead><tr><th>Tier</th><th>Grants</th></tr></thead><tbody>
-<tr><td><code>admin</code></td><td>Platform administration. Superuser: satisfies every other tier.</td></tr>
-<tr><td><code>approve</code></td><td>Approving requests through the governed lifecycle.</td></tr>
-<tr><td><code>execute</code></td><td>Dispatching execution (dry-run by default; live modes have extra gates).</td></tr>
-<tr><td><code>request</code></td><td>Creating and managing requests.</td></tr>
-<tr><td><code>audit</code></td><td>Read access to audit trails and evidence.</td></tr>
+<p>Authorization has two independent layers. Roles decide <strong>what</strong> a human principal may do through five permissions. Scopes decide <strong>where</strong> the principal may do it along two axes: site and environment. A request must pass both. The route reference also uses access-class labels for composite reads and non-human authentication; those labels are not roles.</p>
+<h2 id="roles-and-permissions">Roles and permissions</h2>
+<p>Ryuki uses twelve fixed Entra app roles. Each maps to one or more permissions; coarse authorization checks permissions, while approval workflows additionally use canonical role names for approval routing and quorum bookkeeping. See <a href="entra-app-registration.html">Entra App Registration</a> for the full role matrix and how the <code>roles</code> claim is issued.</p>
+<table><thead><tr><th>Permission</th><th>Grants</th></tr></thead><tbody>
+<tr><td><code>admin</code></td><td>Platform administration. This is the superuser permission and satisfies every other permission check.</td></tr>
+<tr><td><code>approve</code></td><td>Governed approval, rejection, rework, and maker/checker sign-offs.</td></tr>
+<tr><td><code>execute</code></td><td>Operator mutations and designated operator working-data reads. Dry-run is the default; live modes have additional gates.</td></tr>
+<tr><td><code>request</code></td><td>Creating requests and requester/self-service actions, subject to ownership checks where documented.</td></tr>
+<tr><td><code>audit</code></td><td>Audit trails, evidence, and eligibility for ordinary authenticated reads.</td></tr>
 </tbody></table>
 <p>The roles: <code>PlatformAdmin</code>, <code>BreakGlassAdmin</code>, <code>DatacenterApprover</code>, <code>VMwareOperator</code>, <code>HyperVOperator</code>, <code>ProxmoxOperator</code>, <code>WintelLinuxOperator</code>, <code>BackupOperator</code>, <code>MonitoringOperator</code>, <code>ServiceDesk</code>, <code>Auditor</code>, and <code>Requester</code>.</p>
 <p>Role assignment for people happens in the Entra enterprise application, not in Ryuki. Unknown roles on a token mint are rejected.</p>
+<h2 id="route-access-classes">Route access classes</h2>
+<p>The API Reference's <strong>Access</strong> value can be one of the five permissions above or one of these effective route classes:</p>
+<table><thead><tr><th>Access class</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>read</code></td><td>Composite authenticated access, satisfied by <code>audit</code> <strong>or</strong> <code>request</code> (and therefore by <code>admin</code>). It is not a permission stored on a role. Audit-grade reads still require <code>audit</code> specifically; sensitive and operator-data reads can require <code>admin</code> or <code>execute</code>.</td></tr>
+<tr><td><code>public</code></td><td>No human session is required. This covers health/bootstrap and selected auth or agent-bootstrap routes; handlers still validate their inputs and configured mode.</td></tr>
+<tr><td><code>agent</code></td><td>Bypasses human-session RBAC and authenticates with an agent <code>rya_...</code> bearer token plus the supported <code>x-ryuki-protocol-version</code>. Agent registration, the control-plane public key, and the agent OpenAPI document are public bootstrap exceptions.</td></tr>
+<tr><td><code>webhook</code></td><td>Bypasses human-session RBAC but requires a valid <code>X-Hub-Signature-256</code> HMAC over the exact raw body. It is not anonymous access.</td></tr>
+</tbody></table>
+<p>These classes explain why the complete route surface cannot be described using only the five role permissions. They describe how a caller reaches a route; role permissions and scope checks continue to govern human API operations.</p>
 <h2 id="scopes">Scopes</h2>
 <p>A principal's session carries a site scope and an environment scope, each a list of allowed values. An empty list means unrestricted on that axis.</p>
 <p>Today, scopes are carried by <strong>API tokens</strong>: interactive sessions (Entra ID or local auth) are unscoped, and the dev auth modes run as an unscoped admin. To give an integration a narrow blast radius, mint it a scoped token.</p>
@@ -124,11 +135,12 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>The same rules apply across all scoped domains:</p>
 <table><thead><tr><th>Access pattern</th><th>Out-of-scope behavior</th></tr></thead><tbody>
 <tr><td>Read a single resource by id</td><td><code>404</code>, identical to a missing row. Cross-scope probing never confirms existence.</td></tr>
-<tr><td>Write or filter that explicitly names an out-of-scope site or environment</td><td><code>403</code></td></tr>
-<tr><td>List endpoints</td><td>Results are silently narrowed to the principal's scope. A principal with multiple scopes must name one explicitly in the filter.</td></tr>
-<tr><td>Fleet-wide or aggregate operations</td><td><code>403</code> for scoped principals: an aggregate over data you cannot fully see is denied, not silently partial.</td></tr>
+<tr><td>Write, filtered read, or single-site aggregate that explicitly names an out-of-scope site or environment</td><td><code>403</code></td></tr>
+<tr><td>List endpoint with no explicit site/environment filter</td><td>Results are silently narrowed across every site and environment in the principal's authorized scope.</td></tr>
+<tr><td>Endpoint that resolves one optional site/environment filter</td><td>A principal with multiple allowed values must name one explicitly; an omitted ambiguous filter is rejected.</td></tr>
+<tr><td>Cross-scope or fleet-wide aggregate</td><td><code>403</code> for scoped principals: an aggregate over data the caller cannot fully see is denied, not silently partial. A single-site aggregate remains available when that site resolves within scope.</td></tr>
 <tr><td>Resources that target a set of sites (for example patch waves)</td><td>Allowed only if every targeted site is in scope.</td></tr>
-<tr><td>Environment-scoped principal reading a site-only resource</td><td>Empty result set; the axes do not substitute for each other.</td></tr>
+<tr><td>Environment-scoped principal listing a site-only resource without a filter</td><td>Empty result set; the axes do not substitute for each other. An explicit or by-id site read is rejected according to the filtered (<code>403</code>) or single-resource (<code>404</code>) rule above.</td></tr>
 </tbody></table>
 <h2 id="platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</h2>
 <p>Some resources have optional site or environment columns. A <code>NULL</code> axis means "no value on that axis," not "visible to everyone":</p>
@@ -139,7 +151,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 </ul>
 <h2 id="managing-api-tokens">Managing API tokens</h2>
 <table><thead><tr><th>Route</th><th>Method</th><th>Notes</th></tr></thead><tbody>
-<tr><td><code>/api/admin/tokens</code></td><td>POST</td><td>Create: name, owner principal, roles, optional <code>site_scope</code> and <code>environment_scope</code> (comma-separated), expiry. Admin tier, interactive session required: a token cannot mint tokens.</td></tr>
+<tr><td><code>/api/admin/tokens</code></td><td>POST</td><td>Create: name, owner principal, roles, optional <code>site_scope</code> and <code>environment_scope</code> (comma-separated), expiry. <code>admin</code> permission, interactive session required: a token cannot mint tokens.</td></tr>
 <tr><td><code>/api/admin/tokens</code></td><td>GET</td><td>List tokens.</td></tr>
 <tr><td><code>/api/admin/tokens/{id}</code></td><td>GET / DELETE</td><td>Inspect / revoke.</td></tr>
 <tr><td><code>/api/admin/rbac-roles</code></td><td>GET</td><td>The role and permission catalog, as the server enforces it.</td></tr>

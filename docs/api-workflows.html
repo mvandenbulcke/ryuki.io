@@ -46,39 +46,272 @@
 <h1>Workflows API</h1>
 <p>Workflow contract reads: per-workflow deployment/dry-run contracts and preflight decision surfaces.</p>
 <p class="area-count">6 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-workflows-application-environment-deployment-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/application-environment/deployment-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/application-environment/deployment-contract</code></pre>
-<h2 class="ep-h" id="get-api-workflows-application-environment-retirement-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/application-environment/retirement-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/application-environment/retirement-contract</code></pre>
-<h2 class="ep-h" id="get-api-workflows-azure-landing-zone-validation-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/azure-landing-zone/validation-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/azure-landing-zone/validation-contract</code></pre>
-<h2 class="ep-h" id="get-api-workflows-preflight-local-decision"><span class="method-chip m-get">GET</span><code>/api/workflows/preflight/local/decision</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows app env deployment.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/application-environment/deployment-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>requestedOffering</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>owner</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>site</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>environment</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>criticality</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>dryRunPlan</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>approvalRoute</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>evidenceManifest</code></td><td><code>String</code></td><td>optional</td><td></td></tr><tr><td><code>secretReferenceState</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/preflight/local/decision</code></pre>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveExecutionEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveExecutionEnabled</code> returned in the response body.</td></tr><tr><td><code>deploymentPlans</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>deploymentPlans</code> returned in the response body.</td></tr><tr><td><code>tiers</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tiers</code> returned in the response body.</td></tr><tr><td><code>supportedHypervisors</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedHypervisors</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/application-environment/deployment-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveExecutionEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"deploymentPlans"</span>: [],
+  <span class="hl-k">"tiers"</span>: [],
+  <span class="hl-k">"supportedHypervisors"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-workflows-application-environment-retirement-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/application-environment/retirement-contract</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows app env retirement.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/application-environment/retirement-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveExecutionEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveExecutionEnabled</code> returned in the response body.</td></tr><tr><td><code>phases</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>phases</code> returned in the response body.</td></tr><tr><td><code>domains</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>domains</code> returned in the response body.</td></tr><tr><td><code>supportedHypervisors</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedHypervisors</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/application-environment/retirement-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveExecutionEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"phases"</span>: [],
+  <span class="hl-k">"domains"</span>: [],
+  <span class="hl-k">"supportedHypervisors"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-workflows-azure-landing-zone-validation-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/azure-landing-zone/validation-contract</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows azure lz.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/azure-landing-zone/validation-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>validationSurfaces</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>validationSurfaces</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/azure-landing-zone/validation-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"validationSurfaces"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
+<h2 class="ep-h" id="get-api-workflows-preflight-local-decision"><span class="method-chip m-get">GET</span><code>/api/workflows/preflight/local/decision</code></h2>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows preflight local decision.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/preflight/local/decision</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>requestedOffering</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>requestedOffering</code> query parameter.</td></tr><tr><td><code>owner</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>owner</code> query parameter.</td></tr><tr><td><code>site</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Site identifier used to scope or filter the operation.</td></tr><tr><td><code>environment</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Environment identifier used to scope or filter the operation.</td></tr><tr><td><code>criticality</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>criticality</code> query parameter.</td></tr><tr><td><code>dryRunPlan</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>dryRunPlan</code> query parameter.</td></tr><tr><td><code>approvalRoute</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>approvalRoute</code> query parameter.</td></tr><tr><td><code>evidenceManifest</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>evidenceManifest</code> query parameter.</td></tr><tr><td><code>secretReferenceState</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>secretReferenceState</code> query parameter.</td></tr></tbody></table>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveExecutionAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveExecutionAllowed</code> returned in the response body.</td></tr><tr><td><code>decision</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>decision</code> returned in the response body.</td></tr><tr><td><code>status</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>requestedOffering</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requestedOffering</code> returned in the response body.</td></tr><tr><td><code>requiredInputs</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredInputs</code> returned in the response body.</td></tr><tr><td><code>missingInputs</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>missingInputs</code> returned in the response body.</td></tr><tr><td><code>guardBlocks</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>guardBlocks</code> returned in the response body.</td></tr><tr><td><code>remediation</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>remediation</code> returned in the response body.</td></tr><tr><td><code>evidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidence</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/preflight/local/decision'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveExecutionAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"decision"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"requestedOffering"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"requiredInputs"</span>: [],
+  <span class="hl-k">"missingInputs"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"guardBlocks"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"remediation"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"evidence"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-workflows-server-lifecycle-dry-run-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/server-lifecycle/dry-run-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/server-lifecycle/dry-run-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows server lifecycle.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/server-lifecycle/dry-run-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveExecutionEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveExecutionEnabled</code> returned in the response body.</td></tr><tr><td><code>workflows</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>workflows</code> returned in the response body.</td></tr><tr><td><code>supportedHypervisors</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedHypervisors</code> returned in the response body.</td></tr><tr><td><code>supportedLinuxDistributions</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedLinuxDistributions</code> returned in the response body.</td></tr><tr><td><code>requiredInputs</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredInputs</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/server-lifecycle/dry-run-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveExecutionEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"workflows"</span>: [],
+  <span class="hl-k">"supportedHypervisors"</span>: [],
+  <span class="hl-k">"supportedLinuxDistributions"</span>: [],
+  <span class="hl-k">"requiredInputs"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-workflows-sql-server-deployment-contract"><span class="method-chip m-get">GET</span><code>/api/workflows/sql-server/deployment-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/workflows/sql-server/deployment-contract</code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-vm.html">&larr; VM</a><span></span></nav>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Workflows sql server.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/workflows/sql-server/deployment-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>providerCallsEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsEnabled</code> returned in the response body.</td></tr><tr><td><code>liveExecutionEnabled</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveExecutionEnabled</code> returned in the response body.</td></tr><tr><td><code>deploymentPlans</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>deploymentPlans</code> returned in the response body.</td></tr><tr><td><code>topologies</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>topologies</code> returned in the response body.</td></tr><tr><td><code>supportedHypervisors</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>supportedHypervisors</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>planSections</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>planSections</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/workflows/sql-server/deployment-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"providerCallsEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveExecutionEnabled"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"deploymentPlans"</span>: [],
+  <span class="hl-k">"topologies"</span>: [],
+  <span class="hl-k">"supportedHypervisors"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"planSections"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: []
+}</code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-vm.html">&larr; VM</a><span></span></nav>
 </main>
 </div>
 <script>

@@ -1,14 +1,24 @@
 # Using the API
 
-Everything the portal does, it does through this API, and everything the API serves is available to your own tooling: the same authentication, the same permission tiers, the same audited lifecycle. This guide covers how to authenticate, the conventions every endpoint follows, and a complete request lifecycle you can run with curl. The [API Reference](api-reference.md) documents every route by area.
+Everything the portal does, it does through this API, and the same surface is
+available to your own tooling: the same authentication, authorization, scopes,
+and audited lifecycle. This guide covers the cross-cutting conventions and a
+complete request lifecycle you can run with curl. The
+[API Reference](api-reference.md) documents every generated route by area.
 
 ## Base URL and versioning
 
-All routes live under `/api` on the control plane (the same origin the portal is served behind). Every response carries an `x-api-version` header. Health lives at `/health` and readiness at `/ready`, both unauthenticated.
+Application routes live under `/api` on the control plane, normally on the same
+origin as the portal. Three operational routes live at the top level: `/health`
+and `/ready` are unauthenticated probes, while `/metrics` requires human API
+authentication. The API is not URI-versioned. Normal routed responses carry the
+server version in `x-api-version`.
 
 ## Authentication
 
-The API supports three ways in, selected by the platform's `RYUKI_AUTH_MODE` (see [Configuration](configuration.md)):
+`RYUKI_AUTH_MODE` selects one of four session-establishment modes (see
+[Configuration](configuration.md)); service API tokens are a separate,
+mode-independent credential type.
 
 **Development modes** (`mock-dry-run`, the default, and `static-dry-run`): requests run as a static admin session with no credentials. Nothing to configure; never run these against anything real.
 
@@ -54,7 +64,13 @@ curl --fail-with-body -sS 'https://<host>/api/requests' \
 curl -s https://<host>/api/requests -H "Authorization: Bearer <entra-jwt>"
 ```
 
-**API tokens** work in every mode and are the right choice for integrations. An admin mints one; the `ryk_...` value is returned exactly once. Tokens can carry site and environment scopes, which narrow everything the token sees — the recommended blast-radius control.
+**API tokens** are the right choice for integrations once the platform is using
+database-backed interactive authentication. An interactive Local or Entra
+administrator mints one; another API token cannot mint tokens. The `ryk_...`
+value is returned exactly once. Tokens created while the platform is in
+`mock-dry-run` or `static-dry-run` are persisted with `token_valid: false` and
+cannot authenticate. Usable tokens can carry site and environment scopes, which
+narrow everything the token sees—the recommended blast-radius control.
 
 ```bash
 curl -s -X POST https://<host>/api/admin/tokens \
@@ -65,38 +81,119 @@ curl -s -X POST https://<host>/api/admin/tokens \
 curl -s https://<host>/api/requests -H "Authorization: Bearer ryk_..."
 ```
 
+## Request headers
+
+Header names are case-insensitive. Use only the credential type appropriate to
+the route's access class.
+
+| Header | When to send it |
+| --- | --- |
+| `Authorization: Bearer ...` | Human API routes accept a `ryk_...` API token, a validated Entra JWT, or a persisted session UUID as applicable to the configured auth mode. Token minting is the exception: it rejects `ryk_...` credentials and requires an interactive administrator. Agent routes use their own `rya_...` bearer tokens. |
+| `X-Ryuki-Session-Id` | Explicit persisted-session carrier used by the portal and scripts. A `ryuki_session` cookie can authorize safe reads, but cookie-only `POST`, `PUT`, `PATCH`, and `DELETE` requests are rejected as a CSRF defense. |
+| `Content-Type: application/json` | Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: webhook HMAC verification covers the exact bytes sent. |
+| `x-ryuki-protocol-version` | Required on agent registration, poll, acknowledgement, heartbeat, and result requests. This build accepts version `2`; missing, duplicate, malformed, or unsupported values return `400`. The public-key and OpenAPI bootstrap reads do not require it. |
+| `X-Hub-Signature-256` | Required only by the inbound webhook receiver. Send the hex HMAC-SHA256 of the exact raw body, optionally prefixed with `sha256=`. |
+| `Idempotency-Key` | Enables durable deduplication for authenticated, DB-backed human mutations. Use a unique, unguessable key for each logical operation; the emergency-initiate route requires one. |
+
 ## Authorization
 
-Every route is gated by one of five permission tiers — `admin`, `approve`, `execute`, `request`, `audit` — derived from your roles, and results are narrowed by your site and environment scopes. The enforcement semantics (when you get a 404 versus a 403 versus a silently narrowed list) are documented in [RBAC & Scoping](rbac-and-scoping.md); the per-route tier appears in the [API Reference](api-reference.md).
+Human-session mutations are gated by one of five role permissions: `admin`,
+`approve`, `execute`, `request`, or `audit`. Safe reads and non-human entry
+points also use effective access classes such as composite `read`, `public`,
+`agent`, and `webhook`; those labels are not additional roles. Results are then
+narrowed by site and environment scope. [RBAC & Scoping](rbac-and-scoping.md)
+defines these labels and the `404`/`403`/filtered-list behavior. The effective
+access requirement for each route appears in the
+[API Reference](api-reference.md).
 
 ## Conventions
 
-**Errors** use HTTP status as the authoritative contract. Newer endpoints may
-return a machine code, message, and optional detail, while legacy request and
-agent handlers may return only a human-readable `error` string:
+### Idempotent mutations
+
+The idempotency layer applies to authenticated human `POST`, `PUT`, `PATCH`,
+and `DELETE` requests when PostgreSQL is available. It is opt-in unless the
+route says otherwise: without a usable key, or without a database, the request
+continues without deduplication. A usable key is 1..200 bytes; an unguessable
+UUID is a good default. Keys are isolated by authenticated principal.
+
+The server fingerprints the method, full path and query string, and exact body.
+For the same key and fingerprint, a completed JSON response is replayed with
+its stored status and an `Idempotency-Replayed: true` header. A concurrent
+in-flight request returns `409`; reusing the key for a different fingerprint
+returns `422`. Records become eligible for the best-effort hourly expiry sweep
+after 24 hours; do not assume a key becomes claimable at an exact instant.
+
+`5xx` responses and responses that cannot be replayed faithfully are not
+stored. This includes non-JSON responses, responses with replay-significant
+headers, and `Cache-Control: no-store` one-time-secret responses. The
+idempotency capture path has a 1 MiB request/response buffer limit. The
+high-blast-radius `POST /api/ops/emergency/initiate` route requires a usable key
+and returns `400 IDEMPOTENCY_KEY_REQUIRED` when it is absent or invalid.
+
+### Pagination
+
+Pagination is not universal, and defaults and caps are route-specific. Offset
+routes generally accept `limit` and `offset`. A bare-array response can expose
+the filtered pre-page total in `X-Total-Count`; object responses instead carry
+route-specific metadata such as `total`, `limit`, and `offset`. Cursor routes
+use their documented cursor pair—for example, audit export uses `after_id` and
+returns `next_after_id`. Keep any accompanying time window stable while
+advancing a cursor. All totals and pages are scope-filtered; never infer a
+whole-table count.
+
+### Errors
+
+HTTP status is the authoritative contract, but error bodies are not globally
+uniform. Many human API and middleware errors use the project `ApiError` shape,
+whose `detail` member is optional:
 
 ```json
 { "error": "VALIDATION_FAILED", "message": "site is not active", "detail": "..." }
 ```
 
-Most `4xx` responses mean the request cannot succeed unchanged. A CAS `409`
-requires reloading current state and deciding whether a new transition is still
-valid; do not blindly replay it. `5xx` is the platform's problem. The bounded
-agent, public, and operations-read subset additionally documents RFC
-9457-shaped errors in the machine-readable [OpenAPI spec](api-reference.md);
-the route-by-area reference covers the full registered control-plane surface.
+Legacy, agent, webhook, and extractor paths may instead return a compact
+`{"error":"..."}` object, plain text, or an empty body. `ApiError` is not an
+RFC 9457 Problem Details representation: it does not promise the RFC
+`type`/`title`/`status` members or `application/problem+json`. Parse the body
+documented for the route and always retain the HTTP status.
 
-**Pagination**: pagination-enabled list endpoints accept `limit` (default 500,
-clamped to 1..1000) and `offset`. Object-shaped responses add `total`, `limit`,
-and `offset` keys; bare-array responses carry the filtered total in an
-`X-Total-Count` header instead. Check the route reference because pagination is
-not yet universal. Totals are filtered and scope-aware, never whole-table
-counts.
+Common cross-cutting statuses are `401` for missing or unverified
+authentication, `403` for insufficient permission or an explicitly requested
+out-of-scope target, `413` for an oversized body, `429` for rate limiting, and
+`504` when the configured request timeout expires. A lifecycle CAS `409`
+requires reloading current state and deciding whether a new transition remains
+valid; do not blindly replay it.
 
-**Timestamps** are RFC 3339 strings. **Degraded behavior**: DB-authoritative
-endpoints generally return `source: "no-db"` plus empty reads or `503` writes
-when PostgreSQL is unavailable. Static contracts and selected in-memory
-development handlers have their documented fallback behavior instead.
+### Response metadata, retries, and limits
+
+Capture `x-request-id` and `traceresponse` from responses that include them and
+use them when correlating client failures with server traces. For correlation,
+the current middleware reuses the second dash-separated `traceparent` segment
+when it is 32 characters long; it does not fully validate W3C Trace Context.
+Otherwise the server creates a hyphenated UUID request ID. Treat
+`traceresponse` as Ryuki correlation metadata, not a W3C-conformance guarantee.
+Normal routed responses also include `x-api-version`. A rate-limit `429`
+includes `Retry-After` in whole seconds.
+
+The request timeout defaults to 30 seconds and produces `504 REQUEST_TIMEOUT`
+when it expires. The configurable global request-body limit defaults to
+10 MiB; routes and middleware such as idempotency may impose a smaller limit.
+
+### Reference coverage
+
+The HTML [API Reference](api-reference.md) is generated from the registered
+route surface and covers every generated control-plane route. The
+[machine-readable OpenAPI document](openapi.json) is deliberately bounded
+to the agent protocol, selected public/bootstrap endpoints, and selected
+operational reads. Absence from OpenAPI does not mean that a route is absent;
+use the HTML reference for the complete inventory.
+
+### Other data conventions
+
+Timestamps are RFC 3339 strings. DB-authoritative endpoints generally return
+`source: "no-db"` plus empty reads or `503` writes when PostgreSQL is
+unavailable. Static contracts and selected in-memory development handlers have
+their documented fallback behavior instead.
 
 ## Walkthrough: a request through its lifecycle
 

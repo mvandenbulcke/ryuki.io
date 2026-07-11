@@ -46,84 +46,267 @@
 <h1>Agents API</h1>
 <p>Routes for Agents.</p>
 <p class="area-count">7 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-agents-cp-public-key"><span class="method-chip m-get">GET</span><code>/api/agents/cp-public-key</code></h2>
-<p class="badges"><span class="badge">public tier</span></p>
+<p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
 <p class="ep-summary">Return the CP's Ed25519 public key as base64.</p>
-<p>Return the CP's Ed25519 public key as base64.</p>
 <p class="ep-doc-heading">Auth posture</p>
-<p><strong>Unauthenticated</strong> — intentionally. A public key is not a secret; any agent (or observer) may fetch it. Agents use this to pin the CP public key for verifying [<code>VerifiedLiveContext</code>] grants. This endpoint is mounted via <code>agent_routes()</code>, which sits OUTSIDE the human <code>auth_middleware</code> layer in <code>main.rs</code>, so no session or agent-token is required.</p>
+<p><strong>Unauthenticated</strong> — intentionally.  A public key is not a secret; any agent (or observer) may fetch it.  Agents use this to pin the CP public key for verifying [<code>VerifiedLiveContext</code>] grants.  This endpoint is mounted via <code>agent_routes()</code>, which sits OUTSIDE the human <code>auth_middleware</code> layer in <code>main.rs</code>, so no session or agent-token is required.</p>
 <p>Returns 503 if the CP signing key was not initialised at startup (e.g. the key file was unreadable and the server continued in degraded mode).</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/agents/cp-public-key</code></pre>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/agents/cp-public-key</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>public_key</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>public_key</code> returned in the response body.</td></tr><tr><td><code>protocol_version</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>protocol_version</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/cp-public-key'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"public_key"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"protocol_version"</span>: <span class="hl-n">null</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-agents-openapi-json"><span class="method-chip m-get">GET</span><code>/api/agents/openapi.json</code></h2>
-<p class="badges"><span class="badge">public tier</span></p>
+<p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
 <p class="ep-summary">Thin handler wrapping [<code>openapi_document</code>] for <code>GET /api/agents/openapi.json</code>.</p>
-<p>Thin handler wrapping [<code>openapi_document</code>] for <code>GET /api/agents/openapi.json</code>.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/agents/openapi.json</code></pre>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/agents/openapi.json</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/openapi.json'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-agents-register"><span class="method-chip m-post">POST</span><code>/api/agents/register</code></h2>
-<p class="badges"><span class="badge">public tier</span></p>
-<p class="ep-summary">POST /api/agents/register Enrolls a new agent in 'pending' status.</p>
-<p>POST /api/agents/register</p>
-<p>Enrolls a new agent in 'pending' status. Generates a bearer token, stores its SHA-256 hash, and returns the plaintext token ONCE. A pending agent cannot poll for jobs until an admin approves it.</p>
+<p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
+<p class="ep-summary">Enrolls a new agent in 'pending' status.</p>
+<p>Generates a bearer token, stores its SHA-256 hash, and returns the plaintext token ONCE. A pending agent cannot poll for jobs until an admin approves it.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/agents/register</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>RegisterBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>platform</code></td><td><code>String</code></td><td>required</td><td></td></tr><tr><td><code>capabilities</code></td><td><code>Capabilities</code></td><td>required</td><td></td></tr><tr><td><code>public_key</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"agent_id": "&lt;string&gt;", "platform": "&lt;string&gt;", "capabilities": "&lt;Capabilities&gt;", "public_key": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/register</span></code></pre>
+<p>JSON structure: <code>RegisterBody</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>agent_id</code> in the JSON request body.</td></tr><tr><td><code>platform</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>platform</code> in the JSON request body.</td></tr><tr><td><code>capabilities</code></td><td><code>object (Capabilities)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>capabilities</code> in the JSON request body.</td></tr><tr><td><code>public_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>public_key</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>RegisterResponse</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>RegisterResponse</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>agent_id</code> returned in the response body.</td></tr><tr><td><code>token</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>token</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"agent_id":"&lt;string&gt;","platform":"&lt;string&gt;","capabilities":{},"public_key":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/register'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"agent_id"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"token"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-agents-agent-id-heartbeat"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/heartbeat</code></h2>
-<p class="badges"><span class="badge">agent tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
+<p class="badges"><span class="badge">agent access</span></p>
+<p class="ep-summary">Heartbeat.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>agent</code></td><td>An enrolled agent bearer token beginning with <code>rya_</code> is required.</td><td>The credential represents the enrolled agent; request-path identifiers must address that agent's operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/agents/{agent_id}/heartbeat</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required agent credential: <code>Bearer rya_...</code>; this route bypasses human-session authentication and validates the agent token in the handler.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AgentHeartbeat</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>running_job_id</code></td><td><code>Uuid</code></td><td>optional</td><td></td></tr><tr><td><code>attempt_id</code></td><td><code>Uuid</code></td><td>optional</td><td></td></tr><tr><td><code>lease_generation</code></td><td><code>u64</code></td><td>optional</td><td></td></tr><tr><td><code>fencing_token</code></td><td><code>String</code></td><td>optional</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"running_job_id": "&lt;uuid&gt;", "attempt_id": "&lt;uuid&gt;", "lease_generation": 0, "fencing_token": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/{agent_id}/heartbeat</span></code></pre>
+<p>JSON structure: <code>AgentHeartbeat</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>running_job_id</code></td><td><code>string (uuid)</code></td><td><span class="req req-optional">Optional</span></td><td>Running job whose lease should be renewed. Omit together with every
+other lease field for an idle heartbeat.</td></tr><tr><td><code>attempt_id</code></td><td><code>string (uuid)</code></td><td><span class="req req-optional">Optional</span></td><td>Exact lease attempt identifier issued with <code>running_job_id</code>.</td></tr><tr><td><code>lease_generation</code></td><td><code>integer</code></td><td><span class="req req-optional">Optional</span></td><td>Exact lease generation issued by the control plane.</td></tr><tr><td><code>fencing_token</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Exact opaque fencing token issued for this attempt. Partial or stale
+four-field fences are rejected.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>AgentHeartbeatResponse</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>AgentHeartbeatResponse</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the authenticated enrolled agent.</td></tr><tr><td><code>last_seen_at</code></td><td><code>string (date-time)</code></td><td><span class="req req-required">Required</span></td><td>Control-plane timestamp recorded for this heartbeat.</td></tr><tr><td><code>lease_deadline</code></td><td><code>string (date-time)</code></td><td><span class="req req-optional">Optional</span></td><td>Renewed database-clock lease deadline; present only for a valid running
+job fence and omitted for an idle heartbeat.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer rya_&lt;agent-token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/&lt;agent_id&gt;/heartbeat'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"agent_id"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"last_seen_at"</span>: {},
+  <span class="hl-k">"lease_deadline"</span>: {}
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-agents-agent-id-jobs"><span class="method-chip m-get">GET</span><code>/api/agents/{agent_id}/jobs</code></h2>
-<p class="badges"><span class="badge">agent tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/agents/{agent_id}/jobs</code></pre>
+<p class="badges"><span class="badge">agent access</span></p>
+<p class="ep-summary">Poll job.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>agent</code></td><td>An enrolled agent bearer token beginning with <code>rya_</code> is required.</td><td>The credential represents the enrolled agent; request-path identifiers must address that agent's operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/agents/{agent_id}/jobs</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required agent credential: <code>Bearer rya_...</code>; this route bypasses human-session authentication and validates the agent token in the handler.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr><tr><td><code>204</code></td><td>No Content</td><td>No response body</td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer rya_&lt;agent-token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/&lt;agent_id&gt;/jobs'</span></code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-agents-agent-id-jobs-job-id-ack"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/jobs/{job_id}/ack</code></h2>
-<p class="badges"><span class="badge">agent tier</span></p>
-<p class="ep-summary">POST /api/agents/{agent_id}/jobs/{job_id}/ack Transitions Leased → Running.</p>
-<p>POST /api/agents/{agent_id}/jobs/{job_id}/ack</p>
-<p>Transitions Leased → Running. The caller must supply the fencing_token and attempt_id that match the current lease. A mismatch returns 409.</p>
+<p class="badges"><span class="badge">agent access</span></p>
+<p class="ep-summary">Transitions Leased → Running.</p>
+<p>The caller must supply the fencing_token and attempt_id that match the current lease. A mismatch returns 409.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>agent</code></td><td>An enrolled agent bearer token beginning with <code>rya_</code> is required.</td><td>The credential represents the enrolled agent; request-path identifiers must address that agent's operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/agents/{agent_id}/jobs/{job_id}/ack</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr><tr><td><code>job_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required agent credential: <code>Bearer rya_...</code>; this route bypasses human-session authentication and validates the agent token in the handler.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>AckBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>attempt_id</code></td><td><code>Uuid</code></td><td>required</td><td></td></tr><tr><td><code>fencing_token</code></td><td><code>String</code></td><td>required</td><td></td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"attempt_id": "&lt;uuid&gt;", "fencing_token": "&lt;string&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/{agent_id}/jobs/{job_id}/ack</span></code></pre>
+<p>JSON structure: <code>AckBody</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>attempt_id</code></td><td><code>string (uuid)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>attempt_id</code> in the JSON request body.</td></tr><tr><td><code>fencing_token</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>fencing_token</code> in the JSON request body.</td></tr></tbody></table>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>job_id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>job_id</code> returned in the response body.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer rya_&lt;agent-token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"attempt_id":"&lt;uuid&gt;","fencing_token":"&lt;string&gt;"}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/&lt;agent_id&gt;/jobs/&lt;job_id&gt;/ack'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"job_id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="post-api-agents-agent-id-jobs-job-id-result"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/jobs/{job_id}/result</code></h2>
-<p class="badges"><span class="badge">agent tier</span></p>
+<p class="badges"><span class="badge">agent access</span></p>
 <p class="ep-summary">Verifies and records the signed <code>JobResult</code> from an agent.</p>
-<p>Verifies and records the signed <code>JobResult</code> from an agent.</p>
 <p>The full 9-step verifier runs FAIL-CLOSED: every check that fails returns 4xx and mutates nothing. The terminal UPDATE is a single atomic conditional statement guarded on (id, attempt_id, lease_generation, status IN ('Leased','Running'), unexpired database-clock lease). A repeat POST with the same (job_id, attempt_id, result_id) returns idempotent 200.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>agent</code></td><td>An enrolled agent bearer token beginning with <code>rya_</code> is required.</td><td>The credential represents the enrolled agent; request-path identifiers must address that agent's operation.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>POST https://&lt;your-host&gt;/api/agents/{agent_id}/jobs/{job_id}/result</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr><tr><td><code>job_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the target resource in the request path.</td></tr></tbody></table>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required agent credential: <code>Bearer rya_...</code>; this route bypasses human-session authentication and validates the agent token in the handler.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
-<p class="ep-struct">Structure: <code>ResultBody</code></p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>job_result</code></td><td><code>JobResult</code></td><td>required</td><td></td></tr><tr><td><code>evidence</code></td><td><code>Vec&lt;u8&gt;</code></td><td>optional</td><td>Raw evidence bytes (the payload whose SHA-256 is <code>evidence_digest</code>).
+<p>JSON structure: <code>ResultBody</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>job_result</code></td><td><code>object (JobResult)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>job_result</code> in the JSON request body.</td></tr><tr><td><code>evidence</code></td><td><code>array&lt;integer&gt;</code></td><td><span class="req req-optional">Optional</span></td><td>Raw evidence bytes (the payload whose SHA-256 is <code>evidence_digest</code>).
 May be empty for modes that produce no evidence (e.g. OfflineDryRun
-without a plan artifact), but the digest must still match.</td></tr><tr><td><code>evidence_json</code></td><td><code>serde_json::Value</code></td><td>optional</td><td>Optional structured evidence parsed from the evidence bytes.
+without a plan artifact), but the digest must still match.</td></tr><tr><td><code>evidence_json</code></td><td><code>JSON value</code></td><td><span class="req req-optional">Optional</span></td><td>Optional structured evidence parsed from the evidence bytes.
 Stored as JSONB for query convenience; never trusted for authz.</td></tr></tbody></table>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> \
-  <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
-  <span class="hl-cmd">-d</span> <span class="hl-s">'{"job_result": "&lt;JobResult&gt;", "evidence": [], "evidence_json": "&lt;serde_json::Value&gt;"}'</span> \
-  <span class="hl-cmd">https://&lt;your-host&gt;/api/agents/{agent_id}/jobs/{job_id}/result</span></code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>serde_json::Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>serde_json::Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> POST \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer rya_&lt;agent-token&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"job_result":{}}'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/agents/&lt;agent_id&gt;/jobs/&lt;job_id&gt;/result'</span></code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
 </main>
 </div>
 <script>

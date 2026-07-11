@@ -2560,12 +2560,16 @@ struct NetworkReserveIpsRequest {
 #[allow(dead_code)]
 struct NetworkSwitchQuery {
     #[serde(rename = "switch")]
+    /// Switch name to inspect. Defaults to `defra-sw-01` for an unrestricted
+    /// development caller.
     switch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct NetworkSiteQuery {
+    /// Site code to inspect. Defaults to `DEFRA` only when scope resolution is
+    /// unambiguous; an out-of-scope value is rejected.
     site: Option<String>,
 }
 
@@ -2978,6 +2982,7 @@ struct LogsOnboardRequest {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LogsSiteQuery {
+    /// Required site code whose log-forwarding report should be returned.
     site: String,
 }
 
@@ -12875,33 +12880,50 @@ async fn analytics_cost_capacity() -> Json<Value> {
 
 #[derive(Deserialize)]
 struct AnalyticsSiteQuery {
+    /// Site code to analyze. Defaults to `DEFRA` only when scope resolution is
+    /// unambiguous; an out-of-scope value is rejected.
     site: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AnalyticsClusterQuery {
+    /// Site code to analyze; subject to the caller's site scope.
     site: Option<String>,
+    /// Cluster name within the selected site. Defaults to
+    /// `defra-general-cluster`.
     cluster: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ClusterAdmissionQuery {
+    /// Site code whose cluster capacity should be evaluated.
     site: Option<String>,
+    /// Cluster name within the selected site.
     cluster: Option<String>,
+    /// Additional CPU cores requested by the dry-run admission check; defaults
+    /// to `0`.
     cpu_cores: Option<u32>,
+    /// Additional memory in GiB requested by the dry-run admission check;
+    /// defaults to `0`.
     memory_gb: Option<u32>,
+    /// Additional storage in GiB requested by the dry-run admission check;
+    /// defaults to `0`.
     storage_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct AnalyticsForecastQuery {
+    /// Site code to forecast; subject to the caller's site scope.
     site: Option<String>,
+    /// Forecast horizon in months. Defaults to `6`.
     months: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct AnalyticsTrendQuery {
+    /// Site code to analyze; subject to the caller's site scope.
     site: Option<String>,
+    /// Trend metric name. Defaults to `cpu`; unsupported metrics return `400`.
     metric: Option<String>,
 }
 
@@ -13917,15 +13939,24 @@ fn generate_api_token() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTokenRequest {
+    /// Operator-facing credential name stored with the token metadata.
     name: String,
+    /// Service-account or integration principal that owns the credential.
     owner_principal: String,
     #[serde(default)]
+    /// Application role names from `GET /api/admin/rbac-roles`; unknown names
+    /// are rejected with `400 UNKNOWN_ROLE`.
     roles: Vec<String>,
     #[serde(default)]
+    /// Optional comma-separated site scope. Omit for an unrestricted site axis.
     site_scope: Option<String>,
     #[serde(default)]
+    /// Optional comma-separated environment scope. Omit for an unrestricted
+    /// environment axis.
     environment_scope: Option<String>,
     #[serde(default)]
+    /// Optional RFC 3339 expiry timestamp. Malformed values return
+    /// `400 INVALID_EXPIRES_AT`; omission creates a non-expiring token.
     expires_at: Option<String>,
 }
 
@@ -19902,6 +19933,8 @@ async fn requests_retire(
 /// so a forged actor is impossible.
 #[derive(Debug, Deserialize)]
 struct ReasonBody {
+    /// Mandatory human reason recorded in lifecycle evidence and the audit
+    /// trail. Per-operation validation and length limits apply.
     reason: String,
 }
 

@@ -46,17 +46,145 @@
 <h1>Dashboard API</h1>
 <p>Contract endpoints for the portal's global-overview and risk-heatmap dashboards.</p>
 <p class="area-count">2 routes</p>
+<p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-dashboard-global-overview-contract"><span class="method-chip m-get">GET</span><code>/api/dashboard/global-overview-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/dashboard/global-overview-contract</code></pre>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Dashboard global overview.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/dashboard/global-overview-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>dashboardGlobalOverviewMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dashboardGlobalOverviewMode</code> returned in the response body.</td></tr><tr><td><code>dashboardSummaryAggregateOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dashboardSummaryAggregateOnly</code> returned in the response body.</td></tr><tr><td><code>siteReadinessAggregateOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>siteReadinessAggregateOnly</code> returned in the response body.</td></tr><tr><td><code>riskSignalsReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>riskSignalsReadOnly</code> returned in the response body.</td></tr><tr><td><code>evidenceReferencesOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidenceReferencesOnly</code> returned in the response body.</td></tr><tr><td><code>liveQueryAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveQueryAllowed</code> returned in the response body.</td></tr><tr><td><code>dashboardMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dashboardMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>providerCallsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsAllowed</code> returned in the response body.</td></tr><tr><td><code>notificationDispatchAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>notificationDispatchAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRequestRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRequestRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawOperationRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawOperationRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawInventoryRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawInventoryRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawCmdbRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawCmdbRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawBackupRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawBackupRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawMonitoringRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawMonitoringRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawUserDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawUserDataAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRecipientDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRecipientDataAllowed</code> returned in the response body.</td></tr><tr><td><code>credentialValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>credentialValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tokenValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tokenValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tenantIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tenantIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>objectIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>objectIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>principalIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>principalIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>privateNetworkValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>privateNetworkValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>summaryDomains</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>summaryDomains</code> returned in the response body.</td></tr><tr><td><code>statusBands</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>statusBands</code> returned in the response body.</td></tr><tr><td><code>lenses</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>lenses</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr><tr><td><code>rules</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rules</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/dashboard/global-overview-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"dashboardGlobalOverviewMode"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"dashboardSummaryAggregateOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"siteReadinessAggregateOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"riskSignalsReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"evidenceReferencesOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveQueryAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"dashboardMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"providerCallsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"notificationDispatchAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRequestRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawOperationRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawInventoryRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawCmdbRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawBackupRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawMonitoringRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawUserDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRecipientDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"credentialValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tokenValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tenantIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"objectIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"principalIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"privateNetworkValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"summaryDomains"</span>: [],
+  <span class="hl-k">"statusBands"</span>: [],
+  <span class="hl-k">"lenses"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: [],
+  <span class="hl-k">"rules"</span>: []
+}</code></pre>
+</section>
+<section class="ep-operation">
 <h2 class="ep-h" id="get-api-dashboard-risk-heatmap-contract"><span class="method-chip m-get">GET</span><code>/api/dashboard/risk-heatmap-contract</code></h2>
-<p class="badges"><span class="badge">read tier</span></p>
-<p class="ep-missing">No description extracted yet.</p>
-<h3 class="ep-sub">Example request</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;token&gt;"</span> https://&lt;your-host&gt;/api/dashboard/risk-heatmap-contract</code></pre>
-<div class="page-meta">Last updated 2026-07-10 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-cmdb.html">&larr; CMDB</a><a href="/api-datacenter.html">Datacenter &rarr;</a></nav>
+<p class="badges"><span class="badge">read access</span></p>
+<p class="ep-summary">Dashboard risk heatmap.</p>
+<h3 class="ep-sub">Permissions</h3>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<h3 class="ep-sub">HTTP request</h3>
+<pre><code>GET https://&lt;your-host&gt;/api/dashboard/risk-heatmap-contract</code></pre>
+<h3 class="ep-sub">Path parameters</h3>
+<p>This operation has no path parameters.</p>
+<h3 class="ep-sub">Query parameters</h3>
+<p>This operation has no query parameters.</p>
+<h3 class="ep-sub">Request headers</h3>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<h3 class="ep-sub">Request body</h3>
+<p>This operation does not accept a request body.</p>
+<h3 class="ep-sub">Response</h3>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>riskHeatmapMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>riskHeatmapMode</code> returned in the response body.</td></tr><tr><td><code>heatmapReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>heatmapReadOnly</code> returned in the response body.</td></tr><tr><td><code>trendSummaryReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>trendSummaryReadOnly</code> returned in the response body.</td></tr><tr><td><code>riskBandSummaryOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>riskBandSummaryOnly</code> returned in the response body.</td></tr><tr><td><code>evidenceReferencesReadOnly</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>evidenceReferencesReadOnly</code> returned in the response body.</td></tr><tr><td><code>liveMetricsQueryAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveMetricsQueryAllowed</code> returned in the response body.</td></tr><tr><td><code>liveDashboardQueryAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>liveDashboardQueryAllowed</code> returned in the response body.</td></tr><tr><td><code>dashboardMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dashboardMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>workflowMutationAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>workflowMutationAllowed</code> returned in the response body.</td></tr><tr><td><code>providerCallsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>providerCallsAllowed</code> returned in the response body.</td></tr><tr><td><code>notificationDispatchAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>notificationDispatchAllowed</code> returned in the response body.</td></tr><tr><td><code>rawMetricRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawMetricRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRequestRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRequestRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawOperationRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawOperationRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawInventoryRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawInventoryRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawCmdbRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawCmdbRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawBackupRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawBackupRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawMonitoringRowsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawMonitoringRowsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawProviderPayloadsAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawProviderPayloadsAllowed</code> returned in the response body.</td></tr><tr><td><code>rawUserDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawUserDataAllowed</code> returned in the response body.</td></tr><tr><td><code>rawRecipientDataAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rawRecipientDataAllowed</code> returned in the response body.</td></tr><tr><td><code>credentialValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>credentialValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tokenValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tokenValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>tenantIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>tenantIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>objectIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>objectIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>principalIdentifiersAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>principalIdentifiersAllowed</code> returned in the response body.</td></tr><tr><td><code>privateNetworkValuesAllowed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>privateNetworkValuesAllowed</code> returned in the response body.</td></tr><tr><td><code>dimensions</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>dimensions</code> returned in the response body.</td></tr><tr><td><code>riskDomains</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>riskDomains</code> returned in the response body.</td></tr><tr><td><code>riskBands</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>riskBands</code> returned in the response body.</td></tr><tr><td><code>trendWindows</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>trendWindows</code> returned in the response body.</td></tr><tr><td><code>requiredGuards</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredGuards</code> returned in the response body.</td></tr><tr><td><code>blockedReasons</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>blockedReasons</code> returned in the response body.</td></tr><tr><td><code>requiredEvidence</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredEvidence</code> returned in the response body.</td></tr><tr><td><code>rules</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rules</code> returned in the response body.</td></tr></tbody></table>
+<h3 class="ep-sub">Errors</h3>
+<p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
+<h3 class="ep-sub">Examples</h3>
+<h4>Request</h4>
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
+  <span class="hl-cmd">--request</span> GET \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
+  <span class="hl-s">'https://&lt;your-host&gt;/api/dashboard/risk-heatmap-contract'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"riskHeatmapMode"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"heatmapReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"trendSummaryReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"riskBandSummaryOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"evidenceReferencesReadOnly"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveMetricsQueryAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"liveDashboardQueryAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"dashboardMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"workflowMutationAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"providerCallsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"notificationDispatchAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawMetricRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRequestRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawOperationRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawInventoryRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawCmdbRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawBackupRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawMonitoringRowsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawProviderPayloadsAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawUserDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"rawRecipientDataAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"credentialValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tokenValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"tenantIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"objectIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"principalIdentifiersAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"privateNetworkValuesAllowed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"dimensions"</span>: [],
+  <span class="hl-k">"riskDomains"</span>: [],
+  <span class="hl-k">"riskBands"</span>: [],
+  <span class="hl-k">"trendWindows"</span>: [],
+  <span class="hl-k">"requiredGuards"</span>: [],
+  <span class="hl-k">"blockedReasons"</span>: [],
+  <span class="hl-k">"requiredEvidence"</span>: [],
+  <span class="hl-k">"rules"</span>: []
+}</code></pre>
+</section>
+<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-cmdb.html">&larr; CMDB</a><a href="/api-datacenter.html">Datacenter &rarr;</a></nav>
 </main>
 </div>
 <script>

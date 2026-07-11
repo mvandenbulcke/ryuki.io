@@ -74,7 +74,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a><ul class="sb-sections"><li><a href="#un-locode">UN/LOCODE</a></li><li><a href="#custom-codes">Custom Codes</a></li><li><a href="#site-selection">Site Selection</a></li><li><a href="#managing-sites">Managing Sites</a></li><li><a href="#seeded-active-sites">Seeded Active Sites</a></li><li><a href="#important-notes">Important Notes</a></li></ul></li><li><a class="sb-link" data-sections="roles and permission tiers
+important notes" href="/site-management.html">Site Management</a><ul class="sb-sections"><li><a href="#un-locode">UN/LOCODE</a></li><li><a href="#custom-codes">Custom Codes</a></li><li><a href="#site-selection">Site Selection</a></li><li><a href="#managing-sites">Managing Sites</a></li><li><a href="#seeded-active-sites">Seeded Active Sites</a></li><li><a href="#important-notes">Important Notes</a></li></ul></li><li><a class="sb-link" data-sections="roles and permissions
+route access classes
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
@@ -98,6 +99,7 @@ the portal bell
 delivery channels
 known limits" href="/notifications.html">Notifications</a></li><li><a class="sb-link" data-sections="base url and versioning
 authentication
+request headers
 authorization
 conventions
 walkthrough: a request through its lifecycle" href="/using-the-api.html">Using the API</a></li><li><a class="sb-link" data-sections="conventions
@@ -192,7 +194,7 @@ GET /api/admin/sites/search?q=Netherlands → Search by country name</code></pre
 <li><strong>Governance</strong>: Site registration, activation, and deactivation are admin operations and are audit-recorded when the database is enabled.</li>
 <li><strong>Registry vs placement policy</strong>: Registration and activation make a code available to request validation and scoping; they do not create provider placement, capacity, agent, OU/folder derivation, or policy-guardrail bindings. The bundled <code>catalog/site-catalog.yaml</code> covers only its reviewed policy-bound subset. Add and review those operational bindings separately before a custom or newly registered site runs a workflow that depends on them.</li>
 </ul>
-<div class="page-meta">Last updated 2026-06-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/site-management.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/entra-app-registration.html">&larr; Entra App Registration</a><a href="/rbac-and-scoping.html">RBAC & Scoping &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/site-management.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/entra-app-registration.html">&larr; Entra App Registration</a><a href="/rbac-and-scoping.html">RBAC & Scoping &rarr;</a></nav>
 </main>
 </div>
 <script>
