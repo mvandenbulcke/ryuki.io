@@ -14,6 +14,42 @@ Nested fields use `__` in environment variables. For example, `server.bind_addre
 
 `RyukiConfig::load()` does not parse `.env` files by itself. Use `.env` with Docker Compose, export variables into the host process environment, or use one of the supported config files for direct `cargo run` workflows.
 
+## Deployment-security startup admission
+
+Every API and migration process requires these five values; none has a runtime
+default and empty values fail closed:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable directory containing the profile and all referenced artifacts |
+| `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized relative path beneath that absolute root; absolute paths and traversal are rejected |
+| `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Nonzero `sha256:<64 lowercase hex>` digest computed over the profile's exact raw bytes |
+| `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independent canonical `deployment:` pin that must equal the document's deployment identity |
+| `RYUKI_SECURITY_PROFILE` | Independent profile-class pin, exactly `development`, `test`, or `production`, that must equal the document |
+
+The deployment and profile pins come from process configuration, not from the
+document being admitted. Preflight verifies the content-addressed root before
+migration-mode or database configuration, application configuration, signing
+keys, workers, router construction, or listener binding. The sole
+configuration-free exception is the read-only `--dump-route-meta` maintenance
+mode, which exits without starting runtime services.
+
+Files checked into `catalog/security-contracts/v1` with lifecycle
+`implementation_only` are schema/conformance fixtures, not active deployment
+authority, and cannot start the API or migration runner. Production remains
+blocked until trusted conformance receipts and live runtime facts can be
+verified. The proving ground likewise requires a separately reviewed active
+operator bundle and evidence; the repository does not publish or infer a
+runnable profile digest.
+
+This admission slice binds authentication to exactly one active provider
+configuration. Only a matching mock/static development fixture can currently
+pass, and it must use a literal loopback listener and public URL. The provider
+schema does not yet project every security-relevant legacy `local` or
+`entra-id` runtime value, so those live modes fail closed even under a migration
+overlay. Their configuration sections below document implemented runtime
+features, not a bypass around startup admission.
+
 ## Core Environment Variables
 
 Copy `.env.example` to `.env` for Compose workflows, or export the same variables before running the API directly:

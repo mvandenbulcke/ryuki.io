@@ -8,31 +8,55 @@ use tokio::sync::Mutex;
 #[cfg(not(test))]
 static STORE: OnceLock<Mutex<ConfigStore>> = OnceLock::new();
 #[cfg(not(test))]
-static APP_CONFIG: OnceLock<RyukiConfig> = OnceLock::new();
+static STARTUP_CONFIG: OnceLock<ImmutableStartupConfig> = OnceLock::new();
+
+/// The immutable configuration admitted before startup side effects begin.
+///
+/// Keeping the application configuration and its validated security contract
+/// in the same value prevents consumers from observing a configuration that
+/// was initialized without the contract that authorized it.
+#[cfg(not(test))]
+struct ImmutableStartupConfig {
+    app_config: RyukiConfig,
+    security_contract: crate::security_contracts::SecurityContractContext,
+}
+
+// Existing unit tests initialize only the application configuration. Keep
+// that compatibility isolated to test builds: production construction always
+// requires a validated security contract.
+#[cfg(test)]
+struct ImmutableStartupConfig {
+    app_config: RyukiConfig,
+    security_contract: Option<crate::security_contracts::SecurityContractContext>,
+}
 
 #[cfg(test)]
 thread_local! {
     // Auth-mode tests require different immutable startup configurations. A
     // process-global OnceLock makes the first test silently dictate every later
-    // test's mode, so test builds scope both values to the Rust test thread.
+    // test's mode, so test builds scope the paired value to the Rust test thread.
     // The small fixtures are leaked intentionally: callers receive `static`
     // references, and repeated initialization must never invalidate one.
     static TEST_STORE: std::cell::RefCell<Option<&'static Mutex<ConfigStore>>> = const {
         std::cell::RefCell::new(None)
     };
-    static TEST_APP_CONFIG: std::cell::RefCell<Option<&'static RyukiConfig>> = const {
+    static TEST_STARTUP_CONFIG: std::cell::RefCell<Option<&'static ImmutableStartupConfig>> = const {
         std::cell::RefCell::new(None)
     };
 }
 
 #[cfg(not(test))]
-fn app_config_if_initialized() -> Option<&'static RyukiConfig> {
-    APP_CONFIG.get()
+fn startup_config_if_initialized() -> Option<&'static ImmutableStartupConfig> {
+    STARTUP_CONFIG.get()
 }
 
 #[cfg(test)]
+fn startup_config_if_initialized() -> Option<&'static ImmutableStartupConfig> {
+    TEST_STARTUP_CONFIG.with(|slot| *slot.borrow())
+}
+
 fn app_config_if_initialized() -> Option<&'static RyukiConfig> {
-    TEST_APP_CONFIG.with(|slot| *slot.borrow())
+    startup_config_if_initialized().map(|config| &config.app_config)
 }
 
 #[cfg(not(test))]
@@ -89,8 +113,17 @@ impl ConfigStore {
 }
 
 #[cfg(not(test))]
-pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
-    let _ = APP_CONFIG.set(app_cfg.clone());
+pub fn init_with_security_contract(
+    path: &str,
+    app_cfg: &RyukiConfig,
+    security_contract: crate::security_contracts::SecurityContractContext,
+) {
+    STARTUP_CONFIG
+        .set(ImmutableStartupConfig {
+            app_config: app_cfg.clone(),
+            security_contract,
+        })
+        .unwrap_or_else(|_| panic!("startup config already initialized"));
     let store = ConfigStore::new(path);
     STORE
         .set(Mutex::new(store))
@@ -98,9 +131,31 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
 }
 
 #[cfg(test)]
+pub fn init_with_security_contract(
+    path: &str,
+    app_cfg: &RyukiConfig,
+    security_contract: crate::security_contracts::SecurityContractContext,
+) {
+    TEST_STARTUP_CONFIG.with(|slot| {
+        *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
+            app_config: app_cfg.clone(),
+            security_contract: Some(security_contract),
+        })));
+    });
+    TEST_STORE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::leak(Box::new(Mutex::new(ConfigStore::new(path)))));
+    });
+}
+
+/// Test-only compatibility helper for callers that do not exercise startup
+/// admission. Production initialization cannot omit the security contract.
+#[cfg(test)]
 pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
-    TEST_APP_CONFIG.with(|slot| {
-        *slot.borrow_mut() = Some(Box::leak(Box::new(app_cfg.clone())));
+    TEST_STARTUP_CONFIG.with(|slot| {
+        *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
+            app_config: app_cfg.clone(),
+            security_contract: None,
+        })));
     });
     TEST_STORE.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(Mutex::new(ConfigStore::new(path)))));
@@ -109,6 +164,24 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
 
 pub fn get_app_config() -> &'static RyukiConfig {
     app_config_if_initialized().expect("app config not initialized")
+}
+
+#[cfg(not(test))]
+pub fn get_security_contract_context() -> &'static crate::security_contracts::SecurityContractContext
+{
+    &startup_config_if_initialized()
+        .expect("startup config not initialized")
+        .security_contract
+}
+
+#[cfg(test)]
+pub fn get_security_contract_context() -> &'static crate::security_contracts::SecurityContractContext
+{
+    startup_config_if_initialized()
+        .expect("startup config not initialized")
+        .security_contract
+        .as_ref()
+        .expect("security contract context not initialized")
 }
 
 /// The configured auth mode, or the default (`MockDryRun`) when the config store
@@ -183,5 +256,13 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("failed to parse config file"));
+    }
+
+    #[test]
+    #[should_panic(expected = "security contract context not initialized")]
+    fn compatibility_initializer_never_fabricates_security_contract_context() {
+        init_with_config("test-only-config.json", &RyukiConfig::default());
+
+        let _ = get_security_contract_context();
     }
 }

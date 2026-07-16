@@ -53,13 +53,26 @@ RUN apt-get update \
     && groupadd --system --gid 10001 ryuki \
     && useradd --system --uid 10001 --gid ryuki --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin ryuki \
-    && install -d -o 10001 -g 10001 -m 0700 /app/keys
+    && install -d -o 10001 -g 10001 -m 0700 /app/keys \
+    && install -d -o 0 -g 0 -m 0555 \
+        /app/security-contract/catalog/security-contracts \
+        /app/security-contract/docs/architecture \
+        /app/security-contract/sources/ryuki-api/src
 
 WORKDIR /app
 
 ENV RYUKI_API_EXECUTION_MODE=static-dry-run
 
 COPY --from=build --chown=10001:10001 /app/target/release/ryuki-api /app/ryuki-api
+COPY --chown=0:0 catalog/security-contracts/ /app/security-contract/catalog/security-contracts/
+COPY --chown=0:0 --chmod=0444 docs/architecture/platform-security-boundary.md /app/security-contract/docs/architecture/platform-security-boundary.md
+COPY --chown=0:0 --chmod=0444 sources/ryuki-api/src/main.rs sources/ryuki-api/src/contracts.rs sources/ryuki-api/src/scheduler.rs sources/ryuki-api/src/agents.rs /app/security-contract/sources/ryuki-api/src/
+
+# The admission loader reads this root but the runtime identity cannot mutate
+# its content-addressed contract or normative specification dependency.
+RUN chmod -R a-w /app/security-contract \
+    && find /app/security-contract -type d -exec chmod 0555 {} + \
+    && find /app/security-contract -type f -exec chmod 0444 {} +
 
 # Match the Kubernetes runtime identity. The writable signing-key directory is
 # prepared above; the rest of the runtime image remains root-owned and read-only

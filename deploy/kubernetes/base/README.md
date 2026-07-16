@@ -7,12 +7,22 @@ Base manifests define the portable Kubernetes skeleton for Ryuki Infrastructure 
 | `namespace.yaml` | `ryuki-platform` namespace. |
 | `serviceaccounts.yaml` | One ServiceAccount per serving component, a dedicated one-shot migration identity, and four non-auto-mounted TokenRequest identities that separate database owner, backup, API runtime, and migration secret materialization. |
 | `configmap.yaml` | Non-secret runtime settings: verify-only `platform-api-config`, apply-only `platform-api-migration-config` with bounded DDL timeouts, and a fail-closed, static-dry-run `portal-ui-config` with non-resolving HTTPS placeholders. |
-| `deployments.yaml` | `portal-ui` and `platform-api` deployments with HTTP probes on port 8080, conservative resource requests/limits, non-root security contexts, digest-only non-resolving image placeholders, ConfigMap-only `envFrom`, one explicit API database Secret key reference, and a CA-only CloudNativePG trust mount for the API. |
+| `deployments.yaml` | `portal-ui` and `platform-api` deployments with HTTP probes on port 8080, conservative resource requests/limits, non-root security contexts, digest-only non-resolving image placeholders, exact allowlisted ConfigMap-only `envFrom`, exact database/admission key references, and a CA-only CloudNativePG trust mount. |
 | `services.yaml` | Internal ClusterIP services for `portal-ui` and `platform-api`. |
 | `ingress.yaml` | Dedicated `ryuki-platform` NGINX IngressClass placeholder for `platform.example.invalid` and same-origin `/api`. |
 | `networkpolicies.yaml` | Default-deny ingress/egress plus explicit UI/API/DNS allowances, a dedicated ingress-controller instance selector, separate API and migration-Job ↔ CNPG database paths (TCP 5432 in both directions), CNPG intra-cluster and operator allowances (5432 + 8000), and a commented Vault:8200 egress stub. Deployment-time TODOs: the CNPG instance manager additionally needs egress to the kube-apiserver (cluster-specific ipBlock, supply via overlay), and Barman backups will need egress to the object-store endpoint. |
 
 ## Database configuration delivery
+
+The API Deployment and one-shot migration Job both require an operator-owned
+`platform-security-admission-config`. Five individual `configMapKeyRef` entries
+import the absolute image path `/app/security-contract`, relative profile path,
+raw-byte SHA-256 profile digest, expected deployment id, and explicit production
+profile; whole-ConfigMap import is forbidden. The release image must bake the
+exact reviewed contract tree into `/app/security-contract` as root-owned regular
+files. The base does not fabricate the admission ConfigMap, and its checked-in
+image contains only non-production implementation fixtures, so an unoverlaid
+production render remains fail-closed.
 
 `platform-api` reads its non-secret settings from the `platform-api-config`
 ConfigMap and `RYUKI_DATABASE_URL` from the `ryuki-platform-api-db` Secret.

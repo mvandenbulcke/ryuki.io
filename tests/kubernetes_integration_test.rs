@@ -436,6 +436,82 @@ fn find_deployment<'a>(docs: &'a [serde_yaml::Value], name: &str) -> &'a serde_y
         .unwrap_or_else(|| panic!("{name} Deployment not found"))
 }
 
+const SECURITY_ADMISSION_CONFIG_MAP: &str = "platform-security-admission-config";
+const SECURITY_ADMISSION_KEYS: [&str; 5] = [
+    "RYUKI_SECURITY_CONTRACT_ROOT",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+    "RYUKI_EXPECTED_DEPLOYMENT_ID",
+    "RYUKI_SECURITY_PROFILE",
+];
+const PLATFORM_API_CONFIG_KEYS: [&str; 10] = [
+    "RYUKI_SERVER__BIND_ADDRESS",
+    "RYUKI_PLATFORM_URL",
+    "RYUKI_DATABASE__REQUIRED",
+    "RYUKI_MIGRATION_MODE",
+    "RYUKI_DATABASE_EXPECTED_ROLE",
+    "RYUKI_DATABASE_FORBIDDEN_ROLE",
+    "RYUKI_RETENTION__DAILY_BACKUPS",
+    "RYUKI_RETENTION__WEEKLY_BACKUPS",
+    "RYUKI_RETENTION__MONTHLY_BACKUPS",
+    "RYUKI_RETENTION__YEARLY_BACKUPS",
+];
+const PLATFORM_API_MIGRATION_CONFIG_KEYS: [&str; 5] = [
+    "RYUKI_MIGRATION_MODE",
+    "RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS",
+    "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS",
+    "RYUKI_MIGRATION_EXPECTED_ROLE",
+    "RYUKI_APPLICATION_DATABASE_ROLE",
+];
+const PORTAL_UI_CONFIG_KEYS: [&str; 4] = [
+    "RYUKI_API_URL",
+    "RYUKI_PORTAL_PUBLIC_ORIGIN",
+    "RYUKI_PORTAL_EXECUTION_MODE",
+    "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK",
+];
+
+fn assert_ordered_security_admission_env(env: &[serde_yaml::Value]) {
+    assert_eq!(
+        env.len(),
+        SECURITY_ADMISSION_KEYS.len() + 1,
+        "the exact database secret key must be followed by five admission keys"
+    );
+
+    let names: Vec<&str> = env
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("environment variable name"))
+        .collect();
+    let expected_names: Vec<&str> = std::iter::once(names[0])
+        .chain(SECURITY_ADMISSION_KEYS)
+        .collect();
+    assert_eq!(
+        names, expected_names,
+        "security admission key order changed"
+    );
+    assert_eq!(
+        names.iter().copied().collect::<HashSet<_>>().len(),
+        names.len(),
+        "environment keys must not be duplicated"
+    );
+
+    for (entry, expected_key) in env[1..].iter().zip(SECURITY_ADMISSION_KEYS) {
+        assert_eq!(entry["name"], expected_key);
+        assert_eq!(
+            entry["valueFrom"]["configMapKeyRef"]["name"],
+            SECURITY_ADMISSION_CONFIG_MAP
+        );
+        assert_eq!(entry["valueFrom"]["configMapKeyRef"]["key"], expected_key);
+        assert!(
+            entry["value"].is_null(),
+            "{expected_key} must not have a literal value"
+        );
+        assert!(
+            entry["valueFrom"]["secretKeyRef"].is_null(),
+            "{expected_key} must come only from the admission ConfigMap"
+        );
+    }
+}
+
 #[test]
 fn platform_api_imports_config_map_and_exact_db_secret_key() {
     let docs = parse_multi_doc("deploy/kubernetes/base/deployments.yaml");
@@ -467,7 +543,7 @@ fn platform_api_imports_config_map_and_exact_db_secret_key() {
     let env = api["spec"]["template"]["spec"]["containers"][0]["env"]
         .as_sequence()
         .expect("platform-api container must declare its exact secret key");
-    assert_eq!(env.len(), 1);
+    assert_ordered_security_admission_env(env);
     assert_eq!(env[0]["name"], "RYUKI_DATABASE_URL");
     assert_eq!(
         env[0]["valueFrom"]["secretKeyRef"]["name"],
@@ -478,12 +554,13 @@ fn platform_api_imports_config_map_and_exact_db_secret_key() {
         "RYUKI_DATABASE_URL"
     );
     assert!(env[0]["value"].is_null());
+    assert!(env[0]["valueFrom"]["configMapKeyRef"].is_null());
 
     let pod = &api["spec"]["template"]["spec"];
     let volumes = pod["volumes"]
         .as_sequence()
         .expect("platform-api must project the CNPG CA");
-    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes.len(), 1, "only the CNPG CA may be projected");
     assert_eq!(volumes[0]["name"], "cnpg-ca");
     assert_eq!(volumes[0]["secret"]["secretName"], "ryuki-platform-db-ca");
     assert_eq!(
@@ -495,7 +572,7 @@ fn platform_api_imports_config_map_and_exact_db_secret_key() {
     let mounts = api["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
         .as_sequence()
         .expect("platform-api CA mount");
-    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts.len(), 1, "only the CNPG CA may be mounted");
     assert_eq!(mounts[0]["name"], "cnpg-ca");
     assert_eq!(mounts[0]["mountPath"], "/var/run/secrets/ryuki/cnpg");
     assert_eq!(mounts[0]["readOnly"], true);
@@ -551,6 +628,50 @@ fn referenced_config_maps_exist_in_manifest_set() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn security_admission_config_map_is_a_required_external_input() {
+    let cm_docs = parse_multi_doc("deploy/kubernetes/base/configmap.yaml");
+    let checked_in_names: HashSet<&str> = cm_docs
+        .iter()
+        .filter_map(|document| document["metadata"]["name"].as_str())
+        .collect();
+
+    assert!(
+        !checked_in_names.contains(SECURITY_ADMISSION_CONFIG_MAP),
+        "{SECURITY_ADMISSION_CONFIG_MAP} must remain an external, release-reviewed input"
+    );
+}
+
+#[test]
+fn env_from_config_maps_have_exact_reviewed_key_allowlists() {
+    let cm_docs = parse_multi_doc("deploy/kubernetes/base/configmap.yaml");
+
+    for (name, expected_keys) in [
+        ("platform-api-config", PLATFORM_API_CONFIG_KEYS.as_slice()),
+        (
+            "platform-api-migration-config",
+            PLATFORM_API_MIGRATION_CONFIG_KEYS.as_slice(),
+        ),
+        ("portal-ui-config", PORTAL_UI_CONFIG_KEYS.as_slice()),
+    ] {
+        let config_map = cm_docs
+            .iter()
+            .find(|document| document["metadata"]["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing ConfigMap {name}"));
+        let actual_keys: HashSet<&str> = config_map["data"]
+            .as_mapping()
+            .expect("ConfigMap data")
+            .keys()
+            .map(|key| key.as_str().expect("string ConfigMap data key"))
+            .collect();
+        let expected_keys: HashSet<&str> = expected_keys.iter().copied().collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "ConfigMap {name} must not widen its envFrom surface"
+        );
     }
 }
 
@@ -1169,7 +1290,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     let volumes = pod["volumes"]
         .as_sequence()
         .expect("migration CNPG CA volume");
-    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes.len(), 1, "only the CNPG CA may be projected");
     assert_eq!(volumes[0]["name"], "cnpg-ca");
     assert_eq!(volumes[0]["secret"]["secretName"], "ryuki-platform-db-ca");
     assert_eq!(volumes[0]["secret"]["items"][0]["key"], "ca.crt");
@@ -1181,13 +1302,13 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     assert!(container["ports"].is_null());
     assert!(container["readinessProbe"].is_null());
     assert!(container["livenessProbe"].is_null());
-    assert_eq!(container["volumeMounts"].as_sequence().unwrap().len(), 1);
-    assert_eq!(container["volumeMounts"][0]["name"], "cnpg-ca");
-    assert_eq!(
-        container["volumeMounts"][0]["mountPath"],
-        "/var/run/secrets/ryuki/cnpg"
-    );
-    assert_eq!(container["volumeMounts"][0]["readOnly"], true);
+    let mounts = container["volumeMounts"]
+        .as_sequence()
+        .expect("migration volume mounts");
+    assert_eq!(mounts.len(), 1, "only the CNPG CA may be mounted");
+    assert_eq!(mounts[0]["name"], "cnpg-ca");
+    assert_eq!(mounts[0]["mountPath"], "/var/run/secrets/ryuki/cnpg");
+    assert_eq!(mounts[0]["readOnly"], true);
 
     let deployments = parse_multi_doc("deploy/kubernetes/base/deployments.yaml");
     let api = find_deployment(&deployments, "platform-api");
@@ -1213,7 +1334,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
     let env = container["env"]
         .as_sequence()
         .expect("job exact secret env");
-    assert_eq!(env.len(), 1);
+    assert_ordered_security_admission_env(env);
     assert_eq!(env[0]["name"], "RYUKI_MIGRATION_DATABASE_URL");
     assert_eq!(
         env[0]["valueFrom"]["secretKeyRef"]["name"],
@@ -1224,6 +1345,7 @@ fn migration_job_is_one_shot_hardened_and_uses_the_exact_api_image() {
         "RYUKI_MIGRATION_DATABASE_URL"
     );
     assert!(env[0]["value"].is_null());
+    assert!(env[0]["valueFrom"]["configMapKeyRef"].is_null());
     assert_eq!(container["securityContext"]["runAsNonRoot"], true);
     assert_eq!(
         container["securityContext"]["allowPrivilegeEscalation"],

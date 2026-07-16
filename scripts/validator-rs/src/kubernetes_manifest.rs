@@ -22,7 +22,6 @@ const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
 const CNPG_CA_VOLUME_NAME: &str = "cnpg-ca";
 const CNPG_CA_SECRET_KEY: &str = "ca.crt";
 const CNPG_CA_MOUNT_PATH: &str = "/var/run/secrets/ryuki/cnpg";
-const CNPG_CA_FILE_PATH: &str = "/var/run/secrets/ryuki/cnpg/ca.crt";
 const EXPECTED_CUTOVER_WORKLOAD_KINDS: &[&str] =
     &["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"];
 const EXPECTED_BASE_WRITER_SELECTORS: &[&str] = &[
@@ -40,6 +39,39 @@ const EXPECTED_CONFIG_MAPS: &[&str] = &[
     "platform-api-config",
     "platform-api-migration-config",
     "portal-ui-config",
+];
+const PLATFORM_API_CONFIG_KEYS: &[&str] = &[
+    "RYUKI_SERVER__BIND_ADDRESS",
+    "RYUKI_PLATFORM_URL",
+    "RYUKI_DATABASE__REQUIRED",
+    "RYUKI_MIGRATION_MODE",
+    "RYUKI_DATABASE_EXPECTED_ROLE",
+    "RYUKI_DATABASE_FORBIDDEN_ROLE",
+    "RYUKI_RETENTION__DAILY_BACKUPS",
+    "RYUKI_RETENTION__WEEKLY_BACKUPS",
+    "RYUKI_RETENTION__MONTHLY_BACKUPS",
+    "RYUKI_RETENTION__YEARLY_BACKUPS",
+];
+const PLATFORM_API_MIGRATION_CONFIG_KEYS: &[&str] = &[
+    "RYUKI_MIGRATION_MODE",
+    "RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS",
+    "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS",
+    "RYUKI_MIGRATION_EXPECTED_ROLE",
+    "RYUKI_APPLICATION_DATABASE_ROLE",
+];
+const PORTAL_UI_CONFIG_KEYS: &[&str] = &[
+    "RYUKI_API_URL",
+    "RYUKI_PORTAL_PUBLIC_ORIGIN",
+    "RYUKI_PORTAL_EXECUTION_MODE",
+    "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK",
+];
+const SECURITY_ADMISSION_CONFIG_MAP: &str = "platform-security-admission-config";
+const SECURITY_ADMISSION_KEYS: &[&str] = &[
+    "RYUKI_SECURITY_CONTRACT_ROOT",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+    "RYUKI_EXPECTED_DEPLOYMENT_ID",
+    "RYUKI_SECURITY_PROFILE",
 ];
 const EXPECTED_SERVICE_ACCOUNTS: &[&str] = &[
     "portal-ui",
@@ -120,6 +152,7 @@ const APPROVED_KEYS: &[&str] = &[
     "items",
     "envFrom",
     "configMapRef",
+    "configMapKeyRef",
     "secretRef",
     "env",
     "valueFrom",
@@ -422,19 +455,22 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
     };
     let api = find("platform-api-config");
     expect(
-        str_at(api, &["data", "RYUKI_DATABASE__REQUIRED"]) == Some("true")
+        object_at(api, &["data"])
+            .is_some_and(|data| object_has_exact_keys(data, PLATFORM_API_CONFIG_KEYS))
+            && str_at(api, &["data", "RYUKI_DATABASE__REQUIRED"]) == Some("true")
             && str_at(api, &["data", "RYUKI_MIGRATION_MODE"]) == Some("verify-only")
             && str_at(api, &["data", "RYUKI_DATABASE_EXPECTED_ROLE"]) == Some("ryuki_app_runtime")
             && str_at(api, &["data", "RYUKI_DATABASE_FORBIDDEN_ROLE"])
                 == Some("ryuki_schema_migrator"),
         errors,
-        "platform-api-config must require the database, use verify-only ryuki_app_runtime, and forbid migrator membership",
+        "platform-api-config must contain only the exact reviewed keys, require the database, use verify-only ryuki_app_runtime, and forbid migrator membership",
     );
 
     let migration = find("platform-api-migration-config");
     let migration_data = object_at(migration, &["data"]);
     expect(
-        migration_data.is_some_and(|data| data.len() == 5)
+        migration_data
+            .is_some_and(|data| object_has_exact_keys(data, PLATFORM_API_MIGRATION_CONFIG_KEYS))
             && str_at(migration, &["data", "RYUKI_MIGRATION_MODE"]) == Some("apply-only")
             && str_at(
                 migration,
@@ -446,18 +482,20 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
             && str_at(migration, &["data", "RYUKI_APPLICATION_DATABASE_ROLE"])
                 == Some("ryuki_app_runtime"),
         errors,
-        "platform-api-migration-config must contain only apply-only mode, 1800/60 timeouts, and exact migrator/application roles",
+        "platform-api-migration-config must contain only the exact reviewed keys with apply-only mode, 1800/60 timeouts, and exact migrator/application roles",
     );
 
     let portal = find("portal-ui-config");
     let expected_origin = format!("https://{APPROVED_HOST}");
     expect(
-        str_at(portal, &["data", "RYUKI_API_URL"]) == Some(expected_origin.as_str())
+        object_at(portal, &["data"])
+            .is_some_and(|data| object_has_exact_keys(data, PORTAL_UI_CONFIG_KEYS))
+            && str_at(portal, &["data", "RYUKI_API_URL"]) == Some(expected_origin.as_str())
             && str_at(portal, &["data", "RYUKI_PORTAL_PUBLIC_ORIGIN"])
                 == Some(expected_origin.as_str())
             && str_at(portal, &["data", "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK"]) == Some("false"),
         errors,
-        "portal-ui-config must use the exact HTTPS ingress origin with insecure-loopback disabled",
+        "portal-ui-config must contain only the exact reviewed keys and use the exact HTTPS ingress origin with insecure-loopback disabled",
     );
 
     for config_map in manifests
@@ -595,10 +633,10 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
             format!("Deployment {name} container name must match component"),
         );
         validate_container_image(name, container, errors);
-        // Non-secret configuration is imported from one exact ConfigMap. The
-        // API's only explicit env entry is one reviewed Secret key reference;
-        // whole-Secret envFrom imports are forbidden so new Secret fields can
-        // never override policy configuration.
+        // Non-secret configuration is imported from one exact, key-allowlisted
+        // ConfigMap. The API adds one reviewed Secret key and five individually
+        // pinned admission ConfigMap keys; whole-Secret envFrom imports are
+        // forbidden so new Secret fields can never override policy configuration.
         for (index, item) in containers.iter().enumerate() {
             validate_container_env(name, index, item, errors);
         }
@@ -800,7 +838,7 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
     let env = array_at_path(container, &["env"]);
     let migration_url = env.first().copied().unwrap_or(&Value::Null);
     expect(
-        env.len() == 1
+        env.len() == 6
             && object(migration_url).is_some_and(|entry| entry.len() == 2)
             && str_at(migration_url, &["name"]) == Some("RYUKI_MIGRATION_DATABASE_URL")
             && object_at(migration_url, &["valueFrom"])
@@ -815,7 +853,13 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
                 == Some("RYUKI_MIGRATION_DATABASE_URL")
             && value_at(migration_url, &["value"]).is_none(),
         errors,
-        "migration Job must import only the digest-scoped migrator URL key through secretKeyRef",
+        "migration Job must import the digest-scoped migrator URL key plus five security-admission keys",
+    );
+    expect(
+        env.get(1..)
+            .is_some_and(exact_security_admission_env_entries),
+        errors,
+        "migration Job must import the exact five security-admission ConfigMap keys",
     );
 
     validate_cnpg_ca_mount("migration Job", pod_spec, container, errors);
@@ -1180,8 +1224,9 @@ fn immutable_image_digest(image: &str) -> Option<&str> {
     image.rsplit_once("@sha256:").map(|(_, digest)| digest)
 }
 
-/// Require one exact ConfigMap import per deployment and one exact database URL
-/// Secret key for the API. Literal values and whole-Secret imports are refused.
+/// Require one exact allowlisted ConfigMap import per deployment, plus one exact
+/// database URL Secret key and five admission ConfigMap keys for the API.
+/// Literal values and whole-Secret imports are refused.
 fn validate_container_env(name: &str, index: usize, container: &Value, errors: &mut Vec<String>) {
     let Some(item) = object(container) else {
         return;
@@ -1210,7 +1255,7 @@ fn validate_container_env(name: &str, index: usize, container: &Value, errors: &
     if name == "platform-api" {
         let entry = env.first().copied().unwrap_or(&Value::Null);
         expect(
-            env.len() == 1
+            env.len() == 6
                 && object(entry).is_some_and(|map| map.len() == 2)
                 && str_at(entry, &["name"]) == Some("RYUKI_DATABASE_URL")
                 && object_at(entry, &["valueFrom"]).is_some_and(|value_from| value_from.len() == 1)
@@ -1222,7 +1267,13 @@ fn validate_container_env(name: &str, index: usize, container: &Value, errors: &
                     == Some("RYUKI_DATABASE_URL")
                 && value_at(entry, &["value"]).is_none(),
             errors,
-            "Deployment platform-api must import only ryuki-platform-api-db/RYUKI_DATABASE_URL through secretKeyRef",
+            "Deployment platform-api must import the database URL plus five security-admission keys",
+        );
+        expect(
+            env.get(1..)
+                .is_some_and(exact_security_admission_env_entries),
+            errors,
+            "Deployment platform-api must import the exact five security-admission ConfigMap keys",
         );
     } else {
         expect(
@@ -1250,6 +1301,25 @@ fn validate_container_env(name: &str, index: usize, container: &Value, errors: &
     }
 }
 
+fn exact_security_admission_env_entries(entries: &[&Value]) -> bool {
+    entries.len() == SECURITY_ADMISSION_KEYS.len()
+        && entries
+            .iter()
+            .zip(SECURITY_ADMISSION_KEYS)
+            .all(|(entry, expected_key)| {
+                object(entry).is_some_and(|map| object_has_exact_keys(map, &["name", "valueFrom"]))
+                    && str_at(entry, &["name"]) == Some(*expected_key)
+                    && object_at(entry, &["valueFrom"])
+                        .is_some_and(|map| object_has_exact_keys(map, &["configMapKeyRef"]))
+                    && object_at(entry, &["valueFrom", "configMapKeyRef"])
+                        .is_some_and(|map| object_has_exact_keys(map, &["name", "key"]))
+                    && str_at(entry, &["valueFrom", "configMapKeyRef", "name"])
+                        == Some(SECURITY_ADMISSION_CONFIG_MAP)
+                    && str_at(entry, &["valueFrom", "configMapKeyRef", "key"])
+                        == Some(*expected_key)
+            })
+}
+
 fn validate_cnpg_ca_mount(
     owner: &str,
     pod_spec: &Value,
@@ -1257,7 +1327,11 @@ fn validate_cnpg_ca_mount(
     errors: &mut Vec<String>,
 ) {
     let volumes = array_at_path(pod_spec, &["volumes"]);
-    let volume = volumes.first().copied().unwrap_or(&Value::Null);
+    let volume = volumes
+        .iter()
+        .copied()
+        .find(|volume| str_at(volume, &["name"]) == Some(CNPG_CA_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
     let items = array_at_path(volume, &["secret", "items"]);
     let item = items.first().copied().unwrap_or(&Value::Null);
     expect(
@@ -1272,13 +1346,15 @@ fn validate_cnpg_ca_mount(
             && str_at(item, &["key"]) == Some(CNPG_CA_SECRET_KEY)
             && str_at(item, &["path"]) == Some(CNPG_CA_SECRET_KEY),
         errors,
-        format!(
-            "{owner} must project only {CNPG_CA_SECRET_NAME}/{CNPG_CA_SECRET_KEY} into the CNPG CA volume"
-        ),
+        format!("{owner} must project only the exact CNPG CA volume"),
     );
 
     let mounts = array_at_path(container, &["volumeMounts"]);
-    let mount = mounts.first().copied().unwrap_or(&Value::Null);
+    let mount = mounts
+        .iter()
+        .copied()
+        .find(|mount| str_at(mount, &["name"]) == Some(CNPG_CA_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
     expect(
         mounts.len() == 1
             && object(mount)
@@ -1287,7 +1363,7 @@ fn validate_cnpg_ca_mount(
             && str_at(mount, &["mountPath"]) == Some(CNPG_CA_MOUNT_PATH)
             && bool_at(mount, &["readOnly"]) == Some(true),
         errors,
-        format!("{owner} must mount the CNPG CA read-only at {CNPG_CA_FILE_PATH}"),
+        format!("{owner} must mount only the CNPG CA read-only"),
     );
 }
 
@@ -2869,6 +2945,37 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_config_maps_reject_unreviewed_env_from_keys() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join("deploy/kubernetes/base/configmap.yaml"))
+            .expect("checked-in ConfigMaps must be readable");
+        let manifests: Vec<Value> = serde_yaml::Deserializer::from_str(&raw)
+            .map(|document| Value::deserialize(document).expect("ConfigMap YAML must parse"))
+            .collect();
+
+        for name in EXPECTED_CONFIG_MAPS {
+            let mut invalid = manifests.clone();
+            let config_map = invalid
+                .iter_mut()
+                .find(|manifest| str_at(manifest, &["metadata", "name"]) == Some(*name))
+                .unwrap_or_else(|| panic!("missing checked-in ConfigMap {name}"));
+            config_map["data"]
+                .as_object_mut()
+                .expect("ConfigMap data")
+                .insert("RYUKI_UNREVIEWED_ENV".to_string(), json!("injected"));
+
+            let mut errors = Vec::new();
+            validate_config_maps(&invalid, &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("only the exact reviewed keys")),
+                "ConfigMap {name} must reject an unreviewed envFrom key: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn checked_in_cutover_contract_binds_config_secret_digest_and_https_path() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert!(
@@ -3160,15 +3267,52 @@ mod tests {
                                     }
                                 }
                             ],
-                            "env": [{
-                                "name": "RYUKI_MIGRATION_DATABASE_URL",
-                                "valueFrom": {
-                                    "secretKeyRef": {
-                                        "name": identity.secret_name,
-                                        "key": "RYUKI_MIGRATION_DATABASE_URL"
+                            "env": [
+                                {
+                                    "name": "RYUKI_MIGRATION_DATABASE_URL",
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": identity.secret_name,
+                                            "key": "RYUKI_MIGRATION_DATABASE_URL"
+                                        }
                                     }
+                                },
+                                {
+                                    "name": "RYUKI_SECURITY_CONTRACT_ROOT",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_SECURITY_CONTRACT_ROOT"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_EXPECTED_DEPLOYMENT_ID",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_EXPECTED_DEPLOYMENT_ID"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_SECURITY_PROFILE",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_SECURITY_PROFILE"
+                                    }}
                                 }
-                            }],
+                            ],
                             "resources": {
                                 "requests": { "cpu": "100m", "memory": "128Mi" },
                                 "limits": { "cpu": "1", "memory": "512Mi" }

@@ -20,6 +20,7 @@ mod oidc_callback;
 mod openapi;
 mod repos;
 mod scheduler;
+mod security_contracts;
 mod session_credentials;
 mod session_lookup_admission;
 #[cfg(test)]
@@ -2953,6 +2954,23 @@ async fn main() {
         return;
     }
 
+    // Every serving and migration process admits one independently pinned,
+    // content-addressed deployment security root before it can touch database
+    // configuration, signing keys, workers, routers, or listener state. The
+    // route-metadata maintenance mode above is intentionally read-only and is
+    // the sole configuration-free exception.
+    let security_pins =
+        security_contracts::StartupSecurityPins::from_environment().unwrap_or_else(|error| {
+            eprintln!("security contract preflight failed: {error}");
+            std::process::exit(1);
+        });
+    let security_contract =
+        security_contracts::load_startup_security_contract(&security_pins, chrono::Utc::now())
+            .unwrap_or_else(|error| {
+                eprintln!("security contract preflight failed: {error}");
+                std::process::exit(1);
+            });
+
     let migration_mode = database::migration_startup_mode_from_env().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
@@ -2995,12 +3013,26 @@ async fn main() {
         }
     }
 
-    START_TIME.set(Instant::now()).ok();
     let app_config = config::load_config().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
     });
-    config_store::init_with_config("platform-config.json", &app_config);
+    security_contract
+        .validate_runtime_bindings(
+            &app_config,
+            std::env::var_os("RYUKI_AUTH_MODE").is_some(),
+            chrono::Utc::now(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("security contract runtime binding failed: {error}");
+            std::process::exit(1);
+        });
+    START_TIME.set(Instant::now()).ok();
+    config_store::init_with_security_contract(
+        "platform-config.json",
+        &app_config,
+        security_contract,
+    );
     let session_lookup_admission =
         crate::session_lookup_admission::initialize_global(app_config.server.pool_max_connections);
 
@@ -3026,6 +3058,16 @@ async fn main() {
             tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
+
+    let admitted_security = config_store::get_security_contract_context();
+    tracing::info!(
+        deployment_id = %admitted_security.profile.deployment_id,
+        security_profile = admitted_security.profile.security_profile.as_str(),
+        profile_digest = %admitted_security.profile_digest,
+        contract_root = %admitted_security.contract_root.display(),
+        profile_path = %admitted_security.profile_path.display(),
+        "deployment security contract admitted"
+    );
 
     if app_config.auth_mode == AuthMode::Local {
         if !app_config.local_auth.users.is_empty() {

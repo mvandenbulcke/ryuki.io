@@ -100,15 +100,39 @@ spec:
           envFrom:
             - configMapRef:
                 name: platform-api-config
-          # Import only the one reviewed key. A newly added Secret field can
-          # never override non-secret ConfigMap policy through whole-Secret
-          # envFrom precedence.
+          # Import only reviewed keys. The external admission ConfigMap cannot
+          # inject or override any unrelated process configuration.
           env:
             - name: RYUKI_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: ryuki-platform-api-db
                   key: RYUKI_DATABASE_URL
+            - name: RYUKI_SECURITY_CONTRACT_ROOT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_SECURITY_CONTRACT_ROOT
+            - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+            - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+            - name: RYUKI_EXPECTED_DEPLOYMENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_EXPECTED_DEPLOYMENT_ID
+            - name: RYUKI_SECURITY_PROFILE
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_SECURITY_PROFILE
           ports:
             - containerPort: 8080
           readinessProbe:

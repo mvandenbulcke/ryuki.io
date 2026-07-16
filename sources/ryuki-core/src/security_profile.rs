@@ -63,6 +63,7 @@ pub struct DeploymentSecurityProfile {
 pub struct StartupAdmissionContext {
     pub deployment_id: String,
     pub security_profile: SecurityProfile,
+    pub profile_digest: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -381,10 +382,25 @@ impl DeploymentSecurityProfile {
     pub fn validate_for_startup(
         &self,
         expected: &StartupAdmissionContext,
+        actual_profile_digest: &str,
         now: DateTime<Utc>,
     ) -> Vec<String> {
         let mut errors = self.validate_structure_at(now);
 
+        validate_digest(
+            "startup expected profile_digest",
+            &expected.profile_digest,
+            &mut errors,
+        );
+        validate_digest(
+            "startup actual profile_digest",
+            actual_profile_digest,
+            &mut errors,
+        );
+        if actual_profile_digest != expected.profile_digest {
+            errors
+                .push("deployment profile digest does not match the pinned profile_digest".into());
+        }
         if self.deployment_id != expected.deployment_id {
             errors.push("deployment profile does not match the pinned deployment_id".into());
         }
@@ -765,6 +781,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_PROFILE_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn fixture() -> DeploymentSecurityProfile {
         serde_json::from_str(include_str!(
             "../../../catalog/security-contracts/v1/deployment-security-profile.implementation.json"
@@ -901,7 +920,9 @@ mod tests {
             &StartupAdmissionContext {
                 deployment_id: profile.deployment_id.clone(),
                 security_profile: SecurityProfile::Production,
+                profile_digest: TEST_PROFILE_DIGEST.into(),
             },
+            TEST_PROFILE_DIGEST,
             fixed_now(),
         );
         assert!(
@@ -925,7 +946,9 @@ mod tests {
             &StartupAdmissionContext {
                 deployment_id: profile.deployment_id.clone(),
                 security_profile: SecurityProfile::Production,
+                profile_digest: TEST_PROFILE_DIGEST.into(),
             },
+            TEST_PROFILE_DIGEST,
             fixed_now(),
         );
         assert!(
@@ -946,6 +969,70 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("exactly [active]"))
         );
+    }
+
+    #[test]
+    fn startup_rejects_malformed_profile_digests() {
+        let profile = fixture();
+        let errors = profile.validate_for_startup(
+            &StartupAdmissionContext {
+                deployment_id: profile.deployment_id.clone(),
+                security_profile: profile.security_profile,
+                profile_digest: "SHA256:not-lowercase".into(),
+            },
+            "sha256:GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+            fixed_now(),
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "startup expected profile_digest must be a sha256 digest")
+        );
+        assert!(errors.iter().any(|error| {
+            error
+                == "startup actual profile_digest must contain 64 lowercase hexadecimal characters"
+        }));
+    }
+
+    #[test]
+    fn startup_rejects_zero_profile_digests() {
+        let profile = fixture();
+        let zero_digest = format!("sha256:{}", "0".repeat(64));
+        let errors = profile.validate_for_startup(
+            &StartupAdmissionContext {
+                deployment_id: profile.deployment_id.clone(),
+                security_profile: profile.security_profile,
+                profile_digest: zero_digest.clone(),
+            },
+            &zero_digest,
+            fixed_now(),
+        );
+
+        assert!(errors.iter().any(|error| {
+            error == "startup expected profile_digest must not use the unresolved all-zero digest"
+        }));
+        assert!(errors.iter().any(|error| {
+            error == "startup actual profile_digest must not use the unresolved all-zero digest"
+        }));
+    }
+
+    #[test]
+    fn startup_rejects_a_profile_digest_that_does_not_match_its_pin() {
+        let profile = fixture();
+        let errors = profile.validate_for_startup(
+            &StartupAdmissionContext {
+                deployment_id: profile.deployment_id.clone(),
+                security_profile: profile.security_profile,
+                profile_digest: TEST_PROFILE_DIGEST.into(),
+            },
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            fixed_now(),
+        );
+
+        assert!(errors.iter().any(|error| {
+            error == "deployment profile digest does not match the pinned profile_digest"
+        }));
     }
 
     #[test]

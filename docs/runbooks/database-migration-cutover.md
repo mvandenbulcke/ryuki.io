@@ -8,9 +8,17 @@ hard-coded latest version.
 
 ## Startup modes
 
+Before interpreting `RYUKI_MIGRATION_MODE` or opening a database connection,
+every mode admits the same five independently pinned deployment-security
+inputs documented in `docs/configuration.md`. The one-shot Job uses the same
+root-owned contract tree baked into the release image and imports the same exact
+key references as the serving Deployment. A missing, inactive, unresolved, or
+digest-mismatched contract therefore exits before migration credentials or
+PostgreSQL are touched.
+
 `RYUKI_MIGRATION_MODE` is a closed enum:
 
-- `local-auto` is the default when the variable is absent. It preserves local
+- `local-auto` must be selected explicitly. It preserves local
   development auto-apply behavior, but applies through an isolated
   one-connection migration pool rather than the application pool.
 - `apply-only` requires `RYUKI_MIGRATION_DATABASE_URL`, applies every pending

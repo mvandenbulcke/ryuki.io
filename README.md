@@ -116,7 +116,8 @@ cargo build --workspace
 cargo test --workspace
 
 # Run API on the portal's default upstream port. Pass any additional auth
-# settings explicitly; do not source .env as executable shell code.
+# settings and all five security-admission inputs explicitly; do not source
+# .env as executable shell code.
 # Export RYUKI_DATABASE_URL in this shell without committing its value.
 RYUKI_MIGRATION_MODE=local-auto \
 RYUKI_SERVER__BIND_ADDRESS=127.0.0.1:8081 \
@@ -131,18 +132,27 @@ RYUKI_PORTAL_EXECUTION_MODE=live-provider \
   cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
 
+API startup also requires `RYUKI_SECURITY_CONTRACT_ROOT`,
+`RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH`,
+`RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST`, `RYUKI_EXPECTED_DEPLOYMENT_ID`, and
+`RYUKI_SECURITY_PROFILE` to have been exported for a reviewed active contract.
+The checked-in `implementation_only` fixtures are validation inputs and cannot
+start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
+before using the API command above; no runnable digest is inferred from Git.
+
 The API is then at `http://127.0.0.1:8081` and the portal at
 `http://127.0.0.1:8080`. Check API readiness at `/ready` before using the
 portal. The full first-test gate and evidence requirements are in
 [`docs/first-test.md`](docs/first-test.md).
 
 The complete development Compose stack publishes every service on
-`127.0.0.1`. Its API uses local authentication because a container bridge
-listener is not loopback: before starting the full stack, set
-`RYUKI_LOCAL_AUTH__USERS`, explicit site/environment authority modes (and
-scope lists for `scoped` modes), and a random, at-least-32-byte
-`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` in the gitignored `.env`. The portal runs
-in static dry-run mode at `http://127.0.0.1:18000` by default.
+`127.0.0.1`, but its API listener is a non-loopback container bridge. Startup
+admission currently permits only an exactly bound mock/static development
+fixture on literal loopback; legacy `local` and `entra-id` runtime values are
+not yet projected by the content-addressed provider contract and therefore
+fail closed. The Compose API remains intentionally blocked until that typed
+projection is implemented. When run independently, the portal can still serve
+its labeled static dry-run data at `http://127.0.0.1:18000`.
 
 ### Validation
 
@@ -210,6 +220,11 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 
 | Variable | Purpose |
 |---|---|
+| `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable deployment-security contract root |
+| `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized profile path relative to the contract root |
+| `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw profile bytes |
+| `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
+| `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
 | `RYUKI_AUTH_MODE` | `mock-dry-run` (default), `static-dry-run`, `entra-id`, or `local` |
 | `RYUKI_ENTRA_TENANT_ID` | Azure AD directory ID |

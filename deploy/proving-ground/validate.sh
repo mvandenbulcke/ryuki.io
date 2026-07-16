@@ -43,6 +43,24 @@ is_image_id() {
   [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]
 }
 
+is_security_profile_path() {
+  local path="$1"
+
+  [[ "${#path}" -le 512 ]] || return 1
+  [[ "$path" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\.json$ ]]
+}
+
+is_nonzero_sha256_digest() {
+  local digest="$1"
+
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  [[ "$digest" != "sha256:$(printf '%064d' 0)" ]]
+}
+
+is_deployment_id() {
+  [[ "$1" =~ ^deployment:[a-z0-9][a-z0-9._-]{2,126}$ ]]
+}
+
 verify_local_revision_image() {
   local image_ref="$1"
   local expected_id="$2"
@@ -323,6 +341,37 @@ validate_agent_env
 load_agent_env "$ENV_FILE"
 validate_agent_env
 
+if [[ "$ENV_FILE" == "$HERE/env.example" ]]; then
+  # The committed template deliberately carries no admission choice. These
+  # non-secret, syntactically valid values exist only in this process so
+  # Compose interpolation and rendered-boundary checks can still be exercised.
+  PG_DEPLOYMENT_SECURITY_PROFILE_PATH=sentinel/proving-ground-profile.json
+  PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST="sha256:$(printf '%064d' 1)"
+  PG_EXPECTED_DEPLOYMENT_ID=deployment:proving-ground-template
+  PG_SECURITY_PROFILE=test
+else
+  PG_DEPLOYMENT_SECURITY_PROFILE_PATH="$(
+    compose_env_value PG_DEPLOYMENT_SECURITY_PROFILE_PATH "$ENV_FILE"
+  )" || fail "PG_DEPLOYMENT_SECURITY_PROFILE_PATH is missing"
+  PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST="$(
+    compose_env_value PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST "$ENV_FILE"
+  )" || fail "PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST is missing"
+  PG_EXPECTED_DEPLOYMENT_ID="$(
+    compose_env_value PG_EXPECTED_DEPLOYMENT_ID "$ENV_FILE"
+  )" || fail "PG_EXPECTED_DEPLOYMENT_ID is missing"
+  PG_SECURITY_PROFILE="$(compose_env_value PG_SECURITY_PROFILE "$ENV_FILE")" || \
+    fail "PG_SECURITY_PROFILE is missing"
+
+  is_security_profile_path "$PG_DEPLOYMENT_SECURITY_PROFILE_PATH" || \
+    fail "PG_DEPLOYMENT_SECURITY_PROFILE_PATH must be a safe relative .json path without dot segments"
+  is_nonzero_sha256_digest "$PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST" || \
+    fail "PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST must be a nonzero sha256: digest with 64 lowercase hex digits"
+  is_deployment_id "$PG_EXPECTED_DEPLOYMENT_ID" || \
+    fail "PG_EXPECTED_DEPLOYMENT_ID must be a canonical deployment: id"
+  [[ "$PG_SECURITY_PROFILE" == "test" ]] || \
+    fail "PG_SECURITY_PROFILE must be exactly test for the proving ground"
+fi
+
 LOCAL_USERS="$(compose_env_value PG_LOCAL_USERS "$ENV_FILE")" || \
   fail "PG_LOCAL_USERS is missing"
 SESSION_CREDENTIAL_HMAC_KEY="$(compose_env_value PG_SESSION_CREDENTIAL_HMAC_KEY "$ENV_FILE")" || \
@@ -516,11 +565,32 @@ else
   PG_ACCEPTANCE_REVISION="$ACCEPTANCE_REVISION"
 fi
 export PG_DB_PASSWORD PG_SESSION_CREDENTIAL_HMAC_KEY PG_ACCEPTANCE_REVISION
+export PG_DEPLOYMENT_SECURITY_PROFILE_PATH
+export PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST PG_EXPECTED_DEPLOYMENT_ID
+export PG_SECURITY_PROFILE
 
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$HERE/compose.yaml")
 "${COMPOSE[@]}" config --quiet
 RENDERED_CONFIG_JSON="$("${COMPOSE[@]}" config --format json)" || \
   fail "cannot render proving-ground Compose JSON"
+
+jq -e \
+  --arg profile_path "$PG_DEPLOYMENT_SECURITY_PROFILE_PATH" \
+  --arg profile_digest "$PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST" \
+  --arg deployment_id "$PG_EXPECTED_DEPLOYMENT_ID" \
+  --arg security_profile "$PG_SECURITY_PROFILE" '
+  .services["platform-api"].environment.RYUKI_SECURITY_CONTRACT_ROOT
+    == "/app/security-contract"
+  and .services["platform-api"].environment.RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+    == $profile_path
+  and .services["platform-api"].environment.RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+    == $profile_digest
+  and .services["platform-api"].environment.RYUKI_EXPECTED_DEPLOYMENT_ID
+    == $deployment_id
+  and .services["platform-api"].environment.RYUKI_SECURITY_PROFILE
+    == $security_profile
+' >/dev/null <<< "$RENDERED_CONFIG_JSON" || \
+  fail "rendered API security admission root or exact profile pins changed"
 
 jq -e '
   .services["platform-api"].network_mode == "service:vault"

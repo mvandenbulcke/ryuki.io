@@ -3091,6 +3091,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "jsonschema",
  "jsonwebtoken",
  "pkcs8",
  "rand 0.8.6",

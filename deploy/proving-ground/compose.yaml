@@ -94,6 +94,14 @@ services:
       RYUKI_MIGRATION_MODE: local-auto
       RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8081
       RYUKI_PLATFORM_URL: http://localhost:18081
+      # The proving ground cannot become an authority merely by selecting live
+      # execution. Its exact admission profile and pins are operator inputs;
+      # validation fails closed when any one is absent or inconsistent.
+      RYUKI_SECURITY_CONTRACT_ROOT: /app/security-contract
+      RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH: ${PG_DEPLOYMENT_SECURITY_PROFILE_PATH:?set in .env}
+      RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST: ${PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST:?set in .env}
+      RYUKI_EXPECTED_DEPLOYMENT_ID: ${PG_EXPECTED_DEPLOYMENT_ID:?set in .env}
+      RYUKI_SECURITY_PROFILE: ${PG_SECURITY_PROFILE:?set in .env}
       # Real authentication for a real test: local accounts from .env.
       RYUKI_AUTH_MODE: local
       RYUKI_LOCAL_AUTH__USERS: ${PG_LOCAL_USERS:?set in .env}

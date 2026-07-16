@@ -20,20 +20,27 @@ forwarding descriptors, not the ignored values themselves. API startup
 validates the local-user syntax, explicit authority shape, and session key
 length.
 
+The API image fixes `RYUKI_SECURITY_CONTRACT_ROOT=/app/security-contract` and
+Compose requires the profile path, exact raw-byte profile digest, expected
+deployment id, and `development|test|production` profile pin from the
+gitignored environment. The checked-in bundle is `implementation_only`, so it
+is not selected automatically and cannot start this stack. Until an active
+typed provider profile can bind every runtime authentication value, the full
+Compose startup is intentionally blocked. A migration overlay cannot grant
+authority or enable live execution and therefore cannot admit legacy `local`
+or `entra-id` mode.
+
 The Compose file overrides the database URL to use the internal `platform-db`
 service hostname instead of the host-local `localhost` default.
 
 The API container listens on a bridge interface, so credential-free mock/static
-authority is intentionally rejected. Before starting the full stack, put a
-valid `RYUKI_LOCAL_AUTH__USERS` value, explicit
-`RYUKI_LOCAL_AUTH__SITE_AUTHORITY` and
-`RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY` modes (plus scope lists when either
-mode is `scoped`), and a random, at-least-32-byte
-`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` in the gitignored root `.env`; Compose
-selects `local` authentication explicitly. The portal defaults to labeled
-static dry-run data and is published only on `127.0.0.1:18000`. Provider-live
-portal use needs a separately reviewed HTTPS upstream topology; this skeleton
-does not weaken the transport guard to admit a cleartext bridge hostname.
+authority is intentionally rejected. Compose selects legacy `local`
+authentication explicitly, which the current content-addressed admission
+loader also rejects because the password authority cannot be equated with a
+typed WebAuthn provider record. The portal defaults to labeled static dry-run
+data and is published only on `127.0.0.1:18000`. Provider-live portal use needs
+a separately reviewed HTTPS upstream topology; this skeleton does not weaken
+the transport guard to admit a cleartext bridge hostname.
 
 ## Boundaries
 
@@ -46,6 +53,11 @@ does not weaken the transport guard to admit a cleartext bridge hostname.
   reject these development tags.
 
 ## Commands
+
+The commands below require all security-admission and local-auth inputs
+described above; Compose fails interpolation before creating containers when a
+required pin is absent, and API admission remains fail-closed afterward for the
+documented unresolved authority binding.
 
 ```bash
 docker compose --env-file .env -f deploy/compose/compose.yaml build

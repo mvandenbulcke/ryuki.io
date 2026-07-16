@@ -66,14 +66,39 @@ spec:
           envFrom:
             - configMapRef:
                 name: platform-api-migration-config
-          # The digest-scoped VaultDynamicSecret is created only for this
-          # operation. Import exactly its reviewed URL key.
+          # The digest-scoped VaultDynamicSecret and the external admission
+          # ConfigMap are imported key-by-key; neither can widen configuration.
           env:
             - name: RYUKI_MIGRATION_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: ryuki-platform-api-migrator-db-111111111111
                   key: RYUKI_MIGRATION_DATABASE_URL
+            - name: RYUKI_SECURITY_CONTRACT_ROOT
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_SECURITY_CONTRACT_ROOT
+            - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH
+            - name: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+            - name: RYUKI_EXPECTED_DEPLOYMENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_EXPECTED_DEPLOYMENT_ID
+            - name: RYUKI_SECURITY_PROFILE
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_SECURITY_PROFILE
           resources:
             requests:
               cpu: 50m

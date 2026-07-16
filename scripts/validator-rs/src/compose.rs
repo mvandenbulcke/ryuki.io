@@ -83,6 +83,11 @@ const PLATFORM_DB_ENV_WHITELIST: &[&str] = &["POSTGRES_USER", "POSTGRES_PASSWORD
 const PLATFORM_API_ENV_WHITELIST: &[&str] = &[
     "RYUKI_DATABASE_URL",
     "RYUKI_DATABASE__REQUIRED",
+    "RYUKI_SECURITY_CONTRACT_ROOT",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+    "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+    "RYUKI_EXPECTED_DEPLOYMENT_ID",
+    "RYUKI_SECURITY_PROFILE",
     "RYUKI_SERVER__BIND_ADDRESS",
     "RYUKI_PLATFORM_URL",
     "RYUKI_AUTH_MODE",
@@ -111,6 +116,23 @@ const PLATFORM_API_ENVIRONMENT: &[(&str, &str)] = &[
     ),
     ("RYUKI_DATABASE__REQUIRED", "true"),
     ("RYUKI_MIGRATION_MODE", "local-auto"),
+    ("RYUKI_SECURITY_CONTRACT_ROOT", "/app/security-contract"),
+    (
+        "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+        "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH:?required}",
+    ),
+    (
+        "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+        "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST:?required}",
+    ),
+    (
+        "RYUKI_EXPECTED_DEPLOYMENT_ID",
+        "${RYUKI_EXPECTED_DEPLOYMENT_ID:?required}",
+    ),
+    (
+        "RYUKI_SECURITY_PROFILE",
+        "${RYUKI_SECURITY_PROFILE:?required}",
+    ),
     ("RYUKI_SERVER__BIND_ADDRESS", "0.0.0.0:8080"),
     ("RYUKI_PLATFORM_URL", "http://localhost:18080"),
     ("RYUKI_AUTH_MODE", "local"),
@@ -788,6 +810,68 @@ mod tests {
             "reviewed profile must contain no prohibited material: {:?}",
             prohibited_errors(&compose)
         );
+    }
+
+    #[test]
+    fn security_admission_environment_is_exact_and_fail_closed() {
+        const SECURITY_ADMISSION_CASES: &[(&str, &str)] = &[
+            (
+                "RYUKI_SECURITY_CONTRACT_ROOT",
+                "/tmp/unreviewed-security-contract",
+            ),
+            (
+                "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+                "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH:-unreviewed-profile.json}",
+            ),
+            (
+                "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+                "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST:-unreviewed-digest}",
+            ),
+            (
+                "RYUKI_EXPECTED_DEPLOYMENT_ID",
+                "${RYUKI_EXPECTED_DEPLOYMENT_ID:-deployment:unreviewed}",
+            ),
+            ("RYUKI_SECURITY_PROFILE", "development"),
+        ];
+
+        let reviewed = reviewed_compose();
+        let reviewed_errors = value_errors(&reviewed);
+        assert!(
+            reviewed_errors.is_empty(),
+            "checked-in compose must satisfy the security admission environment contract: {reviewed_errors:?}"
+        );
+
+        for (key, changed_or_downgraded_value) in SECURITY_ADMISSION_CASES {
+            for (mutation, replacement) in [
+                ("missing", None),
+                ("empty", Some("")),
+                ("changed or downgraded", Some(*changed_or_downgraded_value)),
+            ] {
+                let mut compose = reviewed.clone();
+                let environment = compose["services"]["platform-api"]["environment"]
+                    .as_object_mut()
+                    .expect("reviewed platform-api environment must be an object");
+                match replacement {
+                    Some(value) => {
+                        environment.insert((*key).to_string(), Value::String(value.to_string()));
+                    }
+                    None => {
+                        assert!(
+                            environment.remove(*key).is_some(),
+                            "reviewed compose must contain {key}"
+                        );
+                    }
+                }
+
+                let errors = value_errors(&compose);
+                assert!(
+                    errors.iter().any(|error| error.contains(
+                        "platform-api environment must match the reviewed local-safe profile"
+                    )),
+                    "{key} must be rejected when {mutation}: {errors:?}"
+                );
+            }
+        }
     }
 
     #[test]

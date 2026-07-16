@@ -31,6 +31,14 @@ services:
       RYUKI_MIGRATION_MODE: local-auto
       RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8080
       RYUKI_PLATFORM_URL: http://localhost:18080
+      # Select an active, content-addressed admission profile explicitly. The
+      # image supplies the immutable contract root; no implementation-only
+      # repository fixture is selected implicitly.
+      RYUKI_SECURITY_CONTRACT_ROOT: /app/security-contract
+      RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH: "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH:?required}"
+      RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST: "${RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST:?required}"
+      RYUKI_EXPECTED_DEPLOYMENT_ID: "${RYUKI_EXPECTED_DEPLOYMENT_ID:?required}"
+      RYUKI_SECURITY_PROFILE: "${RYUKI_SECURITY_PROFILE:?required}"
       # The bridge listener is non-loopback, so credential-free mock/static
       # authority is rejected. Compose reads the root .env for interpolation,
       # but forwards only this reviewed local-auth/session contract.
