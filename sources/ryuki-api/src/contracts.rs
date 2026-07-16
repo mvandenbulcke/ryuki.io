@@ -21112,6 +21112,7 @@ async fn requests_approve_live_apply(
         platform: String,
         spec: serde_json::Value,
         evidence_digest: Option<String>,
+        raw_plan_digest: Option<String>,
         req_status: String,
         site: String,
     }
@@ -21121,6 +21122,7 @@ async fn requests_approve_live_apply(
     // reviewed execution authority.
     let plan: Option<PlanJobRow> = sqlx::query_as(
         "SELECT j.id, j.attempt_id, j.platform, j.spec, j.evidence_digest, \
+                j.raw_plan_digest, \
                 r.status AS req_status, r.site AS site \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 AND j.mode = 'LivePlan' \
@@ -21183,7 +21185,15 @@ async fn requests_approve_live_apply(
     // unreachable (enforces the degradation rule, not just advertises it).
     enforce_site_operational(pool, &request_site).await?;
 
-    let digest = plan.evidence_digest.unwrap_or_default();
+    // The evidence digest identifies the safe projection the human reviewed.
+    // Execution authority is bound separately to the signed raw-plan digest;
+    // never substitute one commitment for the other when minting the grant.
+    let evidence_digest = plan.evidence_digest.unwrap_or_default();
+    let Some(raw_plan_digest) = plan.raw_plan_digest else {
+        return Err(status_409(
+            "the completed live plan has no signed raw-plan commitment",
+        ));
+    };
     let Some(plan_attempt_id) = plan.attempt_id else {
         return Err(status_409(
             "the completed live plan has no immutable leased attempt identity",
@@ -21209,12 +21219,12 @@ async fn requests_approve_live_apply(
     // evidence and must never mint a live grant.
     let evidence: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT bytes FROM evidence_blobs WHERE digest = $1")
-            .bind(&digest)
+            .bind(&evidence_digest)
             .fetch_optional(pool)
             .await
             .map_err(db_error)?;
     let reviewable = evidence.as_deref().is_some_and(|bytes| {
-        ryuki_protocol::sha256_hex(bytes) == digest
+        ryuki_protocol::sha256_hex(bytes) == evidence_digest
             && crate::agents::server_live_plan_is_safe_to_approve(&spec, bytes)
     });
     if !reviewable {
@@ -21237,7 +21247,7 @@ async fn requests_approve_live_apply(
         request_id: uid,
         platform: request_site,
         spec,
-        approved_plan_digest: reviewed_plan.approved_plan_digest,
+        approved_plan_digest: raw_plan_digest,
         // 1-hour grant TTL — the operator must apply within this window.
         expiry_seconds: 3600,
     };
@@ -55443,6 +55453,30 @@ mod db_lifecycle_tests {
             .ok();
     }
 
+    /// Migration 185 makes the durable registry row the certificate site's
+    /// authority. Tests using generated site codes must therefore seed that
+    /// authority in PostgreSQL rather than only in the process-local cache.
+    async fn seed_active_certificate_site(pool: &PgPool, site: &str) {
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', $2, 'Test country', 'ZZ', 'UTC', true)",
+        )
+        .bind(site)
+        .bind(format!("Certificate test site {site}"))
+        .execute(pool)
+        .await
+        .expect("seed active canonical certificate site");
+    }
+
+    async fn cleanup_certificate_site(pool: &PgPool, site: &str) {
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("clean active canonical certificate site");
+    }
+
     /// C279: inventory is a fixed newest-first keyset.  Equal timestamps use
     /// UUID as the deterministic tie-break, and legacy scan-amplifying query
     /// options fail explicitly instead of silently falling back to a full scan.
@@ -55456,6 +55490,7 @@ mod db_lifecycle_tests {
         let suffix = Uuid::new_v4();
         let prefix = format!("clp-{suffix}");
         let site = format!("CERT{}", &suffix.simple().to_string()[..8]);
+        seed_active_certificate_site(pool, &site).await;
         let id_a = seed_cert(
             pool,
             &format!("{prefix}-alpha"),
@@ -55494,7 +55529,7 @@ mod db_lifecycle_tests {
         .expect("tie certificate creation timestamps");
 
         let mut session = AuthSession::static_dry_run();
-        session.site_scope = vec![site];
+        session.site_scope = vec![site.clone()];
         let list = |params: CertListParams| {
             let s = session.clone();
             async move { certificates_inventory(AuthExtractor(s), Query(params)).await }
@@ -55565,6 +55600,7 @@ mod db_lifecycle_tests {
         for id in [&id_a, &id_b, &id_c] {
             cleanup_cert(pool, id).await;
         }
+        cleanup_certificate_site(pool, &site).await;
     }
 
     /// C279: the scoped repository performs a bounded per-site top-N merge.
@@ -55580,6 +55616,8 @@ mod db_lifecycle_tests {
         let tag = Uuid::new_v4().simple().to_string();
         let site_a = format!("CMA{}", tag[..8].to_ascii_uppercase());
         let site_b = format!("CMB{}", tag[..8].to_ascii_uppercase());
+        seed_active_certificate_site(pool, &site_a).await;
+        seed_active_certificate_site(pool, &site_b).await;
         let mut ids = Vec::new();
         for (index, site) in [&site_a, &site_b, &site_a, &site_b, &site_a, &site_b]
             .into_iter()
@@ -55618,7 +55656,7 @@ mod db_lifecycle_tests {
         assert_eq!(expected.len(), 6);
 
         let mut session = AuthSession::static_dry_run();
-        session.site_scope = vec![site_b, site_a];
+        session.site_scope = vec![site_b.clone(), site_a.clone()];
         let mut cursor = None;
         let mut actual = Vec::new();
         loop {
@@ -55655,6 +55693,8 @@ mod db_lifecycle_tests {
         for id in &ids {
             cleanup_cert(pool, id).await;
         }
+        cleanup_certificate_site(pool, &site_a).await;
+        cleanup_certificate_site(pool, &site_b).await;
     }
 
     /// C278/C279: omission/exaggeration of a limit is capped, inventory and
@@ -55669,6 +55709,7 @@ mod db_lifecycle_tests {
         let tag = Uuid::new_v4().simple().to_string();
         let bulk_prefix = format!("cert-bound-{tag}-");
         let inventory_site = format!("CI{}", tag[..10].to_ascii_uppercase());
+        seed_active_certificate_site(pool, &inventory_site).await;
         sqlx::query(
             "INSERT INTO certificates \
              (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
@@ -55719,18 +55760,7 @@ mod db_lifecycle_tests {
         assert_eq!(second_page.as_array().expect("array").len(), 5);
 
         let expiry_site = format!("CQP{}", tag[..8].to_ascii_uppercase());
-        site_registry::upsert_site(
-            site_registry::SiteEntry {
-                unlocode: expiry_site.clone(),
-                name: format!("Certificate query page {tag}"),
-                country: "Test country".into(),
-                country_code: "ZZ".into(),
-                timezone: "UTC".into(),
-                active: true,
-            },
-            site_registry::SiteCodeSystem::Custom,
-        )
-        .expect("register certificate query site");
+        seed_active_certificate_site(pool, &expiry_site).await;
         let expiry_prefix = format!("cert-expiry-{tag}-");
         sqlx::query(
             "INSERT INTO certificates \
@@ -55747,6 +55777,7 @@ mod db_lifecycle_tests {
         .await
         .expect("seed expiry inventory");
         let foreign_expiry_site = format!("CQF{}", tag[..8].to_ascii_uppercase());
+        seed_active_certificate_site(pool, &foreign_expiry_site).await;
         sqlx::query(
             "INSERT INTO certificates \
              (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
@@ -55983,8 +56014,8 @@ mod db_lifecycle_tests {
         .await
         .expect("read certificate site query-bound constraint");
         assert!(
-            !site_constraint.0,
-            "legacy-compatible constraint stays NOT VALID"
+            site_constraint.0,
+            "migration 185 validates the bounds after quarantining legacy rows"
         );
         assert!(
             site_constraint.1.contains("octet_length(site) >= 1")
@@ -56007,12 +56038,18 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .expect("clean expiry inventory");
+        cleanup_certificate_site(pool, &inventory_site).await;
+        cleanup_certificate_site(pool, &expiry_site).await;
+        cleanup_certificate_site(pool, &foreign_expiry_site).await;
     }
 
     /// C278/C279: migration 172 must be deployable over a schema-valid legacy
     /// site wider than a btree tuple. The row remains untouched for explicit
     /// reconciliation, but every partial index and list predicate quarantines
     /// it; the NOT VALID check rejects all new out-of-bounds direct writes.
+    /// Migration 185 later validates that check and adds canonical-site
+    /// authority; this simulation removes those later controls only inside a
+    /// rolled-back transaction and verifies they remain installed afterwards.
     #[tokio::test]
     async fn certificate_site_bound_rollout_quarantines_oversized_legacy_rows() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -56035,9 +56072,11 @@ mod db_lifecycle_tests {
             .as_database_error()
             .expect("site-bound rejection is a PostgreSQL error");
         assert_eq!(direct_database_error.code().as_deref(), Some("23514"));
-        assert_eq!(
-            direct_database_error.constraint(),
-            Some("certificates_site_query_bounds")
+        assert!(
+            direct_database_error
+                .message()
+                .contains("certificate site must reference an active canonical site"),
+            "migration 185 active-site trigger must reject the direct write: {direct_database_error}"
         );
 
         let index_names = vec![
@@ -56064,8 +56103,29 @@ mod db_lifecycle_tests {
         )
         .fetch_one(pool)
         .await
-        .expect("snapshot migration 172 constraint");
-        assert!(!constraint_before.0);
+        .expect("snapshot migration 185-validated bounds constraint");
+        assert!(constraint_before.0);
+        let site_fk_before: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'certificates'::regclass \
+               AND conname = 'certificates_site_registry_fk' AND contype = 'f'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("snapshot migration 185 certificate site foreign key");
+        assert!(site_fk_before);
+        let active_site_trigger_before: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_trigger \
+                 WHERE tgrelid = 'certificates'::regclass \
+                   AND tgname = 'trg_certificates_active_site' \
+                   AND NOT tgisinternal \
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("snapshot migration 185 active-site trigger");
+        assert!(active_site_trigger_before);
 
         let legacy_id = Uuid::new_v4();
         let mut tx = pool
@@ -56073,7 +56133,9 @@ mod db_lifecycle_tests {
             .await
             .expect("begin certificate site-bound rollout test");
         sqlx::raw_sql(
-            "DROP INDEX idx_certificates_inventory_page;
+            "DROP TRIGGER trg_certificates_active_site ON certificates;
+             ALTER TABLE certificates DROP CONSTRAINT certificates_site_registry_fk;
+             DROP INDEX idx_certificates_inventory_page;
              DROP INDEX idx_certificates_site_inventory_page;
              DROP INDEX idx_certificates_expiry_page;
              DROP INDEX idx_certificates_site_expiry_page;
@@ -56142,6 +56204,27 @@ mod db_lifecycle_tests {
         .await
         .expect("read legacy-compatible site constraint");
         assert!(!rolled_constraint.0);
+        let rollout_direct_error = sqlx::query(
+            "INSERT INTO certificates \
+             (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             VALUES ('rollout-direct-site-bound', 'CN=rollout-direct-site-bound', NOW(), \
+                     NOW() + INTERVAL '1 day', 'Custom', 'rollout-direct.test', $1, 'Active')",
+        )
+        .bind("é".repeat(17))
+        .execute(&mut *tx)
+        .await
+        .expect_err("migration 172 must reject new 34-octet direct-write sites");
+        let rollout_direct_database_error = rollout_direct_error
+            .as_database_error()
+            .expect("migration 172 bounds rejection is a PostgreSQL error");
+        assert_eq!(
+            rollout_direct_database_error.code().as_deref(),
+            Some("23514")
+        );
+        assert_eq!(
+            rollout_direct_database_error.constraint(),
+            Some("certificates_site_query_bounds")
+        );
         tx.rollback()
             .await
             .expect("rollback certificate rollout simulation");
@@ -56164,8 +56247,29 @@ mod db_lifecycle_tests {
         .fetch_one(pool)
         .await
         .expect("read certificate constraint after rollout rollback");
+        let site_fk_after: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'certificates'::regclass \
+               AND conname = 'certificates_site_registry_fk' AND contype = 'f'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read migration 185 certificate site foreign key after rollback");
+        let active_site_trigger_after: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_trigger \
+                 WHERE tgrelid = 'certificates'::regclass \
+                   AND tgname = 'trg_certificates_active_site' \
+                   AND NOT tgisinternal \
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read migration 185 active-site trigger after rollback");
         assert_eq!(indexes_after, indexes_before);
         assert_eq!(constraint_after, constraint_before);
+        assert_eq!(site_fk_after, site_fk_before);
+        assert_eq!(active_site_trigger_after, active_site_trigger_before);
         let legacy_after: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM certificates WHERE id = $1")
                 .bind(legacy_id)
@@ -56189,6 +56293,7 @@ mod db_lifecycle_tests {
         let tag = Uuid::new_v4().simple().to_string();
         let site = format!("CEM{}", tag[..8].to_ascii_uppercase());
         let prefix = format!("expiry-mutable-{tag}-");
+        seed_active_certificate_site(pool, &site).await;
         sqlx::query(
             "INSERT INTO certificates \
              (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
@@ -56235,7 +56340,7 @@ mod db_lifecycle_tests {
         let (_, Json(second_page)) = certificates_expiring(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(CertificateExpiringQuery {
-                site: Some(site),
+                site: Some(site.clone()),
                 days: Some(90),
                 limit: Some(2),
                 cursor: Some(cursor),
@@ -56258,6 +56363,7 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .expect("clean mutable expiry traversal");
+        cleanup_certificate_site(pool, &site).await;
     }
 
     /// #8: an environment-scoped principal sees no certificates. The bounded
@@ -66739,7 +66845,8 @@ mod db_lifecycle_tests {
         // Approval must be able to derive the same safe review projection
         // the portal showed; a bare digest is no longer sufficient.
         let plan_bytes = reviewable_server_plan_bytes();
-        let digest = ryuki_protocol::sha256_hex(&plan_bytes);
+        let evidence_digest = ryuki_protocol::sha256_hex(&plan_bytes);
+        let raw_plan_digest = "a".repeat(64);
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
             offering_id: Uuid::new_v4(),
@@ -66764,7 +66871,7 @@ mod db_lifecycle_tests {
             "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
              ON CONFLICT (digest) DO NOTHING",
         )
-        .bind(&digest)
+        .bind(&evidence_digest)
         .bind(&plan_bytes)
         .bind(plan_bytes.len() as i64)
         .execute(pool)
@@ -66774,13 +66881,17 @@ mod db_lifecycle_tests {
         // selector: request.site is the sole destination authority.
         let (cross_site_plan, cross_site_agent_id) =
             super::step_materialization_db_tests::seed_exact_signed_live_plan(
-                pool, id, "GBLON", &spec, &digest,
+                pool,
+                id,
+                "GBLON",
+                &spec,
+                &raw_plan_digest,
             )
             .await;
         let cross_site = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(reviewed_plan_selection(&cross_site_plan, &digest)),
+            Json(reviewed_plan_selection(&cross_site_plan, &evidence_digest)),
         )
         .await;
         assert!(matches!(cross_site, Err((StatusCode::CONFLICT, _))));
@@ -66795,12 +66906,20 @@ mod db_lifecycle_tests {
         // of silently minting from the newer B row.
         let (plan_a, plan_agent_a) =
             super::step_materialization_db_tests::seed_exact_signed_live_plan(
-                pool, id, "DEFRA", &spec, &digest,
+                pool,
+                id,
+                "DEFRA",
+                &spec,
+                &raw_plan_digest,
             )
             .await;
         let (plan_b, plan_agent_b) =
             super::step_materialization_db_tests::seed_exact_signed_live_plan(
-                pool, id, "DEFRA", &spec, &digest,
+                pool,
+                id,
+                "DEFRA",
+                &spec,
+                &raw_plan_digest,
             )
             .await;
         sqlx::query(
@@ -66814,7 +66933,7 @@ mod db_lifecycle_tests {
         let stale = requests_approve_live_apply(
             p(&id_str),
             AuthExtractor(admin.clone()),
-            Json(reviewed_plan_selection(&plan_a, &digest)),
+            Json(reviewed_plan_selection(&plan_a, &evidence_digest)),
         )
         .await;
         assert!(matches!(stale, Err((StatusCode::CONFLICT, _))));
@@ -66830,7 +66949,7 @@ mod db_lifecycle_tests {
             "stale or cross-site review mints nothing"
         );
 
-        let reviewed_selection = reviewed_plan_selection(&plan_b, &digest);
+        let reviewed_selection = reviewed_plan_selection(&plan_b, &evidence_digest);
 
         // Admin approve -> mints exactly one LiveApply job (signed grant).
         let _ = requests_approve_live_apply(
@@ -66879,7 +66998,7 @@ mod db_lifecycle_tests {
             .await
             .ok();
         sqlx::query("DELETE FROM evidence_blobs WHERE digest = $1")
-            .bind(&digest)
+            .bind(&evidence_digest)
             .execute(pool)
             .await
             .ok();

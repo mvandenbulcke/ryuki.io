@@ -9187,26 +9187,95 @@ mod tests {
         );
     }
 
+    fn reviewable_live_plan_vars() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("vm_name".to_string(), "first-test-vm".to_string()),
+            ("num_cpus".to_string(), "2".to_string()),
+            ("memory_mb".to_string(), "4096".to_string()),
+            ("disk_size_gb".to_string(), "80".to_string()),
+            ("datacenter".to_string(), "Primary DC".to_string()),
+            ("cluster".to_string(), "Compute A".to_string()),
+            ("datastore".to_string(), "General Storage".to_string()),
+            ("network".to_string(), "Server Network".to_string()),
+            ("template".to_string(), "Linux Golden".to_string()),
+        ])
+    }
+
     fn reviewable_live_plan_spec() -> JobSpec {
         JobSpec {
             request_id: Uuid::new_v4(),
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "a".repeat(64),
-            vars: std::collections::BTreeMap::from([
-                ("vm_name".to_string(), "first-test-vm".to_string()),
-                ("num_cpus".to_string(), "2".to_string()),
-                ("memory_mb".to_string(), "4096".to_string()),
-                ("disk_size_gb".to_string(), "80".to_string()),
-                ("datacenter".to_string(), "Primary DC".to_string()),
-                ("cluster".to_string(), "Compute A".to_string()),
-                ("datastore".to_string(), "General Storage".to_string()),
-                ("network".to_string(), "Server Network".to_string()),
-                ("template".to_string(), "Linux Golden".to_string()),
-            ]),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{}", Uuid::new_v4())),
             mode: JobMode::LivePlan,
         }
+    }
+
+    /// Build the exact safe projection for a positive signed-plan fixture.
+    /// Approval tests exercise immutable authority selection, not projection
+    /// parsing, so their retained evidence must follow the supplied JobSpec
+    /// instead of silently reusing one unrelated hard-coded VM shape.
+    fn reviewable_live_plan_for_spec(spec: &JobSpec, raw_plan_digest: &str) -> Value {
+        let placement = live_plan_placement(spec)
+            .expect("positive signed-plan fixture must carry reviewable placement vars");
+        let logical_name = match spec.iac_ref.split('@').next() {
+            Some("linux-server-deployment") => "linux_server",
+            Some("windows-server-deployment") => "windows_server",
+            _ => panic!("positive signed-plan fixture must use a supported offering"),
+        };
+        json!({
+            "schema_version": ryuki_protocol::TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION,
+            "canonical_plan_sha256": raw_plan_digest,
+            "projection_complete": true,
+            "resource_changes": [
+                {
+                    "mode": "data",
+                    "type": "vsphere_datacenter",
+                    "name": "dc",
+                    "change": {"actions": ["read"], "after": {"name": placement.datacenter}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_compute_cluster",
+                    "name": "cluster",
+                    "change": {"actions": ["read"], "after": {"name": placement.cluster}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_datastore",
+                    "name": "ds",
+                    "change": {"actions": ["read"], "after": {"name": placement.datastore}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_network",
+                    "name": "net",
+                    "change": {"actions": ["read"], "after": {"name": placement.network}}
+                },
+                {
+                    "mode": "data",
+                    "type": "vsphere_virtual_machine",
+                    "name": "template",
+                    "change": {"actions": ["read"], "after": {"name": placement.template}}
+                },
+                {
+                    "mode": "managed",
+                    "type": "vsphere_virtual_machine",
+                    "name": logical_name,
+                    "change": {
+                        "actions": ["create"],
+                        "after": {
+                            "name": placement.name,
+                            "num_cpus": placement.cpu,
+                            "memory": placement.memory_gb * 1024,
+                            "disk": [{"label": "disk0", "size": placement.disk_size_gb}]
+                        }
+                    }
+                }
+            ]
+        })
     }
 
     fn reviewable_live_plan(actions: &[&str]) -> Value {
@@ -13366,8 +13435,7 @@ mod tests {
         let mut plan_spec = mutation_spec.clone();
         plan_spec.mode = JobMode::LivePlan;
         assert_eq!(plan_spec.request_id, request_id);
-        let mut projection = reviewable_live_plan(&["create"]);
-        projection["canonical_plan_sha256"] = json!(raw_plan_digest);
+        let projection = reviewable_live_plan_for_spec(&plan_spec, raw_plan_digest);
         let evidence = serde_json::to_vec(&projection).expect("safe plan projection JSON");
         let evidence_digest = proto_sha256(&evidence);
         let unsigned = SignedEnvelope {
@@ -15361,7 +15429,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".to_string(),
             iac_digest: "0".repeat(64),
-            vars: Default::default(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -16570,8 +16638,6 @@ mod tests {
 
         use chrono::Utc;
         use ryuki_protocol::crypto::verify_vlc;
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let cp_vk = cp_key.verifying_key();
 
@@ -16597,7 +16663,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -16815,8 +16881,6 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
         let platform = format!("audit-rollback-{}", Uuid::new_v4().simple());
@@ -16827,7 +16891,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -16969,8 +17033,6 @@ mod tests {
         };
 
         use chrono::Utc;
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
 
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
@@ -16988,7 +17050,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -17083,8 +17145,6 @@ mod tests {
         };
 
         use chrono::Utc;
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
 
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
@@ -17103,7 +17163,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -17892,8 +17952,6 @@ mod tests {
             return;
         };
         use ryuki_protocol::crypto::verify_vlc;
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let cp_vk = cp_key.verifying_key();
         let request_id = Uuid::new_v4();
@@ -17938,7 +17996,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(crate::contracts::step_state_key(step_id)),
             mode: JobMode::LiveApply,
         };
@@ -18309,8 +18367,6 @@ mod tests {
         };
 
         use ryuki_protocol::crypto::{sha256_hex as proto_sha256, verify_vlc};
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let cp_vk = cp_key.verifying_key();
 
@@ -18325,7 +18381,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -18474,8 +18530,6 @@ mod tests {
             return;
         };
         use ryuki_protocol::crypto::sha256_hex as proto_sha256;
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
         let platform = format!("s5c-race-{}", Uuid::new_v4().simple());
@@ -18486,7 +18540,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -18759,8 +18813,6 @@ mod tests {
         };
 
         use ryuki_protocol::crypto::{sha256_hex as proto_sha256, verify_vlc};
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let cp_vk = cp_key.verifying_key();
 
@@ -18777,7 +18829,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
@@ -19493,15 +19545,20 @@ mod tests {
             .expect("load plan");
         let step_a = plan.iter().find(|s| s.step_key == "a").expect("step a");
         let job_a = dispatch_liveplan_step_job(&pool, req_id, step_a.id).await;
+        let evidence_digest = "b".repeat(64);
+        let raw_plan_digest = "a".repeat(64);
 
         let mut tx = pool.begin().await.unwrap();
-        backlink_request_execution(
+        backlink_request_execution_with_raw_plan_digest(
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
             &JobMode::LivePlan,
             "planned",
-            "livedigest-a",
+            BacklinkDigests {
+                evidence: &evidence_digest,
+                raw_plan: Some(&raw_plan_digest),
+            },
             job_a,
         )
         .await
@@ -19519,8 +19576,8 @@ mod tests {
         );
         assert_eq!(
             a_after.live_plan_digest.as_deref(),
-            Some("livedigest-a"),
-            "a's live_plan_digest is recorded from the LivePlan result's evidence_digest"
+            Some(raw_plan_digest.as_str()),
+            "a's live_plan_digest is recorded from the signed raw-plan commitment"
         );
         assert_eq!(
             b_after.status, "Pending",
@@ -20037,7 +20094,7 @@ mod tests {
         {
             let iac_digest = ryuki_runner::iac::offering_iac_digest(&step.iac_ref)
                 .unwrap_or_else(|| "0".repeat(64));
-            let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+            let mut vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
                 offering_id: &step.iac_ref,
                 request_id: &req_id.to_string(),
                 name: &name,
@@ -20047,6 +20104,10 @@ mod tests {
                 memory_gb: u32::try_from(memory_gb).unwrap_or(0),
                 metadata: &metadata,
             });
+            // The synthetic request intentionally leaves its deployment shape
+            // empty; complete this positive signed-plan fixture with a safe,
+            // reviewable shape before minting its apply authority.
+            vars.extend(reviewable_live_plan_vars());
             let apply_spec = JobSpec {
                 request_id: req_id,
                 offering_id: Uuid::new_v4(),
@@ -21075,15 +21136,20 @@ mod tests {
         };
         let req_id = seed_executing_request(&pool).await;
         let job_id = Uuid::new_v4();
+        let evidence_digest = "b".repeat(64);
+        let raw_plan_digest = "a".repeat(64);
 
         let mut tx = pool.begin().await.unwrap();
-        backlink_request_execution(
+        backlink_request_execution_with_raw_plan_digest(
             &mut tx,
             req_id,
             &JobResultStatus::Planned,
             &JobMode::LivePlan,
             "planned",
-            "deadbeefdeadbeef",
+            BacklinkDigests {
+                evidence: &evidence_digest,
+                raw_plan: Some(&raw_plan_digest),
+            },
             job_id,
         )
         .await
@@ -21105,7 +21171,11 @@ mod tests {
         assert_eq!(execute["status"], "InProgress");
         assert_eq!(
             execute["metadata"]["live_plan_evidence_digest"],
-            "deadbeefdeadbeef"
+            evidence_digest
+        );
+        assert_eq!(
+            execute["metadata"]["live_plan_raw_plan_digest"],
+            raw_plan_digest
         );
 
         let (from_status, to_status, outcome): (String, String, String) = sqlx::query_as(
@@ -22361,8 +22431,6 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        use std::collections::BTreeMap;
-
         let cp_key = ensure_test_cp_key();
         let platform = format!("plt-slot-{}", Uuid::new_v4().simple());
         // The parent request is mid-apply: Executing (NOT concluded).
@@ -22373,7 +22441,7 @@ mod tests {
             offering_id: Uuid::new_v4(),
             iac_ref: "linux-server-deployment@v1".into(),
             iac_digest: "0".repeat(64),
-            vars: BTreeMap::new(),
+            vars: reviewable_live_plan_vars(),
             state_key: Some(format!("request-{req}")),
             mode: JobMode::LiveApply,
         };
@@ -23030,9 +23098,14 @@ mod tests {
         assert_eq!(out["plan_review"]["digest_verified"], true);
         assert_eq!(out["plan_review"]["counts"]["create"], 1);
         assert_eq!(out["plan_review"]["placement"]["name"], "first-test-vm");
-        let rendered = out.to_string();
-        assert!(!rendered.contains("canonical_plan_sha256"));
-        assert!(!rendered.contains(&"a".repeat(64)));
+        let rendered_review = out["plan_review"].to_string();
+        assert!(!rendered_review.contains("canonical_plan_sha256"));
+        assert!(!rendered_review.contains(&"a".repeat(64)));
+        assert_eq!(out["raw_plan_digest"], "a".repeat(64));
+        assert_eq!(
+            out["signed_envelope"]["raw_plan_digest"],
+            out["raw_plan_digest"]
+        );
         assert!(out.get("evidence_json").is_none());
         assert!(out.get("spec").is_none());
 
