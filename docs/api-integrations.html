@@ -17,31 +17,36 @@
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap">
 <link rel="stylesheet" href="/assets/docs.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
-<header class="site-header">
-  <div class="header-inner">
-    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg><span>ryuki<span class="io">.io</span></span></a>
-    <nav class="header-nav">
-      <a href="/documentation.html">Docs</a>
-      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
-    </nav>
+<div class="site-frame">
+  <div class="utility-rail">
+    <span>Open source / Rust / MIT</span>
+    <span class="bus">Field guide / indexed</span>
   </div>
-</header>
-<div class="docs-shell">
+  <header class="site-header">
+    <div class="topbar">
+      <a class="brand" href="/" aria-label="Ryuki home">
+        <img src="/assets/logo.svg" alt="">
+        <span>ryuki<span class="io">.io</span></span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="/">Home</a>
+        <a href="/documentation.html">Docs</a>
+        <a class="active" aria-current="page" href="/api-reference.html">API</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="gate-state"><span class="lamp green" aria-hidden="true"></span><span>Field guide online</span></div>
+    </div>
+  </header>
+  <div class="docs-shell">
 <button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link active" aria-current="page" href="/api-integrations.html">Integrations</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-integrations">GET /api/integrations</a></li><li><a class="sb-ep" href="#post-api-integrations">POST /api/integrations</a></li><li><a class="sb-ep" href="#get-api-integrations-adapter-contract-test-contract">GET /api/integrations/adapter-contract-test-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-adapter-readiness-matrix-contract">GET /api/integrations/adapter-readiness-matrix-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-capabilities">GET /api/integrations/capabilities</a></li><li><a class="sb-ep" href="#get-api-integrations-capabilities-vendor-type">GET /api/integrations/capabilities/{vendor_type}</a></li><li><a class="sb-ep" href="#get-api-integrations-circuits">GET /api/integrations/circuits</a></li><li><a class="sb-ep" href="#get-api-integrations-cohesity-readiness">GET /api/integrations/cohesity/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-commvault-readiness">GET /api/integrations/commvault/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-credentials-expiring">GET /api/integrations/credentials/expiring</a></li><li><a class="sb-ep" href="#get-api-integrations-datadog-readiness">GET /api/integrations/datadog/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-grafana-readiness">GET /api/integrations/grafana/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-hyperv-readiness">GET /api/integrations/hyperv/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-kvm-readiness">GET /api/integrations/kvm/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-netbackup-readiness">GET /api/integrations/netbackup/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-nutanix-readiness">GET /api/integrations/nutanix/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-prometheus-readiness">GET /api/integrations/prometheus/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-proxmox-readiness">GET /api/integrations/proxmox/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-readiness">GET /api/integrations/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-rubrik-readiness">GET /api/integrations/rubrik/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-servicenow-cmdb-file-contract">GET /api/integrations/servicenow/cmdb-file-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-servicenow-cmdb-file-row-validation">GET /api/integrations/servicenow/cmdb-file-row-validation</a></li><li><a class="sb-ep" href="#get-api-integrations-servicenow-future-api-contract">GET /api/integrations/servicenow/future-api-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-servicenow-future-api-readiness">GET /api/integrations/servicenow/future-api-readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-servicenow-readiness">GET /api/integrations/servicenow/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-solarwinds-readiness">GET /api/integrations/solarwinds/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-veeam-readiness">GET /api/integrations/veeam/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-cluster-capacity-admission">GET /api/integrations/vmware/cluster-capacity-admission</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-cluster-capacity-admission-contract">GET /api/integrations/vmware/cluster-capacity-admission-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-customization-spec-governance">GET /api/integrations/vmware/customization-spec-governance</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-customization-spec-governance-contract">GET /api/integrations/vmware/customization-spec-governance-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-day2-change-contract">GET /api/integrations/vmware/day2-change-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-decommission-quarantine">GET /api/integrations/vmware/decommission-quarantine</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-decommission-quarantine-contract">GET /api/integrations/vmware/decommission-quarantine-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-object-placement">GET /api/integrations/vmware/object-placement</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-object-placement-contract">GET /api/integrations/vmware/object-placement-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-readiness">GET /api/integrations/vmware/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-snapshot-governance">GET /api/integrations/vmware/snapshot-governance</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-snapshot-governance-contract">GET /api/integrations/vmware/snapshot-governance-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-vsan-esxi-lifecycle">GET /api/integrations/vmware/vsan-esxi-lifecycle</a></li><li><a class="sb-ep" href="#get-api-integrations-vmware-vsan-esxi-lifecycle-contract">GET /api/integrations/vmware/vsan-esxi-lifecycle-contract</a></li><li><a class="sb-ep" href="#get-api-integrations-xen-readiness">GET /api/integrations/xen/readiness</a></li><li><a class="sb-ep" href="#get-api-integrations-zabbix-readiness">GET /api/integrations/zabbix/readiness</a></li><li><a class="sb-ep" href="#post-api-integrations-connection-id-webhook">POST /api/integrations/{connection_id}/webhook</a></li><li><a class="sb-ep" href="#delete-api-integrations-id">DELETE /api/integrations/{id}</a></li><li><a class="sb-ep" href="#get-api-integrations-id">GET /api/integrations/{id}</a></li><li><a class="sb-ep" href="#put-api-integrations-id">PUT /api/integrations/{id}</a></li><li><a class="sb-ep" href="#get-api-integrations-id-circuit">GET /api/integrations/{id}/circuit</a></li><li><a class="sb-ep" href="#post-api-integrations-id-circuit-record">POST /api/integrations/{id}/circuit/record</a></li><li><a class="sb-ep" href="#post-api-integrations-id-circuit-reset">POST /api/integrations/{id}/circuit/reset</a></li><li><a class="sb-ep" href="#post-api-integrations-id-credential-expiry">POST /api/integrations/{id}/credential-expiry</a></li><li><a class="sb-ep" href="#get-api-integrations-id-health">GET /api/integrations/{id}/health</a></li><li><a class="sb-ep" href="#post-api-integrations-id-test">POST /api/integrations/{id}/test</a></li><li><a class="sb-ep" href="#post-api-integrations-id-webhook-secret">POST /api/integrations/{id}/webhook-secret</a></li></ul></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
+<div class="doc-readout"><span>Field guide / Integrations API</span><span>Reviewable source / main</span></div>
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Integrations</span></nav>
 <h1>Integrations API</h1>
 <p>External-provider integration management: connection CRUD, health history, credential expiry, circuit breakers, vendor capabilities, adapter readiness and contract tests, plus signed inbound webhooks.</p>
@@ -2035,8 +2040,21 @@ defaults to <code>0</code>.</td></tr></tbody></table>
   <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>
 }</code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-images.html">&larr; Images</a><a href="/api-inventory.html">Inventory &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-images.html">&larr; Images</a><a href="/api-inventory.html">Inventory &rarr;</a></nav>
 </main>
+  </div>
+  <footer class="site-footer">
+    <div class="footer-top">
+      <div class="footer-brand"><img src="/assets/logo.svg" alt=""><span>ryuki<span class="io">.io</span></span></div>
+      <nav class="footer-links" aria-label="Footer navigation">
+        <a href="/documentation.html">Documentation</a>
+        <a href="/api-reference.html">API reference</a>
+        <a href="/architecture.html">Architecture</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom"><span>© 2026 Ryuki · governed infrastructure operations</span><span>Built with Rust · 竜騎</span></div>
+  </footer>
 </div>
 <script>
 (function(){
@@ -2067,7 +2085,7 @@ defaults to <code>0</code>.</td></tr></tbody></table>
             byId[en.target.id].classList.add('active');
           }
         });
-      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      },{rootMargin:'-96px 0px -68% 0px',threshold:0});
       targets.forEach(function(t){spy.observe(t)});
     }
   }

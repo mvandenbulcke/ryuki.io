@@ -17,31 +17,36 @@
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap">
 <link rel="stylesheet" href="/assets/docs.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
-<header class="site-header">
-  <div class="header-inner">
-    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg><span>ryuki<span class="io">.io</span></span></a>
-    <nav class="header-nav">
-      <a href="/documentation.html">Docs</a>
-      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
-    </nav>
+<div class="site-frame">
+  <div class="utility-rail">
+    <span>Open source / Rust / MIT</span>
+    <span class="bus">Field guide / indexed</span>
   </div>
-</header>
-<div class="docs-shell">
+  <header class="site-header">
+    <div class="topbar">
+      <a class="brand" href="/" aria-label="Ryuki home">
+        <img src="/assets/logo.svg" alt="">
+        <span>ryuki<span class="io">.io</span></span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="/">Home</a>
+        <a href="/documentation.html">Docs</a>
+        <a class="active" aria-current="page" href="/api-reference.html">API</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="gate-state"><span class="lamp green" aria-hidden="true"></span><span>Field guide online</span></div>
+    </div>
+  </header>
+  <div class="docs-shell">
 <button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link active" aria-current="page" href="/api-datacenter.html">Datacenter</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-datacenter-check-cooling-contract">GET /api/datacenter/check-cooling-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-power-contract">GET /api/datacenter/check-power-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-rack-space-contract">GET /api/datacenter/check-rack-space-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-check-switchports-contract">GET /api/datacenter/check-switchports-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-failing-checks-contract">GET /api/datacenter/failing-checks-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-contract">GET /api/datacenter/firmware-contract</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-check-id">POST /api/datacenter/firmware/check/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-device-id">GET /api/datacenter/firmware/device/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-devices">GET /api/datacenter/firmware/devices</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-eol">GET /api/datacenter/firmware/eol</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-exception">POST /api/datacenter/firmware/exception</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-exception-id-approve">POST /api/datacenter/firmware/exception/{id}/approve</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-exceptions">GET /api/datacenter/firmware/exceptions</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-noncompliant">GET /api/datacenter/firmware/noncompliant</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-report">GET /api/datacenter/firmware/report</a></li><li><a class="sb-ep" href="#post-api-datacenter-firmware-revoke-id">POST /api/datacenter/firmware/revoke/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-firmware-vendor-summary">GET /api/datacenter/firmware/vendor-summary</a></li><li><a class="sb-ep" href="#get-api-datacenter-full-readiness-contract">GET /api/datacenter/full-readiness-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-contract">GET /api/datacenter/hardware-contract</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-add">POST /api/datacenter/hardware/add</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-firmware-check-id">POST /api/datacenter/hardware/firmware-check/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-firmware-gaps">GET /api/datacenter/hardware/firmware-gaps</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-inventory">GET /api/datacenter/hardware/inventory</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-lifecycle-report">GET /api/datacenter/hardware/lifecycle-report</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-refresh-plan">GET /api/datacenter/hardware/refresh-plan</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-support-risk">GET /api/datacenter/hardware/support-risk</a></li><li><a class="sb-ep" href="#post-api-datacenter-hardware-update-firmware-id">POST /api/datacenter/hardware/update-firmware/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-hardware-warranty-expiring">GET /api/datacenter/hardware/warranty-expiring</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-contract">GET /api/datacenter/image-factory-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-active-site">GET /api/datacenter/image-factory/active/{site}</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-history-site">GET /api/datacenter/image-factory/history/{site}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-initiate-build">POST /api/datacenter/image-factory/initiate-build</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-promote-id">POST /api/datacenter/image-factory/promote/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-reject-id">POST /api/datacenter/image-factory/reject/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-run-tests-id">POST /api/datacenter/image-factory/run-tests/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-image-factory-schedule-monthly">POST /api/datacenter/image-factory/schedule-monthly</a></li><li><a class="sb-ep" href="#get-api-datacenter-image-factory-superseded">GET /api/datacenter/image-factory/superseded</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-contract">GET /api/datacenter/network-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-capacity">GET /api/datacenter/network/capacity</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-ports">GET /api/datacenter/network/ports</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-readiness">GET /api/datacenter/network/readiness</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-release-id">POST /api/datacenter/network/release/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-reserve-ips">POST /api/datacenter/network/reserve-ips</a></li><li><a class="sb-ep" href="#post-api-datacenter-network-reserve-ports">POST /api/datacenter/network/reserve-ports</a></li><li><a class="sb-ep" href="#get-api-datacenter-network-vlans">GET /api/datacenter/network/vlans</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-contract">GET /api/datacenter/oob-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-cert-expiring">GET /api/datacenter/oob/cert-expiring</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-check-defaults-id">POST /api/datacenter/oob/check-defaults/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-failing">GET /api/datacenter/oob/failing</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-firmware-outdated">GET /api/datacenter/oob/firmware-outdated</a></li><li><a class="sb-ep" href="#get-api-datacenter-oob-inventory">GET /api/datacenter/oob/inventory</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-test-id">POST /api/datacenter/oob/test/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-validate-cert-id">POST /api/datacenter/oob/validate-cert/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-oob-validate-site-site">POST /api/datacenter/oob/validate-site/{site}</a></li><li><a class="sb-ep" href="#get-api-datacenter-readiness-score-contract">GET /api/datacenter/readiness-score-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-site-report-contract">GET /api/datacenter/site-report-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-sites-contract">GET /api/datacenter/sites-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-contract">GET /api/datacenter/storage-contract</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-arrays">GET /api/datacenter/storage/arrays</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-arrays">POST /api/datacenter/storage/arrays</a></li><li><a class="sb-ep" href="#delete-api-datacenter-storage-arrays-id">DELETE /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-arrays-id">GET /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#put-api-datacenter-storage-arrays-id">PUT /api/datacenter/storage/arrays/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-check-capacity">POST /api/datacenter/storage/check-capacity</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-report">GET /api/datacenter/storage/report</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-volumes">GET /api/datacenter/storage/volumes</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes">POST /api/datacenter/storage/volumes</a></li><li><a class="sb-ep" href="#get-api-datacenter-storage-volumes-id">GET /api/datacenter/storage/volumes/{id}</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-extend">POST /api/datacenter/storage/volumes/{id}/extend</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-map">POST /api/datacenter/storage/volumes/{id}/map</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-retire">POST /api/datacenter/storage/volumes/{id}/retire</a></li><li><a class="sb-ep" href="#post-api-datacenter-storage-volumes-id-unmap">POST /api/datacenter/storage/volumes/{id}/unmap</a></li></ul></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link" href="/api-protect.html">Protect</a></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
+<div class="doc-readout"><span>Field guide / Datacenter API</span><span>Reviewable source / main</span></div>
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Datacenter</span></nav>
 <h1>Datacenter API</h1>
 <p>Datacenter readiness and capacity checks (power, cooling, rack space, switch ports), plus firmware, hardware, out-of-band, storage, network, and image-factory surfaces with per-site readiness reporting.</p>
@@ -2517,8 +2522,21 @@ unambiguous; an out-of-scope value is rejected.</td></tr></tbody></table>
   <span class="hl-k">"volume"</span>: <span class="hl-n">null</span>
 }</code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-dashboard.html">&larr; Dashboard</a><a href="/api-events.html">Events &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-dashboard.html">&larr; Dashboard</a><a href="/api-events.html">Events &rarr;</a></nav>
 </main>
+  </div>
+  <footer class="site-footer">
+    <div class="footer-top">
+      <div class="footer-brand"><img src="/assets/logo.svg" alt=""><span>ryuki<span class="io">.io</span></span></div>
+      <nav class="footer-links" aria-label="Footer navigation">
+        <a href="/documentation.html">Documentation</a>
+        <a href="/api-reference.html">API reference</a>
+        <a href="/architecture.html">Architecture</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom"><span>© 2026 Ryuki · governed infrastructure operations</span><span>Built with Rust · 竜騎</span></div>
+  </footer>
 </div>
 <script>
 (function(){
@@ -2549,7 +2567,7 @@ unambiguous; an out-of-scope value is rejected.</td></tr></tbody></table>
             byId[en.target.id].classList.add('active');
           }
         });
-      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      },{rootMargin:'-96px 0px -68% 0px',threshold:0});
       targets.forEach(function(t){spy.observe(t)});
     }
   }
