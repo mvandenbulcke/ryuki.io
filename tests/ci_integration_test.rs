@@ -260,7 +260,7 @@ fn azure_pipeline_definition_is_deleted() {
 }
 
 #[test]
-fn pages_deploy_is_gated_on_ci_workflow_run() {
+fn pages_deploy_is_gated_on_validated_ci_workflow_run() {
     let workflow = load_workflow(PAGES_WORKFLOW_PATH);
     let on = triggers(&workflow);
 
@@ -287,10 +287,65 @@ fn pages_deploy_is_gated_on_ci_workflow_run() {
         .collect();
     assert!(branches.contains(&"main"));
 
-    let deploy_condition = job(&workflow, "deploy")["if"].as_str().unwrap();
-    assert!(
-        deploy_condition.contains("github.event.workflow_run.conclusion == 'success'"),
-        "deploy job must require a successful CI conclusion"
+    let validation = job(&workflow, "validate-run");
+    assert_eq!(
+        validation["outputs"]["head_sha"].as_str(),
+        Some("${{ steps.event.outputs.head_sha }}")
+    );
+    let validation_step = validation["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"].as_str() == Some("event"))
+        .expect("validate-run must expose the trusted event step");
+    for (name, expression) in [
+        ("EVENT_NAME", "${{ github.event_name }}"),
+        ("CONCLUSION", "${{ github.event.workflow_run.conclusion }}"),
+        ("PARENT_EVENT", "${{ github.event.workflow_run.event }}"),
+        (
+            "PARENT_WORKFLOW_PATH",
+            "${{ github.event.workflow_run.path }}",
+        ),
+        (
+            "HEAD_BRANCH",
+            "${{ github.event.workflow_run.head_branch }}",
+        ),
+        (
+            "HEAD_REPOSITORY",
+            "${{ github.event.workflow_run.head_repository.full_name }}",
+        ),
+        ("HEAD_SHA", "${{ github.event.workflow_run.head_sha }}"),
+        ("REPOSITORY", "${{ github.repository }}"),
+    ] {
+        assert_eq!(
+            validation_step["env"][name].as_str(),
+            Some(expression),
+            "trusted-run validation must bind {name} to the event payload"
+        );
+    }
+    let validation_script = job_run_text(validation);
+    for required_guard in [
+        r#""${EVENT_NAME}" == "workflow_run""#,
+        r#""${CONCLUSION}" == "success""#,
+        r#""${PARENT_EVENT}" == "push""#,
+        r#""${PARENT_WORKFLOW_PATH}" == ".github/workflows/ci.yml""#,
+        r#""${HEAD_BRANCH}" == "main""#,
+        r#""${HEAD_REPOSITORY}" == "${REPOSITORY}""#,
+        r#""${HEAD_SHA}" =~ ^[0-9a-f]{40}$"#,
+    ] {
+        assert!(
+            validation_script.contains(required_guard),
+            "trusted-run validation must check {required_guard}"
+        );
+    }
+    assert_eq!(
+        job(&workflow, "deploy")["needs"].as_str(),
+        Some("validate-run")
+    );
+    assert_eq!(
+        job(&workflow, "deploy")["steps"][0]["with"]["ref"].as_str(),
+        Some("${{ needs.validate-run.outputs.head_sha }}"),
+        "Pages checkout must use the commit SHA admitted by validate-run"
     );
 
     // Direct pushes to main must not trigger an ungated deploy anymore.
@@ -304,7 +359,13 @@ fn pages_deploy_is_gated_on_ci_workflow_run() {
 fn pages_deploy_keeps_permissions_and_concurrency() {
     let workflow = load_workflow(PAGES_WORKFLOW_PATH);
 
-    let permissions = workflow["permissions"].as_object().unwrap();
+    let root_permissions = workflow["permissions"].as_object().unwrap();
+    assert!(
+        root_permissions.is_empty(),
+        "Pages workflow permissions must be denied by default"
+    );
+
+    let permissions = job(&workflow, "deploy")["permissions"].as_object().unwrap();
     assert_eq!(permissions["contents"].as_str(), Some("read"));
     assert_eq!(permissions["pages"].as_str(), Some("write"));
     assert_eq!(permissions["id-token"].as_str(), Some("write"));

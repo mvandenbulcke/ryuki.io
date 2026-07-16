@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::sync::Mutex;
 
 pub const SITE_CODE_MAX_LEN: usize = 32;
+pub const DIRECTORY_NAMESPACE_POLICY_VERSION: &str = "directory-namespace-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SiteEntry {
@@ -1062,6 +1063,17 @@ pub fn get_active_site_codes() -> Result<Vec<String>, String> {
     Ok(store
         .iter()
         .filter(|entry| entry.site.active)
+        .map(|entry| entry.site.unlocode.clone())
+        .collect())
+}
+
+/// Return every governed canonical site code, including inactive sites.
+/// Directory namespace resolution uses this closed set so deactivating a site
+/// cannot make its global name suffix claimable by a shorter active-site code.
+pub fn get_known_site_codes() -> Result<Vec<String>, String> {
+    let store = site_store().lock().map_err(|e| e.to_string())?;
+    Ok(store
+        .iter()
         .map(|entry| entry.site.unlocode.clone())
         .collect())
 }

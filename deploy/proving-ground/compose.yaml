@@ -3,7 +3,7 @@
 # ("Running a live apply against real infrastructure").
 #
 # Deliberately a SEPARATE compose project from deploy/compose (its own
-# volumes, network, and ports), so the regular dev stack and its data stay
+# volumes, networks, and ports), so the regular dev stack and its data stay
 # untouched and both can coexist.
 #
 #   install -m 600 env.example .env # fill in credentials when each gate permits
@@ -12,15 +12,18 @@
 #
 # The execution agent deliberately runs OUTSIDE compose, on the host, via
 # ./run-agent.sh: agents belong next to the infrastructure they execute
-# against, and the agent's fail-closed transport gate refuses cleartext
-# non-loopback control-plane URLs in live mode — from the host, the
-# published port is loopback and passes.
+# against. The agent's fail-closed transport gate refuses cleartext by default;
+# run-agent.sh explicitly opts into HTTP only for the fixed host-loopback URL.
 
 name: ryuki-proving-ground
 
 services:
   platform-db:
-    image: postgres:18-alpine
+    # postgres:18.4-alpine3.24, pinned to the reviewed multi-platform index.
+    image: postgres:18.4-alpine3.24@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    # Acceptance validation requires this exact digest to be staged locally;
+    # startup must never resolve a tag or contact a registry implicitly.
+    pull_policy: never
     environment:
       POSTGRES_USER: ryuki
       POSTGRES_PASSWORD: ${PG_DB_PASSWORD:?set in .env} # secret-scan-allow: reviewed env reference
@@ -39,71 +42,134 @@ services:
       - pg-net
 
   vault:
-    image: hashicorp/vault
+    # Vault 2.0.3, pinned to the reviewed multi-platform manifest list.
+    image: hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
+    pull_policy: never
     # Dev mode: in-memory, auto-unsealed, root token from .env. Good enough
     # for proving-ground credential resolution (CredentialSource::Vault on
     # integration connections); NOT durable — re-seed secrets after restart.
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: ${PG_VAULT_TOKEN:?set in .env}
+      # Only the API shares this network namespace. Vault never listens on a
+      # bridge interface, so its cleartext dev-token traffic cannot be observed
+      # or reached by the separately namespaced portal container.
+      VAULT_DEV_LISTEN_ADDRESS: 127.0.0.1:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_TOKEN: ${PG_VAULT_TOKEN:?set in .env}
     ports:
-      - "127.0.0.1:18200:8200"
+      # Vault owns the API's published port because the two trusted services
+      # share one namespace. Vault itself has no published port.
+      - "127.0.0.1:18081:8081"
+    user: vault
+    cap_drop:
+      - ALL
     cap_add:
       - IPC_LOCK
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
     networks:
-      - pg-net
+      pg-net:
+      # The API listener is reachable through this alias. The Vault listener is
+      # bound only to loopback and therefore is not exposed on this network.
+      portal-net:
+        aliases:
+          - platform-api
 
   platform-api:
-    # Same image the regular dev stack builds (deploy/compose). Build once:
-    #   docker compose -f ../compose/compose.yaml build platform-api
-    image: ryuki/platform-api:rust-dev
+    # validate.sh proves this revision-specific local tag resolves to the
+    # recorded immutable image ID and matching OCI source-revision label.
+    image: "ryuki/platform-api:${PG_ACCEPTANCE_REVISION:?set exact acceptance revision}"
+    # This environment must consume the explicitly built local artifact; a
+    # missing image is an error and must never fall back to a registry pull.
+    pull_policy: never
     environment:
       RYUKI_DATABASE_URL: postgres://ryuki:${PG_DB_PASSWORD}@platform-db:5432/ryuki_platform
       RYUKI_DATABASE__REQUIRED: "true"
-      RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8080
+      RYUKI_MIGRATION_MODE: local-auto
+      RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8081
       RYUKI_PLATFORM_URL: http://localhost:18081
       # Real authentication for a real test: local accounts from .env.
       RYUKI_AUTH_MODE: local
       RYUKI_LOCAL_AUTH__USERS: ${PG_LOCAL_USERS:?set in .env}
+      # The isolated proving ground deliberately admits its two local test
+      # principals across the whole disposable acceptance environment.
+      RYUKI_LOCAL_AUTH__SITE_AUTHORITY: global
+      RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY: global
+      RYUKI_SESSION__CREDENTIAL_HMAC_KEY: ${PG_SESSION_CREDENTIAL_HMAC_KEY:?set in .env}
       # This stack is loopback-only plain HTTP; Secure cookies would not be
       # returned by browsers. Never use this setting on a non-loopback stack.
       RYUKI_SESSION__COOKIE_SECURE: "false"
-      # Control-plane Vault resolver (VaultKv2Resolver); unset would fall
-      # back to the mock resolver.
-      VAULT_ADDR: http://vault:8200
+      # Control-plane Vault resolver (VaultKv2Resolver). This local-auth stack
+      # fails credential resolution if either setting is absent; it never
+      # degrades to the dry-run mock resolver.
+      VAULT_ADDR: http://127.0.0.1:8200
       VAULT_TOKEN: ${PG_VAULT_TOKEN}
+      RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK: "true"
       # Persist the CP grant-signing key across container recreation —
       # agents pin this key's public half at enrolment.
       RYUKI_CP_SIGNING_KEY_PATH: /app/keys/cp-signing.key
-    ports:
-      - "127.0.0.1:18081:8080"
+    # Share Vault's network namespace so the explicit cleartext-development
+    # exception remains literal loopback. The lower-trust portal is deliberately
+    # outside this namespace; it can reach only the API listener over portal-net.
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: "service:vault"
     volumes:
       - pg-cp-keys:/app/keys
     depends_on:
       platform-db:
         condition: service_healthy
       vault:
-        condition: service_started
-    networks:
-      - pg-net
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/ready"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
   portal-ui:
-    image: ryuki/portal-ui:rust-dev
+    image: "ryuki/portal-ui:${PG_ACCEPTANCE_REVISION:?set exact acceptance revision}"
+    pull_policy: never
     environment:
-      RYUKI_API_URL: http://platform-api:8080
+      # The portal transport gate admits cleartext only on literal loopback. A
+      # fixed, non-root relay carries that already-portal-visible API traffic to
+      # the API-only bridge without exposing the Vault loopback listener.
+      RYUKI_API_URL: http://127.0.0.1:18082
+      RYUKI_PORTAL_PUBLIC_ORIGIN: http://127.0.0.1:18001
+      RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK: "true"
       RYUKI_PORTAL_EXECUTION_MODE: live-provider
+    # The portal has its own network namespace and no access to pg-net. Dropping
+    # every capability, including NET_RAW, prevents packet capture on its sole
+    # API-facing bridge even after a portal-process compromise.
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        /usr/bin/socat TCP-LISTEN:18082,bind=127.0.0.1,reuseaddr,fork TCP:platform-api:8081 &
+        exec /app/ryuki-portal-ui
     ports:
       - "127.0.0.1:18001:8080"
     depends_on:
       platform-api:
         condition: service_healthy
     networks:
-      - pg-net
+      - portal-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s
@@ -117,4 +183,6 @@ volumes:
 
 networks:
   pg-net:
+    driver: bridge
+  portal-net:
     driver: bridge

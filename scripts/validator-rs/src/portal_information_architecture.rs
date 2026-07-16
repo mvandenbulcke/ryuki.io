@@ -22,6 +22,10 @@ const PORTAL_WORKSPACES_PATH: &str = "portal/portal-ui/src/views/workspaces.rs";
 const PORTAL_API_PATH: &str = "portal/portal-ui/src/api.rs";
 const PORTAL_SERVER_BOUNDARY_PATH: &str = "portal/portal-ui/src/server_boundary.rs";
 const ENDPOINT: &str = "/api/platform/portal-information-architecture-contract";
+// The portal's standalone image and local-development command use this exact
+// fail-closed loopback origin. The value scanner admits no suffix, alternate
+// port, credential, query, fragment, or non-loopback host.
+const ALLOWED_LOOPBACK_ORIGINS: &[&str] = &["http://127.0.0.1:8080"];
 
 const REQUIRED_SURFACES: &[&str] = &[
     "product-shell",
@@ -1134,7 +1138,7 @@ fn validate_portal_runtime_text(
     expect(
         dockerfile.contains("FROM rust:")
             && dockerfile.contains("rustup target add wasm32-unknown-unknown")
-            && dockerfile.contains("cargo install cargo-leptos --locked")
+            && dockerfile.contains("cargo install cargo-leptos --version 0.3.7 --locked")
             && (dockerfile.contains("COPY Cargo.toml Cargo.lock ./")
                 || dockerfile.contains("COPY Cargo.toml styles.css ./"))
             && (dockerfile.contains("COPY portal/ portal/")
@@ -1144,14 +1148,18 @@ fn validate_portal_runtime_text(
         "portal IA runtime Dockerfile must build the full-stack Leptos server and hydration assets",
     );
     expect(
-        dockerfile.contains("FROM debian:bookworm-slim AS runtime")
+        dockerfile.contains("FROM debian:bookworm-slim@sha256:")
+            && dockerfile.contains(" AS runtime")
             && dockerfile.contains("LEPTOS_SITE_ROOT=/app/site")
             && dockerfile.contains("LEPTOS_SITE_ADDR=0.0.0.0:8080")
             && dockerfile.contains("RYUKI_PORTAL_EXECUTION_MODE=static-dry-run")
             && dockerfile.contains(
-                "COPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui",
+                "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui",
             )
-            && dockerfile.contains("COPY --from=build /app/target/site /app/site")
+            && dockerfile.contains(
+                "COPY --from=build --chown=10001:10001 /app/target/site /app/site",
+            )
+            && dockerfile.contains("USER 10001:10001")
             && dockerfile.contains("EXPOSE 8080")
             && dockerfile.contains(r#"CMD ["/app/ryuki-portal-ui"]"#),
         errors,
@@ -1362,17 +1370,21 @@ fn validate_portal_workspaces_text(
     expect(
         active_workspaces.contains("<SecretReferenceWorkspaceDetail/>")
             && secret_reference_detail.contains("Secret-reference workspace detail")
-            && secret_reference_detail_code.contains("PortalSecretReferenceSnapshot::static_dry_run()")
+            && secret_reference_detail_code
+                .contains("PortalSecretReferenceSnapshot::static_dry_run()")
             && secret_reference_detail_code.contains("snapshot.secret_references")
             && secret_reference_detail_code.contains("secret_references_resource()")
             && secret_reference_detail_code.contains("data-secret-reference-workspace-detail=")
             && secret_reference_detail_code
-                .contains("data-live-cli-execution-allowed=live_cli_execution_allowed")
-            && secret_reference_detail_code.contains("data-provider-calls-allowed=provider_calls_allowed")
-            && secret_reference_detail_code.contains("data-secret-values-allowed=secret_values_allowed")
-            && secret_reference_detail_code.contains("data-provider-paths-allowed=provider_paths_allowed"),
+                .contains("data-live-provider-actions-allowed=live_provider_actions_allowed")
+            && secret_reference_detail_code
+                .contains("data-provider-calls-allowed=provider_calls_allowed")
+            && secret_reference_detail_code
+                .contains("data-secret-values-allowed=secret_values_allowed")
+            && secret_reference_detail_code
+                .contains("data-provider-paths-allowed=provider_paths_allowed"),
         errors,
-        "portal workspaces must render static secret-reference readiness without live CLI or value/path exposure",
+        "portal workspaces must render static secret-reference readiness without live provider actions or value/path exposure",
     );
     expect(
         active_workspaces.contains("<CmdbWorkspaceDetail/>")
@@ -1386,19 +1398,20 @@ fn validate_portal_workspaces_text(
             && cmdb_detail_code.contains("cmdb_reconciliation_resource()")
             && cmdb_detail_code.contains("cmdb_relationship_graph_resource()")
             && cmdb_detail_code.contains("data-cmdb-workspace-detail=")
-            && cmdb_detail_code.contains("data-file-import-execution-allowed=file_import_execution_allowed")
-            && cmdb_detail_code.contains("data-file-export-execution-allowed=file_export_execution_allowed")
+            && cmdb_detail_code
+                .contains("data-file-import-execution-allowed=file_import_execution_allowed")
+            && cmdb_detail_code
+                .contains("data-file-export-execution-allowed=file_export_execution_allowed")
             && cmdb_detail_code.contains("data-live-servicenow-api-allowed=live_api_allowed")
             && cmdb_detail_code.contains("data-cmdb-mutation-allowed=cmdb_mutation_allowed")
-            && cmdb_detail_code.contains(
-                "data-relationship-mutation-allowed=relationship_mutation_allowed",
-            )
+            && cmdb_detail_code
+                .contains("data-relationship-mutation-allowed=relationship_mutation_allowed")
             && cmdb_detail_code.contains("data-provider-calls-allowed=provider_calls_allowed")
             && cmdb_detail_code.contains("data-raw-cmdb-rows-allowed=raw_cmdb_rows_allowed")
-            && cmdb_detail_code.contains(
-                "data-raw-relationship-rows-allowed=raw_relationship_rows_allowed",
-            )
-            && cmdb_detail_code.contains("data-evidence-redaction-required=evidence_redaction_required"),
+            && cmdb_detail_code
+                .contains("data-raw-relationship-rows-allowed=raw_relationship_rows_allowed")
+            && cmdb_detail_code
+                .contains("data-evidence-redaction-required=evidence_redaction_required"),
         errors,
         "portal workspaces must render static CMDB readiness without live API, mutation, or raw row exposure",
     );
@@ -1579,7 +1592,7 @@ fn validate_portal_server_boundary_text(server_boundary: &str, errors: &mut Vec<
             && !active.contains("secret_values_allowed: true")
             && !active.contains("customer_identifiers_allowed: true")
             && !active.contains("raw_route_state_allowed: true")
-            && !active.contains("live_cli_execution_allowed: true")
+            && !active.contains("live_provider_actions_allowed: true")
             && !active.contains("provider_paths_allowed: true")
             && !active.contains("file_import_execution_allowed: true")
             && !active.contains("file_export_execution_allowed: true")
@@ -1645,17 +1658,18 @@ fn validate_portal_server_boundary_text(server_boundary: &str, errors: &mut Vec<
             && active.contains(
                 r#"#[server(prefix = "/portal/api", endpoint = "secret-reference-status")]"#,
             )
-            && secret_reference_function.contains("PortalSecretReferenceSnapshot::static_dry_run()")
+            && secret_reference_function
+                .contains("PortalSecretReferenceSnapshot::static_dry_run()")
             && secret_reference_function.contains("ServerFnError::new")
             && active.contains("secret_references_resource()")
             && active.contains("secret_reference_catalog_fallback()")
             && active.contains("secret_reference_fallbacks()")
-            && active.contains("live_cli_execution_allowed: false")
+            && active.contains("live_provider_actions_allowed: false")
             && active.contains("provider_calls_allowed: false")
             && active.contains("secret_values_allowed: false")
             && active.contains("provider_paths_allowed: false"),
         errors,
-        "portal server boundary must expose static secret-reference readiness without live CLI or value/path exposure",
+        "portal server boundary must expose static secret-reference readiness without live provider actions or value/path exposure",
     );
     let cmdb_function =
         rust_function_block(&active_code, "load_portal_cmdb_workspace_status").unwrap_or_default();
@@ -2291,17 +2305,45 @@ fn contains_private_key_marker(value: &str) -> bool {
 }
 
 fn contains_url(value: &str) -> bool {
-    value.find("://").is_some_and(|index| {
-        index > 0
-            && value[..index]
-                .chars()
-                .rev()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || "+.-".contains(*character)
-                })
-                .count()
-                > 0
+    value.match_indices("://").any(|(index, _)| {
+        if index == 0 {
+            return false;
+        }
+        let scheme_start = value[..index]
+            .char_indices()
+            .rev()
+            .find(|(_, character)| {
+                !(character.is_ascii_alphanumeric() || "+.-".contains(*character))
+            })
+            .map(|(boundary, character)| boundary + character.len_utf8())
+            .unwrap_or(0);
+        if scheme_start == index {
+            return false;
+        }
+
+        !ALLOWED_LOOPBACK_ORIGINS
+            .iter()
+            .any(|allowed| exact_allowed_url_at(value, scheme_start, allowed))
     })
+}
+
+fn exact_allowed_url_at(value: &str, start: usize, allowed: &str) -> bool {
+    let Some(remainder) = value.get(start..) else {
+        return false;
+    };
+    if !remainder.starts_with(allowed) {
+        return false;
+    }
+    let end = start + allowed.len();
+    let before_is_boundary = start == 0
+        || !value.as_bytes()[start - 1].is_ascii_alphanumeric()
+            && !b"+.-".contains(&value.as_bytes()[start - 1]);
+    let after_is_boundary = end == value.len()
+        || matches!(
+            value.as_bytes()[end],
+            b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b'`' | b')' | b']' | b'}' | b',' | b';'
+        );
+    before_is_boundary && after_is_boundary
 }
 
 fn contains_private_ip(value: &str) -> bool {
@@ -2689,25 +2731,63 @@ mod tests {
     }
 
     #[test]
+    fn prohibited_value_scan_allows_only_exact_documented_loopback_origin() {
+        let mut exact_errors = Vec::new();
+        scan_prohibited_value(
+            &Value::String(
+                "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 \\\n+".to_string(),
+            ),
+            PORTAL_DOCKERFILE_PATH,
+            &mut exact_errors,
+        );
+        assert!(
+            exact_errors.is_empty(),
+            "exact loopback origin: {exact_errors:?}"
+        );
+
+        for unsafe_value in [
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080/admin",
+            r"ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080\admin",
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://192.168.1.5:8080",
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=https://portal.example.test",
+            concat!("password", "=http://127.0.0.1:8080"),
+        ] {
+            let mut errors = Vec::new();
+            scan_prohibited_value(
+                &Value::String(unsafe_value.to_string()),
+                PORTAL_DOCKERFILE_PATH,
+                &mut errors,
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("prohibited value")),
+                "unsafe origin must remain prohibited: {unsafe_value}"
+            );
+        }
+    }
+
+    #[test]
     fn root_context_portal_dockerfile_passes_runtime_check() {
         // RED: root-context portal Dockerfile must not trigger
         // "portal IA runtime Dockerfile must build the full-stack Leptos" error
         let dockerfile = concat!(
-            "FROM rust:1.88-bookworm AS build\n",
+            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n",
             "WORKDIR /app\n",
             "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && cargo install cargo-leptos --locked\n",
+            "    && cargo install cargo-leptos --version 0.3.7 --locked\n",
             "COPY Cargo.toml Cargo.lock ./\n",
             "COPY sources/ sources/\n",
             "COPY portal/ portal/\n",
             "RUN cargo leptos build --release -p ryuki-portal-ui\n",
-            "FROM debian:bookworm-slim AS runtime\n",
+            "FROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\n",
             "WORKDIR /app\n",
             "ENV LEPTOS_SITE_ROOT=/app/site \\\n",
             "    LEPTOS_SITE_ADDR=0.0.0.0:8080 \\\n",
             "    RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n",
-            "COPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
-            "COPY --from=build /app/target/site /app/site\n",
+            "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
+            "COPY --from=build --chown=10001:10001 /app/target/site /app/site\n",
+            "USER 10001:10001\n",
             "EXPOSE 8080\n",
             "CMD [\"/app/ryuki-portal-ui\"]\n",
         );
@@ -2732,20 +2812,21 @@ mod tests {
     #[test]
     fn crate_local_dockerfile_still_passes_runtime_check() {
         let dockerfile = concat!(
-            "FROM rust:1.88-bookworm AS build\n",
+            "FROM rust:1.88-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS build\n",
             "WORKDIR /app\n",
             "RUN rustup target add wasm32-unknown-unknown \\\n",
-            "    && cargo install cargo-leptos --locked\n",
+            "    && cargo install cargo-leptos --version 0.3.7 --locked\n",
             "COPY Cargo.toml styles.css ./\n",
             "COPY src ./src\n",
             "RUN cargo leptos build --release\n",
-            "FROM debian:bookworm-slim AS runtime\n",
+            "FROM debian:bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS runtime\n",
             "WORKDIR /app\n",
             "ENV LEPTOS_SITE_ROOT=/app/site \\\n",
             "    LEPTOS_SITE_ADDR=0.0.0.0:8080 \\\n",
             "    RYUKI_PORTAL_EXECUTION_MODE=static-dry-run\n",
-            "COPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
-            "COPY --from=build /app/target/site /app/site\n",
+            "COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui\n",
+            "COPY --from=build --chown=10001:10001 /app/target/site /app/site\n",
+            "USER 10001:10001\n",
             "EXPOSE 8080\n",
             "CMD [\"/app/ryuki-portal-ui\"]\n",
         );

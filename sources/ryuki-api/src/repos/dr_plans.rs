@@ -7,11 +7,13 @@
 use ryuki_engine::dr_testing::{DrPlan, DrPlanStatus};
 use sqlx::PgPool;
 
-pub const COLUMNS: &str = "id, status, plan_json::text AS plan_json, xmin::text AS row_version";
+pub const COLUMNS: &str =
+    "id, site, status, plan_json::text AS plan_json, xmin::text AS row_version";
 
 #[derive(sqlx::FromRow)]
 pub struct DrPlanRow {
     pub id: String,
+    pub site: String,
     pub status: String,
     pub plan_json: Option<String>,
     pub row_version: String,
@@ -29,6 +31,9 @@ impl DrPlanRow {
         entity.status = decode_status(&self.status)
             .map_err(|e| sqlx::Error::Decode(format!("dr_plans.status: {e}").into()))?;
         entity.id = self.id;
+        // The scalar DB column is the scheduler/read authorization source. The
+        // JSON model is descriptive and cannot self-assert a different site.
+        entity.site = self.site;
         Ok(entity)
     }
 }
@@ -59,9 +64,15 @@ fn decode_status(s: &str) -> Result<DrPlanStatus, String> {
 pub async fn active_plans_for_overdue_scan(
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<Vec<DrPlanRow>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM dr_plans WHERE status IN ('active', 'approved') ORDER BY id"
-    ))
+    sqlx::query_as(
+        "SELECT plan.id, plan.site, plan.status, \
+                plan.plan_json::text AS plan_json, plan.xmin::text AS row_version \
+         FROM dr_plans AS plan \
+         INNER JOIN site_registry AS registry \
+                 ON registry.unlocode = plan.site AND registry.active = true \
+         WHERE plan.status IN ('active', 'approved') ORDER BY plan.id \
+         FOR SHARE OF plan, registry",
+    )
     .fetch_all(executor)
     .await
 }

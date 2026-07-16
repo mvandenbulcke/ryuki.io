@@ -35,9 +35,8 @@ fn ryuki_engine_inventory_sync_dry_run() {
 // These fixture literals are copied verbatim from the wave contract and are
 // tested on BOTH sides; do not retype or reformat them.
 
-/// Canonical POST /api/auth/local/login 200 response. `<uuid>` and
-/// `<rfc3339>` are placeholders for the per-login values.
-const LOCAL_LOGIN_RESPONSE_FIXTURE: &str = r#"{"session_id":"<uuid>","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"<rfc3339>"}"#;
+/// Canonical POST /api/auth/local/login 200 response.
+const LOCAL_LOGIN_RESPONSE_FIXTURE: &str = r#"{"session_token":"<session-token>","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"<rfc3339>"}"#;
 
 /// Engine `AuthSession` serialization (GET /api/auth/local/me body).
 const AUTH_SESSION_FIXTURE: &str = r#"{"user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local"}"#;
@@ -75,7 +74,7 @@ fn local_login_response_fixture_pins_canonical_shape() {
     let value: serde_json::Value = serde_json::from_str(LOCAL_LOGIN_RESPONSE_FIXTURE).unwrap();
     let object = value.as_object().unwrap();
     let expected_keys = [
-        "session_id",
+        "session_token",
         "user_id",
         "display_name",
         "roles",

@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,23 +89,24 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link active" aria-current="page" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link active" aria-current="page" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
 platform-wide rows and nullable axes
 managing api tokens
 authentication modes
-a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a><ul class="sb-sections"><li><a href="#roles-and-permissions">Roles and permissions</a></li><li><a href="#route-access-classes">Route access classes</a></li><li><a href="#scopes">Scopes</a></li><li><a href="#enforcement-semantics">Enforcement semantics</a></li><li><a href="#platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</a></li><li><a href="#managing-api-tokens">Managing API tokens</a></li><li><a href="#authentication-modes">Authentication modes</a></li><li><a href="#a-note-on-the-portal">A note on the portal</a></li></ul></li><li><a class="sb-link" data-sections="how an agent joins the platform
+a note on the portal" href="/rbac-and-scoping.html">RBAC & Scoping</a><ul class="sb-sections"><li><a href="#boundary-convergence">Boundary convergence</a></li><li><a href="#roles-and-permissions">Roles and permissions</a></li><li><a href="#route-access-classes">Route access classes</a></li><li><a href="#scopes">Scopes</a></li><li><a href="#enforcement-semantics">Enforcement semantics</a></li><li><a href="#platform-wide-rows-and-nullable-axes">Platform-wide rows and nullable axes</a></li><li><a href="#managing-api-tokens">Managing API tokens</a></li><li><a href="#authentication-modes">Authentication modes</a></li><li><a href="#a-note-on-the-portal">A note on the portal</a></li></ul></li><li><a class="sb-link" data-sections="how an agent joins the platform
 execution modes
 the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -107,9 +123,11 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <main id="main">
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ RBAC & Scoping</span></nav>
 <h1 id="rbac-scoping">RBAC &amp; Scoping</h1>
-<p>Authorization has two independent layers. Roles decide <strong>what</strong> a human principal may do through five permissions. Scopes decide <strong>where</strong> the principal may do it along two axes: site and environment. A request must pass both. The route reference also uses access-class labels for composite reads and non-human authentication; those labels are not roles.</p>
+<p>Authorization has independent mandatory axes. Roles decide <strong>what</strong> a human principal may do through five coarse permissions and, for selected high-impact mutations, a closed typed operation capability. Scopes decide <strong>where</strong> the principal may do it along two axes: site and environment. A request must pass every applicable axis. Human routes publish their exact current permission or functional-capability requirement; protocol entry points use separate <code>public</code>, <code>agent</code>, or <code>webhook</code> classes. These access values are enforcement metadata, not roles.</p>
+<h2 id="boundary-convergence">Boundary convergence</h2>
+<p>This page documents the current RBAC vocabulary and scope behavior. Production acceptance additionally requires the <a href="platform-security-boundary.html">Platform Security Boundary Specification</a>: all human and non-human authenticators normalize to one verified principal; every route and internal operation maps to a typed action; the decisive policy check evaluates the final canonical resource; and approval, transition, and audit obligations are enforced atomically. The current path/permission and handler-local checks are migration inputs, not the final control ownership model.</p>
 <h2 id="roles-and-permissions">Roles and permissions</h2>
-<p>Ryuki uses twelve fixed Entra app roles. Each maps to one or more permissions; coarse authorization checks permissions, while approval workflows additionally use canonical role names for approval routing and quorum bookkeeping. See <a href="entra-app-registration.html">Entra App Registration</a> for the full role matrix and how the <code>roles</code> claim is issued.</p>
+<p>The current <code>entra-id</code> implementation uses twelve fixed Entra app-role values. Each maps to one or more permissions; coarse authorization checks permissions, while approval workflows additionally use canonical role names for approval routing and quorum bookkeeping. This provider-specific mapping is transitional; the target accepts allowlisted claims from any configured authenticator and normalizes them before policy evaluation. See <a href="entra-app-registration.html">Entra App Registration</a> for the full role matrix and how the <code>roles</code> claim is issued.</p>
 <table><thead><tr><th>Permission</th><th>Grants</th></tr></thead><tbody>
 <tr><td><code>admin</code></td><td>Platform administration. This is the superuser permission and satisfies every other permission check.</td></tr>
 <tr><td><code>approve</code></td><td>Governed approval, rejection, rework, and maker/checker sign-offs.</td></tr>
@@ -117,20 +135,35 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <tr><td><code>request</code></td><td>Creating requests and requester/self-service actions, subject to ownership checks where documented.</td></tr>
 <tr><td><code>audit</code></td><td>Audit trails, evidence, and eligibility for ordinary authenticated reads.</td></tr>
 </tbody></table>
-<p>The roles: <code>PlatformAdmin</code>, <code>BreakGlassAdmin</code>, <code>DatacenterApprover</code>, <code>VMwareOperator</code>, <code>HyperVOperator</code>, <code>ProxmoxOperator</code>, <code>WintelLinuxOperator</code>, <code>BackupOperator</code>, <code>MonitoringOperator</code>, <code>ServiceDesk</code>, <code>Auditor</code>, and <code>Requester</code>.</p>
-<p>Role assignment for people happens in the Entra enterprise application, not in Ryuki. Unknown roles on a token mint are rejected.</p>
+<p>The coarse <code>execute</code> tier is not authority for every functional domain. The server evaluates these typed capability identifiers before dispatch and repeats the check in the protected handler:</p>
+<table><thead><tr><th>Capability</th><th>Current non-admin role</th></tr></thead><tbody>
+<tr><td><code>identity.ad-computer.delete</code></td><td>None; intentionally admin-only pending a governed identity-lifecycle role.</td></tr>
+<tr><td><code>network.firewall.manage</code></td><td>None; intentionally admin-only pending a governed network/firewall role.</td></tr>
+<tr><td><code>monitoring.alert-routing.manage</code></td><td><code>MonitoringOperator</code>.</td></tr>
+<tr><td><code>monitoring.alert.read</code></td><td><code>MonitoringOperator</code>.</td></tr>
+<tr><td><code>monitoring.alert.acknowledge</code></td><td><code>MonitoringOperator</code>.</td></tr>
+<tr><td><code>storage.array.decommission</code></td><td>None; intentionally admin-only pending a governed storage role.</td></tr>
+<tr><td><code>software.deployment.execute</code></td><td><code>WintelLinuxOperator</code>.</td></tr>
+</tbody></table>
+<p><code>PlatformAdmin</code> and <code>BreakGlassAdmin</code> satisfy these capabilities through the explicit <code>admin</code> superuser rule. A capability never substitutes for object ownership, site/environment scope, approval, state-transition, or audit checks.</p>
+<p>The current roles: <code>PlatformAdmin</code>, <code>BreakGlassAdmin</code>, <code>DatacenterApprover</code>, <code>VMwareOperator</code>, <code>HyperVOperator</code>, <code>ProxmoxOperator</code>, <code>WintelLinuxOperator</code>, <code>BackupOperator</code>, <code>MonitoringOperator</code>, <code>ServiceDesk</code>, <code>Auditor</code>, and <code>Requester</code>.</p>
+<p>In current Entra mode, role assignment for people happens in the Entra enterprise application, not in Ryuki. Unknown roles on a token mint are rejected. Future providers must use an explicit, provider-qualified claim mapping; role strings never select a verifier or link identities.</p>
+<p>The current <code>BreakGlassAdmin</code> mapping grants standing <code>admin</code> and is transitional. In the target model the external role establishes eligibility only: a separate, stepped-up, audited, short-lived activation grants emergency authority, and the role claim by itself grants none.</p>
 <h2 id="route-access-classes">Route access classes</h2>
-<p>The API Reference's <strong>Access</strong> value can be one of the five permissions above or one of these effective route classes:</p>
+<p>The API Reference's <strong>Access</strong> value for a human route is its exact current <code>request</code>, <code>audit</code>, <code>execute</code>, or <code>admin</code> tier. Safe reads do not inherit one generic <code>read</code> class: the router owns a closed requester-readable manifest and new or unclassified reads default to <code>audit</code>.</p>
 <table><thead><tr><th>Access class</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>read</code></td><td>Composite authenticated access, satisfied by <code>audit</code> <strong>or</strong> <code>request</code> (and therefore by <code>admin</code>). It is not a permission stored on a role. Audit-grade reads still require <code>audit</code> specifically; sensitive and operator-data reads can require <code>admin</code> or <code>execute</code>.</td></tr>
+<tr><td><code>request</code> on a safe read</td><td>Closed self-service/static compatibility class, satisfied by <code>request</code> <strong>or</strong> <code>audit</code> (and therefore by <code>admin</code>). Dynamic resources in this class require repository/handler ownership predicates. This behavior applies only to the enumerated route shapes; it is not the default for a new GET.</td></tr>
+<tr><td><code>audit</code> on a safe read</td><td>Default for a new or unclassified authenticated read and mandatory for audit-grade identity/evidence data. A <code>request</code>-only principal cannot use it.</td></tr>
+<tr><td><code>execute</code> on a safe read</td><td>Operator working data, such as the shift queue. It is not ordinary requester visibility.</td></tr>
+<tr><td><code>admin</code> on a safe read</td><td>Sensitive identity, secret, emergency, and administration data.</td></tr>
 <tr><td><code>public</code></td><td>No human session is required. This covers health/bootstrap and selected auth or agent-bootstrap routes; handlers still validate their inputs and configured mode.</td></tr>
 <tr><td><code>agent</code></td><td>Bypasses human-session RBAC and authenticates with an agent <code>rya_...</code> bearer token plus the supported <code>x-ryuki-protocol-version</code>. Agent registration, the control-plane public key, and the agent OpenAPI document are public bootstrap exceptions.</td></tr>
-<tr><td><code>webhook</code></td><td>Bypasses human-session RBAC but requires a valid <code>X-Hub-Signature-256</code> HMAC over the exact raw body. It is not anonymous access.</td></tr>
+<tr><td><code>webhook</code></td><td>Bypasses human-session RBAC but requires a fresh v1 <code>X-Hub-Signature-256</code> envelope binding the fixed path, connection, timestamp, delivery ID, and exact-body digest. Accepted delivery IDs are atomically deduplicated. It is not anonymous access.</td></tr>
 </tbody></table>
-<p>These classes explain why the complete route surface cannot be described using only the five role permissions. They describe how a caller reaches a route; role permissions and scope checks continue to govern human API operations.</p>
+<p>The former generated <code>read</code> label is retired because it hid the difference between requester-owned/static reads and audit-only data. Protocol classes explain why the complete surface still cannot be described using only human permissions. Scope and resource predicates continue after the route tier; the tier alone never proves ownership or final-resource authorization.</p>
 <h2 id="scopes">Scopes</h2>
-<p>A principal's session carries a site scope and an environment scope, each a list of allowed values. An empty list means unrestricted on that axis.</p>
-<p>Today, scopes are carried by <strong>API tokens</strong>: interactive sessions (Entra ID or local auth) are unscoped, and the dev auth modes run as an unscoped admin. To give an integration a narrow blast radius, mint it a scoped token.</p>
+<p>A principal's current session representation carries a site scope and an environment scope, each a list of allowed values. The current implementation interprets an empty list as unrestricted on that axis. That is a migration encoding, not the production target: unrestricted, unknown/unresolved, not-applicable, and explicitly empty authority must be distinct validated states, so a missing or malformed claim cannot widen access.</p>
+<p>Today, scopes are carried by <strong>API tokens</strong>: interactive sessions (Entra ID or local auth) are unscoped, and the development auth modes run as an unscoped admin. Preserve that behavior only to operate current development/migration deployments. To give a current integration a narrower blast radius, mint it a scoped token; production acceptance requires explicit effective scope on every actor kind under the <a href="platform-security-boundary.html#canonical-security-context">canonical security context</a>.</p>
 <h2 id="enforcement-semantics">Enforcement semantics</h2>
 <p>The same rules apply across all scoped domains:</p>
 <table><thead><tr><th>Access pattern</th><th>Out-of-scope behavior</th></tr></thead><tbody>
@@ -157,17 +190,18 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <tr><td><code>/api/admin/rbac-roles</code></td><td>GET</td><td>The role and permission catalog, as the server enforces it.</td></tr>
 </tbody></table>
 <p>Tokens are create-and-revoke: there is no edit. To change a token's roles or scope, mint a replacement and revoke the old one.</p>
+<p>This is the current role-based compatibility-token model. The production target uses a credential-family id and version, an exact Ryuki audience, a closed action allowlist (or role ceiling translated to actions), explicit site/environment scope state, mandatory short TTL, and audited last-use/revocation metadata. Rotation shows the replacement once, permits only a bounded overlap, then revokes the prior version. Service tokens cannot satisfy interactive, step-up, or break-glass obligations. See <a href="platform-security-boundary.html#service-credentials-and-api-tokens">service credentials and API tokens</a>.</p>
 <h2 id="authentication-modes">Authentication modes</h2>
-<p><code>RYUKI_AUTH_MODE</code> selects how sessions are established; it never enables live provider calls (that is a separate, operator-gated setting).</p>
+<p>In the current compatibility implementation, <code>RYUKI_AUTH_MODE</code> selects how sessions are established; it never enables live provider calls (that is a separate, operator-gated setting). The target registry and explicit deployment profile replace this switch; a missing profile or simultaneous legacy and registry authority selection fails before binding unless a time-bounded, non-authorizing migration overlay names the single source of truth.</p>
 <table><thead><tr><th>Mode</th><th>Behavior</th></tr></thead><tbody>
 <tr><td><code>mock-dry-run</code> (default)</td><td>Static development session, unscoped admin.</td></tr>
 <tr><td><code>static-dry-run</code></td><td>Same, without the mock provider affordances.</td></tr>
-<tr><td><code>local</code></td><td>Local username/password sessions.</td></tr>
+<tr><td><code>local</code></td><td>Current development/migration username/password sessions; not the production emergency-authentication target.</td></tr>
 <tr><td><code>entra-id</code></td><td>Entra ID SSO. Bearer tokens are validated cryptographically (RS256, issuer, audience, expiry) against tenant JWKS.</td></tr>
 </tbody></table>
 <h2 id="a-note-on-the-portal">A note on the portal</h2>
 <p>The portal filters navigation and actions by role for usability, but that is convenience, not security: every rule above is enforced server-side, and the API answers the same regardless of which client asks.</p>
-<div class="page-meta">Last updated 2026-07-09 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/rbac-and-scoping.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/site-management.html">&larr; Site Management</a><a href="/agents-and-live-execution.html">Agents & Live Execution &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/rbac-and-scoping.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/site-management.html">&larr; Site Management</a><a href="/agents-and-live-execution.html">Agents & Live Execution &rarr;</a></nav>
 </main>
 </div>
 <script>

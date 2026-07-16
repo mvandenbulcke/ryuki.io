@@ -36,6 +36,13 @@ impl AuthMode {
             Self::Local => "local",
         }
     }
+
+    /// Whether this mode synthesizes authority without a caller credential.
+    /// Shared consumers use this classification instead of maintaining their
+    /// own provider-name allowlists.
+    pub const fn is_credential_free(&self) -> bool {
+        matches!(self, Self::MockDryRun | Self::StaticDryRun)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -590,7 +597,81 @@ pub struct ServerConfig {
 }
 
 fn default_bind_address() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
+}
+
+fn bind_address_is_loopback(bind_address: &str) -> bool {
+    bind_address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback())
+}
+
+/// Returns true only when a configured browser-visible HTTP(S) URL has a
+/// literal loopback host. DNS names other than `localhost`, userinfo, malformed
+/// ports, and ambiguous IPv6 authorities are rejected.
+fn public_url_has_loopback_host(public_url: &str) -> bool {
+    let Some(remainder) = public_url
+        .strip_prefix("http://")
+        .or_else(|| public_url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let Some(host) = authority_host(authority) else {
+        return false;
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Returns true only when a configured browser-visible URL is plain HTTP on a
+/// literal loopback origin. This is the sole configuration in which an
+/// unprefixed, non-Secure browser session cookie is admitted.
+fn public_url_allows_insecure_session_cookie(public_url: &str) -> bool {
+    public_url.starts_with("http://") && public_url_has_loopback_host(public_url)
+}
+
+/// Extracts a literal host from an HTTP authority without accepting userinfo,
+/// malformed ports, or ambiguous unbracketed IPv6 text.
+fn authority_host(authority: &str) -> Option<&str> {
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let closing_bracket = bracketed.find(']')?;
+        let host = &bracketed[..closing_bracket];
+        let suffix = &bracketed[closing_bracket + 1..];
+        if host.parse::<Ipv6Addr>().is_err() || !valid_optional_port(suffix) {
+            return None;
+        }
+        return Some(host);
+    }
+
+    match authority.split_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !port.is_empty()
+                && !port.contains(':')
+                && port.parse::<u16>().is_ok() =>
+        {
+            Some(host)
+        }
+        None => Some(authority),
+        _ => None,
+    }
+}
+
+fn valid_optional_port(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    suffix
+        .strip_prefix(':')
+        .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok())
 }
 
 fn default_shutdown_timeout() -> u64 {
@@ -807,21 +888,56 @@ impl Default for LogConfigExtended {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SessionConfig {
     #[serde(default = "default_session_cookie_max_age")]
     pub cookie_max_age_secs: u64,
+    /// Maximum age of the most recent validated federated assertion or trusted
+    /// lifecycle heartbeat before persisted federated sessions fail closed.
+    /// This bounds exposure when an IdP lifecycle feed is delayed or absent;
+    /// absolute session expiry remains an independent upper bound.
+    #[serde(default = "default_federated_authority_max_staleness")]
+    pub federated_authority_max_staleness_secs: u64,
     #[serde(default = "default_true")]
     pub cookie_secure: bool,
     #[serde(default = "default_true")]
     pub cookie_http_only: bool,
     #[serde(default = "default_same_site")]
     pub cookie_same_site: String,
+    /// Dedicated HMAC key for persisted-session bearer verifiers. This value
+    /// is accepted from configuration input but never serialized or printed.
+    /// Rotating the single active key intentionally invalidates every active
+    /// session; a future key-id ring is required for zero-downtime rotation.
+    #[serde(default, skip_serializing)]
+    pub credential_hmac_key: String,
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionConfig")
+            .field("cookie_max_age_secs", &self.cookie_max_age_secs)
+            .field(
+                "federated_authority_max_staleness_secs",
+                &self.federated_authority_max_staleness_secs,
+            )
+            .field("cookie_secure", &self.cookie_secure)
+            .field("cookie_http_only", &self.cookie_http_only)
+            .field("cookie_same_site", &self.cookie_same_site)
+            .field("credential_hmac_key", &"[redacted]")
+            .finish()
+    }
 }
 
 fn default_session_cookie_max_age() -> u64 {
     86400
 }
+
+fn default_federated_authority_max_staleness() -> u64 {
+    900
+}
+
+const MAX_FEDERATED_AUTHORITY_STALENESS_SECS: u64 = 3600;
 
 fn default_true() -> bool {
     true
@@ -835,9 +951,11 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             cookie_max_age_secs: default_session_cookie_max_age(),
+            federated_authority_max_staleness_secs: default_federated_authority_max_staleness(),
             cookie_secure: default_true(),
             cookie_http_only: default_true(),
             cookie_same_site: default_same_site(),
+            credential_hmac_key: String::new(),
         }
     }
 }
@@ -1070,9 +1188,12 @@ impl Default for RateLimitConfig {
 
 // ─── Local authentication (defensive auth for self-hosted deployments) ───
 
-/// Maximum byte length for local-auth usernames and passwords. Comparison
-/// operands are padded to this length so equality checks are constant-time.
-const LOCAL_AUTH_MAX_FIELD_BYTES: usize = 256;
+/// Shared request/configuration bound for local-auth usernames and passwords.
+/// The API applies this before any attacker-controlled value can enter login
+/// throttle state; the verifier and configuration parser enforce the same
+/// boundary. Comparison operands are padded to this length so equality checks
+/// are constant-time.
+pub const LOCAL_AUTH_MAX_FIELD_BYTES: usize = 256;
 
 /// Constant-time equality over byte strings up to
 /// [`LOCAL_AUTH_MAX_FIELD_BYTES`] bytes: both operands are zero-padded to the
@@ -1112,6 +1233,41 @@ impl std::fmt::Debug for LocalAuthUser {
             .field("password", &"<redacted>")
             .field("roles", &self.roles)
             .finish()
+    }
+}
+
+impl LocalAuthUser {
+    /// Returns a keyed, non-reversible authorization stamp for persisted local
+    /// sessions. The stamp changes when the exact account name, password, or
+    /// effective role set changes, while role ordering alone is ignored.
+    ///
+    /// The caller must supply deployment-secret key material that has already
+    /// passed the session credential-key policy. Password material never leaves
+    /// this type and is never returned, logged, or persisted.
+    pub fn session_authority_digest(&self, key: &[u8]) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        fn update_field(mac: &mut Hmac<Sha256>, value: &[u8]) {
+            mac.update(&(value.len() as u64).to_be_bytes());
+            mac.update(value);
+        }
+
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+        mac.update(b"ryuki/local-session-authority/v1\0");
+        update_field(&mut mac, self.username.as_bytes());
+        update_field(&mut mac, self.password.as_bytes());
+
+        let mut roles: Vec<&str> = self.roles.iter().map(String::as_str).collect();
+        roles.sort_unstable();
+        roles.dedup();
+        mac.update(&(roles.len() as u64).to_be_bytes());
+        for role in roles {
+            update_field(&mut mac, role.as_bytes());
+        }
+
+        mac.finalize().into_bytes().into()
     }
 }
 
@@ -1257,6 +1413,80 @@ fn parse_local_auth_users(raw: &str) -> Result<Vec<LocalAuthUser>, String> {
     Ok(users)
 }
 
+/// Explicit authority mode for the startup-owned local identity bootstrap.
+///
+/// `Unknown` is deliberately the default so adding a local user never grants
+/// platform-wide authority by omission. `Global` must be selected explicitly;
+/// `Scoped` requires at least one canonical value on the corresponding axis.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalAuthorityMode {
+    #[default]
+    Unknown,
+    Global,
+    Scoped,
+}
+
+impl LocalAuthorityMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Global => "global",
+            Self::Scoped => "scoped",
+        }
+    }
+}
+
+/// Validated, provider-neutral local authority bootstrap. Scope values are
+/// canonicalized before they cross the configuration/database boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHumanAuthority {
+    pub site_mode: LocalAuthorityMode,
+    pub site_scope: Vec<String>,
+    pub environment_mode: LocalAuthorityMode,
+    pub environment_scope: Vec<String>,
+}
+
+fn parse_local_authority_scope(raw: &str) -> Result<Vec<String>, &'static str> {
+    let mut values = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if value.len() > LOCAL_AUTH_MAX_FIELD_BYTES
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+            })
+        {
+            return Err("scope values must be bounded canonical identifiers");
+        }
+        values.push(value.to_string());
+    }
+    values.sort();
+    values.dedup();
+    if values.len() > 64 {
+        return Err("scope value count exceeds 64");
+    }
+    Ok(values)
+}
+
+fn validate_local_authority_axis(
+    mode: LocalAuthorityMode,
+    raw: &str,
+) -> Result<Vec<String>, &'static str> {
+    let values = parse_local_authority_scope(raw)?;
+    match mode {
+        LocalAuthorityMode::Unknown => Err("authority mode must be explicitly global or scoped"),
+        LocalAuthorityMode::Global if values.is_empty() => Ok(values),
+        LocalAuthorityMode::Global => Err("global authority must not carry scope values"),
+        LocalAuthorityMode::Scoped if values.is_empty() => {
+            Err("scoped authority requires at least one scope value")
+        }
+        LocalAuthorityMode::Scoped => Ok(values),
+    }
+}
+
 /// Local username/password authentication config. The user list is carried in
 /// every mode but HONORED only when `auth_mode == AuthMode::Local` (enforced
 /// in ryuki-api, the only call site of [`LocalAuthConfig::verify`]).
@@ -1264,9 +1494,35 @@ fn parse_local_auth_users(raw: &str) -> Result<Vec<LocalAuthUser>, String> {
 pub struct LocalAuthConfig {
     #[serde(default)]
     pub users: LocalAuthUsers,
+    /// `unknown` (default), `global`, or `scoped`. Global must be explicit.
+    #[serde(default)]
+    pub site_authority: LocalAuthorityMode,
+    /// Comma-separated canonical site identifiers; required only for scoped.
+    #[serde(default)]
+    pub site_scope: String,
+    /// `unknown` (default), `global`, or `scoped`. Global must be explicit.
+    #[serde(default)]
+    pub environment_authority: LocalAuthorityMode,
+    /// Comma-separated canonical environment identifiers; required only for scoped.
+    #[serde(default)]
+    pub environment_scope: String,
 }
 
 impl LocalAuthConfig {
+    /// Resolves the explicit local bootstrap. Populated local authentication
+    /// never interprets an omitted/empty scope as platform-wide authority.
+    pub fn human_authority(&self) -> Result<LocalHumanAuthority, &'static str> {
+        Ok(LocalHumanAuthority {
+            site_mode: self.site_authority,
+            site_scope: validate_local_authority_axis(self.site_authority, &self.site_scope)?,
+            environment_mode: self.environment_authority,
+            environment_scope: validate_local_authority_axis(
+                self.environment_authority,
+                &self.environment_scope,
+            )?,
+        })
+    }
+
     /// Verifies a username/password pair in constant time.
     ///
     /// Iterates ALL configured users without early exit; for each user both
@@ -1408,12 +1664,13 @@ pub struct RyukiConfig {
     /// RYUKI_ENTRA_REDIRECT_URI.
     #[serde(default)]
     pub entra_redirect_uri: String,
-    /// JWKS keyset cache TTL in seconds for Entra token validation (default 24h).
-    /// Optional tuning knob; not required for EntraId mode validation.
+    /// JWKS keyset cache TTL in seconds for Entra token validation (default and
+    /// maximum 24h; minimum 1s). Validated even before EntraId mode is enabled.
     #[serde(default = "default_entra_jwks_ttl_secs")]
     pub entra_jwks_ttl_secs: u64,
     /// Clock-skew leeway in seconds applied to exp/nbf during Entra token
-    /// validation (default 60s). Optional tuning knob; not required for EntraId mode.
+    /// validation (default 60s; maximum 300s). Validated even before EntraId
+    /// mode is enabled.
     #[serde(default = "default_entra_leeway_secs")]
     pub entra_leeway_secs: u64,
     #[serde(default = "default_platform_name")]
@@ -1476,8 +1733,16 @@ fn default_entra_authority() -> String {
     "https://login.microsoftonline.com".to_string()
 }
 
+/// One day balances normal signing-key rotation with bounded retirement of a
+/// withdrawn Entra key. Longer trust generations require a code-reviewed
+/// policy change rather than an unconstrained runtime knob.
+const MAX_ENTRA_JWKS_TTL_SECS: u64 = 86_400;
+/// Five minutes accommodates substantial clock skew without turning token
+/// expiry/not-before validation into a configurable bypass.
+const MAX_ENTRA_LEEWAY_SECS: u64 = 300;
+
 fn default_entra_jwks_ttl_secs() -> u64 {
-    86_400
+    MAX_ENTRA_JWKS_TTL_SECS
 }
 
 fn default_entra_leeway_secs() -> u64 {
@@ -1614,6 +1879,24 @@ impl RyukiConfig {
             errors.push("server.bind_address is required".into());
         }
 
+        // Mock/static modes intentionally synthesize a PlatformAdmin session
+        // without credentials. They are useful for a local demo only and must
+        // never be admitted on a remotely reachable listener.
+        if self.auth_mode.is_credential_free() {
+            if !bind_address_is_loopback(&self.server.bind_address) {
+                errors.push(
+                    "mock-dry-run and static-dry-run authentication require a loopback server.bind_address"
+                        .into(),
+                );
+            }
+            if !public_url_has_loopback_host(&self.platform_url) {
+                errors.push(
+                    "mock-dry-run and static-dry-run authentication require a literal loopback browser-visible origin"
+                        .into(),
+                );
+            }
+        }
+
         if self.server.shutdown_timeout_secs == 0 {
             errors.push("server.shutdown_timeout_secs must be greater than 0".into());
         }
@@ -1675,8 +1958,29 @@ impl RyukiConfig {
             errors.push("entra_tenant_id is required when auth_mode is entra-id".into());
         }
 
+        if self.entra_jwks_ttl_secs == 0 {
+            errors.push("entra_jwks_ttl_secs must be greater than 0".into());
+        } else if self.entra_jwks_ttl_secs > MAX_ENTRA_JWKS_TTL_SECS {
+            errors.push(format!(
+                "entra_jwks_ttl_secs must not exceed {MAX_ENTRA_JWKS_TTL_SECS}"
+            ));
+        }
+        if self.entra_leeway_secs > MAX_ENTRA_LEEWAY_SECS {
+            errors.push(format!(
+                "entra_leeway_secs must not exceed {MAX_ENTRA_LEEWAY_SECS}"
+            ));
+        }
+
         if self.auth_mode == AuthMode::Local && self.local_auth.users.is_empty() {
             errors.push("local_auth.users is required when auth_mode is local".into());
+        }
+        if self.auth_mode == AuthMode::Local
+            && !self.local_auth.users.is_empty()
+            && let Err(error) = self.local_auth.human_authority()
+        {
+            errors.push(format!(
+                "local_auth site/environment authority is invalid: {error}"
+            ));
         }
 
         if self.rate_limit.enabled && self.rate_limit.requests_per_second == 0 {
@@ -1744,6 +2048,33 @@ impl RyukiConfig {
                 self.platform_url
             ));
         }
+        if !self.session.cookie_secure
+            && !public_url_allows_insecure_session_cookie(&self.platform_url)
+        {
+            errors.push(
+                "session.cookie_secure may be false only when platform_url uses plain HTTP with a literal loopback host; HTTPS and non-loopback public origins require session.cookie_secure=true"
+                    .into(),
+            );
+        }
+        if !self.session.cookie_secure
+            && self.oidc.enabled
+            && !public_url_allows_insecure_session_cookie(&self.oidc.redirect_uri)
+        {
+            errors.push(
+                "oidc.redirect_uri must use plain HTTP with a literal loopback host when session.cookie_secure=false"
+                    .into(),
+            );
+        }
+        if !self.session.cookie_secure
+            && self.auth_mode == AuthMode::EntraId
+            && !self.entra_redirect_uri.is_empty()
+            && !public_url_allows_insecure_session_cookie(&self.entra_redirect_uri)
+        {
+            errors.push(
+                "entra_redirect_uri must use plain HTTP with a literal loopback host when session.cookie_secure=false"
+                    .into(),
+            );
+        }
 
         if self.security.content_security_policy.is_empty() {
             errors.push("security.content_security_policy must not be empty".into());
@@ -1802,6 +2133,41 @@ impl RyukiConfig {
         }
         if self.session.cookie_max_age_secs == 0 {
             errors.push("session.cookie_max_age_secs must be greater than 0".into());
+        }
+        if self.session.federated_authority_max_staleness_secs == 0 {
+            errors.push(
+                "session.federated_authority_max_staleness_secs must be greater than 0".into(),
+            );
+        } else if self.session.federated_authority_max_staleness_secs
+            > MAX_FEDERATED_AUTHORITY_STALENESS_SECS
+        {
+            errors.push(format!(
+                "session.federated_authority_max_staleness_secs must not exceed {MAX_FEDERATED_AUTHORITY_STALENESS_SECS}"
+            ));
+        }
+        let session_credentials_enabled =
+            matches!(self.auth_mode, AuthMode::Local | AuthMode::EntraId) || self.oidc.enabled;
+        let verifier_key = self.session.credential_hmac_key.as_str();
+        if session_credentials_enabled && verifier_key.is_empty() {
+            errors.push(
+                "session.credential_hmac_key is required for local, Entra, and OIDC sessions"
+                    .into(),
+            );
+        } else if !verifier_key.is_empty() {
+            if verifier_key.len() < 32 {
+                errors.push(
+                    "session.credential_hmac_key must contain at least 32 bytes of key material"
+                        .into(),
+                );
+            }
+            if verifier_key.trim() != verifier_key
+                || verifier_key.as_bytes().iter().any(u8::is_ascii_control)
+            {
+                errors.push(
+                    "session.credential_hmac_key must not contain surrounding whitespace or control characters"
+                        .into(),
+                );
+            }
         }
 
         if self.retention.daily_backups == 0 {
@@ -1891,6 +2257,7 @@ mod tests {
     fn test_default_ryuki_config() {
         let config = RyukiConfig::default();
         assert_eq!(config.auth_mode, AuthMode::MockDryRun);
+        assert_eq!(config.server.bind_address, "127.0.0.1:8080");
         assert_eq!(config.database_provider, DatabaseProvider::CloudNativePg);
         assert_eq!(config.secret_provider, SecretProvider::HashicorpVault);
         assert_eq!(config.kubernetes_runtime, KubernetesRuntime::VsphereVks);
@@ -1933,6 +2300,61 @@ mod tests {
             errors.is_empty(),
             "default config should produce no hard validation errors, got: {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn test_entra_jwks_ttl_and_token_leeway_security_bounds() {
+        for ttl in [1, MAX_ENTRA_JWKS_TTL_SECS] {
+            let config = RyukiConfig {
+                entra_jwks_ttl_secs: ttl,
+                ..Default::default()
+            };
+            assert!(
+                !config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("entra_jwks_ttl_secs")),
+                "admitted JWKS TTL boundary must validate: {ttl}"
+            );
+        }
+        for ttl in [0, MAX_ENTRA_JWKS_TTL_SECS + 1] {
+            let config = RyukiConfig {
+                entra_jwks_ttl_secs: ttl,
+                ..Default::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("entra_jwks_ttl_secs")),
+                "unsafe JWKS TTL must fail validation: {ttl}"
+            );
+        }
+
+        for leeway in [0, MAX_ENTRA_LEEWAY_SECS] {
+            let config = RyukiConfig {
+                entra_leeway_secs: leeway,
+                ..Default::default()
+            };
+            assert!(
+                !config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("entra_leeway_secs")),
+                "admitted token leeway boundary must validate: {leeway}"
+            );
+        }
+        let config = RyukiConfig {
+            entra_leeway_secs: MAX_ENTRA_LEEWAY_SECS + 1,
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("entra_leeway_secs")),
+            "token leeway above the hard bound must fail validation"
         );
     }
 
@@ -1994,6 +2416,97 @@ mod tests {
                 "valid scheme must pass: {ok}"
             );
         }
+    }
+
+    #[test]
+    fn test_insecure_session_cookie_requires_plain_http_loopback_platform_url() {
+        for platform_url in [
+            "https://platform.example.test",
+            "https://localhost:8443",
+            "http://platform.example.test",
+            "http://10.0.0.8:8080",
+            "http://localhost.example.test:8080",
+            "http://user@localhost:8080",
+            "http://[localhost]:8080",
+            "http://[127.0.0.1]:8080",
+            "http://[::1].example.test:8080",
+            "http://[::1]:not-a-port",
+        ] {
+            let mut config = RyukiConfig {
+                platform_url: platform_url.into(),
+                ..Default::default()
+            };
+            config.session.cookie_secure = false;
+            assert!(
+                config.validate().iter().any(|error| {
+                    error.contains("session.cookie_secure")
+                        && error.contains("literal loopback host")
+                }),
+                "insecure session cookies must be rejected for {platform_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insecure_session_cookie_accepts_explicit_http_loopback_platform_url() {
+        for platform_url in [
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://127.0.0.1:8080",
+            "http://127.42.0.9",
+            "http://[::1]:8080",
+            "http://[::1]",
+        ] {
+            let mut config = RyukiConfig {
+                platform_url: platform_url.into(),
+                ..Default::default()
+            };
+            config.session.cookie_secure = false;
+            assert!(
+                !config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("session.cookie_secure may be false")),
+                "explicit loopback development should be admitted for {platform_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insecure_session_cookie_requires_loopback_browser_callbacks() {
+        let mut oidc = RyukiConfig::default();
+        oidc.session.cookie_secure = false;
+        oidc.oidc.enabled = true;
+        oidc.oidc.redirect_uri = "https://platform.example.test/api/auth/oidc/callback".into();
+        assert!(
+            oidc.validate()
+                .iter()
+                .any(|error| error.contains("oidc.redirect_uri")
+                    && error.contains("cookie_secure=false"))
+        );
+
+        let mut entra = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            entra_redirect_uri: "https://platform.example.test/api/auth/entra/callback".into(),
+            ..Default::default()
+        };
+        entra.session.cookie_secure = false;
+        assert!(
+            entra
+                .validate()
+                .iter()
+                .any(|error| error.contains("entra_redirect_uri")
+                    && error.contains("cookie_secure=false"))
+        );
+
+        oidc.oidc.redirect_uri = "http://127.0.0.1:8080/api/auth/oidc/callback".into();
+        assert!(!oidc.validate().iter().any(|error| {
+            error.contains("oidc.redirect_uri") && error.contains("cookie_secure=false")
+        }));
+        entra.entra_redirect_uri = "http://[::1]:8080/api/auth/entra/callback".into();
+        assert!(!entra.validate().iter().any(|error| {
+            error.contains("entra_redirect_uri") && error.contains("cookie_secure=false")
+        }));
     }
 
     #[test]
@@ -2333,6 +2846,85 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dry_run_auth_requires_loopback_listener() {
+        for auth_mode in [AuthMode::MockDryRun, AuthMode::StaticDryRun] {
+            let mut config = RyukiConfig {
+                auth_mode,
+                ..Default::default()
+            };
+            config.server.bind_address = "0.0.0.0:8080".into();
+            let errors = config.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("require a loopback"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_dry_run_auth_requires_loopback_browser_origin() {
+        for auth_mode in [AuthMode::MockDryRun, AuthMode::StaticDryRun] {
+            for platform_url in [
+                "https://platform.example.test",
+                "http://platform.example.test",
+                "http://localhost.example.test",
+                "http://user@localhost:18080",
+            ] {
+                let config = RyukiConfig {
+                    auth_mode: auth_mode.clone(),
+                    platform_url: platform_url.into(),
+                    ..Default::default()
+                };
+                assert!(
+                    config
+                        .validate()
+                        .iter()
+                        .any(|error| error.contains("literal loopback browser-visible origin")),
+                    "{auth_mode:?} must reject non-local browser origin {platform_url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_dry_run_auth_accepts_loopback_browser_origins() {
+        for platform_url in [
+            "http://localhost:18080",
+            "http://127.0.0.1:18080",
+            "http://[::1]:18080",
+            "https://localhost:18443",
+        ] {
+            let config = RyukiConfig {
+                platform_url: platform_url.into(),
+                ..Default::default()
+            };
+            assert!(
+                !config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("literal loopback browser-visible origin")),
+                "local browser origin {platform_url} must preserve dry-run development mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_dry_run_auth_accepts_ipv4_and_ipv6_loopback() {
+        for bind_address in ["127.0.0.1:8080", "[::1]:8080"] {
+            let mut config = RyukiConfig::default();
+            config.server.bind_address = bind_address.into();
+            assert!(
+                !config
+                    .validate()
+                    .iter()
+                    .any(|error| error.contains("require a loopback")),
+                "{bind_address} should be admitted for local dry-run mode"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_csp_not_empty() {
         let mut config = RyukiConfig::default();
         config.security.content_security_policy = String::new();
@@ -2377,6 +2969,9 @@ mod tests {
     fn populated_local_auth() -> LocalAuthConfig {
         LocalAuthConfig {
             users: local_auth_from_str(PLACEHOLDER_USERS).unwrap(),
+            site_authority: LocalAuthorityMode::Global,
+            environment_authority: LocalAuthorityMode::Global,
+            ..Default::default()
         }
     }
 
@@ -2389,6 +2984,73 @@ mod tests {
         assert_eq!(users.users()[0].roles, vec!["PlatformAdmin"]);
         assert_eq!(users.users()[1].username, "bob");
         assert_eq!(users.users()[1].roles, vec!["VMwareOperator", "Auditor"]);
+    }
+
+    #[test]
+    fn local_human_authority_requires_explicit_global_or_nonempty_scoped_axes() {
+        let mut config = populated_local_auth();
+        config.site_authority = LocalAuthorityMode::Unknown;
+        assert!(config.human_authority().is_err());
+
+        config.site_authority = LocalAuthorityMode::Scoped;
+        config.site_scope = " SITE-B, SITE-A, SITE-B ".into();
+        config.environment_authority = LocalAuthorityMode::Scoped;
+        config.environment_scope = "prod,stage".into();
+        let authority = config.human_authority().unwrap();
+        assert_eq!(authority.site_scope, ["SITE-A", "SITE-B"]);
+        assert_eq!(authority.environment_scope, ["prod", "stage"]);
+
+        config.site_authority = LocalAuthorityMode::Global;
+        assert!(
+            config.human_authority().is_err(),
+            "explicit global must not silently retain a scoped list"
+        );
+    }
+
+    #[test]
+    fn local_mode_validation_rejects_ambiguous_empty_scope_bootstrap() {
+        let config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            local_auth: LocalAuthConfig {
+                users: local_auth_from_str(PLACEHOLDER_USERS).unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().iter().any(|error| {
+                error.contains("local_auth site/environment authority is invalid")
+            })
+        );
+    }
+
+    #[test]
+    fn test_local_session_authority_digest_tracks_security_changes_not_role_order() {
+        let key = b"placeholder-session-authority-key";
+        let baseline =
+            local_auth_from_str("alice:placeholder-pass-1:PlatformAdmin|Auditor").unwrap();
+        let reordered =
+            local_auth_from_str("alice:placeholder-pass-1:Auditor|PlatformAdmin").unwrap();
+        let rotated_password =
+            local_auth_from_str("alice:placeholder-pass-2:PlatformAdmin|Auditor").unwrap();
+        let reduced_roles = local_auth_from_str("alice:placeholder-pass-1:Auditor").unwrap();
+
+        let digest = baseline.users()[0].session_authority_digest(key);
+        assert_eq!(
+            digest,
+            reordered.users()[0].session_authority_digest(key),
+            "role order is not an authorization change"
+        );
+        assert_ne!(
+            digest,
+            rotated_password.users()[0].session_authority_digest(key),
+            "password rotation must invalidate prior sessions"
+        );
+        assert_ne!(
+            digest,
+            reduced_roles.users()[0].session_authority_digest(key),
+            "role reduction must invalidate prior sessions"
+        );
     }
 
     #[test]
@@ -2445,12 +3107,15 @@ mod tests {
     fn test_local_auth_users_parse_from_toml_nested_key() {
         // Mirrors the nested key that RYUKI_LOCAL_AUTH__USERS produces via
         // Env::prefixed("RYUKI_").split("__").
+        let session_key = "k".repeat(32);
         let config: RyukiConfig = Figment::new()
             .merge(figment::providers::Serialized::defaults(
                 RyukiConfig::default(),
             ))
             .merge(Toml::string(&format!(
-                "auth_mode = \"local\"\n[local_auth]\nusers = \"{PLACEHOLDER_USERS}\""
+                "auth_mode = \"local\"\n[local_auth]\nusers = \"{PLACEHOLDER_USERS}\"\n\
+                 site_authority = \"global\"\nenvironment_authority = \"global\"\n\
+                 [session]\ncredential_hmac_key = \"{session_key}\""
             )))
             .extract()
             .expect("config with local_auth.users should parse");
@@ -2546,7 +3211,94 @@ mod tests {
         );
 
         config.local_auth = populated_local_auth();
+        config.session.credential_hmac_key = "k".repeat(32);
         assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_session_verifier_key_is_required_for_persisted_auth_modes() {
+        let mut local = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            local_auth: populated_local_auth(),
+            ..Default::default()
+        };
+        assert!(
+            local
+                .validate()
+                .iter()
+                .any(|error| error.contains("session.credential_hmac_key is required"))
+        );
+
+        local.session.credential_hmac_key = "k".repeat(32);
+        assert!(local.validate().is_empty());
+
+        let entra = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            entra_tenant_id: "synthetic-tenant".into(),
+            entra_client_id: "synthetic-client".into(),
+            ..Default::default()
+        };
+        assert!(
+            entra
+                .validate()
+                .iter()
+                .any(|error| error.contains("session.credential_hmac_key is required"))
+        );
+    }
+
+    #[test]
+    fn test_session_verifier_key_is_redacted_and_never_serialized() {
+        let session = SessionConfig {
+            credential_hmac_key: "k".repeat(32),
+            ..Default::default()
+        };
+        let debug = format!("{session:?}");
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!debug.contains(&session.credential_hmac_key));
+        assert!(debug.contains("[redacted]"));
+        assert!(!json.contains("credential_hmac_key"));
+        assert!(!json.contains(&session.credential_hmac_key));
+    }
+
+    #[test]
+    fn test_configured_short_or_whitespace_session_key_is_rejected() {
+        let mut config = RyukiConfig::default();
+        config.session.credential_hmac_key = "k".repeat(31);
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("at least 32 bytes"))
+        );
+
+        config.session.credential_hmac_key = format!("{}\n", "k".repeat(32));
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("control characters"))
+        );
+    }
+
+    #[test]
+    fn test_zero_federated_authority_staleness_is_rejected() {
+        let mut config = RyukiConfig::default();
+        config.session.federated_authority_max_staleness_secs = 0;
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| { error.contains("session.federated_authority_max_staleness_secs") })
+        );
+
+        config.session.federated_authority_max_staleness_secs =
+            MAX_FEDERATED_AUTHORITY_STALENESS_SECS + 1;
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("must not exceed"))
+        );
     }
 
     #[test]

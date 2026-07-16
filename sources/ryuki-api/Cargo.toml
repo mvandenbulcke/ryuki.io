@@ -17,13 +17,14 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uu
 figment = { workspace = true }
 governor = { workspace = true }
 tower = { workspace = true }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 ryuki-core = { workspace = true }
 ryuki-engine = { workspace = true }
 ryuki-protocol = { workspace = true }
 ryuki-runner = { workspace = true }
 rand = "0.8"
+hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
 base64 = "0.22"
@@ -34,13 +35,11 @@ thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [dev-dependencies]
-rsa = "0.9"
+aws-lc-rs = "1"
+pkcs8 = "0.10"
 ryuki-agent = { workspace = true }
 tempfile = "3"
 # `test-util` enables the paused-clock test runtime (`start_paused = true`) used
 # by the background-loop timeout unit tests; kept dev-only so it never ships.
 tokio = { version = "1", features = ["full", "test-util"] }
-# HMAC test-vector signing for inbound_webhooks tests (versions match
-# ryuki-engine, which owns the production verify_hmac_sha256 primitive).
-hmac = "0.12"
 hex = "0.4"

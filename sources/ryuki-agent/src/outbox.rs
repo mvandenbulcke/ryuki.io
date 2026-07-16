@@ -155,7 +155,7 @@ impl Outbox {
                 return Err(OutboxError::Io {
                     path: path.display().to_string(),
                     source: e,
-                })
+                });
             }
         };
 
@@ -277,7 +277,7 @@ impl Outbox {
                 return Err(OutboxError::Io {
                     path: path.display().to_string(),
                     source: e,
-                })
+                });
             }
         }
         // Best-effort: clean up the sidecar even if the main file was already gone.
@@ -461,6 +461,7 @@ mod tests {
 
         let unsigned = SignedEnvelope {
             agent_id: "test-agent".to_string(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "test-platform".to_string(),
             job_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
@@ -471,6 +472,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -485,6 +488,7 @@ mod tests {
             attempt_id: signed_envelope.attempt_id,
             result_id: signed_envelope.result_id,
             status: signed_envelope.status.clone(),
+            raw_plan_digest: signed_envelope.raw_plan_digest.clone(),
             evidence_digest: signed_envelope.evidence_digest.clone(),
             signed_envelope,
         };

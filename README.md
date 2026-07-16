@@ -101,8 +101,9 @@ docker compose -f deploy/compose/compose.yaml up -d platform-db
 
 # Configure environment
 cp .env.example .env
-# Edit .env — set RYUKI_DATABASE_URL; for live SSO set RYUKI_AUTH_MODE,
-# RYUKI_ENTRA_TENANT_ID, and RYUKI_ENTRA_CLIENT_ID
+# Edit .env — set RYUKI_DATABASE_URL. Entra mode also requires the tenant,
+# client, and runtime-only session-verifier key; browser SSO additionally
+# requires the exact registered Web callback URI.
 
 # Install portal tooling once
 rustup target add wasm32-unknown-unknown
@@ -117,11 +118,15 @@ cargo test --workspace
 # Run API on the portal's default upstream port. Pass any additional auth
 # settings explicitly; do not source .env as executable shell code.
 # Export RYUKI_DATABASE_URL in this shell without committing its value.
+RYUKI_MIGRATION_MODE=local-auto \
 RYUKI_SERVER__BIND_ADDRESS=127.0.0.1:8081 \
   cargo run --manifest-path sources/ryuki-api/Cargo.toml
 
 # Run portal (separate terminal)
+LEPTOS_SITE_ADDR=127.0.0.1:8080 \
 RYUKI_API_URL=http://127.0.0.1:8081 \
+RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 \
+RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true \
 RYUKI_PORTAL_EXECUTION_MODE=live-provider \
   cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
@@ -130,6 +135,14 @@ The API is then at `http://127.0.0.1:8081` and the portal at
 `http://127.0.0.1:8080`. Check API readiness at `/ready` before using the
 portal. The full first-test gate and evidence requirements are in
 [`docs/first-test.md`](docs/first-test.md).
+
+The complete development Compose stack publishes every service on
+`127.0.0.1`. Its API uses local authentication because a container bridge
+listener is not loopback: before starting the full stack, set
+`RYUKI_LOCAL_AUTH__USERS`, explicit site/environment authority modes (and
+scope lists for `scoped` modes), and a random, at-least-32-byte
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` in the gitignored `.env`. The portal runs
+in static dry-run mode at `http://127.0.0.1:18000` by default.
 
 ### Validation
 
@@ -142,6 +155,9 @@ cargo fmt --check --all
 
 # Clippy (matches the CI lint gate)
 cargo clippy --workspace --all-targets -- -D warnings
+
+# Dependency audit (requires cargo-audit 0.22.2)
+./scripts/dependency-audit.sh
 
 # Secret scan
 ./scripts/no-secret-scan.sh
@@ -173,9 +189,24 @@ Ryuki uses Entra ID [app roles](https://learn.microsoft.com/en-us/entra/identity
 
 See `docs/entra-app-registration.md` for the app manifest template.
 
+The normative production model is broader than app-role mapping. Browser
+sessions, API tokens, local emergency access, agents, webhooks, system workers,
+approvals, provider credentials, and audit must cross the same typed boundary.
+See the [Platform Security Boundary Specification](docs/architecture/platform-security-boundary.md)
+for the target design and production acceptance gates.
+
+The target is provider-neutral: deployments may configure multiple OpenID
+Connect providers (including Entra ID or Keycloak-brokered SAML/LDAP), while
+secrets can be supplied by Vault, OpenBao, Azure Key Vault, AWS Secrets Manager,
+Google Secret Manager, or another conforming adapter without changing domain
+authorization rules.
+
 ## Configuration
 
-All configuration via environment variables with the `RYUKI_` prefix (nested fields use `__`, e.g. `RYUKI_SERVER__BIND_ADDRESS`). See `.env.example` for the full reference.
+Application configuration uses environment variables with the `RYUKI_` prefix
+(nested fields use `__`, e.g. `RYUKI_SERVER__BIND_ADDRESS`). The current Vault
+compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
+`VAULT_TOKEN`. See `.env.example` for the full reference.
 
 | Variable | Purpose |
 |---|---|
@@ -185,7 +216,11 @@ All configuration via environment variables with the `RYUKI_` prefix (nested fie
 | `RYUKI_ENTRA_CLIENT_ID` | App registration client ID |
 | `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL |
 | `RYUKI_PLATFORM_NAME` | Display name in portal |
-| `RYUKI_PLATFORM_URL` | Platform URL for redirects |
+| `RYUKI_PLATFORM_URL` | Public platform/API base URL metadata |
+| `RYUKI_API_URL` | Portal server's validated platform API origin |
+| `RYUKI_PORTAL_PUBLIC_ORIGIN` | Exact browser origin admitted by the portal (required) |
+| `RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK` | Explicitly permit HTTP only for a loopback portal/API origin |
+| `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Runtime-only verifier key required for local, Entra, and OIDC sessions |
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

@@ -14,6 +14,13 @@ kind: Cluster
 metadata:
   name: ryuki-platform-db
   namespace: ryuki-platform
+  annotations:
+    # Final certificate evidence must contain this exact DNS SAN. Both runtime
+    # and migration clients connect by this name with sslmode=verify-full.
+    ryuki.io/required-server-dns-san: ryuki-platform-db-rw.ryuki-platform.svc
+    # CloudNativePG's operator-managed CA Secret is projected into clients with
+    # an items allowlist that exposes ca.crt only, never ca.key.
+    ryuki.io/client-ca-secret: ryuki-platform-db-ca
   labels:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
 spec:
@@ -31,6 +38,72 @@ spec:
       owner: ryuki_platform
       secret:
         name: ryuki-platform-db-superuser
+      # Stable NOLOGIN group roles are the only database authorities used by
+      # short-lived Vault logins. Dynamic sessions must SET ROLE to one of
+      # these exact principals; application startup and the migration runner
+      # independently verify current_user plus session membership.
+      postInitApplicationSQL:
+        - |-
+          DO $roles$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_roles WHERE rolname = 'ryuki_app_runtime'
+            ) THEN
+              CREATE ROLE ryuki_app_runtime NOLOGIN NOSUPERUSER NOCREATEDB
+                NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_roles WHERE rolname = 'ryuki_schema_migrator'
+            ) THEN
+              CREATE ROLE ryuki_schema_migrator NOLOGIN NOSUPERUSER NOCREATEDB
+                NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+            END IF;
+          END
+          $roles$;
+        - ALTER ROLE ryuki_app_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL
+        - ALTER ROLE ryuki_schema_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL
+        # Scope migration ownership to the application schema. The durable
+        # bootstrap role remains the NOLOGIN database owner, so the migration
+        # role can alter application objects without acquiring database-wide
+        # CREATE/TEMP or ownership authority.
+        - ALTER SCHEMA public OWNER TO ryuki_schema_migrator
+        - ALTER ROLE ryuki_platform NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL
+        # Remove PostgreSQL's default PUBLIC CONNECT/TEMP authority from every
+        # existing connectable database, including template1. Strict startup
+        # rejects a later database until its defaults are similarly closed.
+        - |-
+          DO $databases$
+          DECLARE
+            target_database name;
+          BEGIN
+            FOR target_database IN
+              SELECT datname
+              FROM pg_database
+              WHERE datallowconn
+            LOOP
+              EXECUTE format(
+                'REVOKE ALL PRIVILEGES ON DATABASE %I FROM PUBLIC, ryuki_app_runtime, ryuki_schema_migrator',
+                target_database
+              );
+            END LOOP;
+          END
+          $databases$;
+        - GRANT CONNECT ON DATABASE ryuki_platform TO ryuki_app_runtime, ryuki_schema_migrator
+        - REVOKE ALL ON SCHEMA public FROM PUBLIC
+        - GRANT USAGE ON SCHEMA public TO ryuki_app_runtime, ryuki_schema_migrator
+        - GRANT CREATE ON SCHEMA public TO ryuki_schema_migrator
+        - |-
+          ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+          IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES
+          FROM PUBLIC, ryuki_app_runtime
+        - |-
+          ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+          IN SCHEMA public REVOKE ALL PRIVILEGES ON SEQUENCES
+          FROM PUBLIC, ryuki_app_runtime
+        - |-
+          ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+          IN SCHEMA public REVOKE ALL PRIVILEGES ON FUNCTIONS
+          FROM PUBLIC, ryuki_app_runtime
 
   # vSphere CSI-backed persistent storage
   storage:
@@ -45,10 +118,26 @@ spec:
   # External secret reference for Vault-managed credentials
   managed:
     roles:
-      - name: ryuki-platform-app
-        ensure: managed
-        passwordSecret:
-          name: ryuki-platform-db-app-user
+      - name: ryuki_app_runtime
+        ensure: present
+        login: false
+        superuser: false
+        createdb: false
+        createrole: false
+        inherit: true
+        replication: false
+        bypassrls: false
+        disablePassword: true
+      - name: ryuki_schema_migrator
+        ensure: present
+        login: false
+        superuser: false
+        createdb: false
+        createrole: false
+        inherit: true
+        replication: false
+        bypassrls: false
+        disablePassword: true
 
   # Maintenance and upgrade posture — placeholder, reviewed per plan
   primaryUpdateStrategy: unsupervised

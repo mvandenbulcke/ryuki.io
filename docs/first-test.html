@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
-result and evidence" href="/first-test.html">First Test Acceptance</a><ul class="sb-sections"><li><a href="#authority-and-scope">Authority and scope</a></li><li><a href="#required-roles-and-target">Required roles and target</a></li><li><a href="#tool-and-provider-prerequisites">Tool and provider prerequisites</a></li><li><a href="#request-contract">Request contract</a></li><li><a href="#gate-1-repository-checks">Gate 1: repository checks</a></li><li><a href="#gate-2-proving-ground-readiness">Gate 2: proving-ground readiness</a></li><li><a href="#gate-3-offline-rehearsal">Gate 3: offline rehearsal</a></li><li><a href="#gate-4-live-plan-and-state-isolation">Gate 4: live plan and state isolation</a></li><li><a href="#gate-5-live-apply-and-verification">Gate 5: live apply and verification</a></li><li><a href="#gate-6-mandatory-cleanup">Gate 6: mandatory cleanup</a></li><li><a href="#result-and-evidence">Result and evidence</a></li></ul></li><li><a class="sb-link" data-sections="stack
+result and evidence" href="/first-test.html">First Test Acceptance</a><ul class="sb-sections"><li><a href="#authority-and-scope">Authority and scope</a></li><li><a href="#required-roles-and-target">Required roles and target</a></li><li><a href="#tool-and-provider-prerequisites">Tool and provider prerequisites</a></li><li><a href="#request-contract">Request contract</a></li><li><a href="#gate-1-repository-checks">Gate 1: repository checks</a></li><li><a href="#gate-2-proving-ground-readiness">Gate 2: proving-ground readiness</a></li><li><a href="#gate-3-platform-no-spawn-rehearsal">Gate 3: platform no-spawn rehearsal</a></li><li><a href="#gate-4-live-plan-and-state-isolation">Gate 4: live plan and state isolation</a></li><li><a href="#gate-5-live-apply-and-verification">Gate 5: live apply and verification</a></li><li><a href="#gate-6-mandatory-cleanup">Gate 6: mandatory cleanup</a></li><li><a href="#result-and-evidence">Result and evidence</a></li></ul></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -110,25 +126,18 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>This document defines what "ready for a first test" means for Ryuki. A goal session, tracker entry, review, commit, or successful build is supporting evidence, not acceptance by itself.</p>
 <p>The first test has two milestones:</p>
 <ol>
-<li><strong>Platform rehearsal</strong> proves the governed lifecycle with <code>OfflineDryRun</code>.</li>
+<li><strong>Platform no-spawn rehearsal</strong> proves the governed control-plane lifecycle, maker/checker handoff, enrollment, protocol, signing, and evidence seams without starting Terraform or Ansible. It must complete before any external-process or provider-connected work.</li>
+<li><strong>First live vSphere test</strong> proves plan, approval, apply, verification, state isolation, and cleanup against one approved disposable target.</li>
 </ol>
-<p>   It must complete before any provider-connected work.</p>
-<ol>
-<li><strong>First live vSphere test</strong> proves plan, approval, apply, verification, state</li>
-</ol>
-<p>   isolation, and cleanup against one approved disposable target.</p>
 <p>The live milestone is optional until an operator approves the target and credentials. It is blocked, not failed, when those external prerequisites are unavailable. It must never be redirected to production merely to make the test runnable.</p>
+<p>The current source tree also blocks that live milestone by design: production external subprocess execution refuses before spawn until a reviewed per-command containment adapter can attach before exec, kill all descendants, and wait for an empty scope. The live gates below therefore specify future acceptance evidence; they do not assert working provider execution in this snapshot. The current executable milestone is the no-spawn control-plane and pure/stub protocol rehearsal. A successful external <code>OfflineDryRun</code> result is deferred with the same containment adapter as live execution.</p>
 <h2 id="authority-and-scope">Authority and scope</h2>
 <p>This document is normative for first-test scope and acceptance. Runtime protocol types, lifecycle code, and migrations are the evidence for what is implemented; they do not silently weaken an acceptance criterion. If the implementation and this document disagree, the affected gate is blocked until both are reconciled.</p>
 <p>Use the remaining documentation in this order:</p>
 <ol>
-<li><a href="agents-and-live-execution.html">Agents &amp; Live Execution</a>,</li>
+<li><a href="agents-and-live-execution.html">Agents &amp; Live Execution</a> and <code>deploy/proving-ground/README.md</code> define current operator procedures. <a href="orchestration.html">Multi-Step Orchestration</a> documents the disabled per-step live-apply boundary and future compensation groundwork; it is not an enabled operator procedure in this release.</li>
+<li>Files under <code>docs/design/</code> and goal-session trackers are historical design records. They do not override implemented behavior or this acceptance gate.</li>
 </ol>
-<p>   <a href="orchestration.html">Multi-Step Orchestration</a>, and    <code>deploy/proving-ground/README.md</code> define operator procedures.</p>
-<ol>
-<li>Files under <code>docs/design/</code> and goal-session trackers are historical design</li>
-</ol>
-<p>   records. They do not override implemented behavior or this acceptance gate.</p>
 <p>The first live test is one <strong>single-job Linux server deployment</strong>. Do not set <code>deployment_profile=managed-onboarding</code>; multi-step orchestration, Windows, Ansible, production targets, provider API adapters, high availability, and performance testing are outside this acceptance scope.</p>
 <h2 id="required-roles-and-target">Required roles and target</h2>
 <table><thead><tr><th>Item</th><th>Requirement</th></tr></thead><tbody>
@@ -144,38 +153,16 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="tool-and-provider-prerequisites">Tool and provider prerequisites</h2>
 <p>Before Gate 1, require all of the following on the operator/agent host:</p>
 <ul>
-<li>Rust stable with Cargo, rustfmt, and Clippy. <code>cargo-leptos</code> and the</li>
-</ul>
-<p>  <code>wasm32-unknown-unknown</code> target are required only for a direct host portal   build, not for the repository gates or the Compose portal image;</p>
-<ul>
+<li>Rust stable with Cargo, rustfmt, and Clippy. <code>cargo-leptos</code> and the <code>wasm32-unknown-unknown</code> target are required only for a direct host portal build, not for the repository gates or the Compose portal image;</li>
 <li>Bash, Docker with Compose v2, Terraform, <code>curl</code>, <code>jq</code>, and <code>shasum</code>;</li>
-<li>outbound access to the Terraform registry for the exact, checksum-locked</li>
+<li>outbound access to the Terraform registry for the exact, checksum-locked <code>vmware/vsphere</code> 2.16.1 provider embedded in both server bundles;</li>
+<li>a vSphere 8.x or 9.x target, matching the provider release's documented support matrix. A vSphere 7.x target blocks this revision; select and lock a reviewed compatible provider in source, then rerun Gate 1 instead of overriding the dependency lock;</li>
+<li>a trusted TLS chain for vCenter. The bundled provider sets <code>allow_unverified_ssl=false</code>; do not bypass certificate verification;</li>
+<li>a least-privilege vSphere account that can read the selected inventory and clone, configure, power, and delete a VM only in the approved disposable target;</li>
+<li>an isolated approved test port group and a generalized clone-safe template: no retained static IP, hostname, or machine identity; DHCP/cloud-init or an equivalent first-boot identity mechanism must prevent a network conflict;</li>
+<li>synchronized UTC time on the host running the agent and the control plane. Record the time source and prove absolute skew from a trusted source is at most five seconds immediately before live mode is enabled;</li>
+<li>enough local disk to preserve the control-plane volumes, agent identity, Terraform state, and value-free evidence until cleanup is accepted.</li>
 </ul>
-<p>  <code>vmware/vsphere</code> 2.16.1 provider embedded in both server bundles;</p>
-<ul>
-<li>a vSphere 8.x or 9.x target, matching the provider release's documented</li>
-</ul>
-<p>  support matrix. A vSphere 7.x target blocks this revision; select and lock a   reviewed compatible provider in source, then rerun Gate 1 instead of   overriding the dependency lock;</p>
-<ul>
-<li>a trusted TLS chain for vCenter. The bundled provider sets</li>
-</ul>
-<p>  <code>allow_unverified_ssl=false</code>; do not bypass certificate verification;</p>
-<ul>
-<li>a least-privilege vSphere account that can read the selected inventory and</li>
-</ul>
-<p>  clone, configure, power, and delete a VM only in the approved disposable   target;</p>
-<ul>
-<li>an isolated approved test port group and a generalized clone-safe template:</li>
-</ul>
-<p>  no retained static IP, hostname, or machine identity; DHCP/cloud-init or an   equivalent first-boot identity mechanism must prevent a network conflict;</p>
-<ul>
-<li>synchronized UTC time on the host running the agent and the control plane.</li>
-</ul>
-<p>  Record the time source and prove absolute skew from a trusted source is at   most five seconds immediately before live mode is enabled;</p>
-<ul>
-<li>enough local disk to preserve the control-plane volumes, agent identity,</li>
-</ul>
-<p>  Terraform state, and value-free evidence until cleanup is accepted.</p>
 <p>Record the tool versions, vCenter major version, exact provider version, and approved vSphere privilege scope. A missing tool, unsupported vCenter, registry path, trusted CA, or delete privilege blocks the live gate.</p>
 <h2 id="request-contract">Request contract</h2>
 <p>Prepare four distinct requests and record their IDs with these exact operator labels:</p>
@@ -203,39 +190,42 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <tr><td><code>fields.disk_size_gb</code></td><td>Decimal digits encoded as a JSON string; the resulting positive integer must not shrink the template disk.</td></tr>
 </tbody></table>
 <p>VM and placement values must not contain control characters or <code>://</code>; the safe Plan Review intentionally refuses values it cannot project without ambiguity. Every value inside the <code>fields</code> object is encoded as a JSON string, including <code>disk_size_gb</code> (for example, <code>"disk_size_gb": "80"</code>). The top-level <code>cpu</code> and <code>memory_gb</code> values remain JSON numbers. Placement values and Ryuki's requester, approver, agent, request, and job IDs are non-secret test evidence. Credentials, raw-provider tenant or object IDs, private addresses, and raw provider payloads never belong in the request, audit notes, screenshots, or committed test evidence.</p>
-<p>Before Gate 1, initialize one operator shell with the repository paths and exact approved inputs below, and keep that shell through Gate 6. After Gate 2, write each local login response's <code>session_id</code> to the matching mode-<code>0600</code> header file; unsafe API methods require <code>X-Ryuki-Session-Id</code> and reject cookie-only authorization. Session IDs are credentials: never print or commit them. Assign each <code>*_REQUEST_ID</code> immediately after that request is created in its stated gate.</p>
+<p>Before Gate 1, initialize one operator shell with the repository paths and exact approved inputs below, and keep that shell through Gate 6. After Gate 2, write each local login response's <code>session_token</code> to the matching mode-<code>0600</code> header file; unsafe API methods require <code>X-Ryuki-Session-Id</code> and reject cookie-only authorization. Session tokens are credentials: never print or commit them. Administrative session UUIDs are management metadata and cannot authenticate. Assign each <code>*_REQUEST_ID</code> immediately after that request is created in its stated gate.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">BASE=http://127.0.0.1:18081</span>
 <span class="hl-cmd">umask</span> 077
 <span class="hl-cmd">REPO_ROOT=</span>$(git rev-parse <span class="hl-f">--show-toplevel)</span>
 <span class="hl-cmd">PROVING_GROUND_DIR=</span><span class="hl-s">"$REPO_ROOT/deploy/proving-ground"</span>
 <span class="hl-cmd">TEST_REVISION=</span>$(git <span class="hl-f">-C</span> <span class="hl-s">"$REPO_ROOT"</span> rev-parse HEAD)
 <span class="hl-cmd">AUTH_DIR=</span>$(mktemp <span class="hl-f">-d</span> <span class="hl-s">"${TMPDIR:-/tmp}/ryuki-first-test.XXXXXX"</span>)
+<span class="hl-cmd">AUTH_DIR=</span>$(cd <span class="hl-s">"$AUTH_DIR"</span> &amp;&amp; <span class="hl-cmd">pwd</span> <span class="hl-f">-P)</span>
 <span class="hl-cmd">REQUESTER_HEADERS=</span><span class="hl-s">"$AUTH_DIR/requester.headers"</span>
 <span class="hl-cmd">ADMIN_HEADERS=</span><span class="hl-s">"$AUTH_DIR/admin.headers"</span>
 
 <span class="hl-cmd">login_local()</span> {
   <span class="hl-cmd">local</span> username=<span class="hl-v">$1</span>
   <span class="hl-cmd">local</span> header_file=<span class="hl-v">$2</span>
-  <span class="hl-cmd">local</span> password login session_id
+  <span class="hl-cmd">local</span> password login session_token
   <span class="hl-cmd">printf</span> <span class="hl-s">'%s password: '</span> <span class="hl-s">"$username"</span> &gt;&amp;2
   <span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> password &lt;/dev/tty
   <span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
   <span class="hl-cmd">login=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$password"</span> | <span class="hl-cmd">\</span>
     <span class="hl-cmd">jq</span> <span class="hl-f">-Rs</span> <span class="hl-f">--arg</span> username <span class="hl-s">"$username"</span> <span class="hl-s">'{username: $username, password: .}'</span> | <span class="hl-cmd">\</span>
-    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/login"</span> \
+    <span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> \
+      <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/login"</span> \
       <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
   <span class="hl-cmd">unset</span> password
-  <span class="hl-cmd">session_id=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+  <span class="hl-cmd">session_token=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_token'</span>)
   <span class="hl-cmd">unset</span> login
-  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_id"</span> &gt; <span class="hl-s">"$header_file"</span>
-  <span class="hl-cmd">unset</span> session_id
+  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_token"</span> &gt; <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">unset</span> session_token
 <span class="hl-cmd">}</span>
 
 <span class="hl-cmd">logout_local()</span> {
   <span class="hl-cmd">local</span> header_file=<span class="hl-v">$1</span>
   <span class="hl-cmd">local</span> logout_status=0
   <span class="hl-cmd">if</span> test <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>; <span class="hl-cmd">then</span>
-    <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/logout"</span> \
+    <span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> \
+      <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/logout"</span> \
       <span class="hl-cmd">-H</span> <span class="hl-s">"@$header_file"</span> &gt;/dev/null || <span class="hl-cmd">logout_status=</span>$?
     <span class="hl-cmd">rm</span> <span class="hl-f">-f</span> <span class="hl-s">"$header_file"</span>
   <span class="hl-cmd">fi</span>
@@ -318,68 +308,36 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <span class="hl-cmd">docker</span> compose <span class="hl-f">-f</span> ../compose/compose.yaml build platform-api portal-ui
 <span class="hl-cmd">docker</span> compose down
 <span class="hl-cmd">docker</span> compose up <span class="hl-f">-d</span> <span class="hl-f">--wait</span> <span class="hl-f">--force-recreate</span>
-<span class="hl-cmd">curl</span> <span class="hl-f">--fail</span> http://localhost:18081/ready
+<span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> http://127.0.0.1:18081/ready
 <span class="hl-cmd">docker</span> image inspect ryuki/platform-api:rust-dev ryuki/portal-ui:rust-dev \
   <span class="hl-cmd">--format</span> <span class="hl-s">'{{.Id}}'</span></code></pre>
 <p>Acceptance requires:</p>
 <ul>
 <li><code>.env</code> contains distinct requester and admin accounts.</li>
 <li><code>PG_AGENT_PLATFORM</code> is exactly <code>DEFRA</code>.</li>
-<li>the active backend state-location attribute contains <code>{STATE_KEY}</code>; a comment or</li>
-</ul>
-<p>  unrelated attribute does not satisfy the validator.</p>
-<ul>
-<li>no database, Vault, or local-account placeholder remains. Provider</li>
-</ul>
-<p>  credentials may stay empty until the live gate.</p>
-<ul>
+<li>the active backend state-location attribute contains <code>{STATE_KEY}</code>; a comment or unrelated attribute does not satisfy the validator.</li>
+<li>no database, Vault, or local-account placeholder remains. Provider credentials may stay empty until the live gate.</li>
 <li><code>/ready</code> succeeds; <code>/health</code> alone is not sufficient.</li>
-<li>API and portal images were rebuilt from <code>TEST_REVISION</code>, force-recreated, and</li>
-</ul>
-<p>  their image IDs were recorded; a previously built <code>rust-dev</code> image is not   acceptance evidence.</p>
-<ul>
-<li>the agent self-registers once, persists its token, exits pending approval,</li>
-</ul>
-<p>  and enters its poll loop only after the admin approves it;</p>
-<ul>
-<li>control plane and agent negotiate protocol v2. Missing or v1 protocol headers</li>
-</ul>
-<p>  are rejected rather than treated as compatible. Record the approved agent's   startup log entry <code>CP wire protocol is compatible</code> with both   <code>cp_protocol_version=2</code> and <code>agent_protocol_version=2</code>; the protocol rejection   tests in Gate 1 are the evidence for missing/v1 fail-closed behavior.</p>
-<ul>
-<li>direct vSphere inventory inspection proves all four recorded VM names are</li>
-</ul>
-<p>  absent from the approved target folder/placement before any LivePlan;</p>
-<ul>
+<li>API and portal images were rebuilt from <code>TEST_REVISION</code>, force-recreated, and their image IDs were recorded; a previously built <code>rust-dev</code> image is not acceptance evidence.</li>
+<li>before the agent starts, the operator records the preprovisioned Ed25519 public-key fingerprint, creates a short-lived challenge for that exact agent id/platform/key through the admin API, and invokes <code>run-agent.sh --stage-enrollment</code> with a temporary mode-<code>0600</code> administrator session header outside the repository. The response is held only in the private gitignored agent-state directory until consumption; neither challenge field is stored in <code>.env</code>. The plaintext challenge is not recorded in test evidence;</li>
+<li>the agent proves possession of that key, consumes the challenge exactly once, persists its token, exits pending approval, and enters its poll loop only after the admin verifies <code>cryptographically_admitted: true</code> and approves the matching fingerprint and platform;</li>
+<li>control plane and agent negotiate protocol v6. Missing and v1-v5 protocol headers are rejected rather than treated as compatible. Record the approved agent's startup log entry <code>CP wire protocol is compatible</code> with both <code>cp_protocol_version=6</code> and <code>agent_protocol_version=6</code>; the protocol rejection tests in Gate 1 are the evidence for older-version fail-closed behavior and for rejection of legacy live grants without exact destination, planning-agent enrollment/key, reviewed execution-profile, and exact plan-row bindings.</li>
+<li>direct vSphere inventory inspection proves all four recorded VM names are absent from the approved target folder/placement before any LivePlan;</li>
 <li>the host/control-plane clock evidence satisfies the five-second skew bound.</li>
 </ul>
 <p>For API-driven steps, run <code>login_local requester "$REQUESTER_HEADERS"</code> before each requester create and <code>logout_local "$REQUESTER_HEADERS"</code> immediately after recording the request ID. Run <code>login_local admin "$ADMIN_HEADERS"</code> for post-create actions and <code>logout_local "$ADMIN_HEADERS"</code> before returning to the requester. Re-login after each handoff. Removing a header file without calling logout does not revoke its server-side session. Portal-driven steps require the equivalent explicit sign-out/sign-in handoff.</p>
-<h2 id="gate-3-offline-rehearsal">Gate 3: offline rehearsal</h2>
+<h2 id="gate-3-platform-no-spawn-rehearsal">Gate 3: platform no-spawn rehearsal</h2>
 <p>Keep live mode disabled for this entire gate.</p>
 <ol>
-<li>Sign in as the requester and create the dry-run request using the complete</li>
+<li>Sign in as the requester and create the dry-run request using the complete request contract above. Record its <code>intake</code> status and request ID, then sign out.</li>
+<li>Sign in as the admin. Run <code>validate</code> and <code>plan</code>. The observable request statuses become <code>validated</code>, then <code>planned</code>.</li>
+<li>Review the plan, approve the request, and lock it. The statuses become <code>approved</code>, then <code>locked</code>.</li>
+<li>Exercise enrollment, polling, protocol-v6 negotiation, result signing, and evidence handling only through pure/stub tests that do not spawn Terraform or Ansible. Preserve their value-free evidence.</li>
+<li>Confirm the production runner reports the missing sealed containment capability before process creation for every external mode, including <code>OfflineDryRun</code>. This is expected fail-closed evidence, not a successful dry-run result. Keep the governed request locked for the future containment acceptance wave rather than claiming it reached <code>verifying</code> or <code>completed</code>.</li>
 </ol>
-<p>   request contract above. Record its <code>intake</code> status and request ID, then sign    out.</p>
-<ol>
-<li>Sign in as the admin. Run <code>validate</code> and <code>plan</code>. The observable request</li>
-</ol>
-<p>   statuses become <code>validated</code>, then <code>planned</code>.</p>
-<ol>
-<li>Review the plan, approve the request, and lock it. The statuses become</li>
-</ol>
-<p>   <code>approved</code>, then <code>locked</code>.</p>
-<ol>
-<li>As the same admin, dispatch the default <code>OfflineDryRun</code>. The request becomes</li>
-</ol>
-<p>   <code>executing</code>.</p>
-<ol>
-<li>Wait for the signed agent result. Do not call <code>verify</code> while the request is</li>
-</ol>
-<p>   still <code>executing</code>. A successful result moves it to <code>verifying</code>.</p>
-<ol>
-<li>Run <code>verify</code> and require <code>completed</code>.</li>
-</ol>
-<p>Pass only when the audit trail attributes creation and approval to different principals, the job result signature is accepted, evidence is redacted, and no provider resource or Terraform state was created.</p>
-<p>As the fail-closed check, create and record the separate <code>LIVE_REFUSAL_REQUEST_ID</code> as the requester. As the admin, govern it through lock, then dispatch <code>LivePlan</code> while live mode is still disabled. Require a signed refusal, a terminal failed request, and no provider or state mutation. <code>LiveApply</code> cannot be approved without a successful plan and <code>LiveDestroy</code> is not an operator action, so <code>LivePlan</code> is the refusal directly testable here. Do not reuse either Gate 3 request in the live gates.</p>
+<p>Pass the current milestone only when the audit trail attributes creation and approval to different principals, the v6 enrollment/signing/evidence seams are exercised without an external child, and no provider resource or Terraform state was created.</p>
+<p>After the reviewed containment adapter exists, extend this gate with the external <code>OfflineDryRun</code>: dispatch it, wait for the signed successful result, require the request to move from <code>executing</code> to <code>verifying</code>, then run <code>verify</code> and require <code>completed</code>. Only that future wave may claim successful Terraform or Ansible dry-run evidence. It must still prove redaction and that no provider resource or state was created.</p>
+<p>Preserve a separate governed request for future live-refusal and containment acceptance. <code>LivePlan</code> with live mode disabled must eventually produce a signed refusal with no external spawn, but do not treat a pure/stub assertion as a deployed-agent acceptance result. Do not reuse either Gate 3 request in the live gates.</p>
 <h2 id="gate-4-live-plan-and-state-isolation">Gate 4: live plan and state isolation</h2>
 <p>Stop the agent, set <code>PG_AGENT_ALLOW_LIVE=true</code>, fill the three vSphere credential values, recheck the recorded revision and clean worktree, prove the five-second clock-skew bound, rerun <code>./validate.sh .env</code>, and restart the agent:</p>
 <pre><code class="lang-bash"><span class="hl-cmd">test</span> <span class="hl-s">"$(git -C "</span><span class="hl-v">$REPO_ROOT</span><span class="hl-s">" rev-parse HEAD)"</span> = <span class="hl-s">"$TEST_REVISION"</span>
@@ -402,7 +360,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 
 <span class="hl-cmd">TRUSTED_TIME_URL=https://www.cloudflare.com/</span>
 <span class="hl-cmd">HOST_TRUST_BEFORE=</span>$(date <span class="hl-f">-u</span> +%s)
-<span class="hl-cmd">TRUSTED_DATE=</span>$(curl <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sSI</span> <span class="hl-s">"$TRUSTED_TIME_URL"</span> | <span class="hl-cmd">\</span>
+<span class="hl-cmd">TRUSTED_DATE=</span>$(curl <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sSI</span> <span class="hl-s">"$TRUSTED_TIME_URL"</span> | <span class="hl-cmd">\</span>
   <span class="hl-cmd">awk</span> <span class="hl-s">'tolower($1) == "date:" { sub(/\r$/, ""); sub(/^[^:]*:[[:space:]]*/, ""); print; exit }'</span>)
 <span class="hl-cmd">HOST_TRUST_AFTER=</span>$(date <span class="hl-f">-u</span> +%s)
 <span class="hl-cmd">test</span> <span class="hl-f">-n</span> <span class="hl-s">"$TRUSTED_DATE"</span>
@@ -437,31 +395,15 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>The admin dispatches <code>LivePlan</code> and waits for its terminal job result. A successful plan leaves the request at <code>executing</code> because it is waiting for human approval; it does not advance to <code>verifying</code>. In the portal, review the Execution Job's server-derived Plan Review before approving live apply. Require all of the following:</p>
 <ul>
 <li>the job is <code>Succeeded</code>, its result is <code>planned</code>, and it has a plan digest;</li>
-<li>the Plan Review says <code>digest_verified=true</code> and reports exactly one</li>
-</ul>
-<p>  <code>virtual_machine</code> create, with zero update, delete, or replace actions;</p>
-<ul>
-<li>the plan contains no other managed resource, including a managed <code>no-op</code>;</li>
-</ul>
-<p>  read-only inventory data sources are the only additional entries allowed;</p>
-<ul>
-<li>name, CPU, memory, disk, datacenter, cluster, datastore, network, and template</li>
-</ul>
-<p>  in the Plan Review match the recorded request exactly; the control plane   derives the VM shape from the managed resource's actual <code>change.after</code> and   the placement names from the five expected data-source <code>change.after.name</code>   values, and rejects missing or mismatched values;</p>
-<ul>
+<li>the Plan Review says <code>digest_verified=true</code> and reports exactly one <code>virtual_machine</code> create, with zero update, delete, or replace actions;</li>
+<li>the plan contains no other managed resource, including a managed <code>no-op</code>; read-only inventory data sources are the only additional entries allowed;</li>
+<li>name, CPU, memory, disk, datacenter, cluster, datastore, network, and template in the Plan Review match the recorded request exactly; the control plane derives the VM shape from the managed resource's actual <code>change.after</code> and the placement names from the five expected data-source <code>change.after.name</code> values, and rejects missing or mismatched values;</li>
 <li>the Plan Review state key is <code>request-$PRIMARY_LIVE_REQUEST_ID</code>;</li>
-<li>the resolved local backend path is absolute and ends with</li>
-</ul>
-<p>  <code>agent-state/terraform-request-$PRIMARY_LIVE_REQUEST_ID.tfstate</code>;</p>
-<ul>
+<li>the resolved local backend path is absolute and ends with <code>agent-state/terraform-request-$PRIMARY_LIVE_REQUEST_ID.tfstate</code>;</li>
 <li>no generic or shared Terraform state path is used;</li>
-<li><code>agent-state/provider-context.sha256</code> exists and remains unchanged from plan</li>
+<li><code>agent-state/provider-authority.ref</code> exists and retains the same opaque, non-secret authority id/version from plan through apply and cleanup; trusted provisioning rotates that version whenever the destination, account, or any credential member changes, without recording or hashing those values;</li>
+<li>raw Terraform JSON, provider object identifiers, and credentials are absent from the portal/API projection, evidence export, screenshots, and operator-collected acceptance record. Exact digest-covered plan bytes remain restricted internal control-plane storage for re-deriving this projection.</li>
 </ul>
-<p>  through apply and cleanup, binding the vCenter endpoint/account without   recording either value;</p>
-<ul>
-<li>raw Terraform JSON, provider object identifiers, and credentials are absent</li>
-</ul>
-<p>  from the portal/API projection, evidence export, screenshots, and   operator-collected acceptance record. Exact digest-covered plan bytes remain   restricted internal control-plane storage for re-deriving this projection.</p>
 <p>The API refuses server live-apply approval when this digest-verified safe review cannot be derived. Do not substitute raw Terraform output to bypass that gate.</p>
 <p>Before any apply, rehearse the exact Gate 6 cleanup invocation by adding <code>--preflight</code>. Use <code>PRIMARY_LIVE_REQUEST_ID</code>, <code>PRIMARY_LIVE_VM_NAME</code>, and every recorded original input. The command must pass before continuing; it validates the arguments, tools, environment, backend rendering, and Terraform input file without initializing Terraform or contacting vSphere.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">cd</span> <span class="hl-s">"$PROVING_GROUND_DIR"</span>
@@ -489,41 +431,30 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
   <span class="hl-cmd">printf</span> <span class="hl-s">'absent  %s\n'</span> <span class="hl-s">"$PRIMARY_STATE"</span>
 <span class="hl-cmd">fi</span></code></pre>
 <p>Also require the second Plan Review to report <code>request-$ISOLATION_REQUEST_ID</code>; derive its corresponding different backend path from the locked local template. Conclude the isolation probe while it is still <code>executing</code>:</p>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
   <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$ISOLATION_REQUEST_ID/fail"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
   <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"First-test state-isolation probe concluded without apply"}'</span></code></pre>
 <p>From this point onward, every apply, verify, and cleanup action targets only <code>PRIMARY_LIVE_REQUEST_ID</code>; do not reuse a generic <code>REQUEST_ID</code> variable.</p>
 <h2 id="gate-5-live-apply-and-verification">Gate 5: live apply and verification</h2>
 <ol>
-<li>The admin approves live apply only after reviewing Gate 4 evidence. This</li>
+<li>The admin approves live apply only after reviewing Gate 4 evidence. This mints the control-plane-signed grant; <code>live-apply</code> is never dispatched via the generic execute endpoint. Capture its job ID for status and any required reconciliation:</li>
 </ol>
-<p>   mints the control-plane-signed grant; <code>live-apply</code> is never dispatched via    the generic execute endpoint. Capture its job ID for status and any required    reconciliation:</p>
-<p>   ``<code>bash    LIVE_APPLY=$(curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \      -X POST "$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/approve-live-apply")    APPLY_JOB_ID=$(printf '%s' "$LIVE_APPLY" | jq -er '.job_id')    </code>``</p>
-<ol>
-<li>Wait for the latest <code>LiveApply</code> job to finish. During plan review and apply,</li>
+<p>``<code>bash LIVE_APPLY=$(curl --disable --fail-with-body -sS --noproxy '*' \ -H "@$ADMIN_HEADERS" \ -X POST "$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/approve-live-apply") APPLY_JOB_ID=$(printf '%s' "$LIVE_APPLY" | jq -er '.job_id') </code>``</p>
+<ol start="2">
+<li>Wait for the latest <code>LiveApply</code> job to finish. During plan review and apply, the request remains <code>executing</code>; only an accepted apply result advances it to <code>verifying</code>.</li>
+<li>Require a <code>Succeeded</code> job with result <code>verified</code>, a matching approved-plan digest, an exact job-spec/grant binding, a successful Terraform apply summary, and a clean post-apply re-plan.</li>
+<li>Inspect vSphere directly. Confirm exactly one VM exists with the recorded placement and sizing.</li>
+<li>Run request verification only after the converged apply job and provider check pass. The API rejects plan-only, unbound, inconclusive, and drifted live executions even if a stale client offers the action. Require final request status <code>completed</code> and a sealed, redacted evidence pack.</li>
 </ol>
-<p>   the request remains <code>executing</code>; only an accepted apply result advances it to    <code>verifying</code>.</p>
-<ol>
-<li>Require a <code>Succeeded</code> job with result <code>verified</code>, a matching approved-plan</li>
-</ol>
-<p>   digest, an exact job-spec/grant binding, a successful Terraform apply    summary, and a clean post-apply re-plan.</p>
-<ol>
-<li>Inspect vSphere directly. Confirm exactly one VM exists with the recorded</li>
-</ol>
-<p>   placement and sizing.</p>
-<ol>
-<li>Run request verification only after the converged apply job and provider</li>
-</ol>
-<p>   check pass. The API rejects plan-only, unbound, inconclusive, and drifted    live executions even if a stale client offers the action.    Require final request status <code>completed</code> and a sealed, redacted evidence    pack.</p>
 <p>After every <code>LiveApply</code> attempt, successful or not, record both the isolated Terraform-state disposition and a direct vSphere disposition. Any plan drift, expired or invalid grant, missing credential, digest mismatch, unexpected provider object, or uncertain disposition is a hard stop. Do not retry live apply on the same request.</p>
 <p>If the job is <code>ReconcileRequired</code>, inspect the isolated state and vSphere out of band before resolving it. When the state contains the expected VM resource, use the guarded Gate 6 destroy procedure. When the state is absent or mismatched but vSphere contains an object, do not force this script against unrelated state; use a separately approved provider-recovery procedure and retain only value-free evidence. After the provider and state dispositions are known, the admin resolves the job with a non-sensitive reason:</p>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
   <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/admin/agents/jobs/$APPLY_JOB_ID/reconcile"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
   <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"Provider and isolated state reconciled under the approved recovery record"}'</span></code></pre>
 <p>That moves the job to <code>Failed</code> but deliberately leaves the parent request at <code>executing</code>. Conclude it separately:</p>
-<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
+<pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--disable</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">--noproxy</span> <span class="hl-s">'*'</span> <span class="hl-f">-H</span> <span class="hl-s">"@$ADMIN_HEADERS"</span> \
   <span class="hl-cmd">-X</span> POST <span class="hl-s">"$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/fail"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> \
   <span class="hl-cmd">-d</span> <span class="hl-s">'{"reason":"Live apply did not complete with a provable successful disposition"}'</span></code></pre>
@@ -553,13 +484,9 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <ul>
 <li>Terraform reports no managed resources in the isolated state;</li>
 <li>direct vSphere inspection confirms the VM is absent;</li>
-<li>after direct vSphere inspection, the value-free cleanup record under</li>
+<li>after direct vSphere inspection, the value-free cleanup record under <code>agent-state/</code> contains <code>provider_verification=absent</code>, a nonempty <code>provider_verified_by</code>, and an RFC 3339 UTC <code>provider_verified_at</code>;</li>
+<li>the control-plane database and <code>agent-state/</code> remain available until the result is reviewed.</li>
 </ul>
-<p>  <code>agent-state/</code> contains <code>provider_verification=absent</code>, a nonempty   <code>provider_verified_by</code>, and an RFC 3339 UTC <code>provider_verified_at</code>;</p>
-<ul>
-<li>the control-plane database and <code>agent-state/</code> remain available until the</li>
-</ul>
-<p>  result is reviewed.</p>
 <p>Only then may the operator reset Compose volumes or remove <code>agent-state/</code>. <code>docker compose down -v</code> does not destroy provider resources.</p>
 <p>If the guarded destroy command or either absence check fails, mark the live test <code>FAIL</code> and stop. Preserve the database, <code>agent-state/</code>, cleanup output, and provider object. Inspect state and vSphere, then use a separately approved recovery procedure; never reset volumes, delete state, or blindly rerun destroy.</p>
 <h2 id="result-and-evidence">Result and evidence</h2>

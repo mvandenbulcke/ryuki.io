@@ -8,33 +8,81 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: ["main"]
-  workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Deny by default. Only the deploy job receives the Pages/OIDC permissions it
+# needs after the triggering CI run is proven to be a trusted push to main.
+permissions: {}
 
 concurrency:
   group: "pages"
   cancel-in-progress: false
 
 jobs:
+  # Validate every independent provenance field before the job that owns Pages
+  # and OIDC write authority can start. Missing/null fields and non-commit SHAs
+  # fail here; they never fall back to github.ref or another moving ref.
+  validate-run:
+    name: Validate Trusted CI Run
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      head_sha: ${{ steps.event.outputs.head_sha }}
+    steps:
+      - name: Validate workflow_run event and commit SHA
+        id: event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          PARENT_EVENT: ${{ github.event.workflow_run.event }}
+          PARENT_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          [[ "${EVENT_NAME}" == "workflow_run" ]] || \
+            fail "Pages promotion requires a workflow_run event"
+          [[ "${CONCLUSION}" == "success" ]] || \
+            fail "Pages promotion requires a successful parent run"
+          [[ "${PARENT_EVENT}" == "push" ]] || \
+            fail "Pages promotion requires a parent push event"
+          [[ "${PARENT_WORKFLOW_PATH}" == ".github/workflows/ci.yml" ]] || \
+            fail "Pages promotion requires the governed CI workflow file"
+          [[ "${HEAD_BRANCH}" == "main" ]] || \
+            fail "Pages promotion requires the main branch"
+          [[ "${HEAD_REPOSITORY}" == "${REPOSITORY}" ]] || \
+            fail "Pages promotion requires a same-repository parent run"
+          [[ "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]] || \
+            fail "Pages promotion requires a full lowercase commit SHA"
+          printf 'head_sha=%s\n' "${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+
   deploy:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    needs: validate-run
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          # Deploy exactly the tree CI validated, not whatever main moved to
-          # since. Manual dispatch falls back to the current ref.
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          # Deploy exactly the trusted push tree CI validated, not whatever
+          # main moved to since.
+          ref: ${{ needs.validate-run.outputs.head_sha }}
+          persist-credentials: false
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       # docs/ doubles as the repo's internal documentation tree (design notes,
       # workflow specs, runbooks) that the validator depends on in place.
       # Only the curated site files below are published; everything else in
@@ -51,9 +99,9 @@ jobs:
           cp docs/openapi.json _site/
           cp -R docs/assets _site/assets
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: './_site'
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

@@ -3,6 +3,8 @@
 //! Executes `ansible-playbook --check` in an isolated workspace.
 //!
 //! # Security invariants
+//! - The top-level Ansible CLI is an approved absolute canonical executable;
+//!   inherited `PATH` is never used to select it.
 //! - All child `Command`s call `.env_clear()` and then re-inject only a minimal
 //!   allowlist: PATH, HOME, TMPDIR, LANG, LC_ALL (if present in the parent).
 //!   This prevents platform secrets (RYUKI_*, RYUKI_DATABASE_*, vault tokens,
@@ -29,7 +31,8 @@ use ryuki_engine::runners::{
 };
 
 use super::{
-    exec::run_command_with_timeout,
+    exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
+    executable::{ApprovedExecutable, ApprovedTool},
     scrub::scrub_output,
     terraform::{
         credential_components, pin_home_tmpdir_to_workspace, validate_offering_slug,
@@ -43,8 +46,16 @@ use super::{
 /// A hung ansible (e.g. waiting for an unreachable host) is killed after this.
 const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Default binary name; overridable for tests via `AnsibleRunner::with_binary`.
-const DEFAULT_BINARY: &str = "ansible-playbook";
+/// Preserve authoritative terminal supervisor outcomes while adding Ansible
+/// phase context to ordinary setup failures.
+fn ansible_check_error(error: RunnerError) -> RunnerError {
+    match error {
+        terminal @ (RunnerError::Timeout
+        | RunnerError::Cancelled
+        | RunnerError::OutputLimitExceeded { .. }) => terminal,
+        other => RunnerError::Spawn(format!("ansible-playbook --check: {other}")),
+    }
+}
 
 /// Variable name prefixes that are specifically blocked for Ansible in addition
 /// to the shared BLOCKED_PREFIXES in terraform.rs.
@@ -52,25 +63,20 @@ const ANSIBLE_BLOCKED_PREFIXES: &[&str] = &["ANSIBLE_"];
 
 /// Runner for Ansible. Dry-run (--check) only in Slice 1.
 ///
-/// # Binary injection
-/// Use `AnsibleRunner::with_binary("/path/to/fake-ansible-playbook")` in tests.
+/// # Executable approval
+/// Production runs require `RYUKI_ANSIBLE_PLAYBOOK_EXECUTABLE` and
+/// `RYUKI_ANSIBLE_PLAYBOOK_EXPECTED_VERSION`. The configured CLI is admitted
+/// through the shared approved-executable boundary before command construction.
 ///
 /// # IaC embedding
 /// Use `AnsibleRunner::with_iac(files)` to embed static playbook content that is
 /// written into the workspace before `ansible-playbook --check` is invoked.
 /// This mirrors the `TerraformRunner::with_iac` pattern.
+#[derive(Default)]
 pub struct AnsibleRunner {
-    binary: String,
+    executable: Option<ApprovedExecutable>,
     iac_files: Vec<(&'static str, &'static str)>,
-}
-
-impl Default for AnsibleRunner {
-    fn default() -> Self {
-        Self {
-            binary: DEFAULT_BINARY.to_string(),
-            iac_files: Vec::new(),
-        }
-    }
+    cancellation: Option<CommandCancellation>,
 }
 
 impl AnsibleRunner {
@@ -78,11 +84,15 @@ impl AnsibleRunner {
         Self::default()
     }
 
-    /// Create a runner pointing at a custom binary path (for tests / injection).
+    /// Create a runner pointing at a test shim without requiring a real
+    /// Ansible installation. This bypass is absent from production builds.
+    #[cfg(test)]
     pub fn with_binary(binary: impl Into<String>) -> Self {
+        let binary: String = binary.into();
         Self {
-            binary: binary.into(),
+            executable: Some(ApprovedExecutable::for_test(binary)),
             iac_files: Vec::new(),
+            cancellation: None,
         }
     }
 
@@ -95,6 +105,30 @@ impl AnsibleRunner {
     pub fn with_iac(mut self, files: Vec<(&'static str, &'static str)>) -> Self {
         self.iac_files = files;
         self
+    }
+
+    /// Attach one cancellation signal to the entire logical run, including
+    /// the version probe and the actual `--check` subprocess.
+    pub fn with_cancellation(mut self, cancellation: &CommandCancellation) -> Self {
+        self.cancellation = Some(cancellation.clone());
+        self
+    }
+
+    fn approved_executable(&self) -> Result<ApprovedExecutable, RunnerError> {
+        match &self.executable {
+            Some(executable) => Ok(executable.clone()),
+            None => ApprovedExecutable::configured(
+                ApprovedTool::AnsiblePlaybook,
+                self.cancellation.as_ref(),
+            ),
+        }
+    }
+
+    fn probe_available(&self, executable: &ApprovedExecutable) -> Result<bool, RunnerError> {
+        let mut cmd = Command::new(executable.path());
+        apply_env_allowlist(&mut cmd);
+        cmd.arg("--version");
+        run_version_probe(cmd, self.cancellation.as_ref())
     }
 }
 
@@ -209,16 +243,8 @@ fn extract_ansible_summary(log: &str) -> String {
 
 impl Runner for AnsibleRunner {
     fn available(&self) -> bool {
-        // env_clear() + allowlist: prevent parent secrets from reaching the probe.
-        let mut cmd = Command::new(&self.binary);
-        apply_env_allowlist(&mut cmd);
-        cmd.arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Retry on transient ETXTBSY: a test probe may exec a just-written shim
-        // that a concurrent fork() briefly holds a write fd to (see exec.rs).
-        crate::exec::retry_on_etxtbsy(|| cmd.status())
-            .map(|s| s.success())
+        self.approved_executable()
+            .and_then(|executable| self.probe_available(&executable))
             .unwrap_or(false)
     }
 
@@ -243,19 +269,41 @@ impl Runner for AnsibleRunner {
             validate_ansible_var_name(name)?;
         }
 
+        // Establish executable provenance before credential material is even
+        // split or written and before any credential-bearing Command exists.
+        let executable = match self.approved_executable() {
+            Ok(executable) => executable,
+            Err(error) => {
+                if matches!(&error, RunnerError::Cancelled) {
+                    return Err(error);
+                }
+                return Ok(RunOutcome {
+                    runner_kind: RunnerKind::Ansible,
+                    mode: plan.mode,
+                    status: RunStatus::RunnerUnavailable,
+                    summary:
+                        "runner unavailable: configured ansible-playbook executable was not approved"
+                            .to_string(),
+                    log: String::new(),
+                    exit_code: None,
+                    post_apply: None,
+                });
+            }
+        };
+
         // Build per-component secret values for scrubbing.
         let components: Vec<Vec<u8>> = credential_components(creds.material.as_slice());
         let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
         // --- Binary availability check ---
-        if !self.available() {
+        if !self.probe_available(&executable)? {
             return Ok(RunOutcome {
                 runner_kind: RunnerKind::Ansible,
                 mode: plan.mode,
                 status: RunStatus::RunnerUnavailable,
                 summary: format!(
-                    "runner unavailable: ansible-playbook binary not found at '{}'",
-                    self.binary
+                    "runner unavailable: ansible-playbook binary not found at {:?}",
+                    executable.path()
                 ),
                 log: String::new(),
                 exit_code: None,
@@ -306,7 +354,7 @@ impl Runner for AnsibleRunner {
         // --- Build command ---
         // NEVER pass: -vvv (verbose), --vault-password-file with secret on argv.
         // env_clear() + allowlist applied; then explicit Ansible control vars added.
-        let mut cmd = Command::new(&self.binary);
+        let mut cmd = Command::new(executable.path());
         apply_env_allowlist(&mut cmd);
         // Pin HOME and TMPDIR to the workspace so ansible cannot write to
         // the real $HOME (e.g. ~/.ansible/tmp). Also set ANSIBLE_LOCAL_TEMP
@@ -337,10 +385,9 @@ impl Runner for AnsibleRunner {
 
         // Execute with bounded timeout. A hung ansible (unreachable host, etc.)
         // is killed and returns Err(RunnerError::Timeout) to the caller.
-        let output = run_command_with_timeout(cmd, RUNNER_TIMEOUT).map_err(|e| match e {
-            RunnerError::Timeout => RunnerError::Timeout,
-            other => RunnerError::Spawn(format!("ansible-playbook --check: {other}")),
-        })?;
+        let output =
+            run_command_with_optional_cancellation(cmd, RUNNER_TIMEOUT, self.cancellation.as_ref())
+                .map_err(ansible_check_error)?;
 
         let raw = combine_output(&output.stdout, &output.stderr);
         let scrubbed_log = scrub_output(&raw, &secret_refs);
@@ -473,6 +520,73 @@ mod tests {
         assert_eq!(outcome.mode, RunMode::DryRun);
         // Echo exits 0 → CheckOk.
         assert_eq!(outcome.status, RunStatus::CheckOk);
+    }
+
+    #[test]
+    fn check_cancellation_preserves_exact_terminal_variant() {
+        let ws = Workspace::new().expect("workspace");
+        let started = ws.path().join("ansible-check-started");
+        let shim = ws.path().join("cancellable-ansible");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\ntouch '{}'\nsleep 30\n",
+            started.display()
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let cancellation = CommandCancellation::new();
+        let runner =
+            AnsibleRunner::with_binary(shim.to_string_lossy()).with_cancellation(&cancellation);
+        let worker =
+            std::thread::spawn(move || runner.run_dry(&make_plan_dryrun(), &fake_creds("")));
+        assert!(
+            (0..500).any(|_| {
+                if started.exists() {
+                    true
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    false
+                }
+            }),
+            "fake Ansible check must start"
+        );
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("runner thread must not panic")
+            .expect_err("cancelled Ansible check must be terminal");
+        assert_eq!(error, RunnerError::Cancelled);
+    }
+
+    #[test]
+    fn check_capture_overflow_preserves_exact_terminal_variant() {
+        let ws = Workspace::new().expect("workspace");
+        let shim = ws.path().join("overflowing-ansible-check");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nyes x | head -c {}\n",
+            crate::exec::MAX_CAPTURE_BYTES_PER_STREAM + 1
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let error = AnsibleRunner::with_binary(shim.to_string_lossy())
+            .run_dry(&make_plan_dryrun(), &fake_creds(""))
+            .expect_err("oversized Ansible check output must be terminal");
+        assert!(matches!(
+            error,
+            RunnerError::OutputLimitExceeded { ref scope, limit }
+                if scope == "stdout" && limit == crate::exec::MAX_CAPTURE_BYTES_PER_STREAM
+        ));
     }
 
     // --- SECRET SCRUB ---

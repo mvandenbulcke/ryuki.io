@@ -50,6 +50,10 @@ const REQUIRED_INPUTS: &[&str] = &[
 const REQUIRED_GUARDS: &[&str] = &[
     "request-context-known",
     "service-account-scope-summarized",
+    "canonical-name-site-owner-bound",
+    "longest-governed-site-suffix-resolved",
+    "namespace-provenance-verified",
+    "current-owner-site-active",
     "kds-root-key-readiness-reviewed",
     "retrieval-scope-reviewed",
     "kerberos-policy-reviewed",
@@ -82,6 +86,9 @@ const REQUIRED_BLOCKED_REASONS: &[&str] = &[
     "gmsa-assignment-disabled",
     "gmsa-validation-disabled",
     "gmsa-retire-disabled",
+    "unverified-namespace-provenance",
+    "inactive-owner-site",
+    "old-replica-drain-required",
     "password-retrieval-disabled",
     "managed-password-material-disabled",
     "spn-change-disabled",
@@ -238,10 +245,22 @@ const REQUIRED_RULE_DETAILS: &[RuleDetail] = &[
         evidence: "gMSA lifecycle review summary",
     },
     RuleDetail {
+        id: "directory-namespace-owner-required",
+        decision: "block",
+        requirement: "A platform-state gMSA create must resolve the longest governed site suffix from the canonical lowercase global name, require that owner site to be active and authorized, and persist directory-namespace-v1 provenance before the unique-name claim. Site-code registration and namespace-changing account writes serialize on one persistence lock, governed site codes are immutable, inactive namespaces remain reserved, and unverified legacy rows remain quarantined from operational reads and writes.",
+        evidence: "Service account scope summary",
+    },
+    RuleDetail {
         id: "retrieval-scope-review-required",
         decision: "block",
         requirement: "KDS root key readiness, password retrieval scope, worker usage, Kerberos policy, SPN policy, and delegation risk must be reviewed before any gMSA lifecycle decision can be accepted.",
         evidence: "Password retrieval scope review",
+    },
+    RuleDetail {
+        id: "inactive-directory-owner-fails-closed",
+        decision: "block",
+        requirement: "Every platform-state inventory read, lookup, host mutation, rotation, retrieval test, and expiry scan requires the persisted namespace owner site to be currently active. Deactivation gates access without rewriting the gMSA, host assignments, or lifecycle status; reactivation restores access only to already-Verified provenance, while rows quarantined during legacy backfill are never auto-promoted. Deployments must drain or fence replicas that predate the active-owner read predicates before relying on deactivation as a read boundary; database triggers independently fence stale account and host-assignment mutations.",
+        evidence: "Service account scope summary",
     },
     RuleDetail {
         id: "approval-worker-and-rollback-required",
@@ -2547,6 +2566,20 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn gmsa_test_stub() {}
+    fn current_catalog_matches_the_pinned_directory_namespace_contract() {
+        let catalog: Value = serde_yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../catalog/gmsa-lifecycle-contract.yaml"
+        )))
+        .expect("shipped gMSA lifecycle catalog must parse");
+        let mut errors = Vec::new();
+        validate_catalog_value(&catalog, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "current gMSA lifecycle catalog: {errors:?}"
+        );
+    }
 }

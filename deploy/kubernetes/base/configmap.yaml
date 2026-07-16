@@ -13,16 +13,49 @@ metadata:
     app.kubernetes.io/name: platform-api
 data:
   RYUKI_SERVER__BIND_ADDRESS: "0.0.0.0:8080"
+  # Deliberately no default authentication mode. Startup rejects the
+  # credential-free mock/static modes on this non-loopback listener; a
+  # deployment overlay must select and fully configure an admitted
+  # authenticator before the API can become ready.
   # Placeholder external URL — real host resolved by the deployment-time overlay.
   RYUKI_PLATFORM_URL: "https://platform.example.invalid"
   # Fail hard when the database is unreachable: crash-loop instead of silently
   # serving from in-memory stores. Required posture for the K8s topology.
   RYUKI_DATABASE__REQUIRED: "true"
+  # The long-running API has read-only migration-ledger authority. Schema
+  # mutation is owned exclusively by the one-shot platform-api-migrations Job.
+  RYUKI_MIGRATION_MODE: "verify-only"
+  # Vault issues a short-lived login that must SET ROLE to this non-login
+  # application group. Startup verifies current_user, session membership,
+  # DML coverage, read-only migration-ledger access, and absence of DDL.
+  RYUKI_DATABASE_EXPECTED_ROLE: "ryuki_app_runtime"
+  RYUKI_DATABASE_FORBIDDEN_ROLE: "ryuki_schema_migrator"
   # Backup retention knobs (days/weeks/months/years).
   RYUKI_RETENTION__DAILY_BACKUPS: "30"
   RYUKI_RETENTION__WEEKLY_BACKUPS: "12"
   RYUKI_RETENTION__MONTHLY_BACKUPS: "12"
   RYUKI_RETENTION__YEARLY_BACKUPS: "7"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-api-migration-config
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api-migrations
+data:
+  # Reviewed offline-DDL envelope. The runner validates these bounds before
+  # opening its dedicated one-connection pool and exits after readback.
+  RYUKI_MIGRATION_MODE: "apply-only"
+  RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS: "1800"
+  RYUKI_MIGRATION_LOCK_TIMEOUT_SECS: "60"
+  # The dynamic login must SET ROLE to the stable schema owner so every release
+  # can alter objects created by earlier short-lived Vault credentials.
+  RYUKI_MIGRATION_EXPECTED_ROLE: "ryuki_schema_migrator"
+  # The apply-only runner grants application DML after each migration wave,
+  # then revokes every write/DDL privilege on _sqlx_migrations.
+  RYUKI_APPLICATION_DATABASE_ROLE: "ryuki_app_runtime"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -33,6 +66,10 @@ metadata:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
     app.kubernetes.io/name: portal-ui
 data:
-  # In-cluster platform API base URL. The portal currently calls same-origin
-  # /api through the ingress; this entry parameterizes server-side calls.
-  RYUKI_PORTAL_API_BASE_URL: "http://platform-api.ryuki-platform.svc:8080"
+  # Safe, non-resolving HTTPS placeholders. Every deployment overlay MUST
+  # replace both with its externally reachable same-origin ingress address.
+  RYUKI_API_URL: "https://platform.example.invalid"
+  RYUKI_PORTAL_PUBLIC_ORIGIN: "https://platform.example.invalid"
+  RYUKI_PORTAL_EXECUTION_MODE: "static-dry-run"
+  # Override the loopback-development image default explicitly in Kubernetes.
+  RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK: "false"

@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: "ryuki_dev" # secret-scan-allow: local dev-only default, not a production secret
       POSTGRES_DB: ryuki_platform
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
@@ -25,16 +25,25 @@ services:
       context: ../..
       dockerfile: sources/ryuki-api/Dockerfile
     image: ryuki/platform-api:rust-dev
-    env_file:
-      - path: ../../.env
-        required: false
     environment:
       RYUKI_DATABASE_URL: postgres://ryuki:ryuki_dev@platform-db:5432/ryuki_platform
       RYUKI_DATABASE__REQUIRED: "true"
+      RYUKI_MIGRATION_MODE: local-auto
       RYUKI_SERVER__BIND_ADDRESS: 0.0.0.0:8080
       RYUKI_PLATFORM_URL: http://localhost:18080
+      # The bridge listener is non-loopback, so credential-free mock/static
+      # authority is rejected. Compose reads the root .env for interpolation,
+      # but forwards only this reviewed local-auth/session contract.
+      RYUKI_AUTH_MODE: local
+      RYUKI_LOCAL_AUTH__USERS: "${RYUKI_LOCAL_AUTH__USERS:?required}"
+      RYUKI_LOCAL_AUTH__SITE_AUTHORITY: "${RYUKI_LOCAL_AUTH__SITE_AUTHORITY:?required}"
+      RYUKI_LOCAL_AUTH__SITE_SCOPE: "${RYUKI_LOCAL_AUTH__SITE_SCOPE:-}"
+      RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY: "${RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY:?required}"
+      RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE: "${RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE:-}"
+      RYUKI_SESSION__CREDENTIAL_HMAC_KEY: "${RYUKI_SESSION__CREDENTIAL_HMAC_KEY:?required}"
+      RYUKI_SESSION__COOKIE_SECURE: "false"
     ports:
-      - "18080:8080"
+      - "127.0.0.1:18080:8080"
     depends_on:
       platform-db:
         condition: service_healthy
@@ -52,8 +61,11 @@ services:
       context: ../..
       dockerfile: portal/portal-ui/Dockerfile
     image: ryuki/portal-ui:rust-dev
+    environment:
+      RYUKI_PORTAL_PUBLIC_ORIGIN: http://127.0.0.1:18000
+      RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK: "true"
     ports:
-      - "18000:8080"
+      - "127.0.0.1:18000:8080"
     depends_on:
       platform-api:
         condition: service_healthy

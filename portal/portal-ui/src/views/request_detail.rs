@@ -1,13 +1,13 @@
 use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::{
     audit_rows_to_csv, condense_timestamp, AuthSession, EvidencePackExport, ExecutionJob,
-    LivePlanReview,
+    LivePlanReview, ReviewedLivePlanSelection,
 };
 use crate::server_boundary::{
-    approve_live_apply_request, approve_request, approve_step_live_apply, cancel_request,
-    execute_request, execute_request_live_plan, get_request_audit, get_request_detail,
-    get_request_evidence, get_request_execution_job, lock_request, plan_request, protect_request,
-    publish_request, reject_request, retire_request, validate_request, verify_request,
+    approve_live_apply_request, approve_request, cancel_request, execute_request,
+    execute_request_live_plan, get_request_audit, get_request_detail, get_request_evidence,
+    get_request_execution_job, lock_request, plan_request, protect_request, publish_request,
+    reject_request, retire_request, validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -323,7 +323,10 @@ pub(crate) fn audit_action_label(action: &str) -> &'static str {
 
 /// Render only the control-plane allowlisted LivePlan projection. The raw plan
 /// and provider identifiers are never present in this model.
-fn render_live_plan_review(review: LivePlanReview) -> impl IntoView {
+fn render_live_plan_review(
+    review: LivePlanReview,
+    raw_plan_digest: Option<String>,
+) -> impl IntoView {
     let counts = review.counts;
     let placement = review.placement;
     let changes = review.managed_changes;
@@ -348,6 +351,12 @@ fn render_live_plan_review(review: LivePlanReview) -> impl IntoView {
                 <div class="request-info-item">
                     <strong>"State key"</strong>
                     <code class="evidence-item-key">{review.state_key}</code>
+                </div>
+                <div class="request-info-item">
+                    <strong>"Raw plan SHA-256"</strong>
+                    <code class="evidence-item-key">
+                        {raw_plan_digest.unwrap_or_else(|| "Unavailable".to_string())}
+                    </code>
                 </div>
                 <div class="request-info-item">
                     <strong>"Create"</strong>
@@ -531,12 +540,6 @@ pub fn RequestDetail() -> impl IntoView {
     // transition — so a single misclick can't retire a request.
     #[allow(deprecated)]
     let (retire_armed, set_retire_armed) = create_signal(false);
-    // Two-click arm guard for the per-step "Approve live apply" (#42 B1b):
-    // holds the step_key of the armed step, or None. Like `apply_armed`, a
-    // lone misclick must never mint a step-scoped LiveApply grant.
-    #[allow(deprecated)]
-    let (step_apply_armed, set_step_apply_armed) = create_signal::<Option<String>>(None);
-
     // Reset transient per-request UI state whenever the routed request id changes.
     // leptos_router reuses this component across /requests/:id navigations, so a
     // stale feedback badge — or, worse, an OPEN reject/cancel reason panel whose
@@ -552,7 +555,6 @@ pub fn RequestDetail() -> impl IntoView {
         set_reason_error.set(String::new());
         set_apply_armed.set(false);
         set_retire_armed.set(false);
-        set_step_apply_armed.set(None);
         set_execution_polling.set(false);
     });
 
@@ -700,58 +702,30 @@ pub fn RequestDetail() -> impl IntoView {
         }
     });
 
-    let approve_live_apply_action = Action::new(move |id: &String| {
-        let id = id.clone();
-        set_action_feedback.set("Approving & applying...".to_string());
-        set_action_class.set("badge neutral");
-        async move {
-            match approve_live_apply_request(id).await {
-                Ok(resp) => {
-                    let succeeded = resp.success;
-                    set_action_feedback.set(resp.message);
-                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
-                    if succeeded {
-                        detail_resource.refetch();
-                        audit_resource.refetch();
-                        execution_job_resource.refetch();
+    let approve_live_apply_action =
+        Action::new(move |args: &(String, ReviewedLivePlanSelection)| {
+            let (id, reviewed_plan) = args.clone();
+            set_action_feedback.set("Approving & applying...".to_string());
+            set_action_class.set("badge neutral");
+            async move {
+                match approve_live_apply_request(id, reviewed_plan).await {
+                    Ok(resp) => {
+                        let succeeded = resp.success;
+                        set_action_feedback.set(resp.message);
+                        set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                        if succeeded {
+                            detail_resource.refetch();
+                            audit_resource.refetch();
+                            execution_job_resource.refetch();
+                        }
+                    }
+                    Err(e) => {
+                        set_action_feedback.set(server_error_message(&e));
+                        set_action_class.set("badge bad");
                     }
                 }
-                Err(e) => {
-                    set_action_feedback.set(server_error_message(&e));
-                    set_action_class.set("badge bad");
-                }
             }
-        }
-    });
-
-    // Per-step live-apply approval (#42 B1b): approves ONE AwaitingApproval
-    // step of a multi-step request. The input is the (request id, step_key)
-    // pair captured from the step row's armed button. API refusals (409 when
-    // the step is not awaiting approval or rollback began, 403 on separation
-    // of duties) surface verbatim in the action badge.
-    let approve_step_live_apply_action = Action::new(move |args: &(String, String)| {
-        let (id, step_key) = args.clone();
-        set_action_feedback.set(format!("Approving live apply for step '{step_key}'..."));
-        set_action_class.set("badge neutral");
-        async move {
-            match approve_step_live_apply(id, step_key).await {
-                Ok(resp) => {
-                    let succeeded = resp.success;
-                    set_action_feedback.set(resp.message);
-                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
-                    if succeeded {
-                        detail_resource.refetch();
-                        audit_resource.refetch();
-                        execution_job_resource.refetch();
-                    }
-                }
-                Err(e) => {
-                    set_action_feedback.set(server_error_message(&e));
-                    set_action_class.set("badge bad");
-                }
-            }
-        }
-    });
+        });
 
     let verify_action = Action::new(move |id: &String| {
         let id = id.clone();
@@ -919,7 +893,6 @@ pub fn RequestDetail() -> impl IntoView {
             || execute_action.pending().get()
             || run_live_plan_action.pending().get()
             || approve_live_apply_action.pending().get()
-            || approve_step_live_apply_action.pending().get()
             || verify_action.pending().get()
             || protect_action.pending().get()
             || publish_action.pending().get()
@@ -1012,12 +985,16 @@ pub fn RequestDetail() -> impl IntoView {
                             && detail.actions_available.iter().any(|a| a == "execute")
                             && session_can(&session, "admin");
                         // Live apply is offered only from the latest completed,
-                        // accepted LivePlan and only after its safe projection
-                        // was digest-verified by the control plane.
+                        // accepted LivePlan, only after its safe projection
+                        // was evidence-digest verified and its distinct raw
+                        // plan commitment was signature-bound by the control plane.
                         let show_approve_apply = session_can(&session, "admin")
                             && execution_job
                                 .as_ref()
                                 .is_some_and(ExecutionJob::can_approve_live_apply);
+                        let reviewed_plan_selection = execution_job
+                            .as_ref()
+                            .and_then(|job| job.reviewed_plan_selection.clone());
                         let request_id_for_action = detail.id.clone();
 
                         // Persisted-state fields surfaced in the detail panel.
@@ -1055,17 +1032,12 @@ pub fn RequestDetail() -> impl IntoView {
                         let has_approval_route = !approval_route.is_empty();
                         let has_payload = !payload_fields.is_empty();
 
-                        // Multi-step orchestration plan (#42): ordered step
+                        // Multi-step orchestration plan (#42): ordered display
                         // rows for composite offerings; empty for single-job
-                        // requests, which hides the panel entirely. The
-                        // per-step "Approve live apply" mirrors the single-job
-                        // button's admin gate; the API additionally enforces
-                        // separation of duties and step state (409s surface
-                        // in the action badge).
+                        // requests. Per-step live approval is intentionally not
+                        // rendered until each step has its own exact safe review.
                         let steps = detail.steps.clone();
                         let has_steps = !steps.is_empty();
-                        let can_approve_step = session_can(&session, "admin");
-                        let step_request_id = detail.id.clone();
 
                         view! {
                             <article
@@ -1272,10 +1244,9 @@ pub fn RequestDetail() -> impl IntoView {
                                 // ordered step DAG the API surfaces for
                                 // composite offerings. Each row carries the
                                 // step key, its IaC reference, its
-                                // dependencies, and a status chip; a step
-                                // parked AwaitingApproval offers the
-                                // admin-gated, two-click per-step live-apply
-                                // approval.
+                                // dependencies, and a status chip. Awaiting
+                                // approval is display-only until a step-scoped
+                                // digest-bound review endpoint exists.
                                 <Show when=move || has_steps>
                                     <div class="request-steps" aria-label="Orchestration steps">
                                         <h3>"Orchestration Steps"</h3>
@@ -1291,13 +1262,6 @@ pub fn RequestDetail() -> impl IntoView {
                                                     } else {
                                                         step.depends_on.join(", ")
                                                     };
-                                                    // Per-step approval is offered only on a step the
-                                                    // API reports as parked AwaitingApproval, and only
-                                                    // to admin-capable sessions.
-                                                    let show_step_approve =
-                                                        step.status == "AwaitingApproval" && can_approve_step;
-                                                    let step_key_for_button = step.step_key.clone();
-                                                    let step_id = step_request_id.clone();
                                                     view! {
                                                         <li class="request-step-item" aria-label=step.step_key.clone()>
                                                             <div class="request-step-head">
@@ -1306,54 +1270,6 @@ pub fn RequestDetail() -> impl IntoView {
                                                             </div>
                                                             <span class="table-note">"IaC: " {step.iac_ref.clone()}</span>
                                                             <span class="table-note">"Depends on: " {dependencies}</span>
-                                                            <Show when=move || show_step_approve>
-                                                                {
-                                                                    let id = step_id.clone();
-                                                                    let armed_key = step_key_for_button.clone();
-                                                                    let label_key = step_key_for_button.clone();
-                                                                    let dispatch_key = step_key_for_button.clone();
-                                                                    view! {
-                                                                        <button
-                                                                            class="btn btn-secondary"
-                                                                            class:btn-danger=move || {
-                                                                                step_apply_armed.get().as_deref()
-                                                                                    == Some(armed_key.as_str())
-                                                                            }
-                                                                            disabled=move || any_action_pending.get()
-                                                                            on:click=move |_| {
-                                                                                // First click arms THIS step; the
-                                                                                // confirming second click mints the
-                                                                                // step-scoped LiveApply grant. Arming
-                                                                                // a different step re-targets the arm
-                                                                                // instead of firing.
-                                                                                if step_apply_armed.get().as_deref()
-                                                                                    == Some(dispatch_key.as_str())
-                                                                                {
-                                                                                    set_step_apply_armed.set(None);
-                                                                                    approve_step_live_apply_action
-                                                                                        .dispatch((
-                                                                                            id.clone(),
-                                                                                            dispatch_key.clone(),
-                                                                                        ));
-                                                                                } else {
-                                                                                    set_step_apply_armed
-                                                                                        .set(Some(dispatch_key.clone()));
-                                                                                }
-                                                                            }
-                                                                        >
-                                                                            {move || {
-                                                                                if step_apply_armed.get().as_deref()
-                                                                                    == Some(label_key.as_str())
-                                                                                {
-                                                                                    "Confirm — apply step live".to_string()
-                                                                                } else {
-                                                                                    "Approve live apply".to_string()
-                                                                                }
-                                                                            }}
-                                                                        </button>
-                                                                    }
-                                                                }
-                                                            </Show>
                                                         </li>
                                                     }
                                                 })
@@ -1370,6 +1286,10 @@ pub fn RequestDetail() -> impl IntoView {
                                             job.is_successful_live_plan()
                                                 && job.live_plan_review.is_none();
                                         let plan_review = job.live_plan_review.clone();
+                                        let raw_plan_digest = job
+                                            .reviewed_plan_selection
+                                            .as_ref()
+                                            .map(|selection| selection.approved_plan_digest.clone());
                                         let result_status_display = if job.result_status.is_empty() {
                                             "—".to_string()
                                         } else {
@@ -1422,7 +1342,11 @@ pub fn RequestDetail() -> impl IntoView {
                                                 </div>
                                                 {match plan_review {
                                                     Some(review) => {
-                                                        render_live_plan_review(review).into_any()
+                                                        render_live_plan_review(
+                                                            review,
+                                                            raw_plan_digest,
+                                                        )
+                                                        .into_any()
                                                     }
                                                     None if successful_plan_without_review => {
                                                         view! {
@@ -1512,10 +1436,8 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 return;
                                                             }
                                                             // Any other action cancels a pending
-                                                            // retire or step-apply arm before
-                                                            // dispatching.
+                                                            // retire arm before dispatching.
                                                             set_retire_armed.set(false);
-                                                            set_step_apply_armed.set(None);
                                                             match action.as_str() {
                                                                 "validate" => { validate_action.dispatch(id.clone()); }
                                                                 "plan" => { plan_action.dispatch(id.clone()); }
@@ -1573,10 +1495,14 @@ pub fn RequestDetail() -> impl IntoView {
                                         // Mints a CP-signed LiveApply grant from that plan.
                                         {
                                             let approve_apply_id = request_id_for_action.clone();
+                                            let approve_apply_selection =
+                                                reviewed_plan_selection.clone();
                                             view! {
                                                 <Show when=move || show_approve_apply>
                                                     {
                                                         let id = approve_apply_id.clone();
+                                                        let reviewed_plan =
+                                                            approve_apply_selection.clone();
                                                         view! {
                                                             <button
                                                                 class="btn btn-secondary"
@@ -1588,8 +1514,15 @@ pub fn RequestDetail() -> impl IntoView {
                                                                     // apply. A lone misclick never fires
                                                                     // a real terraform apply.
                                                                     if apply_armed.get() {
-                                                                        approve_live_apply_action
-                                                                            .dispatch(id.clone());
+                                                                        if let Some(selection) =
+                                                                            reviewed_plan.clone()
+                                                                        {
+                                                                            approve_live_apply_action
+                                                                                .dispatch((
+                                                                                    id.clone(),
+                                                                                    selection,
+                                                                                ));
+                                                                        }
                                                                         set_apply_armed.set(false);
                                                                     } else {
                                                                         set_apply_armed.set(true);
@@ -2149,6 +2082,7 @@ mod tests {
                 && (mode == "OfflineDryRun"
                     || (mode == "LiveApply" && result_status == "verified")),
             live_plan_review: None,
+            reviewed_plan_selection: None,
         }
     }
 

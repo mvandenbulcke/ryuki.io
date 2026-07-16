@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 ryuki-core = { workspace = true }
 serde_yaml = { workspace = true }
 figment = { workspace = true }

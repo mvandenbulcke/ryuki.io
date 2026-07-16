@@ -15,12 +15,18 @@ const REQUIRED_KINDS: &[&str] = &[
     "signing-material",
 ];
 const REQUIRED_FIELDS: &[&str] = &[
+    "schemaVersion",
     "referenceId",
-    "provider",
+    "providerId",
+    "providerConfigVersion",
+    "deploymentId",
+    "trustDomainId",
     "kind",
+    "purpose",
     "scope",
     "ownerRole",
     "consumerComponent",
+    "versionSelector",
     "rotationPolicy",
     "readinessState",
     "evidenceRequirement",
@@ -29,8 +35,11 @@ const REQUIRED_STATES: &[&str] = &[
     "missing",
     "pending-approval",
     "configured",
+    "admitted",
     "rotation-due",
     "blocked",
+    "quarantined",
+    "retired",
 ];
 const REQUIRED_CONSUMERS: &[&str] = &[
     "platform-api",
@@ -45,7 +54,7 @@ const REQUIRED_CONSUMERS: &[&str] = &[
     "zabbix-adapter",
     "servicenow-adapter",
     "image-factory-controller",
-    "vaultwarden-cli",
+    "secret-materialization-controller",
 ];
 const REQUIRED_ROTATION_POLICIES: &[&str] = &[
     "deployment-managed",
@@ -67,14 +76,23 @@ const REQUIRED_PROHIBITED_FIELDS: &[&str] = &[
     "url",
 ];
 const REQUIRED_RULES: &[&str] = &[
-    "vaultwarden-primary-provider",
+    "capability-registry-required",
     "provider-fallbacks-disabled",
+    "provider-capabilities-admitted",
     "no-secret-values-in-reference",
     "deployment-paths-outside-catalog",
     "rotation-policy-required",
 ];
 
-const DISALLOWED_PROVIDER_FALLBACKS: &[&str] = &["conjur", "cyberark", "hashicorp"];
+const REQUIRED_PROVIDER_CLASSES: &[&str] = &[
+    "lease-capable-secret-service",
+    "cloud-secret-manager",
+    "deployment-injection",
+    "enterprise-plugin-adapter",
+    "development-adapter",
+];
+const REQUIRED_CAPABILITY_INTERFACES: &[&str] =
+    &["resolve-read", "publish-version", "materialize-reload"];
 
 #[derive(Debug, Deserialize)]
 struct Context {
@@ -140,9 +158,9 @@ fn validate_catalog_value(catalog: &Value, errors: &mut Vec<String>) {
         return;
     }
     expect(
-        catalog.get("version").and_then(Value::as_i64) == Some(1),
+        catalog.get("version").and_then(Value::as_i64) == Some(2),
         errors,
-        "secret-reference-catalog version must be 1",
+        "secret-reference-catalog version must be 2",
     );
     expect(
         string_value(catalog, "status").is_some_and(|status| STATUSES.contains(&status)),
@@ -150,19 +168,38 @@ fn validate_catalog_value(catalog: &Value, errors: &mut Vec<String>) {
         "secret-reference-catalog status is invalid",
     );
     expect(
-        string_value(catalog, "primaryProvider") == Some("vaultwarden"),
+        string_value(catalog, "providerModel") == Some("capability-registry"),
         errors,
-        "primaryProvider must be vaultwarden",
+        "providerModel must be capability-registry",
     );
     expect(
-        string_value(catalog, "managementCli") == Some("vaultwarden-cli"),
+        string_value(catalog, "managementInterface") == Some("provider-adapter"),
         errors,
-        "managementCli must be vaultwarden-cli",
+        "managementInterface must be provider-adapter",
     );
     expect(
-        string_array_like(catalog, "futureProviders").is_empty(),
+        string_value(catalog, "fallbackPolicy") == Some("disabled"),
         errors,
-        "futureProviders must be empty",
+        "fallbackPolicy must be disabled",
+    );
+    for removed in ["primaryProvider", "managementCli", "futureProviders"] {
+        expect(
+            catalog.get(removed).is_none(),
+            errors,
+            format!("retired field {removed} must be absent"),
+        );
+    }
+    validate_required_array(
+        catalog,
+        "admittedProviderClasses",
+        REQUIRED_PROVIDER_CLASSES,
+        errors,
+    );
+    validate_required_array(
+        catalog,
+        "capabilityInterfaces",
+        REQUIRED_CAPABILITY_INTERFACES,
+        errors,
     );
     expect(
         non_empty_string(catalog.get("referencePurpose")),
@@ -187,7 +224,7 @@ fn validate_catalog_value(catalog: &Value, errors: &mut Vec<String>) {
     );
     validate_rules(catalog, errors);
     validate_kebab_arrays(catalog, errors);
-    validate_no_legacy_provider_fallbacks(catalog, "secret-reference-catalog", errors);
+    validate_no_provider_fallback_fields(catalog, "secret-reference-catalog", errors);
 }
 
 fn validate_required_array(
@@ -276,6 +313,7 @@ fn validate_rules(catalog: &Value, errors: &mut Vec<String>) {
 
 fn validate_kebab_arrays(catalog: &Value, errors: &mut Vec<String>) {
     for field in [
+        "admittedProviderClasses",
         "referenceKinds",
         "readinessStates",
         "allowedConsumers",
@@ -300,23 +338,25 @@ fn validate_doc_text(text: &str, errors: &mut Vec<String>) {
         "secret reference doc must define purpose",
     );
     expect(
-        text.contains("Vaultwarden is the runtime provider"),
+        text.contains("Secret references use the platform's capability registry"),
         errors,
-        "secret reference doc must state Vaultwarden provider direction",
+        "secret reference doc must state capability-registry provider direction",
     );
     expect(
-        text.contains("vaultwarden-cli"),
+        text.contains("there is no universal runtime provider"),
         errors,
-        "secret reference doc must state vaultwarden-cli management",
+        "secret reference doc must prohibit a universal runtime provider",
+    );
+    expect(
+        text.contains("Resolution, dynamic issuance, lease control, key custody"),
+        errors,
+        "secret reference doc must separate provider capabilities",
     );
     expect(
         text.contains("Adapters and workers fail closed"),
         errors,
         "secret reference doc must require fail-closed behavior",
     );
-    if contains_legacy_provider_fallback(text) {
-        errors.push("secret reference doc contains legacy provider fallback".to_string());
-    }
 }
 
 fn validate_no_prohibited_shape(
@@ -394,51 +434,33 @@ fn prohibited_key(key: &str) -> bool {
         }
 }
 
-fn validate_no_legacy_provider_fallbacks(value: &Value, path: &str, errors: &mut Vec<String>) {
+fn validate_no_provider_fallback_fields(value: &Value, path: &str, errors: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
                 let child_path = format!("{path}.{key}");
-                if contains_legacy_provider_fallback(key) {
-                    errors.push(format!("{child_path} contains legacy provider fallback"));
+                let normalized = key_segments(key).join("-");
+                if [
+                    "future-providers",
+                    "fallback-providers",
+                    "secondary-provider",
+                    "legacy-provider",
+                    "provider-fallbacks",
+                ]
+                .contains(&normalized.as_str())
+                {
+                    errors.push(format!("{child_path} declares a retired provider fallback"));
                 }
-                validate_no_legacy_provider_fallbacks(child, &child_path, errors);
+                validate_no_provider_fallback_fields(child, &child_path, errors);
             }
         }
         Value::Array(values) => {
             for (index, child) in values.iter().enumerate() {
-                validate_no_legacy_provider_fallbacks(child, &format!("{path}[{index}]"), errors);
+                validate_no_provider_fallback_fields(child, &format!("{path}[{index}]"), errors);
             }
-        }
-        Value::String(text) if contains_legacy_provider_fallback(text) => {
-            errors.push(format!("{path} contains legacy provider fallback"));
         }
         _ => {}
     }
-}
-
-fn contains_legacy_provider_fallback(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    DISALLOWED_PROVIDER_FALLBACKS
-        .iter()
-        .any(|provider| contains_word(&lower, provider))
-}
-
-fn contains_word(text: &str, term: &str) -> bool {
-    let mut offset = 0;
-    while let Some(found) = text[offset..].find(term) {
-        let start = offset + found;
-        let end = start + term.len();
-        let before = text[..start].chars().next_back();
-        let after = text[end..].chars().next();
-        let boundary_before = !before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-        let boundary_after = !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-        if boundary_before && boundary_after {
-            return true;
-        }
-        offset = end;
-    }
-    false
 }
 
 fn key_segments(key: &str) -> Vec<String> {
@@ -599,5 +621,24 @@ mod tests {
         assert!(prohibited_key("end_point"));
         assert!(!prohibited_key("curlCommand"));
         assert!(!prohibited_key("scurlHandle"));
+    }
+
+    #[test]
+    fn provider_names_are_allowed_but_fallback_fields_are_not() {
+        let allowed = serde_json::json!({
+            "admittedProviders": ["hashicorp-vault", "openbao", "cyberark"]
+        });
+        let mut errors = Vec::new();
+        validate_no_provider_fallback_fields(&allowed, "catalog", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "provider products are not fallback semantics"
+        );
+
+        let retired = serde_json::json!({"fallbackProviders": ["example"]});
+        validate_no_provider_fallback_fields(&retired, "catalog", &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("retired provider fallback")));
     }
 }

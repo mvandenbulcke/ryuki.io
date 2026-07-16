@@ -17,7 +17,9 @@ spec:
       serviceAccountName: portal-ui
       containers:
         - name: portal-ui
-          image: ryuki/portal-ui:rust-dev
+          # Non-resolving skeleton reference. Every adopted render must replace
+          # the whole registry/repository@sha256 digest, never only a tag.
+          image: registry.example.invalid/ryuki/portal-ui@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:
@@ -62,6 +64,13 @@ metadata:
     app.kubernetes.io/component: platform-api-rust
 spec:
   replicas: 1
+  # Intentionally non-overlapping. Authentication-mode and idempotency writer-
+  # contract migrations, plus database credential rotation, stop the old API pod
+  # before starting its replacement. Pre-contract idempotency code failed open
+  # on a rejected store claim, so RollingUpdate is not a safe schema cutover;
+  # the accepted tradeoff is short control-plane downtime.
+  strategy:
+    type: Recreate
   selector:
     matchLabels: *platform-api-labels
   template:
@@ -69,18 +78,37 @@ spec:
       labels: *platform-api-labels
     spec:
       serviceAccountName: platform-api
+      # CloudNativePG creates this CA Secret for the cluster. Project only the
+      # public certificate; never expose the CA private key to the API.
+      volumes:
+        - name: cnpg-ca
+          secret:
+            secretName: ryuki-platform-db-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
       containers:
         - name: platform-api
-          image: ryuki/platform-api:rust-dev
+          # Non-resolving skeleton reference. Every adopted render must replace
+          # the whole registry/repository@sha256 digest, never only a tag.
+          image: registry.example.invalid/ryuki/platform-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
           imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: cnpg-ca
+              mountPath: /var/run/secrets/ryuki/cnpg
+              readOnly: true
           envFrom:
             - configMapRef:
                 name: platform-api-config
-            # RYUKI_DATABASE_URL — materialized from Vault by the Vault Secrets
-            # Operator (deploy/kubernetes/vault/vso-secrets.yaml). For clusters
-            # without VSO, create this Secret out-of-band (see base README).
-            - secretRef:
-                name: ryuki-platform-api-db
+          # Import only the one reviewed key. A newly added Secret field can
+          # never override non-secret ConfigMap policy through whole-Secret
+          # envFrom precedence.
+          env:
+            - name: RYUKI_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ryuki-platform-api-db
+                  key: RYUKI_DATABASE_URL
           ports:
             - containerPort: 8080
           readinessProbe:

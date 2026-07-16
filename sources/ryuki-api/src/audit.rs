@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::{interval, MissedTickBehavior};
 
 use ryuki_engine::auth::AuthSession;
 
@@ -46,18 +48,14 @@ use ryuki_engine::auth::AuthSession;
 // Postgres, or periodically anchoring the head entry_hash to external storage)
 // are a documented hardening follow-up.
 //
-// LOCK ORDER: record_audit_tx takes AUDIT_CHAIN_LOCK_KEY only AFTER any
-// `UPDATE requests` row lock its caller already holds (request row → audit lock,
-// always), so concurrent transitions cannot deadlock on the two.
+// LOCK ORDER: migration 187's append_audit_log() takes the audit advisory lock
+// only AFTER any `UPDATE requests` row lock its caller already holds (request
+// row → audit lock, always), so concurrent transitions cannot deadlock on the
+// two. The SECURITY DEFINER writer also owns id allocation and hash generation.
 // ---------------------------------------------------------------------------
 
 /// Predecessor hash of the first row in the chain.
 const AUDIT_CHAIN_GENESIS: &str = "GENESIS";
-
-/// Key for the Postgres transaction-scoped advisory lock that serializes chain
-/// appends, so two concurrent inserts cannot read the same predecessor and fork
-/// the chain. Released automatically on commit/rollback.
-const AUDIT_CHAIN_LOCK_KEY: i64 = 0x4155_4449_5400; // "AUDIT\0"
 
 /// Deterministic, canonical JSON: object keys are sorted, arrays keep order,
 /// scalars use serde's stable encoding. The SAME logical value hashes
@@ -120,14 +118,14 @@ fn audit_canonical_payload(
     }))
 }
 
-/// `sha256(len(prev_hash)‖prev_hash‖len(payload)‖payload)`, lowercase hex. The
-/// length prefixes make the encoding unambiguous (no value can forge a field
-/// boundary). Pure + deterministic.
+/// `sha256(hex16(byte_len(prev_hash))‖prev_hash‖hex16(byte_len(payload))‖payload)`,
+/// lowercase hex. Migration 187 uses this same SQL-reproducible v2 framing to
+/// backfill and append the complete domain. Pure + deterministic.
 fn chain_hash(prev_hash: &str, payload: &str) -> String {
     let mut h = Sha256::new();
-    h.update((prev_hash.len() as u64).to_le_bytes());
+    h.update(format!("{:016x}", prev_hash.len()).as_bytes());
     h.update(prev_hash.as_bytes());
-    h.update((payload.len() as u64).to_le_bytes());
+    h.update(format!("{:016x}", payload.len()).as_bytes());
     h.update(payload.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -283,43 +281,13 @@ pub async fn record_audit_tx(
         .request_id
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
 
-    // Serialize chain appends: hold a transaction-scoped advisory lock while we
-    // read the predecessor's hash and insert, so two concurrent transitions
-    // cannot both chain off the same predecessor and fork the chain.
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(AUDIT_CHAIN_LOCK_KEY)
-        .execute(&mut **tx)
-        .await?;
-    let prev_hash: String = sqlx::query_scalar(
-        "SELECT entry_hash FROM audit_log WHERE entry_hash IS NOT NULL ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?
-    .unwrap_or_else(|| AUDIT_CHAIN_GENESIS.to_string());
-
-    let request_id_str = request_uuid.map(|u| u.to_string());
-    let payload = audit_canonical_payload(
-        request_id_str.as_deref(),
-        &session.user_id,
-        &session.display_name,
-        &session.roles,
-        &session.provider_mode,
-        record.action,
-        record.from_stage,
-        record.to_stage,
-        record.from_status,
-        record.to_status,
-        &record.detail,
-        record.outcome,
-    );
-    let entry_hash = chain_hash(&prev_hash, &payload);
-
-    sqlx::query(
-        "INSERT INTO audit_log \
-            (request_id, actor_principal, actor_display, actor_roles, provider_mode, \
-             action, from_stage, to_stage, from_status, to_status, detail, outcome, \
-             prev_hash, entry_hash) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)",
+    // The database writer serializes the chain, allocates the positive id only
+    // after acquiring that lock, derives canonical content, and computes both
+    // hashes. Runtime code cannot supply ids or chain fields.
+    let _: i64 = sqlx::query_scalar(
+        "SELECT append_audit_log( \
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12 \
+         )",
     )
     .bind(request_uuid)
     .bind(&session.user_id)
@@ -333,9 +301,7 @@ pub async fn record_audit_tx(
     .bind(record.to_status)
     .bind(record.detail.to_string())
     .bind(record.outcome)
-    .bind(&prev_hash)
-    .bind(&entry_hash)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     Ok(())
@@ -670,6 +636,7 @@ pub async fn export_audit(
 }
 
 /// Result of re-verifying the audit hash chain.
+#[cfg(test)]
 pub struct ChainVerification {
     /// True when every chained row's content hash and prev→entry link are intact.
     pub verified: bool,
@@ -695,22 +662,65 @@ struct ChainRow {
     from_status: Option<String>,
     to_status: String,
     detail: Option<String>,
+    detail_too_large: bool,
     outcome: String,
     prev_hash: Option<String>,
     entry_hash: Option<String>,
 }
 
-/// Re-verify the audit hash chain over all chained rows (id order). Recomputes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainRowError {
+    DetailTooLarge,
+    BrokenLink,
+    ContentMismatch,
+}
+
+fn verify_chain_row(row: &ChainRow, expected_prev: &str) -> Result<String, ChainRowError> {
+    if row.detail_too_large {
+        return Err(ChainRowError::DetailTooLarge);
+    }
+    if row.prev_hash.as_deref() != Some(expected_prev) {
+        return Err(ChainRowError::BrokenLink);
+    }
+    let detail: Value = row
+        .detail
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    let request_id_str = row.request_id.map(|u| u.to_string());
+    let payload = audit_canonical_payload(
+        request_id_str.as_deref(),
+        &row.actor_principal,
+        row.actor_display.as_deref().unwrap_or(""),
+        &row.actor_roles,
+        &row.provider_mode,
+        &row.action,
+        row.from_stage.as_deref(),
+        &row.to_stage,
+        row.from_status.as_deref(),
+        &row.to_status,
+        &detail,
+        &row.outcome,
+    );
+    let recomputed = chain_hash(expected_prev, &payload);
+    if row.entry_hash.as_deref() != Some(recomputed.as_str()) {
+        return Err(ChainRowError::ContentMismatch);
+    }
+    Ok(recomputed)
+}
+
+/// Re-verify the complete audit hash chain (id order). Recomputes
 /// each row's content hash from its stored columns and checks both the content
 /// hash and the prev→entry linkage; reports the first divergent row. A clean
-/// chain returns `verified: true`. Rows written before migration 094 (NULL
-/// entry_hash) are not part of the chain and are skipped.
+/// chain returns `verified: true`. No row is filtered out: an unhashed row is a
+/// divergence, never an invisible legacy exception.
+#[cfg(test)]
 pub async fn verify_audit_chain(pool: &PgPool) -> Result<ChainVerification, sqlx::Error> {
     let rows = sqlx::query_as::<_, ChainRow>(
         "SELECT id, request_id, actor_principal, actor_display, actor_roles, provider_mode, \
                 action, from_stage, to_stage, from_status, to_status, detail::text AS detail, \
-                outcome, prev_hash, entry_hash \
-         FROM audit_log WHERE entry_hash IS NOT NULL ORDER BY id ASC",
+                FALSE AS detail_too_large, outcome, prev_hash, entry_hash \
+         FROM audit_log ORDER BY id ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -718,46 +728,29 @@ pub async fn verify_audit_chain(pool: &PgPool) -> Result<ChainVerification, sqlx
     let mut expected_prev = AUDIT_CHAIN_GENESIS.to_string();
     let mut checked = 0i64;
     for row in &rows {
-        // Linkage: this row must chain off the predecessor's entry_hash.
-        if row.prev_hash.as_deref() != Some(expected_prev.as_str()) {
-            return Ok(ChainVerification {
-                verified: false,
-                checked,
-                first_divergent_id: Some(row.id),
-                reason: Some("broken chain link (prev_hash does not match predecessor)".into()),
-            });
+        match verify_chain_row(row, &expected_prev) {
+            Ok(recomputed) => {
+                expected_prev = recomputed;
+                checked += 1;
+            }
+            Err(error) => {
+                let reason = match error {
+                    ChainRowError::DetailTooLarge => {
+                        "audit row exceeds the verification byte limit"
+                    }
+                    ChainRowError::BrokenLink => {
+                        "broken chain link (prev_hash does not match predecessor)"
+                    }
+                    ChainRowError::ContentMismatch => "content hash mismatch (row was altered)",
+                };
+                return Ok(ChainVerification {
+                    verified: false,
+                    checked,
+                    first_divergent_id: Some(row.id),
+                    reason: Some(reason.into()),
+                });
+            }
         }
-        let detail: Value = row
-            .detail
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| json!({}));
-        let request_id_str = row.request_id.map(|u| u.to_string());
-        let payload = audit_canonical_payload(
-            request_id_str.as_deref(),
-            &row.actor_principal,
-            row.actor_display.as_deref().unwrap_or(""),
-            &row.actor_roles,
-            &row.provider_mode,
-            &row.action,
-            row.from_stage.as_deref(),
-            &row.to_stage,
-            row.from_status.as_deref(),
-            &row.to_status,
-            &detail,
-            &row.outcome,
-        );
-        let recomputed = chain_hash(&expected_prev, &payload);
-        if row.entry_hash.as_deref() != Some(recomputed.as_str()) {
-            return Ok(ChainVerification {
-                verified: false,
-                checked,
-                first_divergent_id: Some(row.id),
-                reason: Some("content hash mismatch (row was altered)".into()),
-            });
-        }
-        expected_prev = recomputed;
-        checked += 1;
     }
 
     Ok(ChainVerification {
@@ -766,6 +759,467 @@ pub async fn verify_audit_chain(pool: &PgPool) -> Result<ChainVerification, sqlx
         first_divergent_id: None,
         reason: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Durable bounded audit-chain verification (migration 173)
+// ---------------------------------------------------------------------------
+
+const AUDIT_VERIFICATION_ENQUEUE_LOCK: i64 = 0x4155_4456_4552; // "AUDVER"
+                                                               // Keep one page's worst-case decoded detail envelope at 4 MiB. Four pages per
+                                                               // worker slice therefore remain at or below 16 MiB before ordinary row fields,
+                                                               // while a single oversized detail fails closed without crossing into Rust.
+const AUDIT_VERIFICATION_PAGE_ROWS: i64 = 64;
+const AUDIT_VERIFICATION_PAGES_PER_SLICE: usize = 4;
+const AUDIT_VERIFICATION_MAX_DETAIL_BYTES: i64 = 65_536;
+// Leave room for the one active job that may become terminal after enqueue.
+// Each enqueue prunes at most one bounded batch beyond this retained window.
+const AUDIT_VERIFICATION_MAX_TERMINAL_JOBS: i64 = 1_000;
+const AUDIT_VERIFICATION_PRUNE_BATCH: i64 = 128;
+const AUDIT_VERIFICATION_LOOP_NAME: &str = "audit_chain_verification";
+
+const _: () = assert!(
+    AUDIT_VERIFICATION_PAGE_ROWS * AUDIT_VERIFICATION_MAX_DETAIL_BYTES <= 4 * 1024 * 1024,
+    "one page's worst-case decoded detail envelope must stay at or below 4 MiB"
+);
+const _: () = assert!(
+    AUDIT_VERIFICATION_PAGE_ROWS
+        * AUDIT_VERIFICATION_MAX_DETAIL_BYTES
+        * AUDIT_VERIFICATION_PAGES_PER_SLICE as i64
+        <= 16 * 1024 * 1024,
+    "one worker slice's detail envelope must stay at or below 16 MiB"
+);
+
+const VERIFICATION_JOB_SAFE_COLUMNS: &str =
+    "id, status, requested_at, started_at, updated_at, completed_at, \
+     snapshot_tail_id, cursor_id, checked, first_divergent_id, reason_code";
+
+/// Safe job state returned to audit-tier callers. Requester identity, chain
+/// hashes, and the expected-predecessor checkpoint never cross the API boundary.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuditVerificationJob {
+    pub id: uuid::Uuid,
+    pub status: String,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub snapshot_tail_id: Option<i64>,
+    pub cursor_id: i64,
+    pub checked: i64,
+    pub first_divergent_id: Option<i64>,
+    pub reason_code: Option<String>,
+}
+
+impl AuditVerificationJob {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "verified" | "divergent" | "failed")
+    }
+}
+
+async fn prune_terminal_verification_jobs(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<u64, sqlx::Error> {
+    let retained_before_active = AUDIT_VERIFICATION_MAX_TERMINAL_JOBS.saturating_sub(1);
+    let result = sqlx::query(
+        "DELETE FROM audit_chain_verification_jobs WHERE id IN ( \
+             SELECT id FROM audit_chain_verification_jobs \
+             WHERE status IN ('verified', 'divergent', 'failed') \
+             ORDER BY completed_at DESC, id DESC \
+             OFFSET $1 LIMIT $2 \
+         )",
+    )
+    .bind(retained_before_active)
+    .bind(AUDIT_VERIFICATION_PRUNE_BATCH)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Join the one active verification, return a very recent completed result, or
+/// enqueue a new genesis scan. The short advisory lock serializes the decision
+/// across replicas; the partial unique index is the authoritative backstop.
+/// This function never reads `audit_log`, so the HTTP request is constant-work.
+pub async fn enqueue_or_join_audit_verification(
+    pool: &PgPool,
+    requested_by: &str,
+) -> Result<AuditVerificationJob, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_VERIFICATION_ENQUEUE_LOCK)
+        .execute(&mut *tx)
+        .await?;
+
+    // The job table is itself attacker-reachable through authenticated POSTs.
+    // Prune only a fixed batch under the singleton enqueue lock: this bounds
+    // request work and converges an older oversized table without a bulk delete.
+    prune_terminal_verification_jobs(&mut tx).await?;
+
+    let active: Option<AuditVerificationJob> = sqlx::query_as(&format!(
+        "SELECT {VERIFICATION_JOB_SAFE_COLUMNS} \
+         FROM audit_chain_verification_jobs \
+         WHERE status IN ('queued', 'running') \
+         ORDER BY requested_at ASC LIMIT 1"
+    ))
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(job) = active {
+        tx.commit().await?;
+        return Ok(job);
+    }
+
+    // A short cooldown prevents repeated authenticated POSTs from scheduling
+    // back-to-back full scans while still making result freshness explicit.
+    let recent: Option<AuditVerificationJob> = sqlx::query_as(&format!(
+        "SELECT {VERIFICATION_JOB_SAFE_COLUMNS} \
+         FROM audit_chain_verification_jobs \
+         WHERE status IN ('verified', 'divergent', 'failed') \
+           AND completed_at >= NOW() - INTERVAL '60 seconds' \
+         ORDER BY completed_at DESC, id DESC LIMIT 1"
+    ))
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(job) = recent {
+        tx.commit().await?;
+        return Ok(job);
+    }
+
+    let job: AuditVerificationJob = sqlx::query_as(&format!(
+        "INSERT INTO audit_chain_verification_jobs (requested_by) VALUES ($1) \
+         RETURNING {VERIFICATION_JOB_SAFE_COLUMNS}"
+    ))
+    .bind(requested_by)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(job)
+}
+
+pub async fn audit_verification_status(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<AuditVerificationJob>, sqlx::Error> {
+    let Ok(id) = uuid::Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    sqlx::query_as(&format!(
+        "SELECT {VERIFICATION_JOB_SAFE_COLUMNS} \
+         FROM audit_chain_verification_jobs WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[derive(sqlx::FromRow)]
+struct VerificationCheckpoint {
+    id: uuid::Uuid,
+    status: String,
+    snapshot_tail_id: Option<i64>,
+    snapshot_tail_hash: Option<String>,
+    cursor_id: i64,
+    expected_prev_hash: String,
+    checked: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationPageResult {
+    Idle,
+    Advanced,
+    Terminal,
+}
+
+// These arguments deliberately mirror one atomic terminal-checkpoint UPDATE;
+// grouping them would obscure which persisted security field each bind owns.
+#[allow(clippy::too_many_arguments)]
+async fn finish_verification_job(
+    tx: &mut Transaction<'_, Postgres>,
+    id: uuid::Uuid,
+    status: &str,
+    cursor_id: i64,
+    expected_prev_hash: &str,
+    checked: i64,
+    first_divergent_id: Option<i64>,
+    reason_code: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE audit_chain_verification_jobs SET status = $2, cursor_id = $3, \
+         expected_prev_hash = $4, checked = $5, first_divergent_id = $6, \
+         reason_code = $7, updated_at = NOW(), completed_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(cursor_id)
+    .bind(expected_prev_hash)
+    .bind(checked)
+    .bind(first_divergent_id)
+    .bind(reason_code)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Advance at most one 64-row page under the durable singleton row lock. Each
+/// successful page commits its checkpoint, so cancellation or replica loss
+/// resumes from the last fully verified predecessor on the next tick.
+async fn process_audit_verification_page(
+    pool: &PgPool,
+) -> Result<VerificationPageResult, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(mut job): Option<VerificationCheckpoint> = sqlx::query_as(
+        "SELECT id, status, snapshot_tail_id, snapshot_tail_hash, cursor_id, \
+                expected_prev_hash, checked \
+         FROM audit_chain_verification_jobs \
+         WHERE status IN ('queued', 'running') \
+         ORDER BY requested_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(VerificationPageResult::Idle);
+    };
+
+    if job.status == "queued" {
+        let tail: Option<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((tail_id, tail_hash)) = tail else {
+            finish_verification_job(
+                &mut tx,
+                job.id,
+                "verified",
+                0,
+                AUDIT_CHAIN_GENESIS,
+                0,
+                None,
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(VerificationPageResult::Terminal);
+        };
+        let Some(tail_hash) = tail_hash else {
+            finish_verification_job(
+                &mut tx,
+                job.id,
+                "divergent",
+                0,
+                AUDIT_CHAIN_GENESIS,
+                0,
+                Some(tail_id),
+                Some("unhashed_audit_row"),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(VerificationPageResult::Terminal);
+        };
+        sqlx::query(
+            "UPDATE audit_chain_verification_jobs SET status = 'running', \
+             started_at = NOW(), updated_at = NOW(), snapshot_tail_id = $2, \
+             snapshot_tail_hash = $3 WHERE id = $1",
+        )
+        .bind(job.id)
+        .bind(tail_id)
+        .bind(&tail_hash)
+        .execute(&mut *tx)
+        .await?;
+        job.snapshot_tail_id = Some(tail_id);
+        job.snapshot_tail_hash = Some(tail_hash);
+    }
+
+    let (Some(tail_id), Some(tail_hash)) =
+        (job.snapshot_tail_id, job.snapshot_tail_hash.as_deref())
+    else {
+        finish_verification_job(
+            &mut tx,
+            job.id,
+            "failed",
+            job.cursor_id,
+            &job.expected_prev_hash,
+            job.checked,
+            None,
+            Some("invalid_checkpoint"),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(VerificationPageResult::Terminal);
+    };
+
+    let rows: Vec<ChainRow> = sqlx::query_as(
+        "SELECT id, request_id, actor_principal, actor_display, actor_roles, provider_mode, \
+                action, from_stage, to_stage, from_status, to_status, \
+                CASE WHEN octet_length(COALESCE(detail::text, '')) <= $3 \
+                     THEN detail::text ELSE NULL END AS detail, \
+                octet_length(COALESCE(detail::text, '')) > $3 AS detail_too_large, \
+                outcome, prev_hash, entry_hash \
+         FROM audit_log WHERE id > $1 AND id <= $2 \
+         ORDER BY id ASC LIMIT $4",
+    )
+    .bind(job.cursor_id)
+    .bind(tail_id)
+    .bind(AUDIT_VERIFICATION_MAX_DETAIL_BYTES)
+    .bind(AUDIT_VERIFICATION_PAGE_ROWS)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if rows.is_empty() {
+        finish_verification_job(
+            &mut tx,
+            job.id,
+            "failed",
+            job.cursor_id,
+            &job.expected_prev_hash,
+            job.checked,
+            None,
+            Some("snapshot_tail_missing"),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(VerificationPageResult::Terminal);
+    }
+
+    let mut expected_prev = job.expected_prev_hash;
+    let mut cursor_id = job.cursor_id;
+    let mut checked = job.checked;
+    for row in &rows {
+        match verify_chain_row(row, &expected_prev) {
+            Ok(recomputed) => {
+                expected_prev = recomputed;
+                cursor_id = row.id;
+                checked = checked.saturating_add(1);
+            }
+            Err(ChainRowError::DetailTooLarge) => {
+                finish_verification_job(
+                    &mut tx,
+                    job.id,
+                    "failed",
+                    cursor_id,
+                    &expected_prev,
+                    checked,
+                    Some(row.id),
+                    Some("row_size_limit"),
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(VerificationPageResult::Terminal);
+            }
+            Err(error) => {
+                let reason = match error {
+                    ChainRowError::BrokenLink => "broken_chain_link",
+                    ChainRowError::ContentMismatch => "content_hash_mismatch",
+                    ChainRowError::DetailTooLarge => unreachable!(),
+                };
+                finish_verification_job(
+                    &mut tx,
+                    job.id,
+                    "divergent",
+                    cursor_id,
+                    &expected_prev,
+                    checked,
+                    Some(row.id),
+                    Some(reason),
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(VerificationPageResult::Terminal);
+            }
+        }
+    }
+
+    if cursor_id == tail_id {
+        let (status, reason) = if expected_prev == tail_hash {
+            ("verified", None)
+        } else {
+            ("failed", Some("snapshot_tail_hash_mismatch"))
+        };
+        finish_verification_job(
+            &mut tx,
+            job.id,
+            status,
+            cursor_id,
+            &expected_prev,
+            checked,
+            None,
+            reason,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(VerificationPageResult::Terminal);
+    }
+
+    sqlx::query(
+        "UPDATE audit_chain_verification_jobs SET cursor_id = $2, \
+         expected_prev_hash = $3, checked = $4, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(job.id)
+    .bind(cursor_id)
+    .bind(&expected_prev)
+    .bind(checked)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(VerificationPageResult::Advanced)
+}
+
+pub async fn process_audit_verification_slice(pool: &PgPool) -> Result<usize, sqlx::Error> {
+    let mut pages = 0usize;
+    while pages < AUDIT_VERIFICATION_PAGES_PER_SLICE {
+        match process_audit_verification_page(pool).await? {
+            VerificationPageResult::Idle => break,
+            VerificationPageResult::Advanced => pages += 1,
+            VerificationPageResult::Terminal => {
+                pages += 1;
+                break;
+            }
+        }
+    }
+    Ok(pages)
+}
+
+/// Dedicated write-capable worker for durable verification checkpoints. The
+/// database singleton row makes duplicate process spawns harmless.
+pub fn spawn_audit_verification_worker(pool: PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        crate::background::register_loop(AUDIT_VERIFICATION_LOOP_NAME, interval_secs);
+        let mut ticker = interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await;
+        let mut consecutive_failures = 0u32;
+        loop {
+            ticker.tick().await;
+            match crate::background::run_bounded(
+                Duration::from_secs(30),
+                process_audit_verification_slice(&pool),
+            )
+            .await
+            {
+                Ok(_) => {
+                    consecutive_failures = 0;
+                    crate::background::record_loop_success(AUDIT_VERIFICATION_LOOP_NAME);
+                }
+                Err(error) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match error {
+                        crate::background::IterError::Failed(error) => tracing::error!(
+                            error = %error,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "audit-chain verification worker failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "audit-chain verification worker timed out; backing off"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_secs(interval_secs.saturating_mul(backoff)))
+                        .await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -821,6 +1275,76 @@ mod tests {
         assert_ne!(h, chain_hash("GENESIS", &tampered));
         // A length-boundary collision is prevented by length-prefixing.
         assert_ne!(chain_hash("ab", "c"), chain_hash("a", "bc"));
+    }
+
+    fn clean_chain_row(id: i64, prev_hash: &str) -> ChainRow {
+        let detail = json!({"page": id});
+        let payload = audit_canonical_payload(
+            None,
+            "audit-test",
+            "Audit Test",
+            &["Auditor".into()],
+            "local",
+            "audit.verify.test",
+            None,
+            "verify",
+            None,
+            "recorded",
+            &detail,
+            "applied",
+        );
+        ChainRow {
+            id,
+            request_id: None,
+            actor_principal: "audit-test".into(),
+            actor_display: Some("Audit Test".into()),
+            actor_roles: vec!["Auditor".into()],
+            provider_mode: "local".into(),
+            action: "audit.verify.test".into(),
+            from_stage: None,
+            to_stage: "verify".into(),
+            from_status: None,
+            to_status: "recorded".into(),
+            detail: Some(detail.to_string()),
+            detail_too_large: false,
+            outcome: "applied".into(),
+            prev_hash: Some(prev_hash.into()),
+            entry_hash: Some(chain_hash(prev_hash, &payload)),
+        }
+    }
+
+    #[test]
+    fn bounded_chain_pages_preserve_predecessor_and_fail_closed() {
+        assert_eq!(AUDIT_VERIFICATION_PAGE_ROWS, 64);
+        assert_eq!(AUDIT_VERIFICATION_PAGES_PER_SLICE, 4);
+        assert_eq!(AUDIT_VERIFICATION_MAX_DETAIL_BYTES, 65_536);
+
+        let first = clean_chain_row(1, AUDIT_CHAIN_GENESIS);
+        let first_hash = verify_chain_row(&first, AUDIT_CHAIN_GENESIS).expect("first row");
+        let second = clean_chain_row(2, &first_hash);
+        assert!(verify_chain_row(&second, &first_hash).is_ok());
+
+        // The first row of a later page still requires the prior page's exact
+        // checkpoint hash; a reset-to-genesis bypass is rejected.
+        assert_eq!(
+            verify_chain_row(&second, AUDIT_CHAIN_GENESIS),
+            Err(ChainRowError::BrokenLink)
+        );
+
+        let mut altered = second;
+        altered.outcome = "denied".into();
+        assert_eq!(
+            verify_chain_row(&altered, &first_hash),
+            Err(ChainRowError::ContentMismatch)
+        );
+
+        let mut oversized = clean_chain_row(3, &first_hash);
+        oversized.detail = None;
+        oversized.detail_too_large = true;
+        assert_eq!(
+            verify_chain_row(&oversized, &first_hash),
+            Err(ChainRowError::DetailTooLarge)
+        );
     }
 
     #[test]
@@ -891,6 +1415,65 @@ mod audit_chain_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        sqlx::query("DELETE FROM audit_chain_verification_jobs")
+            .execute(pool)
+            .await
+            .expect("reset verification jobs");
+
+        // Authenticated enqueue calls cannot grow the durable job history
+        // forever. Seed beyond the retention window, then prove one enqueue
+        // performs only the bounded overflow prune and leaves room for the
+        // active job to become the 1,000th terminal result.
+        sqlx::query(
+            "INSERT INTO audit_chain_verification_jobs \
+                 (status, requested_by, completed_at) \
+             SELECT 'verified', 'retention-fixture', \
+                    NOW() - INTERVAL '2 minutes' - (n * INTERVAL '1 second') \
+             FROM generate_series(1, $1::bigint) AS n",
+        )
+        .bind(AUDIT_VERIFICATION_MAX_TERMINAL_JOBS + 5)
+        .execute(pool)
+        .await
+        .expect("seed terminal verification history");
+        let retention_job = enqueue_or_join_audit_verification(pool, "retention-auditor")
+            .await
+            .expect("enqueue after bounded retention prune");
+        assert_eq!(retention_job.status, "queued");
+        let retained_terminal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_chain_verification_jobs \
+             WHERE status IN ('verified', 'divergent', 'failed')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count retained terminal jobs");
+        assert_eq!(retained_terminal, AUDIT_VERIFICATION_MAX_TERMINAL_JOBS - 1);
+        sqlx::query("DELETE FROM audit_chain_verification_jobs")
+            .execute(pool)
+            .await
+            .expect("clear retention fixture");
+
+        // Enqueue is constant-work and must not wait on the audit table itself.
+        // Holding an exclusive audit_log lock proves the request path touches
+        // only the small verification-job table.
+        let mut lock_tx = pool.begin().await.expect("lock transaction");
+        sqlx::query("LOCK TABLE audit_log IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .expect("lock audit log");
+        let enqueued_while_locked = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            enqueue_or_join_audit_verification(pool, "lock-proof-auditor"),
+        )
+        .await
+        .expect("enqueue must not wait on audit_log")
+        .expect("enqueue while audit_log is locked");
+        assert_eq!(enqueued_while_locked.status, "queued");
+        lock_tx.rollback().await.expect("release audit log lock");
+        sqlx::query("DELETE FROM audit_chain_verification_jobs")
+            .execute(pool)
+            .await
+            .expect("clear lock proof job");
+
         let mut session = AuthSession::static_dry_run();
         session.user_id = "audit-chain-tester".into();
         session.provider_mode = "entra-id".into();
@@ -928,17 +1511,62 @@ mod audit_chain_db_tests {
             .expect("record audit");
         }
 
-        // The whole chain (these rows plus any from earlier transitions) verifies.
-        let result = verify_audit_chain(pool).await.expect("verify");
-        assert!(
-            result.verified,
-            "clean chain must verify; first divergence at {:?}: {:?}",
-            result.first_divergent_id, result.reason
+        let (complete_domain_rows, excluded_rows): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(*) FILTER ( \
+                 WHERE id <= 0 OR prev_hash IS NULL OR entry_hash IS NULL \
+             ) FROM audit_log",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("inspect complete audit domain");
+        assert_eq!(
+            excluded_rows, 0,
+            "positive ids and non-null hashes are mandatory for every audit row"
         );
-        assert!(
-            result.checked >= 3,
-            "at least the three rows just appended are chained (checked={})",
-            result.checked
+
+        // Concurrent callers converge on the same durable singleton job.
+        let (first, joined) = tokio::join!(
+            enqueue_or_join_audit_verification(pool, "auditor-one"),
+            enqueue_or_join_audit_verification(pool, "auditor-two")
+        );
+        let first = first.expect("enqueue first verifier");
+        let joined = joined.expect("join verifier");
+        assert_eq!(first.id, joined.id);
+        assert_eq!(first.status, "queued");
+
+        // One worker transaction advances no more than the fixed page size.
+        let first_page = process_audit_verification_page(pool)
+            .await
+            .expect("first bounded page");
+        assert_ne!(first_page, VerificationPageResult::Idle);
+        let after_first = audit_verification_status(pool, &first.id.to_string())
+            .await
+            .expect("status after first page")
+            .expect("job exists");
+        assert!(after_first.checked <= AUDIT_VERIFICATION_PAGE_ROWS);
+
+        // Continue bounded slices until the captured tail is terminal. Each
+        // slice is independently capped at four pages/1,000 rows.
+        let mut terminal = after_first;
+        for _ in 0..1000 {
+            if terminal.is_terminal() {
+                break;
+            }
+            let pages = process_audit_verification_slice(pool)
+                .await
+                .expect("bounded verification slice");
+            assert!(pages <= AUDIT_VERIFICATION_PAGES_PER_SLICE);
+            terminal = audit_verification_status(pool, &first.id.to_string())
+                .await
+                .expect("verification status")
+                .expect("job exists");
+        }
+        assert_eq!(terminal.status, "verified", "terminal job: {terminal:?}");
+        assert!(terminal.is_terminal());
+        assert!(terminal.completed_at.is_some());
+        assert_eq!(
+            terminal.checked, complete_domain_rows,
+            "verification must include every row in the canonical audit domain"
         );
     }
 

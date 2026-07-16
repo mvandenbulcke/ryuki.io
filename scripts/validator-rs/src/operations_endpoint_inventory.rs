@@ -16,8 +16,9 @@ const REQUIRED_CATEGORIES: &[&str] = &[
     "sql-inventory",
     "evidence-object-storage",
     "cloudnativepg-database",
-    "vault-runtime-secrets",
-    "vaultwarden-cli-secrets",
+    "secret-resolve-read",
+    "secret-publish-version",
+    "secret-materialize-reload",
     "harbor-registry",
     "kubernetes-runtime",
     "azure-object-backup",
@@ -39,10 +40,7 @@ const REQUIRED_SECTIONS: &[&str] = &[
     "Approved Discovery Outputs",
 ];
 const REDACTION_BOUNDARY: &str = "no raw endpoint names, FQDNs, URLs, tenant identifiers, object identifiers, private network values, credentials, tokens, or provider payloads";
-const VAULTWARDEN_STATIC_BOUNDARY: &str =
-    "Vaultwarden and vaultwarden-cli entries remain static, dry-run, and approval-gated";
-const LEGACY_SECRET_PROVIDER_WORDING: &[&str] = &["conjur", "cyberark", "hashicorp"];
-const ALLOWED_VAULT_CATEGORY_IDS: &[&str] = &["vault-runtime-secrets"];
+const SECRET_CAPABILITY_STATIC_BOUNDARY: &str = "Secret resolution/read, publication/version, and materialization/reload entries remain separate, static, dry-run, and approval-gated";
 const README_LINK: &str = "[Endpoint Inventory](endpoint-inventory.md)";
 const README_CATEGORY_RULE: &str = "endpoint categories only";
 
@@ -111,13 +109,10 @@ fn validate_doc_text(doc: &str, errors: &mut Vec<String>) {
         "endpoint inventory must declare redaction boundary",
     );
     expect(
-        doc.contains(VAULTWARDEN_STATIC_BOUNDARY),
+        doc.contains(SECRET_CAPABILITY_STATIC_BOUNDARY),
         errors,
-        "endpoint inventory must declare Vaultwarden and vaultwarden-cli static boundary",
+        "endpoint inventory must declare separate secret capability boundaries",
     );
-    if contains_legacy_secret_provider_wording(doc) {
-        errors.push("endpoint inventory contains legacy secret provider wording".to_string());
-    }
     validate_table_categories(doc, errors);
     validate_no_forbidden_text(doc, DOC_PATH, errors);
 }
@@ -242,9 +237,6 @@ fn validate_readme_text(readme: &str, errors: &mut Vec<String>) {
         errors,
         "operations README must require endpoint categories only",
     );
-    if contains_legacy_secret_provider_wording(readme) {
-        errors.push("operations README contains legacy secret provider wording".to_string());
-    }
     validate_no_forbidden_text(readme, README_PATH, errors);
 }
 
@@ -418,29 +410,6 @@ fn contains_secret_path(line: &str) -> bool {
     .any(|prefix| contains_prefixed_path(line, prefix))
 }
 
-fn contains_legacy_secret_provider_wording(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if LEGACY_SECRET_PROVIDER_WORDING
-        .iter()
-        .any(|provider| contains_word(&lower, provider))
-    {
-        return true;
-    }
-
-    text.to_ascii_lowercase()
-        .lines()
-        .map(remove_allowed_vault_category_ids)
-        .any(|line| contains_word(&line, "vault"))
-}
-
-fn remove_allowed_vault_category_ids(line: &str) -> String {
-    ALLOWED_VAULT_CATEGORY_IDS
-        .iter()
-        .fold(line.to_string(), |current, category| {
-            current.replace(category, "")
-        })
-}
-
 fn contains_prefixed_path(line: &str, prefix: &str) -> bool {
     let mut search_from = 0;
     while let Some(offset) = line[search_from..].find(prefix) {
@@ -541,7 +510,7 @@ mod tests {
         doc.push_str("\n## Collection Boundary\n");
         doc.push_str(REDACTION_BOUNDARY);
         doc.push('\n');
-        doc.push_str(VAULTWARDEN_STATIC_BOUNDARY);
+        doc.push_str(SECRET_CAPABILITY_STATIC_BOUNDARY);
         doc.push_str("\n\n## Browser Isolation\nStatic browser isolation only.\n");
         doc.push_str("\n## Approved Discovery Outputs\nApproved redacted summaries only.\n");
         doc
@@ -552,25 +521,25 @@ mod tests {
         let doc = valid_doc();
         let changed_doc = doc
             .lines()
-            .filter(|line| !line.contains("`vault-runtime-secrets`"))
+            .filter(|line| !line.contains("`secret-resolve-read`"))
             .collect::<Vec<_>>()
             .join("\n");
         let changed_doc = format!(
-            "{changed_doc}\n<!--\n| `vault-runtime-secrets` | Static dry-run inventory summary | confirmed-category |\n-->\n"
+            "{changed_doc}\n<!--\n| `secret-resolve-read` | Static dry-run inventory summary | confirmed-category |\n-->\n"
         );
         let mut errors = Vec::new();
 
         validate_doc_text(&changed_doc, &mut errors);
 
         assert!(errors.iter().any(|error| {
-            error.contains("missing categories") && error.contains("vault-runtime-secrets")
+            error.contains("missing categories") && error.contains("secret-resolve-read")
         }));
     }
 
     #[test]
     fn commented_status_row_decoy_is_ignored() {
         let doc = format!(
-            "{}\n<!--\n| `vault-runtime-secrets` | Static dry-run inventory summary | live-discovery |\n-->\n",
+            "{}\n<!--\n| `secret-resolve-read` | Static dry-run inventory summary | live-discovery |\n-->\n",
             valid_doc()
         );
         let mut errors = Vec::new();
@@ -585,7 +554,7 @@ mod tests {
     #[test]
     fn active_row_with_inline_comment_is_still_validated() {
         let doc = format!(
-            "{}\n| `vault-runtime-secrets` | Static dry-run inventory summary | live-discovery | <!-- active row comment -->\n",
+            "{}\n| `secret-resolve-read` | Static dry-run inventory summary | live-discovery | <!-- active row comment -->\n",
             valid_doc()
         );
         let mut errors = Vec::new();
@@ -600,7 +569,7 @@ mod tests {
     #[test]
     fn active_duplicate_row_with_inline_comment_is_still_validated() {
         let doc = format!(
-            "{}\n| `vault-runtime-secrets` | Static dry-run inventory summary | confirmed-category | <!-- active row comment -->\n",
+            "{}\n| `secret-resolve-read` | Static dry-run inventory summary | confirmed-category | <!-- active row comment -->\n",
             valid_doc()
         );
         let mut errors = Vec::new();
@@ -610,5 +579,21 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("endpoint inventory categories must be unique")));
+    }
+
+    #[test]
+    fn approved_provider_names_are_not_treated_as_legacy_wording() {
+        let doc = valid_doc().replace(
+            "Static dry-run inventory summary",
+            "HashiCorp Vault, OpenBao, and CyberArk adapter category",
+        );
+        let mut errors = Vec::new();
+
+        validate_doc_text(&doc, &mut errors);
+
+        assert!(
+            errors.is_empty(),
+            "provider names are allowed when no endpoint, path, or payload is present: {errors:?}"
+        );
     }
 }

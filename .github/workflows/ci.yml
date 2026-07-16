@@ -1,6 +1,7 @@
 name: CI
 
-# Gates main: build, test, lint, secret scan, validator, and (on push) image builds.
+# Gates main: build, test, lint, dependency/secret scans, validator, and (on
+# push) image builds.
 # The Pages deploy (.github/workflows/static.yml) triggers via workflow_run on this
 # workflow's success, so broken code never redeploys the live site.
 on:
@@ -26,7 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18
+        # postgres:18.4, pinned to the reviewed multi-platform index.
+        image: postgres:18.4@sha256:b913fd5699b8bd23fa4b06d72ecdd939fad43b80fb8651bac06caa0e6d135cac
         env:
           POSTGRES_DB: ryuki_ci
           POSTGRES_USER: postgres
@@ -40,12 +42,12 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       # rust-toolchain.toml pins the stable channel with rustfmt + clippy components.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build workspace
         run: cargo build --workspace
       - name: Test workspace
@@ -76,24 +78,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
         with:
           components: rustfmt, clippy
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check formatting
         run: cargo fmt --check --all
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   security:
-    name: Secret Scan
+    name: Dependency & Secret Scan
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Run dependency audit
+        run: ./scripts/dependency-audit.sh
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Run secret scan
@@ -104,11 +112,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run validator
         run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 
@@ -120,7 +128,7 @@ jobs:
     needs: build-test
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Build platform-api image
         run: docker build -t ryuki/platform-api:ci -f sources/ryuki-api/Dockerfile .
       - name: Build portal-ui image

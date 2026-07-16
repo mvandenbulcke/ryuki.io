@@ -130,12 +130,12 @@
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>x-ryuki-protocol-version</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Required CP↔agent wire-schema version. The extractor rejects absent, duplicate, malformed, or unsupported values.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>RegisterBody</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>agent_id</code> in the JSON request body.</td></tr><tr><td><code>platform</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>platform</code> in the JSON request body.</td></tr><tr><td><code>capabilities</code></td><td><code>object (Capabilities)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>capabilities</code> in the JSON request body.</td></tr><tr><td><code>public_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>public_key</code> in the JSON request body.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>enrollment_challenge_id</code></td><td><code>string (uuid)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>enrollment_challenge_id</code> in the JSON request body.</td></tr><tr><td><code>enrollment_challenge</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>enrollment_challenge</code> in the JSON request body.</td></tr><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>agent_id</code> in the JSON request body.</td></tr><tr><td><code>platform</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>platform</code> in the JSON request body.</td></tr><tr><td><code>capabilities</code></td><td><code>object (Capabilities)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>capabilities</code> in the JSON request body.</td></tr><tr><td><code>public_key</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>public_key</code> in the JSON request body.</td></tr><tr><td><code>enrollment_proof</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>enrollment_proof</code> in the JSON request body.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>RegisterResponse</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>RegisterResponse</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>agent_id</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>agent_id</code> returned in the response body.</td></tr><tr><td><code>token</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>token</code> returned in the response body.</td></tr></tbody></table>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
+<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response headers</h4>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -144,15 +144,8 @@
   <span class="hl-cmd">--request</span> POST \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Content-Type: application/json'</span> \
   <span class="hl-cmd">--header</span> <span class="hl-s">'x-ryuki-protocol-version: 2'</span> \
-  <span class="hl-cmd">--data</span> <span class="hl-s">'{"agent_id":"&lt;string&gt;","platform":"&lt;string&gt;","capabilities":{},"public_key":"&lt;string&gt;"}'</span> \
+  <span class="hl-cmd">--data</span> <span class="hl-s">'{"enrollment_challenge_id":"&lt;uuid&gt;","enrollment_challenge":"&lt;string&gt;","agent_id":"&lt;string&gt;","platform":"&lt;string&gt;","capabilities":{},"public_key":"&lt;string&gt;","enrollment_proof":"&lt;string&gt;"}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/agents/register'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"agent_id"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
-  <span class="hl-k">"token"</span>: <span class="hl-s">"&lt;string&gt;"</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-agents-agent-id-heartbeat"><span class="method-chip m-post">POST</span><code>/api/agents/{agent_id}/heartbeat</code></h2>

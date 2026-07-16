@@ -15,7 +15,18 @@ const API_README_PATH: &str = "api/Ryuki.Platform.Api/README.md";
 const CATALOG_README_PATH: &str = "catalog/README.md";
 const DOC_README_PATH: &str = "docs/workflows/README.md";
 const DOC_PATH: &str = "docs/workflows/vault-secret-delivery.md";
+const VSO_MANIFEST_PATH: &str = "deploy/kubernetes/vault/vso-secrets.yaml";
+const MIGRATION_VSO_MANIFEST_PATH: &str =
+    "deploy/kubernetes/operations/migration-vault-dynamic-secret.yaml";
+const SERVICE_ACCOUNTS_PATH: &str = "deploy/kubernetes/base/serviceaccounts.yaml";
+const API_DEPLOYMENT_PATH: &str = "deploy/kubernetes/base/deployments.yaml";
+const CNPG_CLUSTER_PATH: &str = "deploy/kubernetes/cloudnativepg/cnpg-cluster.yaml";
+const VAULT_BOOTSTRAP_PATH: &str = "deploy/kubernetes/vault/bootstrap-runbook.md";
 const ENDPOINT: &str = "/api/platform/vault-secret-delivery-contract";
+const CNPG_SERVER_DNS_NAME: &str = "ryuki-platform-db-rw.ryuki-platform.svc";
+const CNPG_POSTGRES_ENDPOINT: &str = "ryuki-platform-db-rw.ryuki-platform.svc:5432";
+const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
+const CNPG_CA_FILE_PATH: &str = "/var/run/secrets/ryuki/cnpg/ca.crt";
 
 const REQUIRED_SURFACES: &[&str] = &[
     "vault-secrets-operator-readiness",
@@ -211,6 +222,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
 
 #[derive(Debug, Deserialize)]
 struct Context {
+    root: String,
     catalog: Value,
     catalog_text: String,
     program: String,
@@ -268,6 +280,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
         &context.doc,
         &mut errors,
     );
+    validate_reference_guardrails(Path::new(&context.root), &mut errors)?;
     // relaxed (PROGRAM_PATH / API_README_PATH): the prohibited-value scan was
     // written for C# Program.cs / README literals. Run against the whole Rust
     // contracts.rs source and the generated route-inventory doc it flags values
@@ -282,6 +295,384 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
     });
     scan_prohibited_value(&scope, "vault-secret-delivery", &mut errors);
     Ok(errors)
+}
+
+fn validate_reference_guardrails(root: &Path, errors: &mut Vec<String>) -> Result<(), String> {
+    let vso = fs::read_to_string(root.join(VSO_MANIFEST_PATH))
+        .map_err(|error| format!("failed to read {VSO_MANIFEST_PATH}: {error}"))?;
+    let migration_vso = fs::read_to_string(root.join(MIGRATION_VSO_MANIFEST_PATH))
+        .map_err(|error| format!("failed to read {MIGRATION_VSO_MANIFEST_PATH}: {error}"))?;
+    let service_accounts = fs::read_to_string(root.join(SERVICE_ACCOUNTS_PATH))
+        .map_err(|error| format!("failed to read {SERVICE_ACCOUNTS_PATH}: {error}"))?;
+    let deployments = fs::read_to_string(root.join(API_DEPLOYMENT_PATH))
+        .map_err(|error| format!("failed to read {API_DEPLOYMENT_PATH}: {error}"))?;
+    let cnpg = fs::read_to_string(root.join(CNPG_CLUSTER_PATH))
+        .map_err(|error| format!("failed to read {CNPG_CLUSTER_PATH}: {error}"))?;
+    let bootstrap = fs::read_to_string(root.join(VAULT_BOOTSTRAP_PATH))
+        .map_err(|error| format!("failed to read {VAULT_BOOTSTRAP_PATH}: {error}"))?;
+
+    validate_yaml_duplicate_keys_text(&vso, VSO_MANIFEST_PATH, errors);
+    validate_yaml_duplicate_keys_text(&migration_vso, MIGRATION_VSO_MANIFEST_PATH, errors);
+    validate_yaml_duplicate_keys_text(&cnpg, CNPG_CLUSTER_PATH, errors);
+    let base_documents = parse_yaml_documents(&vso, VSO_MANIFEST_PATH)?;
+    let migration_documents = parse_yaml_documents(&migration_vso, MIGRATION_VSO_MANIFEST_PATH)?;
+    let deployment_documents = parse_yaml_documents(&deployments, API_DEPLOYMENT_PATH)?;
+    let cnpg_documents = parse_yaml_documents(&cnpg, CNPG_CLUSTER_PATH)?;
+    let migration_digest_prefix = platform_api_digest_prefix(&deployment_documents);
+    if migration_digest_prefix.is_none() {
+        errors.push(format!(
+            "{API_DEPLOYMENT_PATH} platform-api image must provide a 64-hex digest for migration identity derivation"
+        ));
+    }
+    validate_vso_documents(
+        &base_documents,
+        &migration_documents,
+        migration_digest_prefix.as_deref(),
+        errors,
+    );
+    validate_cnpg_tls_contract(&cnpg_documents, errors);
+    if vso.contains("serviceAccount: platform-api") {
+        errors.push(format!(
+            "{VSO_MANIFEST_PATH} must not reuse the API workload identity across secret families"
+        ));
+    }
+
+    let service_account_documents = parse_yaml_documents(&service_accounts, SERVICE_ACCOUNTS_PATH)?;
+    let actual_service_accounts: HashSet<&str> = service_account_documents
+        .iter()
+        .filter(|document| document.get("kind").and_then(Value::as_str) == Some("ServiceAccount"))
+        .filter_map(|document| document.pointer("/metadata/name").and_then(Value::as_str))
+        .collect();
+    let expected_service_accounts: HashSet<&str> = [
+        "portal-ui",
+        "platform-api",
+        "platform-api-migrator",
+        "vault-db-owner",
+        "vault-db-backup",
+        "vault-api-db",
+        "vault-api-db-migrator",
+    ]
+    .into_iter()
+    .collect();
+    if actual_service_accounts != expected_service_accounts {
+        errors.push(format!(
+            "{SERVICE_ACCOUNTS_PATH} must contain exactly the serving, one-shot, and four materializer identities"
+        ));
+    }
+    if !deployments.contains("strategy:\n    type: Recreate")
+        || deployments.contains("type: RollingUpdate")
+        || deployments.contains("maxUnavailable:")
+        || deployments.contains("maxSurge:")
+    {
+        errors.push(format!(
+            "{API_DEPLOYMENT_PATH} must recreate, not overlap, the API during secret rotation"
+        ));
+    }
+
+    for required in [
+        "VAULT_HELM_CHART_ARCHIVE",
+        "VAULT_HELM_CHART_VERSION",
+        "VAULT_HELM_CHART_SHA256",
+        "chart version must be exact MAJOR.MINOR.PATCH",
+        "chart SHA-256 mismatch",
+        "helm show chart \"$VAULT_HELM_CHART_ARCHIVE\"",
+        "helm upgrade --install vault \"$VAULT_HELM_CHART_ARCHIVE\"",
+    ] {
+        if !bootstrap.contains(required) {
+            errors.push(format!(
+                "{VAULT_BOOTSTRAP_PATH} is missing exact-chart guard `{required}`"
+            ));
+        }
+    }
+    if bootstrap.contains("helm upgrade --install vault hashicorp/vault") {
+        errors.push(format!(
+            "{VAULT_BOOTSTRAP_PATH} must not install a repository-latest chart"
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_yaml_documents(text: &str, path: &str) -> Result<Vec<Value>, String> {
+    serde_yaml::Deserializer::from_str(text)
+        .enumerate()
+        .map(|(index, document)| {
+            Value::deserialize(document).map_err(|error| {
+                format!(
+                    "failed to parse {path} YAML document {}: {error}",
+                    index + 1
+                )
+            })
+        })
+        .collect()
+}
+
+fn named_document<'a>(documents: &'a [Value], kind: &str, name: &str) -> Option<&'a Value> {
+    documents.iter().find(|document| {
+        document.get("kind").and_then(Value::as_str) == Some(kind)
+            && document.pointer("/metadata/name").and_then(Value::as_str) == Some(name)
+    })
+}
+
+fn platform_api_digest_prefix(deployments: &[Value]) -> Option<String> {
+    let deployment = named_document(deployments, "Deployment", "platform-api")?;
+    let image = deployment
+        .pointer("/spec/template/spec/containers/0/image")
+        .and_then(Value::as_str)?;
+    let (name, digest) = image.rsplit_once("@sha256:")?;
+    if name.is_empty()
+        || name.contains('@')
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    digest.get(..12).map(str::to_string)
+}
+
+fn validate_cnpg_tls_contract(documents: &[Value], errors: &mut Vec<String>) {
+    let cluster = named_document(documents, "Cluster", "ryuki-platform-db");
+    let valid = documents.len() == 1
+        && cluster.is_some_and(|cluster| {
+            cluster
+                .pointer("/metadata/annotations/ryuki.io~1required-server-dns-san")
+                .and_then(Value::as_str)
+                == Some(CNPG_SERVER_DNS_NAME)
+                && cluster
+                    .pointer("/metadata/annotations/ryuki.io~1client-ca-secret")
+                    .and_then(Value::as_str)
+                    == Some(CNPG_CA_SECRET_NAME)
+        });
+    if !valid {
+        errors.push(format!(
+            "{CNPG_CLUSTER_PATH} must bind clients to DNS SAN {CNPG_SERVER_DNS_NAME} and CA Secret {CNPG_CA_SECRET_NAME}"
+        ));
+    }
+}
+
+fn validate_vso_documents(
+    base: &[Value],
+    migration: &[Value],
+    migration_digest_prefix: Option<&str>,
+    errors: &mut Vec<String>,
+) {
+    let base_kind_count = |kind: &str| {
+        base.iter()
+            .filter(|document| document.get("kind").and_then(Value::as_str) == Some(kind))
+            .count()
+    };
+    if base_kind_count("VaultStaticSecret") != 2 || base_kind_count("VaultDynamicSecret") != 1 {
+        errors.push(format!(
+            "{VSO_MANIFEST_PATH} must contain exactly two static infrastructure secrets and one dynamic API database lease"
+        ));
+    }
+    let expected_base_auth: HashMap<&str, &str> = [
+        ("ryuki-db-owner-vault-auth", "vault-db-owner"),
+        ("ryuki-db-backup-vault-auth", "vault-db-backup"),
+        ("ryuki-api-db-vault-auth", "vault-api-db"),
+    ]
+    .into_iter()
+    .collect();
+    let actual_base_auth: HashMap<&str, &str> = base
+        .iter()
+        .filter(|document| document.get("kind").and_then(Value::as_str) == Some("VaultAuth"))
+        .filter_map(|document| {
+            Some((
+                document.pointer("/metadata/name")?.as_str()?,
+                document
+                    .pointer("/spec/kubernetes/serviceAccount")?
+                    .as_str()?,
+            ))
+        })
+        .collect();
+    if actual_base_auth != expected_base_auth {
+        errors.push(format!(
+            "{VSO_MANIFEST_PATH} must contain exactly the owner, backup, and runtime API VaultAuth boundaries"
+        ));
+    }
+    if base.iter().any(|document| {
+        document
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.contains("migrator"))
+    }) {
+        errors.push(format!(
+            "{VSO_MANIFEST_PATH} must not continuously reconcile migration credentials"
+        ));
+    }
+
+    for (name, auth) in [
+        ("ryuki-platform-db-superuser", "ryuki-db-owner-vault-auth"),
+        ("ryuki-platform-db-backup-s3", "ryuki-db-backup-vault-auth"),
+    ] {
+        let valid = named_document(base, "VaultStaticSecret", name).is_some_and(|document| {
+            document
+                .pointer("/spec/vaultAuthRef")
+                .and_then(Value::as_str)
+                == Some(auth)
+                && document
+                    .pointer("/spec/destination/name")
+                    .and_then(Value::as_str)
+                    == Some(name)
+        });
+        if !valid {
+            errors.push(format!(
+                "{VSO_MANIFEST_PATH} has an invalid static secret boundary for {name}"
+            ));
+        }
+    }
+
+    let runtime = named_document(base, "VaultDynamicSecret", "ryuki-platform-api-db");
+    let runtime_valid = runtime.is_some_and(|document| {
+        document
+            .pointer("/metadata/annotations/ryuki.io~1postgres-host")
+            .and_then(Value::as_str)
+            == Some(CNPG_POSTGRES_ENDPOINT)
+            && document
+                .pointer("/spec/vaultAuthRef")
+                .and_then(Value::as_str)
+                == Some("ryuki-api-db-vault-auth")
+            && document.pointer("/spec/mount").and_then(Value::as_str) == Some("database")
+            && document.pointer("/spec/path").and_then(Value::as_str)
+                == Some("creds/ryuki-app-runtime")
+            && document
+                .pointer("/spec/renewalPercent")
+                .and_then(Value::as_i64)
+                == Some(67)
+            && document.pointer("/spec/revoke").and_then(Value::as_bool) == Some(true)
+            && document
+                .pointer("/spec/allowStaticCreds")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && document
+                .pointer("/spec/destination/name")
+                .and_then(Value::as_str)
+                == Some("ryuki-platform-api-db")
+            && document
+                .pointer("/spec/destination/create")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && document
+                .pointer("/spec/destination/type")
+                .and_then(Value::as_str)
+                == Some("Opaque")
+            && exact_transformed_key(document, "RYUKI_DATABASE_URL")
+            && exact_restart_target(document, "Deployment", "platform-api")
+    });
+    if !runtime_valid {
+        errors.push(format!(
+            "{VSO_MANIFEST_PATH} runtime database delivery must be a revoking dynamic lease with one transformed URL and one restart target"
+        ));
+    }
+
+    let digest_prefix = migration_digest_prefix.unwrap_or_default();
+    let migration_auth_name = format!("ryuki-api-db-migrator-vault-auth-{digest_prefix}");
+    let migration_auth_role = format!("ryuki-api-db-migrator-{digest_prefix}");
+    let migration_secret_name = format!("ryuki-platform-api-migrator-db-{digest_prefix}");
+    let migration_database_path = format!("creds/ryuki-schema-migrator-{digest_prefix}");
+    let migration_auth = named_document(migration, "VaultAuth", &migration_auth_name);
+    let migration_auth_valid = migration_auth.is_some_and(|document| {
+        document
+            .pointer("/spec/kubernetes/role")
+            .and_then(Value::as_str)
+            == Some(migration_auth_role.as_str())
+            && document
+                .pointer("/spec/kubernetes/serviceAccount")
+                .and_then(Value::as_str)
+                == Some("vault-api-db-migrator")
+            && document
+                .pointer("/metadata/labels/ryuki.io~1release-digest-prefix")
+                .and_then(Value::as_str)
+                == Some(digest_prefix)
+    });
+    let migration_secret = named_document(migration, "VaultDynamicSecret", &migration_secret_name);
+    let migration_secret_valid = migration_secret.is_some_and(|document| {
+        document
+            .pointer("/metadata/annotations/ryuki.io~1postgres-host")
+            .and_then(Value::as_str)
+            == Some(CNPG_POSTGRES_ENDPOINT)
+            && document
+                .pointer("/metadata/labels/ryuki.io~1release-digest-prefix")
+                .and_then(Value::as_str)
+                == Some(digest_prefix)
+            && document
+                .pointer("/spec/vaultAuthRef")
+                .and_then(Value::as_str)
+                == Some(migration_auth_name.as_str())
+            && document.pointer("/spec/mount").and_then(Value::as_str) == Some("database")
+            && document.pointer("/spec/path").and_then(Value::as_str)
+                == Some(migration_database_path.as_str())
+            && document
+                .pointer("/spec/renewalPercent")
+                .and_then(Value::as_i64)
+                == Some(67)
+            && document.pointer("/spec/revoke").and_then(Value::as_bool) == Some(true)
+            && document
+                .pointer("/spec/allowStaticCreds")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && document
+                .pointer("/spec/destination/name")
+                .and_then(Value::as_str)
+                == Some(migration_secret_name.as_str())
+            && document
+                .pointer("/spec/destination/create")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && document
+                .pointer("/spec/destination/type")
+                .and_then(Value::as_str)
+                == Some("Opaque")
+            && exact_transformed_key(document, "RYUKI_MIGRATION_DATABASE_URL")
+            && document.pointer("/spec/rolloutRestartTargets").is_none()
+    });
+    if migration.len() != 2 || !migration_auth_valid || !migration_secret_valid {
+        errors.push(format!(
+            "{MIGRATION_VSO_MANIFEST_PATH} must contain exactly one digest-scoped VaultAuth and one revoking migration VaultDynamicSecret"
+        ));
+    }
+}
+
+fn exact_transformed_key(document: &Value, key: &str) -> bool {
+    let Some(templates) = document
+        .pointer("/spec/destination/transformation/templates")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let text = templates
+        .get(key)
+        .and_then(|template| template.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let authenticated_tls = format!("sslmode=verify-full&sslrootcert={CNPG_CA_FILE_PATH}");
+    templates.len() == 1
+        && text.contains(&authenticated_tls)
+        && !text.contains("sslmode=require")
+        && text.contains("regexMatch")
+        && text.contains("fail")
+        && document
+            .pointer("/spec/destination/transformation/excludeRaw")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && document
+            .pointer("/spec/destination/transformation/excludes")
+            .and_then(Value::as_array)
+            .is_some_and(|excludes| excludes.len() == 1 && excludes[0].as_str() == Some(".*"))
+}
+
+fn exact_restart_target(document: &Value, kind: &str, name: &str) -> bool {
+    let Some(targets) = document
+        .pointer("/spec/rolloutRestartTargets")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    targets.len() == 1
+        && targets[0].get("kind").and_then(Value::as_str) == Some(kind)
+        && targets[0].get("name").and_then(Value::as_str) == Some(name)
 }
 
 pub fn validate_catalog_json(input: &str) -> Result<Vec<String>, String> {
@@ -2212,6 +2603,78 @@ mod tests {
                 "evidence": rule.evidence,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn current_reference_manifests_keep_secret_delivery_guardrails() {
+        let mut errors = Vec::new();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        validate_reference_guardrails(&root, &mut errors)
+            .expect("reference files should be readable");
+        assert!(errors.is_empty(), "guardrail errors: {errors:#?}");
+    }
+
+    #[test]
+    fn migration_secret_identities_follow_the_admitted_api_digest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let base_raw = fs::read_to_string(root.join(VSO_MANIFEST_PATH)).expect("base VSO YAML");
+        let migration_raw =
+            fs::read_to_string(root.join(MIGRATION_VSO_MANIFEST_PATH)).expect("migration VSO YAML");
+        let deployments_raw =
+            fs::read_to_string(root.join(API_DEPLOYMENT_PATH)).expect("Deployment YAML");
+        let base = parse_yaml_documents(&base_raw, VSO_MANIFEST_PATH).expect("base VSO parse");
+        let migration = parse_yaml_documents(&migration_raw, MIGRATION_VSO_MANIFEST_PATH)
+            .expect("migration VSO parse");
+        let deployments =
+            parse_yaml_documents(&deployments_raw, API_DEPLOYMENT_PATH).expect("Deployment parse");
+        let prefix = platform_api_digest_prefix(&deployments).expect("admitted API digest");
+
+        let mut errors = Vec::new();
+        validate_vso_documents(&base, &migration, Some(&prefix), &mut errors);
+        assert!(
+            errors.is_empty(),
+            "derived identities should pass: {errors:?}"
+        );
+
+        let mut errors = Vec::new();
+        validate_vso_documents(&base, &migration, Some("222222222222"), &mut errors);
+        assert!(
+            errors.iter().any(|error| error.contains("digest-scoped")),
+            "stale Vault identities must fail when the admitted digest changes: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn transformed_database_urls_require_verify_full_and_the_cnpg_ca() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join(VSO_MANIFEST_PATH)).expect("base VSO YAML");
+        let documents = parse_yaml_documents(&raw, VSO_MANIFEST_PATH).expect("base VSO parse");
+        let runtime = named_document(&documents, "VaultDynamicSecret", "ryuki-platform-api-db")
+            .expect("runtime database delivery");
+        assert!(exact_transformed_key(runtime, "RYUKI_DATABASE_URL"));
+
+        for replacement in [
+            "sslmode=require",
+            "sslmode=verify-full",
+            "sslmode=verify-ca&sslrootcert=/var/run/secrets/ryuki/cnpg/ca.crt",
+        ] {
+            let mut invalid = runtime.clone();
+            let text = invalid
+                .pointer_mut("/spec/destination/transformation/templates/RYUKI_DATABASE_URL/text")
+                .and_then(|value| value.as_str())
+                .expect("URL template text")
+                .replace(
+                    "sslmode=verify-full&sslrootcert=/var/run/secrets/ryuki/cnpg/ca.crt",
+                    replacement,
+                );
+            *invalid
+                .pointer_mut("/spec/destination/transformation/templates/RYUKI_DATABASE_URL/text")
+                .expect("URL template text") = Value::String(text);
+            assert!(
+                !exact_transformed_key(&invalid, "RYUKI_DATABASE_URL"),
+                "unauthenticated or CA-unbound TLS template must be rejected: {replacement}"
+            );
+        }
     }
 
     #[test]

@@ -298,10 +298,142 @@ fn is_terminal(status: &ExecutionStatus) -> bool {
     )
 }
 
+/// Validate the complete execution snapshot before any transition or durable
+/// write. Required catalog steps must appear exactly once, in their declared
+/// order; a non-pending step requires every predecessor to be completed; status
+/// and timestamp shapes must agree; and Completed means every required step is
+/// actually complete.
+pub fn validate_execution_invariants(exec: &RunbookExecution) -> Result<(), String> {
+    let runbook = find_runbook(&exec.runbook_id)
+        .ok_or_else(|| format!("Runbook '{}' not found", exec.runbook_id))?;
+    let expected_orders: Vec<u32> = runbook.steps.iter().map(|step| step.order).collect();
+    let mut persisted_orders: Vec<u32> = exec
+        .steps_results
+        .iter()
+        .filter(|step| step.step_order > 0)
+        .map(|step| step.step_order)
+        .collect();
+    persisted_orders.sort_unstable();
+    if persisted_orders != expected_orders {
+        return Err(format!(
+            "Execution '{}' must contain each required runbook step exactly once in order",
+            exec.id
+        ));
+    }
+
+    let failure_markers: Vec<&StepResult> = exec
+        .steps_results
+        .iter()
+        .filter(|step| step.step_order == 0)
+        .collect();
+    if exec.status == ExecutionStatus::Failed {
+        if failure_markers.len() != 1 || failure_markers[0].status != StepStatus::Failed {
+            return Err(format!(
+                "Execution '{}' must carry exactly one failure reason marker",
+                exec.id
+            ));
+        }
+    } else if !failure_markers.is_empty() {
+        return Err(format!(
+            "Execution '{}' carries a failure marker outside Failed status",
+            exec.id
+        ));
+    }
+
+    for step in &exec.steps_results {
+        match step.status {
+            StepStatus::Pending => {
+                if step.started_at.is_some() || step.completed_at.is_some() {
+                    return Err(format!(
+                        "Pending step {} cannot carry execution timestamps",
+                        step.step_order
+                    ));
+                }
+            }
+            StepStatus::Running => {
+                if step.started_at.is_none() || step.completed_at.is_some() {
+                    return Err(format!(
+                        "Running step {} requires only a start timestamp",
+                        step.step_order
+                    ));
+                }
+            }
+            StepStatus::Completed | StepStatus::Failed => {
+                if step.started_at.is_none() || step.completed_at.is_none() {
+                    return Err(format!(
+                        "Terminal step {} requires start and completion timestamps",
+                        step.step_order
+                    ));
+                }
+            }
+        }
+
+        if step.step_order > 0 && step.status != StepStatus::Pending {
+            let predecessors_complete = exec.steps_results.iter().all(|candidate| {
+                candidate.step_order == 0
+                    || candidate.step_order >= step.step_order
+                    || candidate.status == StepStatus::Completed
+            });
+            if !predecessors_complete {
+                return Err(format!(
+                    "Step {} cannot advance before every predecessor is completed",
+                    step.step_order
+                ));
+            }
+        }
+    }
+
+    let required_steps = exec.steps_results.iter().filter(|step| step.step_order > 0);
+    match exec.status {
+        ExecutionStatus::Draft | ExecutionStatus::Approved => {
+            if !required_steps
+                .clone()
+                .all(|step| step.status == StepStatus::Pending)
+            {
+                return Err(format!(
+                    "Execution '{}' cannot have advanced steps before Running",
+                    exec.id
+                ));
+            }
+        }
+        ExecutionStatus::Running => {
+            if !required_steps
+                .clone()
+                .any(|step| step.status != StepStatus::Pending)
+                || required_steps
+                    .clone()
+                    .any(|step| step.status == StepStatus::Failed)
+            {
+                return Err(format!(
+                    "Running execution '{}' requires an advanced, non-failed step",
+                    exec.id
+                ));
+            }
+        }
+        ExecutionStatus::Completed => {
+            if !required_steps
+                .clone()
+                .all(|step| step.status == StepStatus::Completed)
+            {
+                return Err(format!(
+                    "Execution '{}' cannot complete while a required step is unfinished",
+                    exec.id
+                ));
+            }
+        }
+        ExecutionStatus::Failed | ExecutionStatus::RolledBack => {}
+    }
+
+    Ok(())
+}
+
 // ─── Pure constructors and transition functions ────────────────────────────────
 
-/// Pure constructor: validates inputs and builds a new `RunbookExecution` in
-/// `Draft` status without touching any shared state.
+/// Pure constructor: validates inputs and builds a new `RunbookExecution`
+/// without touching any shared state. Approval-required runbooks start in
+/// `Draft`; explicitly no-approval runbooks start ready in `Approved` so the
+/// lifecycle gate does not turn their documented fast path into an unusable
+/// workflow.
 pub fn build_execution(
     runbook_id: &str,
     site: &str,
@@ -320,10 +452,16 @@ pub fn build_execution(
     let runbook =
         find_runbook(runbook_id).ok_or_else(|| format!("Runbook '{}' not found", runbook_id))?;
 
+    let initial_status = if runbook.approval_required {
+        ExecutionStatus::Draft
+    } else {
+        ExecutionStatus::Approved
+    };
+
     Ok(RunbookExecution {
         id: make_execution_id(site),
         runbook_id: runbook.id.clone(),
-        status: ExecutionStatus::Draft,
+        status: initial_status,
         site: site.into(),
         started_by: started_by.into(),
         steps_results: runbook
@@ -335,11 +473,13 @@ pub fn build_execution(
 }
 
 /// Pure transition: approve an execution. Returns `Err` if the current status
-/// is not `Draft`. Returns a cloned entity with `status = Approved`.
+/// is not `Draft` or the approver is the execution initiator. Returns a cloned
+/// entity with `status = Approved`.
 pub fn approve_execution_pure(
     exec: &RunbookExecution,
     approver: &str,
 ) -> Result<RunbookExecution, String> {
+    validate_execution_invariants(exec)?;
     if approver.trim().is_empty() {
         return Err("approver cannot be empty".into());
     }
@@ -349,22 +489,46 @@ pub fn approve_execution_pure(
             exec.id, exec.status
         ));
     }
+    if exec.started_by.trim() == approver.trim() {
+        return Err(format!(
+            "Execution '{}' requires an approver distinct from its initiator",
+            exec.id
+        ));
+    }
     let mut updated = exec.clone();
     updated.status = ExecutionStatus::Approved;
+    validate_execution_invariants(&updated)?;
     Ok(updated)
 }
 
-/// Pure transition: complete an execution. Returns `Err` if the execution is
-/// already terminal.
+/// Pure transition: complete an execution. Completion is valid only after the
+/// distinct approval boundary, either directly from `Approved` for a runbook
+/// with no executable steps or from `Running` after step execution began.
 pub fn complete_execution_pure(exec: &RunbookExecution) -> Result<RunbookExecution, String> {
-    if is_terminal(&exec.status) {
+    validate_execution_invariants(exec)?;
+    if !matches!(
+        exec.status,
+        ExecutionStatus::Approved | ExecutionStatus::Running
+    ) {
         return Err(format!(
-            "Execution '{}' is already terminal ({:?})",
+            "Execution '{}' must be Approved or Running to complete (current: {:?})",
             exec.id, exec.status
+        ));
+    }
+    if exec
+        .steps_results
+        .iter()
+        .filter(|step| step.step_order > 0)
+        .any(|step| step.status != StepStatus::Completed)
+    {
+        return Err(format!(
+            "Execution '{}' cannot complete until every required step is completed",
+            exec.id
         ));
     }
     let mut updated = exec.clone();
     updated.status = ExecutionStatus::Completed;
+    validate_execution_invariants(&updated)?;
     Ok(updated)
 }
 
@@ -374,6 +538,7 @@ pub fn fail_execution_pure(
     exec: &RunbookExecution,
     reason: &str,
 ) -> Result<RunbookExecution, String> {
+    validate_execution_invariants(exec)?;
     if reason.trim().is_empty() {
         return Err("reason cannot be empty".into());
     }
@@ -393,12 +558,14 @@ pub fn fail_execution_pure(
         started_at: Some(timestamp.clone()),
         completed_at: Some(timestamp),
     });
+    validate_execution_invariants(&updated)?;
     Ok(updated)
 }
 
 /// Pure transition: rollback an execution. Returns `Err` if the execution is
 /// already terminal.
 pub fn rollback_execution_pure(exec: &RunbookExecution) -> Result<RunbookExecution, String> {
+    validate_execution_invariants(exec)?;
     if is_terminal(&exec.status) {
         return Err(format!(
             "Execution '{}' is already terminal ({:?})",
@@ -407,24 +574,47 @@ pub fn rollback_execution_pure(exec: &RunbookExecution) -> Result<RunbookExecuti
     }
     let mut updated = exec.clone();
     updated.status = ExecutionStatus::RolledBack;
+    validate_execution_invariants(&updated)?;
     Ok(updated)
 }
 
-/// Pure transition: execute a step. Returns `Err` if the execution is terminal
-/// or the step is not found.
+/// Pure transition: execute a step. Step execution is valid only after the
+/// distinct Draft-to-Approved transition and while the execution is Approved
+/// or Running.
 pub fn execute_step_pure(
     exec: &RunbookExecution,
     step_order: u32,
 ) -> Result<RunbookExecution, String> {
-    if is_terminal(&exec.status) {
-        return Err(format!("Execution '{}' is terminal", exec.id));
+    validate_execution_invariants(exec)?;
+    if !matches!(
+        exec.status,
+        ExecutionStatus::Approved | ExecutionStatus::Running
+    ) {
+        return Err(format!(
+            "Execution '{}' must be Approved or Running to execute a step (current: {:?})",
+            exec.id, exec.status
+        ));
     }
-    if !exec
+    let step = exec
         .steps_results
         .iter()
-        .any(|s| s.step_order == step_order)
-    {
-        return Err(format!("Step {} not found", step_order));
+        .find(|s| s.step_order == step_order)
+        .ok_or_else(|| format!("Step {} not found", step_order))?;
+    if step.status != StepStatus::Pending {
+        return Err(format!(
+            "Step {} is not Pending (current: {:?})",
+            step_order, step.status
+        ));
+    }
+    if exec.steps_results.iter().any(|candidate| {
+        candidate.step_order > 0
+            && candidate.step_order < step_order
+            && candidate.status != StepStatus::Completed
+    }) {
+        return Err(format!(
+            "Step {} cannot execute before every predecessor is completed",
+            step_order
+        ));
     }
     let timestamp = now_iso();
     let mut updated = exec.clone();
@@ -437,6 +627,7 @@ pub fn execute_step_pure(
             step.completed_at = Some(timestamp.clone());
         }
     }
+    validate_execution_invariants(&updated)?;
     Ok(updated)
 }
 
@@ -606,12 +797,23 @@ mod tests {
     }
 
     #[test]
-    fn test_start_runbook_creates_execution_in_draft_status() {
-        let result = start_runbook("restart-service", "DEFRA", "test.engineer").unwrap();
+    fn approval_required_runbook_starts_in_draft_status() {
+        let result = start_runbook("certificate-renewal", "DEFRA", "test.engineer").unwrap();
 
-        assert_eq!(result["execution"]["runbook_id"], "restart-service");
+        assert_eq!(result["execution"]["runbook_id"], "certificate-renewal");
         assert_eq!(result["execution"]["site"], "DEFRA");
         assert_eq!(result["execution"]["status"], "draft");
+    }
+
+    #[test]
+    fn no_approval_runbook_starts_ready_and_can_execute() {
+        let ready = build_execution("restart-service", "DEFRA", "test.engineer").unwrap();
+
+        assert_eq!(ready.status, ExecutionStatus::Approved);
+        let running = execute_step_pure(&ready, 1)
+            .expect("a catalog runbook that explicitly needs no approval stays executable");
+        assert_eq!(running.status, ExecutionStatus::Running);
+        assert_eq!(ready.status, ExecutionStatus::Approved);
     }
 
     #[test]
@@ -622,8 +824,33 @@ mod tests {
         let approved = approve_execution(id, "change.manager").unwrap();
         assert_eq!(approved["execution"]["status"], "approved");
 
+        execute_step(id, 1).unwrap();
+        execute_step(id, 2).unwrap();
+        execute_step(id, 3).unwrap();
         let completed = complete_execution(id).unwrap();
         assert_eq!(completed["execution"]["status"], "completed");
+    }
+
+    #[test]
+    fn initiator_cannot_approve_own_execution() {
+        let draft = build_execution("dns-record-update", "GBLON", "same.principal").unwrap();
+
+        let error = approve_execution_pure(&draft, " same.principal ")
+            .expect_err("maker/checker approval must require a distinct principal");
+
+        assert!(error.contains("approver distinct from its initiator"));
+        assert_eq!(draft.status, ExecutionStatus::Draft);
+    }
+
+    #[test]
+    fn distinct_principal_can_approve_execution() {
+        let draft = build_execution("dns-record-update", "GBLON", "request.maker").unwrap();
+
+        let approved = approve_execution_pure(&draft, "request.checker")
+            .expect("a distinct approver must retain the supported approval flow");
+
+        assert_eq!(approved.status, ExecutionStatus::Approved);
+        assert_eq!(draft.status, ExecutionStatus::Draft);
     }
 
     #[test]
@@ -631,12 +858,108 @@ mod tests {
         let result = start_runbook("certificate-renewal", "DEBER", "test.engineer").unwrap();
         let id = result["execution"]["id"].as_str().unwrap();
 
+        approve_execution(id, "change.manager").unwrap();
+
         let executed = execute_step(id, 1).unwrap();
 
         assert_eq!(executed["status"], "running");
         assert_eq!(executed["step_result"]["step_order"], 1);
         assert_eq!(executed["step_result"]["status"], "completed");
         assert!(executed["step_result"]["completed_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn completed_step_cannot_be_executed_twice() {
+        let draft = build_execution("certificate-renewal", "DEBER", "test.engineer").unwrap();
+        let approved = approve_execution_pure(&draft, "change.manager").unwrap();
+        let running = execute_step_pure(&approved, 1).expect("first execution");
+
+        let error =
+            execute_step_pure(&running, 1).expect_err("completed step retry must be a no-op");
+
+        assert!(error.contains("not Pending"));
+        assert_eq!(
+            running
+                .steps_results
+                .iter()
+                .find(|step| step.step_order == 1)
+                .expect("step")
+                .status,
+            StepStatus::Completed
+        );
+    }
+
+    #[test]
+    fn later_steps_require_completed_predecessors() {
+        let draft = build_execution("certificate-renewal", "DEBER", "test.engineer").unwrap();
+        let approved = approve_execution_pure(&draft, "change.manager").unwrap();
+
+        let error = execute_step_pure(&approved, 2)
+            .expect_err("step 2 must not bypass its pending predecessor");
+
+        assert!(error.contains("predecessor"));
+        assert!(
+            approved
+                .steps_results
+                .iter()
+                .all(|step| step.status == StepStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn completion_requires_every_required_step() {
+        let ready = build_execution("restart-service", "DEFRA", "test.engineer").unwrap();
+        let error = complete_execution_pure(&ready)
+            .expect_err("Approved with pending required steps cannot complete");
+        assert!(error.contains("every required step"));
+
+        let one = execute_step_pure(&ready, 1).unwrap();
+        assert!(complete_execution_pure(&one).is_err());
+        let two = execute_step_pure(&one, 2).unwrap();
+        let three = execute_step_pure(&two, 3).unwrap();
+        assert_eq!(
+            complete_execution_pure(&three).unwrap().status,
+            ExecutionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn malformed_required_step_projection_fails_closed() {
+        let mut ready = build_execution("restart-service", "DEFRA", "test.engineer").unwrap();
+        ready.steps_results.remove(1);
+        assert!(validate_execution_invariants(&ready).is_err());
+
+        let mut duplicate = build_execution("restart-service", "DEFRA", "test.engineer").unwrap();
+        duplicate.steps_results[2].step_order = 2;
+        assert!(validate_execution_invariants(&duplicate).is_err());
+    }
+
+    #[test]
+    fn draft_execution_cannot_execute_a_step() {
+        let draft = build_execution("certificate-renewal", "DEBER", "test.engineer").unwrap();
+
+        let error = execute_step_pure(&draft, 1)
+            .expect_err("Draft execution must cross the approval boundary first");
+
+        assert!(error.contains("Approved or Running"));
+        assert_eq!(draft.status, ExecutionStatus::Draft);
+        assert!(
+            draft
+                .steps_results
+                .iter()
+                .all(|step| step.status == StepStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn draft_execution_cannot_complete() {
+        let draft = build_execution("dns-record-update", "GBLON", "test.engineer").unwrap();
+
+        let error = complete_execution_pure(&draft)
+            .expect_err("Draft execution must cross the approval boundary first");
+
+        assert!(error.contains("Approved or Running"));
+        assert_eq!(draft.status, ExecutionStatus::Draft);
     }
 
     #[test]

@@ -51,7 +51,7 @@
 <h2 class="ep-h" id="get-api-auth-entra-authorize-url"><span class="method-chip m-get">GET</span><code>/api/auth/entra/authorize-url</code></h2>
 <p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
 <p class="ep-summary">Begins a browser sign-in.</p>
-<p>Persists <code>(state, nonce, pkce_verifier, binding)</code> via the single-use <code>oidc_login_states</code> store, then returns the tenant authorize URL plus the per-browser binding as JSON. The binding is ALSO set as the HttpOnly <code>entra_login_csrf</code> cookie for direct same-origin browser callers; the portal server function (which cannot forward upstream Set-Cookie headers) reads the JSON field and sets an identical cookie on its own response. The binding value never reaches page JavaScript either way.</p>
+<p>Persists <code>(state, nonce, pkce_verifier, binding)</code> via the single-use <code>oidc_login_states</code> store, then returns the tenant authorize URL plus the per-browser binding as JSON. The binding is ALSO set as the HttpOnly mode-selected binding cookie for direct same-origin browser callers; the portal server function (which cannot forward upstream Set-Cookie headers) reads the JSON field and sets an identical cookie on its own response. The binding value never reaches page JavaScript either way. Mandatory shared source/global admission precedes PostgreSQL; serialized DB-time cleanup and provider/global quotas precede entropy generation. A 429 carries a bounded <code>Retry-After</code> response header.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
@@ -90,7 +90,7 @@
 <h2 class="ep-h" id="get-api-auth-entra-callback"><span class="method-chip m-get">GET</span><code>/api/auth/entra/callback</code></h2>
 <p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
 <p class="ep-summary">Completes a browser sign-in.</p>
-<p>Flow (mirrors the generic OIDC callback): 1. Gate on auth mode + SSO config, then on DB availability. 2. If the IdP returned <code>?error=</code>, redirect to <code>/?auth_error=1</code> (the error text is never forwarded). 3. Require <code>code</code> and <code>state</code>. 4. Consume the state row (single-use, expiry-checked) and verify the per-browser binding cookie. 5. Exchange the code (PKCE public client — no secret). 6. Validate the id_token (RS256 sig + iss/aud/exp/nbf + nonce) and extract identity + <code>roles</code>. 7. Mint the SAME persisted session shape local login mints (aligned row-expiry and cookie Max-Age), set the <code>ryuki_session</code> cookie, and 302-redirect to <code>/</code> (hardcoded — no open-redirect surface).</p>
+<p>Flow (mirrors the generic OIDC callback): 1. Gate on auth mode + SSO config, then on DB availability. 2. If the IdP returned <code>?error=</code>, redirect to <code>/?auth_error=1</code> (the error text is never forwarded). 3. Require <code>code</code> and <code>state</code>. 4. Consume the state row (single-use, expiry-checked) and verify the per-browser binding cookie. 5. Exchange the code (PKCE public client — no secret). 6. Validate the id_token (RS256 sig + iss/aud/exp/nbf + nonce) and extract identity + <code>roles</code>. 7. Mint the SAME persisted session shape local login mints (aligned row-expiry and cookie Max-Age), set the mode-selected session cookie, and 302-redirect to <code>/</code> (hardcoded — no open-redirect surface).</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
@@ -104,28 +104,28 @@ with <code>code</code> on the successful callback path.</td></tr><tr><td><code>e
 sanitized error-redirect path instead of the code-exchange path.</td></tr><tr><td><code>error_description</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional provider error detail. It is accepted for protocol compatibility
 but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Required on the successful <code>code</code> + <code>state</code> callback path: the browser must return the HttpOnly <code>entra_login_csrf</code> binding cookie set by login initiation. The provider-error redirect path does not require it.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Required on the successful <code>code</code> + <code>state</code> callback path: the browser must return the HttpOnly <code>__Host-entra_login_csrf</code> binding cookie set by login initiation. The provider-error redirect path does not require it. Explicit loopback HTTP uses the compatibility name <code>entra_login_csrf</code>.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>302</code></td><td>Found</td><td>No response body</td></tr></tbody></table>
 <h4><code>302</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
 <h4>Request</h4>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> GET \
-  <span class="hl-cmd">--header</span> <span class="hl-s">'Cookie: entra_login_csrf=&lt;browser-binding&gt;'</span> \
+  <span class="hl-cmd">--header</span> <span class="hl-s">'Cookie: __Host-entra_login_csrf=&lt;browser-binding&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/auth/entra/callback?code=&lt;code&gt;&amp;state=&lt;state&gt;'</span></code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-local-decision"><span class="method-chip m-get">GET</span><code>/api/auth/local/decision</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Auth local decision.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/auth/local/decision</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -133,7 +133,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -182,10 +182,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <p>JSON structure: <code>LocalLoginRequest</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>username</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>username</code> in the JSON request body.</td></tr><tr><td><code>password</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>password</code> in the JSON request body.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
-<h4><code>200</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<p class="ep-note">No successful response schema was extracted for this operation.</p>
 <p>Error responses use the platform ApiError body (error, message, optional detail).</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
@@ -214,13 +211,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr></tbody></table>
-<h4><code>200</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
-<p>Error responses use the platform ApiError body (error, message, optional detail).</p>
+<p class="ep-note">No successful response schema was extracted for this operation.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -228,19 +219,13 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> POST \
   <span class="hl-s">'https://&lt;your-host&gt;/api/auth/local/logout'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-local-me"><span class="method-chip m-get">GET</span><code>/api/auth/local/me</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Auth local me.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/auth/local/me</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -248,7 +233,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -266,10 +251,10 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-local-roles"><span class="method-chip m-get">GET</span><code>/api/auth/local/roles</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Auth local roles.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/auth/local/roles</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -277,14 +262,14 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
 <h4><code>200</code> response body</h4>
 <p>Structure: <code>Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>authenticationMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>authenticationMode</code> returned in the response body.</td></tr><tr><td><code>configuredForProduction</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>configuredForProduction</code> returned in the response body.</td></tr><tr><td><code>entraGroupsConfigured</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>entraGroupsConfigured</code> returned in the response body.</td></tr><tr><td><code>requiredProductionProvider</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredProductionProvider</code> returned in the response body.</td></tr><tr><td><code>actions</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>actions</code> returned in the response body.</td></tr><tr><td><code>roles</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>roles</code> returned in the response body.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>authenticationMode</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>authenticationMode</code> returned in the response body.</td></tr><tr><td><code>configuredForProduction</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>configuredForProduction</code> returned in the response body.</td></tr><tr><td><code>entraGroupsConfigured</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>entraGroupsConfigured</code> returned in the response body.</td></tr><tr><td><code>requiredProductionProvider</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requiredProductionProvider</code> returned in the response body.</td></tr><tr><td><code>actions</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>actions</code> returned in the response body.</td></tr><tr><td><code>capabilityPolicy</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>capabilityPolicy</code> returned in the response body.</td></tr><tr><td><code>roles</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>roles</code> returned in the response body.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -302,7 +287,8 @@ but is never forwarded to the browser.</td></tr></tbody></table>
   <span class="hl-k">"entraGroupsConfigured"</span>: <span class="hl-n">false</span>,
   <span class="hl-k">"requiredProductionProvider"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
   <span class="hl-k">"actions"</span>: [],
-  <span class="hl-k">"roles"</span>: []
+  <span class="hl-k">"capabilityPolicy"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"roles"</span>: <span class="hl-n">null</span>
 }</code></pre>
 </section>
 <section class="ep-operation">
@@ -351,11 +337,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr></tbody></table>
-<p>Error responses use the platform ApiError body (error, message, optional detail).</p>
+<p class="ep-note">No successful response schema was extracted for this operation.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -363,12 +345,6 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> POST \
   <span class="hl-s">'https://&lt;your-host&gt;/api/auth/logout'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-oidc-callback"><span class="method-chip m-get">GET</span><code>/api/auth/oidc/callback</code></h2>
@@ -395,7 +371,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>302</code></td><td>Found</td><td>No response body</td></tr></tbody></table>
 <h4><code>302</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -408,9 +384,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-oidc-login"><span class="method-chip m-get">GET</span><code>/api/auth/oidc/login</code></h2>
 <p class="badges"><span class="badge">public access</span><span class="badge badge-open">no bearer auth required</span></p>
-<p class="ep-summary">OIDC browser sign-in — login initiation (auth-code + PKCE, S256 only).</p>
-<p>Generates a cryptographically random <code>state</code>, <code>nonce</code>, and PKCE <code>code_verifier</code> (all via OsRng / getrandom), persists them to the <code>oidc_login_states</code> table, then redirects the browser to the IdP's authorization endpoint with the full set of OAuth2/OIDC parameters.</p>
-<p># Security properties - <code>state</code> / <code>nonce</code> / <code>pkce_verifier</code>: 32 bytes from OsRng → ≥256-bit entropy; base64url-encoded (URL_SAFE_NO_PAD). - <code>code_challenge</code> = BASE64URL(SHA-256(pkce_verifier_bytes)); method = S256. - <code>state</code> is single-use and expires in 10 minutes (enforced by <code>take</code> in slice 2 and by the DB <code>expires_at</code> column). - All authorize-URL query parameters are percent-encoded by the <code>url</code> crate, preventing injection via <code>redirect_uri</code>, <code>scope</code>, or <code>client_id</code>. - No session cookie is set; no sensitive value is included in the redirect.</p>
+<p class="ep-summary">Initiate oidc login.</p>
 <h3 class="ep-sub">Permissions</h3>
 <table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>public</code></td><td>No user or agent bearer token is required. Operation-specific proof, when present, is documented below.</td><td>No authenticated-principal scope is applied to this operation.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>

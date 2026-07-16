@@ -25,12 +25,14 @@
 //! for ansible plans.  Callers of `run_ansible_live_apply` MUST NOT pass a
 //! `tfplan` byte buffer and instead just re-run the playbook.
 //!
-//! ## ansible-playbook-absent guarantee
+//! ## Executable approval and absence
 //!
-//! If the `ansible-playbook` binary is not present, both functions return
-//! `Ok(RunOutcome { status: RunnerUnavailable, … })` — NEVER `Err` and NEVER
-//! a panic.  This keeps the agent buildable and testable in CI environments
-//! that have no Ansible installation.
+//! Production entry points require `RYUKI_ANSIBLE_PLAYBOOK_EXECUTABLE` and
+//! `RYUKI_ANSIBLE_PLAYBOOK_EXPECTED_VERSION`. The absolute canonical
+//! executable must pass ownership/mode, identity/version, and optional
+//! SHA-256 validation before secrets are processed. Invalid or missing
+//! approval configuration is an error; if an approved executable disappears
+//! before the availability probe, the outcome is `RunnerUnavailable`.
 //!
 //! ## Credential gap (operator responsibility)
 //!
@@ -43,6 +45,8 @@
 //!
 //! ## Security invariants (MUST hold — same as `live.rs` and `ansible.rs`)
 //!
+//! - The top-level Ansible CLI is locally approved before credentials are
+//!   processed or attached; inherited `PATH` never selects it.
 //! - Secret material is NEVER passed as a command-line argument.
 //! - Secrets are written to a 0600 `--extra-vars @<file>` JSON file only.
 //! - Output is scrubbed via `scrub_output` before placement in `RunOutcome.log` / `.summary`.
@@ -50,6 +54,7 @@
 //! - `-vvv` (verbose) is never passed.
 //! - `ANSIBLE_VERBOSITY` is explicitly removed from the child environment.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -58,7 +63,8 @@ use ryuki_engine::runners::{
 };
 
 use super::{
-    exec::run_command_with_timeout,
+    exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
+    executable::{ApprovedExecutable, ApprovedTool},
     iac,
     scrub::scrub_output,
     terraform::{
@@ -70,9 +76,6 @@ use super::{
 
 /// Per-subprocess timeout for each ansible-playbook invocation in a live run.
 const LIVE_ANSIBLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min per step
-
-/// Default binary name; overridable via the internal functions for tests.
-const DEFAULT_BINARY: &str = "ansible-playbook";
 
 /// Additional blocked prefix specific to Ansible: prevent hijacking Ansible
 /// configuration via extra-vars names.
@@ -99,6 +102,8 @@ const ANSIBLE_BLOCKED_PREFIX: &str = "ANSIBLE_";
 ///
 /// - `RunnerError::Spawn` if `plan.mode != RunMode::Live`.
 /// - `RunnerError::Spawn` if no Ansible IaC is found for the offering.
+/// - `RunnerError::Spawn` if the configured Ansible executable does not pass
+///   path provenance and identity/version approval.
 /// - `RunnerError::CredInjection` if any secret variable name is invalid.
 /// - `RunnerError::WorkspaceSetup` if workspace initialisation fails.
 /// - `RunnerError::Timeout` if the subprocess exceeds `LIVE_ANSIBLE_TIMEOUT`.
@@ -113,7 +118,25 @@ pub fn run_ansible_live_plan(
         )));
     }
 
-    live_ansible_plan(DEFAULT_BINARY, plan, creds)
+    let executable = ApprovedExecutable::configured(ApprovedTool::AnsiblePlaybook, None)?;
+    live_ansible_plan_inner(&executable, plan, creds, None)
+}
+
+/// Cancellation-aware live Ansible check entry point.
+pub fn run_ansible_live_plan_with_cancellation(
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: &CommandCancellation,
+) -> Result<RunOutcome, RunnerError> {
+    if plan.mode != RunMode::Live {
+        return Err(RunnerError::Spawn(format!(
+            "run_ansible_live_plan only accepts RunMode::Live; got {:?}",
+            plan.mode
+        )));
+    }
+    let executable =
+        ApprovedExecutable::configured(ApprovedTool::AnsiblePlaybook, Some(cancellation))?;
+    live_ansible_plan_inner(&executable, plan, creds, Some(cancellation))
 }
 
 /// Execute a live Ansible apply: `ansible-playbook --diff` (no `--check`).
@@ -146,22 +169,52 @@ pub fn run_ansible_live_apply(
         )));
     }
 
-    live_ansible_apply(DEFAULT_BINARY, plan, creds)
+    let executable = ApprovedExecutable::configured(ApprovedTool::AnsiblePlaybook, None)?;
+    live_ansible_apply_inner(&executable, plan, creds, None)
+}
+
+/// Cancellation-aware live Ansible apply entry point.
+pub fn run_ansible_live_apply_with_cancellation(
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: &CommandCancellation,
+) -> Result<RunOutcome, RunnerError> {
+    if plan.mode != RunMode::Live {
+        return Err(RunnerError::Spawn(format!(
+            "run_ansible_live_apply only accepts RunMode::Live; got {:?}",
+            plan.mode
+        )));
+    }
+    let executable =
+        ApprovedExecutable::configured(ApprovedTool::AnsiblePlaybook, Some(cancellation))?;
+    live_ansible_apply_inner(&executable, plan, creds, Some(cancellation))
 }
 
 // ---------------------------------------------------------------------------
-// Internal implementations (binary path injectable for tests)
+// Approved internal implementations plus test-only shim adapters
 // ---------------------------------------------------------------------------
 
-/// Core plan implementation.  `binary` is injectable for tests (e.g. `/bin/echo`).
+/// Test seam for plan command-behavior coverage.
 ///
 /// Runs `ansible-playbook --check --diff <playbook>` in an isolated workspace
 /// with extra-vars files for non-secret and secret vars.
+#[cfg(test)]
 pub(crate) fn live_ansible_plan(
     binary: &str,
     plan: &RunPlan,
     creds: &ResolvedCredentials,
 ) -> Result<RunOutcome, RunnerError> {
+    let executable = ApprovedExecutable::for_test(binary);
+    live_ansible_plan_inner(&executable, plan, creds, None)
+}
+
+fn live_ansible_plan_inner(
+    executable: &ApprovedExecutable,
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: Option<&CommandCancellation>,
+) -> Result<RunOutcome, RunnerError> {
+    let binary = executable.path();
     // Validate inputs before any workspace or process creation.
     validate_offering_slug(&plan.offering_id)?;
     for name in &plan.secret_var_names {
@@ -189,12 +242,15 @@ pub(crate) fn live_ansible_plan(
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
     // Binary availability check — ansible-absent-safe.
-    if !binary_available(binary) {
+    if !binary_available(binary, cancellation)? {
         return Ok(RunOutcome {
             runner_kind: RunnerKind::Ansible,
             mode: plan.mode,
             status: RunStatus::RunnerUnavailable,
-            summary: format!("runner unavailable: ansible-playbook binary not found at '{binary}'"),
+            summary: format!(
+                "runner unavailable: ansible-playbook binary not found at {:?}",
+                binary
+            ),
             log: String::new(),
             exit_code: None,
             post_apply: None,
@@ -216,7 +272,7 @@ pub(crate) fn live_ansible_plan(
     let mut cmd = build_ansible_command(binary, &playbook_ref, ws.path(), &vars_arg, &secrets_arg);
     cmd.arg("--check").arg("--diff");
 
-    let output = run_command_with_timeout(cmd, LIVE_ANSIBLE_TIMEOUT)?;
+    let output = run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
 
     let raw = combine_output(&output.stdout, &output.stderr);
     let scrubbed_log = scrub_output(&raw, &secret_refs);
@@ -246,17 +302,29 @@ pub(crate) fn live_ansible_plan(
     })
 }
 
-/// Core apply implementation.  `binary` is injectable for tests.
+/// Test seam for apply command-behavior coverage.
 ///
 /// Runs `ansible-playbook --diff <playbook>` (no `--check`) in a fresh isolated
 /// workspace.  This re-runs the playbook + vars against live infrastructure.
 ///
 /// See module-level docs for the rationale behind Ansible's no-saved-plan model.
+#[cfg(test)]
 pub(crate) fn live_ansible_apply(
     binary: &str,
     plan: &RunPlan,
     creds: &ResolvedCredentials,
 ) -> Result<RunOutcome, RunnerError> {
+    let executable = ApprovedExecutable::for_test(binary);
+    live_ansible_apply_inner(&executable, plan, creds, None)
+}
+
+fn live_ansible_apply_inner(
+    executable: &ApprovedExecutable,
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: Option<&CommandCancellation>,
+) -> Result<RunOutcome, RunnerError> {
+    let binary = executable.path();
     // Validate inputs.
     validate_offering_slug(&plan.offering_id)?;
     for name in &plan.secret_var_names {
@@ -284,12 +352,15 @@ pub(crate) fn live_ansible_apply(
     let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
     // Binary availability check.
-    if !binary_available(binary) {
+    if !binary_available(binary, cancellation)? {
         return Ok(RunOutcome {
             runner_kind: RunnerKind::Ansible,
             mode: plan.mode,
             status: RunStatus::RunnerUnavailable,
-            summary: format!("runner unavailable: ansible-playbook binary not found at '{binary}'"),
+            summary: format!(
+                "runner unavailable: ansible-playbook binary not found at {:?}",
+                binary
+            ),
             log: String::new(),
             exit_code: None,
             post_apply: None,
@@ -311,7 +382,7 @@ pub(crate) fn live_ansible_apply(
     let mut cmd = build_ansible_command(binary, &playbook_ref, ws.path(), &vars_arg, &secrets_arg);
     cmd.arg("--diff");
 
-    let output = run_command_with_timeout(cmd, LIVE_ANSIBLE_TIMEOUT)?;
+    let output = run_command_with_optional_cancellation(cmd, LIVE_ANSIBLE_TIMEOUT, cancellation)?;
 
     let raw = combine_output(&output.stdout, &output.stderr);
     let scrubbed_log = scrub_output(&raw, &secret_refs);
@@ -347,17 +418,14 @@ pub(crate) fn live_ansible_apply(
 
 /// Lightweight availability probe: runs `ansible-playbook --version` and checks exit 0.
 /// Returns `false` when the binary is missing — never panics.
-fn binary_available(binary: &str) -> bool {
+fn binary_available(
+    binary: &Path,
+    cancellation: Option<&CommandCancellation>,
+) -> Result<bool, RunnerError> {
     let mut cmd = Command::new(binary);
     apply_env_allowlist(&mut cmd);
-    cmd.arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // Retry the probe on transient ETXTBSY: tests probe a just-written shim, and
-    // a concurrent fork() can briefly hold a write fd to it (see exec.rs).
-    crate::exec::retry_on_etxtbsy(|| cmd.status())
-        .map(|s| s.success())
-        .unwrap_or(false)
+    cmd.arg("--version");
+    run_version_probe(cmd, cancellation)
 }
 
 /// Populate a `Command` with only the allowed parent environment variables.
@@ -426,7 +494,7 @@ fn write_extra_vars_files(
 ///
 /// Caller must add mode flags (`--check --diff` or `--diff`) after this call.
 fn build_ansible_command(
-    binary: &str,
+    binary: &Path,
     playbook_ref: &str,
     ws_path: &std::path::Path,
     vars_arg: &Option<String>,
@@ -578,7 +646,7 @@ mod tests {
     #[test]
     fn run_ansible_live_plan_fails_closed_on_missing_iac() {
         let plan = live_ansible_plan_spec("no-such-offering-xyz");
-        let result = run_ansible_live_plan(&plan, &dummy_creds());
+        let result = live_ansible_plan("ansible-playbook", &plan, &dummy_creds());
         assert!(
             result.is_err(),
             "run_ansible_live_plan must fail closed when IaC is missing"
@@ -593,7 +661,7 @@ mod tests {
     #[test]
     fn run_ansible_live_apply_fails_closed_on_missing_iac() {
         let plan = live_ansible_plan_spec("no-such-offering-xyz");
-        let result = run_ansible_live_apply(&plan, &dummy_creds());
+        let result = live_ansible_apply("ansible-playbook", &plan, &dummy_creds());
         assert!(
             result.is_err(),
             "run_ansible_live_apply must fail closed when IaC is missing"

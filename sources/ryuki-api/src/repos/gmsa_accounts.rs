@@ -1,15 +1,14 @@
 //! Repository functions for `gmsa_accounts` + `gmsa_host_assignments`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Ordinary reads use `&PgPool`; mutations accept a caller-owned transaction
+//! connection where row/site locks and atomic audit are required. Operational
+//! paths expose only Verified rows whose exact persisted owner site is active.
 //!
 //! # Design: engine vs. repo responsibility split
-//! The engine functions (`assign_to_host`, `remove_from_host`) validate
-//! invariants on the fully-loaded account (revoked guard, last-host guard,
-//! host-already-present check) and return a mutated clone. The repo
-//! `add_host`/`remove_host` functions persist ONLY the single child-row
-//! change — they trust the engine's pre-validation and do no invariant
-//! checking of their own.
+//! The engine functions (`assign_to_host`, `remove_from_host`) are the pure
+//! lifecycle specification. The repo `add_host`/`remove_host` functions repeat
+//! the mutable invariants under database locks, including current owner-site
+//! authorization, so a stale read or concurrent mutation fails closed.
 //!
 //! # Child table join
 //! `authorized_hosts` is stored in the `gmsa_host_assignments` child table,
@@ -23,6 +22,7 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::gmsa_lifecycle::{GMSAAccount, GMSAStatus};
+use ryuki_engine::site_registry::DIRECTORY_NAMESPACE_POLICY_VERSION;
 #[cfg(test)]
 use sqlx::Row;
 use sqlx::{PgConnection, PgPool};
@@ -141,11 +141,17 @@ pub fn status_str(s: &GMSAStatus) -> &'static str {
 /// Fetch one account by name (the domain key). Returns `Ok(None)` when no row
 /// matches — callers map to 404.
 pub async fn get_by_name(pool: &PgPool, name: &str) -> Result<Option<GMSAAccount>, sqlx::Error> {
-    let row: Option<GmsaAccountRow> =
-        sqlx::query_as(&format!("{SELECT_AGG} WHERE a.name = $1 GROUP BY a.id"))
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<GmsaAccountRow> = sqlx::query_as(&format!(
+        "{SELECT_AGG} WHERE a.namespace_state = 'Verified' AND a.name = $1 \
+             AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                         WHERE registry.unlocode = a.namespace_owner_site \
+                           AND registry.active \
+                           AND a.namespace_owner_site = a.site) \
+             GROUP BY a.id"
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
@@ -154,12 +160,24 @@ pub async fn get_by_name(pool: &PgPool, name: &str) -> Result<Option<GMSAAccount
 /// filtered to that site; an empty string returns all sites.
 pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<GMSAAccount>, sqlx::Error> {
     let rows: Vec<GmsaAccountRow> = if site.is_empty() {
-        sqlx::query_as(&format!("{SELECT_AGG} GROUP BY a.id ORDER BY a.name"))
-            .fetch_all(pool)
-            .await?
+        sqlx::query_as(&format!(
+            "{SELECT_AGG} WHERE a.namespace_state = 'Verified' \
+             AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                         WHERE registry.unlocode = a.namespace_owner_site \
+                           AND registry.active \
+                           AND a.namespace_owner_site = a.site) \
+             GROUP BY a.id ORDER BY a.name"
+        ))
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query_as(&format!(
-            "{SELECT_AGG} WHERE a.site = $1 GROUP BY a.id ORDER BY a.name"
+            "{SELECT_AGG} WHERE a.namespace_state = 'Verified' AND a.site = $1 \
+             AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                         WHERE registry.unlocode = a.namespace_owner_site \
+                           AND registry.active \
+                           AND a.namespace_owner_site = a.site) \
+             GROUP BY a.id ORDER BY a.name"
         ))
         .bind(site)
         .fetch_all(pool)
@@ -182,7 +200,12 @@ pub async fn list_page(
 ) -> Result<Vec<GMSAAccount>, sqlx::Error> {
     let rows: Vec<GmsaAccountRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "{SELECT_AGG} GROUP BY a.id ORDER BY a.name, a.id LIMIT $1 OFFSET $2"
+            "{SELECT_AGG} WHERE a.namespace_state = 'Verified' \
+             AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                         WHERE registry.unlocode = a.namespace_owner_site \
+                           AND registry.active \
+                           AND a.namespace_owner_site = a.site) \
+             GROUP BY a.id ORDER BY a.name, a.id LIMIT $1 OFFSET $2"
         ))
         .bind(limit)
         .bind(offset)
@@ -190,7 +213,12 @@ pub async fn list_page(
         .await?
     } else {
         sqlx::query_as(&format!(
-            "{SELECT_AGG} WHERE a.site = $1 GROUP BY a.id ORDER BY a.name, a.id LIMIT $2 OFFSET $3"
+            "{SELECT_AGG} WHERE a.namespace_state = 'Verified' AND a.site = $1 \
+             AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                         WHERE registry.unlocode = a.namespace_owner_site \
+                           AND registry.active \
+                           AND a.namespace_owner_site = a.site) \
+             GROUP BY a.id ORDER BY a.name, a.id LIMIT $2 OFFSET $3"
         ))
         .bind(site)
         .bind(limit)
@@ -207,14 +235,28 @@ pub async fn list_page(
 /// array_agg query, whose pre-GROUP row count would over-count).
 pub async fn count(pool: &PgPool, site: &str) -> Result<i64, sqlx::Error> {
     if site.is_empty() {
-        sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts")
-            .fetch_one(pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gmsa_accounts AS account \
+             WHERE namespace_state = 'Verified' \
+               AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                           WHERE registry.unlocode = account.namespace_owner_site \
+                             AND registry.active \
+                             AND account.namespace_owner_site = account.site)",
+        )
+        .fetch_one(pool)
+        .await
     } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM gmsa_accounts WHERE site = $1")
-            .bind(site)
-            .fetch_one(pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gmsa_accounts AS account \
+             WHERE namespace_state = 'Verified' AND site = $1 \
+               AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                           WHERE registry.unlocode = account.namespace_owner_site \
+                             AND registry.active \
+                             AND account.namespace_owner_site = account.site)",
+        )
+        .bind(site)
+        .fetch_one(pool)
+        .await
     }
 }
 
@@ -252,8 +294,9 @@ pub async fn insert(conn: &mut PgConnection, r: &GMSAAccount) -> Result<(), sqlx
     sqlx::query(
         "INSERT INTO gmsa_accounts \
          (id, name, sam_account_name, dns_host_name, service_principal_names, \
-          site, status, managed_password_interval_days, created_at, last_rotation_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          site, status, managed_password_interval_days, created_at, last_rotation_at, \
+          namespace_owner_site, namespace_policy_version, namespace_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'Verified')",
     )
     .bind(id)
     .bind(&r.name)
@@ -265,6 +308,8 @@ pub async fn insert(conn: &mut PgConnection, r: &GMSAAccount) -> Result<(), sqlx
     .bind(interval_days)
     .bind(created_at)
     .bind(last_rotation_at)
+    .bind(&r.site)
+    .bind(DIRECTORY_NAMESPACE_POLICY_VERSION)
     .execute(&mut *conn)
     .await?;
 
@@ -325,7 +370,11 @@ pub async fn rotate(
     let affected = sqlx::query(
         "UPDATE gmsa_accounts \
          SET last_rotation_at = NOW(), status = 'Active', updated_at = NOW() \
-         WHERE name = $1 AND status = $2",
+         WHERE name = $1 AND status = $2 AND namespace_state = 'Verified' \
+           AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                       WHERE registry.unlocode = gmsa_accounts.namespace_owner_site \
+                         AND registry.active \
+                         AND gmsa_accounts.namespace_owner_site = gmsa_accounts.site)",
     )
     .bind(name)
     .bind(expected_status)
@@ -349,11 +398,20 @@ pub async fn add_host(
     name: &str,
     host: &str,
 ) -> Result<HostOpOutcome, sqlx::Error> {
-    let acct: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, status FROM gmsa_accounts WHERE name = $1 FOR UPDATE")
-            .bind(name)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let acct: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT account.id, account.status \
+         FROM gmsa_accounts AS account \
+         JOIN site_registry AS registry \
+           ON registry.unlocode = account.namespace_owner_site \
+          AND registry.active \
+         WHERE account.name = $1 \
+           AND account.namespace_state = 'Verified' \
+           AND account.namespace_owner_site = account.site \
+         FOR UPDATE OF account FOR SHARE OF registry",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?;
     let Some((acct_id, status)) = acct else {
         return Ok(HostOpOutcome::AccountNotFound);
     };
@@ -386,11 +444,20 @@ pub async fn remove_host(
     name: &str,
     host: &str,
 ) -> Result<HostOpOutcome, sqlx::Error> {
-    let acct: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM gmsa_accounts WHERE name = $1 FOR UPDATE")
-            .bind(name)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let acct: Option<Uuid> = sqlx::query_scalar(
+        "SELECT account.id \
+         FROM gmsa_accounts AS account \
+         JOIN site_registry AS registry \
+           ON registry.unlocode = account.namespace_owner_site \
+          AND registry.active \
+         WHERE account.name = $1 \
+           AND account.namespace_state = 'Verified' \
+           AND account.namespace_owner_site = account.site \
+         FOR UPDATE OF account FOR SHARE OF registry",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?;
     let Some(acct_id) = acct else {
         return Ok(HostOpOutcome::AccountNotFound);
     };
@@ -432,7 +499,11 @@ pub async fn fetch_hosts(pool: &PgPool, name: &str) -> Result<Vec<String>, sqlx:
         "SELECT COALESCE(array_agg(h.host ORDER BY h.host), '{}') AS hosts \
          FROM gmsa_accounts a \
          LEFT JOIN gmsa_host_assignments h ON h.gmsa_account_id = a.id \
-         WHERE a.name = $1 \
+         WHERE a.namespace_state = 'Verified' AND a.name = $1 \
+           AND EXISTS (SELECT 1 FROM site_registry AS registry \
+                       WHERE registry.unlocode = a.namespace_owner_site \
+                         AND registry.active \
+                         AND a.namespace_owner_site = a.site) \
          GROUP BY a.id",
     )
     .bind(name)

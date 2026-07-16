@@ -8,11 +8,12 @@
 //! - Value-based scrubbing (this module) replaces the actual resolved secret
 //!   values with `[REDACTED]`, regardless of the surrounding context.
 //!
-//! # Performance
-//! Scrubbing is linear in the number of secrets × output length. For
-//! Slice 1 (dry-run), output is bounded by `MAX_LOG_BYTES`. This is
-//! acceptable for the expected output sizes; a future slice may optimize
-//! if very large outputs are expected.
+//! # Representation coverage
+//! Providers frequently render values through JSON/HCL, URL, or shell
+//! escaping before writing them. The scrub set therefore includes those
+//! deterministic representations as well as the literal secret. Matches are
+//! found against the original output and overlapping ranges are merged before
+//! replacement, so the result is independent of secret ordering.
 
 /// Maximum log excerpt stored in `RunOutcome.log`. Outputs longer than this
 /// are truncated with a suffix indicating the truncation.
@@ -31,20 +32,145 @@ pub const MAX_LOG_BYTES: usize = 32 * 1024; // 32 KiB
 /// * `output` — raw captured stdout/stderr from the runner binary.
 /// * `secret_values` — slice of byte-string values to redact.
 pub fn scrub(output: &str, secret_values: &[&[u8]]) -> String {
-    let mut result = output.to_string();
-    for secret in secret_values {
-        if secret.is_empty() {
+    let variants = secret_variants(secret_values);
+    if variants.is_empty() {
+        return output.to_string();
+    }
+
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for variant in &variants {
+        if variant.is_empty() || variant.len() > output.len() {
             continue;
         }
-        // Only redact if the secret is valid UTF-8 (it always should be for
-        // env-var and vault-resolved string credentials, but guard defensively).
-        if let Ok(secret_str) = std::str::from_utf8(secret) {
-            if !secret_str.is_empty() {
-                result = result.replace(secret_str, "[REDACTED]");
-            }
+        let mut search_from = 0usize;
+        while let Some(relative_start) = output[search_from..].find(variant) {
+            let start = search_from + relative_start;
+            ranges.push((start, start + variant.len()));
+            // Advance by one Unicode scalar rather than by the whole match so
+            // overlapping occurrences (for example `aaa` in `aaaa`) are seen.
+            let advance = output[start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            search_from = start + advance;
         }
     }
-    result
+    if ranges.is_empty() {
+        return output.to_string();
+    }
+
+    ranges.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut scrubbed = String::with_capacity(output.len());
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        scrubbed.push_str(&output[cursor..start]);
+        scrubbed.push_str("[REDACTED]");
+        cursor = end;
+    }
+    scrubbed.push_str(&output[cursor..]);
+    scrubbed
+}
+
+fn secret_variants(secret_values: &[&[u8]]) -> Vec<String> {
+    let mut variants = Vec::new();
+    for secret in secret_values
+        .iter()
+        .copied()
+        .filter(|value| !value.is_empty())
+    {
+        let upper_percent = percent_encode(secret, true, false);
+        let lower_percent = percent_encode(secret, false, false);
+        let upper_form_percent = percent_encode(secret, true, true);
+        let lower_form_percent = percent_encode(secret, false, true);
+        variants.push(upper_percent);
+        variants.push(lower_percent);
+        variants.push(upper_form_percent);
+        variants.push(lower_form_percent);
+
+        let Ok(secret_str) = std::str::from_utf8(secret) else {
+            continue;
+        };
+        variants.push(secret_str.to_string());
+
+        if let Ok(quoted) = serde_json::to_string(secret_str) {
+            if let Some(inner) = quoted
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+            {
+                variants.push(inner.to_string());
+            }
+        }
+
+        let shell_single = secret_str.replace('\'', "'\\''");
+        variants.push(shell_single);
+        variants.push(shell_backslash_escape(secret_str));
+        variants.push(shell_mixed_escape(secret_str));
+    }
+
+    variants.retain(|variant| !variant.is_empty());
+    variants
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    variants.dedup();
+    variants
+}
+
+fn percent_encode(value: &[u8], uppercase: bool, space_as_plus: bool) -> String {
+    const UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    const LOWER: &[u8; 16] = b"0123456789abcdef";
+    let hex = if uppercase { UPPER } else { LOWER };
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(*byte));
+        } else if space_as_plus && *byte == b' ' {
+            encoded.push('+');
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(hex[usize::from(*byte >> 4)]));
+            encoded.push(char::from(hex[usize::from(*byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn shell_backslash_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/') {
+            escaped.push(character);
+        } else {
+            escaped.push('\\');
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn shell_mixed_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\'' => escaped.push_str("'\\''"),
+            '$' | '`' | '"' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// Scrub `secret_values` from `output`, then truncate to `MAX_LOG_BYTES`.
@@ -170,5 +296,51 @@ mod tests {
         assert!(!scrubbed.contains("tail-secret-value"));
         assert!(scrubbed.contains("[REDACTED]"));
         assert!(scrubbed.len() > MAX_LOG_BYTES, "no truncation applied");
+    }
+
+    #[test]
+    fn scrub_redacts_json_url_and_shell_representations() {
+        let json_secret = b"quote\"slash\\line";
+        let url_secret = b"api key/+";
+        let shell_secret = b"shell'value$part";
+        let output = concat!(
+            "json=quote\\\"slash\\\\line\n",
+            "url=api%20key%2F%2B\n",
+            "form=api+key%2F%2B\n",
+            "lower-form=api+key%2f%2b\n",
+            "shell=shell'\\''value\\$part\n"
+        );
+        let scrubbed = scrub(
+            output,
+            &[
+                json_secret.as_slice(),
+                url_secret.as_slice(),
+                shell_secret.as_slice(),
+            ],
+        );
+        assert!(!scrubbed.contains("quote\\\"slash\\\\line"));
+        assert!(!scrubbed.contains("api%20key%2F%2B"));
+        assert!(!scrubbed.contains("api+key%2F%2B"));
+        assert!(!scrubbed.contains("api+key%2f%2b"));
+        assert!(!scrubbed.contains("shell'\\''value\\$part"));
+        assert_eq!(scrubbed.matches("[REDACTED]").count(), 5);
+    }
+
+    #[test]
+    fn scrub_merges_overlapping_secrets_independent_of_input_order() {
+        let short = b"overlap-canary";
+        let long = b"overlap-canary-tail";
+        let output = "before overlap-canary-tail after";
+        let short_first = scrub(output, &[short.as_slice(), long.as_slice()]);
+        let long_first = scrub(output, &[long.as_slice(), short.as_slice()]);
+        assert_eq!(short_first, "before [REDACTED] after");
+        assert_eq!(short_first, long_first);
+        assert!(!short_first.contains("tail"));
+    }
+
+    #[test]
+    fn scrub_redacts_overlapping_occurrences_of_the_same_secret() {
+        let scrubbed = scrub("aaaa", &[b"aaa"]);
+        assert_eq!(scrubbed, "[REDACTED]");
     }
 }

@@ -58,6 +58,8 @@ syn = { version = "2", features = ["full", "visit"] }
 figment = { version = "0.10", features = ["env", "json", "toml"] }
 governor = { version = "0.7", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["limit"] }
+hmac = "0.12"
+sha2 = "0.10"
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 ryuki-runner = { path = "sources/ryuki-runner" }

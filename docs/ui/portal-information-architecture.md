@@ -46,3 +46,6 @@ static wireframe only and carries no live execution.
 - No live provider calls.
 - No direct browser calls to adapters, providers, the database, or the secret
   store; the browser bundle talks only to the portal server-function boundary.
+- Secret-reference readiness remains a static, value-free summary. It labels
+  provider actions as blocked and never renders provider paths, credentials, or
+  resolved values.

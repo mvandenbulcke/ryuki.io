@@ -1,7 +1,9 @@
 //! Repository functions for `golden_images`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Read and ordinary transition helpers use `&PgPool`; governed promotion uses
+//! a caller-owned `&mut PgConnection` so the handler can append its security
+//! audit event before committing. Callers are responsible for mapping
+//! `sqlx::Error` → 500 and `None` → 404/409 as appropriate.
 //!
 //! # Status encoding
 //! `BuildStatus` uses `#[serde(rename_all = "kebab-case")]`, so serde variant
@@ -10,9 +12,9 @@
 //! exactly — no PascalCase conversion is needed.
 //!
 //! # Promote transaction
-//! `promote` runs as a single transaction: it CAS-transitions the target image
-//! from `Testing` → `Promoted` AND supersedes all currently-`Promoted` images
-//! with the same `site_scope + os_family`, so the invariant "at most one
+//! `promote_in_tx` uses the caller's transaction: it CAS-transitions the target
+//! image from `Testing` → `Promoted` AND supersedes all currently-`Promoted`
+//! images with the same `site_scope + os_family`, so the invariant "at most one
 //! promoted image per site+os" is never violated, even under concurrent requests.
 //!
 //! # supersedes_image_id
@@ -22,7 +24,7 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::image_factory::{BuildStatus, GoldenImage};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
@@ -170,33 +172,71 @@ pub async fn list_promoted(pool: &PgPool, site: &str) -> Result<Vec<GoldenImage>
 
 // ─── Stale-scan projection (#60) ───────────────────────────────────────────────
 
-/// Minimal projection for `golden_image_stale_scan`: id, name, site, and build_date.
-/// Scalar columns only — no full-model deserialization — so the scan reads exactly what
-/// it needs from real typed columns (no JSONB blob to corrupt or parse).
+/// Minimal raw projection for the bounded golden-image scheduler page. Scalar
+/// columns only — no full-model deserialization — so the scan reads exactly
+/// what it needs from real typed columns (no JSONB blob to corrupt or parse).
 #[derive(sqlx::FromRow)]
 pub struct StalePromotedRow {
+    pub scan_seq: i64,
     pub id: String,
     pub image_name: String,
     pub site_scope: String,
     pub build_date: chrono::DateTime<chrono::Utc>,
+    pub status: String,
 }
 
-/// Fetch every PROMOTED golden image whose `build_date` is older than `stale_days` — the
-/// live base image has aged past its (monthly) refresh window and is missing recent
-/// patches. Only status='promoted' (the live image) is considered; superseded/building/
-/// testing/failed are excluded. The date filter runs in SQL on the real `build_date`
-/// column (no parse, no fail-safe needed).
-pub async fn stale_promoted_images(
+/// Repository-level ceiling for one golden-image scheduler page.
+const MAX_SCHEDULER_SCAN_PAGE: i64 = 100;
+
+/// Bound the current image cycle by its largest visible sequence.  Later
+/// sequence allocations wait for the next cycle; an earlier allocation that
+/// commits late is also recovered after the cursor resets on exhaustion.
+pub async fn stale_scan_high_water(
     executor: impl sqlx::PgExecutor<'_>,
-    stale_days: i32,
-) -> Result<Vec<StalePromotedRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id::text AS id, image_name, site_scope, build_date \
-         FROM golden_images \
-         WHERE status = 'promoted' AND build_date < NOW() - make_interval(days => $1) \
-         ORDER BY id",
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(MAX(scan_seq), 0) \
+         FROM golden_image_scheduler_population",
     )
-    .bind(stale_days)
+    .fetch_one(executor)
+    .await
+}
+
+/// Fetch one immutable raw keyset page before status/staleness filtering.  The
+/// caller advances through every image sequence, so non-promoted or fresh rows
+/// cannot create cursor gaps or make a short matching page look exhausted.
+/// Classification then uses the cycle's fixed cutoff in the scheduler.
+pub async fn scheduler_scan_page(
+    executor: impl sqlx::PgExecutor<'_>,
+    cursor_seq: i64,
+    high_water_seq: i64,
+    limit: i64,
+) -> Result<Vec<StalePromotedRow>, sqlx::Error> {
+    if cursor_seq < 0
+        || high_water_seq < cursor_seq
+        || !(1..=MAX_SCHEDULER_SCAN_PAGE).contains(&limit)
+    {
+        return Err(sqlx::Error::Protocol(
+            "golden-image scheduler page requires 0 <= cursor <= high-water and limit 1..=100"
+                .to_string(),
+        ));
+    }
+    sqlx::query_as(
+        "SELECT population.scan_seq, image.id::text AS id, image.image_name, \
+                image.site_scope, image.build_date, image.status \
+         FROM ( \
+             SELECT scan_seq, image_id \
+             FROM golden_image_scheduler_population \
+             WHERE scan_seq > $1 AND scan_seq <= $2 \
+             ORDER BY scan_seq \
+             LIMIT $3 \
+         ) population \
+         JOIN golden_images image ON image.id = population.image_id \
+         ORDER BY population.scan_seq",
+    )
+    .bind(cursor_seq)
+    .bind(high_water_seq)
+    .bind(limit)
     .fetch_all(executor)
     .await
 }
@@ -304,9 +344,8 @@ pub async fn insert(pool: &PgPool, r: &GoldenImage) -> Result<GoldenImage, sqlx:
     row.into_model()
 }
 
-/// Atomically transition an image to `Promoted` AND supersede all currently-
-/// `Promoted` images for the same `site_scope + os_family`, in a single
-/// transaction.
+/// Transition an image to `Promoted` and supersede every currently-promoted
+/// peer for the same `site_scope + os_family` on the caller's transaction.
 ///
 /// The transaction uses two `SELECT … FOR UPDATE` steps to serialize
 /// concurrent promotions:
@@ -316,18 +355,20 @@ pub async fn insert(pool: &PgPool, r: &GoldenImage) -> Result<GoldenImage, sqlx:
 ///    deadlocks between two concurrent promotions in the same scope).
 /// 3. Supersede those rows.
 /// 4. Set the target to `promoted`.
-/// 5. Commit.
+/// 5. Return the promoted row and canonical peer-id set without committing.
+///
+/// The caller must append the actor-attributed security event and commit the
+/// same transaction. This keeps promotion, collateral supersession, and audit
+/// evidence atomic.
 ///
 /// Returns `Ok(None)` when the CAS misses (caller → 409).
-pub async fn promote(
-    pool: &PgPool,
+pub async fn promote_in_tx(
+    conn: &mut PgConnection,
     img: &GoldenImage,
 ) -> Result<Option<(GoldenImage, Vec<String>)>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(&img.id) else {
         return Ok(None);
     };
-
-    let mut tx = pool.begin().await?;
 
     // Step 1 — lock the target row and re-read its current state.
     let locked: Option<(String, String, String)> = sqlx::query_as(
@@ -337,12 +378,12 @@ pub async fn promote(
          FOR UPDATE",
     )
     .bind(uid)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let Some((_id_text, site_scope, os_family)) = locked else {
-        // Row missing or status is no longer 'testing'.
-        tx.rollback().await?;
+        // Row missing or status is no longer 'testing'. The caller's
+        // transaction remains uncommitted and contains no domain mutation.
         return Ok(None);
     };
 
@@ -356,7 +397,7 @@ pub async fn promote(
     // guaranteeing at most one 'promoted' image per scope.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("golden_images:{site_scope}|{os_family}"))
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     // Step 3 — supersede prior promoted images for this scope (excluding
@@ -370,27 +411,24 @@ pub async fn promote(
     .bind(&site_scope)
     .bind(&os_family)
     .bind(uid)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
 
     // Step 4 — promote the target.
-    sqlx::query(
+    let promoted_row: GoldenImageRow = sqlx::query_as(&format!(
         "UPDATE golden_images \
          SET status = 'promoted', build_log = $2 \
-         WHERE id = $1",
-    )
+         WHERE id = $1 \
+         RETURNING {COLUMNS}"
+    ))
     .bind(uid)
     .bind(&img.build_log)
-    .execute(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
 
-    tx.commit().await?;
-
-    let superseded_ids: Vec<String> = superseded_rows.into_iter().map(|(id,)| id).collect();
-
-    let persisted = get(pool, &img.id).await?.ok_or_else(|| {
-        sqlx::Error::Decode("golden_images: row vanished immediately after promote".into())
-    })?;
+    let mut superseded_ids: Vec<String> = superseded_rows.into_iter().map(|(id,)| id).collect();
+    superseded_ids.sort();
+    let persisted = promoted_row.into_model()?;
 
     Ok(Some((persisted, superseded_ids)))
 }
@@ -481,6 +519,19 @@ mod golden_images_db_tests {
                     .await;
             }
         }
+    }
+
+    /// Repository-only tests that exercise the promotion primitive still own
+    /// the commit explicitly, mirroring the production handler's transaction
+    /// boundary (the handler additionally appends its audit before commit).
+    async fn promote_committed(
+        pool: &PgPool,
+        image: &GoldenImage,
+    ) -> Result<Option<(GoldenImage, Vec<String>)>, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let result = promote_in_tx(&mut tx, image).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     /// #14: `list_superseded_page`/`count_superseded` push the site scope INTO SQL
@@ -657,7 +708,7 @@ mod golden_images_db_tests {
         let promoted_val =
             ryuki_engine::image_factory::promote_image(&testing_img).expect("promote_image engine");
 
-        let result = promote(&pool, &promoted_val)
+        let result = promote_committed(&pool, &promoted_val)
             .await
             .expect("promote repo")
             .expect("promote returned Some");
@@ -699,7 +750,10 @@ mod golden_images_db_tests {
         // must win (Some) and the other must lose (None or also Some but
         // supersede the first). Either way, at most ONE 'promoted' row may
         // exist in this scope after both finish.
-        let (res_a, res_b) = tokio::join!(promote(&pool, &promoted_a), promote(&pool, &promoted_b));
+        let (res_a, res_b) = tokio::join!(
+            promote_committed(&pool, &promoted_a),
+            promote_committed(&pool, &promoted_b)
+        );
         // Both must not return a DB error (only CAS miss / None is acceptable).
         let _ = res_a.expect("promote a no db error");
         let _ = res_b.expect("promote b no db error");
@@ -762,7 +816,9 @@ mod golden_images_db_tests {
         let mut faux_promoted = img.clone();
         faux_promoted.status = BuildStatus::Promoted;
 
-        let result = promote(&pool, &faux_promoted).await.expect("no db error");
+        let result = promote_committed(&pool, &faux_promoted)
+            .await
+            .expect("no db error");
         assert!(
             result.is_none(),
             "promote CAS from wrong state must return None"

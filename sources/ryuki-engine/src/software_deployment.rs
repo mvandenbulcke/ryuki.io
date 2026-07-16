@@ -57,9 +57,22 @@ impl SiteScope {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DeploymentRequest {
     pub server_name: String,
+    /// Authoritative authorization axes supplied by the API after canonicalization.
+    /// Defaults preserve deserialization of older clients, but validation rejects a
+    /// missing/blank value so a legacy request can never create an unscoped record.
+    #[serde(default)]
+    pub site: String,
+    #[serde(default)]
+    pub environment: String,
     pub package_id: String,
+    /// Compatibility field for offline validation. The DB-backed planning
+    /// boundary replaces it with the locked approved-catalog version.
+    #[serde(default)]
     pub target_version: String,
     pub scheduled_time: String,
+    /// Compatibility field. The API overwrites this with the authenticated
+    /// principal before planning; clients cannot choose the persisted maker.
+    #[serde(default)]
     pub requester: String,
 }
 
@@ -67,17 +80,33 @@ pub struct DeploymentRequest {
 pub struct DeploymentRecord {
     pub id: String,
     pub server_name: String,
+    pub site: String,
+    pub environment: String,
     pub package_id: String,
     pub package_name: String,
     pub target_version: String,
     pub scheduled_time: String,
     pub requester: String,
+    pub maker_user_id: String,
     pub status: DeploymentStatus,
     pub approved_by: Option<String>,
     pub plan: Option<DeploymentPlan>,
     pub executed_at: Option<String>,
     pub verified_at: Option<String>,
     pub evidence: Vec<EvidenceItem>,
+}
+
+/// Canonical approved-package facts supplied by the persistence adapter after
+/// it has resolved and locked the approved catalog row. Keeping this small and
+/// provider-neutral lets the domain plan builder consume database-backed (or a
+/// future inventory-adapter-backed) authority without consulting the process-
+/// local demo package store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentPackageAuthority {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub package_type: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -172,11 +201,14 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
         DeploymentRecord {
             id: "dep-001".into(),
             server_name: "w-defra-srv-01".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-zabbix-agent".into(),
             package_name: "Zabbix Agent 7.0".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
             requester: "ops-team".into(),
+            maker_user_id: "ops-team".into(),
             status: DeploymentStatus::Completed,
             approved_by: Some("admin".into()),
             plan: None,
@@ -187,11 +219,14 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
         DeploymentRecord {
             id: "dep-002".into(),
             server_name: "l-gblon-srv-03".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
             package_id: "pkg-crowdstrike-sensor".into(),
             package_name: "CrowdStrike Falcon Sensor".into(),
             target_version: "7.11.0".into(),
             scheduled_time: "2026-06-18T23:00:00Z".into(),
             requester: "security-team".into(),
+            maker_user_id: "security-team".into(),
             status: DeploymentStatus::Draft,
             approved_by: None,
             plan: None,
@@ -202,11 +237,14 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
         DeploymentRecord {
             id: "dep-003".into(),
             server_name: "w-nlams-srv-02".into(),
+            site: "NLAMS".into(),
+            environment: "production".into(),
             package_id: "pkg-qualys-agent".into(),
             package_name: "Qualys Cloud Agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-20T01:00:00Z".into(),
             requester: "compliance-team".into(),
+            maker_user_id: "compliance-team".into(),
             status: DeploymentStatus::Draft,
             approved_by: None,
             plan: None,
@@ -241,6 +279,18 @@ pub fn validate_deployment(request: &DeploymentRequest) -> Result<ValidationResu
         remediation.push("Provide a valid server name.".into());
     }
 
+    if request.site.is_empty() || !site_registry::is_valid_site(&request.site) {
+        errors.push("An active, canonical site is required".into());
+        failed_rules.push("p0-site-required".into());
+        remediation.push("Provide an active registered site code.".into());
+    }
+
+    if request.environment.trim().is_empty() {
+        errors.push("Environment is required".into());
+        failed_rules.push("p0-environment-required".into());
+        remediation.push("Provide a concrete environment scope.".into());
+    }
+
     if request.package_id.is_empty() {
         errors.push("Package ID is required".into());
         failed_rules.push("p0-package-id-required".into());
@@ -251,12 +301,6 @@ pub fn validate_deployment(request: &DeploymentRequest) -> Result<ValidationResu
         errors.push("Target version is required".into());
         failed_rules.push("p0-target-version-required".into());
         remediation.push("Provide a target package version.".into());
-    }
-
-    if request.requester.is_empty() {
-        errors.push("Requester is required".into());
-        failed_rules.push("p0-requester-required".into());
-        remediation.push("Provide the requester identity.".into());
     }
 
     let packages = package_store().lock().unwrap();
@@ -290,20 +334,45 @@ pub fn validate_deployment(request: &DeploymentRequest) -> Result<ValidationResu
     })
 }
 
-pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, String> {
-    let validation = validate_deployment(request)?;
-    if !validation.passed {
-        return Err(format!(
-            "Cannot plan software deployment until validation passes: {}",
-            validation.errors.join("; ")
-        ));
+/// Build a deployment plan from already-resolved target and package authority.
+///
+/// This function is deliberately pure: callers persist the returned record only
+/// after resolving the CMDB target and approved package under their own locks.
+/// It neither reads nor writes the process-local demo stores, preventing a DB-
+/// backed request from creating a second, ungoverned in-memory deployment.
+pub fn prepare_authorized_deployment(
+    request: &DeploymentRequest,
+    package: &DeploymentPackageAuthority,
+) -> Result<DeploymentRecord, String> {
+    if request.requester.trim().is_empty() || request.requester != request.requester.trim() {
+        return Err("Authenticated software deployment maker is required".into());
     }
-
-    let packages = package_store().lock().unwrap();
-    let package = packages
-        .iter()
-        .find(|p| p.id == request.package_id)
-        .ok_or_else(|| format!("Package not found: {}", request.package_id))?;
+    if request.server_name.trim().is_empty() || request.server_name != request.server_name.trim() {
+        return Err("Authoritative software deployment server is required".into());
+    }
+    if request.site.trim().is_empty() || request.site != request.site.trim() {
+        return Err("Authoritative software deployment site is required".into());
+    }
+    if request.environment.trim().is_empty() || request.environment != request.environment.trim() {
+        return Err("Authoritative software deployment environment is required".into());
+    }
+    if package.id.trim().is_empty()
+        || package.id != package.id.trim()
+        || package.name.trim().is_empty()
+        || package.name != package.name.trim()
+        || package.version.trim().is_empty()
+        || package.version != package.version.trim()
+        || package.package_type.trim().is_empty()
+        || package.package_type != package.package_type.trim()
+    {
+        return Err("Approved package authority is incomplete".into());
+    }
+    if request.package_id != package.id {
+        return Err("Deployment package does not match approved package authority".into());
+    }
+    if request.target_version != package.version {
+        return Err("Deployment version does not match approved package authority".into());
+    }
 
     let id = format!(
         "dep-{}",
@@ -326,7 +395,7 @@ pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, 
         install_steps: vec![
             format!(
                 "DRY-RUN: Download {} v{} ({}) — simulated",
-                package.name, request.target_version, package.package_type
+                package.name, package.version, package.package_type
             ),
             format!(
                 "DRY-RUN: Install {} on {} — simulated",
@@ -348,15 +417,18 @@ pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, 
     let record = DeploymentRecord {
         id,
         server_name: request.server_name.clone(),
-        package_id: request.package_id.clone(),
+        site: request.site.clone(),
+        environment: request.environment.clone(),
+        package_id: package.id.clone(),
         package_name: package.name.clone(),
-        target_version: request.target_version.clone(),
+        target_version: package.version.clone(),
         scheduled_time: if request.scheduled_time.is_empty() {
             chrono::Utc::now().to_rfc3339()
         } else {
             request.scheduled_time.clone()
         },
         requester: request.requester.clone(),
+        maker_user_id: request.requester.clone(),
         status: DeploymentStatus::Planned,
         approved_by: None,
         plan: Some(plan),
@@ -364,6 +436,37 @@ pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, 
         verified_at: None,
         evidence: vec![],
     };
+
+    Ok(record)
+}
+
+pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, String> {
+    // Preserve the explicit offline/demo API for callers that intentionally use
+    // the process-local stores. The HTTP mutation boundary does not use this
+    // path because those rows have no authoritative CMDB identity.
+    let validation = validate_deployment(request)?;
+    if !validation.passed {
+        return Err(format!(
+            "Cannot plan software deployment until validation passes: {}",
+            validation.errors.join("; ")
+        ));
+    }
+
+    let package = {
+        let packages = package_store().lock().unwrap();
+        packages
+            .iter()
+            .find(|package| package.id == request.package_id)
+            .cloned()
+            .ok_or_else(|| format!("Package not found: {}", request.package_id))?
+    };
+    let authority = DeploymentPackageAuthority {
+        id: package.id,
+        name: package.name,
+        version: package.version,
+        package_type: package.package_type.to_string(),
+    };
+    let record = prepare_authorized_deployment(request, &authority)?;
 
     deployment_store().lock().unwrap().push(record.clone());
     Ok(record)
@@ -383,6 +486,12 @@ pub fn approve_deployment(request_id: &str, approver: &str) -> Result<Deployment
             record.status
         ));
     }
+    if record.maker_user_id.trim().is_empty() {
+        return Err("Software deployment lacks trusted maker provenance".into());
+    }
+    if record.maker_user_id == approver {
+        return Err("Software deployment maker cannot approve the same deployment".into());
+    }
 
     let mut approved = record.clone();
     approved.status = DeploymentStatus::Approved;
@@ -390,6 +499,18 @@ pub fn approve_deployment(request_id: &str, approver: &str) -> Result<Deployment
 
     store[idx] = approved.clone();
     Ok(approved)
+}
+
+/// Resolve one in-memory deployment for API authorization before any state
+/// transition. The returned clone carries the immutable site/environment/maker
+/// provenance used by the same guards as the database path.
+pub fn get_deployment(request_id: &str) -> Option<DeploymentRecord> {
+    deployment_store()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|deployment| deployment.id == request_id)
+        .cloned()
 }
 
 pub fn execute_deployment(request_id: &str) -> Result<Vec<EvidenceItem>, String> {
@@ -575,9 +696,11 @@ pub fn get_software_contract() -> Value {
         "supportedWorkflows": ["get-packages", "validate", "plan", "approve", "execute", "verify", "history", "compliance"],
         "validPackageTypes": ["msi", "exe", "apt", "rpm", "script"],
         "validSites": site_registry::get_active_site_codes().unwrap_or_default(),
-        "requiredInputs": ["serverName", "packageId", "targetVersion", "requester"],
-        "requiredGuards": ["package-approved", "server-online", "no-conflicting-deployments", "approval-route-assigned", "evidence-redacted"],
-        "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "package-not-approved", "server-offline", "conflicting-deployment", "approval-missing", "evidence-not-redacted"],
+        "requiredInputs": ["serverName", "packageId"],
+        "compatibilityInputsIgnoredAsAuthority": ["site", "environment", "targetVersion", "requester"],
+        "derivedAuthority": ["configurationItemId", "serverName", "site", "environment", "packageVersion", "makerUserId"],
+        "requiredGuards": ["active-cmdb-server-bound", "canonical-dual-scope-bound", "stable-package-version-bound", "authenticated-maker-bound", "distinct-approver", "immutable-lifecycle-provenance", "provider-calls-disabled", "evidence-redacted"],
+        "blockedReasons": ["persistence-unavailable", "provider-calls-disabled", "live-execution-disabled", "target-missing-or-inactive", "target-scope-out-of-bounds", "target-authority-unresolved", "target-authority-changed", "maker-checker-conflict", "package-not-approved-for-target-site", "approval-missing", "evidence-not-redacted"],
         "requiredEvidence": ["Deployment plan summary", "Validation result", "Approval decisions", "Redacted execution evidence", "Post-install verification report", "Evidence references"]
     })
 }
@@ -614,6 +737,8 @@ mod tests {
     fn test_validate_deployment_empty_fields() {
         let request = DeploymentRequest {
             server_name: "".into(),
+            site: "".into(),
+            environment: "".into(),
             package_id: "".into(),
             target_version: "".into(),
             scheduled_time: "".into(),
@@ -628,6 +753,8 @@ mod tests {
     fn test_validate_deployment_unknown_package() {
         let request = DeploymentRequest {
             server_name: "w-defra-srv-01".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-unknown".into(),
             target_version: "1.0".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -647,6 +774,8 @@ mod tests {
     fn test_validate_deployment_valid() {
         let request = DeploymentRequest {
             server_name: "w-defra-srv-01".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-zabbix-agent".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -660,6 +789,8 @@ mod tests {
     fn test_plan_deployment_creates_record() {
         let request = DeploymentRequest {
             server_name: "w-defra-srv-02".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-zabbix-agent".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -677,6 +808,8 @@ mod tests {
     fn test_plan_deployment_unknown_package_fails() {
         let request = DeploymentRequest {
             server_name: "w-defra-srv-02".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-unknown".into(),
             target_version: "1.0".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -689,6 +822,8 @@ mod tests {
     fn test_plan_deployment_requires_validation_success() {
         let request = DeploymentRequest {
             server_name: "".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-zabbix-agent".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -704,6 +839,8 @@ mod tests {
     fn test_approve_deployment() {
         let request = DeploymentRequest {
             server_name: "w-defra-srv-03".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
             package_id: "pkg-qualys-agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-16T22:00:00Z".into(),
@@ -716,6 +853,27 @@ mod tests {
     }
 
     #[test]
+    fn test_approve_deployment_rejects_maker_as_checker() {
+        let request = DeploymentRequest {
+            server_name: "w-defra-srv-maker-checker".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            package_id: "pkg-zabbix-agent".into(),
+            target_version: "7.0.4".into(),
+            scheduled_time: "2026-06-16T22:00:00Z".into(),
+            requester: "same-actor".into(),
+        };
+        let planned = plan_deployment(&request).unwrap();
+        let error = approve_deployment(&planned.id, "same-actor").unwrap_err();
+        assert!(error.contains("maker cannot approve"));
+        assert_eq!(
+            get_deployment(&planned.id).expect("planned record").status,
+            DeploymentStatus::Planned,
+            "denied self-approval must not transition state"
+        );
+    }
+
+    #[test]
     fn test_approve_deployment_not_found() {
         assert!(approve_deployment("dep-nonexistent", "admin").is_err());
     }
@@ -724,6 +882,8 @@ mod tests {
     fn test_execute_deployment() {
         let request = DeploymentRequest {
             server_name: "w-gblon-srv-01".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
             package_id: "pkg-crowdstrike-sensor".into(),
             target_version: "7.11.0".into(),
             scheduled_time: "2026-06-18T23:00:00Z".into(),
@@ -751,6 +911,8 @@ mod tests {
     fn test_execute_deployment_not_approved_fails() {
         let request = DeploymentRequest {
             server_name: "w-gblon-srv-02".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
             package_id: "pkg-ms-teams".into(),
             target_version: "24091.214.2846.4154".into(),
             scheduled_time: "2026-06-17T22:00:00Z".into(),
@@ -769,6 +931,8 @@ mod tests {
     fn test_verify_deployment_requires_execution() {
         let request = DeploymentRequest {
             server_name: "w-nlams-srv-03".into(),
+            site: "NLAMS".into(),
+            environment: "production".into(),
             package_id: "pkg-qualys-agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-19T22:00:00Z".into(),
@@ -782,6 +946,8 @@ mod tests {
     fn test_verify_deployment_after_execute() {
         let request = DeploymentRequest {
             server_name: "w-nlams-srv-04".into(),
+            site: "NLAMS".into(),
+            environment: "production".into(),
             package_id: "pkg-qualys-agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-19T23:00:00Z".into(),

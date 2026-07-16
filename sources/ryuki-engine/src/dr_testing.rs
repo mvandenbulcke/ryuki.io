@@ -619,12 +619,18 @@ pub fn get_test_results(plan_id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn list_due_tests() -> Result<Value, String> {
+/// List overdue DR plans visible to the caller's persisted site scope.
+///
+/// The scope predicate is evaluated while the store lock is held and before a
+/// plan is cloned into the response. An empty scope is the explicit
+/// unrestricted form; a multi-site scope returns the union of those sites.
+pub fn list_due_tests(site_scope: &[String]) -> Result<Value, String> {
     let now = Utc::now();
     let store = dr_store().lock().unwrap();
     let due: Vec<DrPlan> = store
         .0
         .iter()
+        .filter(|p| crate::auth::scope_permits(site_scope, Some(&p.site)))
         .filter(|p| parse_iso_time(&p.next_test_due).is_some_and(|due| due <= now))
         .cloned()
         .collect();
@@ -870,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_list_due_tests() {
-        let due = list_due_tests().unwrap();
+        let due = list_due_tests(&[]).unwrap();
         assert!(due["count"].as_u64().unwrap() >= 1);
         assert!(
             due["due_tests"]
@@ -878,6 +884,36 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|p| p["id"] == "drp-defra-001")
+        );
+    }
+
+    #[test]
+    fn test_list_due_tests_applies_single_and_multi_site_scope_before_projection() {
+        let defra = list_due_tests(&["DEFRA".into()]).unwrap();
+        let defra_plans = defra["due_tests"].as_array().unwrap();
+        assert!(
+            !defra_plans.is_empty(),
+            "seed includes an overdue DEFRA plan"
+        );
+        assert!(defra_plans.iter().all(|plan| plan["site"] == "DEFRA"));
+
+        let union = list_due_tests(&["DEFRA".into(), "FRPAR".into()]).unwrap();
+        let union_plans = union["due_tests"].as_array().unwrap();
+        assert!(
+            union_plans
+                .iter()
+                .all(|plan| matches!(plan["site"].as_str(), Some("DEFRA") | Some("FRPAR")))
+        );
+        assert!(union_plans.iter().any(|plan| plan["site"] == "DEFRA"));
+        assert!(union_plans.iter().any(|plan| plan["site"] == "FRPAR"));
+
+        let foreign = list_due_tests(&["GBLON".into()]).unwrap();
+        assert!(
+            foreign["due_tests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|plan| plan["site"] == "GBLON")
         );
     }
 

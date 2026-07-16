@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Multi-Step Orchestration · Ryuki</title>
-<meta name="description" content="Dependency-ordered step plans, per-step live approval, and automatic teardown.">
+<meta name="description" content="Dependency-ordered step plans, disabled human per-step live approval, and system-owned compensation groundwork.">
 <link rel="canonical" href="https://ryuki.io/orchestration.html">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://ryuki.io/orchestration.html">
 <meta property="og:title" content="Multi-Step Orchestration · Ryuki">
-<meta property="og:description" content="Dependency-ordered step plans, per-step live approval, and automatic teardown.">
+<meta property="og:description" content="Dependency-ordered step plans, disabled human per-step live approval, and system-owned compensation groundwork.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,12 +103,12 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link active" aria-current="page" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
-honest limits" href="/orchestration.html">Multi-Step Orchestration</a><ul class="sb-sections"><li><a href="#what-exists-today">What exists today</a></li><li><a href="#how-a-stepped-request-runs">How a stepped request runs</a></li><li><a href="#per-step-live-apply">Per-step live apply</a></li><li><a href="#automatic-teardown">Automatic teardown</a></li><li><a href="#honest-limits">Honest limits</a></li></ul></li><li><a class="sb-link" data-sections="what gets notified, and to whom
+honest limits" href="/orchestration.html">Multi-Step Orchestration</a><ul class="sb-sections"><li><a href="#what-exists-today">What exists today</a></li><li><a href="#how-a-stepped-request-runs">How a stepped request runs</a></li><li><a href="#per-step-live-apply-is-disabled">Per-step live apply is disabled</a></li><li><a href="#automatic-teardown">Automatic teardown</a></li><li><a href="#honest-limits">Honest limits</a></li></ul></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
 api
 the portal bell
@@ -107,7 +123,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <main id="main">
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Multi-Step Orchestration</span></nav>
 <h1 id="multi-step-orchestration">Multi-Step Orchestration</h1>
-<p>Some offerings are not one job but a sequence: preflight, deploy, enroll monitoring. Ryuki can materialize a dependency-ordered step plan inside a single governed request, execute steps as their dependencies succeed, gate each live apply on its own approval, and roll back applied steps in reverse order when a later step fails.</p>
+<p>Some offerings are not one job but a sequence: preflight, deploy, enroll monitoring. Ryuki can materialize a dependency-ordered step plan inside a single governed request and track steps as their dependencies succeed. Human per-step live apply is deliberately disabled in this release; the signed step-grant and reverse-order compensation machinery remains internal protocol groundwork, not an enabled operator workflow.</p>
 <h2 id="what-exists-today">What exists today</h2>
 <p>One composite offering is wired: <strong>managed server onboarding</strong>, three steps (<code>preflight</code> → <code>deploy</code> → <code>monitor</code>), each depending on the previous. It is selected by creating a <code>server-deployment</code> request whose <code>fields.deployment_profile</code> is <code>managed-onboarding</code> (the server mirrors that allowlisted field into request metadata); it is not a separate catalog entry. Each step references a real single-offering IaC bundle.</p>
 <p>Step plans are defined in code (a step template in <code>ryuki-runner</code>), not in YAML: adding a new composite offering is a code change. The plan is validated at request creation (duplicate keys, unknown dependencies, and cycles are rejected), materialized in the same transaction as the request, and immutable afterwards.</p>
@@ -119,28 +135,28 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <li><code>GET /api/requests/{id}</code> includes a <code>steps</code> array with each step's key, dependencies, IaC reference, and status.</li>
 </ol>
 <p>If a step fails, in-flight siblings are swept to failed and their pending agent jobs cancelled. A failed dependency blocks its dependents permanently, by design; there is no automatic retry or skip.</p>
-<h2 id="per-step-live-apply">Per-step live apply</h2>
-<p>A stepped request can never be live-applied as a whole; <code>?mode=live-apply</code> and the request-level approval endpoint both refuse. Instead each step earns its own apply:</p>
+<h2 id="per-step-live-apply-is-disabled">Per-step live apply is disabled</h2>
+<p>A stepped request cannot be live-applied as a whole; <code>?mode=live-apply</code> and the request-level approval endpoint both refuse. Human approval of an individual step is also disabled in this release:</p>
 <ol>
-<li>The step's live plan completes and the step parks in <code>AwaitingApproval</code>, carrying its plan digest.</li>
-<li>An admin (not the requester; separation of duties is enforced) calls <code>POST /api/requests/{id}/steps/{step_key}/approve-live-apply</code>.</li>
-<li>The approval flips the step to <code>Applying</code> under a row lock, so a double approval loses cleanly, and mints a step-scoped grant bound to that one job: signed by the control plane, digest-checked by the agent, one live apply per step.</li>
-<li>Approval is refused if the request has begun rolling back.</li>
+<li>The portal renders the step plan and statuses but exposes no per-step live-apply control.</li>
+<li><code>POST /api/requests/{id}/steps/{step_key}/approve-live-apply</code> retains verified-human admin, request-scope, separation-of-duties, and closed exact-plan-body checks, then returns <code>409 Conflict</code> without changing the step or minting a job.</li>
+<li>The internal exact-plan and step-scoped grant types are retained for protocol validation and system-owned compensation. They are not authority for an operator to apply a step.</li>
+<li>Enabling human per-step apply requires a dedicated safe review projection for each exact step plan job, attempt, and digest, plus a separately reviewed release.</li>
 </ol>
 <h2 id="automatic-teardown">Automatic teardown</h2>
-<p>If a live step fails after earlier steps have applied, the control plane rolls back:</p>
+<p>The protocol retains a system-owned reverse-order compensation path for a future release in which live steps are admitted. If such a live step fails after earlier steps have applied, the control plane is designed to roll back:</p>
 <ul>
-<li>Steps still awaiting approval are failed first, so nothing new can be approved into a collapsing run.</li>
+<li>Steps still awaiting approval are failed first, so nothing new can enter a collapsing run.</li>
 <li>Applied steps are torn down in reverse dependency order, each with its own step-scoped <code>LiveDestroy</code> grant minted by the system. The authority to destroy derives from the step's own apply approval; a whole-request grant can never authorize a destroy.</li>
 <li>If a destroy itself fails, the cascade halts rather than thrashing. The request ends <code>failed</code>, and any steps still marked applied or tearing down are the operator's reconciliation list.</li>
 </ul>
 <p>The request remains <code>executing</code> while teardown runs, so destroy results flow through the same result path, and settles at <code>failed</code> once nothing is left applied.</p>
 <h2 id="honest-limits">Honest limits</h2>
 <ul>
-<li><strong>Portal support exists.</strong> Request detail renders the step plan and status of every step. An admin sees a two-click live-apply approval on a step only while it is <code>AwaitingApproval</code>; the API remains available for automation.</li>
+<li><strong>Portal status support exists; approval does not.</strong> Request detail renders the step plan and status of every step, but no per-step live-apply button or action is present. The API route is a fail-closed <code>409</code>, not an automation path.</li>
 <li><strong>Destroy is compensating, not operator-triggered.</strong> Terraform <code>LiveDestroy</code> runs on the agent during automatic rollback of a failed multi-step run. A successful request has no general operator destroy endpoint, so its cleanup must use a separately approved state-keyed procedure.</li>
-<li><strong>Live steps need a real agent.</strong> Per-step live applies require a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and real provider credentials; CI validates the control-plane side with simulated agent results.</li>
-<li><strong>Provider egress.</strong> Server-deployment bundles use the real <code>vmware/vsphere</code> Terraform provider: <code>init</code> needs one-time registry egress, and <code>plan</code> needs a reachable vCenter, degrading gracefully otherwise.</li>
+<li><strong>External execution is unavailable.</strong> Production refuses every Terraform/Ansible mode before spawn until the reviewed per-command containment adapter exists; no live or offline step execution is claimed here.</li>
+<li><strong>Future provider egress.</strong> If external execution is admitted later, server-deployment bundles use the checksum-locked <code>vmware/vsphere</code> provider: <code>init</code> needs registry egress and <code>plan</code> needs a reachable vCenter.</li>
 <li><strong>No in-place retry.</strong> A non-stepped request's single live-apply slot is consumed permanently, even by a failure; recovery is a new request.</li>
 </ul>
 <div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/orchestration.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/agents-and-live-execution.html">&larr; Agents & Live Execution</a><a href="/notifications.html">Notifications &rarr;</a></nav>

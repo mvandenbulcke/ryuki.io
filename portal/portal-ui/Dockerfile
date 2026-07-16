@@ -8,13 +8,14 @@
 # full-workspace COPY (ordered least- to most-frequently changing) over
 # cargo-chef layer tricks.
 
-FROM rust:1.96-bookworm AS build
+# rust:1.96-bookworm, pinned to the reviewed multi-platform index.
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 
 WORKDIR /app
 
 # Toolchain layer: cached independently of the workspace sources
 RUN rustup target add wasm32-unknown-unknown \
-    && cargo install cargo-leptos --locked
+    && cargo install cargo-leptos --version 0.3.7 --locked
 
 # Full workspace COPY set so `cargo metadata` resolves every member
 COPY Cargo.toml Cargo.lock ./
@@ -25,20 +26,33 @@ COPY portal/ portal/
 
 RUN cargo leptos build --release -p ryuki-portal-ui
 
-FROM debian:bookworm-slim AS runtime
+# debian:bookworm-slim, pinned to the reviewed multi-platform index.
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates curl socat \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 ryuki \
+    && useradd --system --uid 10001 --gid ryuki --no-create-home \
+        --home-dir /nonexistent --shell /usr/sbin/nologin ryuki
 
 WORKDIR /app
 
+# The standalone image is the documented loopback development image. Publish
+# its container port on 127.0.0.1; deployment manifests override the public
+# origin for their externally visible HTTPS address.
 ENV LEPTOS_SITE_ROOT=/app/site \
     LEPTOS_SITE_ADDR=0.0.0.0:8080 \
+    RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 \
+    RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true \
     RYUKI_PORTAL_EXECUTION_MODE=static-dry-run
 
-COPY --from=build /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui
-COPY --from=build /app/target/site /app/site
+COPY --from=build --chown=10001:10001 /app/target/release/ryuki-portal-ui /app/ryuki-portal-ui
+COPY --from=build --chown=10001:10001 /app/target/site /app/site
+
+# Match the Kubernetes runtime identity and keep a compromised SSR process away
+# from root-only container state.
+USER 10001:10001
 
 EXPOSE 8080
 

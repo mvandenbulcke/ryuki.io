@@ -34,16 +34,17 @@ pub const COLUMNS: &str = "id::text AS id, \
 
 // ─── Overdue-scan projection (#59) ─────────────────────────────────────────────
 
-/// Minimal projection for `patch_wave_overdue_scan`: just the wave id, name, and its
-/// committed window start extracted from the `schedule` JSONB (`schedule->>'start'`).
-/// Scalar extraction — no full-model deserialization — so a single corrupt `schedule`
-/// blob cannot fail the scan; a missing/empty start is returned as `""` (the caller
-/// skips it). Independent of the full `PatchWaveRow`.
+/// Minimal projection for `patch_wave_overdue_scan`. A shift item has one typed
+/// resource scope, so only waves with exactly one canonical site and zero or one
+/// environment are eligible. Multi-scope or malformed waves remain fail-closed
+/// instead of being guessed into one site's queue.
 #[derive(sqlx::FromRow)]
 pub struct ScheduledWaveRow {
     pub id: String,
     pub name: String,
     pub scheduled_start: String,
+    pub site: String,
+    pub environment: Option<String>,
 }
 
 /// Fetch every patch wave in status 'Scheduled' (committed to start at
@@ -54,8 +55,29 @@ pub async fn scheduled_waves_for_overdue_scan(
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<Vec<ScheduledWaveRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id::text AS id, name, COALESCE(schedule->>'start', '') AS scheduled_start \
-         FROM patch_waves WHERE status = 'Scheduled' ORDER BY id",
+        "SELECT wave.id::text AS id, wave.name, \
+                COALESCE(wave.schedule->>'start', '') AS scheduled_start, \
+                wave.site_scope->>0 AS site, \
+                CASE WHEN jsonb_typeof(wave.environment_scope) = 'array' THEN \
+                         CASE WHEN jsonb_array_length(wave.environment_scope) = 1 \
+                              THEN wave.environment_scope->>0 ELSE NULL END \
+                     ELSE NULL END AS environment \
+         FROM patch_waves AS wave \
+         INNER JOIN site_registry AS registry \
+                 ON registry.unlocode = wave.site_scope->>0 \
+                AND registry.active = true \
+         WHERE wave.status = 'Scheduled' \
+           AND CASE WHEN jsonb_typeof(wave.site_scope) = 'array' \
+                    THEN jsonb_array_length(wave.site_scope) = 1 ELSE false END \
+           AND jsonb_typeof(wave.site_scope->0) = 'string' \
+           AND CASE WHEN jsonb_typeof(wave.environment_scope) = 'array' \
+                    THEN jsonb_array_length(wave.environment_scope) <= 1 ELSE false END \
+           AND CASE WHEN jsonb_typeof(wave.environment_scope) = 'array' \
+                    THEN (jsonb_array_length(wave.environment_scope) = 0 \
+                          OR jsonb_typeof(wave.environment_scope->0) = 'string') \
+                    ELSE false END \
+         ORDER BY wave.id \
+         FOR SHARE OF wave, registry",
     )
     .fetch_all(executor)
     .await

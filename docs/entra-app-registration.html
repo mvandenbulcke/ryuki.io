@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,16 +79,18 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link active" aria-current="page" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
 environment configuration
-important security notes" href="/entra-app-registration.html">Entra App Registration</a><ul class="sb-sections"><li><a href="#overview">Overview</a></li><li><a href="#app-roles-definition">App Roles Definition</a></li><li><a href="#how-it-works">How It Works</a></li><li><a href="#permissions-by-role">Permissions by Role</a></li><li><a href="#environment-configuration">Environment Configuration</a></li><li><a href="#important-security-notes">Important Security Notes</a></li></ul></li><li><a class="sb-link" data-sections="un/locode
+important security notes" href="/entra-app-registration.html">Entra App Registration</a><ul class="sb-sections"><li><a href="#overview">Overview</a></li><li><a href="#browser-redirect-registration">Browser Redirect Registration</a></li><li><a href="#app-roles-definition">App Roles Definition</a></li><li><a href="#how-it-works">How It Works</a></li><li><a href="#permissions-by-role">Permissions by Role</a></li><li><a href="#environment-configuration">Environment Configuration</a></li><li><a href="#important-security-notes">Important Security Notes</a></li></ul></li><li><a class="sb-link" data-sections="un/locode
 custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -108,15 +124,17 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Entra App Registration</span></nav>
 <h1 id="entra-id-app-registration-app-roles">Entra ID App Registration — App Roles</h1>
 <h2 id="overview">Overview</h2>
-<p>The Ryuki Infrastructure Platform uses Entra ID <strong>app roles</strong> for RBAC instead of group-name-to-role mapping. Roles are defined in the Entra app registration manifest and assigned to users/groups in the enterprise application. The access token issued by Entra ID contains a <code>roles</code> claim which the platform reads directly — no group name mapping needed.</p>
+<p>The current Ryuki <code>entra-id</code> mode uses Entra ID <strong>app roles</strong> for RBAC instead of group-name-to-role mapping. Roles are defined in the Entra app registration manifest and assigned to users/groups in the enterprise application. The access token issued by Entra ID contains a <code>roles</code> claim which the current platform reads directly—no group-name mapping is needed.</p>
+<p>This is a transitional provider-specific setup guide, not the final production identity boundary. The target supports multiple OIDC providers and maps their allowlisted claims into one provider-qualified principal and typed policy model. See the <a href="platform-security-boundary.html#pluggable-authentication-providers">Platform Security Boundary Specification</a>.</p>
+<h2 id="browser-redirect-registration">Browser Redirect Registration</h2>
+<p>For portal sign-in, register the exact callback (for example, <code>https://&lt;host&gt;/api/auth/entra/callback</code>) as a <strong>Web</strong> redirect URI. Do not register the portal as an SPA token recipient. The server-side API/BFF validates the authorization response, exchanges the code, and establishes the browser session; tokens are not delivered to browser storage. Bearer-only API validation does not require this redirect URI.</p>
 <h2 id="app-roles-definition">App Roles Definition</h2>
-<p>Define these roles in the app registration manifest (Entra admin center → App registrations → [Your App] → App roles). Replace <code>{APP_CLIENT_ID}</code> below with your actual client ID.</p>
+<p>Define these roles in the app registration manifest (Entra admin center → App registrations → [Your App] → App roles). Merge the <code>appRoles</code> array below into the application manifest. Do not replace the manifest's read-only <code>id</code> (object id) or <code>appId</code> (client id). Replace every placeholder role <code>id</code> below with a different generated GUID. The field semantics follow the <a href="https://learn.microsoft.com/en-us/entra/identity-platform/reference-microsoft-graph-app-manifest">Microsoft Graph app-manifest reference</a>.</p>
 <h3 id="manifest-snippet">Manifest Snippet</h3>
 <pre><code class="lang-json">{
-  <span class="hl-k">"id"</span>: <span class="hl-s">"{APP_CLIENT_ID}"</span>,
   <span class="hl-k">"appRoles"</span>: [
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Full platform administration, approval, and audit access"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Platform Admin"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000001"</span>,
@@ -124,7 +142,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"PlatformAdmin"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Datacenter-level approval and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Datacenter Approver"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000002"</span>,
@@ -132,7 +150,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"DatacenterApprover"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"VMware virtualization execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"VMware Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000003"</span>,
@@ -140,7 +158,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"VMwareOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Hyper-V virtualization execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Hyper-V Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000004"</span>,
@@ -148,7 +166,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"HyperVOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Proxmox virtualization execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Proxmox Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000005"</span>,
@@ -156,7 +174,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"ProxmoxOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Operating system execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Wintel/Linux Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000006"</span>,
@@ -164,7 +182,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"WintelLinuxOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Backup execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Backup Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000007"</span>,
@@ -172,7 +190,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"BackupOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Monitoring execution and audit"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Monitoring Operator"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000008"</span>,
@@ -180,7 +198,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"MonitoringOperator"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Service Desk triage, request, and audit access"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Service Desk"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000009"</span>,
@@ -188,7 +206,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"ServiceDesk"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Read-only audit access"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Auditor"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000010"</span>,
@@ -196,7 +214,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"Auditor"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
       <span class="hl-k">"description"</span>: <span class="hl-s">"Request-only access"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Requester"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000011"</span>,
@@ -204,8 +222,8 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
       <span class="hl-k">"value"</span>: <span class="hl-s">"Requester"</span>
     },
     {
-      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>, <span class="hl-s">"Group"</span>],
-      <span class="hl-k">"description"</span>: <span class="hl-s">"Emergency administration and audit"</span>,
+      <span class="hl-k">"allowedMemberTypes"</span>: [<span class="hl-s">"User"</span>],
+      <span class="hl-k">"description"</span>: <span class="hl-s">"Current build: standing emergency admin; target: activation eligibility only"</span>,
       <span class="hl-k">"displayName"</span>: <span class="hl-s">"Break-Glass Admin"</span>,
       <span class="hl-k">"id"</span>: <span class="hl-s">"00000000-0000-0000-0000-000000000012"</span>,
       <span class="hl-k">"isEnabled"</span>: <span class="hl-n">true</span>,
@@ -218,21 +236,34 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <li>Roles are defined once in the app registration manifest (above).</li>
 <li>Users and/or groups are assigned roles in the <strong>Enterprise application</strong> blade (not the app registration).</li>
 <li>When a user authenticates, the access token issued by Entra ID includes a <code>roles</code> claim containing the assigned role values (e.g., <code>["PlatformAdmin", "Auditor"]</code>).</li>
-<li>Verified Entra role values are mapped to platform permissions.</li>
-<li><code>check_permission()</code> maps verified role names to permissions for authorization decisions.</li>
+<li>In the current build, verified Entra role values are mapped to platform permissions.</li>
+<li><code>check_permission()</code> maps verified role names to coarse permissions, while <code>check_operation_capability()</code> maps the same server-verified roles to a closed functional-operation capability. The identity provider never emits or selects Ryuki capability strings directly.</li>
 </ol>
 <h2 id="permissions-by-role">Permissions by Role</h2>
-<p>The platform recognises <strong>12</strong> app roles. Each role grants one or more of five coarse permission tiers. Authorization is checked per route: a request must hold the permission tier the route requires.</p>
+<p>The current platform recognises <strong>12</strong> app roles. Each role grants one or more of five coarse permission tiers. Current authorization is checked per route: a request must hold the permission tier the route requires.</p>
 <h3 id="permission-tiers">Permission tiers</h3>
 <table><thead><tr><th>Tier</th><th>Grants</th></tr></thead><tbody>
 <tr><td><code>admin</code></td><td>Superuser — satisfies every other tier. Required for <code>/api/admin/*</code>, emergency-change mutations, <code>secrets/rotate-all</code>, <strong>minting a live-apply grant</strong> (<code>approve-live-apply</code>), dispatching a live terraform plan, and reading sensitive prefixes (<code>/api/protect/secrets</code>, <code>/api/ops/emergency</code>, <code>/api/admin</code>).</td></tr>
 <tr><td><code>approve</code></td><td>Approve or reject requests, and maker/checker signoffs (<code>runbook/approve</code>, <code>patch/approve</code>, <code>software/approve</code>, <code>restore-approve</code>, <code>app-environment/approve</code>, <code>decommission/approve</code>, access-review <code>approve</code>/<code>revoke</code>/<code>exempt</code>).</td></tr>
-<tr><td><code>execute</code></td><td>Operator-tier mutations across <code>/api/protect</code>, <code>/api/identity</code>, <code>/api/network</code>, <code>/api/build</code>, <code>/api/vm</code>, <code>/api/maintain</code>, <code>/api/observe</code>, <code>/api/datacenter</code>, <code>/api/inventory</code>, <code>/api/cmdb</code>, <code>/api/analytics</code>, <code>/api/evidence</code>, <code>/api/retire</code>. Dispatches <strong>dry-run</strong> jobs only.</td></tr>
+<tr><td><code>execute</code></td><td>Default operator tier across <code>/api/protect</code>, <code>/api/identity</code>, <code>/api/network</code>, <code>/api/build</code>, <code>/api/vm</code>, <code>/api/maintain</code>, <code>/api/observe</code>, <code>/api/datacenter</code>, <code>/api/inventory</code>, <code>/api/cmdb</code>, <code>/api/analytics</code>, <code>/api/evidence</code>, <code>/api/retire</code>. High-impact functional operations listed below require a separate typed capability; <code>execute</code> alone never satisfies them. Dispatches <strong>dry-run</strong> jobs only.</td></tr>
 <tr><td><code>request</code></td><td>Submit and cancel requests (a Requester can cancel only their own).</td></tr>
 <tr><td><code>audit</code></td><td>Read the audit trail and evidence packs (<code>/api/requests/{id}/audit</code>, <code>/api/requests/{id}/evidence</code>, <code>/api/activity/audit</code>).</td></tr>
 </tbody></table>
-<p>The <strong>superuser rule</strong>: a session holding <code>admin</code> passes every permission check. Ordinary (non-sensitive) GET reads require <code>audit</code> <strong>or</strong> <code>request</code>; sensitive reads require <code>admin</code>. Any unmatched state-changing route falls back to <code>admin</code> (fail-closed) — a newly added mutating route is never silently open.</p>
-<h3 id="role-tier-matrix">Role → tier matrix</h3>
+<p>The <strong>superuser rule</strong>: a session holding <code>admin</code> passes every permission check. Safe reads use an exact closed classification. Enumerated requester-owned or static reads are marked <code>request</code> and accept <code>request</code> <strong>or</strong> <code>audit</code>; audit-grade reads require <code>audit</code>, operator working data requires <code>execute</code>, and sensitive reads require <code>admin</code>. A new or unclassified read defaults to <code>audit</code>, not requester visibility. Any unmatched state-changing route falls back to <code>admin</code> (fail-closed) — a newly added mutating route is never silently open.</p>
+<h3 id="functional-operation-capabilities">Functional operation capabilities</h3>
+<p>These current server-owned grants are evaluated before the coarse route tier. They answer <strong>which operation family</strong> the principal may execute; site and environment checks independently answer <strong>where</strong> it may act. <code>admin</code> remains the intentional superuser override.</p>
+<table><thead><tr><th>Capability</th><th>Current non-admin grant</th><th>Protected operation</th></tr></thead><tbody>
+<tr><td><code>identity.ad-computer.delete</code></td><td>None (admin-only until an identity-lifecycle role is governed)</td><td>Soft-delete an AD computer lifecycle record.</td></tr>
+<tr><td><code>network.firewall.manage</code></td><td>None (admin-only until a network/firewall role is governed)</td><td>Firewall rule and rule-set mutations.</td></tr>
+<tr><td><code>monitoring.alert-routing.manage</code></td><td><code>MonitoringOperator</code></td><td>Alert-route mutations.</td></tr>
+<tr><td><code>monitoring.alert.read</code></td><td><code>MonitoringOperator</code></td><td>Read the scoped live operational-alert feed.</td></tr>
+<tr><td><code>monitoring.alert.acknowledge</code></td><td><code>MonitoringOperator</code></td><td>Acknowledge scoped operational alerts.</td></tr>
+<tr><td><code>storage.array.decommission</code></td><td>None (admin-only until a storage role is governed)</td><td>Decommission an empty in-scope storage array.</td></tr>
+<tr><td><code>software.deployment.execute</code></td><td><code>WintelLinuxOperator</code></td><td>Advance an approved, in-scope software deployment to executed.</td></tr>
+</tbody></table>
+<p>The access-control and local-role catalog endpoints derive their permissions, execution domains, and operation-capability lists from this same runtime role registry. Catalog metadata cannot create an authority grant.</p>
+<p>These are current implementation semantics. The target authorization boundary evaluates a typed action against the final canonical resource and effective scope; it does not make an external provider's role string the final decision.</p>
+<h3 id="current-role-tier-matrix">Current role → tier matrix</h3>
 <table><thead><tr><th>Role</th><th>admin</th><th>approve</th><th>execute</th><th>request</th><th>audit</th></tr></thead><tbody>
 <tr><td><code>PlatformAdmin</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
 <tr><td><code>BreakGlassAdmin</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
@@ -250,29 +281,28 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>(A ✓ in <code>admin</code> implies every other tier via the superuser rule; the table shows each role's effective access.)</p>
 <p>Notes:</p>
 <ul>
-<li><strong>Live execution is admin-only.</strong> Only <code>PlatformAdmin</code> and <code>BreakGlassAdmin</code></li>
+<li><strong>Live execution is admin-only.</strong> Only <code>PlatformAdmin</code> and <code>BreakGlassAdmin</code> can dispatch a live terraform plan or mint a live-apply grant. <code>execute</code>-tier operators run dry-run jobs only. See the Execution Model in the <a href="architecture.html">Architecture</a> docs.</li>
+<li><strong>DatacenterApprover</strong> approves but cannot execute; <strong>Auditor</strong> is strictly read-only; <strong>Requester</strong> can submit and cancel its own requests but cannot read audit trails.</li>
+<li><strong>BreakGlassAdmin is transitional in the current build.</strong> Its Entra claim maps directly to standing <code>admin</code>, with the same effective permission as <code>PlatformAdmin</code>. Do not treat that mapping as production-ready emergency access.</li>
+<li>In the target model, <code>BreakGlassAdmin</code> is eligibility to request emergency activation, not standing emergency authority. Activation requires verified step-up and the governed emergency ceremony, issues a distinct short-lived grant, preserves scope and execution gates, alerts immediately, expires or is revoked explicitly, and is reviewed afterward. The app-role claim alone must not activate emergency power.</li>
 </ul>
-<p>  can dispatch a live terraform plan or mint a live-apply grant. <code>execute</code>-tier   operators run dry-run jobs only. See the Execution Model in the   <a href="architecture.html">Architecture</a> docs.</p>
-<ul>
-<li><strong>DatacenterApprover</strong> approves but cannot execute; <strong>Auditor</strong> is strictly</li>
-</ul>
-<p>  read-only; <strong>Requester</strong> can submit and cancel its own requests but cannot read   audit trails.</p>
-<ul>
-<li><strong>BreakGlassAdmin</strong> is the audited emergency role — same power as</li>
-</ul>
-<p>  <code>PlatformAdmin</code>, intended for break-glass use and called out in the   separation-of-duties controls.</p>
 <h2 id="environment-configuration">Environment Configuration</h2>
-<p>Only the Entra tenant and client IDs are needed:</p>
+<p>Bearer-token validation uses the Entra tenant and client IDs. Every Entra-mode launch also requires a dedicated persisted-session verifier key; browser sign-in additionally needs the exact server-side Web callback URI:</p>
 <pre><code class="lang-env"><span class="hl-v">RYUKI_ENTRA_TENANT_ID</span>=&lt;your-tenant-id&gt;
 <span class="hl-v">RYUKI_ENTRA_CLIENT_ID</span>=&lt;your-app-client-id&gt;
 <span class="hl-v">RYUKI_ENTRA_AUTHORITY</span>=https://login.microsoftonline.com
-<span class="hl-v">RYUKI_AUTH_MODE</span>=entra-id</code></pre>
+<span class="hl-v">RYUKI_ENTRA_REDIRECT_URI</span>=https://&lt;host&gt;/api/auth/entra/callback
+<span class="hl-v">RYUKI_AUTH_MODE</span>=entra-id
+<span class="hl-c"># Inject at runtime from a secret manager; never commit the value.</span>
+<span class="hl-v">RYUKI_SESSION__CREDENTIAL_HMAC_KEY</span>=&lt;at-least-32-random-bytes&gt;</code></pre>
 <h2 id="important-security-notes">Important Security Notes</h2>
 <ul>
 <li><strong>Do NOT commit</strong> the app registration manifest with real GUIDs, tenant IDs, or client IDs.</li>
 <li>The manifest snippet above uses placeholder GUIDs (<code>00000000-...</code>) for documentation only.</li>
 <li>Real role assignments are managed in the Entra admin center, not in code or Git.</li>
 <li>Role <strong>values</strong> (like <code>"PlatformAdmin"</code>) are safe to keep in source code as string constants — they are not secrets.</li>
+<li>Register the callback as a Web redirect and keep authorization-code and token handling server-side; do not expose tokens to SPA/browser storage.</li>
+<li>Until governed activation is implemented, assigning <code>BreakGlassAdmin</code> creates standing current-build admin authority. Keep it unassigned in a production-bound deployment rather than relying on the role name as a safety control.</li>
 </ul>
 <div class="page-meta">Last updated 2026-06-23 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/entra-app-registration.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/configuration.html">&larr; Configuration</a><a href="/site-management.html">Site Management &rarr;</a></nav>
 </main>

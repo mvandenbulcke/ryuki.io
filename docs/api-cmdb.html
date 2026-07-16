@@ -49,11 +49,11 @@
 <p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-cis-ci-name"><span class="method-chip m-get">GET</span><code>/api/cmdb/cis/{ci_name}</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Read one configuration item from the REAL <code>configuration_items</code> table by its unique <code>ci_name</code> (#18).</p>
-<p>The FIRST authenticated, DB-backed CMDB read — the impact/export endpoints serve an in-memory mock. AUDIT-tier (an explicit check, NOT the central gate's looser <code>audit OR request</code>): CI criticality and owner are inventory signals, kept audit-grade. Site-scoped (out-of-scope → 404, no oracle), like <code>certificates_get</code>. 503 with no DB (the table is the only CI source). NOTE: a <code>ci_name</code> containing <code>/</code> will not route as one path segment (404) — a by-UUID variant (the response carries <code>id</code>) is the follow-up for such names.</p>
+<p>The FIRST authenticated, DB-backed CMDB read — the impact/export endpoints serve an in-memory mock. AUDIT-tier (an explicit check, NOT the central gate's looser <code>audit OR request</code>): CI criticality and owner are inventory signals, kept audit-grade. Site/environment scope is applied in SQL through the exact active site-registry relation (out-of-scope → 404, no oracle). 503 with no DB (the table is the only CI source). NOTE: a <code>ci_name</code> containing <code>/</code> will not route as one path segment (404) — a by-UUID variant (the response carries <code>id</code>) is the follow-up for such names.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/cis/{ci_name}</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -61,7 +61,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -78,10 +78,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-export"><span class="method-chip m-get">GET</span><code>/api/cmdb/export</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Cmdb export records.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/export</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -89,7 +89,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>format</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Value supplied for the <code>format</code> query parameter.</td></tr></tbody></table>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -106,10 +106,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-impact-analysis-contract"><span class="method-chip m-get">GET</span><code>/api/cmdb/impact-analysis-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Cmdb impact analysis.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/impact-analysis-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -117,7 +117,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -149,10 +149,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-impact-contract"><span class="method-chip m-get">GET</span><code>/api/cmdb/impact-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Cmdb impact contract.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/impact-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -160,7 +160,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -206,7 +206,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>serde_json::Value</code>.</p>
 <p class="ep-note">This operation accepts JSON, but its field schema is not available. The known body type is <code>serde_json::Value</code>. No object shape is fabricated.</p>
@@ -227,10 +227,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-impact-downstream-ci-name"><span class="method-chip m-get">GET</span><code>/api/cmdb/impact/downstream/{ci_name}</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Cmdb impact downstream.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/impact/downstream/{ci_name}</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -238,7 +238,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -255,10 +255,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-impact-graph"><span class="method-chip m-get">GET</span><code>/api/cmdb/impact/graph</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Cmdb impact graph.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/impact/graph</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -266,7 +266,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -283,10 +283,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-impact-upstream-ci-name"><span class="method-chip m-get">GET</span><code>/api/cmdb/impact/upstream/{ci_name}</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Cmdb impact upstream.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/impact/upstream/{ci_name}</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -294,7 +294,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -322,7 +322,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>CmdbImportRequest</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>source</code> in the JSON request body.</td></tr></tbody></table>
@@ -354,7 +354,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -382,10 +382,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-reconciliation-contract"><span class="method-chip m-get">GET</span><code>/api/cmdb/reconciliation-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Cmdb reconciliation.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/reconciliation-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -393,7 +393,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -424,10 +424,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-relationship-graph-contract"><span class="method-chip m-get">GET</span><code>/api/cmdb/relationship-graph-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Cmdb relationship graph.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/relationship-graph-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -435,7 +435,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -465,10 +465,10 @@
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-servicenow-contract"><span class="method-chip m-get">GET</span><code>/api/cmdb/servicenow-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Servicenow contract.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/servicenow-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -476,7 +476,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -504,12 +504,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>approved_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>approved_at</code> returned in the response body.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>note</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>note</code> returned in the response body.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -519,6 +521,16 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/approve/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"approved_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"note"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-cmdb-servicenow-cancel-id"><span class="method-chip m-post">POST</span><code>/api/cmdb/servicenow/cancel/{id}</code></h2>
@@ -533,12 +545,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>cancelled_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>cancelled_at</code> returned in the response body.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -548,6 +562,15 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/cancel/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"cancelled_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-cmdb-servicenow-change"><span class="method-chip m-post">POST</span><code>/api/cmdb/servicenow/change</code></h2>
@@ -562,13 +585,15 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>ServicenowChangeRequest</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>ciName</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ciName</code> in the JSON request body.</td></tr><tr><td><code>changeType</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>changeType</code> in the JSON request body.</td></tr><tr><td><code>description</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Client-supplied human-readable description.</td></tr><tr><td><code>plannedStart</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>plannedStart</code> in the JSON request body.</td></tr><tr><td><code>plannedEnd</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>plannedEnd</code> in the JSON request body.</td></tr><tr><td><code>risk</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>risk</code> in the JSON request body.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>request_type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>request_type</code> returned in the response body.</td></tr><tr><td><code>ci_name</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ci_name</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>payload_summary</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>payload_summary</code> returned in the response body.</td></tr><tr><td><code>created_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>RFC 3339 timestamp when the resource was created.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -580,13 +605,27 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-cmd">--data</span> <span class="hl-s">'{"ciName":"&lt;string&gt;","changeType":"&lt;string&gt;","description":"&lt;string&gt;","plannedStart":"&lt;string&gt;","plannedEnd":"&lt;string&gt;","risk":"&lt;string&gt;"}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/change'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"request_type"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"ci_name"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"payload_summary"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"created_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-servicenow-history-ci"><span class="method-chip m-get">GET</span><code>/api/cmdb/servicenow/history/{ci}</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Servicenow history.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/servicenow/history/{ci}</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -594,12 +633,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>ci_name</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ci_name</code> returned in the response body.</td></tr><tr><td><code>count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Number of items represented in this response.</td></tr><tr><td><code>items</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Resources returned by this operation.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -608,6 +649,15 @@
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/history/&lt;ci&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"ci_name"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"items"</span>: <span class="hl-n">null</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-cmdb-servicenow-incident"><span class="method-chip m-post">POST</span><code>/api/cmdb/servicenow/incident</code></h2>
@@ -622,13 +672,15 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>ServicenowIncidentRequest</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>ciName</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ciName</code> in the JSON request body.</td></tr><tr><td><code>description</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Client-supplied human-readable description.</td></tr><tr><td><code>urgency</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>urgency</code> in the JSON request body.</td></tr><tr><td><code>assignmentGroup</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>assignmentGroup</code> in the JSON request body.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>request_type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>request_type</code> returned in the response body.</td></tr><tr><td><code>ci_name</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ci_name</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>payload_summary</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>payload_summary</code> returned in the response body.</td></tr><tr><td><code>created_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>RFC 3339 timestamp when the resource was created.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -640,13 +692,27 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-cmd">--data</span> <span class="hl-s">'{"ciName":"&lt;string&gt;","description":"&lt;string&gt;","urgency":"&lt;string&gt;","assignmentGroup":"&lt;string&gt;"}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/incident'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"request_type"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"ci_name"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"payload_summary"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"created_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-servicenow-pending"><span class="method-chip m-get">GET</span><code>/api/cmdb/servicenow/pending</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Servicenow pending.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/servicenow/pending</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -654,12 +720,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>count</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Number of items represented in this response.</td></tr><tr><td><code>items</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Resources returned by this operation.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -668,6 +736,14 @@
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/pending'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"count"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"items"</span>: <span class="hl-n">null</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-cmdb-servicenow-request"><span class="method-chip m-post">POST</span><code>/api/cmdb/servicenow/request</code></h2>
@@ -682,13 +758,15 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>Content-Type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Required by the resolved Axum <code>Json&lt;T&gt;</code> request extractor; send <code>application/json</code>.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>JSON structure: <code>ServicenowRequestRequest</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>ciName</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ciName</code> in the JSON request body.</td></tr><tr><td><code>requestType</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>requestType</code> in the JSON request body.</td></tr><tr><td><code>description</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Client-supplied human-readable description.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>request_type</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>request_type</code> returned in the response body.</td></tr><tr><td><code>ci_name</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>ci_name</code> returned in the response body.</td></tr><tr><td><code>site</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>site</code> returned in the response body.</td></tr><tr><td><code>environment</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>environment</code> returned in the response body.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>payload_summary</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>payload_summary</code> returned in the response body.</td></tr><tr><td><code>created_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>RFC 3339 timestamp when the resource was created.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -700,13 +778,27 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-cmd">--data</span> <span class="hl-s">'{"ciName":"&lt;string&gt;","requestType":"&lt;string&gt;","description":"&lt;string&gt;"}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/request'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"request_type"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"ci_name"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"site"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"environment"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"payload_summary"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"created_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-cmdb-servicenow-status-id"><span class="method-chip m-get">GET</span><code>/api/cmdb/servicenow/status/{id}</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">audit access</span></p>
 <p class="ep-summary">Servicenow status.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>audit</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/cmdb/servicenow/status/{id}</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -714,7 +806,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
@@ -742,12 +834,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>queued_at</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>queued_at</code> returned in the response body.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr><tr><td><code>note</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>note</code> returned in the response body.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -757,6 +851,16 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/submit/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"queued_at"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"note"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="post-api-cmdb-servicenow-validate-id"><span class="method-chip m-post">POST</span><code>/api/cmdb/servicenow/validate/{id}</code></h2>
@@ -771,12 +875,14 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>Idempotency-Key</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional at-most-once retry key for human mutations. When omitted, the idempotency middleware passes the request through without deduplication.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
+<h4><code>200</code> response body</h4>
+<p>Structure: <code>Value</code>.</p>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Identifier of the returned resource.</td></tr><tr><td><code>status</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>passed</code></td><td><code>boolean</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>passed</code> returned in the response body.</td></tr><tr><td><code>errors</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>errors</code> returned in the response body.</td></tr><tr><td><code>warnings</code></td><td><code>array&lt;JSON value&gt;</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>warnings</code> returned in the response body.</td></tr><tr><td><code>source</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Origin or authority of the returned data.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -786,6 +892,17 @@
   <span class="hl-cmd">--header</span> <span class="hl-s">'Authorization: Bearer &lt;token&gt;'</span> \
   <span class="hl-cmd">--header</span> <span class="hl-s">'Idempotency-Key: &lt;idempotency-key&gt;'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/cmdb/servicenow/validate/&lt;id&gt;'</span></code></pre>
+<h4>Schematic response body</h4>
+<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
+<p>Success status: <code>200</code></p>
+<pre><code class="lang-json">{
+  <span class="hl-k">"id"</span>: <span class="hl-n">null</span>,
+  <span class="hl-k">"status"</span>: <span class="hl-s">"&lt;string&gt;"</span>,
+  <span class="hl-k">"passed"</span>: <span class="hl-n">false</span>,
+  <span class="hl-k">"errors"</span>: [],
+  <span class="hl-k">"warnings"</span>: [],
+  <span class="hl-k">"source"</span>: <span class="hl-s">"&lt;string&gt;"</span>
+}</code></pre>
 </section>
 <div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-catalog.html">&larr; Catalog</a><a href="/api-dashboard.html">Dashboard &rarr;</a></nav>
 </main>

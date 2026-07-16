@@ -6,8 +6,12 @@ pub mod api;
 pub mod api_client;
 pub mod app;
 pub mod models;
+#[cfg(feature = "ssr")]
+pub mod security;
 pub mod server_boundary;
 pub mod shell;
+#[cfg(feature = "ssr")]
+pub mod startup;
 pub mod upstream;
 pub mod views;
 pub mod workspace_catalog;

@@ -20,11 +20,15 @@
 //!
 //! First-boot self-registration is wired: when no token is available from
 //! `RYUKI_AGENT_TOKEN` or the token file, and `RYUKI_AGENT_SELF_REGISTER=true`,
-//! the agent registers via `CpClient::register_new`, persists the returned
-//! token to the token file (0600, create-only), and **exits 0** pending admin
-//! approval. See [`self_register_and_exit`] for the exit-vs-poll rationale.
+//! the agent consumes the preprovisioned one-time enrollment challenge and
+//! signs the exact claim with its existing Ed25519 workload key. It then
+//! registers via `CpClient::register_new`, persists the returned token to the
+//! token file (0600, create-only), and **exits 0** pending admin approval. See
+//! [`self_register_and_exit`] for the exit-vs-poll rationale.
 //! Token precedence is documented in `config.rs`.
 
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,11 +43,72 @@ use ryuki_agent::{
     run::run_loop,
     token::{resolve_token, save_token_file, validate_register_response, ResolvedToken},
 };
-use ryuki_protocol::AgentRegistration;
+use ryuki_protocol::{sign_agent_enrollment_proof, AgentRegistration};
 use tracing::info;
+
+#[derive(Debug, Eq, PartialEq)]
+enum StartupMode {
+    Run,
+    PrintEnrollmentPublicKey,
+}
+
+fn parse_startup_mode(args: impl IntoIterator<Item = OsString>) -> Result<StartupMode, String> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Ok(StartupMode::Run),
+        [arg] if arg.as_os_str() == OsStr::new("--enrollment-public-key") => {
+            Ok(StartupMode::PrintEnrollmentPublicKey)
+        }
+        _ => Err(
+            "unsupported arguments; use no arguments to run the agent or exactly \
+             --enrollment-public-key to stage its enrollment identity"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Load or create the durable workload key and print only its public half.
+///
+/// Trusted provisioning calls this before requesting a challenge, so the
+/// control plane binds admission to the exact key the normal agent process
+/// subsequently loads. No token, challenge, control-plane URL, or provider
+/// credential is read in this mode.
+fn print_enrollment_public_key() -> Result<(), String> {
+    let key_path = std::env::var_os("RYUKI_AGENT_KEY_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("agent.key"));
+    let identity = if key_path.exists() {
+        AgentIdentity::load(&key_path)
+            .map_err(|error| format!("failed to load enrollment identity: {error}"))?
+    } else {
+        let identity = AgentIdentity::generate();
+        identity
+            .save(&key_path)
+            .map_err(|error| format!("failed to save enrollment identity: {error}"))?;
+        identity
+    };
+    println!("{}", identity.public_key_b64());
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
+    let startup_mode = match parse_startup_mode(std::env::args_os().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    if startup_mode == StartupMode::PrintEnrollmentPublicKey {
+        if let Err(error) = print_enrollment_public_key() {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Init structured logging from RUST_LOG (default: info).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -61,12 +126,12 @@ async fn main() {
         }
     };
 
-    // The bearer token is sent on every request. Warn (don't fail — local/e2e
-    // runs use http://127.0.0.1) if the control plane is reached over cleartext.
-    if cfg.cp_base_url.starts_with("http://") {
+    // The parser already rejected every remote cleartext endpoint. Keep the
+    // explicit local development exception visible to operators.
+    if cfg.cp_base_url.is_insecure_loopback() {
         tracing::warn!(
             cp_base_url = %cfg.cp_base_url,
-            "control-plane URL is cleartext http:// — the agent bearer token will be sent unencrypted; use https:// in production"
+            "control-plane URL uses explicitly enabled loopback HTTP for local development/testing; use HTTPS outside the local harness"
         );
     }
 
@@ -144,7 +209,13 @@ async fn main() {
     );
 
     // Build dependencies.
-    let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &token);
+    let cp = match CpClient::from_endpoint(&cfg.cp_base_url, &agent_id, &token) {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to initialize control-plane client");
+            std::process::exit(1);
+        }
+    };
 
     // Wire protocol compatibility handshake — runs for EVERY agent, live or not
     // (the CP→agent half of the version check; the CP-side extractor is the
@@ -275,11 +346,30 @@ async fn self_register_and_exit(cfg: &AgentConfig, identity: &AgentIdentity, age
         "no agent token found — attempting first-boot self-registration"
     );
 
+    let enrollment_challenge_id = cfg
+        .enrollment_challenge_id
+        .expect("self-registration config requires a challenge id");
+    let enrollment_challenge = cfg
+        .enrollment_challenge
+        .as_deref()
+        .expect("self-registration config requires a one-time challenge");
+    let public_key = identity.public_key_b64();
+    let enrollment_proof = sign_agent_enrollment_proof(
+        enrollment_challenge_id,
+        enrollment_challenge,
+        agent_id,
+        &cfg.platform,
+        &public_key,
+        identity.signing_key(),
+    );
     let reg = AgentRegistration {
+        enrollment_challenge_id,
+        enrollment_challenge: enrollment_challenge.to_owned(),
         agent_id: agent_id.to_owned(),
         platform: cfg.platform.clone(),
         capabilities: cfg.capabilities.clone(),
-        public_key: identity.public_key_b64(),
+        public_key,
+        enrollment_proof,
     };
 
     let resp = match CpClient::register_new(&cfg.cp_base_url, &reg).await {
@@ -288,9 +378,11 @@ async fn self_register_and_exit(cfg: &AgentConfig, identity: &AgentIdentity, age
             tracing::error!(
                 error = %e,
                 agent_id,
-                "self-registration failed. If this agent_id is already registered \
-                 (HTTP 409), restore its token file or have an admin revoke/delete \
-                 the stale enrollment before re-registering"
+                "self-registration failed. Retry only with the same private staged \
+                 challenge while it remains valid. If the control plane already \
+                 consumed it or reports an existing identity, restore the token or \
+                 complete the approved enrollment-recovery procedure before a trusted \
+                 administrator issues a fresh key-bound challenge"
             );
             std::process::exit(1);
         }
@@ -316,8 +408,9 @@ async fn self_register_and_exit(cfg: &AgentConfig, identity: &AgentIdentity, age
             agent_id,
             token_path = %cfg.token_path.display(),
             "registration succeeded but the token could NOT be persisted; the \
-             one-time token is now lost. An admin must delete/revoke the pending \
-             agent before retrying self-registration"
+             one-time token is now lost. Do not retry or revoke expecting the \
+             human-readable id to become reusable: an administrator must complete \
+             the approved enrollment-recovery procedure before issuing a fresh challenge"
         );
         std::process::exit(1);
     }
@@ -328,10 +421,42 @@ async fn self_register_and_exit(cfg: &AgentConfig, identity: &AgentIdentity, age
         "self-registration complete — token persisted (0600); agent is PENDING admin approval"
     );
     info!(
-        "next step: an admin must approve this agent: \
-         POST {}/api/admin/agents/{}/approve with body {{\"platform\": \"{}\"}}",
+        "next step: an admin must review GET {}/api/admin/agents and copy this \
+         enrollment's immutable enrollment_id and public_key_fingerprint",
+        cfg.cp_base_url
+    );
+    info!(
+        "then approve the reviewed enrollment: POST {}/api/admin/agents/{}/approve \
+         with body {{\"enrollment_id\":\"<from-list>\",\"public_key_fingerprint\":\
+         \"<from-list>\",\"platform\":\"{}\"}}",
         cfg.cp_base_url, agent_id, cfg.platform
     );
     info!("after approval, start the agent again — it will load the token from the token file");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn startup_mode_is_explicit_and_non_composable() {
+        assert_eq!(
+            parse_startup_mode(Vec::<OsString>::new()).unwrap(),
+            StartupMode::Run
+        );
+        assert_eq!(
+            parse_startup_mode([OsString::from("--enrollment-public-key")]).unwrap(),
+            StartupMode::PrintEnrollmentPublicKey
+        );
+        for args in [
+            vec![OsString::from("--unknown")],
+            vec![
+                OsString::from("--enrollment-public-key"),
+                OsString::from("extra"),
+            ],
+        ] {
+            assert!(parse_startup_mode(args).is_err());
+        }
+    }
 }

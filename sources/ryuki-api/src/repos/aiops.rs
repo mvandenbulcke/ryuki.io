@@ -36,6 +36,7 @@ use ryuki_engine::aiops::{
     suggestion_status_from_db, suggestion_status_to_db, suggestion_type_from_db, AIOpsSuggestion,
     SuggestionStatus, SuggestionType,
 };
+use ryuki_engine::auth::ActorClass;
 use sqlx::PgPool;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
@@ -121,7 +122,10 @@ impl AiopsSuggestionRow {
 /// List suggestions for a site.
 pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
     let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM aiops_suggestions WHERE site = $1 ORDER BY created_at"
+        "SELECT {COLUMNS} FROM aiops_suggestions \
+         WHERE site = $1 \
+           AND (status IN ('New', 'Rejected') OR reviewer_actor_class = 'verified-human') \
+         ORDER BY created_at"
     ))
     .bind(site)
     .fetch_all(pool)
@@ -136,7 +140,10 @@ pub async fn list_by_type(
     suggestion_type_db: &str,
 ) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
     let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM aiops_suggestions WHERE suggestion_type = $1 ORDER BY created_at"
+        "SELECT {COLUMNS} FROM aiops_suggestions \
+         WHERE suggestion_type = $1 \
+           AND (status IN ('New', 'Rejected') OR reviewer_actor_class = 'verified-human') \
+         ORDER BY created_at"
     ))
     .bind(suggestion_type_db)
     .fetch_all(pool)
@@ -171,21 +178,28 @@ pub async fn review(
     pool: &PgPool,
     id: &str,
     reviewer: &str,
+    reviewer_actor_class: ActorClass,
     expected_status: &str,
     scope_site: &str,
 ) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
-    // `AND site = $5` (#2) — site-aware CAS, matching accept/reject/implement: if
+    // The persistence boundary accepts the typed classification itself, never
+    // a caller-asserted string that an internal caller could forge.
+    if reviewer_actor_class != ActorClass::VerifiedHuman {
+        return Ok(None);
+    }
+    // `AND site = $6` (#2) — site-aware CAS, matching accept/reject/implement: if
     // the row was re-homed out of the caller's scope after the handler's scope
     // guard, this matches 0 rows and the handler reports a 409 instead of writing
     // off-scope (closes the load-then-write TOCTOU).
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "UPDATE aiops_suggestions \
-         SET status = $4, reviewer = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = $3 AND site = $5 \
+         SET status = $5, reviewer = $2, reviewer_actor_class = $3, updated_at = NOW() \
+         WHERE id = $1 AND status = $4 AND site = $6 \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(reviewer)
+    .bind(reviewer_actor_class.as_str())
     .bind(expected_status)
     .bind(suggestion_status_to_db(&SuggestionStatus::Reviewed))
     .bind(scope_site)
@@ -211,6 +225,7 @@ pub async fn accept(
         "UPDATE aiops_suggestions \
          SET status = $4, implementation_plan = $2, updated_at = NOW() \
          WHERE id = $1 AND status = $3 AND site = $5 \
+           AND reviewer_actor_class = 'verified-human' \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -264,6 +279,7 @@ pub async fn implement(
         "UPDATE aiops_suggestions \
          SET status = $3, updated_at = NOW() \
          WHERE id = $1 AND status = $2 AND site = $4 \
+           AND reviewer_actor_class = 'verified-human' \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -410,13 +426,151 @@ mod aiops_db_tests {
 
         let expected = ryuki_engine::aiops::guard_review(&suggestion).expect("guard ok");
 
-        let updated = review(&pool, id, "alice", expected, "DEFRA")
+        for actor_class in [
+            ActorClass::Workload,
+            ActorClass::Unknown,
+            ActorClass::Simulated,
+        ] {
+            let denied = review(&pool, id, "machine-alice", actor_class, expected, "DEFRA")
+                .await
+                .expect("nonhuman review repo call");
+            assert!(
+                denied.is_none(),
+                "a nonhuman must not create review evidence"
+            );
+        }
+        let unchanged = get(&pool, id)
             .await
-            .expect("review repo")
-            .expect("CAS hit");
+            .expect("get unchanged")
+            .expect("row exists");
+        assert_eq!(unchanged.status, SuggestionStatus::New);
+        assert_eq!(unchanged.reviewer, None);
+        assert_eq!(unchanged.updated_at, suggestion.updated_at);
+        let unchanged_actor_class: Option<String> =
+            sqlx::query_scalar("SELECT reviewer_actor_class FROM aiops_suggestions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read unchanged actor provenance");
+        assert_eq!(unchanged_actor_class, None);
+
+        let updated = review(
+            &pool,
+            id,
+            "alice",
+            ActorClass::VerifiedHuman,
+            expected,
+            "DEFRA",
+        )
+        .await
+        .expect("review repo")
+        .expect("CAS hit");
 
         assert_eq!(updated.status, SuggestionStatus::Reviewed);
         assert_eq!(updated.reviewer, Some("alice".into()));
+        let persisted_actor_class: Option<String> =
+            sqlx::query_scalar("SELECT reviewer_actor_class FROM aiops_suggestions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read review actor provenance");
+        assert_eq!(persisted_actor_class.as_deref(), Some("verified-human"));
+
+        let expected_accept =
+            ryuki_engine::aiops::guard_accept(&updated).expect("verified review is acceptable");
+        let accepted = accept(
+            &pool,
+            id,
+            "verified provenance plan",
+            expected_accept,
+            "DEFRA",
+        )
+        .await
+        .expect("accept repo")
+        .expect("verified review provenance permits acceptance");
+        assert_eq!(accepted.status, SuggestionStatus::Accepted);
+
+        let rebind = sqlx::query(
+            "UPDATE aiops_suggestions SET reviewer_actor_class = 'workload' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect_err("reviewer actor provenance must be immutable");
+        assert!(rebind
+            .to_string()
+            .contains("AIOps reviewer provenance is immutable"));
+
+        cleanup(&pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn accept_quarantines_reviewed_rows_without_verified_human_provenance() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: DB unavailable");
+            return;
+        };
+
+        let id = "test-aiops-legacy-review-001";
+        insert_test_suggestion(&pool, id, "Migration", "Reviewed", "DEFRA", None).await;
+        sqlx::query(
+            "UPDATE aiops_suggestions \
+             SET reviewer = 'legacy-reviewer', reviewer_actor_class = 'unknown' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("seed pre-admission reviewer provenance");
+
+        let suggestion = get(&pool, id).await.expect("get").expect("row exists");
+        let expected = ryuki_engine::aiops::guard_accept(&suggestion).expect("engine status guard");
+        let denied = accept(&pool, id, "legacy plan", expected, "DEFRA")
+            .await
+            .expect("accept repository call");
+        assert!(
+            denied.is_none(),
+            "unknown legacy provenance must be quarantined"
+        );
+        let unchanged = get(&pool, id)
+            .await
+            .expect("get unchanged")
+            .expect("row exists");
+        assert_eq!(unchanged.status, SuggestionStatus::Reviewed);
+
+        sqlx::query("UPDATE aiops_suggestions SET status = 'Accepted' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("seed a legacy accepted row");
+        let legacy_accepted = get(&pool, id)
+            .await
+            .expect("get legacy accepted")
+            .expect("row exists");
+        let expected_implement =
+            ryuki_engine::aiops::guard_implement(&legacy_accepted).expect("engine status guard");
+        let implementation = implement(&pool, id, expected_implement, "DEFRA")
+            .await
+            .expect("implement repository call");
+        assert!(
+            implementation.is_none(),
+            "unknown legacy provenance must not become implemented"
+        );
+        let trusted = list_by_site(&pool, "DEFRA")
+            .await
+            .expect("trusted site list");
+        assert!(
+            trusted.iter().all(|suggestion| suggestion.id != id),
+            "legacy accepted evidence must be quarantined from trusted consumers"
+        );
+        let raw_status: String =
+            sqlx::query_scalar("SELECT status FROM aiops_suggestions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read unchanged legacy status");
+        assert_eq!(raw_status, "Accepted");
 
         cleanup(&pool, id).await;
     }
@@ -456,9 +610,16 @@ mod aiops_db_tests {
         insert_test_suggestion(&pool, id, "CostOptimization", "New", "DEFRA", Some(200.0)).await;
 
         // Attempt CAS with wrong expected status ("Reviewed" but row is "New")
-        let result = review(&pool, id, "bob", "Reviewed", "DEFRA")
-            .await
-            .expect("query ok");
+        let result = review(
+            &pool,
+            id,
+            "bob",
+            ActorClass::VerifiedHuman,
+            "Reviewed",
+            "DEFRA",
+        )
+        .await
+        .expect("query ok");
         assert!(
             result.is_none(),
             "wrong expected_status → Ok(None) (CAS miss)"

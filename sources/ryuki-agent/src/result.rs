@@ -20,6 +20,7 @@
 //! | `status`                | mapped from `RunStatus` → `JobResultStatus`                    | Step 5        |
 //! | `job_spec_digest`       | `ryuki_protocol::job_spec_digest(&job.spec)`                   | Step 7        |
 //! | `approved_plan_digest`  | `None` for non-LiveApply; `Some(d)` for LiveApply+Applied      | Step 8        |
+//! | `raw_plan_digest`       | `Some(raw)` only for LivePlan+Planned; otherwise `None`        | Step 8        |
 //! | `evidence_digest`       | `sha256_hex(&evidence.evidence_bytes)`                         | Step 6        |
 //! | `redaction_policy_version` | `REDACTION_POLICY_VERSION` constant                         | Stored        |
 //! | `timestamp`             | `Utc::now()`                                                   | Stored        |
@@ -32,8 +33,8 @@
 use chrono::Utc;
 use ryuki_engine::runners::RunStatus;
 use ryuki_protocol::{
-    job_result_status_allowed, job_spec_digest, sha256_hex, sign, Job, JobMode, JobResult,
-    JobResultStatus, SignedEnvelope,
+    job_result_status_allowed, job_spec_digest, sha256_digest_is_canonical, sha256_hex, sign,
+    ExecutionTrustProfile, Job, JobMode, JobResult, JobResultStatus, SignedEnvelope,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -142,8 +143,60 @@ pub enum ResultError {
          build_refused_result instead)"
     )]
     MissingPlanDigestForLiveApply,
+    #[error(
+        "a successful LivePlan result MUST carry raw_plan_digest so approval binds the complete canonical pre-redaction plan"
+    )]
+    MissingRawPlanDigestForLivePlan,
+    #[error("raw_plan_digest must be a lowercase 64-character SHA-256 hex string")]
+    MalformedRawPlanDigest,
+    #[error(
+        "raw_plan_digest is valid only for LivePlan + Planned, not mode {mode:?} with status {status:?}"
+    )]
+    RawPlanDigestOnWrongOutcome {
+        mode: JobMode,
+        status: JobResultStatus,
+    },
     #[error("serialisation error: {0}")]
     Serialise(String),
+    #[error("evidence failed the final redaction policy")]
+    EvidencePolicy,
+}
+
+const PATTERN_REDACTED_EVIDENCE: &[u8] = b"[REDACTED BY EVIDENCE POLICY]";
+
+/// Apply the shared semantic/pattern policy at the last possible point before
+/// digesting and signing. Runner value scrubbing remains the primary control;
+/// this final gate prevents a recognizable assignment/auth pattern from riding
+/// into the durable outbox merely because a provider used an unanticipated
+/// representation. Pattern matches are replaced as a whole, and a non-UTF-8
+/// payload fails closed without including the rejected bytes in diagnostics.
+fn finalize_evidence(
+    evidence_bytes: &[u8],
+    evidence_json: Option<&serde_json::Value>,
+) -> Result<(Vec<u8>, Option<serde_json::Value>), ResultError> {
+    let text = std::str::from_utf8(evidence_bytes).map_err(|_| ResultError::EvidencePolicy)?;
+    let safe_bytes = if ryuki_engine::evidence_pipeline::should_redact("execution-output", text) {
+        PATTERN_REDACTED_EVIDENCE.to_vec()
+    } else {
+        evidence_bytes.to_vec()
+    };
+
+    let safe_json = evidence_json
+        .map(|value| {
+            let serialized =
+                serde_json::to_string(value).map_err(|_| ResultError::EvidencePolicy)?;
+            if ryuki_engine::evidence_pipeline::should_redact(
+                "structured-execution-output",
+                &serialized,
+            ) {
+                Ok(serde_json::json!({"redacted": true}))
+            } else {
+                Ok(value.clone())
+            }
+        })
+        .transpose()?;
+
+    Ok((safe_bytes, safe_json))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +214,11 @@ pub enum ResultError {
 ///   non-refusal LiveApply result goes through the CP's grant-checked branch,
 ///   which requires the digest; a refusal uses `build_refused_result` instead.
 ///
+/// ## `raw_plan_digest` rules (fail-closed)
+///
+/// - `LivePlan + Planned`: MUST be canonical lowercase SHA-256 `Some(d)`.
+/// - Every other mode/status: MUST be `None`.
+///
 /// The mode/status consistency guard (non-live mode producing `Applied` →
 /// `LiveStatusInNonLiveMode`) runs BEFORE the digest checks.
 ///
@@ -177,6 +235,30 @@ pub fn build_signed_result(
     job: &Job,
     evidence: &Evidence,
     approved_plan_digest: Option<String>,
+) -> Result<ResultBody, ResultError> {
+    build_signed_result_with_trust_profile(
+        identity,
+        agent_id,
+        job,
+        evidence,
+        approved_plan_digest,
+        None,
+        None,
+    )
+}
+
+/// Live-result variant that binds the full canonical non-secret execution
+/// profile into the signed envelope. The compatibility wrapper above remains
+/// for offline results and refusal fixtures; successful live paths use this
+/// function and the CP rejects a missing profile.
+pub fn build_signed_result_with_trust_profile(
+    identity: &AgentIdentity,
+    agent_id: &str,
+    job: &Job,
+    evidence: &Evidence,
+    approved_plan_digest: Option<String>,
+    raw_plan_digest: Option<String>,
+    execution_trust_profile: Option<ExecutionTrustProfile>,
 ) -> Result<ResultBody, ResultError> {
     // Require an active lease — cannot sign without attempt_id and cp_nonce.
     let lease = job.lease.as_ref().ok_or(ResultError::NoLease)?;
@@ -241,14 +323,40 @@ pub fn build_signed_result(
         }
     };
 
-    // Compute the two digests that the CP will recompute and check.
-    let evidence_digest = sha256_hex(&evidence.evidence_bytes);
+    // The reviewed-plan commitment is a distinct signed field. Only a clean
+    // LivePlan result may carry it, and every such result must carry one. This
+    // prevents callers from falling back to the post-redaction evidence digest.
+    let envelope_raw_plan_digest = match (&job.spec.mode, &result_status) {
+        (JobMode::LivePlan, JobResultStatus::Planned) => match raw_plan_digest {
+            Some(digest) if sha256_digest_is_canonical(&digest) => Some(digest),
+            Some(_) => return Err(ResultError::MalformedRawPlanDigest),
+            None => return Err(ResultError::MissingRawPlanDigestForLivePlan),
+        },
+        _ => {
+            if raw_plan_digest.is_some() {
+                return Err(ResultError::RawPlanDigestOnWrongOutcome {
+                    mode: job.spec.mode.clone(),
+                    status: result_status.clone(),
+                });
+            }
+            None
+        }
+    };
+
+    // The final semantic/pattern redaction gate runs before the digest and
+    // signature so every durable copy is bound to the already-safe bytes.
+    let (evidence_bytes, evidence_json) =
+        finalize_evidence(&evidence.evidence_bytes, evidence.evidence_json.as_ref())?;
+
+    // Compute the evidence and job-spec digests that the CP will recompute.
+    let evidence_digest = sha256_hex(&evidence_bytes);
     let spec_digest = job_spec_digest(&job.spec);
 
     // Build the envelope with all fields that will be signed.
     // `signature` is filled by `sign()`; we set it to empty here.
     let unsigned_envelope = SignedEnvelope {
         agent_id: agent_id.to_string(),
+        agent_enrollment_id: job.agent_enrollment_id,
         platform: job.platform.clone(),
         job_id: job.id,
         attempt_id: lease.attempt_id,
@@ -259,6 +367,8 @@ pub fn build_signed_result(
         status: result_status.clone(),
         job_spec_digest: spec_digest,
         approved_plan_digest: envelope_plan_digest,
+        raw_plan_digest: envelope_raw_plan_digest,
+        execution_trust_profile,
         evidence_digest: evidence_digest.clone(),
         redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
         timestamp: Utc::now(),
@@ -272,20 +382,21 @@ pub fn build_signed_result(
     let signed_envelope = sign(unsigned_envelope, identity.signing_key());
 
     // Outer JobResult: every field MUST equal the corresponding envelope field.
-    // The CP equality-checks all five (verifier step 5).
+    // The CP equality-checks every duplicated outer/envelope field (step 5).
     let job_result = JobResult {
         job_id: signed_envelope.job_id,
         attempt_id: signed_envelope.attempt_id,
         result_id: signed_envelope.result_id,
         status: signed_envelope.status.clone(),
+        raw_plan_digest: signed_envelope.raw_plan_digest.clone(),
         evidence_digest: signed_envelope.evidence_digest.clone(),
         signed_envelope,
     };
 
     Ok(ResultBody {
         job_result,
-        evidence: evidence.evidence_bytes.clone(),
-        evidence_json: evidence.evidence_json.clone(),
+        evidence: evidence_bytes,
+        evidence_json,
     })
 }
 
@@ -335,14 +446,17 @@ pub fn build_refused_result(
 
     let result_id = Uuid::new_v4();
 
-    // Evidence is the scrubbed refusal reason (plain text, no secrets).
-    let evidence_bytes = reason.as_bytes().to_vec();
-    let evidence_json = Some(serde_json::json!({"refused": reason}));
+    // Refusals use the same final policy as executor outcomes; they are signed
+    // evidence too and must not become a bypass around the central gate.
+    let refusal_json = serde_json::json!({"refused": reason});
+    let (evidence_bytes, evidence_json) =
+        finalize_evidence(reason.as_bytes(), Some(&refusal_json))?;
     let evidence_digest = sha256_hex(&evidence_bytes);
     let spec_digest = job_spec_digest(&job.spec);
 
     let unsigned_envelope = SignedEnvelope {
         agent_id: agent_id.to_string(),
+        agent_enrollment_id: job.agent_enrollment_id,
         platform: job.platform.clone(),
         job_id: job.id,
         attempt_id: lease.attempt_id,
@@ -354,6 +468,8 @@ pub fn build_refused_result(
         job_spec_digest: spec_digest,
         // A refusal applied nothing — the CP rejects LiveRefused with a digest.
         approved_plan_digest: None,
+        raw_plan_digest: None,
+        execution_trust_profile: None,
         evidence_digest: evidence_digest.clone(),
         redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
         timestamp: Utc::now(),
@@ -369,6 +485,7 @@ pub fn build_refused_result(
         attempt_id: signed_envelope.attempt_id,
         result_id: signed_envelope.result_id,
         status: signed_envelope.status.clone(),
+        raw_plan_digest: signed_envelope.raw_plan_digest.clone(),
         evidence_digest: signed_envelope.evidence_digest.clone(),
         signed_envelope,
     };
@@ -423,6 +540,7 @@ mod tests {
         };
         Job {
             id: Uuid::new_v4(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "defra".to_string(),
             spec,
             status: JobStatus::Running,
@@ -487,6 +605,10 @@ mod tests {
         );
         assert_eq!(result.status, env.status, "status must equal envelope");
         assert_eq!(
+            result.raw_plan_digest, env.raw_plan_digest,
+            "raw_plan_digest must equal envelope"
+        );
+        assert_eq!(
             result.evidence_digest, env.evidence_digest,
             "evidence_digest must equal envelope"
         );
@@ -514,6 +636,47 @@ mod tests {
             body.job_result.signed_envelope.evidence_digest, expected_digest,
             "envelope evidence_digest must also equal sha256_hex(evidence_bytes)"
         );
+    }
+
+    #[test]
+    fn final_pattern_policy_runs_before_digest_signature_and_outbox_body() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::OfflineDryRun);
+        let marker = "SYNTH-PATTERN-MARKER";
+        let evidence = Evidence {
+            status: RunStatus::CheckOk,
+            evidence_bytes: format!("provider diagnostic token={marker}").into_bytes(),
+            evidence_json: Some(serde_json::json!({"client_secret": marker})),
+        };
+
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("pattern-bearing evidence is safely replaced");
+        assert_eq!(body.evidence, PATTERN_REDACTED_EVIDENCE);
+        assert_eq!(
+            body.evidence_json,
+            Some(serde_json::json!({"redacted": true}))
+        );
+        assert!(!serde_json::to_string(&body).unwrap().contains(marker));
+        assert_eq!(
+            body.job_result.signed_envelope.evidence_digest,
+            sha256_hex(&body.evidence),
+            "the signature must bind the final redacted bytes"
+        );
+    }
+
+    #[test]
+    fn final_pattern_policy_fails_closed_on_non_utf8_evidence() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::OfflineDryRun);
+        let evidence = Evidence {
+            status: RunStatus::CheckOk,
+            evidence_bytes: vec![0xff, 0xfe],
+            evidence_json: None,
+        };
+        assert!(matches!(
+            build_signed_result(&identity, "test-agent", &job, &evidence, None),
+            Err(ResultError::EvidencePolicy)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -966,17 +1129,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // S5b-2b-i: LivePlan + Planned + None → Ok, no approved_plan_digest
+    // Successful LivePlan results carry a distinct signed raw-plan commitment.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn live_plan_planned_no_digest_succeeds() {
+    fn live_plan_planned_with_raw_digest_succeeds() {
         let identity = make_identity();
         let job = make_leased_job(JobMode::LivePlan);
         let evidence = make_evidence(RunStatus::Planned);
+        let raw_plan_digest = sha256_hex(b"complete-canonical-raw-plan");
 
-        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
-            .expect("LivePlan + Planned + None must succeed");
+        let body = build_signed_result_with_trust_profile(
+            &identity,
+            "test-agent",
+            &job,
+            &evidence,
+            None,
+            Some(raw_plan_digest.clone()),
+            None,
+        )
+        .expect("LivePlan + Planned + canonical raw digest must succeed");
 
         let env = &body.job_result.signed_envelope;
         assert_eq!(env.status, JobResultStatus::Planned);
@@ -984,10 +1156,78 @@ mod tests {
             env.approved_plan_digest.is_none(),
             "LivePlan must NOT carry approved_plan_digest"
         );
+        assert_eq!(env.raw_plan_digest, Some(raw_plan_digest.clone()));
+        assert_eq!(body.job_result.raw_plan_digest, Some(raw_plan_digest));
 
         // Sign → verify passes.
         let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
         verify(env, &vk).expect("signature must verify for LivePlan+Planned");
+    }
+
+    #[test]
+    fn live_plan_planned_without_raw_digest_is_rejected() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LivePlan);
+        let evidence = make_evidence(RunStatus::Planned);
+
+        let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
+        assert!(matches!(
+            result,
+            Err(ResultError::MissingRawPlanDigestForLivePlan)
+        ));
+    }
+
+    #[test]
+    fn live_plan_planned_with_malformed_raw_digest_is_rejected() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LivePlan);
+        let evidence = make_evidence(RunStatus::Planned);
+
+        for malformed in [
+            "f".repeat(63),
+            "A".repeat(64),
+            format!("{}g", "0".repeat(63)),
+        ] {
+            let result = build_signed_result_with_trust_profile(
+                &identity,
+                "test-agent",
+                &job,
+                &evidence,
+                None,
+                Some(malformed),
+                None,
+            );
+            assert!(matches!(result, Err(ResultError::MalformedRawPlanDigest)));
+        }
+    }
+
+    #[test]
+    fn raw_plan_digest_is_rejected_for_wrong_mode_or_status() {
+        let identity = make_identity();
+        let raw_plan_digest = Some(sha256_hex(b"complete-canonical-raw-plan"));
+
+        for (mode, status) in [
+            (JobMode::OfflineDryRun, RunStatus::CheckOk),
+            (JobMode::LiveApply, RunStatus::Applied),
+            (JobMode::LivePlan, RunStatus::Failed),
+        ] {
+            let job = make_leased_job(mode.clone());
+            let evidence = make_evidence(status);
+            let approved = (mode == JobMode::LiveApply).then(|| sha256_hex(b"approved-plan"));
+            let result = build_signed_result_with_trust_profile(
+                &identity,
+                "test-agent",
+                &job,
+                &evidence,
+                approved,
+                raw_plan_digest.clone(),
+                None,
+            );
+            assert!(matches!(
+                result,
+                Err(ResultError::RawPlanDigestOnWrongOutcome { .. })
+            ));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1042,6 +1282,8 @@ mod tests {
             env.approved_plan_digest.is_none(),
             "LiveRefused must NOT carry approved_plan_digest"
         );
+        assert!(env.raw_plan_digest.is_none());
+        assert!(body.job_result.raw_plan_digest.is_none());
 
         // evidence_digest = sha256(reason bytes).
         let expected_digest = sha256_hex(reason.as_bytes());
@@ -1067,6 +1309,27 @@ mod tests {
         // Sign → verify must pass.
         let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
         verify(env, &vk).expect("Ed25519 signature on LiveRefused must verify");
+    }
+
+    #[test]
+    fn build_refused_result_redacts_structured_authorization() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let marker = "SYNTH-REFUSAL-MARKER";
+        let reason = format!(r#"provider={{\"Authorization\":\"Basic {marker}\"}}"#);
+        let body = build_refused_result(&identity, "test-agent", &job, &reason)
+            .expect("pattern-bearing refusal is safely replaced");
+
+        assert_eq!(body.evidence, PATTERN_REDACTED_EVIDENCE);
+        assert_eq!(
+            body.evidence_json,
+            Some(serde_json::json!({"redacted": true}))
+        );
+        assert!(!serde_json::to_string(&body).unwrap().contains(marker));
+        assert_eq!(
+            body.job_result.signed_envelope.evidence_digest,
+            sha256_hex(&body.evidence)
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1,0 +1,95 @@
+# Static release-orchestrator input, not a Kubernetes resource. The release
+# system must validate this file against the rendered objects, then execute the
+# gates in order. It carries no credential value and is never applied with
+# kubectl/GitOps. Every digest-scoped name, label, Vault role, database role,
+# and `digestPrefix` is derived from the first 12 lowercase hex characters of
+# `release.image`; a render must never replace these independently.
+contractVersion: migration-cutover-v1
+release:
+  namespace: ryuki-platform
+  apiDeployment: platform-api
+  migrationJobTemplate: deploy/kubernetes/operations/migration-job.yaml
+  migrationCredentialTemplate: deploy/kubernetes/operations/migration-vault-dynamic-secret.yaml
+  image: registry.example.invalid/ryuki/platform-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
+  digestPrefix: "111111111111"
+  apiMigrationMode: verify-only
+  jobMigrationMode: apply-only
+drain:
+  withdrawIngressTraffic: true
+  requiredWorkloadKinds:
+    - Deployment
+    - StatefulSet
+    - DaemonSet
+    - Job
+    - CronJob
+  requiredBaseWriterSelectors:
+    - app.kubernetes.io/part-of=ryuki-infrastructure-platform,app.kubernetes.io/name=platform-api
+  externalWriterInventoryRequired: true
+  requireZeroWriterPods: true
+  requireZeroLeasedOrRunningJobs: true
+  databaseSessionReadback:
+    independentOperatorIdentityRequired: true
+    requireZeroNonOperatorSessions: true
+    fields:
+      - pid
+      - usename
+      - application_name
+      - backend_start
+      - xact_start
+      - state
+credentials:
+  api:
+    secretName: ryuki-platform-api-db
+    secretKey: RYUKI_DATABASE_URL
+    expectedRole: ryuki_app_runtime
+    delivery: VaultDynamicSecret
+  migration:
+    vaultDynamicSecretName: ryuki-platform-api-migrator-db-111111111111
+    secretName: ryuki-platform-api-migrator-db-111111111111
+    secretKey: RYUKI_MIGRATION_DATABASE_URL
+    expectedRole: ryuki_schema_migrator
+    delivery: VaultDynamicSecret
+    vaultAuthRole: ryuki-api-db-migrator-111111111111
+    vaultDatabaseRole: ryuki-schema-migrator-111111111111
+    createAfterDrain: true
+    revokeAndDeleteAfterReadback: true
+execution:
+  createSemantics: create-once
+  generatedNamePrefix: platform-api-migrations-111111111111-
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  automaticTtlForbidden: true
+readback:
+  requireJobComplete: true
+  requireSingleSuccessfulPod: true
+  requireNoRetryPods: true
+  requireEmbeddedInventoryMatch: true
+  requireNoDirtyMigration: true
+  requireDatabaseRoleEvidence: true
+  retainGeneratedJobNameAndLogs: true
+restart:
+  requireMatchingApiImage: true
+  requireVerifyOnlyStartup: true
+  requireReadyBeforeTraffic: true
+  requireMatchingWorkersBeforeEnable: true
+sequence:
+  - freeze-render-and-digest
+  - withdraw-traffic
+  - stop-and-drain-all-writers
+  - readback-zero-database-sessions
+  - create-jit-migration-credential
+  - create-generated-job-once
+  - wait-for-single-completion
+  - readback-role-and-migration-ledger
+  - revoke-jit-migration-credential
+  - start-matching-verify-only-api
+  - require-readiness
+  - enable-matching-workers
+  - restore-traffic
+failure:
+  keepTrafficAndWritersStopped: true
+  automaticRetryForbidden: true
+  olderBinaryAgainstNewSchemaForbidden: true
+  forwardFixOrCoupledRestoreRequired: true

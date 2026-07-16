@@ -39,6 +39,10 @@ Required guards and approvals (from the contract YAML).
 
     request-context-known
     service-account-scope-summarized
+    canonical-name-site-owner-bound
+    longest-governed-site-suffix-resolved
+    namespace-provenance-verified
+    current-owner-site-active
     kds-root-key-readiness-reviewed
     retrieval-scope-reviewed
     kerberos-policy-reviewed
@@ -58,6 +62,9 @@ Live execution remains blocked until this slice is separately approved for live 
 - No worker execution.
 - No live directory changes.
 - No gMSA creation, assignment, validation, retire, password retrieval, managed password handling, SPN changes, or delegation changes.
+- Namespace provenance and the active owner site are required for every
+  platform-state read or mutation. Inactive namespaces remain reserved and
+  quarantined legacy rows are never auto-promoted.
 
 ## Requirements
 
@@ -71,6 +78,7 @@ Required evidence (from the contract YAML).
 
     gMSA lifecycle review summary
     Service account scope summary
+    Password retrieval scope review
     Kerberos policy review
     SPN policy review
     Delegation risk review

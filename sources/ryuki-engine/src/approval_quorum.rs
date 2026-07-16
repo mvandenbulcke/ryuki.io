@@ -1,7 +1,8 @@
 //! Pure multi-role approval quorum evaluation (#4).
 //!
 //! Builds on separation-of-duties (#3, already enforced: an approver cannot be
-//! the requester, and `request_approval_decisions` is UNIQUE per (request, role)).
+//! the requester, and `request_approval_decisions` is UNIQUE per
+//! (request, approval lifecycle epoch, role)).
 //! A QUORUM additionally requires breadth: at least N distinct approval ROLES and
 //! N distinct APPROVERS, with NO rejection. This module evaluates a request's
 //! recorded decisions against a quorum policy. Pure: the API reads the decision

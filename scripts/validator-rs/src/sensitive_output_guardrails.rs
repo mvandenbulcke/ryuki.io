@@ -99,13 +99,24 @@ fn validate_adapter_response_safety(adapter: &str, errors: &mut Vec<String>) {
 fn validate_no_secret_scan_safety(scan: &str, errors: &mut Vec<String>) {
     if scan.contains("!sources/**") {
         errors.push(
-            "SCAN: no-secret-scan.sh excludes sources/** — must include sources/ryuki-*"
+            "SCAN: no-secret-scan.sh excludes sources/** — default scope must cover every commit candidate"
                 .to_string(),
         );
     }
-    if !scan.contains("sources/ryuki-") {
+
+    let complete_git_scope = [
+        "git ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]
+    .iter()
+    .all(|required| scan.contains(required));
+    if !complete_git_scope {
         errors.push(
-            "SCAN: no-secret-scan.sh does not include sources/ryuki-* in default scope".to_string(),
+            "SCAN: no-secret-scan.sh must enumerate all tracked and unignored files in its default scope"
+                .to_string(),
         );
     }
     if !scan.contains("category=") || !scan.contains("path=") {

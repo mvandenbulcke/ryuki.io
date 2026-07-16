@@ -26,17 +26,22 @@
 //! invocation when one is absent.  The control plane never carries the names
 //! or the values; both sides derive the names from the same embedded registry.
 //!
-//! ## `plan_digest`
+//! ## `raw_plan_digest`
 //!
-//! `RunnerLiveExecutor::plan` computes `sha256_hex(outcome.log.as_bytes())` —
-//! the SHA-256 of the SCRUBBED canonical plan JSON returned by
-//! `terraform show -json tfplan` — and exposes it as `LivePlanOutcome.plan_digest`.
+//! For Terraform, the runner computes SHA-256 over the complete canonical raw
+//! `terraform show -json tfplan` plan before redaction and exposes that value as
+//! `LivePlanOutcome.raw_plan_digest`. Durable evidence retains only this digest and
+//! an allowlisted safe projection. The full plan stays process-local.
 //! The gate in `live.rs` then checks:
 //!   `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 //! so only an operator-reviewed, CP-signed plan is applied.
 
 use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
-use ryuki_protocol::{sha256_hex, JobMode, JobSpec};
+use ryuki_protocol::{
+    sha256_hex, ExecutionTrustProfile, JobMode, JobSpec, EXECUTABLE_PROVENANCE_POLICY_VERSION,
+    EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION, EXECUTION_TRUST_PROFILE_SCHEMA_VERSION,
+    PROVIDER_CREDENTIAL_AUTHORITY_MODE, TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -51,16 +56,19 @@ use crate::executor::Evidence;
 /// - `evidence` — scrubbed plan evidence (suitable for signing and posting to CP).
 ///   `evidence.evidence_bytes` contains the canonical plan JSON (from
 ///   `terraform show -json tfplan`), already scrubbed.
-/// - `plan_digest` — `sha256_hex(evidence.evidence_bytes)`.  The gate checks
-///   `plan_digest == grant.approved_plan_digest` before allowing apply.
+/// - `raw_plan_digest` — for Terraform, SHA-256 of the complete canonical raw plan
+///   before redaction; the gate checks it against the approved grant before
+///   allowing apply. Ansible retains its evidence-byte digest contract.
 /// - `tfplan` — raw binary plan file bytes (opaque).  Pass verbatim to
 ///   `LiveExecutor::apply` so the apply step uses EXACTLY the gated plan.
 ///   MUST NOT be logged, sent to the control plane, or included in evidence.
 #[derive(Debug, Clone)]
 pub struct LivePlanOutcome {
     pub evidence: Evidence,
-    /// SHA-256 hex of `evidence.evidence_bytes`.
-    pub plan_digest: String,
+    /// Canonical lowercase SHA-256 commitment used for plan approval. For
+    /// Terraform this commits to the complete canonical raw plan before
+    /// redaction; Ansible retains its check-output commitment contract.
+    pub raw_plan_digest: String,
     /// Raw binary `tfplan` bytes from `terraform plan -out=tfplan`.
     /// Thread these through to `apply()` unchanged to close the TOCTOU hole.
     pub tfplan: Vec<u8>,
@@ -100,6 +108,17 @@ pub enum LiveExecError {
 /// The trait is object-safe so callers can hold `&dyn LiveExecutor` without
 /// propagating generic parameters throughout the call stack.
 pub trait LiveExecutor: Send + Sync {
+    /// Recompute the complete non-secret execution identity from the exact
+    /// local configuration that the next live operation will use. Production
+    /// implementations must validate backend isolation, embedded IaC/provider
+    /// provenance, and executable admission without contacting a backend or
+    /// provider.
+    fn execution_trust_profile(
+        &self,
+        spec: &JobSpec,
+        platform: &str,
+    ) -> Result<ExecutionTrustProfile, LiveExecError>;
+
     /// Execute a live plan (`terraform plan -out=tfplan` → `show -json`).
     ///
     /// Accepted modes: `LivePlan` and `LiveApply` (the plan step is the same
@@ -111,6 +130,17 @@ pub trait LiveExecutor: Send + Sync {
     /// or errored plan.
     fn plan(&self, spec: &JobSpec) -> Result<LivePlanOutcome, LiveExecError>;
 
+    fn plan_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<LivePlanOutcome, LiveExecError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_live_execution());
+        }
+        self.plan(spec)
+    }
+
     /// Execute a live apply using the SAVED plan from `plan()`.
     ///
     /// `tfplan` MUST be the exact bytes returned by the preceding `plan()` call
@@ -120,6 +150,18 @@ pub trait LiveExecutor: Send + Sync {
     ///
     /// Accepted mode: `LiveApply` only.
     fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError>;
+
+    fn apply_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        tfplan: &[u8],
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, LiveExecError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_live_execution());
+        }
+        self.apply(spec, tfplan)
+    }
 
     /// Execute a live destroy of the step's applied resources (#42 B2-3).
     ///
@@ -137,6 +179,21 @@ pub trait LiveExecutor: Send + Sync {
     ///
     /// Accepted mode: `LiveDestroy` only.
     fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError>;
+
+    fn destroy_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, LiveExecError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_live_execution());
+        }
+        self.destroy(spec)
+    }
+}
+
+fn cancelled_live_execution() -> LiveExecError {
+    LiveExecError::Runner(ryuki_engine::runners::RunnerError::Cancelled)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,39 +235,256 @@ pub trait LiveExecutor: Send + Sync {
 /// provider-native vars from the HOST env; only declared, resolved values
 /// reach the child, scrubbed from all output.  A missing `RYUKI_LIVE_CRED_*`
 /// fails closed BEFORE terraform with the variable name (never a value) in the
-/// refusal.  The offline dry-run path keeps an empty declaration and empty
-/// material — it never sees credentials.
+/// refusal. Trusted provisioning also supplies a canonical non-secret backend
+/// credential-authority id/revision for the backend template. These values are
+/// separate environment reads today; a future typed secret-manager adapter must
+/// co-resolve backend credentials and authority metadata atomically. The
+/// offline dry-run path keeps an empty declaration and empty material — it
+/// never sees credentials.
 pub struct RunnerLiveExecutor {
     /// Backend HCL template populated from `RYUKI_AGENT_BACKEND_HCL`.
     /// Terraform live jobs require it to contain `{STATE_KEY}`.
     pub backend_config: Option<String>,
+    /// Canonical private root required for the local backend. The runner
+    /// performs descriptor-bound ownership, mode, and no-follow checks.
+    pub local_state_root: Option<std::path::PathBuf>,
+    /// Unit tests may bypass only this crate's early availability check so
+    /// pure mode/backend/credential preflights remain covered. The runner is a
+    /// normal dependency in those tests and still refuses every subprocess at
+    /// its sealed containment boundary.
+    #[cfg(test)]
+    controlled_agent_preflight: Option<ControlledAgentPreflight>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct ControlledAgentPreflight;
+
+/// One resolver return packages provider credential material with the
+/// non-secret authority record that is intended to version it. The current
+/// inputs are still separate process-environment reads, and each operation may
+/// resolve them again; this shape is fail-closed plumbing, not proof that both
+/// came atomically from one immutable secret record.
+#[derive(Debug)]
+struct ResolvedLiveCredentialBundle {
+    credentials: ryuki_runner::ResolvedCredentials,
+    provider_authority: Option<(String, String)>,
 }
 
 impl RunnerLiveExecutor {
-    /// Construct from the process environment.
-    ///
-    /// Reads `RYUKI_AGENT_BACKEND_HCL` (optional) and stores it for
-    /// forwarding to the runner on every plan/apply call.
-    pub fn from_env() -> Self {
-        let backend_config = std::env::var("RYUKI_AGENT_BACKEND_HCL").ok();
-        Self { backend_config }
+    fn require_descendant_containment(&self) -> Result<(), LiveExecError> {
+        #[cfg(test)]
+        if self.controlled_agent_preflight.is_some() {
+            return Ok(());
+        }
+        if !ryuki_runner::external_subprocess_containment_available() {
+            return Err(LiveExecError::PlanBuild(format!(
+                "external subprocess descendant containment is unavailable under policy {}",
+                ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION,
+            )));
+        }
+        Ok(())
     }
 
-    /// Resolve credentials for the given set of secret variable names.
+    fn provider_authority_reference(
+        secret_var_names: &[String],
+    ) -> Result<(String, String), LiveExecError> {
+        // The vSphere provider destination and account are part of the exact
+        // declared credential set. Their raw values stay secret; trusted
+        // provisioning supplies one stable public reference and an immutable
+        // version that must rotate whenever any member changes.
+        let reviewed_set = ["VSPHERE_USER", "VSPHERE_PASSWORD", "VSPHERE_SERVER"];
+        if secret_var_names.len() != reviewed_set.len()
+            || !secret_var_names
+                .iter()
+                .zip(reviewed_set)
+                .all(|(actual, expected)| actual.as_str() == expected)
+        {
+            return Err(LiveExecError::CredResolution(
+                "reviewed provider authority requires the exact ordered vSphere credential set"
+                    .to_string(),
+            ));
+        }
+        let id = std::env::var("RYUKI_LIVE_PROVIDER_AUTHORITY_ID").map_err(|_| {
+            LiveExecError::CredResolution(
+                "RYUKI_LIVE_PROVIDER_AUTHORITY_ID is required for live execution".to_string(),
+            )
+        })?;
+        let version = std::env::var("RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION").map_err(|_| {
+            LiveExecError::CredResolution(
+                "RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION is required for live execution".to_string(),
+            )
+        })?;
+        if !ryuki_protocol::provider_authority_reference_is_canonical(&id, &version) {
+            return Err(LiveExecError::CredResolution(
+                "provider authority reference is malformed; expected a canonical non-secret provider-authority/vsphere/... id and v-prefixed version"
+                    .to_string(),
+            ));
+        }
+        Ok((id, version))
+    }
+
+    fn backend_credential_authority_reference(
+        backend_kind: &str,
+    ) -> Result<(String, String), LiveExecError> {
+        // This is deliberately a non-secret provisioning reference, not a
+        // hash or serialization of backend credentials. The environment seam
+        // is a trusted-access compatibility boundary until a pluggable typed
+        // secret-manager adapter returns credential material and immutable
+        // authority metadata in one atomic resolution result.
+        let id = std::env::var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID").map_err(|_| {
+            LiveExecError::CredResolution(
+                "RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID is required for live execution"
+                    .to_string(),
+            )
+        })?;
+        let revision =
+            std::env::var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION").map_err(|_| {
+                LiveExecError::CredResolution(
+                    "RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION is required for live execution"
+                        .to_string(),
+                )
+            })?;
+        if !ryuki_protocol::backend_credential_authority_reference_is_canonical(
+            backend_kind,
+            &id,
+            &revision,
+        ) {
+            return Err(LiveExecError::CredResolution(
+                "backend credential authority reference is malformed; expected a canonical non-secret backend-credential-authority/<backend-kind>/... id and v-prefixed revision"
+                    .to_string(),
+            ));
+        }
+        Ok((id, revision))
+    }
+
+    fn build_execution_trust_profile(
+        &self,
+        spec: &JobSpec,
+        platform: &str,
+    ) -> Result<ExecutionTrustProfile, LiveExecError> {
+        self.require_descendant_containment()?;
+        let run_plan = Self::make_run_plan(spec)?;
+        if run_plan.runner_kind != RunnerKind::Terraform {
+            return Err(LiveExecError::PlanBuild(
+                "reviewed live execution requires the Terraform runner".to_string(),
+            ));
+        }
+        let backend = self.isolated_backend(spec)?;
+        let (backend_credential_authority_id, backend_credential_authority_revision) =
+            Self::backend_credential_authority_reference(backend.backend_kind())?;
+        let (provider_source, provider_version) =
+            ryuki_runner::iac::reviewed_live_provider_identity(&run_plan.offering_id).ok_or_else(
+                || {
+                    LiveExecError::PlanBuild(format!(
+                        "offering {:?} has no unambiguous reviewed provider lock",
+                        run_plan.offering_id
+                    ))
+                },
+            )?;
+        // Admit the exact executable before reading raw provider credentials
+        // into process memory. The runner repeats this check at command
+        // construction, so capability loss still fails closed at spawn.
+        let executable = ryuki_runner::approved_terraform_executable_provenance()?;
+        let resolved = Self::resolve_creds(&run_plan.secret_var_names)?;
+        let (provider_authority_id, provider_authority_version) =
+            resolved.provider_authority.ok_or_else(|| {
+                LiveExecError::CredResolution(
+                    "reviewed live provider has no credential authority record".to_string(),
+                )
+            })?;
+
+        Ok(ExecutionTrustProfile {
+            schema_version: EXECUTION_TRUST_PROFILE_SCHEMA_VERSION.to_string(),
+            allowlist_version: EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION.to_string(),
+            platform: platform.to_string(),
+            offering: run_plan.offering_id,
+            runner_kind: "terraform".to_string(),
+            provider_source,
+            provider_version,
+            provider_authority_id,
+            provider_authority_version,
+            backend_kind: backend.backend_kind().to_string(),
+            backend_credential_authority_id,
+            backend_credential_authority_revision,
+            backend_authority_digest: backend.backend_authority_digest().to_string(),
+            executable_kind: "terraform".to_string(),
+            executable_path: executable.canonical_path,
+            executable_version: executable.expected_version,
+            executable_sha256: executable.expected_sha256,
+            executable_provenance_policy_version: EXECUTABLE_PROVENANCE_POLICY_VERSION.to_string(),
+            provider_credential_authority_mode: PROVIDER_CREDENTIAL_AUTHORITY_MODE.to_string(),
+            backend_credential_authority_mode:
+                ryuki_runner::live::BACKEND_CREDENTIAL_AUTHORITY_POLICY_VERSION.to_string(),
+            containment_policy_version: format!(
+                "{}+{}",
+                ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION,
+                TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+            ),
+            iac_digest: spec.iac_digest.clone(),
+            state_key: backend.state_key().to_string(),
+        })
+    }
+
+    /// Construct from the process environment.
+    ///
+    /// Reads `RYUKI_AGENT_BACKEND_HCL` and the optional
+    /// `RYUKI_AGENT_LOCAL_STATE_ROOT`; a local backend requires the latter and
+    /// the runner validates it before every Terraform phase.
+    pub fn from_env() -> Self {
+        let backend_config = std::env::var("RYUKI_AGENT_BACKEND_HCL").ok();
+        let local_state_root = std::env::var("RYUKI_AGENT_LOCAL_STATE_ROOT")
+            .ok()
+            .map(std::path::PathBuf::from);
+        Self {
+            backend_config,
+            local_state_root,
+            #[cfg(test)]
+            controlled_agent_preflight: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_controlled_test_harness(backend_config: Option<String>) -> Self {
+        Self {
+            backend_config,
+            local_state_root: None,
+            controlled_agent_preflight: Some(ControlledAgentPreflight),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_controlled_test_harness_with_local_state_root(
+        backend_config: String,
+        local_state_root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            backend_config: Some(backend_config),
+            local_state_root: Some(local_state_root),
+            controlled_agent_preflight: Some(ControlledAgentPreflight),
+        }
+    }
+
+    /// Resolve one credential-and-authority snapshot for the given secret
+    /// variable names.
     ///
     /// Reads `RYUKI_LIVE_CRED_<NAME>` for each name in `secret_names`.
-    /// Returns an error (fail-closed) if any variable is absent.
+    /// Returns an error (fail-closed) if any credential or its provider
+    /// authority reference is absent or malformed.
     ///
     /// The combined material is a comma-joined string of the resolved values,
     /// matching the format that `ryuki_runner` uses for multi-component
     /// credential injection.
     fn resolve_creds(
         secret_names: &[String],
-    ) -> Result<ryuki_runner::ResolvedCredentials, LiveExecError> {
+    ) -> Result<ResolvedLiveCredentialBundle, LiveExecError> {
         if secret_names.is_empty() {
-            return Ok(ryuki_runner::ResolvedCredentials {
-                material: vec![],
-                descriptor: "live:no-creds".to_string(),
+            return Ok(ResolvedLiveCredentialBundle {
+                credentials: ryuki_runner::ResolvedCredentials {
+                    material: vec![],
+                    descriptor: "live:no-creds".to_string(),
+                },
+                provider_authority: None,
             });
         }
 
@@ -242,9 +516,13 @@ impl RunnerLiveExecutor {
         }
 
         let material = parts.join(",").into_bytes();
-        Ok(ryuki_runner::ResolvedCredentials {
-            material,
-            descriptor: format!("live:env:{}", secret_names.join(",")),
+        let provider_authority = Self::provider_authority_reference(secret_names)?;
+        Ok(ResolvedLiveCredentialBundle {
+            credentials: ryuki_runner::ResolvedCredentials {
+                material,
+                descriptor: format!("live:env:{}", secret_names.join(",")),
+            },
+            provider_authority: Some(provider_authority),
         })
     }
 
@@ -267,8 +545,12 @@ impl RunnerLiveExecutor {
                     .to_string(),
             )
         })?;
-        ryuki_runner::IsolatedBackendConfig::from_template(template, state_key)
-            .map_err(|e| LiveExecError::BackendIsolation(e.to_string()))
+        ryuki_runner::IsolatedBackendConfig::from_template_with_local_state_root(
+            template,
+            state_key,
+            self.local_state_root.as_deref(),
+        )
+        .map_err(|e| LiveExecError::BackendIsolation(e.to_string()))
     }
 
     /// Build a `RunPlan` from a `JobSpec` with `RunMode::Live`.
@@ -338,8 +620,13 @@ impl RunnerLiveExecutor {
     }
 }
 
-impl LiveExecutor for RunnerLiveExecutor {
-    fn plan(&self, spec: &JobSpec) -> Result<LivePlanOutcome, LiveExecError> {
+impl RunnerLiveExecutor {
+    fn plan_inner(
+        &self,
+        spec: &JobSpec,
+        cancellation: Option<&ryuki_runner::CommandCancellation>,
+    ) -> Result<LivePlanOutcome, LiveExecError> {
+        self.require_descendant_containment()?;
         // Accept LivePlan and LiveApply (plan step is the same pre-condition for both).
         if spec.mode != JobMode::LivePlan && spec.mode != JobMode::LiveApply {
             return Err(LiveExecError::UnsupportedMode(spec.mode.clone()));
@@ -354,11 +641,16 @@ impl LiveExecutor for RunnerLiveExecutor {
 
         match run_plan.runner_kind {
             RunnerKind::Terraform => {
-                let artifacts = ryuki_runner::run_live_plan(
-                    &run_plan,
-                    &creds,
-                    backend.as_ref().expect("Terraform branch builds backend"),
-                )?;
+                let backend = backend.as_ref().expect("Terraform branch builds backend");
+                let artifacts = match cancellation {
+                    Some(cancellation) => ryuki_runner::run_live_plan_with_cancellation(
+                        &run_plan,
+                        &creds.credentials,
+                        backend,
+                        cancellation,
+                    )?,
+                    None => ryuki_runner::run_live_plan(&run_plan, &creds.credentials, backend)?,
+                };
 
                 // FAIL CLOSED: return Err when the plan is not clean.
                 // A non-Planned status means a step failed — do NOT compute a digest.
@@ -369,9 +661,15 @@ impl LiveExecutor for RunnerLiveExecutor {
                     )));
                 }
 
-                // Digest = sha256(scrubbed canonical plan JSON from `terraform show -json`).
+                // The runner computed this digest over the complete canonical
+                // raw plan before any redaction. Evidence below contains only
+                // the digest plus an allowlisted safe projection.
+                let raw_plan_digest = artifacts.raw_plan_digest.ok_or_else(|| {
+                    LiveExecError::PlanFailed(
+                        "planned Terraform outcome omitted its raw-plan commitment".to_string(),
+                    )
+                })?;
                 let evidence_bytes = artifacts.outcome.log.as_bytes().to_vec();
-                let plan_digest = sha256_hex(&evidence_bytes);
 
                 let evidence_json = serde_json::to_value(&artifacts.outcome)
                     .ok()
@@ -383,7 +681,7 @@ impl LiveExecutor for RunnerLiveExecutor {
                         evidence_bytes,
                         evidence_json,
                     },
-                    plan_digest,
+                    raw_plan_digest,
                     // Raw tfplan bytes passed to apply() unchanged — closes TOCTOU hole.
                     tfplan: artifacts.tfplan,
                 })
@@ -392,7 +690,14 @@ impl LiveExecutor for RunnerLiveExecutor {
             RunnerKind::Ansible => {
                 // Ansible plan = `ansible-playbook --check --diff`.
                 // No saved plan artifact — see live_ansible.rs module docs.
-                let outcome = ryuki_runner::run_ansible_live_plan(&run_plan, &creds)?;
+                let outcome = match cancellation {
+                    Some(cancellation) => ryuki_runner::run_ansible_live_plan_with_cancellation(
+                        &run_plan,
+                        &creds.credentials,
+                        cancellation,
+                    )?,
+                    None => ryuki_runner::run_ansible_live_plan(&run_plan, &creds.credentials)?,
+                };
 
                 // FAIL CLOSED: only Planned is acceptable.
                 if outcome.status != ryuki_engine::runners::RunStatus::Planned {
@@ -406,7 +711,7 @@ impl LiveExecutor for RunnerLiveExecutor {
                 // This is NOT byte-locked like a tfplan, but the gate still requires
                 // the CP-signed grant to carry `approved_plan_digest == sha256(check_output)`.
                 let evidence_bytes = outcome.log.as_bytes().to_vec();
-                let plan_digest = sha256_hex(&evidence_bytes);
+                let raw_plan_digest = sha256_hex(&evidence_bytes);
 
                 let evidence_json = serde_json::to_value(&outcome).ok().filter(|v| !v.is_null());
 
@@ -416,7 +721,7 @@ impl LiveExecutor for RunnerLiveExecutor {
                         evidence_bytes,
                         evidence_json,
                     },
-                    plan_digest,
+                    raw_plan_digest,
                     // Ansible has no saved plan artifact — tfplan is empty.
                     // apply() re-runs the same playbook + vars (AWX model).
                     tfplan: vec![],
@@ -437,7 +742,13 @@ impl LiveExecutor for RunnerLiveExecutor {
     /// correct AWX model: Ansible playbooks are idempotent by design and
     /// `--check` is a best-effort preview, not a cryptographic commitment to
     /// exact mutations.
-    fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError> {
+    fn apply_inner(
+        &self,
+        spec: &JobSpec,
+        tfplan: &[u8],
+        cancellation: Option<&ryuki_runner::CommandCancellation>,
+    ) -> Result<Evidence, LiveExecError> {
+        self.require_descendant_containment()?;
         if spec.mode != JobMode::LiveApply {
             return Err(LiveExecError::UnsupportedMode(spec.mode.clone()));
         }
@@ -450,19 +761,38 @@ impl LiveExecutor for RunnerLiveExecutor {
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
         let outcome = match run_plan.runner_kind {
-            RunnerKind::Terraform => ryuki_runner::run_live_apply(
-                &run_plan,
-                &creds,
-                backend.as_ref().expect("Terraform branch builds backend"),
-                tfplan,
-            )?,
+            RunnerKind::Terraform => {
+                let backend = backend.as_ref().expect("Terraform branch builds backend");
+                match cancellation {
+                    Some(cancellation) => ryuki_runner::run_live_apply_with_cancellation(
+                        &run_plan,
+                        &creds.credentials,
+                        backend,
+                        tfplan,
+                        cancellation,
+                    )?,
+                    None => ryuki_runner::run_live_apply(
+                        &run_plan,
+                        &creds.credentials,
+                        backend,
+                        tfplan,
+                    )?,
+                }
+            }
 
             RunnerKind::Ansible => {
                 // Ansible is not plan-byte-locked — the tfplan arg is intentionally
                 // ignored here.  Apply re-runs the same playbook + vars (AWX model).
                 // The gate integrity is provided by the CP-signed grant whose
                 // approved_plan_digest was verified against the --check output.
-                ryuki_runner::run_ansible_live_apply(&run_plan, &creds)?
+                match cancellation {
+                    Some(cancellation) => ryuki_runner::run_ansible_live_apply_with_cancellation(
+                        &run_plan,
+                        &creds.credentials,
+                        cancellation,
+                    )?,
+                    None => ryuki_runner::run_ansible_live_apply(&run_plan, &creds.credentials)?,
+                }
             }
         };
 
@@ -487,7 +817,12 @@ impl LiveExecutor for RunnerLiveExecutor {
     /// state decides what gets destroyed. Evidence follows the apply
     /// conventions: the scrubbed `RunOutcome` serialised as bytes (digest
     /// input) plus the structured JSON mirror.
-    fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError> {
+    fn destroy_inner(
+        &self,
+        spec: &JobSpec,
+        cancellation: Option<&ryuki_runner::CommandCancellation>,
+    ) -> Result<Evidence, LiveExecError> {
+        self.require_descendant_containment()?;
         if spec.mode != JobMode::LiveDestroy {
             return Err(LiveExecError::UnsupportedMode(spec.mode.clone()));
         }
@@ -500,11 +835,18 @@ impl LiveExecutor for RunnerLiveExecutor {
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
         let outcome = match run_plan.runner_kind {
-            RunnerKind::Terraform => ryuki_runner::run_live_destroy(
-                &run_plan,
-                &creds,
-                backend.as_ref().expect("Terraform branch builds backend"),
-            )?,
+            RunnerKind::Terraform => {
+                let backend = backend.as_ref().expect("Terraform branch builds backend");
+                match cancellation {
+                    Some(cancellation) => ryuki_runner::run_live_destroy_with_cancellation(
+                        &run_plan,
+                        &creds.credentials,
+                        backend,
+                        cancellation,
+                    )?,
+                    None => ryuki_runner::run_live_destroy(&run_plan, &creds.credentials, backend)?,
+                }
+            }
 
             RunnerKind::Ansible => {
                 // FAIL CLOSED: Ansible offerings have no terraform state and no
@@ -530,6 +872,53 @@ impl LiveExecutor for RunnerLiveExecutor {
             evidence_bytes,
             evidence_json,
         })
+    }
+}
+
+impl LiveExecutor for RunnerLiveExecutor {
+    fn execution_trust_profile(
+        &self,
+        spec: &JobSpec,
+        platform: &str,
+    ) -> Result<ExecutionTrustProfile, LiveExecError> {
+        self.build_execution_trust_profile(spec, platform)
+    }
+
+    fn plan(&self, spec: &JobSpec) -> Result<LivePlanOutcome, LiveExecError> {
+        self.plan_inner(spec, None)
+    }
+
+    fn plan_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<LivePlanOutcome, LiveExecError> {
+        self.plan_inner(spec, Some(cancellation))
+    }
+
+    fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError> {
+        self.apply_inner(spec, tfplan, None)
+    }
+
+    fn apply_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        tfplan: &[u8],
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, LiveExecError> {
+        self.apply_inner(spec, tfplan, Some(cancellation))
+    }
+
+    fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError> {
+        self.destroy_inner(spec, None)
+    }
+
+    fn destroy_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, LiveExecError> {
+        self.destroy_inner(spec, Some(cancellation))
     }
 }
 
@@ -598,7 +987,7 @@ impl StubLiveExecutor {
     /// will have `last_apply_tfplan()` equal to `plan_bytes` — asserting the
     /// thread-through without any special setup.
     pub fn with_plan(plan_bytes: &[u8], apply_status: RunStatus) -> Self {
-        let plan_digest = sha256_hex(plan_bytes);
+        let raw_plan_digest = sha256_hex(plan_bytes);
         let plan_evidence = Evidence {
             status: RunStatus::Planned,
             evidence_bytes: plan_bytes.to_vec(),
@@ -612,7 +1001,7 @@ impl StubLiveExecutor {
         Self::new(
             LivePlanOutcome {
                 evidence: plan_evidence,
-                plan_digest,
+                raw_plan_digest,
                 tfplan: plan_bytes.to_vec(),
             },
             apply_evidence,
@@ -660,7 +1049,7 @@ impl StubLiveExecutor {
                 evidence_bytes: vec![],
                 evidence_json: None,
             },
-            plan_digest: String::new(),
+            raw_plan_digest: String::new(),
             tfplan: vec![],
         };
         let dummy_apply = Evidence {
@@ -687,6 +1076,55 @@ impl StubLiveExecutor {
 }
 
 impl LiveExecutor for StubLiveExecutor {
+    fn execution_trust_profile(
+        &self,
+        spec: &JobSpec,
+        platform: &str,
+    ) -> Result<ExecutionTrustProfile, LiveExecError> {
+        Ok(ExecutionTrustProfile {
+            schema_version: EXECUTION_TRUST_PROFILE_SCHEMA_VERSION.to_string(),
+            allowlist_version: EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION.to_string(),
+            platform: platform.to_string(),
+            offering: spec
+                .iac_ref
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            runner_kind: "terraform".to_string(),
+            provider_source: "registry.terraform.io/vmware/vsphere".to_string(),
+            provider_version: "2.16.1".to_string(),
+            provider_authority_id: "provider-authority/vsphere/stub-fixture".to_string(),
+            provider_authority_version: "v1".to_string(),
+            backend_kind: "local".to_string(),
+            backend_credential_authority_id: "backend-credential-authority/local/stub-fixture"
+                .to_string(),
+            backend_credential_authority_revision: "v1".to_string(),
+            backend_authority_digest: sha256_hex(
+                format!(
+                    "stub-local-backend-authority:{}",
+                    spec.state_key.as_deref().unwrap_or_default()
+                )
+                .as_bytes(),
+            ),
+            executable_kind: "terraform".to_string(),
+            executable_path: "/test/terraform".to_string(),
+            executable_version: "test".to_string(),
+            executable_sha256: None,
+            executable_provenance_policy_version: EXECUTABLE_PROVENANCE_POLICY_VERSION.to_string(),
+            provider_credential_authority_mode: PROVIDER_CREDENTIAL_AUTHORITY_MODE.to_string(),
+            backend_credential_authority_mode:
+                ryuki_runner::live::BACKEND_CREDENTIAL_AUTHORITY_POLICY_VERSION.to_string(),
+            containment_policy_version: format!(
+                "{}+{}",
+                ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION,
+                TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+            ),
+            iac_digest: spec.iac_digest.clone(),
+            state_key: spec.state_key.clone().unwrap_or_default(),
+        })
+    }
+
     fn plan(&self, _spec: &JobSpec) -> Result<LivePlanOutcome, LiveExecError> {
         self.plan_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -738,11 +1176,22 @@ mod tests {
         }
     }
 
-    fn absolute_local_backend_template() -> String {
-        format!(
-            "terraform {{\n  backend \"local\" {{\n    path = \"{}/ryuki-agent-terraform-{{STATE_KEY}}.tfstate\"\n  }}\n}}",
-            std::env::temp_dir().display()
-        )
+    fn private_local_backend_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let root = tempfile::tempdir().expect("private agent state root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private agent state root permissions");
+        }
+        let canonical_root =
+            std::fs::canonicalize(root.path()).expect("canonical agent state root");
+        let state_path = canonical_root.join("ryuki-agent-terraform-{STATE_KEY}.tfstate");
+        let template = format!(
+            "terraform {{\n  backend \"local\" {{\n    path = \"{}\"\n  }}\n}}",
+            state_path.display()
+        );
+        (root, canonical_root, template)
     }
 
     // -----------------------------------------------------------------------
@@ -758,8 +1207,8 @@ mod tests {
         let outcome = stub.plan(&spec).expect("stub plan must succeed");
         assert_eq!(outcome.evidence.status, RunStatus::Planned);
         assert_eq!(outcome.evidence.evidence_bytes, plan_bytes);
-        // plan_digest == sha256_hex(plan_bytes)
-        assert_eq!(outcome.plan_digest, sha256_hex(plan_bytes));
+        // raw_plan_digest == sha256_hex(plan_bytes)
+        assert_eq!(outcome.raw_plan_digest, sha256_hex(plan_bytes));
         // tfplan bytes must be the same as plan_bytes (stub threads them through).
         assert_eq!(outcome.tfplan, plan_bytes);
     }
@@ -794,6 +1243,44 @@ mod tests {
         stub.apply(&apply_spec, b"p").expect("apply");
         assert_eq!(stub.apply_call_count(), 1);
         assert_eq!(stub.plan_call_count(), 2);
+    }
+
+    #[test]
+    fn cancelled_live_lifecycle_never_enters_plan_apply_or_destroy() {
+        let stub = StubLiveExecutor::with_plan(b"p", RunStatus::Applied);
+        let cancellation = ryuki_runner::CommandCancellation::new();
+        cancellation.cancel();
+
+        assert!(stub
+            .plan_with_cancellation(&make_spec(JobMode::LivePlan), &cancellation)
+            .is_err());
+        assert!(stub
+            .apply_with_cancellation(&make_spec(JobMode::LiveApply), b"p", &cancellation,)
+            .is_err());
+        assert!(stub
+            .destroy_with_cancellation(&make_spec(JobMode::LiveDestroy), &cancellation)
+            .is_err());
+        assert_eq!(stub.plan_call_count(), 0);
+        assert_eq!(stub.apply_call_count(), 0);
+        assert_eq!(stub.destroy_call_count(), 0);
+    }
+
+    #[test]
+    fn cancellation_between_live_plan_and_apply_prevents_mutation() {
+        let stub = StubLiveExecutor::with_plan(b"approved-plan", RunStatus::Applied);
+        let spec = make_spec(JobMode::LiveApply);
+        let cancellation = ryuki_runner::CommandCancellation::new();
+
+        let plan = stub
+            .plan_with_cancellation(&spec, &cancellation)
+            .expect("plan completes before lease loss");
+        cancellation.cancel();
+        let error = stub
+            .apply_with_cancellation(&spec, &plan.tfplan, &cancellation)
+            .expect_err("lease loss between phases must prevent apply");
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(stub.plan_call_count(), 1);
+        assert_eq!(stub.apply_call_count(), 0);
     }
 
     /// Assert that apply() receives the SAME tfplan bytes that plan() produced.
@@ -838,10 +1325,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn runner_live_executor_plan_rejects_offline_dry_run() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
+    fn production_shaped_executor_refuses_without_descendant_containment() {
+        assert!(
+            !ryuki_runner::external_subprocess_containment_available(),
+            "the dependency build must not inherit this crate's test cfg"
+        );
+        let executor = RunnerLiveExecutor::from_env();
+        let error = executor
+            .plan(&make_spec(JobMode::LivePlan))
+            .expect_err("an executor without the private test witness must fail closed");
+        let LiveExecError::PlanBuild(message) = error else {
+            panic!("containment refusal must be a PlanBuild error: {error:?}");
         };
+        assert!(
+            message.contains(ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION),
+            "containment refusal must pin the active policy: {message}"
+        );
+    }
+
+    #[test]
+    fn runner_live_executor_plan_rejects_offline_dry_run() {
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec(JobMode::OfflineDryRun);
         let result = exec.plan(&spec);
         assert!(
@@ -855,30 +1359,35 @@ mod tests {
 
     #[test]
     fn terraform_live_jobs_fail_closed_without_isolated_backend_inputs() {
-        let valid_template = absolute_local_backend_template();
+        let (_state_root, canonical_root, valid_template) = private_local_backend_fixture();
 
         let mut missing_key = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
         missing_key.state_key = None;
-        let exec = RunnerLiveExecutor {
-            backend_config: Some(valid_template.clone()),
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness_with_local_state_root(
+            valid_template.clone(),
+            canonical_root,
+        );
         assert!(matches!(
             exec.plan(&missing_key),
             Err(LiveExecError::BackendIsolation(_))
         ));
 
         let valid_spec = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
-        let no_template = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let missing_local_root =
+            RunnerLiveExecutor::for_controlled_test_harness(Some(valid_template.clone()));
+        assert!(matches!(
+            missing_local_root.isolated_backend(&valid_spec),
+            Err(LiveExecError::BackendIsolation(_))
+        ));
+        let no_template = RunnerLiveExecutor::for_controlled_test_harness(None);
         assert!(matches!(
             no_template.plan(&valid_spec),
             Err(LiveExecError::BackendIsolation(_))
         ));
 
-        let fixed_template = RunnerLiveExecutor {
-            backend_config: Some("# fixed shared backend".to_string()),
-        };
+        let fixed_template = RunnerLiveExecutor::for_controlled_test_harness(Some(
+            "# fixed shared backend".to_string(),
+        ));
         assert!(matches!(
             fixed_template.plan(&valid_spec),
             Err(LiveExecError::BackendIsolation(_))
@@ -894,9 +1403,11 @@ mod tests {
 
     #[test]
     fn executor_preserves_control_plane_state_key_when_rendering_backend() {
-        let exec = RunnerLiveExecutor {
-            backend_config: Some(absolute_local_backend_template()),
-        };
+        let (_state_root, canonical_root, template) = private_local_backend_fixture();
+        let exec = RunnerLiveExecutor::for_controlled_test_harness_with_local_state_root(
+            template,
+            canonical_root,
+        );
         let mut request_a = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
         request_a.state_key = Some("request-a".to_string());
         let mut request_b = request_a.clone();
@@ -916,9 +1427,7 @@ mod tests {
 
     #[test]
     fn runner_live_executor_apply_rejects_live_plan() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec(JobMode::LivePlan);
         let result = exec.apply(&spec, b"fake-tfplan");
         assert!(
@@ -932,9 +1441,7 @@ mod tests {
 
     #[test]
     fn runner_live_executor_apply_rejects_offline_dry_run() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec(JobMode::OfflineDryRun);
         let result = exec.apply(&spec, b"fake-tfplan");
         assert!(
@@ -950,9 +1457,7 @@ mod tests {
 
     #[test]
     fn runner_live_executor_destroy_rejects_live_apply_and_dry_run_modes() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         for mode in [
             JobMode::LiveApply,
             JobMode::LivePlan,
@@ -971,9 +1476,7 @@ mod tests {
     /// must refuse with a clear error, never pretend to tear down.
     #[test]
     fn runner_live_executor_destroy_fails_closed_for_ansible_offering() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         // patch-maintenance is an Ansible offering (offering_kind_from_slug).
         let spec = make_spec_with_iac_ref(JobMode::LiveDestroy, "patch-maintenance@v1.0.0");
         let result = exec.destroy(&spec);
@@ -992,9 +1495,7 @@ mod tests {
     /// never falls back to shared/local state when the template is missing.
     #[test]
     fn runner_live_executor_destroy_routes_terraform_offering() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec_with_iac_ref(JobMode::LiveDestroy, "request-preflight@v1.0.0");
         let result = exec.destroy(&spec);
         assert!(matches!(result, Err(LiveExecError::BackendIsolation(_))));
@@ -1004,9 +1505,7 @@ mod tests {
     /// checking whether Terraform is installed.
     #[test]
     fn runner_live_executor_plan_rejects_missing_backend_template() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
         let result = exec.plan(&spec);
         assert!(matches!(result, Err(LiveExecError::BackendIsolation(_))));
@@ -1102,6 +1601,10 @@ mod tests {
         for key in VSPHERE_CRED_KEYS {
             std::env::remove_var(key);
         }
+        std::env::remove_var("RYUKI_LIVE_PROVIDER_AUTHORITY_ID");
+        std::env::remove_var("RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION");
+        std::env::remove_var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID");
+        std::env::remove_var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION");
     }
 
     /// Live plans for the vSphere server-deployment offerings must carry the
@@ -1139,6 +1642,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_authority_requires_the_exact_ordered_reviewed_credential_set() {
+        for names in [
+            vec!["VSPHERE_USER".to_string(), "VSPHERE_SERVER".to_string()],
+            vec![
+                "VSPHERE_SERVER".to_string(),
+                "VSPHERE_PASSWORD".to_string(),
+                "VSPHERE_USER".to_string(),
+            ],
+            vec![
+                "VSPHERE_USER".to_string(),
+                "VSPHERE_PASSWORD".to_string(),
+                "VSPHERE_SERVER".to_string(),
+                "UNREVIEWED_EXTRA".to_string(),
+            ],
+        ] {
+            let err = RunnerLiveExecutor::provider_authority_reference(&names)
+                .expect_err("non-canonical credential set must fail closed");
+            assert!(matches!(err, LiveExecError::CredResolution(_)));
+        }
+    }
+
+    #[test]
+    fn backend_credential_authority_is_required_and_backend_kind_scoped() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_vsphere_cred_env();
+
+        let missing = RunnerLiveExecutor::backend_credential_authority_reference("local")
+            .expect_err("missing backend credential authority must fail closed");
+        assert!(missing
+            .to_string()
+            .contains("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID"));
+
+        std::env::set_var(
+            "RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID",
+            "backend-credential-authority/http/live-exec-test-fixture",
+        );
+        std::env::set_var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION", "v1");
+        let wrong_kind = RunnerLiveExecutor::backend_credential_authority_reference("local")
+            .expect_err("an authority id for another backend kind must fail closed");
+        assert!(wrong_kind.to_string().contains("malformed"));
+
+        std::env::set_var(
+            "RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_ID",
+            "backend-credential-authority/local/live-exec-test-fixture",
+        );
+        std::env::remove_var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION");
+        let missing_revision = RunnerLiveExecutor::backend_credential_authority_reference("local")
+            .expect_err("missing backend credential authority revision must fail closed");
+        assert!(missing_revision
+            .to_string()
+            .contains("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION"));
+
+        std::env::set_var("RYUKI_LIVE_BACKEND_CREDENTIAL_AUTHORITY_REVISION", "v7");
+        assert_eq!(
+            RunnerLiveExecutor::backend_credential_authority_reference("local")
+                .expect("canonical backend credential authority"),
+            (
+                "backend-credential-authority/local/live-exec-test-fixture".to_string(),
+                "v7".to_string(),
+            )
+        );
+
+        clear_vsphere_cred_env();
+    }
+
     /// FAIL CLOSED BEFORE TERRAFORM: a live job whose declared credential is
     /// missing from the agent environment must be refused with the exact
     /// VARIABLE NAME (and no value) — on plan, apply, AND destroy. The error
@@ -1153,9 +1722,11 @@ mod tests {
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "it-user-value");
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "it-pass-value");
 
-        let exec = RunnerLiveExecutor {
-            backend_config: Some(absolute_local_backend_template()),
-        };
+        let (_state_root, canonical_root, template) = private_local_backend_fixture();
+        let exec = RunnerLiveExecutor::for_controlled_test_harness_with_local_state_root(
+            template,
+            canonical_root,
+        );
         let cases: [(JobMode, &str); 3] = [
             (JobMode::LivePlan, "plan"),
             (JobMode::LiveApply, "apply"),
@@ -1225,6 +1796,47 @@ mod tests {
         clear_vsphere_cred_env();
     }
 
+    /// The profile and runner must consume one resolution event: having every
+    /// declared credential is insufficient when its non-secret authority
+    /// reference is absent. The refusal names configuration fields only.
+    #[test]
+    fn resolve_creds_fails_closed_when_provider_authority_is_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_vsphere_cred_env();
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "authority-test-user");
+        std::env::set_var(
+            "RYUKI_LIVE_CRED_VSPHERE_PASSWORD",
+            "authority-test-password",
+        );
+        std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_SERVER", "authority-test-server");
+
+        let names: Vec<String> =
+            ryuki_runner::iac::live_secret_var_names("linux-server-deployment")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let err = RunnerLiveExecutor::resolve_creds(&names)
+            .expect_err("credentials without authority must fail closed");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, LiveExecError::CredResolution(_))
+                && msg.contains("RYUKI_LIVE_PROVIDER_AUTHORITY_ID"),
+            "refusal must identify the missing authority field: {msg}"
+        );
+        for value in [
+            "authority-test-user",
+            "authority-test-password",
+            "authority-test-server",
+        ] {
+            assert!(
+                !msg.contains(value),
+                "authority refusal must never carry a credential value: {msg}"
+            );
+        }
+
+        clear_vsphere_cred_env();
+    }
+
     /// Happy path: all declared credentials provisioned → material is the
     /// comma-joined values in DECLARED order (the runner's pairing contract),
     /// and the descriptor names the variables but never the values.
@@ -1235,6 +1847,11 @@ mod tests {
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_USER", "u-val");
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_PASSWORD", "p-val");
         std::env::set_var("RYUKI_LIVE_CRED_VSPHERE_SERVER", "s-val");
+        std::env::set_var(
+            "RYUKI_LIVE_PROVIDER_AUTHORITY_ID",
+            "provider-authority/vsphere/live-exec-test-fixture",
+        );
+        std::env::set_var("RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION", "v1");
 
         let names: Vec<String> =
             ryuki_runner::iac::live_secret_var_names("linux-server-deployment")
@@ -1243,21 +1860,28 @@ mod tests {
                 .collect();
         let creds = RunnerLiveExecutor::resolve_creds(&names).expect("all creds provisioned");
         assert_eq!(
-            creds.material, b"u-val,p-val,s-val",
+            creds.credentials.material, b"u-val,p-val,s-val",
             "material must be comma-joined in declared order"
         );
         assert!(
-            creds.descriptor.contains("VSPHERE_USER"),
+            creds.credentials.descriptor.contains("VSPHERE_USER"),
             "descriptor names the variables: {}",
-            creds.descriptor
+            creds.credentials.descriptor
         );
         for value in ["u-val", "p-val", "s-val"] {
             assert!(
-                !creds.descriptor.contains(value),
+                !creds.credentials.descriptor.contains(value),
                 "descriptor must never carry a value: {}",
-                creds.descriptor
+                creds.credentials.descriptor
             );
         }
+        assert_eq!(
+            creds.provider_authority,
+            Some((
+                "provider-authority/vsphere/live-exec-test-fixture".to_string(),
+                "v1".to_string(),
+            )),
+        );
 
         clear_vsphere_cred_env();
     }
@@ -1266,9 +1890,7 @@ mod tests {
     /// → RunnerUnavailable wrapped in PlanFailed, not UnsupportedMode, not panic).
     #[test]
     fn runner_live_executor_plan_routes_ansible_offering_to_ansible_path() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         // patch-maintenance is an Ansible offering.
         let spec = make_spec_with_iac_ref(JobMode::LivePlan, "patch-maintenance@v1.0.0");
         let result = exec.plan(&spec);
@@ -1284,9 +1906,7 @@ mod tests {
     /// → RunnerUnavailable mapped to Failed outcome with no Err, no panic).
     #[test]
     fn runner_live_executor_apply_routes_ansible_offering_to_ansible_path() {
-        let exec = RunnerLiveExecutor {
-            backend_config: None,
-        };
+        let exec = RunnerLiveExecutor::for_controlled_test_harness(None);
         let spec = make_spec_with_iac_ref(JobMode::LiveApply, "patch-maintenance@v1.0.0");
         // Pass an empty tfplan — Ansible ignores it.
         let result = exec.apply(&spec, &[]);

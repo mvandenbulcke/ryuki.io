@@ -1,4 +1,6 @@
 use crate::{models::*, site_registry};
+use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -100,7 +102,161 @@ pub fn plan_vm_day2_change(
         created_at: now.clone(),
         updated_at: now,
         metadata: HashMap::from([("dry_run".into(), "true".into())]),
+        governance: None,
     })
+}
+
+/// Stable digest for the immutable Day-2 plan. Governance evidence deliberately
+/// excludes status, timestamps that change after planning, metadata, approval,
+/// and lock fields so each lifecycle transition can recompute the same value.
+pub fn vm_day2_plan_digest(change: &VmDay2ChangeRequest) -> Result<String, String> {
+    let material = serde_json::json!({
+        "id": change.id,
+        "target_ci_key": change.target_ci_key,
+        "change_type": change.change_type,
+        "target_value": change.target_value,
+        "site": change.site,
+        "environment": change.environment,
+        "owner": change.owner,
+        "maintenance_window": change.maintenance_window,
+        "plan": change.plan,
+        "created_at": change.created_at,
+    });
+    let encoded = serde_json::to_vec(&material)
+        .map_err(|error| format!("cannot encode VM Day-2 plan digest material: {error}"))?;
+    let digest = Sha256::digest(encoded);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Bind a newly planned operation to its verified maker after the API has
+/// replaced the engine's display id with the durable UUID primary key.
+pub fn bind_vm_day2_governance(
+    change: &mut VmDay2ChangeRequest,
+    planned_by: &str,
+) -> Result<(), String> {
+    if planned_by.trim().is_empty() {
+        return Err("planned_by cannot be empty".into());
+    }
+    if change.status != VmChangeStatus::Planned {
+        return Err("VM Day-2 governance can only be bound while Planned".into());
+    }
+    if change.governance.is_some() {
+        return Err("VM Day-2 governance is already bound".into());
+    }
+    let plan_digest = vm_day2_plan_digest(change)?;
+    change.governance = Some(VmDay2Governance {
+        plan_digest,
+        planned_by: planned_by.to_string(),
+        approval: None,
+        operation_lock: None,
+    });
+    Ok(())
+}
+
+fn current_governance(change: &VmDay2ChangeRequest) -> Result<&VmDay2Governance, String> {
+    let governance = change
+        .governance
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 operation has no trusted governance binding".to_string())?;
+    if governance.planned_by.trim().is_empty() {
+        return Err("VM Day-2 operation has no trusted planner".into());
+    }
+    let current_digest = vm_day2_plan_digest(change)?;
+    if governance.plan_digest != current_digest {
+        return Err("VM Day-2 plan changed after governance binding".into());
+    }
+    Ok(governance)
+}
+
+fn current_approval(governance: &VmDay2Governance) -> Result<&VmDay2ApprovalEvidence, String> {
+    let approval = governance
+        .approval
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 approval evidence is missing".to_string())?;
+    if approval.approved_by.trim().is_empty()
+        || approval.approved_by == governance.planned_by
+        || approval.plan_digest != governance.plan_digest
+        || DateTime::parse_from_rfc3339(&approval.approved_at).is_err()
+    {
+        return Err("VM Day-2 approval evidence is invalid or stale".into());
+    }
+    Ok(approval)
+}
+
+pub fn approve_vm_day2_change(
+    change: &VmDay2ChangeRequest,
+    approver: &str,
+) -> Result<VmDay2ChangeRequest, String> {
+    if approver.trim().is_empty() {
+        return Err("approver cannot be empty".into());
+    }
+    if change.status != VmChangeStatus::Validated {
+        return Err(format!(
+            "Cannot approve VM Day-2 operation in status {:?}. Must be Validated first.",
+            change.status
+        ));
+    }
+    let governance = current_governance(change)?;
+    if governance.planned_by == approver {
+        return Err("VM Day-2 planner cannot approve the same operation".into());
+    }
+    if governance.approval.is_some() || governance.operation_lock.is_some() {
+        return Err("VM Day-2 operation already carries governance decision state".into());
+    }
+
+    let mut approved = change.clone();
+    approved.status = VmChangeStatus::Approved;
+    approved.updated_at = Utc::now().to_rfc3339();
+    approved
+        .governance
+        .as_mut()
+        .expect("validated governance above")
+        .approval = Some(VmDay2ApprovalEvidence {
+        approved_by: approver.to_string(),
+        approved_at: Utc::now().to_rfc3339(),
+        plan_digest: governance.plan_digest.clone(),
+    });
+    Ok(approved)
+}
+
+/// Acquire a short, server-timed lock for the exact approved plan. Cross-row
+/// overlap is enforced by the repository in the same transaction that stores
+/// this evidence.
+pub fn lock_vm_day2_change(
+    change: &VmDay2ChangeRequest,
+    locked_by: &str,
+) -> Result<VmDay2ChangeRequest, String> {
+    if locked_by.trim().is_empty() {
+        return Err("lock owner cannot be empty".into());
+    }
+    if change.status != VmChangeStatus::Approved {
+        return Err(format!(
+            "Cannot lock VM Day-2 operation in status {:?}. Must be Approved first.",
+            change.status
+        ));
+    }
+    let governance = current_governance(change)?;
+    current_approval(governance)?;
+    if governance.operation_lock.is_some() {
+        return Err("VM Day-2 operation already carries a lock".into());
+    }
+
+    let now = Utc::now();
+    let mut locked = change.clone();
+    locked.status = VmChangeStatus::Locked;
+    locked.updated_at = now.to_rfc3339();
+    locked
+        .governance
+        .as_mut()
+        .expect("approved governance above")
+        .operation_lock = Some(VmDay2LockEvidence {
+        lock_id: Uuid::new_v4().to_string(),
+        locked_by: locked_by.to_string(),
+        acquired_at: now.to_rfc3339(),
+        expires_at: (now + Duration::minutes(15)).to_rfc3339(),
+        plan_digest: governance.plan_digest.clone(),
+    });
+    Ok(locked)
 }
 
 pub fn validate_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<ValidationResult, String> {
@@ -149,6 +305,14 @@ pub fn validate_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<Validatio
         _ => {}
     }
 
+    if let Err(error) = current_governance(change) {
+        errors.push(error);
+        failed_rules.push("p0-governance-plan-binding-required".into());
+        remediation.push(
+            "Replan the operation so approval and lock evidence bind to the immutable plan.".into(),
+        );
+    }
+
     warnings.push("DRY-RUN: No live provider validation performed".into());
 
     Ok(ValidationResult {
@@ -161,11 +325,35 @@ pub fn validate_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<Validatio
 }
 
 pub fn execute_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<VmDay2ChangeRequest, String> {
-    if change.status == VmChangeStatus::Failed || change.status == VmChangeStatus::Completed {
+    if change.status != VmChangeStatus::Locked {
         return Err(format!(
-            "Cannot execute change in terminal status: {:?}",
+            "Cannot execute VM Day-2 operation in status {:?}. Must be Approved and Locked first.",
             change.status
         ));
+    }
+    let governance = current_governance(change)?;
+    current_approval(governance)?;
+    let operation_lock = governance
+        .operation_lock
+        .as_ref()
+        .ok_or_else(|| "VM Day-2 operation lock is missing".to_string())?;
+    if Uuid::parse_str(&operation_lock.lock_id).is_err()
+        || operation_lock.locked_by.trim().is_empty()
+        || operation_lock.plan_digest != governance.plan_digest
+    {
+        return Err("VM Day-2 operation lock is invalid or stale".into());
+    }
+    let acquired_at = DateTime::parse_from_rfc3339(&operation_lock.acquired_at)
+        .map_err(|_| "VM Day-2 operation lock acquisition time is invalid".to_string())?
+        .with_timezone(&Utc);
+    let expires_at = DateTime::parse_from_rfc3339(&operation_lock.expires_at)
+        .map_err(|_| "VM Day-2 operation lock expiry is invalid".to_string())?
+        .with_timezone(&Utc);
+    if expires_at <= acquired_at {
+        return Err("VM Day-2 operation lock interval is invalid".into());
+    }
+    if expires_at <= Utc::now() {
+        return Err("VM Day-2 operation lock has expired".into());
     }
 
     let mut executed = change.clone();
@@ -221,6 +409,22 @@ pub fn verify_vm_day2_change(change: &VmDay2ChangeRequest) -> Result<Vec<Evidenc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn governed_change(change_type: VmChangeType, target_value: u32) -> VmDay2ChangeRequest {
+        let mut change = plan_vm_day2_change(
+            "ci-vm-governed",
+            change_type,
+            target_value,
+            "DEFRA",
+            "production",
+            "app-team",
+            "EU-Overnight",
+        )
+        .unwrap();
+        change.id = Uuid::new_v4().to_string();
+        bind_vm_day2_governance(&mut change, "stable.vm.planner").unwrap();
+        change
+    }
 
     #[test]
     fn test_plan_vm_resize_cpu() {
@@ -291,16 +495,7 @@ mod tests {
 
     #[test]
     fn test_validate_vm_change_passes() {
-        let change = plan_vm_day2_change(
-            "ci-vm-001",
-            VmChangeType::ResizeMemory,
-            32,
-            "DEFRA",
-            "production",
-            "app-team",
-            "EU-Overnight",
-        )
-        .unwrap();
+        let change = governed_change(VmChangeType::ResizeMemory, 32);
         let result = validate_vm_day2_change(&change).unwrap();
         assert!(result.passed);
     }
@@ -317,6 +512,8 @@ mod tests {
             "EU-Overnight",
         )
         .unwrap();
+        change.id = Uuid::new_v4().to_string();
+        bind_vm_day2_governance(&mut change, "stable.vm.planner").unwrap();
         change.site = "INVALID".into();
         let result = validate_vm_day2_change(&change).unwrap();
         assert!(!result.passed);
@@ -324,19 +521,60 @@ mod tests {
 
     #[test]
     fn test_execute_vm_change() {
-        let change = plan_vm_day2_change(
-            "ci-vm-001",
-            VmChangeType::MigrateHost,
-            0,
-            "DEFRA",
-            "production",
-            "app-team",
-            "EU-Overnight",
-        )
-        .unwrap();
-        let executed = execute_vm_day2_change(&change).unwrap();
+        let mut change = governed_change(VmChangeType::MigrateHost, 0);
+        change.status = VmChangeStatus::Validated;
+        let approved = approve_vm_day2_change(&change, "stable.vm.approver").unwrap();
+        let locked = lock_vm_day2_change(&approved, "stable.vm.executor").unwrap();
+        let executed = execute_vm_day2_change(&locked).unwrap();
         assert_eq!(executed.status, VmChangeStatus::Executed);
         assert!(executed.metadata.contains_key("execution_log"));
+    }
+
+    #[test]
+    fn execution_rejects_missing_stale_and_expired_governance() {
+        let mut validated = governed_change(VmChangeType::ResizeCpu, 8);
+        validated.status = VmChangeStatus::Validated;
+        let error = execute_vm_day2_change(&validated)
+            .expect_err("technical validation alone must not authorize execution");
+        assert!(error.contains("Approved and Locked"));
+
+        let approved = approve_vm_day2_change(&validated, "stable.vm.approver").unwrap();
+        let error = execute_vm_day2_change(&approved)
+            .expect_err("approval without a target lock must not execute");
+        assert!(error.contains("Approved and Locked"));
+
+        let mut locked = lock_vm_day2_change(&approved, "stable.vm.executor").unwrap();
+        let expired_at = Utc::now() - Duration::seconds(1);
+        let operation_lock = locked
+            .governance
+            .as_mut()
+            .unwrap()
+            .operation_lock
+            .as_mut()
+            .unwrap();
+        operation_lock.acquired_at = (expired_at - Duration::seconds(1)).to_rfc3339();
+        operation_lock.expires_at = expired_at.to_rfc3339();
+        let error = execute_vm_day2_change(&locked).expect_err("an expired lock must fail closed");
+        assert!(error.contains("expired"));
+
+        let mut stale = approved;
+        stale.target_value = stale.target_value.saturating_add(1);
+        let error = lock_vm_day2_change(&stale, "stable.vm.executor")
+            .expect_err("approval cannot authorize a modified plan");
+        assert!(error.contains("changed after governance binding"));
+    }
+
+    #[test]
+    fn vm_day2_planner_cannot_self_approve() {
+        let mut validated = governed_change(VmChangeType::ResizeCpu, 8);
+        validated.status = VmChangeStatus::Validated;
+        let before = validated.clone();
+
+        let error = approve_vm_day2_change(&validated, "stable.vm.planner")
+            .expect_err("maker/checker separation must use stable subjects");
+
+        assert!(error.contains("planner cannot approve"));
+        assert_eq!(validated, before);
     }
 
     #[test]

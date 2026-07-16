@@ -11,19 +11,25 @@ pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod entra_sso;
+mod human_authority;
 mod idempotency;
+mod identity_authority;
 mod inbound_webhooks;
 mod integration;
 mod oidc_callback;
 mod openapi;
 mod repos;
 mod scheduler;
+mod session_credentials;
+mod session_lookup_admission;
+#[cfg(test)]
+mod test_crypto;
 
 use axum::body::Body;
-use axum::extract::ConnectInfo;
+use axum::extract::{ConnectInfo, MatchedPath};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequest, StatusCode};
 use axum::middleware;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::{
     extract::{Query, State},
     routing::get,
@@ -32,7 +38,8 @@ use axum::{
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,9 +57,9 @@ use uuid::Uuid;
 
 use crate::database::MigrationStatus;
 use crate::entra_auth::EntraTokenValidator;
-use ryuki_core::config::{AuthMode, TrustedProxyNetwork};
+use ryuki_core::config::{AuthMode, RyukiConfig, SessionConfig, TrustedProxyNetwork};
 use ryuki_core::types::{ApiError, ValidationResult};
-use ryuki_engine::auth::AuthSession;
+use ryuki_engine::auth::{AuthSession, OperationCapability};
 
 /// ProblemDetails error type alias: HTTP status code + structured ApiError JSON body.
 pub type ProblemDetails = (StatusCode, Json<ApiError>);
@@ -133,6 +140,38 @@ struct DbAuthSessionRow {
     user_id: String,
     display_name: String,
     roles: Vec<String>,
+    bearer_verifier: Vec<u8>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    provider: String,
+    identity_issuer: String,
+    identity_subject: String,
+    identity_authority_epoch: i64,
+    human_authority_version: i64,
+    site_authority_mode: String,
+    site_scope: Vec<String>,
+    environment_authority_mode: String,
+    environment_scope: Vec<String>,
+}
+
+fn authority_context_from_db_row(
+    row: &DbAuthSessionRow,
+) -> Option<crate::human_authority::InteractiveHumanAuthorityContext> {
+    Some(crate::human_authority::InteractiveHumanAuthorityContext {
+        provider: row.provider.clone(),
+        issuer: row.identity_issuer.clone(),
+        subject: row.identity_subject.clone(),
+        identity_epoch: row.identity_authority_epoch,
+        assignment_version: row.human_authority_version,
+        roles: row.roles.clone(),
+        site_mode: crate::human_authority::HumanAuthorityMode::parse(&row.site_authority_mode)
+            .ok()?,
+        site_scope: row.site_scope.clone(),
+        environment_mode: crate::human_authority::HumanAuthorityMode::parse(
+            &row.environment_authority_mode,
+        )
+        .ok()?,
+        environment_scope: row.environment_scope.clone(),
+    })
 }
 
 fn unverified_session(provider_mode: &str) -> AuthSession {
@@ -153,9 +192,14 @@ fn session_from_db_row(row: DbAuthSessionRow) -> AuthSession {
         display_name: row.display_name,
         roles: row.roles,
         token_valid: true,
+        actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+        // Preserve the carrier classification used by the settings-write gate.
+        // Provider provenance remains available on the database row and in the
+        // authority-cache binding, but a browser/session bearer is never a
+        // freshly verified interactive external credential.
         provider_mode: "persisted-session".into(),
-        // A persisted (cookie) session is not scope-restricted.
-        ..Default::default()
+        site_scope: row.site_scope,
+        environment_scope: row.environment_scope,
     }
 }
 
@@ -163,61 +207,151 @@ fn bearer_value(auth_header: Option<&str>) -> Option<&str> {
     auth_header?.trim().strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Extracts the `ryuki_session` cookie value from the Cookie header, if any.
-fn session_cookie_value(headers: &HeaderMap) -> Option<&str> {
-    let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    cookie_header.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        if name.trim() == "ryuki_session" {
-            Some(value.trim())
-        } else {
-            None
-        }
-    })
+/// Host-only cookie name required whenever `session.cookie_secure` is true.
+pub(crate) const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
+/// Compatibility cookie name admitted only by explicit non-Secure loopback
+/// development/test configuration.
+pub(crate) const LOOPBACK_SESSION_COOKIE_NAME: &str = "ryuki_session";
+
+/// Selects the single session-cookie name for the process-validated startup
+/// configuration. Callers must not infer this policy from request metadata.
+pub(crate) fn session_cookie_name(session: &SessionConfig) -> &'static str {
+    if session.cookie_secure {
+        SECURE_SESSION_COOKIE_NAME
+    } else {
+        LOOPBACK_SESSION_COOKIE_NAME
+    }
 }
 
-/// Which request surface carried the session id.
+fn is_session_cookie_name(name: &str) -> bool {
+    name == SECURE_SESSION_COOKIE_NAME || name == LOOPBACK_SESSION_COOKIE_NAME
+}
+
+/// Parses every Cookie header field and classifies session-cookie evidence.
+/// Exactly one credential-cookie pair may appear and its name must match the
+/// startup configuration. Malformed header encoding, malformed cookie pairs,
+/// same-name duplicates, and mixed old/new names all remain explicit invalid
+/// evidence so authentication cannot fall through to another carrier.
+fn session_cookie_evidence<'a>(
+    headers: &'a HeaderMap,
+    session: &SessionConfig,
+) -> Option<Result<&'a str, ()>> {
+    let mut credential = None;
+    for raw_cookie_header in headers.get_all(axum::http::header::COOKIE).iter() {
+        let cookie_header = match raw_cookie_header.to_str() {
+            Ok(value) => value,
+            Err(_) => return Some(Err(())),
+        };
+        for pair in cookie_header.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = pair.split_once('=') else {
+                return Some(Err(()));
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return Some(Err(()));
+            }
+            if !is_session_cookie_name(name) {
+                continue;
+            }
+            if credential.is_some() {
+                return Some(Err(()));
+            }
+            credential = Some((name, value.trim()));
+        }
+    }
+
+    let (name, value) = credential?;
+    if name != session_cookie_name(session) {
+        return Some(Err(()));
+    }
+    Some(Ok(value))
+}
+
+/// Which request surface carried the opaque session bearer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionIdSource {
-    /// `X-Ryuki-Session-Id` header (the portal's canonical surface).
+    /// X-Ryuki-Session-Id header (the portal's compatibility surface).
     Header,
-    /// `Authorization: Bearer <uuid>` (direct API callers).
+    /// Authorization: Bearer rys_... (direct API callers).
     Bearer,
-    /// `ryuki_session` cookie. Browsers attach it automatically, so it never
-    /// authorizes unsafe methods (CSRF defense).
+    /// Mode-selected session cookie. Browsers attach it automatically, so it
+    /// never authorizes unsafe methods (CSRF defense).
     Cookie,
 }
 
-/// Resolves the caller's session id, in order: X-Ryuki-Session-Id header,
-/// `Authorization: Bearer <uuid>`, then the `ryuki_session` cookie. Returns
-/// the parse result together with the source that carried the id.
-fn session_id_from_headers(
-    headers: &HeaderMap,
-    auth_header: Option<&str>,
-) -> Option<(Result<Uuid, ()>, SessionIdSource)> {
-    if let Some(raw_session_id) = headers
-        .get("X-Ryuki-Session-Id")
-        .and_then(|value| value.to_str().ok())
-    {
+/// Resolves the caller's opaque session bearer, in order:
+/// X-Ryuki-Session-Id, Authorization: Bearer rys_..., then the mode-selected
+/// session cookie. Administrative session UUIDs and legacy UUID bearers are
+/// never accepted.
+fn session_credential_from_headers<'a>(
+    headers: &'a HeaderMap,
+    auth_header: Option<&'a str>,
+    session: &SessionConfig,
+) -> Option<(Result<&'a str, ()>, SessionIdSource)> {
+    let raw_header_value = headers.get("X-Ryuki-Session-Id");
+    let header_value = raw_header_value.and_then(|value| value.to_str().ok());
+    let raw_authorization = headers.get(axum::http::header::AUTHORIZATION);
+    // Unit-level callers may provide the already-parsed value directly. The
+    // real request path also carries the raw header, which must count as
+    // credential evidence even when it is not valid text.
+    let authorization_present = raw_authorization.is_some() || auth_header.is_some();
+    let cookie_evidence = session_cookie_evidence(headers, session);
+    let evidence_count = usize::from(raw_header_value.is_some())
+        + usize::from(authorization_present)
+        + usize::from(cookie_evidence.is_some());
+    if evidence_count > 1 {
+        let source = if raw_header_value.is_some() {
+            SessionIdSource::Header
+        } else if authorization_present {
+            SessionIdSource::Bearer
+        } else {
+            SessionIdSource::Cookie
+        };
+        return Some((Err(()), source));
+    }
+
+    if raw_header_value.is_some() && header_value.is_none() {
+        return Some((Err(()), SessionIdSource::Header));
+    }
+    if raw_authorization.is_some() && auth_header.is_none() {
+        return Some((Err(()), SessionIdSource::Bearer));
+    }
+
+    if let Some(raw_session_id) = header_value {
+        let candidate = raw_session_id.trim();
         return Some((
-            Uuid::parse_str(raw_session_id.trim()).map_err(|_| ()),
+            crate::session_credentials::is_well_formed_session_bearer(candidate)
+                .then_some(candidate)
+                .ok_or(()),
             SessionIdSource::Header,
         ));
     }
 
     if let Some(auth_value) = bearer_value(auth_header) {
-        // A non-UUID bearer value is not a session id (e.g. a JWT); fall
-        // through to the cookie source instead of failing.
-        if !auth_value.is_empty() {
-            if let Ok(session_id) = Uuid::parse_str(auth_value) {
-                return Some((Ok(session_id), SessionIdSource::Bearer));
-            }
+        // API tokens are handled before this function, and Entra/OIDC JWTs
+        // must reach their validator. Only the explicit session prefix claims
+        // this credential class.
+        if auth_value.starts_with(crate::session_credentials::SESSION_BEARER_PREFIX) {
+            return Some((
+                crate::session_credentials::is_well_formed_session_bearer(auth_value)
+                    .then_some(auth_value)
+                    .ok_or(()),
+                SessionIdSource::Bearer,
+            ));
         }
     }
 
-    if let Some(cookie_value) = session_cookie_value(headers) {
+    if let Some(cookie_evidence) = cookie_evidence {
         return Some((
-            Uuid::parse_str(cookie_value).map_err(|_| ()),
+            cookie_evidence.and_then(|cookie_value| {
+                crate::session_credentials::is_well_formed_session_bearer(cookie_value)
+                    .then_some(cookie_value)
+                    .ok_or(())
+            }),
             SessionIdSource::Cookie,
         ));
     }
@@ -234,7 +368,6 @@ pub const API_TOKEN_PREFIX: &str = "ryk_";
 /// bits of CSPRNG entropy, so a single fast hash is sufficient (slow KDFs exist
 /// to stretch low-entropy passwords and would only add per-request latency).
 pub fn sha256_hex(plaintext: &str) -> String {
-    use sha2::{Digest, Sha256};
     let digest = Sha256::digest(plaintext.as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest.iter() {
@@ -255,6 +388,54 @@ struct ApiTokenRow {
     site_scope: Option<String>,
     environment_scope: Option<String>,
 }
+
+const API_TOKEN_LOOKUP_SQL: &str =
+    "SELECT t.id, t.name, t.owner_principal, t.roles, t.token_valid, t.token_hash, \
+            t.site_scope, t.environment_scope \
+     FROM api_tokens t \
+     JOIN identity_authorities a \
+       ON a.provider = t.issued_by_provider \
+      AND a.issuer = t.issued_by_issuer \
+      AND a.subject = t.issued_by_subject \
+      AND a.authority_epoch = t.issued_by_identity_epoch \
+     JOIN human_authority_assignments h \
+       ON h.provider = t.issued_by_provider \
+      AND h.issuer = t.issued_by_issuer \
+      AND h.subject = t.issued_by_subject \
+      AND h.assignment_version = t.issued_by_human_authority_version \
+     WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND t.token_valid \
+       AND t.expires_at > NOW() \
+       AND a.authority_status = 'active-scoped-v2' \
+       AND h.assignment_status = 'active' \
+       AND t.owner_principal = t.issued_by_subject \
+       AND t.issued_by_roles <@ h.role_allowlist \
+       AND t.roles <@ t.issued_by_roles \
+       AND ( \
+         h.site_authority_mode = 'global' \
+         OR (h.site_authority_mode = 'scoped' \
+           AND t.issued_by_site_authority_mode = 'scoped' \
+           AND t.issued_by_site_scope <@ h.site_scope) \
+       ) \
+       AND ( \
+         h.environment_authority_mode = 'global' \
+         OR (h.environment_authority_mode = 'scoped' \
+           AND t.issued_by_environment_authority_mode = 'scoped' \
+           AND t.issued_by_environment_scope <@ h.environment_scope) \
+       ) \
+       AND ( \
+         (t.site_scope IS NULL AND t.issued_by_site_authority_mode = 'global') \
+         OR (t.site_scope IS NOT NULL \
+           AND (t.issued_by_site_authority_mode = 'global' \
+             OR string_to_array(t.site_scope, ',') <@ t.issued_by_site_scope)) \
+       ) \
+       AND ( \
+         (t.environment_scope IS NULL \
+           AND t.issued_by_environment_authority_mode = 'global') \
+         OR (t.environment_scope IS NOT NULL \
+           AND (t.issued_by_environment_authority_mode = 'global' \
+             OR string_to_array(t.environment_scope, ',') \
+                <@ t.issued_by_environment_scope)) \
+       )";
 
 /// Parse a persisted scope column (a comma-separated TEXT, or NULL) into the
 /// authorized-scope list: trimmed, non-empty values. NULL/empty ⇒ `[]` =
@@ -277,22 +458,46 @@ fn parse_token_scope(raw: Option<String>) -> Vec<String> {
 /// revoked, and hash-mismatch all collapse to a single low-cardinality reason so
 /// the failure surface cannot be used as an enumeration oracle. On success the
 /// session carries the row's `roles`/`token_valid` verbatim and
-/// `provider_mode = "api-token"`; scopes are persisted but not yet carried on
-/// the session (scoped enforcement is a later feature).
+/// `provider_mode = "api-token"`; persisted site and environment scopes are
+/// carried onto the resulting session for downstream authorization checks.
 async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession {
     use subtle::ConstantTimeEq;
 
     let hash_hex = sha256_hex(plaintext);
-    let row = sqlx::query_as::<_, ApiTokenRow>(
-        "SELECT id, name, owner_principal, roles, token_valid, token_hash, \
-                site_scope, environment_scope \
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(error = %error, "api token lookup transaction failed");
+            return unverified_session("api-token-invalid");
+        }
+    };
+    let provenance = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT issued_by_provider, issued_by_issuer, issued_by_subject \
          FROM api_tokens \
-         WHERE token_hash = $1 AND revoked_at IS NULL \
-         AND (expires_at IS NULL OR expires_at > NOW())",
+         WHERE token_hash = $1 AND revoked_at IS NULL AND token_valid \
+           AND expires_at > NOW()",
     )
     .bind(&hash_hex)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await;
+    let (provider, issuer, subject) = match provenance {
+        Ok(Some(provenance)) => provenance,
+        Ok(None) => return unverified_session("api-token-invalid"),
+        Err(error) => {
+            tracing::error!(error = %error, "api token provenance lookup failed");
+            return unverified_session("api-token-invalid");
+        }
+    };
+    if let Err(error) =
+        crate::human_authority::prepare_reader_tx(&mut tx, &provider, &issuer, &subject).await
+    {
+        tracing::error!(error = %error, "api token authority lock failed");
+        return unverified_session("api-token-invalid");
+    }
+    let row = sqlx::query_as::<_, ApiTokenRow>(API_TOKEN_LOOKUP_SQL)
+        .bind(&hash_hex)
+        .fetch_optional(&mut *tx)
+        .await;
 
     let row = match row {
         Ok(Some(row)) => row,
@@ -308,18 +513,25 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
     // it guards against any non-constant-time comparator on the lookup path.
     if hash_hex.as_bytes().ct_eq(row.token_hash.as_bytes()).into() {
         // Update last_used_at; a failure here is non-fatal to resolution.
-        if let Err(error) = sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1")
-            .bind(row.id)
-            .execute(pool)
-            .await
+        if let Err(error) = sqlx::query(
+            "UPDATE api_tokens SET last_used_at = GREATEST( \
+                 COALESCE(last_used_at, '-infinity'::timestamptz), statement_timestamp() \
+             ) WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&mut *tx)
+        .await
         {
             tracing::warn!(error = %error, token_id = %row.id, "api token last_used_at update failed");
+        } else if let Err(error) = tx.commit().await {
+            tracing::warn!(error = %error, token_id = %row.id, "api token last_used_at commit failed");
         }
         AuthSession {
             user_id: row.owner_principal,
             display_name: row.name,
             roles: row.roles,
             token_valid: row.token_valid,
+            actor_class: ryuki_engine::auth::ActorClass::Workload,
             provider_mode: "api-token".into(),
             // #2: carry the token's persisted scopes onto the session so handlers
             // can enforce them. NULL/empty ⇒ unrestricted.
@@ -331,72 +543,234 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn auth_session_from_persisted_session(
     headers: &HeaderMap,
     auth_header: Option<&str>,
-    auth_mode: &AuthMode,
+    config: &RyukiConfig,
 ) -> Option<(AuthSession, SessionIdSource)> {
+    let admission = crate::session_lookup_admission::global_admission();
+    auth_session_from_persisted_session_with_admission(
+        headers,
+        auth_header,
+        config,
+        &admission,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn auth_session_from_persisted_session_with_admission(
+    headers: &HeaderMap,
+    auth_header: Option<&str>,
+    config: &RyukiConfig,
+    admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
+    proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
+) -> Option<(AuthSession, SessionIdSource)> {
+    auth_session_from_persisted_session_with_authority_admission(
+        headers,
+        auth_header,
+        config,
+        admission,
+        proof,
+    )
+    .await
+    .map(|(session, source, _authority)| (session, source))
+}
+
+async fn auth_session_from_persisted_session_with_authority_admission(
+    headers: &HeaderMap,
+    auth_header: Option<&str>,
+    config: &RyukiConfig,
+    admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
+    proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
+) -> Option<(
+    AuthSession,
+    SessionIdSource,
+    Option<crate::human_authority::InteractiveHumanAuthorityContext>,
+)> {
+    let auth_mode = &config.auth_mode;
+    let session = &config.session;
+    // Classify all credential evidence once. Any malformed session bearer or
+    // simultaneous header/Authorization/cookie evidence fails closed before a
+    // credential-specific resolver can fall through to another identity.
+    let session_evidence = session_credential_from_headers(headers, auth_header, session);
+    if let Some((Err(()), source)) = session_evidence {
+        return Some((
+            unverified_session("conflicting-or-invalid-credentials"),
+            source,
+            None,
+        ));
+    }
+
     // API-token bearers (`ryk_...`) are resolved BEFORE the UUID/cookie path: a
     // `ryk_` string is not a valid UUID, so without this explicit branch it
     // would silently fall through to the UUID parse and become unverified.
     //
-    // B5: only a SUCCESSFUL token resolution early-returns. A bogus or
-    // unresolvable `ryk_` bearer (including the no-DB case where it cannot be
-    // validated) must NOT shadow a valid `X-Ryuki-Session-Id` — it falls
-    // through to the session-id resolution below. `session_id_from_headers`
-    // already prefers the header over the bearer, so the fall-through correctly
-    // honors the valid session header.
     if let Some(token) = bearer_value(auth_header) {
         if token.strip_prefix(API_TOKEN_PREFIX).is_some() {
             if let Some(pool) = crate::database::get_db() {
                 let candidate = resolve_api_token(token, pool).await;
                 if candidate.token_valid {
-                    return Some((candidate, SessionIdSource::Bearer));
+                    return Some((candidate, SessionIdSource::Bearer, None));
                 }
-                // Token did not resolve to a valid credential: fall through so a
-                // valid X-Ryuki-Session-Id header is still honored.
+                return Some((candidate, SessionIdSource::Bearer, None));
             }
-            // No pool (token cannot be validated) OR a failed resolution: do
-            // NOT early-return unverified — fall through to session-id
-            // resolution.
+            return Some((
+                unverified_session("api-token-verifier-unavailable"),
+                SessionIdSource::Bearer,
+                None,
+            ));
         }
     }
 
-    let (parsed, source) = session_id_from_headers(headers, auth_header)?;
-    let session_id = match parsed {
-        Ok(session_id) => session_id,
-        Err(()) => return Some((unverified_session("invalid-session-id"), source)),
+    // Persisted browser sessions are not an authentication mechanism in the
+    // credential-free static development modes.
+    if matches!(auth_mode, AuthMode::MockDryRun | AuthMode::StaticDryRun) {
+        if let Some((Ok(_), source)) = session_evidence {
+            return Some((unverified_session("session-auth-disabled"), source, None));
+        }
+        return None;
+    }
+
+    let (Ok(bearer), source) = session_evidence? else {
+        unreachable!("invalid session evidence returned above");
     };
     let pool = crate::database::get_db()?;
+    let verifier = match crate::session_credentials::session_bearer_verifier(bearer, session) {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            tracing::error!(reason = %error, "session verifier configuration rejected");
+            return Some((
+                unverified_session("session-verifier-unavailable"),
+                source,
+                None,
+            ));
+        }
+    };
+    let mut cached_authority = None;
+    let _lookup_guard = match admission.admit_for_resolver(verifier, proof) {
+        crate::session_lookup_admission::SessionLookupDecision::KnownPositive(authority) => {
+            cached_authority = authority;
+            None
+        }
+        crate::session_lookup_admission::SessionLookupDecision::Unknown(guard) => Some(guard),
+        crate::session_lookup_admission::SessionLookupDecision::CachedMiss => {
+            return Some((unverified_session("session-not-found-cached"), source, None));
+        }
+        crate::session_lookup_admission::SessionLookupDecision::Rejected(_) => {
+            return Some((
+                unverified_session("session-lookup-admission-rejected"),
+                source,
+                None,
+            ));
+        }
+    };
     // Each interactive auth mode honors ONLY the sessions minted by its own
-    // login flow, so a stale session from a previous deployment mode cannot
-    // survive a switch. Local mode → local sessions; Entra mode → the
+    // login flow, and every non-local authority assertion must remain within
+    // the configured freshness bound. A stale session from a previous mode or
+    // a delayed provider lifecycle feed therefore fails closed. Local mode →
+    // local sessions; Entra mode → the
     // cryptographically-validated SSO providers ('entra-id', and the generic
     // 'oidc' flow that shares its validator) — never a mock/dry-run/local
     // session, which would otherwise let a leftover admin cookie in.
-    let query = match auth_mode {
-        AuthMode::Local => {
-            "SELECT user_id, display_name, roles FROM sessions \
-             WHERE id = $1 AND expires_at > NOW() AND provider = 'local'"
-        }
-        AuthMode::EntraId => {
-            "SELECT user_id, display_name, roles FROM sessions \
-             WHERE id = $1 AND expires_at > NOW() AND provider IN ('entra-id', 'oidc')"
-        }
-        _ => {
-            "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()"
-        }
-    };
+    let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
+    let query = "SELECT s.user_id, s.display_name, s.roles, s.bearer_verifier, s.expires_at, \
+                s.provider, s.identity_issuer, s.identity_subject, \
+                s.identity_authority_epoch, \
+                s.human_authority_version, s.site_authority_mode, s.site_scope, \
+                s.environment_authority_mode, s.environment_scope \
+         FROM sessions s \
+         JOIN identity_authorities a \
+           ON a.provider = s.provider \
+          AND a.issuer = s.identity_issuer \
+          AND a.subject = s.identity_subject \
+          AND a.authority_epoch = s.identity_authority_epoch \
+         JOIN human_authority_assignments h \
+           ON h.provider = s.provider \
+          AND h.issuer = s.identity_issuer \
+          AND h.subject = s.identity_subject \
+          AND h.assignment_version = s.human_authority_version \
+         WHERE s.bearer_verifier = $1 AND s.expires_at > NOW() \
+           AND a.authority_status = 'active-scoped-v2' \
+           AND h.assignment_status = 'active' \
+           AND (s.provider = 'local' OR (a.last_asserted_at IS NOT NULL \
+                AND a.last_asserted_at >= NOW() - make_interval(secs => $2))) \
+           AND ( \
+             ($3 = 'local' AND s.provider = 'local' AND s.identity_issuer = $4) \
+             OR ($3 = 'entra-id' AND ( \
+               (s.provider = 'entra-id' AND s.identity_issuer = $5) \
+               OR ($6 AND s.provider = 'oidc' AND s.identity_issuer = $7) \
+             )) \
+           )";
+    admission.note_database_lookup();
     match sqlx::query_as::<_, DbAuthSessionRow>(query)
-        .bind(session_id)
+        .bind(verifier.as_slice())
+        .bind(session.federated_authority_max_staleness_secs as f64)
+        .bind(auth_mode.as_str())
+        .bind(crate::identity_authority::LOCAL_ISSUER)
+        .bind(entra_issuer)
+        .bind(config.oidc.enabled)
+        .bind(&config.oidc.issuer)
         .fetch_optional(pool)
         .await
     {
-        Ok(Some(row)) => Some((session_from_db_row(row), source)),
-        Ok(None) => Some((unverified_session("session-not-found"), source)),
+        Ok(Some(row)) => {
+            use subtle::ConstantTimeEq;
+            if bool::from(verifier.as_slice().ct_eq(row.bearer_verifier.as_slice())) {
+                let authority_binding =
+                    crate::session_lookup_admission::SessionAuthorityCacheBinding {
+                        authority_fingerprint: crate::human_authority::authority_fingerprint(
+                            &row.provider,
+                            &row.identity_issuer,
+                            &row.identity_subject,
+                        ),
+                        assignment_version: row.human_authority_version,
+                        assignment_status:
+                            crate::session_lookup_admission::CachedAssignmentStatus::Active,
+                        site_global: row.site_authority_mode == "global",
+                        environment_global: row.environment_authority_mode == "global",
+                    };
+                if let Some(cached) = cached_authority.filter(|cached| *cached != authority_binding)
+                {
+                    admission.evict_authority(cached.authority_fingerprint);
+                    admission.evict_authority(authority_binding.authority_fingerprint);
+                    return Some((
+                        unverified_session("session-authority-cache-stale"),
+                        source,
+                        None,
+                    ));
+                }
+                let valid_for = (row.expires_at - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::ZERO);
+                admission.record_hit(verifier, valid_for, authority_binding);
+                let Some(authority) = authority_context_from_db_row(&row) else {
+                    admission.record_miss(verifier);
+                    return Some((
+                        unverified_session("session-authority-shape-invalid"),
+                        source,
+                        None,
+                    ));
+                };
+                Some((session_from_db_row(row), source, Some(authority)))
+            } else {
+                admission.record_miss(verifier);
+                Some((
+                    unverified_session("session-verifier-mismatch"),
+                    source,
+                    None,
+                ))
+            }
+        }
+        Ok(None) => {
+            admission.record_miss(verifier);
+            Some((unverified_session("session-not-found"), source, None))
+        }
         Err(error) => {
             tracing::error!(error = %error, "auth session lookup failed");
-            Some((unverified_session("session-lookup-failed"), source))
+            Some((unverified_session("session-lookup-failed"), source, None))
         }
     }
 }
@@ -474,10 +848,10 @@ fn auth_session_allows_unsafe_method(session: &AuthSession) -> bool {
 
 /// Decides whether the resolved session may perform this request.
 ///
-/// CSRF defense: the `ryuki_session` cookie is attached automatically by
-/// browsers, so a session resolved from the COOKIE source alone never
-/// authorizes unsafe methods (POST/PUT/PATCH/DELETE). The portal always
-/// sends X-Ryuki-Session-Id; direct API callers use `Authorization: Bearer`.
+/// CSRF defense: the mode-selected session cookie is attached automatically
+/// by browsers, so a session resolved from the COOKIE source alone never
+/// authorizes unsafe methods (POST/PUT/PATCH/DELETE). The portal always sends
+/// X-Ryuki-Session-Id; direct API callers use `Authorization: Bearer`.
 /// Auth endpoints keep their existing exemption only because they are
 /// already auth-exempt.
 fn session_authorizes_request(
@@ -601,6 +975,68 @@ static ROUTE_PERMISSIONS: &[RoutePermission] = &[
 /// is never silently open.
 const DEFAULT_ROUTE_PERMISSION: &str = "admin";
 
+/// True only when `path` is one direct member below `prefix`. This deliberately
+/// rejects the collection itself, empty identifiers, and extra child paths so a
+/// protected capability cannot be inherited through a broad string prefix.
+fn is_single_segment_member(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|segment| !segment.is_empty() && !segment.contains('/'))
+}
+
+/// True only for the single-event and batch acknowledgement route shapes.  A
+/// broad prefix/suffix test would let an unrelated future child route inherit
+/// triage mutation authority, so the middle portion must be exactly one
+/// non-empty path segment.
+fn is_alert_acknowledgement_path(path: &str) -> bool {
+    path.strip_prefix("/api/events/alerts/")
+        .and_then(|rest| rest.strip_suffix("/ack"))
+        .is_some_and(|segment| !segment.is_empty() && !segment.contains('/'))
+}
+
+/// Resolves the closed functional capability required by security-sensitive
+/// read and mutation shapes. This decision runs before the legacy coarse
+/// permission tables: holding `request`, `audit`, or `execute` is never
+/// sufficient for one of these operations.
+///
+/// Resource authority remains a separate handler decision. For example, a
+/// software operator must hold `software.deployment.execute` here and still
+/// satisfy the deployment row's authoritative site/environment scope later.
+fn operation_capability_for(method: &Method, path: &str) -> Option<OperationCapability> {
+    // Operational alert disclosure and triage mutation are intentionally
+    // separate grants. Keep the GET exact and the POST shapes closed so neither
+    // capability can be inherited by its sibling or by a future route.
+    if method == Method::GET && path == "/api/events/alerts" {
+        return Some(OperationCapability::MonitoringAlertRead);
+    }
+    if method == Method::POST && is_alert_acknowledgement_path(path) {
+        return Some(OperationCapability::MonitoringAlertAcknowledge);
+    }
+
+    if !is_unsafe_method(method) {
+        return None;
+    }
+
+    if method == Method::POST && is_single_segment_member(path, "/api/identity/ad/delete") {
+        return Some(OperationCapability::IdentityAdComputerDelete);
+    }
+    if path == "/api/network/firewall" || path.starts_with("/api/network/firewall/") {
+        return Some(OperationCapability::NetworkFirewallManage);
+    }
+    if path == "/api/monitoring/alert-routes" || path.starts_with("/api/monitoring/alert-routes/") {
+        return Some(OperationCapability::MonitoringAlertRoutingManage);
+    }
+    if method == Method::DELETE && is_single_segment_member(path, "/api/datacenter/storage/arrays")
+    {
+        return Some(OperationCapability::StorageArrayDecommission);
+    }
+    if method == Method::POST && is_single_segment_member(path, "/api/maintain/software/execute") {
+        return Some(OperationCapability::SoftwareDeploymentExecute);
+    }
+
+    None
+}
+
 /// Resolves the permission for a mutation under `/api/requests`.
 ///
 /// - `/api/requests` exactly (POST create)                -> "request"
@@ -657,12 +1093,16 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
 /// they require the higher `approve` tier. Without this row an Operator (who holds
 /// `execute`, not `approve`) could self-approve work they created or validated,
 /// collapsing the platform's maker/checker separation of duties into a single
-/// operator capability. The handlers do their own `Approved`-state transition with
-/// no in-handler permission check, so the central gate is the only boundary.
+/// operator capability. The central gate is mandatory for every sign-off.
+/// Security-sensitive newer handlers (including firmware exceptions) repeat it
+/// as defense in depth; several legacy sign-off handlers still rely on this
+/// resolver as their only permission boundary.
 ///
-/// The access-review family carries all three reviewer VERDICTS (approve / revoke /
-/// exempt) at the `approve` tier, mirroring how the request family routes both
-/// `approve` and `reject` (the inverse verdict) to `approve`.
+/// The access-review family carries reviewer CLAIM plus all three reviewer
+/// VERDICTS (start / approve / revoke / exempt) at the `approve` tier. `start`
+/// establishes the stable reviewer designation, so allowing an execute-tier
+/// workload to win that CAS would strand the review: the workload could not
+/// produce the later human verdict and no reassignment route exists.
 ///
 /// NOT included — `/api/cmdb/servicenow/approve` and
 /// `/api/maintain/certificates/approve` carry the `approve` NAME but gate nothing
@@ -672,6 +1112,21 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
 /// Returns `None` for non-approval paths so the caller falls through to the prefix
 /// table.
 fn approval_signoff_permission(path: &str) -> Option<&'static str> {
+    // VM Day-2 approval is a body-id action with no path child. Keep the
+    // checker gate exact so future sibling/deeper actions do not inherit it.
+    if path == "/api/vm/day2/approve" {
+        return Some("approve");
+    }
+
+    // Image promotion and rejection are the two durable reviewer verdicts and
+    // each accepts one exact image id. Keep these shapes closed.
+    if is_single_segment_member(path, "/api/datacenter/image-factory/promote") {
+        return Some("approve");
+    }
+    if is_single_segment_member(path, "/api/datacenter/image-factory/reject") {
+        return Some("approve");
+    }
+
     // id-at-end or no-id forms: a static prefix matches `{prefix}` exactly or
     // `{prefix}/{id}`.
     const APPROVE_SIGNOFF_PREFIXES: &[&str] = &[
@@ -688,12 +1143,27 @@ fn approval_signoff_permission(path: &str) -> Option<&'static str> {
     {
         return Some("approve");
     }
-    // Access-review reviewer verdicts put the id in the MIDDLE
-    // (`/api/identity/access-review/{id}/{approve|revoke|exempt}`), which a static
-    // prefix cannot express. Match exactly one id segment then the verdict.
+    // Firmware exceptions use an id-in-the-middle two-party decision route.
+    // The sibling collection route creates Pending requests and remains at the
+    // datacenter execute tier; only the explicit checker verdict is approve-tier.
+    if let Some(rest) = path.strip_prefix("/api/datacenter/firmware/exception/") {
+        if let Some(id) = rest.strip_suffix("/approve") {
+            if !id.is_empty() && !id.contains('/') {
+                return Some("approve");
+            }
+        }
+    }
+    // Revoking an active exception invalidates previously approved governance
+    // evidence and therefore carries the same human approver tier.
+    if is_single_segment_member(path, "/api/datacenter/firmware/revoke") {
+        return Some("approve");
+    }
+    // Access-review reviewer claim/verdict actions put the id in the MIDDLE
+    // (`/api/identity/access-review/{id}/{start|approve|revoke|exempt}`), which a
+    // static prefix cannot express. Match exactly one id segment then the action.
     if let Some(rest) = path.strip_prefix("/api/identity/access-review/") {
-        for verdict in ["approve", "revoke", "exempt"] {
-            if let Some(id) = rest.strip_suffix(&format!("/{verdict}")) {
+        for action in ["start", "approve", "revoke", "exempt"] {
+            if let Some(id) = rest.strip_suffix(&format!("/{action}")) {
                 if !id.is_empty() && !id.contains('/') {
                     return Some("approve");
                 }
@@ -703,29 +1173,139 @@ fn approval_signoff_permission(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Human judgments and derived-credential grants that must never be produced
+/// by a workload, unknown carrier, or simulated identity. This is deliberately
+/// path-shape based and provider-neutral: the separate admission proof decides
+/// whether the actor is an exact governed human.
+fn requires_verified_human_signoff(method: &Method, path: &str) -> bool {
+    if !is_unsafe_method(method) {
+        return false;
+    }
+
+    // Every request approval verdict (including batch and step-scoped
+    // live-apply grants) ends with one of these closed action names.
+    if let Some(rest) = path.strip_prefix("/api/requests/") {
+        if matches!(
+            rest.rsplit('/').next(),
+            Some("approve" | "reject" | "rework" | "approve-live-apply")
+        ) {
+            return true;
+        }
+    }
+
+    if approval_signoff_permission(path).is_some() {
+        return true;
+    }
+
+    // Break-glass is a human-only control plane from initiation through close.
+    // Safe inventory reads are excluded by the unsafe-method check above.
+    if path == "/api/ops/emergency/initiate" || path.starts_with("/api/ops/emergency/") {
+        return true;
+    }
+
+    // Direct admin-grade sign-off, attestation, and derived-credential sinks
+    // whose coarse route permission is not the ordinary `approve` tier.
+    path == "/api/admin/agents/enrollment-challenges"
+        || path == "/api/admin/agents/live-apply-jobs"
+        || path == "/api/protect/snapshot/review"
+        || is_single_segment_member(path, "/api/protect/legal-hold/release")
+        || is_single_segment_member(path, "/api/analytics/aiops/review")
+        || member_action_path(path, "/api/admin/agents", "approve")
+        || member_action_path(path, "/api/admin/agents", "revoke")
+        || is_single_segment_member(path, "/api/identity/ad/quarantine-recovery/review")
+        || is_single_segment_member(path, "/api/identity/ad/quarantine-recovery/approve")
+        || is_single_segment_member(path, "/api/identity/ad/quarantine-recovery/apply")
+        || is_single_segment_member(path, "/api/identity/shares/recertify")
+        || member_action_path(path, "/api/audit/compliance/controls", "assess")
+        || member_action_path(path, "/api/audit/compliance/findings", "waive")
+}
+
+/// Exactly `{collection}/{one-id}/{action}` with no additional segments.
+fn member_action_path(path: &str, collection: &str, action: &str) -> bool {
+    let Some(rest) = path.strip_prefix(&format!("{collection}/")) else {
+        return false;
+    };
+    let Some(id) = rest.strip_suffix(&format!("/{action}")) else {
+        return false;
+    };
+    !id.is_empty() && !id.contains('/')
+}
+
+/// Credential inventory and lifecycle are themselves a global human control
+/// plane. API tokens may retain explicitly granted machine operations, but can
+/// neither mint/revoke peer credentials nor enumerate their metadata.
+fn requires_global_verified_human_credential_admin(path: &str) -> bool {
+    path == "/api/admin/tokens"
+        || is_single_segment_member(path, "/api/admin/tokens")
+        || path == "/api/admin/sessions"
+        || is_single_segment_member(path, "/api/admin/sessions")
+}
+
+fn interactive_authority_matches_session(
+    session: &AuthSession,
+    authority: Option<&crate::human_authority::InteractiveHumanAuthorityContext>,
+) -> bool {
+    let Some(authority) = authority else {
+        return false;
+    };
+    session.is_verified_human()
+        && !authority.provider.trim().is_empty()
+        && !authority.issuer.trim().is_empty()
+        && !authority.subject.trim().is_empty()
+        && authority.identity_epoch > 0
+        && authority.assignment_version > 0
+        && authority.subject == session.user_id
+        && authority.roles == session.roles
+        && authority.site_scope == session.site_scope
+        && authority.environment_scope == session.environment_scope
+        && matches!(
+            authority.site_mode,
+            crate::human_authority::HumanAuthorityMode::Global
+                | crate::human_authority::HumanAuthorityMode::Scoped
+        )
+        && matches!(
+            authority.environment_mode,
+            crate::human_authority::HumanAuthorityMode::Global
+                | crate::human_authority::HumanAuthorityMode::Scoped
+        )
+}
+
+fn global_interactive_authority_matches_session(
+    session: &AuthSession,
+    authority: Option<&crate::human_authority::InteractiveHumanAuthorityContext>,
+) -> bool {
+    interactive_authority_matches_session(session, authority)
+        && session.site_scope.is_empty()
+        && session.environment_scope.is_empty()
+        && authority.is_some_and(|authority| {
+            authority.site_mode == crate::human_authority::HumanAuthorityMode::Global
+                && authority.environment_mode == crate::human_authority::HumanAuthorityMode::Global
+        })
+}
+
 /// Mutations whose FAMILY ROOT is otherwise unclassified in `ROUTE_PERMISSIONS` (so the
 /// fail-closed `admin` default would apply) but whose handler intends a specific LOWER
 /// tier. Without these, the mutation is accidentally admin-only and the handler's looser
 /// check is unreachable for the intended principals. SHAPE-matched (NOT a method-agnostic
 /// `/api/events`/`/api/audit` prefix) so any OTHER future unsafe route under these families
 /// stays fail-closed to `admin` until explicitly classified.
-fn unclassified_family_mutation_permission(path: &str) -> Option<&'static str> {
-    // Alert acknowledgement — events_alert_ack / events_alert_batch_ack check `request`.
-    if path.starts_with("/api/events/alerts/") && path.ends_with("/ack") {
-        return Some("request");
+fn unclassified_family_mutation_permission(method: &Method, path: &str) -> Option<&'static str> {
+    // The dedicated capability is authoritative; `execute` is only the coarse
+    // route-table floor for this otherwise-unclassified mutation family.
+    if method == Method::POST && is_alert_acknowledgement_path(path) {
+        return Some("execute");
     }
     // Audit hash-chain re-verify — audit_log_verify checks `audit`.
-    if path == "/api/audit/log/verify" {
+    if method == Method::POST && path == "/api/audit/log/verify" {
         return Some("audit");
     }
     None
 }
 
-/// Central resolver applied in `auth_middleware` for unsafe methods. `method`
-/// is accepted for forward-compatibility (per-method granularity is a later
-/// wave); this wave treats every unsafe method on a path family identically.
+/// Central coarse-permission resolver for unsafe methods. Exact exceptional
+/// shapes are method-aware; the legacy family table remains method-independent.
 /// Returns the required coarse permission, defaulting fail-closed to `admin`.
-fn route_permission_for(_method: &Method, path: &str) -> &'static str {
+fn route_permission_for(method: &Method, path: &str) -> &'static str {
     if let Some(permission) = requests_route_permission(path) {
         return permission;
     }
@@ -736,8 +1316,8 @@ fn route_permission_for(_method: &Method, path: &str) -> &'static str {
         return permission;
     }
     // Lower-tier mutations whose family root is unclassified (would else fail-closed to
-    // admin) — alert ack (`request`), audit-chain verify (`audit`). Shape-matched.
-    if let Some(permission) = unclassified_family_mutation_permission(path) {
+    // admin) — alert ack (`execute`), audit-chain verify (`audit`). Shape-matched.
+    if let Some(permission) = unclassified_family_mutation_permission(method, path) {
         return permission;
     }
     ROUTE_PERMISSIONS
@@ -753,14 +1333,239 @@ fn route_permission_for(_method: &Method, path: &str) -> &'static str {
 static SENSITIVE_READ_PREFIXES: &[&str] =
     &["/api/protect/secrets", "/api/ops/emergency", "/api/admin"];
 
+/// Exact static contract documents that are safe for a Requester to inspect.
+/// A future route whose name happens to end in `-contract` defaults to the
+/// audit tier until it is reviewed and added here.
+static REQUESTER_CONTRACT_PATHS: &[&str] = &[
+    "/api/build/k8s-contract",
+    "/api/build/sql-contract",
+    "/api/catalog/policy-guardrails-contract",
+    "/api/catalog/request-form-contract",
+    "/api/catalog/site-catalog-contract",
+    "/api/cmdb/impact-contract",
+    "/api/dashboard/global-overview-contract",
+    "/api/dashboard/risk-heatmap-contract",
+    "/api/images/factory-contract",
+    "/api/observe/logs-contract",
+    "/api/ops/shift-contract",
+    "/api/platform/status-contract",
+    "/api/platform/vault-secret-delivery-contract",
+    "/api/protect/backup-coverage-contract",
+    "/api/protect/backup-coverage-gap-contract",
+    "/api/protect/dr-contract",
+    "/api/protect/immutability-contract",
+    "/api/protect/legal-hold-contract",
+    "/api/protect/repository-capacity-contract",
+    "/api/protect/secrets-contract",
+    "/api/requests/lifecycle-contract",
+    "/api/requests/preflight-contract",
+    "/api/admin/approval-groups-contract",
+    "/api/admin/delegation-boundary-contract",
+    "/api/admin/feature-flag-governance-contract",
+    "/api/admin/site-registry-contract",
+    "/api/admin/worker-capability-contract",
+    "/api/analytics/aiops-contract",
+    "/api/analytics/cost-capacity-contract",
+    "/api/approvals/decision-readiness-contract",
+    "/api/audit/compliance-contract",
+    "/api/build/app-environment-contract",
+    "/api/build/linux-deploy-contract",
+    "/api/catalog/evidence-redaction-contract",
+    "/api/catalog/offerings-contract",
+    "/api/catalog/recommendations-contract",
+    "/api/cmdb/impact-analysis-contract",
+    "/api/cmdb/reconciliation-contract",
+    "/api/cmdb/relationship-graph-contract",
+    "/api/cmdb/servicenow-contract",
+    "/api/datacenter/check-cooling-contract",
+    "/api/datacenter/check-power-contract",
+    "/api/datacenter/check-rack-space-contract",
+    "/api/datacenter/check-switchports-contract",
+    "/api/datacenter/failing-checks-contract",
+    "/api/datacenter/firmware-contract",
+    "/api/datacenter/full-readiness-contract",
+    "/api/datacenter/hardware-contract",
+    "/api/datacenter/image-factory-contract",
+    "/api/datacenter/network-contract",
+    "/api/datacenter/oob-contract",
+    "/api/datacenter/readiness-score-contract",
+    "/api/datacenter/site-report-contract",
+    "/api/datacenter/sites-contract",
+    "/api/datacenter/storage-contract",
+    "/api/evidence/compliance-dashboard-contract",
+    "/api/evidence/export-retention-contract",
+    "/api/identity/access-review-contract",
+    "/api/identity/access-review-recertification-contract",
+    "/api/identity/ad-computer-contract",
+    "/api/identity/ad-computer-lifecycle-contract",
+    "/api/identity/entra-rbac-approval-readiness-contract",
+    "/api/identity/file-share-ntfs-recertification-contract",
+    "/api/identity/gmsa-contract",
+    "/api/identity/gmsa-lifecycle-contract",
+    "/api/identity/local-privilege-access-contract",
+    "/api/identity/rbac-approval-model-contract",
+    "/api/identity/shares-contract",
+    "/api/integrations/adapter-contract-test-contract",
+    "/api/integrations/adapter-readiness-matrix-contract",
+    "/api/integrations/servicenow/cmdb-file-contract",
+    "/api/integrations/servicenow/future-api-contract",
+    "/api/integrations/vmware/cluster-capacity-admission-contract",
+    "/api/integrations/vmware/customization-spec-governance-contract",
+    "/api/integrations/vmware/day2-change-contract",
+    "/api/integrations/vmware/decommission-quarantine-contract",
+    "/api/integrations/vmware/object-placement-contract",
+    "/api/integrations/vmware/snapshot-governance-contract",
+    "/api/integrations/vmware/vsan-esxi-lifecycle-contract",
+    "/api/inventory/coverage-contract",
+    "/api/inventory/os-baseline-compliance-contract",
+    "/api/inventory/ownership-risk-contract",
+    "/api/inventory/resource-overview-contract",
+    "/api/maintain/baseline-contract",
+    "/api/maintain/calendar-contract",
+    "/api/maintain/certificate-contract",
+    "/api/maintain/patch-contract",
+    "/api/maintain/software-contract",
+    "/api/monitoring/alert-routing-contract",
+    "/api/monitoring/noise-contract",
+    "/api/monitoring/zabbix-drift-contract",
+    "/api/network/dns-ipam-contract",
+    "/api/network/firewall-contract",
+    "/api/network/loadbalancer-contract",
+    "/api/observe/alert-routing-contract",
+    "/api/observe/log-forwarder-onboarding-contract",
+    "/api/observe/monitoring-coverage-gap-contract",
+    "/api/observe/monitoring-review-queue-contract",
+    "/api/observe/noise-flapping-remediation-contract",
+    "/api/observe/synthetic-health-check-contract",
+    "/api/observe/zabbix-drift-remediation-contract",
+    "/api/observe/zabbix-onboarding-contract",
+    "/api/operations/activity-queue-contract",
+    "/api/operations/aiops-suggestion-contract",
+    "/api/operations/certificate-lifecycle-contract",
+    "/api/operations/datacenter-readiness-contract",
+    "/api/operations/degradation-mode-contract",
+    "/api/operations/dependency-replay-contract",
+    "/api/operations/emergency-change-contract",
+    "/api/operations/firmware-compliance-exception-contract",
+    "/api/operations/hardware-lifecycle-contract",
+    "/api/operations/incident-context-contract",
+    "/api/operations/knowledge-suggestion-contract",
+    "/api/operations/maintenance-communications-contract",
+    "/api/operations/network-vlan-readiness-contract",
+    "/api/operations/out-of-band-access-validation-contract",
+    "/api/operations/outage-comms-contract",
+    "/api/operations/platform-health-contract",
+    "/api/operations/run-state-contract",
+    "/api/operations/runbook-launch-contract",
+    "/api/operations/shift-queue-contract",
+    "/api/operations/standard-task-contract",
+    "/api/ops/emergency-contract",
+    "/api/ops/incident-context-contract",
+    "/api/ops/runbook-contract",
+    "/api/patching/maintenance-calendar-contract",
+    "/api/patching/maintenance-contract",
+    "/api/patching/policy-import-contract",
+    "/api/patching/reboot-orchestration-contract",
+    "/api/platform/database-readiness-contract",
+    "/api/platform/degradation-contract",
+    "/api/platform/design-system-contract",
+    "/api/platform/kubernetes-runtime-readiness-contract",
+    "/api/platform/local-container-readiness-contract",
+    "/api/platform/object-storage-readiness-contract",
+    "/api/platform/portal-information-architecture-contract",
+    "/api/platform/registry-readiness-contract",
+    "/api/platform/release-promotion-contract",
+    "/api/platform/security-baseline-contract",
+    "/api/platform/ui-mockup-acceptance-contract",
+    "/api/platform/vault-deployment-readiness-contract",
+    "/api/protect/application-aware-backup-validation-contract",
+    "/api/protect/backup-dr-assignment-contract",
+    "/api/protect/controlled-restore-contract",
+    "/api/protect/immutability-air-gap-compliance-contract",
+    "/api/protect/legal-hold-retention-contract",
+    "/api/protect/restore-testing-contract",
+    "/api/protect/snapshot-governance-contract",
+    "/api/requests/execution-timeline-contract",
+    "/api/requests/intake-support-contract",
+    "/api/retire/decommission-contract",
+    "/api/software/approved-deployment-contract",
+    "/api/vm/day2-change-contract",
+    "/api/workflows/application-environment/deployment-contract",
+    "/api/workflows/application-environment/retirement-contract",
+    "/api/workflows/azure-landing-zone/validation-contract",
+    "/api/workflows/server-lifecycle/dry-run-contract",
+    "/api/workflows/sql-server/deployment-contract",
+];
+
+fn is_requester_contract_path(path: &str) -> bool {
+    REQUESTER_CONTRACT_PATHS.contains(&path)
+}
+
+fn is_requester_static_read_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/catalog"
+            | "/api/catalog/approval-routes"
+            | "/api/catalog/categories"
+            | "/api/catalog/policy-guardrails"
+            | "/api/metrics/series"
+            | "/api/metrics/series/aggregated"
+            | "/api/metrics/insights"
+            | "/api/metrics/what-if"
+            | "/api/metrics/budgets"
+            | "/api/metrics/budgets/status"
+            | "/api/metrics/commitment"
+            | "/api/metrics/slo"
+            | "/api/metrics/slo/status"
+            | "/api/notifications"
+            | "/api/notifications/unread-count"
+    )
+}
+
+/// Requester-readable GETs are an explicit, closed set. Each dynamic member is
+/// self-owned by repository/handler predicates; static catalog data contains no
+/// tenant/provider inventory. New routes therefore default to `audit` instead
+/// of silently inheriting Requester visibility.
+fn is_requester_read_path(path: &str) -> bool {
+    if path == "/api/requests"
+        || path == "/api/auth/local/roles"
+        || path == "/api/auth/local/me"
+        || path == "/api/auth/local/decision"
+        || path == "/api/me"
+        || path == "/api/me/preferences"
+        || is_requester_static_read_path(path)
+        || is_notifications_self_service_path(path)
+        || path == "/api/events"
+        || path == "/api/operations/failure-patterns"
+        || path == "/api/operations/knowledge-suggestion-readiness"
+        || path == "/api/observe/monitoring-review-queue"
+        || is_requester_contract_path(path)
+    {
+        return true;
+    }
+
+    let Some(rest) = path.strip_prefix("/api/requests/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(request_id) = segments.next() else {
+        return false;
+    };
+    if request_id.is_empty() {
+        return false;
+    }
+    matches!(
+        (segments.next(), segments.next()),
+        (None, None) | (Some("policy-eval" | "execution-job"), None)
+    )
+}
+
 /// Resolves the permission required to READ (safe method) a path. Reuse of
-/// `route_permission_for` is wrong for reads because the mutating table maps
-/// families like `/api/protect`->execute and `/api/requests`->request, which
-/// would lock a plain auditor out of ordinary GETs. Instead: sensitive read
-/// prefixes require `admin`; everything else is an ordinary read requiring
-/// `audit`. A logged-in Auditor (holds `audit`) reads ordinary GETs but 403s on
-/// the sensitive prefixes; a static-dry-run/PlatformAdmin session satisfies
-/// both via the superuser model, so the demo and mock mode keep reading.
+/// `route_permission_for` is wrong for reads because mutation and read actions
+/// intentionally differ. Sensitive prefixes and the exact persisted network-
+/// readiness data paths require `admin`, operator working data requires
+/// `execute`, the closed self-owned/static set above is `request`, and every
+/// unclassified read fails closed to `audit`.
 /// The shift queue (`/api/ops/shift/...`) is OPERATOR working data: every per-item
 /// read (summary/handover/my-items/stale/items) carries open-item descriptions +
 /// assignees, so it requires the `execute` (operator) tier — NOT the ordinary
@@ -771,18 +1576,46 @@ static SENSITIVE_READ_PREFIXES: &[&str] =
 /// advertisement (not under `/shift/`) stays ordinary-readable. `admin` satisfies it
 /// via the check_permission superuser rule.
 fn is_execute_read_path(path: &str) -> bool {
-    path == "/api/ops/shift" || path.starts_with("/api/ops/shift/")
+    path == "/api/ops/shift"
+        || path.starts_with("/api/ops/shift/")
+        || path == "/api/ops/scheduler/schedules"
+        || path == "/api/ops/scheduler/executions"
+}
+
+fn is_approve_read_path(path: &str) -> bool {
+    path == "/api/approvals/pending"
+}
+
+/// Persisted network-readiness data remains admin-only until a dedicated
+/// network-inventory capability exists. Match exact data paths so the static,
+/// redacted contract advertisement remains ordinary Requester-readable.
+fn is_network_inventory_read_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/datacenter/network/readiness"
+            | "/api/datacenter/network/capacity"
+            | "/api/datacenter/network/ports"
+            | "/api/datacenter/network/vlans"
+    )
 }
 
 fn read_permission_for(path: &str) -> &'static str {
+    if is_approve_read_path(path) {
+        return "approve";
+    }
     if is_execute_read_path(path) {
         return "execute";
+    }
+    if is_network_inventory_read_path(path) {
+        return "admin";
     }
     let sensitive = SENSITIVE_READ_PREFIXES
         .iter()
         .any(|p| path == *p || path.starts_with(&format!("{p}/")));
     if sensitive {
         "admin"
+    } else if is_requester_read_path(path) {
+        "request"
     } else {
         "audit"
     }
@@ -811,25 +1644,24 @@ fn is_audit_read_path(path: &str) -> bool {
                 || path.ends_with("/approval-quorum")))
 }
 
-/// Whether `session` may read `path`. Sensitive prefixes require `admin`; audit
-/// trails require the `audit` tier specifically; all other ordinary reads
-/// accept any standard read permission — `audit`
-/// (Auditor/operators/approver/service-desk) OR `request`
-/// (Requester/service-desk) — so a Requester can view their own requests.
-/// `admin` satisfies everything via the check_permission superuser rule.
+/// Whether `session` may read `path`. Requester access exists only for the
+/// closed self-owned/static set classified as `request`; all unclassified reads
+/// require `audit`. `admin` satisfies every class through the superuser rule.
 fn read_authorized(session: &AuthSession, path: &str) -> bool {
     if is_audit_read_path(path) {
         return ryuki_engine::auth::check_permission(session, "audit");
     }
     match read_permission_for(path) {
         "admin" => ryuki_engine::auth::check_permission(session, "admin"),
+        "approve" => ryuki_engine::auth::check_permission(session, "approve"),
         // Operator-data reads (the shift queue) require `execute` — admin still
         // satisfies it via the superuser rule inside check_permission.
         "execute" => ryuki_engine::auth::check_permission(session, "execute"),
-        _ => {
+        "request" => {
             ryuki_engine::auth::check_permission(session, "audit")
                 || ryuki_engine::auth::check_permission(session, "request")
         }
+        _ => ryuki_engine::auth::check_permission(session, "audit"),
     }
 }
 
@@ -940,20 +1772,92 @@ async fn auth_middleware(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
-    let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
+    let app_config = crate::config_store::get_app_config();
+    let auth_mode = app_config.auth_mode.clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
+    let lookup_admission = crate::session_lookup_admission::global_admission();
+    let lookup_proof = request
+        .extensions()
+        .get::<crate::session_lookup_admission::SessionLookupAdmissionProof>()
+        .copied();
 
-    // Persisted DB session wins for Local/persisted flows; only the None
-    // fallback runs validator-aware resolution.
-    let (session, session_source, failure_reason) =
-        match auth_session_from_persisted_session(&headers, auth_header, &auth_mode).await {
-            Some((session, source)) => (session, Some(source), None),
+    // Logout owns its caller-credential delete/audit transaction in the
+    // handler and is auth-exempt specifically so expired sessions can be
+    // cleared. Do not duplicate that keyed database access here. Every other
+    // route resolves persisted DB sessions first; only the None fallback runs
+    // validator-aware resolution.
+    let (session, session_source, failure_reason, interactive_authority) = if matches!(
+        path.as_str(),
+        "/api/auth/logout" | "/api/auth/local/logout"
+    ) {
+        (
+            unverified_session("logout-self-revocation"),
+            None,
+            None,
+            None,
+        )
+    } else {
+        match auth_session_from_persisted_session_with_authority_admission(
+            &headers,
+            auth_header,
+            app_config,
+            &lookup_admission,
+            lookup_proof,
+        )
+        .await
+        {
+            Some((session, source, authority)) => (session, Some(source), None, authority),
             None => {
-                let (session, reason) =
-                    resolve_request_session(auth_mode, auth_header, &validator).await;
-                (session, None, reason)
+                let (validated, reason) =
+                    resolve_request_session(auth_mode.clone(), auth_header, &validator).await;
+                if auth_mode == AuthMode::EntraId
+                    && validated.token_valid
+                    && !validated.is_verified_human()
+                {
+                    tracing::warn!(
+                        actor_class = ?validated.actor_class,
+                        "validated Entra bearer is not a delegated human token"
+                    );
+                    (
+                        unverified_session("entra-id-actor-kind-rejected"),
+                        None,
+                        Some("actor-kind-rejected"),
+                        None,
+                    )
+                } else if auth_mode == AuthMode::EntraId && validated.token_valid {
+                    let normalized = if let Some(pool) = crate::database::get_db() {
+                        crate::identity_authority::admit_federated_bearer(
+                            pool,
+                            "entra-id",
+                            &crate::identity_authority::configured_entra_issuer(app_config),
+                            &validated.user_id,
+                            &validated.display_name,
+                            &validated.roles,
+                            validated.actor_class,
+                            &app_config.session,
+                        )
+                        .await
+                    } else {
+                        Err(crate::identity_authority::IdentityAuthorityError::AssertionRejected)
+                    };
+                    match normalized {
+                        Ok(admitted) => (admitted.session, None, None, Some(admitted.authority)),
+                        Err(error) => {
+                            tracing::warn!(reason = %error, "verified bearer has no active platform authority assignment");
+                            (
+                                unverified_session("entra-id-authority-rejected"),
+                                None,
+                                Some("authority-rejected"),
+                                None,
+                            )
+                        }
+                    }
+                } else {
+                    (validated, None, reason, None)
+                }
             }
-        };
+        }
+    };
 
     // SAFE logging: presence + mode + token_valid + an optional low-cardinality
     // failure-reason string. NEVER the token, claims, oid, or header bytes.
@@ -999,7 +1903,34 @@ async fn auth_middleware(
         // mutations (which would fall to the admin default); the handler's keying
         // on the verified session.user_id is the real boundary.
         let self_service = is_self_service_mutation(&method, &path);
-        let required = if is_unsafe_method(&method) && !self_service {
+        let operation_capability = if !self_service {
+            operation_capability_for(&method, &path)
+        } else {
+            None
+        };
+        let actor_requirement = if requires_verified_human_signoff(&method, &path) {
+            Some("verified-human-signoff")
+        } else if requires_global_verified_human_credential_admin(&path) {
+            Some("global-verified-human-credential-admin")
+        } else {
+            None
+        };
+        let actor_authorized = match actor_requirement {
+            Some("verified-human-signoff") => {
+                interactive_authority_matches_session(&session, interactive_authority.as_ref())
+            }
+            Some("global-verified-human-credential-admin") => {
+                global_interactive_authority_matches_session(
+                    &session,
+                    interactive_authority.as_ref(),
+                )
+            }
+            Some(_) => false,
+            None => true,
+        };
+        let required = if let Some(capability) = operation_capability {
+            capability.as_str()
+        } else if is_unsafe_method(&method) && !self_service {
             route_permission_for(&method, &path)
         } else {
             read_permission_for(&path)
@@ -1009,17 +1940,25 @@ async fn auth_middleware(
         // ordinary -> audit OR request) so a recipient can manage their own feed,
         // a user can set their own preferences, and a Requester can view their
         // own requests.
-        let authorized = if is_unsafe_method(&method) && !self_service {
+        let role_authorized = if let Some(capability) = operation_capability {
+            ryuki_engine::auth::check_operation_capability(&session, capability)
+        } else if is_unsafe_method(&method) && !self_service {
             ryuki_engine::auth::check_permission(&session, required)
         } else {
             read_authorized(&session, &path)
         };
+        let authorized = actor_authorized && role_authorized;
         if !authorized {
+            let denied_requirement = if actor_authorized {
+                required
+            } else {
+                actor_requirement.unwrap_or(required)
+            };
             tracing::warn!(
                 user_id = %session.user_id,
                 method = %method,
                 path = %path,
-                required,
+                required = denied_requirement,
                 "authorization denied: missing required permission"
             );
             // B7: audit the denial for AUTHENTICATED callers only. The
@@ -1042,17 +1981,20 @@ async fn auth_middleware(
                         detail: serde_json::json!({
                             "method": method.as_str(),
                             "path": path,
-                            "required": required,
+                            "required": denied_requirement,
                         }),
                         outcome: "denied",
                     },
                 )
                 .await;
             }
-            return forbidden(required);
+            return forbidden(denied_requirement);
         }
     }
 
+    if let Some(authority) = interactive_authority {
+        request.extensions_mut().insert(authority);
+    }
     request.extensions_mut().insert(session);
     next.run(request).await
 }
@@ -1135,6 +2077,22 @@ enum ReadinessStatus {
     DatabaseUnusable,
 }
 
+struct ReadinessProbeCache {
+    latest: tokio::sync::RwLock<Option<(Instant, ReadinessStatus)>>,
+    refresh_permit: tokio::sync::Semaphore,
+}
+
+static READINESS_PROBE_CACHE: OnceLock<ReadinessProbeCache> = OnceLock::new();
+const READINESS_PROBE_CACHE_TTL: Duration = Duration::from_secs(2);
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn readiness_probe_cache() -> &'static ReadinessProbeCache {
+    READINESS_PROBE_CACHE.get_or_init(|| ReadinessProbeCache {
+        latest: tokio::sync::RwLock::new(None),
+        refresh_permit: tokio::sync::Semaphore::new(1),
+    })
+}
+
 /// Per-endpoint request counts keyed by "METHOD /path".
 /// Uses std::sync::Mutex with HashMap — acceptable for dev/light production.
 /// For high-throughput deployments, replace with dashmap or sharded approach.
@@ -1176,16 +2134,47 @@ async fn request_counter_middleware(
     next: middleware::Next,
 ) -> Response {
     REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let matched_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
     let label = format!(
         "{} {}",
-        request.method(),
-        normalize_metrics_path(request.uri().path())
+        metrics_method_label(request.method()),
+        metrics_path_label(request.uri().path(), matched_path)
     );
     {
         let mut counts = lock_or_recover(&per_endpoint().counts);
         *counts.entry(label).or_insert(0) += 1;
     }
     next.run(request).await
+}
+
+fn metrics_method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+/// Produce a bounded-cardinality metrics label. A matched Axum route template
+/// comes from the trusted router definition. Unmatched attacker-controlled
+/// paths collapse into one label instead of becoming map/Prometheus keys.
+fn metrics_path_label(request_path: &str, matched_path: Option<&str>) -> String {
+    if let Some(template) = matched_path {
+        return normalize_metrics_path(template);
+    }
+    match request_path {
+        "/health" | "/ready" | "/metrics" => request_path.to_string(),
+        _ => "/__unmatched__".into(),
+    }
 }
 
 fn normalize_metrics_path(path: &str) -> String {
@@ -1208,17 +2197,31 @@ fn normalize_metrics_path(path: &str) -> String {
     }
 }
 
-/// Stores request durations in microseconds, capped at 10,000 entries.
+const REQUEST_DURATION_SAMPLE_CAPACITY: usize = 10_000;
+
+/// Stores request durations in microseconds in a bounded ring buffer. Both
+/// insertion and eviction are O(1), including after the buffer reaches its
+/// steady-state capacity under sustained rejected traffic.
 struct DurationTracker {
-    durations: Mutex<Vec<u64>>,
+    durations: Mutex<VecDeque<u64>>,
 }
 
 static DURATION_TRACKER: OnceLock<DurationTracker> = OnceLock::new();
 
 fn duration_tracker() -> &'static DurationTracker {
     DURATION_TRACKER.get_or_init(|| DurationTracker {
-        durations: Mutex::new(Vec::with_capacity(10_000)),
+        durations: Mutex::new(VecDeque::with_capacity(REQUEST_DURATION_SAMPLE_CAPACITY)),
     })
+}
+
+fn push_bounded_duration(durations: &mut VecDeque<u64>, duration_us: u64, capacity: usize) {
+    if capacity == 0 {
+        return;
+    }
+    if durations.len() >= capacity {
+        durations.pop_front();
+    }
+    durations.push_back(duration_us);
 }
 
 /// Acquires a mutex guard, recovering from poisoning instead of panicking.
@@ -1254,10 +2257,11 @@ async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -
 
     let tracker = duration_tracker();
     let mut durations = lock_or_recover(&tracker.durations);
-    if durations.len() >= 10_000 {
-        durations.remove(0);
-    }
-    durations.push(duration_us);
+    push_bounded_duration(
+        &mut durations,
+        duration_us,
+        REQUEST_DURATION_SAMPLE_CAPACITY,
+    );
 
     response
 }
@@ -1268,6 +2272,9 @@ type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>,
 struct RateLimiters {
     default: SharedRateLimiter,
     path_overrides: Arc<HashMap<String, SharedRateLimiter>>,
+    /// Per-process unpredictable salt prevents a client from calculating which
+    /// bounded quota bucket another identity occupies.
+    bucket_salt: [u8; 32],
     /// Peers matching one of these networks may speak for their clients via
     /// X-Forwarded-For; everyone else is keyed on their own peer address.
     trusted_proxies: Arc<Vec<TrustedProxyNetwork>>,
@@ -1278,6 +2285,13 @@ impl RateLimiters {
         self.path_overrides.get(path_group).unwrap_or(&self.default)
     }
 
+    fn retain_recent(&self) {
+        self.default.retain_recent();
+        for limiter in self.path_overrides.values() {
+            limiter.retain_recent();
+        }
+    }
+
     #[cfg(test)]
     fn has_override(&self, path_group: &str) -> bool {
         self.path_overrides.contains_key(path_group)
@@ -1286,9 +2300,25 @@ impl RateLimiters {
 
 type SharedRateLimiters = Arc<RateLimiters>;
 
+fn spawn_rate_limit_maintenance(limiters: SharedRateLimiters) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let limiters = limiters.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || limiters.retain_recent()).await
+            {
+                tracing::error!(error = %error, "rate-limit state maintenance failed");
+            }
+        }
+    });
+}
+
 /// How the rate-limit client key was derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClientKeySource {
+pub(crate) enum ClientKeySource {
     /// The TCP peer address (the default; never spoofable).
     Peer,
     /// X-Forwarded-For, honored only because the peer is a trusted proxy.
@@ -1310,7 +2340,7 @@ impl ClientKeySource {
 /// trusted proxy wins (entries left of it are client-controlled, entries
 /// right of it are our own proxy tier). If the whole chain is trusted
 /// proxies — or the header is absent — the peer address is the key.
-fn resolve_rate_limit_client_key(
+pub(crate) fn resolve_rate_limit_client_key(
     peer_addr: SocketAddr,
     forwarded_for: Option<&str>,
     trusted_proxies: &[TrustedProxyNetwork],
@@ -1325,26 +2355,60 @@ fn resolve_rate_limit_client_key(
     let Some(forwarded_for) = forwarded_for else {
         return peer_key();
     };
-    for entry in forwarded_for.rsplit(',') {
+
+    // X-Forwarded-For is security admission input, not an arbitrary identity
+    // label. Validate the complete, bounded chain before trusting any hop so a
+    // malformed or excessively long prefix cannot rotate limiter buckets.
+    if forwarded_for.is_empty() || forwarded_for.len() > MAX_FORWARDED_FOR_BYTES {
+        return peer_key();
+    }
+    let mut hop_count = 0_usize;
+    for entry in forwarded_for.split(',') {
         let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        match parse_forwarded_entry_ip(entry) {
-            Some(ip) => {
-                let ip = ip.to_canonical();
-                if is_trusted(ip) {
-                    // a hop our own proxy tier appended; keep walking left
-                    continue;
-                }
-                return (ip.to_string(), ClientKeySource::Forwarded);
-            }
-            // A non-IP entry (e.g. an RFC 7239 obfuscated identifier written
-            // by the trusted proxy) cannot be a trusted proxy: key on it.
-            None => return (entry.to_string(), ClientKeySource::Forwarded),
+        hop_count += 1;
+        if hop_count > MAX_FORWARDED_FOR_HOPS
+            || entry.is_empty()
+            || parse_forwarded_entry_ip(entry).is_none()
+        {
+            return peer_key();
         }
     }
+
+    for entry in forwarded_for.rsplit(',') {
+        let entry = entry.trim();
+        let ip = parse_forwarded_entry_ip(entry)
+            .expect("the complete forwarded chain was validated above")
+            .to_canonical();
+        if is_trusted(ip) {
+            // a hop our own proxy tier appended; keep walking left
+            continue;
+        }
+        return (ip.to_string(), ClientKeySource::Forwarded);
+    }
     peer_key()
+}
+
+/// Maximum accepted wire size and hop count for one authoritative
+/// X-Forwarded-For field. Duplicate fields are rejected by the header-aware
+/// resolver below, preventing ambiguous concatenation/order semantics.
+const MAX_FORWARDED_FOR_BYTES: usize = 4 * 1024;
+const MAX_FORWARDED_FOR_HOPS: usize = 32;
+
+/// Resolve a rate-limit identity from the full header map. Exactly one valid
+/// X-Forwarded-For field is accepted; duplicate, non-ASCII, empty, malformed,
+/// or oversized evidence fails safely to the TCP peer identity.
+pub(crate) fn resolve_rate_limit_client_key_from_headers(
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[TrustedProxyNetwork],
+) -> (String, ClientKeySource) {
+    let mut values = headers.get_all("x-forwarded-for").iter();
+    let forwarded_for = match (values.next(), values.next()) {
+        (None, _) => None,
+        (Some(value), None) => value.to_str().ok(),
+        (Some(_), Some(_)) => None,
+    };
+    resolve_rate_limit_client_key(peer_addr, forwarded_for, trusted_proxies)
 }
 
 /// Parses one X-Forwarded-For entry: a plain IP, `ip:port`, or `[v6]:port`.
@@ -1363,32 +2427,38 @@ async fn rate_limit_middleware(
     if let Some(ref limiters) = limiter {
         // Inserted by into_make_service_with_connect_info in main(); absent
         // only if the router is served without connect info (a programming
-        // error), in which case requests pass unlimited rather than sharing
-        // one global bucket.
+        // error). When limiting is enabled, missing admission context fails
+        // closed rather than silently bypassing the quota.
         let Some(ConnectInfo(peer_addr)) = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .copied()
         else {
-            tracing::error!("peer address unavailable; request not rate limited");
-            return next.run(request).await;
+            tracing::error!("peer address unavailable; rejecting rate-limited request");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::new(
+                    "RATE_LIMIT_CONTEXT_UNAVAILABLE",
+                    "Request admission context is unavailable",
+                )),
+            )
+                .into_response();
         };
 
-        let forwarded_for = request
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok());
-        let (client_key, key_source) =
-            resolve_rate_limit_client_key(peer_addr, forwarded_for, &limiters.trusted_proxies);
+        let (client_key, key_source) = resolve_rate_limit_client_key_from_headers(
+            peer_addr,
+            request.headers(),
+            &limiters.trusted_proxies,
+        );
 
         let path_group = rate_limit_path_group(request.uri().path());
 
-        let key = format!("{path_group}:{client_key}");
-        let limiter = limiters.for_path_group(&path_group);
+        let key = bounded_rate_limit_key(path_group, &client_key, &limiters.bucket_salt);
+        let limiter = limiters.for_path_group(path_group);
 
         if let Err(not_until) = limiter.check_key(&key) {
             tracing::warn!(
-                client = %client_key,
+                bucket = %key,
                 key_source = key_source.as_str(),
                 path_group,
                 "rate limit exceeded"
@@ -1420,12 +2490,36 @@ async fn rate_limit_middleware(
     next.run(request).await
 }
 
-fn rate_limit_path_group(path: &str) -> String {
-    path.split('/')
-        .nth(1)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("root")
-        .to_ascii_lowercase()
+fn rate_limit_path_group(path: &str) -> &'static str {
+    match path.split('/').nth(1).unwrap_or_default() {
+        segment if segment.eq_ignore_ascii_case("api") => "api",
+        segment if segment.eq_ignore_ascii_case("health") => "health",
+        segment if segment.eq_ignore_ascii_case("ready") => "ready",
+        segment if segment.eq_ignore_ascii_case("metrics") => "metrics",
+        "" => "root",
+        _ => "unmatched",
+    }
+}
+
+/// Fixed number of pseudorandom client buckets per closed route group. This
+/// bounds governor's keyed state even when an attacker controls forwarded
+/// identifiers or rotates source addresses. Collisions intentionally share a
+/// quota; the bucket count keeps that trade-off negligible for normal traffic.
+const RATE_LIMIT_CLIENT_BUCKETS: u16 = 16_384;
+
+pub(crate) fn bounded_rate_limit_key(
+    path_group: &str,
+    client_key: &str,
+    salt: &[u8; 32],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update((client_key.len() as u64).to_be_bytes());
+    hasher.update(client_key.as_bytes());
+    let digest = hasher.finalize();
+    let raw = u16::from_be_bytes([digest[0], digest[1]]);
+    let bucket = raw % RATE_LIMIT_CLIENT_BUCKETS;
+    format!("{path_group}:bucket-{bucket:04x}")
 }
 
 fn normalize_rate_limit_override_key(path_group: &str) -> String {
@@ -1484,8 +2578,53 @@ fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<S
     Some(Arc::new(RateLimiters {
         default,
         path_overrides: Arc::new(path_overrides),
+        bucket_salt: rand::random(),
         trusted_proxies: Arc::new(trusted_proxies),
     }))
+}
+
+async fn request_timeout_middleware(
+    State(timeout): State<Duration>,
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|request_id| request_id.0.clone())
+        .unwrap_or_default();
+    let started = Instant::now();
+    let timeout_secs = timeout.as_secs();
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_elapsed) => {
+            tracing::warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                timeout_secs,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "request timeout"
+            );
+            let body = serde_json::to_string(&ApiError::new(
+                "REQUEST_TIMEOUT",
+                format!("Request exceeded {}s timeout", timeout_secs),
+            ))
+            .unwrap_or_else(|_| {
+                format!(
+                    r#"{{"error":"REQUEST_TIMEOUT","message":"Request exceeded {}s timeout"}}"#,
+                    timeout_secs
+                )
+            });
+            Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
 }
 
 async fn security_headers_middleware(
@@ -1535,6 +2674,14 @@ async fn security_headers_middleware(
         HeaderValue::from_static("0.1.0"),
     );
     response
+}
+
+/// The outer response envelope must wrap every path-aware admission and shared
+/// transport limit. Keeping the two layers together prevents a future router
+/// edit from making timeout, quota, or body-limit rejections uncorrelatable.
+fn with_response_envelope(app: Router) -> Router {
+    app.layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn(request_id_middleware))
 }
 
 async fn shutdown_signal(timeout_secs: u64) {
@@ -1608,13 +2755,14 @@ struct RouteMetaEntry {
 /// * `agent` / `webhook` — bypass human sessions but require their named
 ///   protocol credential;
 /// * integration management — explicit handler-level `admin` guards;
-/// * mutations — `route_permission_for` (admin/approve/execute/request/...),
-///   unless the mutation is self-service (gated like a read);
+/// * functional reads and mutations — `operation_capability_for` (a stable
+///   dotted capability id) before any coarse route tier;
+/// * remaining mutations — `route_permission_for`
+///   (admin/approve/execute/request/...), unless the mutation is self-service
+///   (gated like a read);
 /// * audit-grade reads — `audit` specifically;
-/// * remaining reads/self-service — `read_permission_for`'s tier, where the
-///   ordinary arm is reported as `read` because `read_authorized` accepts
-///   EITHER `audit` OR `request` there (labeling it `audit` would wrongly
-///   exclude Requesters).
+/// * remaining reads/self-service — the exact closed `read_permission_for`
+///   class (`request`, `audit`, `approve`, `execute`, or `admin`).
 ///
 /// Returns `None` only for a method the HTTP layer cannot parse or the
 /// synthetic `ANY` placeholder, where enforcement is method-dependent and
@@ -1653,7 +2801,13 @@ fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
     if is_integration_management_route(&method, path) {
         return Some("admin");
     }
-    if is_unsafe_method(&method) && !is_self_service_mutation(&method, path) {
+    let self_service = is_self_service_mutation(&method, path);
+    if !self_service {
+        if let Some(capability) = operation_capability_for(&method, path) {
+            return Some(capability.as_str());
+        }
+    }
+    if is_unsafe_method(&method) && !self_service {
         return Some(route_permission_for(&method, path));
     }
     if is_audit_read_path(path) {
@@ -1661,8 +2815,10 @@ fn route_meta_tier(method_str: &str, path: &str) -> Option<&'static str> {
     }
     Some(match read_permission_for(path) {
         "admin" => "admin",
+        "approve" => "approve",
         "execute" => "execute",
-        _ => "read",
+        "request" => "request",
+        _ => "audit",
     })
 }
 
@@ -1739,9 +2895,56 @@ async fn main() {
         return;
     }
 
+    let migration_mode = database::migration_startup_mode_from_env().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    if !migration_mode.serves_http() {
+        // The one-shot runner intentionally stops here: it does not load
+        // application/auth/provider configuration, initialize the normal pool,
+        // reconcile identity state, spawn background work, or bind a listener.
+        // Kubernetes injects a separate migrator credential into this process.
+        let migration_url = database::migration_database_url_from_env().unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        let timeouts = database::MigrationTimeouts::from_env().unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        let role_contract = database::MigrationRoleContract::from_env().unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        match database::apply_embedded_migrations_with_role_contract(
+            &migration_url,
+            timeouts,
+            role_contract,
+        )
+        .await
+        {
+            Ok(inventory) => {
+                eprintln!(
+                    "embedded migrations applied and verified (count={}, latest={:?})",
+                    inventory.embedded_count, inventory.latest_version
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("migration apply-only process failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     START_TIME.set(Instant::now()).ok();
-    let app_config = config::load_config();
+    let app_config = config::load_config().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
     config_store::init_with_config("platform-config.json", &app_config);
+    let session_lookup_admission =
+        crate::session_lookup_admission::initialize_global(app_config.server.pool_max_connections);
 
     let level_filter = match app_config.logging.level {
         ryuki_core::config::LogLevel::Trace => LevelFilter::TRACE,
@@ -1767,6 +2970,15 @@ async fn main() {
     }
 
     if app_config.auth_mode == AuthMode::Local {
+        if !app_config.local_auth.users.is_empty() {
+            if let Err(reason) = app_config.local_auth.human_authority() {
+                tracing::error!(
+                    reason,
+                    "local_auth requires explicit valid site and environment authority"
+                );
+                std::process::exit(1);
+            }
+        }
         if let Some((entry_index, role)) = find_unknown_local_auth_role(&app_config.local_auth) {
             tracing::error!(
                 entry_index,
@@ -1781,20 +2993,150 @@ async fn main() {
     {
         tracing::warn!(
             bind_address = %app_config.server.bind_address,
-            "session.cookie_secure is false on a non-loopback bind address; session cookies may be exposed over plain HTTP"
+            public_origin = %app_config.platform_url,
+            "insecure loopback cookie mode uses a non-loopback internal listener; ensure the public endpoint remains loopback-only"
         );
     }
+    match migration_mode {
+        database::MigrationStartupMode::VerifyOnly => {
+            let role_contract =
+                database::ApplicationRoleContract::from_env().unwrap_or_else(|error| {
+                    tracing::error!(%error, "invalid verify-only database role contract");
+                    std::process::exit(1);
+                });
+            database::try_connect_with_role_contract(
+                &app_config.database_url,
+                app_config.server.pool_max_connections,
+                app_config.server.pool_min_connections,
+                app_config.server.pool_idle_timeout_secs,
+                app_config.server.pool_acquire_timeout_secs,
+                app_config.server.pool_max_lifetime_secs,
+                role_contract,
+            )
+            .await;
+        }
+        database::MigrationStartupMode::LocalAuto => {
+            // Local/test databases intentionally need no pre-provisioned roles.
+            database::try_connect_with_url(
+                &app_config.database_url,
+                app_config.server.pool_max_connections,
+                app_config.server.pool_min_connections,
+                app_config.server.pool_idle_timeout_secs,
+                app_config.server.pool_acquire_timeout_secs,
+                app_config.server.pool_max_lifetime_secs,
+            )
+            .await;
+        }
+        database::MigrationStartupMode::ApplyOnly => {
+            unreachable!("apply-only exits before application startup")
+        }
+    }
+    match migration_mode {
+        database::MigrationStartupMode::LocalAuto => {
+            let timeouts = database::MigrationTimeouts::from_env().unwrap_or_else(|error| {
+                tracing::error!(%error, "invalid dedicated migration-runner timeout configuration");
+                std::process::exit(1);
+            });
+            if let Err(error) =
+                database::migrate_if_connected(&app_config.database_url, timeouts).await
+            {
+                tracing::error!(
+                    %error,
+                    "local-auto migration failed on a connected database; refusing to serve"
+                );
+                std::process::exit(1);
+            }
+        }
+        database::MigrationStartupMode::VerifyOnly => {
+            let Some(pool) = database::get_db() else {
+                tracing::error!(
+                    "verify-only startup requires the application database connection; refusing to serve"
+                );
+                std::process::exit(1);
+            };
+            match database::verify_embedded_migrations(pool).await {
+                Ok(inventory) => tracing::info!(
+                    embedded_count = inventory.embedded_count,
+                    latest_version = ?inventory.latest_version,
+                    "verify-only startup accepted the complete embedded migration inventory"
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "verify-only startup rejected missing, dirty, unexpected, or modified migrations"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        database::MigrationStartupMode::ApplyOnly => {
+            unreachable!("apply-only exits before application startup")
+        }
+    }
+    if !migration_mode
+        .permits_serving_with(database::migration_status(), database::get_db().is_some())
+    {
+        tracing::error!(
+            mode = %migration_mode,
+            status = ?database::migration_status(),
+            "migration startup policy refused HTTP serving"
+        );
+        std::process::exit(1);
+    }
 
-    database::try_connect_with_url(
-        &app_config.database_url,
-        app_config.server.pool_max_connections,
-        app_config.server.pool_min_connections,
-        app_config.server.pool_idle_timeout_secs,
-        app_config.server.pool_acquire_timeout_secs,
-        app_config.server.pool_max_lifetime_secs,
-    )
-    .await;
-    database::migrate_if_connected().await;
+    // Reconcile identity authority before serving any request. Local account
+    // password/role/removal/rollback changes advance a monotonic epoch. When
+    // Local mode is disabled, its complete authority namespace is revoked.
+    // Sessions for disabled providers or prior issuer/tenant configurations
+    // are deleted, so a later configuration rollback cannot resurrect them.
+    if let Some(pool) = crate::database::get_db() {
+        let local_result = if app_config.auth_mode == AuthMode::Local {
+            crate::identity_authority::reconcile_local_authorities(
+                pool,
+                &app_config.local_auth,
+                &app_config.session,
+            )
+            .await
+        } else {
+            let disabled_local_auth = ryuki_core::config::LocalAuthConfig::default();
+            crate::identity_authority::reconcile_local_authorities(
+                pool,
+                &disabled_local_auth,
+                &app_config.session,
+            )
+            .await
+        };
+        if let Err(error) = local_result {
+            tracing::error!(%error, "local identity-authority reconciliation failed");
+            std::process::exit(1);
+        }
+        match crate::identity_authority::reconcile_session_provider_admission(pool, &app_config)
+            .await
+        {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(
+                    removed,
+                    "sessions outside active provider admission removed"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "session provider-admission reconciliation failed");
+                std::process::exit(1);
+            }
+        }
+        match crate::session_lookup_admission::prewarm(pool, &app_config).await {
+            Ok(report) => tracing::info!(
+                loaded = report.loaded,
+                truncated = report.truncated,
+                "persisted-session lookup admission prewarmed"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "persisted-session lookup admission prewarm failed");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // ── Site registry startup hydration ──────────────────────────────────────
     //
@@ -1921,8 +3263,20 @@ async fn main() {
         tracing::info!("agent lease expiry sweep started (interval: 30s)");
         idempotency::spawn_idempotency_sweep(pool.clone(), 3600);
         tracing::info!("idempotency retention sweep started (interval: 3600s)");
+        // One 128-row batch per second drains faster than this process's
+        // feature-local 50 req/s sustained webhook admission ceiling.
+        repos::inbound_webhook_receipts::spawn_cleanup(pool.clone(), 1);
+        tracing::info!("inbound webhook receipt cleanup started (interval: 1s)");
+        repos::oidc_login_states::spawn_expired_login_state_cleanup(pool.clone(), 60);
+        tracing::info!("OIDC login-state cleanup started (interval: 60s)");
         scheduler::spawn_scheduler(pool.clone(), 60);
         tracing::info!("durable scheduler started (tick interval: 60s)");
+        audit::spawn_audit_verification_worker(pool.clone(), 5);
+        tracing::info!("bounded audit-chain verification worker started (interval: 5s)");
+        contracts::spawn_noise_site_reconciliation(pool.clone(), 1);
+        tracing::info!(
+            "bounded noisy-trigger site reconciliation started (interval: 1s, batch: 128)"
+        );
         // #11 slice 2b: SLO-breach scan emits slo.breach/slo.recovered domain
         // events on transition (write-capable, so separate from the read-only
         // scheduler). 5-minute cadence — SLO windows are days, so sub-minute
@@ -1958,6 +3312,26 @@ async fn main() {
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
+    if let Some(limiters) = rate_limiter.clone() {
+        spawn_rate_limit_maintenance(limiters);
+    }
+    // Feature-specific anonymous gates remain enabled even when the general
+    // limiter above is disabled. Reuse only validated trusted-proxy networks so
+    // each per-client budget derives the same non-spoofable source identity.
+    let anonymous_admission_trusted_proxies = app_config
+        .rate_limit
+        .parsed_trusted_proxies()
+        .unwrap_or_else(|error| {
+            // load_config validation normally makes this unreachable. Empty is
+            // fail-safe: no peer may then assert X-Forwarded-For identity.
+            tracing::error!(%error, "invalid anonymous-admission trusted-proxy configuration");
+            Vec::new()
+        });
+    let webhook_admission =
+        inbound_webhooks::WebhookAdmission::production(anonymous_admission_trusted_proxies.clone());
+    webhook_admission.spawn_maintenance();
+    let agent_registration_admission =
+        agents::AgentRegistrationAdmission::production(anonymous_admission_trusted_proxies);
     // Per-username failed-login throttle for POST /api/auth/local/login,
     // shared with the handler through an Extension (no global mutable state).
     let local_login_throttle = Arc::new(contracts::LocalLoginThrottle::default());
@@ -2043,19 +3417,16 @@ async fn main() {
         // Agent-token endpoints bypass human auth_middleware entirely (they
         // authenticate via authenticate_agent / the rya_ bearer token).
         .merge(agents::agent_routes())
-        // #18 slice 2b: the inbound webhook RECEIVER is a PUBLIC endpoint with NO
-        // human session — it authenticates only via the HMAC signature over the
-        // raw body (see inbound_webhooks module docs). Merged here, BEFORE
-        // human_gated_app, so it bypasses auth_middleware entirely, same as
-        // agent_routes() above. It still inherits every layer applied to `app`
-        // below (body-limit / rate-limit / concurrency / timeout), since those
-        // wrap the OUTER router — that is the DoS protection for a pre-auth,
-        // publicly reachable endpoint.
+        // The inbound receiver is public and bypasses human auth, but requires a
+        // fresh, connection-bound signed delivery envelope. A path-aware layer
+        // outside the shared concurrency queue owns its always-on
+        // per-client/global/in-flight gate; the optional general limiter remains
+        // defense in depth.
         .merge(inbound_webhooks::routes())
         // Human-session routes (includes admin_approve + all existing routes).
         .merge(human_gated_app)
         .fallback(not_found)
-        .layer(Extension(local_login_throttle))
+        .layer(Extension(local_login_throttle.clone()))
         .layer(Extension(
             // OidcCallbackDeps: built once at startup.  When OIDC is disabled
             // the handler gates on `oidc.enabled` before touching these deps, so
@@ -2071,7 +3442,10 @@ async fn main() {
                     app_config.oidc.client_id.clone(),
                     60, // 60-second leeway
                 ));
-                std::sync::Arc::new(oidc_callback::OidcCallbackDeps { exchanger, validator })
+                std::sync::Arc::new(oidc_callback::OidcCallbackDeps {
+                    exchanger,
+                    validator,
+                })
             } else {
                 // Disabled placeholder: handler gates on oidc.enabled → 404
                 // before these are touched.
@@ -2081,11 +3455,14 @@ async fn main() {
                     ));
                 let validator = std::sync::Arc::new(oidc_callback::OidcIdTokenValidator::new(
                     "https://disabled.invalid/jwks".to_string(),
-                    "disabled".to_string(),
+                    "https://disabled.invalid/issuer".to_string(),
                     "disabled".to_string(),
                     60,
                 ));
-                std::sync::Arc::new(oidc_callback::OidcCallbackDeps { exchanger, validator })
+                std::sync::Arc::new(oidc_callback::OidcCallbackDeps {
+                    exchanger,
+                    validator,
+                })
             },
         ))
         // EntraSsoDeps: built once at startup. The handlers gate on
@@ -2098,61 +3475,53 @@ async fn main() {
         .layer(ConcurrencyLimitLayer::new(
             app_config.server.max_concurrent_connections,
         ))
-        .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(request_counter_middleware))
-        .layer(middleware::from_fn(request_id_middleware))
         .layer(middleware::from_fn(
             move |req: HttpRequest<Body>, next: middleware::Next| {
                 let limiter = rate_limiter.clone();
                 async move { rate_limit_middleware(limiter, req, next).await }
             },
         ))
-        .layer(middleware::from_fn(
-            move |req: HttpRequest<Body>, next: middleware::Next| async move {
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
-                // #18: capture the request_id (set by the outer request_id_middleware)
-                // and the actual elapsed wall-time so a timeout log can be correlated
-                // with the request's other traces and the real duration confirmed —
-                // previously only the path + configured timeout were logged.
-                let request_id = req
-                    .extensions()
-                    .get::<RequestId>()
-                    .map(|r| r.0.clone())
-                    .unwrap_or_default();
-                let started = Instant::now();
-                match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
-                    Ok(response) => response,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            method = %method,
-                            path = %path,
-                            timeout_secs,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "request timeout"
-                        );
-                        let body = serde_json::to_string(&ApiError::new(
-                            "REQUEST_TIMEOUT",
-                            format!("Request exceeded {}s timeout", timeout_secs),
-                        ))
-                        .unwrap_or_else(|_| {
-                            format!(r#"{{"error":"REQUEST_TIMEOUT","message":"Request exceeded {}s timeout"}}"#, timeout_secs)
-                        });
-                        Response::builder()
-                            .status(StatusCode::GATEWAY_TIMEOUT)
-                            .header("content-type", "application/json")
-                            .body(Body::from(body))
-                            .unwrap()
-                    }
-                }
-            },
+        .layer(middleware::from_fn_with_state(
+            Duration::from_secs(timeout_secs),
+            request_timeout_middleware,
         ))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(cors)
         .layer(compression)
         .layer(middleware::from_fn(cache_control_middleware))
-        .layer(middleware::from_fn(timing_middleware));
+        .layer(middleware::from_fn(timing_middleware))
+        // Feature-local anonymous admission runs before telemetry, body polling,
+        // the optional general limiter, and the queueing whole-app concurrency
+        // layer. Non-matching paths pass through without consuming its budgets.
+        .layer(middleware::from_fn_with_state(
+            webhook_admission,
+            inbound_webhooks::webhook_admission_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            agent_registration_admission,
+            agents::agent_registration_admission_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            local_login_throttle,
+            contracts::local_login_admission_middleware,
+        ))
+        .layer(middleware::from_fn(
+            contracts::login_initiation_prequeue_middleware,
+        ))
+        // Persisted-session miss admission is outside the queueing whole-app
+        // concurrency layer. Unknown verifiers use try-only capacity; recently
+        // confirmed live sessions bypass the miss budget but are still checked
+        // against PostgreSQL and the current authority epoch on every request.
+        .layer(middleware::from_fn_with_state(
+            session_lookup_admission,
+            session_lookup_admission::session_lookup_admission_middleware,
+        ));
+    // These two cheap wrappers remain outside every early-returning gate so
+    // timeout, body-limit, rate-limit, and feature-admission responses all
+    // carry the same security and correlation headers. RequestId must be
+    // outermost so timeout/access middleware can read it from extensions.
+    let app = with_response_envelope(app);
 
     let listener = match tokio::net::TcpListener::bind(&app_config.server.bind_address).await {
         Ok(l) => l,
@@ -2285,27 +3654,87 @@ async fn readiness_check() -> ReadinessStatus {
         return status;
     }
 
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(pool)
-        .await
-    {
-        Ok(1) => ReadinessStatus::Ready,
-        Ok(unexpected) => {
-            // #37: log symmetrically with the Err arm so operators can tell a
-            // corrupted/misconfigured connection (SELECT 1 answered something
-            // other than 1) apart from a simple unavailability. Mirrors the
-            // self-health probe's "unexpected probe result" diagnostic.
-            tracing::warn!(
-                result = unexpected,
-                "database readiness probe returned an unexpected result (expected 1)"
-            );
-            ReadinessStatus::DatabaseUnusable
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "database readiness probe failed");
-            ReadinessStatus::DatabaseUnusable
-        }
+    cached_database_readiness(pool).await
+}
+
+async fn cached_database_readiness(pool: &sqlx::PgPool) -> ReadinessStatus {
+    let cache = readiness_probe_cache();
+    if let Some(status) = fresh_readiness_snapshot(*cache.latest.read().await) {
+        return status;
     }
+
+    // Do not queue unauthenticated readiness callers behind the DB pool. One
+    // request refreshes the snapshot; concurrent callers reuse the last value
+    // or fail closed when no snapshot exists yet.
+    let Ok(_permit) = cache.refresh_permit.try_acquire() else {
+        return fresh_readiness_snapshot(*cache.latest.read().await)
+            .unwrap_or(ReadinessStatus::DatabaseUnusable);
+    };
+
+    // A request may have waited between the first cache read and acquiring the
+    // permit. Reuse a fresh value before touching the database.
+    if let Some(status) = fresh_readiness_snapshot(*cache.latest.read().await) {
+        return status;
+    }
+
+    // Never enter the pool's async waiter queue on behalf of a public probe.
+    // A saturated pool is itself a not-ready signal; cache that fail-closed
+    // result rather than competing with authenticated application work for the
+    // next released connection.
+    let status = match try_readiness_connection(pool) {
+        Some(mut connection) => {
+            let probe = tokio::time::timeout(
+                READINESS_PROBE_TIMEOUT,
+                sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&mut *connection),
+            )
+            .await;
+            match probe {
+                Ok(Ok(1)) => ReadinessStatus::Ready,
+                Ok(Ok(unexpected)) => {
+                    tracing::warn!(
+                        result = unexpected,
+                        "database readiness probe returned an unexpected result (expected 1)"
+                    );
+                    ReadinessStatus::DatabaseUnusable
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "database readiness probe failed");
+                    ReadinessStatus::DatabaseUnusable
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = READINESS_PROBE_TIMEOUT.as_millis() as u64,
+                        "database readiness probe timed out"
+                    );
+                    ReadinessStatus::DatabaseUnusable
+                }
+            }
+        }
+        None => ReadinessStatus::DatabaseUnusable,
+    };
+    *cache.latest.write().await = Some((Instant::now(), status));
+    status
+}
+
+fn try_readiness_connection(
+    pool: &sqlx::PgPool,
+) -> Option<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    pool.try_acquire()
+}
+
+fn fresh_readiness_snapshot(
+    snapshot: Option<(Instant, ReadinessStatus)>,
+) -> Option<ReadinessStatus> {
+    fresh_readiness_snapshot_at(snapshot, Instant::now())
+}
+
+fn fresh_readiness_snapshot_at(
+    snapshot: Option<(Instant, ReadinessStatus)>,
+    now: Instant,
+) -> Option<ReadinessStatus> {
+    snapshot.and_then(|(checked_at, status)| {
+        (now.saturating_duration_since(checked_at) < READINESS_PROBE_CACHE_TTL).then_some(status)
+    })
 }
 
 fn readiness_status_for_pool_state(
@@ -2594,7 +4023,9 @@ fn classify_scheduler_liveness(
         // one straggler signals a stuck/dead leader, not a per-schedule lag.
         DependencyProbe::down(
             "scheduler",
-            format!("{overdue} of {enabled} enabled schedule(s) overdue past 2x interval; scheduler tick may be dead"),
+            format!(
+                "{overdue} of {enabled} enabled schedule(s) overdue past 2x interval; scheduler tick may be dead"
+            ),
         )
     }
 }
@@ -2653,6 +4084,35 @@ async fn not_found() -> (StatusCode, Json<ApiError>) {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    fn init_transport_middleware_test_config() {
+        crate::config_store::init_with_config(
+            "/tmp/ryuki-unused-transport-middleware-test.json",
+            &RyukiConfig::default(),
+        );
+    }
+
+    fn request_with_trace(
+        method: Method,
+        uri: &str,
+        trace_id: &str,
+        body: Body,
+    ) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("traceparent", format!("00-{trace_id}-1111111111111111-01"))
+            .body(body)
+            .expect("transport test request")
+    }
+
+    fn assert_response_envelope(response: &Response, trace_id: &str) {
+        assert_eq!(response.headers()["x-request-id"], trace_id);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(response.headers()["x-api-version"], "0.1.0");
+    }
 
     #[test]
     fn lock_or_recover_returns_usable_guard_after_poison() {
@@ -2669,6 +4129,125 @@ mod tests {
         let mut g = lock_or_recover(&m); // would panic with .lock().unwrap()
         *g += 1;
         assert_eq!(*g, 1);
+    }
+
+    #[test]
+    fn duration_tracker_uses_a_bounded_fifo_ring() {
+        let mut durations = VecDeque::with_capacity(3);
+        for value in 1..=4 {
+            push_bounded_duration(&mut durations, value, 3);
+        }
+        assert_eq!(durations, VecDeque::from([2, 3, 4]));
+
+        push_bounded_duration(&mut durations, 5, 0);
+        assert_eq!(durations, VecDeque::from([2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn response_envelope_covers_timeout_rejections() {
+        const PATH: &str = "/slow";
+
+        async fn slow_probe() -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            StatusCode::NO_CONTENT
+        }
+
+        init_transport_middleware_test_config();
+        let app = Router::new()
+            .route(PATH, get(slow_probe))
+            .layer(middleware::from_fn_with_state(
+                Duration::from_millis(1),
+                request_timeout_middleware,
+            ));
+        let app = with_response_envelope(app);
+        let trace_id = "11111111111111111111111111111111";
+        let response = app
+            .oneshot(request_with_trace(
+                Method::GET,
+                PATH,
+                trace_id,
+                Body::empty(),
+            ))
+            .await
+            .expect("timeout response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_response_envelope(&response, trace_id);
+    }
+
+    #[tokio::test]
+    async fn response_envelope_covers_rate_limit_rejections() {
+        const PATH: &str = "/api/rate-envelope-test";
+
+        init_transport_middleware_test_config();
+        let config = ryuki_core::config::RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+            path_overrides: HashMap::new(),
+            trusted_proxies: Vec::new(),
+        };
+        let limiter = create_rate_limiter(&config).expect("enabled limiter");
+        let app = Router::new()
+            .route(PATH, get(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn(
+                move |request: HttpRequest<Body>, next: middleware::Next| {
+                    let limiter = Some(limiter.clone());
+                    async move { rate_limit_middleware(limiter, request, next).await }
+                },
+            ));
+        let app = with_response_envelope(app);
+        let request = |trace_id: &str| {
+            let mut request = request_with_trace(Method::GET, PATH, trace_id, Body::empty());
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer("198.51.100.80:443")));
+            request
+        };
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request("22222222222222222222222222222222"))
+                .await
+                .expect("first rate-limited request")
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let trace_id = "33333333333333333333333333333333";
+        let response = app
+            .oneshot(request(trace_id))
+            .await
+            .expect("rate-limit rejection");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_response_envelope(&response, trace_id);
+    }
+
+    #[tokio::test]
+    async fn response_envelope_covers_body_limit_rejections() {
+        const PATH: &str = "/body";
+
+        async fn body_probe(_body: axum::body::Bytes) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        init_transport_middleware_test_config();
+        let app = Router::new()
+            .route(PATH, axum::routing::post(body_probe))
+            .layer(RequestBodyLimitLayer::new(4));
+        let app = with_response_envelope(app);
+        let trace_id = "44444444444444444444444444444444";
+        let response = app
+            .oneshot(request_with_trace(
+                Method::POST,
+                PATH,
+                trace_id,
+                Body::from(vec![b'x'; 5]),
+            ))
+            .await
+            .expect("body-limit rejection");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_response_envelope(&response, trace_id);
     }
 
     #[tokio::test]
@@ -2838,6 +4417,276 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn test_api_token_lookup_has_one_source_clause() {
+        assert_eq!(API_TOKEN_LOOKUP_SQL.matches("FROM api_tokens").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_api_token_lookup_and_usage_telemetry_guards() {
+        use crate::database::DB_TEST_SERIAL;
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply");
+
+        let token_id = Uuid::new_v4();
+        let plaintext = format!("{API_TOKEN_PREFIX}{}", Uuid::new_v4().simple());
+        let token_hash = sha256_hex(&plaintext);
+        let provider = "local";
+        let issuer = "urn:ryuki:test:api-token-lookup";
+        let subject = "session-boundary-query-user";
+        let digest = Sha256::digest(format!("api-token-test\0{provider}\0{issuer}\0{subject}"));
+        let mut identity_tx = pool.begin().await.expect("begin token identity seed");
+        crate::human_authority::prepare_writer_tx(&mut identity_tx, provider, issuer, subject)
+            .await
+            .expect("prepare token identity writer");
+        crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
+            .await
+            .expect("mark token identity reactivation");
+        let identity_epoch: i64 = sqlx::query_scalar(
+            "INSERT INTO identity_authorities \
+             (provider, issuer, subject, authority_epoch, authority_digest, authority_status, \
+              last_asserted_at) \
+             VALUES ($1, $2, $3, 1, $4, 'active-scoped-v2', NOW()) \
+             ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
+               authority_epoch = CASE \
+                 WHEN identity_authorities.authority_status <> 'active-scoped-v2' \
+                   OR identity_authorities.authority_digest <> EXCLUDED.authority_digest \
+                 THEN identity_authorities.authority_epoch + 1 \
+                 ELSE identity_authorities.authority_epoch \
+               END, \
+               authority_digest = EXCLUDED.authority_digest, \
+               authority_status = 'active-scoped-v2', last_asserted_at = NOW() \
+             RETURNING authority_epoch",
+        )
+        .bind(provider)
+        .bind(issuer)
+        .bind(subject)
+        .bind(digest.as_slice())
+        .fetch_one(&mut *identity_tx)
+        .await
+        .expect("seed token identity");
+        identity_tx
+            .commit()
+            .await
+            .expect("commit token identity seed");
+        crate::human_authority::persist_governed_assignment(
+            &pool,
+            provider,
+            issuer,
+            subject,
+            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
+                "Auditor".to_string()
+            ]),
+        )
+        .await
+        .expect("seed token human authority");
+        let assignment_version: i64 = sqlx::query_scalar(
+            "SELECT assignment_version FROM human_authority_assignments \
+             WHERE provider = $1 AND issuer = $2 AND subject = $3",
+        )
+        .bind(provider)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_one(&pool)
+        .await
+        .expect("read token human authority version");
+        let mut token_tx = pool.begin().await.expect("begin API token seed");
+        crate::human_authority::prepare_writer_tx(&mut token_tx, provider, issuer, subject)
+            .await
+            .expect("prepare API token writer");
+        sqlx::query(
+            "INSERT INTO api_tokens \
+             (id, name, owner_principal, token_hash, roles, token_valid, expires_at, \
+              issued_by_provider, issued_by_issuer, issued_by_subject, \
+              issued_by_identity_epoch, issued_by_human_authority_version, issued_by_roles, \
+              issued_by_site_authority_mode, issued_by_site_scope, \
+              issued_by_environment_authority_mode, issued_by_environment_scope) \
+             VALUES ($1, $2, $3, $4, $5, TRUE, NOW() + INTERVAL '1 hour', \
+                     $6, $7, $8, $9, $10, $5, 'global', ARRAY[]::TEXT[], \
+                     'global', ARRAY[]::TEXT[])",
+        )
+        .bind(token_id)
+        .bind("session-boundary-query-test")
+        .bind(subject)
+        .bind(&token_hash)
+        .bind(vec!["Auditor".to_string()])
+        .bind(provider)
+        .bind(issuer)
+        .bind(subject)
+        .bind(identity_epoch)
+        .bind(assignment_version)
+        .execute(&mut *token_tx)
+        .await
+        .expect("seed API token");
+        token_tx.commit().await.expect("commit API token seed");
+
+        let session = resolve_api_token(&plaintext, &pool).await;
+        assert!(session.token_valid);
+        assert_eq!(session.provider_mode, "api-token");
+        assert_eq!(session.user_id, "session-boundary-query-user");
+        let last_used_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read last-used timestamp");
+        assert!(last_used_at.is_some());
+
+        // A raw writer can only signal use; the trigger replaces both future
+        // and past caller values with authoritative database statement time.
+        for supplied_value in [
+            "statement_timestamp() + INTERVAL '1 hour'",
+            "TIMESTAMPTZ '2000-01-01 00:00:00+00'",
+        ] {
+            let (database_now, recorded): (
+                chrono::DateTime<chrono::Utc>,
+                chrono::DateTime<chrono::Utc>,
+            ) = sqlx::query_as(&format!(
+                "WITH updated AS (\
+                   UPDATE api_tokens SET last_used_at = {supplied_value} WHERE id = $1 \
+                   RETURNING last_used_at\
+                 ) \
+                 SELECT statement_timestamp(), last_used_at FROM updated"
+            ))
+            .bind(token_id)
+            .fetch_one(&pool)
+            .await
+            .expect("database must own API token usage time");
+            assert_eq!(recorded, database_now);
+        }
+
+        let clear_error = sqlx::query("UPDATE api_tokens SET last_used_at = NULL WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect_err("API token usage telemetry may not be cleared");
+        assert_eq!(
+            clear_error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+
+        // Reproduce the former transaction-time race with two connections:
+        // the older transaction writes after the newer transaction commits.
+        // The final value must still advance rather than rewind to the older
+        // transaction's NOW().
+        let mut older_tx = pool.begin().await.expect("begin older telemetry tx");
+        let older_started_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut *older_tx)
+                .await
+                .expect("read older transaction time");
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(&mut *older_tx)
+            .await
+            .expect("separate transaction start times");
+
+        let mut newer_tx = pool.begin().await.expect("begin newer telemetry tx");
+        let newer_started_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut *newer_tx)
+                .await
+                .expect("read newer transaction time");
+        assert!(older_started_at < newer_started_at);
+        let newer_recorded: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "UPDATE api_tokens SET last_used_at = transaction_timestamp() \
+             WHERE id = $1 RETURNING last_used_at",
+        )
+        .bind(token_id)
+        .fetch_one(&mut *newer_tx)
+        .await
+        .expect("newer transaction records token use");
+        newer_tx.commit().await.expect("commit newer telemetry tx");
+
+        let older_recorded: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "UPDATE api_tokens SET last_used_at = transaction_timestamp() \
+             WHERE id = $1 RETURNING last_used_at",
+        )
+        .bind(token_id)
+        .fetch_one(&mut *older_tx)
+        .await
+        .expect("older transaction records token use after newer commit");
+        older_tx.commit().await.expect("commit older telemetry tx");
+        assert!(older_recorded >= newer_recorded);
+
+        let final_last_used_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT last_used_at FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read final last-used timestamp");
+        assert_eq!(final_last_used_at, older_recorded);
+
+        for forbidden_update in [
+            "UPDATE api_tokens SET id = gen_random_uuid() WHERE id = $1",
+            "UPDATE api_tokens SET name = 'rewritten-evidence' WHERE id = $1",
+            "UPDATE api_tokens SET token_hash = 'rebound-hash' WHERE id = $1",
+            "UPDATE api_tokens SET created_at = NOW() - INTERVAL '7 days' WHERE id = $1",
+            "UPDATE api_tokens SET expires_at = NOW() + INTERVAL '7 days' WHERE id = $1",
+        ] {
+            let error = sqlx::query(forbidden_update)
+                .bind(token_id)
+                .execute(&pool)
+                .await
+                .expect_err("API token evidence fields must be immutable");
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|database_error| database_error.code())
+                    .as_deref(),
+                Some("23514")
+            );
+        }
+
+        sqlx::query(
+            "UPDATE api_tokens SET token_valid = FALSE, \
+                    revoked_at = COALESCE(revoked_at, NOW()) WHERE id = $1",
+        )
+        .bind(token_id)
+        .execute(&pool)
+        .await
+        .expect("soft-revoke API token evidence");
+        let post_revoke_usage_error =
+            sqlx::query("UPDATE api_tokens SET last_used_at = statement_timestamp() WHERE id = $1")
+                .bind(token_id)
+                .execute(&pool)
+                .await
+                .expect_err("revoked API token may not record fresh usage telemetry");
+        assert_eq!(
+            post_revoke_usage_error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        let delete_error = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect_err("API token evidence must reject hard deletion");
+        assert_eq!(
+            delete_error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref(),
+            Some("23514")
+        );
+        pool.close().await;
+    }
+
     /// Builds an enabled, network-backed validator with no usable keyset. It is
     /// used by middleware-arm tests that never expect a successful validation
     /// (mock arm short-circuits; the unsigned-entra token fails to decode).
@@ -2879,56 +4728,324 @@ mod tests {
         assert!(!session.token_valid);
     }
 
+    fn secure_session_config() -> SessionConfig {
+        SessionConfig::default()
+    }
+
+    fn loopback_session_config() -> SessionConfig {
+        SessionConfig {
+            cookie_secure: false,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn test_session_id_from_header() {
-        let session_id = Uuid::new_v4();
+    fn test_session_credential_from_header() {
+        let session_token = crate::session_credentials::generate_session_bearer();
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Ryuki-Session-Id",
-            HeaderValue::from_str(&session_id.to_string()).unwrap(),
+            HeaderValue::from_str(session_token.as_str()).unwrap(),
         );
 
         let (parsed, source) =
-            session_id_from_headers(&headers, None).expect("session header should be recognized");
-        assert_eq!(parsed.expect("session header should parse"), session_id);
+            session_credential_from_headers(&headers, None, &secure_session_config())
+                .expect("session header should be recognized");
+        assert_eq!(
+            parsed.expect("session header should parse"),
+            session_token.as_str()
+        );
         assert_eq!(source, SessionIdSource::Header);
     }
 
     #[test]
-    fn test_session_id_from_bearer_uuid() {
-        let session_id = Uuid::new_v4();
-        let headers = HeaderMap::new();
+    fn test_admin_management_uuid_is_not_an_authentication_credential() {
+        let management_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            HeaderValue::from_str(&management_id.to_string()).unwrap(),
+        );
 
-        let (parsed, source) =
-            session_id_from_headers(&headers, Some(&format!("Bearer {}", session_id)))
-                .expect("bearer uuid should be recognized");
-        assert_eq!(parsed.expect("bearer uuid should parse"), session_id);
+        assert_eq!(
+            session_credential_from_headers(&headers, None, &secure_session_config()),
+            Some((Err(()), SessionIdSource::Header)),
+            "an admin-visible session UUID must never authenticate"
+        );
+
+        let no_headers = HeaderMap::new();
+        let authorization = format!("Bearer {management_id}");
+        assert!(
+            session_credential_from_headers(
+                &no_headers,
+                Some(&authorization),
+                &secure_session_config(),
+            )
+            .is_none(),
+            "an admin-visible UUID must not claim the session-bearer class"
+        );
+
+        let mut cookie_headers = HeaderMap::new();
+        cookie_headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("{SECURE_SESSION_COOKIE_NAME}={management_id}"))
+                .unwrap(),
+        );
+        assert_eq!(
+            session_credential_from_headers(&cookie_headers, None, &secure_session_config(),),
+            Some((Err(()), SessionIdSource::Cookie)),
+            "an admin-visible UUID cookie must never authenticate"
+        );
+    }
+
+    #[test]
+    fn test_session_credential_from_bearer() {
+        let session_token = crate::session_credentials::generate_session_bearer();
+        let headers = HeaderMap::new();
+        let authorization = format!("Bearer {}", session_token.as_str());
+
+        let (parsed, source) = session_credential_from_headers(
+            &headers,
+            Some(&authorization),
+            &secure_session_config(),
+        )
+        .expect("session bearer should be recognized");
+        assert_eq!(
+            parsed.expect("session bearer should parse"),
+            session_token.as_str()
+        );
         assert_eq!(source, SessionIdSource::Bearer);
     }
 
     #[test]
-    fn test_non_uuid_bearer_is_not_session_id() {
+    fn test_non_session_bearer_is_not_session_credential() {
         let headers = HeaderMap::new();
-        assert!(session_id_from_headers(&headers, Some("Bearer jwt-token")).is_none());
+        assert!(session_credential_from_headers(
+            &headers,
+            Some("Bearer jwt-token"),
+            &secure_session_config(),
+        )
+        .is_none());
     }
 
     #[test]
-    fn test_session_id_from_ryuki_session_cookie() {
-        let session_id = Uuid::new_v4();
+    fn test_https_session_cookie_accepts_only_host_prefixed_singleton() {
+        let session_token = crate::session_credentials::generate_session_bearer();
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
             HeaderValue::from_str(&format!(
-                "other=1; ryuki_session={}; theme=dark",
-                session_id
+                "other=1; {SECURE_SESSION_COOKIE_NAME}={}; theme=dark",
+                session_token.as_str()
             ))
             .unwrap(),
         );
 
         let (parsed, source) =
-            session_id_from_headers(&headers, None).expect("session cookie should be recognized");
-        assert_eq!(parsed.expect("session cookie should parse"), session_id);
+            session_credential_from_headers(&headers, None, &secure_session_config())
+                .expect("secure session cookie should be recognized");
+        assert_eq!(
+            parsed.expect("secure session cookie should parse"),
+            session_token.as_str()
+        );
         assert_eq!(source, SessionIdSource::Cookie);
+
+        let mut old_singleton = HeaderMap::new();
+        old_singleton.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{LOOPBACK_SESSION_COOKIE_NAME}={}",
+                session_token.as_str()
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            session_credential_from_headers(&old_singleton, None, &secure_session_config(),),
+            Some((Err(()), SessionIdSource::Cookie)),
+            "HTTPS must not fall through past an unprefixed session singleton"
+        );
+    }
+
+    #[test]
+    fn test_loopback_session_cookie_accepts_only_unprefixed_singleton() {
+        let session_token = crate::session_credentials::generate_session_bearer();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{LOOPBACK_SESSION_COOKIE_NAME}={}",
+                session_token.as_str()
+            ))
+            .unwrap(),
+        );
+        let (parsed, source) =
+            session_credential_from_headers(&headers, None, &loopback_session_config())
+                .expect("loopback session cookie should be recognized");
+        assert_eq!(parsed.unwrap(), session_token.as_str());
+        assert_eq!(source, SessionIdSource::Cookie);
+
+        let mut host_singleton = HeaderMap::new();
+        host_singleton.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}",
+                session_token.as_str()
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            session_credential_from_headers(&host_singleton, None, &loopback_session_config(),),
+            Some((Err(()), SessionIdSource::Cookie))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_session_cookies_reject_attacker_first_and_last() {
+        let victim = crate::session_credentials::generate_session_bearer();
+        let attacker = crate::session_credentials::generate_session_bearer();
+        for (session, name) in [
+            (secure_session_config(), SECURE_SESSION_COOKIE_NAME),
+            (loopback_session_config(), LOOPBACK_SESSION_COOKIE_NAME),
+        ] {
+            for header in [
+                format!("{name}={}; {name}={}", attacker.as_str(), victim.as_str()),
+                format!("{name}={}; {name}={}", victim.as_str(), attacker.as_str()),
+                format!("{name}=malformed; {name}={}", victim.as_str()),
+                format!("{name}={}; {name}=malformed", victim.as_str()),
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::COOKIE,
+                    HeaderValue::from_str(&header).unwrap(),
+                );
+                assert_eq!(
+                    session_credential_from_headers(&headers, None, &session),
+                    Some((Err(()), SessionIdSource::Cookie)),
+                    "duplicate credential cookies must fail closed: {header}"
+                );
+            }
+        }
+
+        let mut split_fields = HeaderMap::new();
+        split_fields.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}",
+                attacker.as_str()
+            ))
+            .unwrap(),
+        );
+        split_fields.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("{SECURE_SESSION_COOKIE_NAME}={}", victim.as_str()))
+                .unwrap(),
+        );
+        assert_eq!(
+            session_credential_from_headers(&split_fields, None, &secure_session_config()),
+            Some((Err(()), SessionIdSource::Cookie))
+        );
+    }
+
+    #[test]
+    fn test_mixed_old_and_new_session_cookie_names_reject_both_orders() {
+        let old = crate::session_credentials::generate_session_bearer();
+        let current = crate::session_credentials::generate_session_bearer();
+        for header in [
+            format!(
+                "{LOOPBACK_SESSION_COOKIE_NAME}={}; {SECURE_SESSION_COOKIE_NAME}={}",
+                old.as_str(),
+                current.as_str()
+            ),
+            format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}; {LOOPBACK_SESSION_COOKIE_NAME}={}",
+                current.as_str(),
+                old.as_str()
+            ),
+        ] {
+            for session in [secure_session_config(), loopback_session_config()] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::COOKIE,
+                    HeaderValue::from_str(&header).unwrap(),
+                );
+                assert_eq!(
+                    session_credential_from_headers(&headers, None, &session),
+                    Some((Err(()), SessionIdSource::Cookie))
+                );
+            }
+        }
+
+        let old_field = format!("{LOOPBACK_SESSION_COOKIE_NAME}={}", old.as_str());
+        let current_field = format!("{SECURE_SESSION_COOKIE_NAME}={}", current.as_str());
+        for (first, second) in [
+            (old_field.as_str(), current_field.as_str()),
+            (current_field.as_str(), old_field.as_str()),
+        ] {
+            for session in [secure_session_config(), loopback_session_config()] {
+                let mut headers = HeaderMap::new();
+                headers.append(
+                    axum::http::header::COOKIE,
+                    HeaderValue::from_str(first).unwrap(),
+                );
+                headers.append(
+                    axum::http::header::COOKIE,
+                    HeaderValue::from_str(second).unwrap(),
+                );
+                assert_eq!(
+                    session_credential_from_headers(&headers, None, &session),
+                    Some((Err(()), SessionIdSource::Cookie)),
+                    "mixed names split across Cookie fields must fail closed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_malformed_cookie_encoding_and_pairs_are_invalid_evidence() {
+        let mut non_text = HeaderMap::new();
+        non_text.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_bytes(b"theme=dark; \x80")
+                .expect("opaque Cookie header bytes are accepted"),
+        );
+        assert_eq!(
+            session_credential_from_headers(&non_text, None, &secure_session_config()),
+            Some((Err(()), SessionIdSource::Cookie))
+        );
+
+        let mut malformed_pair = HeaderMap::new();
+        malformed_pair.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("theme=dark; malformed"),
+        );
+        assert_eq!(
+            session_credential_from_headers(&malformed_pair, None, &secure_session_config()),
+            Some((Err(()), SessionIdSource::Cookie))
+        );
+
+        let valid_cookie = crate::session_credentials::generate_session_bearer();
+        let valid_field = HeaderValue::from_str(&format!(
+            "{SECURE_SESSION_COOKIE_NAME}={}",
+            valid_cookie.as_str()
+        ))
+        .unwrap();
+        for malformed_first in [true, false] {
+            let malformed_field = HeaderValue::from_bytes(b"theme=dark; \x80")
+                .expect("opaque Cookie header bytes are accepted");
+            let mut split_fields = HeaderMap::new();
+            if malformed_first {
+                split_fields.append(axum::http::header::COOKIE, malformed_field);
+                split_fields.append(axum::http::header::COOKIE, valid_field.clone());
+            } else {
+                split_fields.append(axum::http::header::COOKIE, valid_field.clone());
+                split_fields.append(axum::http::header::COOKIE, malformed_field);
+            }
+            assert_eq!(
+                session_credential_from_headers(&split_fields, None, &secure_session_config(),),
+                Some((Err(()), SessionIdSource::Cookie)),
+                "malformed Cookie field must not fall through in either order"
+            );
+        }
     }
 
     #[test]
@@ -2936,46 +5053,84 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            HeaderValue::from_static("ryuki_session=not-a-uuid"),
+            HeaderValue::from_static("__Host-ryuki_session=not-a-session"),
         );
 
         assert_eq!(
-            session_id_from_headers(&headers, None),
+            session_credential_from_headers(&headers, None, &secure_session_config()),
             Some((Err(()), SessionIdSource::Cookie))
         );
     }
 
     #[test]
-    fn test_session_header_takes_precedence_over_cookie() {
-        let header_id = Uuid::new_v4();
-        let cookie_id = Uuid::new_v4();
+    fn test_conflicting_session_header_and_cookie_are_rejected() {
+        let header_session_token = crate::session_credentials::generate_session_bearer();
+        let cookie_session_token = crate::session_credentials::generate_session_bearer();
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Ryuki-Session-Id",
-            HeaderValue::from_str(&header_id.to_string()).unwrap(),
+            HeaderValue::from_str(header_session_token.as_str()).unwrap(),
         );
         headers.insert(
             axum::http::header::COOKIE,
-            HeaderValue::from_str(&format!("ryuki_session={}", cookie_id)).unwrap(),
+            HeaderValue::from_str(&format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}",
+                cookie_session_token.as_str()
+            ))
+            .unwrap(),
         );
 
-        let (parsed, source) = session_id_from_headers(&headers, None).unwrap();
-        assert_eq!(parsed.unwrap(), header_id);
+        let (parsed, source) =
+            session_credential_from_headers(&headers, None, &secure_session_config()).unwrap();
+        assert_eq!(parsed, Err(()));
         assert_eq!(source, SessionIdSource::Header);
     }
 
     #[test]
-    fn test_non_uuid_bearer_falls_through_to_cookie() {
-        let cookie_id = Uuid::new_v4();
+    fn test_authorization_and_cookie_evidence_are_rejected_together() {
+        let cookie_session_token = crate::session_credentials::generate_session_bearer();
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            HeaderValue::from_str(&format!("ryuki_session={}", cookie_id)).unwrap(),
+            HeaderValue::from_str(&format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}",
+                cookie_session_token.as_str()
+            ))
+            .unwrap(),
         );
 
-        let (parsed, source) = session_id_from_headers(&headers, Some("Bearer jwt-token")).unwrap();
-        assert_eq!(parsed.unwrap(), cookie_id);
-        assert_eq!(source, SessionIdSource::Cookie);
+        let (parsed, source) = session_credential_from_headers(
+            &headers,
+            Some("Bearer jwt-token"),
+            &secure_session_config(),
+        )
+        .unwrap();
+        assert_eq!(parsed, Err(()));
+        assert_eq!(source, SessionIdSource::Bearer);
+    }
+
+    #[test]
+    fn test_non_text_authorization_header_cannot_fall_through_to_cookie() {
+        let cookie_session_token = crate::session_credentials::generate_session_bearer();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \x80").expect("opaque header bytes are accepted"),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{SECURE_SESSION_COOKIE_NAME}={}",
+                cookie_session_token.as_str()
+            ))
+            .unwrap(),
+        );
+
+        let (parsed, source) =
+            session_credential_from_headers(&headers, None, &secure_session_config())
+                .expect("raw Authorization bytes are credential evidence");
+        assert_eq!(parsed, Err(()));
+        assert_eq!(source, SessionIdSource::Bearer);
     }
 
     #[test]
@@ -2985,7 +5140,9 @@ mod tests {
             axum::http::header::COOKIE,
             HeaderValue::from_static("theme=dark; other=1"),
         );
-        assert!(session_id_from_headers(&headers, None).is_none());
+        assert!(
+            session_credential_from_headers(&headers, None, &secure_session_config()).is_none()
+        );
     }
 
     #[test]
@@ -2994,6 +5151,17 @@ mod tests {
             user_id: "platform-engineer".into(),
             display_name: "Platform Engineer".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
+            bearer_verifier: vec![0_u8; crate::session_credentials::SESSION_VERIFIER_LEN],
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            provider: "local".into(),
+            identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
+            identity_subject: "platform-engineer".into(),
+            identity_authority_epoch: 1,
+            human_authority_version: 1,
+            site_authority_mode: "scoped".into(),
+            site_scope: vec!["SITE-A".into()],
+            environment_authority_mode: "global".into(),
+            environment_scope: vec![],
         });
 
         assert_eq!(session.provider_mode, "persisted-session");
@@ -3094,6 +5262,14 @@ mod tests {
     }
 
     #[test]
+    fn test_bind_address_is_loopback() {
+        assert!(bind_address_is_loopback("127.0.0.1:8081"));
+        assert!(bind_address_is_loopback("[::1]:8081"));
+        assert!(!bind_address_is_loopback("0.0.0.0:8080"));
+        assert!(!bind_address_is_loopback("not-an-address"));
+    }
+
+    #[test]
     fn test_auth_exempt_paths_are_limited_to_auth_flow() {
         assert!(is_auth_exempt_path("/api/auth/login"));
         assert!(is_auth_exempt_path("/api/auth/logout"));
@@ -3118,7 +5294,9 @@ mod tests {
     fn local_auth_with_roles(roles: &str) -> ryuki_core::config::LocalAuthConfig {
         // placeholder credentials for tests only
         serde_json::from_value(serde_json::json!({
-            "users": format!("alice:placeholder-pass-1:{roles}")
+            "users": format!("alice:placeholder-pass-1:{roles}"),
+            "site_authority": "global",
+            "environment_authority": "global"
         }))
         .expect("test local auth config should parse")
     }
@@ -3139,14 +5317,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_address_is_loopback() {
-        assert!(bind_address_is_loopback("127.0.0.1:8081"));
-        assert!(bind_address_is_loopback("[::1]:8081"));
-        assert!(!bind_address_is_loopback("0.0.0.0:8080"));
-        assert!(!bind_address_is_loopback("not-an-address"));
-    }
-
-    #[test]
     fn test_unsafe_method_auth_requires_static_or_verified_session() {
         let static_session = AuthSession::static_dry_run();
         let unverified = AuthSession::unverified_entra();
@@ -3163,6 +5333,17 @@ mod tests {
             user_id: "admin".into(),
             display_name: "admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
+            bearer_verifier: vec![0_u8; crate::session_credentials::SESSION_VERIFIER_LEN],
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            provider: "local".into(),
+            identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
+            identity_subject: "admin".into(),
+            identity_authority_epoch: 1,
+            human_authority_version: 1,
+            site_authority_mode: "global".into(),
+            site_scope: vec![],
+            environment_authority_mode: "global".into(),
+            environment_scope: vec![],
         })
     }
 
@@ -3253,10 +5434,51 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_labels_use_route_templates_and_collapse_unknown_paths() {
+        assert_eq!(
+            metrics_path_label("/api/requests/attacker-value", Some("/api/requests/{id}")),
+            "/api/requests/{id}"
+        );
+        for path in [
+            "/random-a/value",
+            "/random-b/another-value",
+            "/api-does-not-exist/123",
+        ] {
+            assert_eq!(metrics_path_label(path, None), "/__unmatched__");
+        }
+        let extension_method = Method::from_bytes(b"ATTACKER-METHOD").unwrap();
+        assert_eq!(metrics_method_label(&extension_method), "OTHER");
+    }
+
+    #[test]
     fn test_rate_limit_path_group_normalizes_first_path_segment() {
         assert_eq!(rate_limit_path_group("/health"), "health");
         assert_eq!(rate_limit_path_group("/API/platform/status"), "api");
         assert_eq!(rate_limit_path_group("/"), "root");
+        assert_eq!(rate_limit_path_group("/attacker-a/x"), "unmatched");
+        assert_eq!(rate_limit_path_group("/attacker-b/y"), "unmatched");
+    }
+
+    #[test]
+    fn test_rate_limit_keys_use_a_fixed_bucket_namespace() {
+        let salt = [7_u8; 32];
+        let mut buckets = std::collections::HashSet::new();
+        for index in 0..(u32::from(RATE_LIMIT_CLIENT_BUCKETS) * 2) {
+            let key = bounded_rate_limit_key("api", &format!("client-{index}"), &salt);
+            assert!(key.starts_with("api:bucket-"));
+            buckets.insert(key);
+        }
+        assert!(buckets.len() <= usize::from(RATE_LIMIT_CLIENT_BUCKETS));
+        assert_ne!(
+            bounded_rate_limit_key("api", "same-client", &salt),
+            bounded_rate_limit_key("health", "same-client", &salt),
+            "closed route groups retain independent quotas"
+        );
+        assert_ne!(
+            bounded_rate_limit_key("api", "same-client", &salt),
+            bounded_rate_limit_key("api", "same-client", &[8_u8; 32]),
+            "bucket assignment must not be predictable across processes"
+        );
     }
 
     #[test]
@@ -3376,6 +5598,72 @@ mod tests {
     }
 
     #[test]
+    fn test_forwarded_header_evidence_is_unique_and_fully_validated() {
+        let trusted_proxies = trusted(&["10.0.0.0/8"]);
+        let proxy = peer("10.0.0.5:443");
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.20, 10.0.0.6"),
+        );
+        assert_eq!(
+            resolve_rate_limit_client_key_from_headers(proxy, &valid, &trusted_proxies),
+            ("198.51.100.20".into(), ClientKeySource::Forwarded)
+        );
+
+        for values in [["198.51.100.20", "10.0.0.6"], ["10.0.0.6", "198.51.100.20"]] {
+            let mut duplicate = HeaderMap::new();
+            for value in values {
+                duplicate.append(
+                    "x-forwarded-for",
+                    HeaderValue::from_str(value).expect("forwarded fixture"),
+                );
+            }
+            assert_eq!(
+                resolve_rate_limit_client_key_from_headers(proxy, &duplicate, &trusted_proxies),
+                ("10.0.0.5".into(), ClientKeySource::Peer),
+                "duplicate attacker-first or attacker-last fields must fail to the peer"
+            );
+        }
+
+        let mut non_ascii = HeaderMap::new();
+        non_ascii.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value is representable"),
+        );
+        assert_eq!(
+            resolve_rate_limit_client_key_from_headers(proxy, &non_ascii, &trusted_proxies),
+            ("10.0.0.5".into(), ClientKeySource::Peer)
+        );
+    }
+
+    #[test]
+    fn test_malformed_or_excessive_forwarded_chain_falls_back_to_peer() {
+        let trusted_proxies = trusted(&["10.0.0.0/8"]);
+        let proxy = peer("10.0.0.5:443");
+        let too_many_hops = std::iter::repeat_n("198.51.100.20", MAX_FORWARDED_FOR_HOPS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized = "1".repeat(MAX_FORWARDED_FOR_BYTES + 1);
+
+        for forwarded_for in [
+            "",
+            "unknown",
+            "198.51.100.20,,10.0.0.6",
+            "attacker-token, 198.51.100.20, 10.0.0.6",
+            too_many_hops.as_str(),
+            oversized.as_str(),
+        ] {
+            assert_eq!(
+                resolve_rate_limit_client_key(proxy, Some(forwarded_for), &trusted_proxies),
+                ("10.0.0.5".into(), ClientKeySource::Peer),
+                "invalid chain must fail to the authoritative peer: {forwarded_for:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_forwarded_entries_with_ports_resolve_to_their_ip() {
         let trusted_proxies = trusted(&["127.0.0.1"]);
         let (key, source) = resolve_rate_limit_client_key(
@@ -3447,6 +5735,68 @@ mod tests {
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.error, "DATABASE_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn test_readiness_probe_cache_never_queues_parallel_refreshes() {
+        let cache = ReadinessProbeCache {
+            latest: tokio::sync::RwLock::new(None),
+            refresh_permit: tokio::sync::Semaphore::new(1),
+        };
+        let first = cache
+            .refresh_permit
+            .try_acquire()
+            .expect("first caller owns the single refresh permit");
+        assert!(
+            cache.refresh_permit.try_acquire().is_err(),
+            "a readiness burst must not queue another DB probe"
+        );
+        drop(first);
+        assert!(
+            cache.refresh_permit.try_acquire().is_ok(),
+            "the permit is immediately reusable after refresh completion"
+        );
+    }
+
+    #[test]
+    fn test_readiness_probe_cache_never_serves_stale_ready() {
+        assert_eq!(
+            fresh_readiness_snapshot(Some((Instant::now(), ReadinessStatus::Ready))),
+            Some(ReadinessStatus::Ready)
+        );
+        let stale = Instant::now()
+            .checked_sub(READINESS_PROBE_CACHE_TTL + Duration::from_millis(1))
+            .expect("test instant can move back by the cache ttl");
+        assert_eq!(
+            fresh_readiness_snapshot(Some((stale, ReadinessStatus::Ready))),
+            None,
+            "an in-flight refresh cannot make an expired Ready snapshot authoritative"
+        );
+    }
+
+    #[test]
+    fn test_readiness_probe_cache_expires_ready_at_exact_ttl_boundary() {
+        let now = Instant::now();
+        let boundary = now
+            .checked_sub(READINESS_PROBE_CACHE_TTL)
+            .expect("test instant can move back by the cache ttl");
+        let still_fresh = now
+            .checked_sub(READINESS_PROBE_CACHE_TTL - Duration::from_millis(1))
+            .expect("test instant can move within the cache ttl");
+
+        assert_eq!(
+            fresh_readiness_snapshot_at(Some((boundary, ReadinessStatus::Ready)), now),
+            None,
+            "a Ready result must fail closed as soon as its TTL is exhausted"
+        );
+        assert_eq!(
+            fresh_readiness_snapshot_at(
+                Some((still_fresh, ReadinessStatus::DatabaseUnusable)),
+                now
+            ),
+            Some(ReadinessStatus::DatabaseUnusable),
+            "a fresh dependency failure remains authoritative without another DB probe"
+        );
     }
 
     #[test]
@@ -3698,6 +6048,7 @@ mod tests {
         "/api/cmdb/servicenow/approve/x1",
         "/api/cmdb/servicenow/submit/x1",
         "/api/cmdb/servicenow/cancel/x1",
+        "/api/admin/sites",
         "/api/admin/sites/USNYC/activate",
         "/api/admin/sites/USNYC/deactivate",
         "/api/admin/platform-settings",
@@ -3728,6 +6079,8 @@ mod tests {
         "/api/maintain/certificates/revoke/c1",
         "/api/vm/day2/plan",
         "/api/vm/day2/validate",
+        "/api/vm/day2/approve",
+        "/api/vm/day2/lock",
         "/api/vm/day2/execute",
         "/api/vm/day2/verify",
         "/api/protect/dr/plans",
@@ -3805,6 +6158,7 @@ mod tests {
         "/api/datacenter/hardware/update-firmware/h1",
         "/api/datacenter/firmware/check/f1",
         "/api/datacenter/firmware/exception",
+        "/api/datacenter/firmware/exception/f1/approve",
         "/api/datacenter/firmware/revoke/f1",
         "/api/datacenter/image-factory/initiate-build",
         "/api/datacenter/image-factory/run-tests/i1",
@@ -3862,12 +6216,23 @@ mod tests {
             route_meta_tier("POST", "/api/requests/{id}/validate"),
             Some("execute")
         );
+        assert_eq!(
+            route_meta_tier("POST", "/api/maintain/software/execute/{id}"),
+            Some("software.deployment.execute")
+        );
+        assert_eq!(
+            route_meta_tier("DELETE", "/api/network/firewall/rules/{id}"),
+            Some("network.firewall.manage")
+        );
         // self-service mutations are gated like reads, not fail-closed admin
         assert_eq!(
             route_meta_tier("POST", "/api/notifications/{id}/read"),
-            Some("read")
+            Some("request")
         );
-        assert_eq!(route_meta_tier("PUT", "/api/me/preferences"), Some("read"));
+        assert_eq!(
+            route_meta_tier("PUT", "/api/me/preferences"),
+            Some("request")
+        );
         // reads: audit-grade, sensitive-admin, operator shift queue, ordinary
         assert_eq!(route_meta_tier("GET", "/api/activity/audit"), Some("audit"));
         assert_eq!(
@@ -3879,7 +6244,19 @@ mod tests {
             route_meta_tier("GET", "/api/ops/shift/summary"),
             Some("execute")
         );
-        assert_eq!(route_meta_tier("GET", "/api/requests"), Some("read"));
+        assert_eq!(route_meta_tier("GET", "/api/requests"), Some("request"));
+        assert_eq!(
+            route_meta_tier("GET", "/api/events/alerts"),
+            Some(OperationCapability::MonitoringAlertRead.as_str())
+        );
+        assert_eq!(
+            route_meta_tier("POST", "/api/events/alerts/{event_id}/ack"),
+            Some(OperationCapability::MonitoringAlertAcknowledge.as_str())
+        );
+        assert_eq!(
+            route_meta_tier("POST", "/api/events/alerts/batch/ack"),
+            Some(OperationCapability::MonitoringAlertAcknowledge.as_str())
+        );
         // agent subrouter: open bootstrap endpoints are public, the rest carry
         // the agent bearer token; the human /api/admin/agents prefix stays admin
         assert_eq!(
@@ -3895,6 +6272,10 @@ mod tests {
             Some("agent")
         );
         assert_eq!(route_meta_tier("GET", "/api/admin/agents"), Some("admin"));
+        assert_eq!(
+            route_meta_tier("POST", "/api/admin/agents/enrollment-challenges"),
+            Some("admin")
+        );
         // The separately mounted integration management router is an exact
         // admin surface; unrelated contracts.rs integration routes are not
         // blanket-promoted by prefix.
@@ -3905,7 +6286,7 @@ mod tests {
         );
         assert_eq!(
             route_meta_tier("GET", "/api/integrations/readiness"),
-            Some("read")
+            Some("audit")
         );
         assert_eq!(
             route_meta_tier("POST", "/api/integrations/{connection_id}/webhook"),
@@ -3945,7 +6326,7 @@ mod tests {
         }
         assert_eq!(
             route_meta_tier("GET", "/api/integrations/readiness"),
-            Some("read")
+            Some("audit")
         );
     }
 
@@ -3984,6 +6365,12 @@ mod tests {
 
     #[test]
     fn test_high_risk_routes_resolve_to_expected_permissions() {
+        // Site-registry creation changes the authorization namespace and stays
+        // behind the central admin gate in addition to its handler-level guard.
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/admin/sites"),
+            "admin"
+        );
         // emergency / break-glass is admin-only
         assert_eq!(
             route_permission_for(&Method::POST, "/api/ops/emergency/initiate"),
@@ -4003,10 +6390,11 @@ mod tests {
             route_permission_for(&Method::POST, "/api/protect/secrets/s1/rotate"),
             "execute"
         );
-        // AD delete is operator-tier (execute), not admin
+        // AD deletion is classified by its functional capability before the
+        // broader identity family's coarse execute tier is considered.
         assert_eq!(
-            route_permission_for(&Method::POST, "/api/identity/ad/delete/host1"),
-            "execute"
+            operation_capability_for(&Method::POST, "/api/identity/ad/delete/host1"),
+            Some(OperationCapability::IdentityAdComputerDelete)
         );
         // patch-wave DELETE is operator-tier (execute) via the /api/maintain prefix —
         // the method is irrelevant (route_permission_for ignores it), so the DELETE
@@ -4023,13 +6411,13 @@ mod tests {
         // default (which silently made them admin-only before this fix).
         assert_eq!(
             route_permission_for(&Method::POST, "/api/events/alerts/e1/ack"),
-            "request",
-            "single alert ack is request-tier (matches the handler), not admin"
+            "execute",
+            "single alert ack is operator-tier, not Requester self-service"
         );
         assert_eq!(
             route_permission_for(&Method::POST, "/api/events/alerts/batch/ack"),
-            "request",
-            "batch alert ack is request-tier"
+            "execute",
+            "batch alert ack is operator-tier"
         );
         assert_eq!(
             route_permission_for(&Method::POST, "/api/audit/log/verify"),
@@ -4042,6 +6430,11 @@ mod tests {
             route_permission_for(&Method::POST, "/api/events/alerts/e1/suppress"),
             "admin",
             "a non-ack /api/events mutation stays fail-closed"
+        );
+        assert_eq!(
+            route_permission_for(&Method::DELETE, "/api/events/alerts/e1/ack"),
+            "admin",
+            "an acknowledgement-shaped path with the wrong method stays fail-closed"
         );
         assert_eq!(
             route_permission_for(&Method::POST, "/api/audit/log/rotate"),
@@ -4096,10 +6489,96 @@ mod tests {
     }
 
     #[test]
-    fn test_operational_approval_signoffs_require_approver_tier() {
-        // Genuine maker/checker sign-offs that transition an entity to an Approved
-        // state: each must require the approver tier, not the execute tier of its
-        // family root — otherwise an Operator self-approves their own work.
+    fn test_functional_operation_capability_routes_are_exact_and_fail_closed() {
+        let cases = [
+            (
+                Method::GET,
+                "/api/events/alerts",
+                OperationCapability::MonitoringAlertRead,
+            ),
+            (
+                Method::POST,
+                "/api/events/alerts/42/ack",
+                OperationCapability::MonitoringAlertAcknowledge,
+            ),
+            (
+                Method::POST,
+                "/api/events/alerts/batch/ack",
+                OperationCapability::MonitoringAlertAcknowledge,
+            ),
+            (
+                Method::POST,
+                "/api/identity/ad/delete/host1",
+                OperationCapability::IdentityAdComputerDelete,
+            ),
+            (
+                Method::POST,
+                "/api/network/firewall/rules",
+                OperationCapability::NetworkFirewallManage,
+            ),
+            (
+                Method::DELETE,
+                "/api/network/firewall/rules/r1",
+                OperationCapability::NetworkFirewallManage,
+            ),
+            (
+                Method::DELETE,
+                "/api/monitoring/alert-routes/a1",
+                OperationCapability::MonitoringAlertRoutingManage,
+            ),
+            (
+                Method::DELETE,
+                "/api/datacenter/storage/arrays/a1",
+                OperationCapability::StorageArrayDecommission,
+            ),
+            (
+                Method::POST,
+                "/api/maintain/software/execute/d1",
+                OperationCapability::SoftwareDeploymentExecute,
+            ),
+        ];
+        for (method, path, expected) in cases {
+            assert_eq!(
+                operation_capability_for(&method, path),
+                Some(expected),
+                "{method} {path} must resolve to {}",
+                expected.as_str()
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/events/alerts"),
+            (Method::GET, "/api/events/alerts/42/ack"),
+            (Method::DELETE, "/api/events/alerts/42/ack"),
+            (Method::GET, "/api/events/alerts/"),
+            (Method::POST, "/api/events/alerts//ack"),
+            (Method::POST, "/api/events/alerts/42/extra/ack"),
+            (Method::GET, "/api/identity/ad/delete/host1"),
+            (Method::POST, "/api/identity/ad/delete"),
+            (Method::POST, "/api/identity/ad/delete/host1/extra"),
+            (Method::POST, "/api/network/firewallish/rules"),
+            (Method::GET, "/api/network/firewall/rules"),
+            (Method::POST, "/api/monitoring/alert-routesish"),
+            (Method::GET, "/api/monitoring/alert-routes/a1"),
+            (Method::PUT, "/api/datacenter/storage/arrays/a1"),
+            (Method::DELETE, "/api/datacenter/storage/arrays/a1/extra"),
+            (Method::GET, "/api/maintain/software/execute/d1"),
+            (Method::POST, "/api/maintain/software/execute/d1/extra"),
+            (Method::POST, "/api/maintain/patch/execute"),
+        ] {
+            assert_eq!(
+                operation_capability_for(&method, path),
+                None,
+                "{method} {path} must not over-match a functional capability"
+            );
+        }
+    }
+
+    #[test]
+    fn operational_reviewer_actions_and_signoffs_require_approver_tier() {
+        // Genuine maker/checker sign-offs, plus the access-review claim that
+        // establishes the only eligible decider: each must require the approver
+        // tier, not the execute tier of its family root.
         for path in [
             "/api/ops/runbook/approve/r1",
             "/api/maintain/patch/approve",
@@ -4107,7 +6586,15 @@ mod tests {
             "/api/protect/backup/restore-approve",
             "/api/build/app-environment/approve/e1",
             "/api/retire/decommission/approve/d1",
-            // access-review carries all three reviewer verdicts (id is mid-path)
+            "/api/datacenter/image-factory/promote/i1",
+            "/api/datacenter/image-factory/reject/i1",
+            "/api/vm/day2/approve",
+            "/api/datacenter/firmware/exception/fwex-1/approve",
+            "/api/datacenter/firmware/revoke/fwex-1",
+            // access-review carries the reviewer claim and all three verdicts
+            // (id is mid-path). Claiming must not remain execute-tier because it
+            // establishes the only subject allowed to decide the review.
+            "/api/identity/access-review/ar1/start",
             "/api/identity/access-review/ar1/approve",
             "/api/identity/access-review/ar1/revoke",
             "/api/identity/access-review/ar1/exempt",
@@ -4115,7 +6602,7 @@ mod tests {
             assert_eq!(
                 route_permission_for(&Method::POST, path),
                 "approve",
-                "{path} is a maker/checker approval sign-off and must require the approver tier"
+                "{path} is a reviewer/approval action and must require the approver tier"
             );
         }
 
@@ -4140,6 +6627,23 @@ mod tests {
             route_permission_for(&Method::POST, "/api/maintain/patch/validate"),
             "execute"
         );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/vm/day2/lock"),
+            "execute"
+        );
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/datacenter/image-factory/promote/i1/extra"
+            ),
+            "execute",
+            "a deeper image-factory child must not inherit promotion authority"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/vm/day2/approve/extra"),
+            "execute",
+            "a deeper VM Day-2 child must not inherit approval authority"
+        );
 
         // Shape guard: a deeper path past the access-review verdict is not a
         // verdict route and falls through to the family tier.
@@ -4150,6 +6654,223 @@ mod tests {
             ),
             "execute"
         );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/identity/access-review/ar1/start/extra"),
+            "execute"
+        );
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/datacenter/firmware/exception/fwex-1/approve/extra"
+            ),
+            "execute"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/datacenter/firmware/exception"),
+            "execute",
+            "the maker request remains execute-tier and never self-approves"
+        );
+    }
+
+    #[test]
+    fn human_signoff_route_manifest_is_closed_and_method_aware() {
+        for path in [
+            "/api/requests/r1/approve",
+            "/api/requests/r1/reject",
+            "/api/requests/r1/rework",
+            "/api/requests/batch/approve",
+            "/api/requests/batch/reject",
+            "/api/requests/batch/rework",
+            "/api/requests/r1/approve-live-apply",
+            "/api/requests/r1/steps/s1/approve-live-apply",
+            "/api/ops/runbook/approve/r1",
+            "/api/ops/emergency/initiate",
+            "/api/ops/emergency/approve/e1",
+            "/api/ops/emergency/execute/e1",
+            "/api/ops/emergency/verify/e1",
+            "/api/ops/emergency/close/e1",
+            "/api/admin/agents/enrollment-challenges",
+            "/api/admin/agents/a1/approve",
+            "/api/admin/agents/a1/revoke",
+            "/api/admin/agents/live-apply-jobs",
+            "/api/protect/snapshot/review",
+            "/api/protect/legal-hold/release/lh1",
+            "/api/analytics/aiops/review/a1",
+            "/api/identity/access-review/r1/start",
+            "/api/identity/access-review/r1/approve",
+            "/api/identity/access-review/r1/revoke",
+            "/api/identity/access-review/r1/exempt",
+            "/api/identity/ad/quarantine-recovery/review/host1",
+            "/api/identity/ad/quarantine-recovery/approve/r1",
+            "/api/identity/ad/quarantine-recovery/apply/r1",
+            "/api/identity/shares/recertify/s1",
+            "/api/audit/compliance/controls/c1/assess",
+            "/api/audit/compliance/findings/f1/waive",
+            "/api/datacenter/image-factory/reject/i1",
+            "/api/datacenter/firmware/revoke/fwex-1",
+        ] {
+            assert!(
+                requires_verified_human_signoff(&Method::POST, path),
+                "missing verified-human route classification for {path}"
+            );
+            assert!(
+                !requires_verified_human_signoff(&Method::GET, path),
+                "safe reads must not be classified as sign-off mutations: {path}"
+            );
+        }
+
+        for path in [
+            "/api/requests/r1/execute",
+            "/api/datacenter/firmware/exception",
+            "/api/audit/compliance/findings/f1/resolve",
+            "/api/cmdb/servicenow/approve/sn1",
+            "/api/maintain/certificates/approve/c1",
+        ] {
+            assert!(
+                !requires_verified_human_signoff(&Method::POST, path),
+                "{path}"
+            );
+        }
+
+        assert!(
+            !requires_verified_human_signoff(&Method::POST, "/api/analytics/aiops/review/a1/extra"),
+            "AIOps review authority must not leak to deeper descendants"
+        );
+        assert!(
+            !requires_verified_human_signoff(
+                &Method::POST,
+                "/api/protect/legal-hold/release/lh1/extra"
+            ),
+            "legal-hold release authority must match exactly one hold id"
+        );
+        assert!(
+            !requires_verified_human_signoff(
+                &Method::POST,
+                "/api/identity/access-review/r1/start/extra"
+            ),
+            "reviewer-claim authority must match exactly one review id"
+        );
+    }
+
+    #[test]
+    fn exact_interactive_authority_proves_human_independent_of_provider_label() {
+        use crate::human_authority::{HumanAuthorityMode, InteractiveHumanAuthorityContext};
+        use ryuki_engine::auth::{ActorClass, APP_ROLE_PLATFORM_ADMIN};
+
+        for (provider, issuer, carrier) in [
+            ("local", "urn:ryuki:local", "persisted-session"),
+            ("entra-id", "https://issuer.example/tenant", "entra-id"),
+        ] {
+            let session = AuthSession {
+                user_id: "human-subject".into(),
+                display_name: "Verified Human".into(),
+                roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+                token_valid: true,
+                provider_mode: carrier.into(),
+                actor_class: ActorClass::VerifiedHuman,
+                site_scope: vec!["SITE-A".into()],
+                environment_scope: vec!["prod".into()],
+            };
+            let authority = InteractiveHumanAuthorityContext {
+                provider: provider.into(),
+                issuer: issuer.into(),
+                subject: session.user_id.clone(),
+                identity_epoch: 2,
+                assignment_version: 7,
+                roles: session.roles.clone(),
+                site_mode: HumanAuthorityMode::Scoped,
+                site_scope: session.site_scope.clone(),
+                environment_mode: HumanAuthorityMode::Scoped,
+                environment_scope: session.environment_scope.clone(),
+            };
+            assert!(interactive_authority_matches_session(
+                &session,
+                Some(&authority)
+            ));
+
+            for actor_class in [
+                ActorClass::Workload,
+                ActorClass::Unknown,
+                ActorClass::Simulated,
+            ] {
+                let rejected = AuthSession {
+                    actor_class,
+                    // Keep the same human-looking provider label and roles: the
+                    // typed actor class, not the carrier string, is authoritative.
+                    ..session.clone()
+                };
+                assert!(!interactive_authority_matches_session(
+                    &rejected,
+                    Some(&authority)
+                ));
+            }
+            assert!(!interactive_authority_matches_session(&session, None));
+            let mut mismatched = authority.clone();
+            mismatched.subject = "different-subject".into();
+            assert!(!interactive_authority_matches_session(
+                &session,
+                Some(&mismatched)
+            ));
+        }
+    }
+
+    #[test]
+    fn credential_administration_requires_exact_global_human_authority() {
+        use crate::human_authority::{HumanAuthorityMode, InteractiveHumanAuthorityContext};
+        use ryuki_engine::auth::{ActorClass, APP_ROLE_PLATFORM_ADMIN};
+
+        for path in [
+            "/api/admin/tokens",
+            "/api/admin/tokens/t1",
+            "/api/admin/sessions",
+            "/api/admin/sessions/s1",
+        ] {
+            assert!(requires_global_verified_human_credential_admin(path));
+        }
+        assert!(!requires_global_verified_human_credential_admin(
+            "/api/admin/platform-settings"
+        ));
+
+        let session = AuthSession {
+            user_id: "global-human".into(),
+            roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: ActorClass::VerifiedHuman,
+            provider_mode: "persisted-session".into(),
+            ..AuthSession::default()
+        };
+        let mut authority = InteractiveHumanAuthorityContext {
+            provider: "local".into(),
+            issuer: "urn:ryuki:local".into(),
+            subject: session.user_id.clone(),
+            identity_epoch: 1,
+            assignment_version: 1,
+            roles: session.roles.clone(),
+            site_mode: HumanAuthorityMode::Global,
+            site_scope: vec![],
+            environment_mode: HumanAuthorityMode::Global,
+            environment_scope: vec![],
+        };
+        assert!(global_interactive_authority_matches_session(
+            &session,
+            Some(&authority)
+        ));
+
+        authority.site_mode = HumanAuthorityMode::Scoped;
+        authority.site_scope = vec!["SITE-A".into()];
+        assert!(!global_interactive_authority_matches_session(
+            &session,
+            Some(&authority)
+        ));
+        let workload = AuthSession {
+            actor_class: ActorClass::Workload,
+            provider_mode: "persisted-session".into(),
+            ..session
+        };
+        assert!(!global_interactive_authority_matches_session(
+            &workload,
+            Some(&authority)
+        ));
     }
 
     #[test]
@@ -4207,20 +6928,18 @@ mod tests {
         assert_eq!(requests_route_permission("/api/identity/ad/prestage"), None);
     }
 
-    /// Pins the static-dry-run / mock demo: with the superuser model, the
-    /// static_dry_run session (roles=[PlatformAdmin], holds `admin`) must
-    /// satisfy every distinct permission in the route table plus the fail-closed
-    /// default. Guards against a future change to the superuser model silently
-    /// breaking the GitHub Pages / static demo.
+    /// Static/mock identities retain ordinary demo administration but are
+    /// explicitly barred from human approvals.
     #[test]
-    fn test_static_dry_run_session_passes_every_route_permission() {
+    fn test_static_dry_run_session_cannot_satisfy_approval_permission() {
         let session = AuthSession::static_dry_run();
-        for perm in ["request", "execute", "approve", "admin"] {
+        for perm in ["request", "execute", "admin"] {
             assert!(
                 ryuki_engine::auth::check_permission(&session, perm),
                 "static-dry-run must satisfy permission {perm}"
             );
         }
+        assert!(!ryuki_engine::auth::check_permission(&session, "approve"));
         // fail-closed default is "admin"; static-dry-run satisfies it too.
         assert!(ryuki_engine::auth::check_permission(
             &session,
@@ -4229,10 +6948,14 @@ mod tests {
         // And it satisfies every concrete mutating route resolution.
         for path in MUTATING_ROUTES {
             let required = route_permission_for(&Method::POST, path);
-            assert!(
-                ryuki_engine::auth::check_permission(&session, required),
-                "static-dry-run must pass route {path} (requires {required})"
-            );
+            if required == "approve" {
+                assert!(!ryuki_engine::auth::check_permission(&session, required));
+            } else {
+                assert!(
+                    ryuki_engine::auth::check_permission(&session, required),
+                    "static-dry-run must pass non-signoff route {path} (requires {required})"
+                );
+            }
         }
     }
 
@@ -4258,7 +6981,7 @@ mod tests {
     /// spread of ordinary reads. The walk test below pins the read tier and the
     /// gate invariants against every entry.
     const GET_ROUTES: &[&str] = &[
-        // ordinary reads (audit tier).
+        // requester-owned plus ordinary audit reads.
         // NOTE: /api/platform/summary is intentionally NOT here — it is
         // auth-exempt (the pre-login portal bootstrap read), asserted
         // separately in test_platform_summary_is_pre_login_exempt.
@@ -4270,6 +6993,7 @@ mod tests {
         "/api/catalog/categories",
         "/api/identity/shares",
         "/api/audit/compliance/summary",
+        "/api/audit/log/verify/00000000-0000-0000-0000-000000000000",
         "/api/ops/runbook/catalog",
         "/api/ops/incident/active",
         "/api/observe/logs/coverage",
@@ -4277,6 +7001,10 @@ mod tests {
         "/api/analytics/capacity",
         "/api/network/dns/records",
         "/api/datacenter/storage/arrays",
+        "/api/datacenter/network/readiness",
+        "/api/datacenter/network/capacity",
+        "/api/datacenter/network/ports",
+        "/api/datacenter/network/vlans",
         "/api/maintain/patch/compliance",
         // sensitive reads (admin tier)
         "/api/protect/secrets",
@@ -4291,12 +7019,28 @@ mod tests {
         "/api/admin/rbac-roles",
     ];
 
-    /// `read_permission_for` returns `admin` for each sensitive prefix and
-    /// `audit` for a representative ordinary path.
+    /// `read_permission_for` returns the exact closed read class: self-owned
+    /// request reads, ordinary audit reads, approver/operator data, or
+    /// sensitive admin.
     #[test]
     fn test_read_permission_tier() {
-        // ordinary read
-        assert_eq!(read_permission_for("/api/requests"), "audit");
+        // self-owned/requester read
+        assert_eq!(read_permission_for("/api/requests"), "request");
+        assert_eq!(
+            read_permission_for("/api/requests/00000000-0000-0000-0000-000000000000"),
+            "request"
+        );
+        // ordinary read defaults to audit
+        assert_eq!(read_permission_for("/api/ops/runbook/catalog"), "audit");
+        assert_eq!(read_permission_for("/api/approvals/pending"), "approve");
+        assert_eq!(
+            read_permission_for("/api/ops/scheduler/schedules"),
+            "execute"
+        );
+        assert_eq!(
+            read_permission_for("/api/ops/scheduler/executions"),
+            "execute"
+        );
         // each sensitive prefix root + a sub-path under it
         assert_eq!(read_permission_for("/api/protect/secrets"), "admin");
         assert_eq!(read_permission_for("/api/protect/secrets/s1"), "admin");
@@ -4304,12 +7048,139 @@ mod tests {
         assert_eq!(read_permission_for("/api/ops/emergency/history"), "admin");
         assert_eq!(read_permission_for("/api/admin"), "admin");
         assert_eq!(read_permission_for("/api/admin/tokens"), "admin");
+        for path in [
+            "/api/datacenter/network/readiness",
+            "/api/datacenter/network/capacity",
+            "/api/datacenter/network/ports",
+            "/api/datacenter/network/vlans",
+        ] {
+            assert_eq!(read_permission_for(path), "admin", "{path}");
+        }
         // a near-miss that is NOT a sensitive prefix stays audit
         assert_eq!(
             read_permission_for("/api/protect/repository-capacity"),
             "audit"
         );
-        assert_eq!(read_permission_for("/api/ops/runbook/catalog"), "audit");
+        assert_eq!(
+            read_permission_for("/api/totally-new/read-surface"),
+            "audit",
+            "new reads fail closed to audit"
+        );
+    }
+
+    #[test]
+    fn test_network_inventory_reads_are_admin_only_but_contract_stays_requester_readable() {
+        let auditor = auditor_session();
+        let requester = AuthSession {
+            user_id: "network-requester".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+            ..Default::default()
+        };
+        let admin = AuthSession::static_dry_run();
+
+        for path in [
+            "/api/datacenter/network/readiness",
+            "/api/datacenter/network/capacity",
+            "/api/datacenter/network/ports",
+            "/api/datacenter/network/vlans",
+        ] {
+            assert_eq!(read_permission_for(path), "admin", "{path}");
+            assert!(!read_authorized(&auditor, path), "auditor refused {path}");
+            assert!(
+                !read_authorized(&requester, path),
+                "requester refused {path}"
+            );
+            assert!(read_authorized(&admin, path), "admin reads {path}");
+        }
+
+        let contract = "/api/datacenter/network-contract";
+        assert_eq!(read_permission_for(contract), "request");
+        assert!(read_authorized(&requester, contract));
+    }
+
+    #[test]
+    fn test_requester_read_manifest_is_closed_and_shape_exact() {
+        let requester = AuthSession {
+            user_id: "requester".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+            ..Default::default()
+        };
+        let id = "00000000-0000-0000-0000-000000000000";
+
+        for path in [
+            "/api/requests".to_string(),
+            "/api/auth/local/roles".to_string(),
+            "/api/auth/local/me".to_string(),
+            "/api/auth/local/decision".to_string(),
+            format!("/api/requests/{id}"),
+            format!("/api/requests/{id}/policy-eval"),
+            format!("/api/requests/{id}/execution-job"),
+            "/api/catalog/categories".to_string(),
+            "/api/catalog/offerings-contract".to_string(),
+            "/api/catalog/recommendations-contract".to_string(),
+            "/api/requests/intake-support-contract".to_string(),
+            "/api/metrics/series".to_string(),
+            "/api/events".to_string(),
+            "/api/operations/failure-patterns".to_string(),
+            "/api/observe/monitoring-review-queue".to_string(),
+            "/api/notifications".to_string(),
+            "/api/notifications/unread-count".to_string(),
+            "/api/notifications/read-all".to_string(),
+            "/api/notifications/n-1/read".to_string(),
+            "/api/operations/runbook-launch-contract".to_string(),
+        ] {
+            assert_eq!(read_permission_for(&path), "request", "{path}");
+            assert!(read_authorized(&requester, &path), "{path}");
+        }
+
+        for path in [
+            format!("/api/requests/{id}/audit"),
+            format!("/api/requests/{id}/evidence"),
+            format!("/api/requests/{id}/approval-decisions"),
+            format!("/api/requests/{id}/policy-eval/extra"),
+            "/api/events/alerts".to_string(),
+            "/api/observe/oncall/contacts".to_string(),
+            "/api/identity/access-review/due".to_string(),
+            "/api/identity/shares/stale-owners".to_string(),
+            "/api/audit/compliance/findings".to_string(),
+            "/api/audit/compliance/reports/00000000-0000-0000-0000-000000000000".to_string(),
+            "/api/ops/runbook/executions".to_string(),
+            "/api/ops/incident/active".to_string(),
+            "/api/network/dns/records".to_string(),
+            "/api/datacenter/storage/arrays".to_string(),
+            "/api/notifications/n-1".to_string(),
+            "/api/notifications/n-1/private".to_string(),
+            "/api/catalog/future-sensitive".to_string(),
+            "/api/metrics/future-sensitive".to_string(),
+            "/api/future-sensitive-contract".to_string(),
+            "/api/totally-new/read-surface".to_string(),
+        ] {
+            assert_ne!(read_permission_for(&path), "request", "{path}");
+            assert!(!read_authorized(&requester, &path), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_requester_contract_manifest_matches_current_static_contracts() {
+        let manifest: std::collections::HashSet<_> =
+            REQUESTER_CONTRACT_PATHS.iter().copied().collect();
+        assert_eq!(
+            manifest.len(),
+            REQUESTER_CONTRACT_PATHS.len(),
+            "duplicate entries obscure review of the exact Requester contract surface"
+        );
+        let routed: std::collections::HashSet<_> = include_str!("contracts.rs")
+            .split('"')
+            .filter(|value| value.starts_with("/api/") && value.ends_with("-contract"))
+            .collect();
+        assert_eq!(
+            manifest, routed,
+            "a static contract route was added or removed without reviewing its Requester tier"
+        );
     }
 
     /// The shift queue is operator working data: its per-item reads require the
@@ -4348,19 +7219,12 @@ mod tests {
                 "requester refused {path}"
             );
         }
-        // The static contract advertisement + a near-miss prefix (NOT under
-        // `/shift/`) stay ordinary-readable — the gate is not over-broad.
-        for ordinary in ["/api/ops/shift-contract", "/api/ops/shift-contract/foo"] {
-            assert_eq!(
-                read_permission_for(ordinary),
-                "audit",
-                "{ordinary} stays ordinary"
-            );
-            assert!(
-                read_authorized(&auditor, ordinary),
-                "auditor reads {ordinary}"
-            );
-        }
+        // The exact static contract advertisement is Requester-readable; a
+        // nested near-miss is unclassified and therefore defaults to audit.
+        assert_eq!(read_permission_for("/api/ops/shift-contract"), "request");
+        assert_eq!(read_permission_for("/api/ops/shift-contract/foo"), "audit");
+        assert!(read_authorized(&auditor, "/api/ops/shift-contract"));
+        assert!(read_authorized(&auditor, "/api/ops/shift-contract/foo"));
         // The exact family root IS execute-gated.
         assert_eq!(read_permission_for("/api/ops/shift"), "execute");
         // admin superuser still reads everything.
@@ -4424,7 +7288,7 @@ mod tests {
                 "read permission for {path} must be non-empty"
             );
             assert!(
-                ["audit", "admin"].contains(&required),
+                ["request", "audit", "admin"].contains(&required),
                 "read permission for {path} must be a read tier, got {required}"
             );
 
@@ -4458,9 +7322,9 @@ mod tests {
                 );
             }
 
-            // A Requester (holds only `request`) reads ordinary GETs (e.g. view
-            // their own requests) but never sensitive ones — and never the
-            // identity-grade audit trails, which require the `audit` tier.
+            // A Requester (holds only `request`) reads only explicitly
+            // classified self-owned/static surfaces. Unclassified operational
+            // reads fail closed to audit.
             let requester = AuthSession {
                 user_id: "req-1".into(),
                 display_name: "Requester One".into(),
@@ -4469,15 +7333,15 @@ mod tests {
                 provider_mode: "persisted-session".into(),
                 ..Default::default()
             };
-            if required == "admin" || is_audit_read_path(path) {
+            if required != "request" || is_audit_read_path(path) {
                 assert!(
                     !read_authorized(&requester, path),
-                    "requester must be refused sensitive/audit GET {path}"
+                    "requester must be refused non-request GET {path}"
                 );
             } else {
                 assert!(
                     read_authorized(&requester, path),
-                    "requester must pass ordinary GET {path}"
+                    "requester must pass explicitly classified GET {path}"
                 );
             }
         }

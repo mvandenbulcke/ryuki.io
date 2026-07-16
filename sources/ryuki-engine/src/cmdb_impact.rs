@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+/// Absolute per-analysis admission budget. The engine applies this to the raw
+/// request before deduplication so repeated valid CI names cannot amplify work.
+pub const MAX_IMPACT_TARGETS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImpactNode {
     pub ci_name: String,
@@ -259,25 +263,33 @@ pub fn get_downstream_dependencies(ci_name: &str) -> Vec<ImpactNode> {
 fn collect_transitive_downstream(
     graph: &HashMap<String, ImpactNode>,
     ci_name: &str,
+    root_target: &str,
     visited: &mut HashSet<String>,
-    result: &mut Vec<ImpactedCi>,
+    affected: &mut HashMap<String, ImpactedCi>,
 ) {
-    if !visited.insert(ci_name.to_string()) {
-        return;
-    }
-    let Some(node) = graph.get(ci_name) else {
-        return;
-    };
-    for rel in &node.relationships {
-        collect_transitive_downstream(graph, rel, visited, result);
-        if let Some(child) = graph.get(rel) {
-            result.push(ImpactedCi {
-                ci_name: child.ci_name.clone(),
-                ci_type: child.ci_type.clone(),
-                criticality: child.criticality.clone(),
-                impact_reason: format!("Downstream dependency of {}", ci_name),
-                is_direct: node.relationships.contains(rel),
-            });
+    let mut pending = vec![ci_name];
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current.to_string()) {
+            continue;
+        }
+        let Some(node) = graph.get(current) else {
+            continue;
+        };
+        for rel in &node.relationships {
+            if let Some(child) = graph.get(rel) {
+                affected
+                    .entry(child.ci_name.clone())
+                    .or_insert_with(|| ImpactedCi {
+                        ci_name: child.ci_name.clone(),
+                        ci_type: child.ci_type.clone(),
+                        criticality: child.criticality.clone(),
+                        impact_reason: format!("Downstream dependency of {}", root_target),
+                        is_direct: false,
+                    });
+                if !visited.contains(rel) {
+                    pending.push(rel);
+                }
+            }
         }
     }
 }
@@ -289,11 +301,23 @@ pub fn analyze_impact(
     if target_cis.is_empty() {
         return Err("At least one target CI is required for impact analysis".into());
     }
+    if target_cis.len() > MAX_IMPACT_TARGETS {
+        return Err(format!(
+            "At most {} target CIs are allowed for impact analysis",
+            MAX_IMPACT_TARGETS
+        ));
+    }
 
     let graph = ci_graph();
+    let mut seen_targets = HashSet::new();
+    let unique_targets: Vec<&str> = target_cis
+        .iter()
+        .map(String::as_str)
+        .filter(|ci| seen_targets.insert(*ci))
+        .collect();
 
-    for ci in target_cis {
-        if !graph.contains_key(ci) {
+    for ci in &unique_targets {
+        if !graph.contains_key(*ci) {
             return Err(format!("Unknown CI: {}", ci));
         }
     }
@@ -301,10 +325,10 @@ pub fn analyze_impact(
     let mut affected_map: HashMap<String, ImpactedCi> = HashMap::new();
     let mut visited = HashSet::new();
 
-    for target in target_cis {
-        if let Some(node) = graph.get(target) {
+    for target in &unique_targets {
+        if let Some(node) = graph.get(*target) {
             affected_map
-                .entry(target.clone())
+                .entry((*target).to_string())
                 .or_insert_with(|| ImpactedCi {
                     ci_name: node.ci_name.clone(),
                     ci_type: node.ci_type.clone(),
@@ -313,28 +337,17 @@ pub fn analyze_impact(
                     is_direct: true,
                 });
         }
-        collect_transitive_downstream(graph, target, &mut visited, &mut Vec::new());
-        for downstream in target_cis
-            .iter()
-            .flat_map(|t| get_downstream_dependencies(t))
-        {
-            affected_map
-                .entry(downstream.ci_name.clone())
-                .or_insert(ImpactedCi {
-                    ci_name: downstream.ci_name.clone(),
-                    ci_type: downstream.ci_type.clone(),
-                    criticality: downstream.criticality.clone(),
-                    impact_reason: format!("Downstream of {}", target),
-                    is_direct: false,
-                });
-        }
+    }
+    for target in &unique_targets {
+        collect_transitive_downstream(graph, target, target, &mut visited, &mut affected_map);
     }
 
-    let affected_cis: Vec<ImpactedCi> = affected_map.into_values().collect();
+    let mut affected_cis: Vec<ImpactedCi> = affected_map.into_values().collect();
+    affected_cis.sort_by(|left, right| left.ci_name.cmp(&right.ci_name));
 
-    let max_criticality = target_cis
+    let max_criticality = unique_targets
         .iter()
-        .filter_map(|ci| graph.get(ci))
+        .filter_map(|ci| graph.get(*ci))
         .map(|n| n.criticality.clone())
         .max()
         .unwrap_or(Criticality::Low);
@@ -439,6 +452,77 @@ mod tests {
         .unwrap();
         assert!(result.affected_cis.len() >= 2);
         assert_eq!(result.risk_level, RiskLevel::High);
+    }
+
+    #[test]
+    fn test_analyze_impact_rejects_targets_over_budget_before_graph_work() {
+        let targets = vec!["app-portal".to_string(); MAX_IMPACT_TARGETS + 1];
+
+        let error = analyze_impact("Oversized change", &targets)
+            .expect_err("raw target count above the admission budget must fail");
+
+        assert!(error.contains(&MAX_IMPACT_TARGETS.to_string()));
+    }
+
+    #[test]
+    fn test_analyze_impact_deduplicates_targets_at_the_budget() {
+        let targets = vec!["app-portal".to_string(); MAX_IMPACT_TARGETS];
+
+        let result = analyze_impact("Repeated target", &targets)
+            .expect("the exact admission budget remains supported");
+
+        assert_eq!(
+            result.affected_cis.iter().filter(|ci| ci.is_direct).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_analyze_impact_collects_each_transitive_dependency() {
+        let result = analyze_impact("Portal change", &["app-portal".into()]).unwrap();
+
+        let names: HashSet<&str> = result
+            .affected_cis
+            .iter()
+            .map(|ci| ci.ci_name.as_str())
+            .collect();
+        assert!(names.contains("app-portal"));
+        assert!(names.contains("env-prod-defra"));
+        assert!(names.contains("vm-defra-web01"));
+        assert!(names.contains("net-defra-vlan100"));
+    }
+
+    #[test]
+    fn test_transitive_collection_terminates_on_cycles_and_visits_each_node_once() {
+        let mut graph = HashMap::new();
+        for (name, next) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            graph.insert(
+                name.to_string(),
+                ImpactNode {
+                    ci_name: name.to_string(),
+                    ci_type: CiType::Application,
+                    relationships: vec![next.to_string()],
+                    criticality: Criticality::Low,
+                },
+            );
+        }
+        let mut visited = HashSet::new();
+        let mut affected = HashMap::from([(
+            "a".to_string(),
+            ImpactedCi {
+                ci_name: "a".to_string(),
+                ci_type: CiType::Application,
+                criticality: Criticality::Low,
+                impact_reason: "direct".to_string(),
+                is_direct: true,
+            },
+        )]);
+
+        collect_transitive_downstream(&graph, "a", "a", &mut visited, &mut affected);
+
+        assert_eq!(visited.len(), graph.len());
+        assert_eq!(affected.len(), graph.len());
+        assert!(affected["a"].is_direct);
     }
 
     #[test]

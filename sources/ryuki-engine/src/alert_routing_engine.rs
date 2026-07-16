@@ -83,7 +83,10 @@ fn seed_routes() -> Vec<AlertRoute> {
 static ROUTE_STORE: std::sync::LazyLock<Mutex<Vec<AlertRoute>>> =
     std::sync::LazyLock::new(|| Mutex::new(seed_routes()));
 
-pub fn build_alert_route(
+/// Validate and construct an alert route without changing the legacy in-memory
+/// store. Durable callers use this before their database transaction so a
+/// failed insert/audit cannot leave a ghost route in process memory.
+pub fn prepare_alert_route(
     trigger_name: &str,
     severity: &str,
     host_group: &str,
@@ -125,6 +128,18 @@ pub fn build_alert_route(
         updated_at: now,
     };
 
+    Ok(route)
+}
+
+/// Legacy in-memory constructor retained for dry-run engine consumers.
+pub fn build_alert_route(
+    trigger_name: &str,
+    severity: &str,
+    host_group: &str,
+    support_group: &str,
+    priority: &str,
+) -> Result<AlertRoute, String> {
+    let route = prepare_alert_route(trigger_name, severity, host_group, support_group, priority)?;
     ROUTE_STORE.lock().unwrap().push(route.clone());
     Ok(route)
 }

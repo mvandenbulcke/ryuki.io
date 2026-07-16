@@ -2,13 +2,13 @@
   "components": {
     "parameters": {
       "ProtocolVersionHeader": {
-        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v2 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
+        "description": "Required sender CP↔agent wire-schema version. This control plane accepts protocol v6 only. An absent header resolves to legacy v1 and is rejected (400), as are duplicate, malformed, or unsupported values.",
         "in": "header",
         "name": "x-ryuki-protocol-version",
         "required": true,
         "schema": {
           "enum": [
-            2
+            6
           ],
           "format": "int64",
           "type": "integer"
@@ -155,8 +155,35 @@
         ],
         "type": "object"
       },
+      "ApproveReviewedLivePlanBody": {
+        "additionalProperties": false,
+        "description": "Exact reviewed LivePlan selection. The control plane compare-and-swaps this immutable job/attempt/digest tuple against the signed stored result before minting any whole-request grant. The per-step route accepts the same closed shape but remains fail-closed in this release.",
+        "properties": {
+          "approved_plan_attempt_id": {
+            "description": "Exact leased attempt recorded in the reviewed plan's signed envelope.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "approved_plan_digest": {
+            "description": "Lowercase SHA-256 digest of the exact reviewed safe projection.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "approved_plan_job_id": {
+            "description": "agent_jobs.id of the exact LivePlan projection the administrator reviewed.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approved_plan_job_id",
+          "approved_plan_attempt_id",
+          "approved_plan_digest"
+        ],
+        "type": "object"
+      },
       "AuthSession": {
-        "description": "The resolved session for the caller. `site_scope` / `environment_scope` are omitted entirely when empty (unscoped principal), not sent as empty arrays.",
+        "description": "The resolved session for the caller. `site_scope` / `environment_scope` are omitted when the admitted axis is explicitly Global; interactive Unknown/Revoked authority is never returned.",
         "properties": {
           "display_name": {
             "type": "string"
@@ -335,6 +362,116 @@
         "required": [
           "events",
           "durable"
+        ],
+        "type": "object"
+      },
+      "ExecutionTrustProfile": {
+        "additionalProperties": false,
+        "description": "Closed-schema, non-secret execution-authority snapshot signed by the planning agent. Raw credentials, backend HCL, and provider-returned identifiers are forbidden.",
+        "properties": {
+          "allowlist_version": {
+            "type": "string"
+          },
+          "backend_authority_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "backend_credential_authority_mode": {
+            "type": "string"
+          },
+          "backend_kind": {
+            "type": "string"
+          },
+          "containment_policy_version": {
+            "type": "string"
+          },
+          "executable_kind": {
+            "type": "string"
+          },
+          "executable_path": {
+            "type": "string"
+          },
+          "executable_provenance_policy_version": {
+            "type": "string"
+          },
+          "executable_sha256": {
+            "oneOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "executable_version": {
+            "type": "string"
+          },
+          "iac_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "offering": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "provider_authority_id": {
+            "description": "Stable, non-secret provisioning-record reference for the exact provider destination/account credential set.",
+            "pattern": "^provider-authority/vsphere/[a-z0-9._/-]+$",
+            "type": "string"
+          },
+          "provider_authority_version": {
+            "description": "Immutable authority version; rotates whenever any destination, account, or credential member changes.",
+            "pattern": "^v[a-z0-9._-]+$",
+            "type": "string"
+          },
+          "provider_credential_authority_mode": {
+            "type": "string"
+          },
+          "provider_source": {
+            "type": "string"
+          },
+          "provider_version": {
+            "type": "string"
+          },
+          "runner_kind": {
+            "enum": [
+              "terraform"
+            ],
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "state_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "allowlist_version",
+          "platform",
+          "offering",
+          "runner_kind",
+          "provider_source",
+          "provider_version",
+          "provider_authority_id",
+          "provider_authority_version",
+          "backend_kind",
+          "backend_authority_digest",
+          "executable_kind",
+          "executable_path",
+          "executable_version",
+          "executable_sha256",
+          "executable_provenance_policy_version",
+          "provider_credential_authority_mode",
+          "backend_credential_authority_mode",
+          "containment_policy_version",
+          "iac_digest",
+          "state_key"
         ],
         "type": "object"
       },
@@ -536,6 +673,11 @@
       "Job": {
         "description": "A dispatchable unit of work, as returned by GET /api/agents/{agent_id}/jobs.",
         "properties": {
+          "agent_enrollment_id": {
+            "description": "Immutable enrollment row of the authenticated assignee returning this job.",
+            "format": "uuid",
+            "type": "string"
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -574,6 +716,7 @@
         },
         "required": [
           "id",
+          "agent_enrollment_id",
           "platform",
           "spec",
           "status"
@@ -727,6 +870,33 @@
         ],
         "type": "string"
       },
+      "LiveExecutionAuthority": {
+        "additionalProperties": false,
+        "description": "Exact successful-plan owner and execution-profile authority carried by a CP-signed live grant.",
+        "properties": {
+          "assigned_agent_enrollment_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "assigned_agent_id": {
+            "type": "string"
+          },
+          "assigned_agent_key_fingerprint": {
+            "type": "string"
+          },
+          "execution_trust_profile_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "assigned_agent_id",
+          "assigned_agent_enrollment_id",
+          "assigned_agent_key_fingerprint",
+          "execution_trust_profile_digest"
+        ],
+        "type": "object"
+      },
       "PlatformSummaryResponse": {
         "properties": {
           "browserIsolation": {
@@ -858,6 +1028,7 @@
         "type": "object"
       },
       "RegisterBody": {
+        "additionalProperties": false,
         "properties": {
           "agent_id": {
             "description": "Stable agent identifier, e.g. \"defra-vcenter-01\".",
@@ -866,20 +1037,37 @@
           "capabilities": {
             "$ref": "#/components/schemas/Capabilities"
           },
+          "enrollment_challenge": {
+            "description": "One-time bootstrap secret. The control plane stores only its SHA-256 hash and consumes it atomically.",
+            "pattern": "^ryc_[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "enrollment_challenge_id": {
+            "description": "Short-lived grant preprovisioned by a trusted administrator.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "enrollment_proof": {
+            "description": "Base64 Ed25519 signature over the domain-separated challenge and exact identity fields, proving possession of public_key.",
+            "type": "string"
+          },
           "platform": {
             "description": "Platform / site this agent serves, e.g. \"defra\".",
             "type": "string"
           },
           "public_key": {
-            "description": "Base64-encoded Ed25519 verifying (public) key.",
+            "description": "Canonical padded-base64 Ed25519 verifying key selected by trusted provisioning.",
             "type": "string"
           }
         },
         "required": [
+          "enrollment_challenge_id",
+          "enrollment_challenge",
           "agent_id",
           "platform",
           "capabilities",
-          "public_key"
+          "public_key",
+          "enrollment_proof"
         ],
         "type": "object"
       },
@@ -1010,6 +1198,11 @@
       "SignedEnvelope": {
         "description": "Binds the full execution context for a posted result; tamper-evident via an Ed25519 signature over the fixed-order signable fields.",
         "properties": {
+          "agent_enrollment_id": {
+            "description": "Immutable UUID of the exact authenticated agent enrollment that signed the result.",
+            "format": "uuid",
+            "type": "string"
+          },
           "agent_id": {
             "type": "string"
           },
@@ -1036,6 +1229,17 @@
             "description": "SHA-256 hex digest of the (post-redaction) evidence pack.",
             "type": "string"
           },
+          "execution_trust_profile": {
+            "description": "Canonical non-secret execution profile for successful live results; null for offline or refused outcomes.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionTrustProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "job_id": {
             "format": "uuid",
             "type": "string"
@@ -1059,7 +1263,7 @@
             "type": "string"
           },
           "redaction_policy_version": {
-            "example": "ryuki-redaction-v1",
+            "example": "ryuki-redaction-v2",
             "type": "string"
           },
           "request_id": {
@@ -1085,6 +1289,7 @@
         },
         "required": [
           "agent_id",
+          "agent_enrollment_id",
           "platform",
           "job_id",
           "attempt_id",
@@ -1094,6 +1299,8 @@
           "mode",
           "status",
           "job_spec_digest",
+          "approved_plan_digest",
+          "execution_trust_profile",
           "evidence_digest",
           "redaction_policy_version",
           "timestamp",
@@ -1110,7 +1317,7 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Terraform provider name → version. Empty/absent for Ansible.",
+            "description": "Terraform-local provider name → version (for example vsphere, not registry source vmware/vsphere). Empty/absent for Ansible.",
             "type": "object"
           },
           "version": {
@@ -1124,13 +1331,26 @@
         "type": "object"
       },
       "VerifiedLiveContext": {
-        "description": "CP-signed approval grant for a live_apply or live_destroy job; live_destroy grants are step-bound.",
+        "description": "Protocol-v6 CP-signed approval grant for a live_apply or live_destroy job. It binds the exact successful plan row and attempt; live_destroy grants are also step-bound.",
         "properties": {
+          "approved_plan_attempt_id": {
+            "description": "Exact leased attempt that produced the reviewed plan result.",
+            "format": "uuid",
+            "type": "string"
+          },
           "approved_plan_digest": {
+            "type": "string"
+          },
+          "approved_plan_job_id": {
+            "description": "Immutable agent_jobs.id of the exact successful LivePlan result reviewed for this grant.",
+            "format": "uuid",
             "type": "string"
           },
           "approver": {
             "type": "string"
+          },
+          "execution_authority": {
+            "$ref": "#/components/schemas/LiveExecutionAuthority"
           },
           "expiry": {
             "format": "date-time",
@@ -1139,6 +1359,10 @@
           "job_spec_digest": {
             "description": "SHA-256 digest of the exact canonical JobSpec authorized by this grant, including mode and state_key.",
             "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "platform": {
+            "description": "Signed destination platform/site; must equal Job.platform before live mutation.",
             "type": "string"
           },
           "request_id": {
@@ -1157,10 +1381,14 @@
         },
         "required": [
           "request_id",
+          "platform",
           "job_spec_digest",
           "approved_plan_digest",
+          "approved_plan_job_id",
+          "approved_plan_attempt_id",
           "approver",
           "expiry",
+          "execution_authority",
           "signature"
         ],
         "type": "object"
@@ -1174,7 +1402,7 @@
         "type": "http"
       },
       "apiSessionHeader": {
-        "description": "Operator session identifier for the ops-read surface. `Authorization: Bearer <session-uuid>` and the `ryuki_session` cookie are alternate carriers of the same session; any one of the three is sufficient.",
+        "description": "Opaque 256-bit operator session bearer (rys_ plus canonical unpadded base64url), retained under the compatibility header name. Authorization: Bearer rys_... and the mode-selected HttpOnly session cookie are alternate single carriers. HTTPS uses __Host-ryuki_session; explicit non-Secure loopback development uses ryuki_session. Supplying more than one credential carrier or cookie name is rejected. The UUID returned by admin session inventory is management metadata and can never authenticate.",
         "in": "header",
         "name": "X-Ryuki-Session-Id",
         "type": "apiKey"
@@ -1182,7 +1410,7 @@
     }
   },
   "info": {
-    "description": "Machine-readable contract for three route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration and `cp-public-key` are unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v2-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents.",
+    "description": "Machine-readable contract for four route groups. (1) The CP↔agent wire protocol (registration, job polling/lease, ack, result submission, heartbeat): poll, ack, result, and heartbeat require an agent bearer token (`Authorization: Bearer rya_...`); registration has no agent bearer yet and instead requires a preprovisioned one-time challenge plus Ed25519 proof of possession; `cp-public-key` is unauthenticated. Every agent-protocol request MUST carry the supported `x-ryuki-protocol-version` header. This build is protocol-v6-only; an absent header resolves to legacy v1 and is rejected. (2) PUBLIC endpoints (no auth) — infra probes plus the pre-login portal bootstrap reads. (3) A bounded READ-ONLY operational surface (events/alerts feed, scheduler introspection) that requires an operator session and a permission tier, documented for operational tooling, not external agents. (4) The human live-approval surface, whose request body compare-and-swaps the exact reviewed plan job, attempt, and digest; per-step approval remains intentionally fail-closed.",
     "title": "Ryuki Agent Protocol API",
     "version": "0.1.0"
   },
@@ -1238,7 +1466,7 @@
     },
     "/api/agents/register": {
       "post": {
-        "description": "Generates a bearer token, stores its SHA-256 hash, and returns the plaintext token ONCE. The agent remains in `pending` status until an admin approves it.",
+        "description": "Consumes a short-lived, single-use trusted provisioning challenge bound to the exact agent id, platform, and Ed25519 public key after verifying proof of possession. It then generates a bearer token, stores its SHA-256 hash, and returns the plaintext token ONCE. The agent remains in `pending` status until an admin approves that cryptographically admitted identity.",
         "operationId": "registerAgent",
         "parameters": [
           {
@@ -1264,7 +1492,16 @@
                 }
               }
             },
-            "description": "Agent registered (pending approval)."
+            "description": "Agent registered (pending approval). The one-time token response is marked Cache-Control: no-store.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always `no-store` because the response contains a one-time plaintext bearer.",
+                "schema": {
+                  "const": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -1274,7 +1511,17 @@
                 }
               }
             },
-            "description": "Empty agent_id/platform/public_key, malformed/weak Ed25519 public key, or an invalid/unsupported x-ryuki-protocol-version header."
+            "description": "Malformed bounded fields, non-canonical/weak Ed25519 public key, or an invalid/unsupported x-ryuki-protocol-version header."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The one-time challenge is absent, expired, consumed, mismatched, or lacks a valid proof of possession."
           },
           "409": {
             "content": {
@@ -1999,6 +2246,264 @@
         "summary": "Read platform branding/mode metadata",
         "tags": [
           "public"
+        ]
+      }
+    },
+    "/api/requests/{id}/approve-live-apply": {
+      "post": {
+        "description": "Admin-only, scope- and separation-of-duties-gated compare-and-swap. The server locks and re-verifies the exact signed LivePlan job, attempt, and safe-projection digest before minting one CP-signed LiveApply grant. A later same-digest row cannot replace the reviewed row. Production external execution remains blocked by the descendant-containment gate.",
+        "operationId": "approveReviewedLivePlan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveReviewedLivePlanBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "approver": {
+                      "type": "string"
+                    },
+                    "job_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "mode": {
+                      "const": "LiveApply",
+                      "type": "string"
+                    },
+                    "status": {
+                      "const": "Pending",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id",
+                    "approver",
+                    "status",
+                    "mode"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The single whole-request LiveApply job was minted from the exact reviewed plan selection."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed selection or stored plan data."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid operator session."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Not a verified human admin, or separation of duties failed."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Request missing or outside the principal's scope."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Reviewed selection is stale/mismatched, no reviewable plan exists, request state/site is ineligible, or the permanent apply slot is consumed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "JSON extraction or field decoding failed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Database or CP signing authority unavailable."
+          }
+        },
+        "security": [
+          {
+            "apiSessionHeader": []
+          }
+        ],
+        "summary": "Approve the exact reviewed whole-request LivePlan",
+        "tags": [
+          "live-approval"
+        ]
+      }
+    },
+    "/api/requests/{id}/steps/{step_key}/approve-live-apply": {
+      "post": {
+        "description": "The route preserves admin, request-scope, and separation-of-duties checks, validates the same exact reviewed-plan body, then returns 409 without minting. It remains disabled until an exact digest-bound step review surface exists.",
+        "operationId": "rejectDisabledStepLiveApproval",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "step_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveReviewedLivePlanBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Malformed reviewed-plan selection."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid operator session."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Not a verified human admin, or separation of duties failed."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Request missing or outside the principal's scope."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Per-step live approval is disabled until an exact digest-bound step review is available."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "JSON extraction or field decoding failed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Database unavailable."
+          }
+        },
+        "security": [
+          {
+            "apiSessionHeader": []
+          }
+        ],
+        "summary": "Fail closed for human per-step LiveApply approval",
+        "tags": [
+          "live-approval"
         ]
       }
     },

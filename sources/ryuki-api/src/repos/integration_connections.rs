@@ -9,9 +9,8 @@
 //! names / secret-row FK, and the persisted health-check `message` is the stub's
 //! secret-free output (it names the credential SOURCE type, never the ref).
 
-use ryuki_engine::integration_connections::{
-    CredentialSource, ExecutionMode, IntegrationConnection,
-};
+use crate::integration::{parse_persisted_credential_source, PersistedCredentialSourceError};
+use ryuki_engine::integration_connections::{ExecutionMode, IntegrationConnection};
 
 /// SELECT column list for `integration_connections`. Mirrors the handler's
 /// `CONN_COLUMNS` in `integration.rs`.
@@ -41,15 +40,15 @@ struct IntegrationConnectionRow {
 }
 
 impl IntegrationConnectionRow {
-    fn into_model(self) -> IntegrationConnection {
-        IntegrationConnection {
+    fn try_into_model(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
+        let credential_source = parse_persisted_credential_source(&self.credential_source)?;
+        Ok(IntegrationConnection {
             id: self.id,
             vendor_type: self.vendor_type,
             name: self.name,
             endpoint_url: self.endpoint_url,
             site_scope: self.site_scope,
-            credential_source: CredentialSource::parse(&self.credential_source)
-                .unwrap_or(CredentialSource::EnvVar),
+            credential_source,
             credential_ref: self.credential_ref,
             status: self.status,
             readiness: self.readiness,
@@ -60,7 +59,7 @@ impl IntegrationConnectionRow {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
-        }
+        })
     }
 }
 
@@ -81,7 +80,10 @@ where
     .fetch_all(executor)
     .await?;
 
-    Ok(rows.into_iter().map(|r| r.into_model()).collect())
+    rows.into_iter()
+        .map(IntegrationConnectionRow::try_into_model)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }
 
 /// Append one `connection_health_checks` history row. Mirrors the on-demand
@@ -135,4 +137,44 @@ where
     .execute(executor)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ryuki_engine::integration_connections::CredentialSource;
+
+    fn row(credential_source: &str) -> IntegrationConnectionRow {
+        IntegrationConnectionRow {
+            id: "ic-scheduler-source-test".to_string(),
+            vendor_type: "vmware".to_string(),
+            name: "Scheduler Source Test".to_string(),
+            endpoint_url: "https://vcenter.test.example.com".to_string(),
+            site_scope: None,
+            credential_source: credential_source.to_string(),
+            credential_ref: "fixture-reference".to_string(),
+            status: "configured".to_string(),
+            readiness: "configured".to_string(),
+            execution_mode: "static-dry-run".to_string(),
+            last_test_at: None,
+            last_test_result: None,
+            created_by: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn scheduler_row_decoder_accepts_explicit_sources_and_rejects_unknown_values() {
+        assert_eq!(
+            row("vault")
+                .try_into_model()
+                .expect("explicit Vault source")
+                .credential_source,
+            CredentialSource::Vault
+        );
+        assert!(row("").try_into_model().is_err());
+        assert!(row("future-provider").try_into_model().is_err());
+        assert!(row(" env-var ").try_into_model().is_err());
+    }
 }

@@ -7,7 +7,10 @@ metadata:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
     app.kubernetes.io/name: ryuki-platform
 spec:
-  ingressClassName: nginx
+  # The matching controller instance must be dedicated to this class and carry
+  # app.kubernetes.io/instance=ryuki-platform. A shared nginx controller does
+  # not satisfy the portal egress boundary.
+  ingressClassName: ryuki-platform
   tls:
     - hosts:
         - platform.example.invalid

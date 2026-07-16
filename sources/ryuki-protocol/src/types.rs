@@ -136,7 +136,8 @@ pub type ProviderVersions = BTreeMap<String, String>;
 pub struct ToolCapability {
     /// e.g. `"1.9.5"`
     pub version: String,
-    /// Provider name → version (Terraform only; empty for Ansible).
+    /// Terraform-local provider name → version (for example `vsphere`, not the
+    /// registry source address `vmware/vsphere`). Must be empty for Ansible.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_versions: ProviderVersions,
 }
@@ -156,11 +157,24 @@ pub struct Capabilities {
 // Agent registration
 // ---------------------------------------------------------------------------
 
+/// Prefix and exact lowercase-hex width of one-time enrollment bootstrap
+/// challenges. Shared by the issuer, API verifier, and agent config parser so
+/// a deployment cannot silently accept different credential shapes.
+pub const AGENT_ENROLLMENT_CHALLENGE_PREFIX: &str = "ryc_";
+pub const AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES: usize = 64;
+
 /// Sent by the agent on `POST /api/agents/register`.
 /// Remains in `Pending` status until an admin approves it and reconciles
 /// capabilities against the trusted inventory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRegistration {
+    /// Identifier of the short-lived enrollment challenge pre-created by an
+    /// administrator or trusted provisioning workflow.
+    pub enrollment_challenge_id: Uuid,
+    /// One-time bootstrap secret returned only when the challenge is created.
+    /// The control plane stores only its SHA-256 digest and consumes it
+    /// atomically with registration.
+    pub enrollment_challenge: String,
     /// Stable agent identifier (e.g. `"defra-vcenter-01"`).
     pub agent_id: String,
     /// Platform / site this agent serves (e.g. `"defra"`).
@@ -171,6 +185,25 @@ pub struct AgentRegistration {
     /// The control plane stores this; every subsequent signed payload from this
     /// agent is verified against it.
     pub public_key: String,
+    /// Base64 Ed25519 signature over the domain-separated enrollment claim.
+    /// This proves possession of the private half of `public_key`; the signed
+    /// bytes also bind the one-time challenge and every identity field above.
+    pub enrollment_proof: String,
+}
+
+impl std::fmt::Debug for AgentRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRegistration")
+            .field("enrollment_challenge_id", &self.enrollment_challenge_id)
+            .field("enrollment_challenge", &"<redacted>")
+            .field("agent_id", &self.agent_id)
+            .field("platform", &self.platform)
+            .field("capabilities", &self.capabilities)
+            .field("public_key", &self.public_key)
+            .field("enrollment_proof", &"<redacted>")
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +344,9 @@ pub struct AgentHeartbeatResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: Uuid,
+    /// Immutable enrollment row of the authenticated assignee returning this
+    /// job. Live grants sign the same id; mismatch is refusal-only.
+    pub agent_enrollment_id: Uuid,
     /// Platform / site this job targets.
     pub platform: String,
     pub spec: JobSpec,
@@ -340,11 +376,183 @@ pub struct JobResult {
     /// Must equal [`SignedEnvelope::result_id`] — the CP enforces this (S3).
     pub result_id: Uuid,
     pub status: JobResultStatus,
+    /// SHA-256 hex digest of the complete canonical raw plan before redaction.
+    /// Required only for a successful `LivePlan` (`status = Planned`) and
+    /// absent for every other mode/status. The control plane equality-checks
+    /// this against [`SignedEnvelope::raw_plan_digest`] before persisting it.
+    pub raw_plan_digest: Option<String>,
     /// SHA-256 hex digest of the (redacted) evidence pack.
     /// The evidence bytes are posted separately (multipart / blob store reference).
     pub evidence_digest: String,
     /// The `SignedEnvelope` that binds all of the above for tamper-evident storage.
     pub signed_envelope: SignedEnvelope,
+}
+
+// ---------------------------------------------------------------------------
+// Execution trust profile — non-secret live-execution provenance
+// ---------------------------------------------------------------------------
+
+/// Canonical schema for the non-secret execution inputs that must remain
+/// identical between an approved `LivePlan` and the later mutation.
+pub const EXECUTION_TRUST_PROFILE_SCHEMA_VERSION: &str = "ryuki.execution-trust-profile.v2";
+/// Closed reviewed-live policy allowlist understood by this protocol version.
+pub const EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION: &str = "ryuki.reviewed-live-allowlist.v2";
+/// Local executable admission policy used by the runner.
+pub const EXECUTABLE_PROVENANCE_POLICY_VERSION: &str = "ryuki.approved-executable.v1";
+/// Only explicitly declared, agent-resolved secret sets may authorize current
+/// live provider credentials. Ambient CLI/default/in-cluster metadata chains
+/// are outside the reviewed profile and fail closed.
+pub const PROVIDER_CREDENTIAL_AUTHORITY_MODE: &str = "ryuki.offering-declared-typed-secret-set.v1";
+/// Canonical namespace for a non-secret operator-managed reference to the
+/// exact vSphere destination/account credential set. The opaque suffix must
+/// identify a provisioning record, never contain a hostname, account name,
+/// credential, tenant id, or other provider-returned value.
+pub const PROVIDER_AUTHORITY_ID_PREFIX: &str = "provider-authority/vsphere/";
+
+/// Canonical namespace for a non-secret operator-managed reference to the
+/// backend credential principal selected by trusted provisioning. The
+/// backend kind is the first path component after this prefix, followed by an
+/// opaque provisioning-record identifier that must not contain credentials,
+/// account names, tenant ids, endpoints, or provider-returned values.
+pub const BACKEND_CREDENTIAL_AUTHORITY_ID_PREFIX: &str = "backend-credential-authority/";
+
+/// Validate the public reference metadata that versions the provider
+/// destination/account credential set. Operators must rotate `version`
+/// whenever any member of that set changes, including VSPHERE_SERVER or
+/// VSPHERE_USER; secret values themselves never enter this protocol.
+pub fn provider_authority_reference_is_canonical(id: &str, version: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(PROVIDER_AUTHORITY_ID_PREFIX) else {
+        return false;
+    };
+    let suffix_valid = !suffix.is_empty()
+        && id.len() <= 256
+        && !suffix.starts_with('/')
+        && !suffix.ends_with('/')
+        && !suffix.contains("//")
+        && suffix.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b'/')
+        });
+    let version_valid = (2..=64).contains(&version.len())
+        && version.starts_with('v')
+        && version.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        });
+    suffix_valid && version_valid
+}
+
+/// Validate the public reference metadata that versions the backend
+/// credential principal. Trusted provisioning must rotate `revision` whenever
+/// the backend principal, destination, or any credential member changes. The
+/// current environment-backed seam validates only this public shape; it does
+/// not prove atomic co-resolution with secret material.
+pub fn backend_credential_authority_reference_is_canonical(
+    backend_kind: &str,
+    id: &str,
+    revision: &str,
+) -> bool {
+    let backend_kind_valid = !backend_kind.is_empty()
+        && backend_kind.len() <= 32
+        && backend_kind.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    let Some(scoped_id) = id.strip_prefix(BACKEND_CREDENTIAL_AUTHORITY_ID_PREFIX) else {
+        return false;
+    };
+    let Some(suffix) = scoped_id
+        .strip_prefix(backend_kind)
+        .and_then(|value| value.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let suffix_valid = backend_kind_valid
+        && !suffix.is_empty()
+        && id.len() <= 256
+        && !suffix.starts_with('/')
+        && !suffix.ends_with('/')
+        && !suffix.contains("//")
+        && suffix.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b'/')
+        });
+    let revision_valid = (2..=64).contains(&revision.len())
+        && revision.starts_with('v')
+        && revision.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        });
+    suffix_valid && revision_valid
+}
+/// Terraform state-containment half enforced by `IsolatedBackendConfig`.
+/// Profile derivation composes this with the runner's exported descendant-
+/// containment version, so either boundary changing invalidates approval.
+pub const TERRAFORM_STATE_ISOLATION_POLICY_VERSION: &str = "ryuki.terraform-isolated-state-key.v1";
+
+/// Full, non-secret live-execution identity reported by the planning agent.
+/// Raw backend HCL, credentials, provider data, and other secret-bearing values
+/// are deliberately absent. Privacy-safe backend and provider authority
+/// fields describe those inputs without exposing them: the backend digest is a
+/// computed commitment, while provider and backend credential authorities are
+/// currently operator-asserted versioned references pending typed atomic
+/// credential co-resolution.
+/// The canonical digest is produced by `execution_trust_profile_digest`; field
+/// order is therefore security-critical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionTrustProfile {
+    pub schema_version: String,
+    pub allowlist_version: String,
+    pub platform: String,
+    /// Exact reviewed offering slug whose embedded provider lock was used.
+    pub offering: String,
+    pub runner_kind: String,
+    pub provider_source: String,
+    pub provider_version: String,
+    /// Stable non-secret reference to the exact provider destination/account
+    /// credential set selected by trusted provisioning.
+    pub provider_authority_id: String,
+    /// Immutable version of `provider_authority_id`; must change whenever any
+    /// destination/account/credential member changes.
+    pub provider_authority_version: String,
+    /// Backend TYPE parsed from the validated agent-local backend template.
+    /// The template and all of its values never cross this boundary.
+    pub backend_kind: String,
+    /// Stable non-secret provisioning-record reference for the exact backend
+    /// credential principal selected by trusted provisioning.
+    pub backend_credential_authority_id: String,
+    /// Immutable revision of `backend_credential_authority_id`; must change
+    /// whenever the backend principal, destination, or credential set changes.
+    pub backend_credential_authority_revision: String,
+    /// SHA-256 commitment to the isolation-validated backend semantics. Secret
+    /// scalars are represented by typed markers and URL credentials are
+    /// sanitized before hashing; raw backend values never cross the boundary.
+    pub backend_authority_digest: String,
+    pub executable_kind: String,
+    /// Canonical path admitted by the runner's existing provenance checks.
+    pub executable_path: String,
+    /// Version identity proven by the runner's bounded executable probe.
+    pub executable_version: String,
+    /// Optional content pin from the existing executable approval policy.
+    pub executable_sha256: Option<String>,
+    pub executable_provenance_policy_version: String,
+    pub provider_credential_authority_mode: String,
+    pub backend_credential_authority_mode: String,
+    pub containment_policy_version: String,
+    pub iac_digest: String,
+    pub state_key: String,
+}
+
+/// Exact plan-owner and execution-profile authority carried by a CP-signed
+/// live grant. The immutable enrollment row prevents an agent-id reuse or key
+/// rotation from inheriting a previously reviewed plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveExecutionAuthority {
+    pub assigned_agent_id: String,
+    pub assigned_agent_enrollment_id: Uuid,
+    pub assigned_agent_key_fingerprint: String,
+    pub execution_trust_profile_digest: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,12 +564,18 @@ pub struct JobResult {
 /// The agent verifies this against the CP's own public key before executing.
 ///
 /// Signable fields (fixed order, see `signing_bytes_vlc`):
-/// `request_id, job_spec_digest, approved_plan_digest, approver, expiry (RFC
-/// 3339), step_job_id`
+/// `request_id, platform, job_spec_digest, approved_plan_digest,
+/// approved_plan_job_id, approved_plan_attempt_id, approver, expiry
+/// (RFC 3339), step_job_id, execution_authority`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedLiveContext {
     /// The upstream change-request id.
     pub request_id: Uuid,
+    /// Exact destination platform/site this grant authorizes. The issuer copies
+    /// the same canonical value into the signed grant and the dispatched
+    /// [`Job`]; the agent refuses a validly signed grant whose value does not
+    /// equal `Job::platform` before any live mutation.
+    pub platform: String,
     /// SHA-256 digest of the exact canonical [`JobSpec`] this grant authorizes.
     /// The agent recomputes it before any live mutation, binding the grant to
     /// the spec's mode, IaC reference/digest, variables, and Terraform state key.
@@ -369,6 +583,14 @@ pub struct VerifiedLiveContext {
     /// SHA-256 hex digest of the plan the approver reviewed.
     /// The agent re-plans and MUST match this before applying.
     pub approved_plan_digest: String,
+    /// Immutable `agent_jobs.id` of the exact successful LivePlan result the
+    /// approver reviewed. A digest is not a unique row identity: two plans can
+    /// produce the same digest under different execution authorities.
+    pub approved_plan_job_id: Uuid,
+    /// Exact leased attempt that produced the approved plan. The CP verifies
+    /// this against both the locked plan row and its signed result envelope
+    /// before minting the grant.
+    pub approved_plan_attempt_id: Uuid,
     /// Identity of the approver (e.g. username or `subject` claim).
     pub approver: String,
     /// Grant expiry (CP DB time).  The agent MUST reject an expired grant.
@@ -377,16 +599,15 @@ pub struct VerifiedLiveContext {
     /// cannot be replayed against a different step or against a later
     /// re-dispatch of the same step (a re-dispatch mints a new job id).
     ///
-    /// `None` means the grant is a legacy/whole-request grant (the original,
-    /// single-job trust model) — behaviourally unchanged from before this
-    /// field existed.  `Some(id)` means the grant is valid ONLY when applied
-    /// against the job whose `Job::id == id`.
-    ///
-    /// `None` is the whole-request grant shape; `Some(id)` is required for
-    /// step-scoped live work. The v2 signing domain intentionally invalidates
-    /// grants created before `job_spec_digest` became mandatory.
+    /// `None` is the whole-request grant shape; `Some(id)` is valid ONLY when
+    /// applied against the job whose `Job::id == id` and is required for
+    /// step-scoped live work. The signing domain is versioned so grants made
+    /// before any required authority field was introduced fail verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_job_id: Option<Uuid>,
+    /// Exact successful-plan owner and canonical execution-profile digest.
+    /// This required field is immutable under the CP signature.
+    pub execution_authority: LiveExecutionAuthority,
     /// Base64-encoded Ed25519 signature over the canonical bytes of the fields
     /// above.  Produced by `sign_vlc`; verified by `verify_vlc`.
     pub signature: String,
@@ -399,11 +620,12 @@ pub struct VerifiedLiveContext {
 /// The redaction policy version the agent stamps into every `SignedEnvelope`
 /// (the agent emits this; the CP recognises it). It is an opaque identifier
 /// SLUG, not a semver number — bump it (e.g. `ryuki-redaction-v2`) when the
-/// redaction rules change, and add the new value to
+/// redaction rules change, and place the new value in
 /// [`SUPPORTED_REDACTION_POLICY_VERSIONS`] so the CP will accept results under
-/// it. Both sides reference this one constant so emission and acceptance can
-/// never silently drift.
-pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
+/// it. Superseded policies with known gaps must be removed rather than retained
+/// for compatibility. Both sides reference this one constant so emission and
+/// acceptance can never silently drift.
+pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v2";
 
 /// The closed set of `redaction_policy_version` values the control plane will
 /// accept at result ingestion. `redaction_policy_version` is the ONE
@@ -414,6 +636,13 @@ pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
 /// cannot interpret. Keep this in lockstep with the policies the CP actually
 /// understands.
 pub const SUPPORTED_REDACTION_POLICY_VERSIONS: &[&str] = &[REDACTION_POLICY_VERSION];
+
+/// Exact schema identifier for the only Terraform live-plan evidence envelope
+/// that may cross the runner/control-plane boundary. The runner emits this and
+/// approval parsing requires it, preventing legacy full-plan JSON from being
+/// mistaken for a safe projection.
+pub const TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION: &str =
+    "ryuki.terraform.live-plan-evidence.v1";
 
 // ---------------------------------------------------------------------------
 // Wire protocol version — the CP↔agent schema-compatibility marker
@@ -442,7 +671,32 @@ pub const SUPPORTED_REDACTION_POLICY_VERSIONS: &[&str] = &[REDACTION_POLICY_VERS
 /// local backend, and only reveal the mismatch when the CP rejects its result
 /// digest after execution. This version is therefore intentionally not
 /// interoperable with v1 for any job mode.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 3 replaces first-writer public enrollment with a preprovisioned,
+/// single-use challenge and an Ed25519 proof-of-possession signature. A v2
+/// agent cannot produce those required registration fields, so v2 and v3 are
+/// intentionally not interoperable at the enrollment boundary.
+///
+/// Version 4 adds the required destination `platform` to the CP-signed
+/// [`VerifiedLiveContext`] and moves that grant to a new signing domain. A v3
+/// peer or legacy grant cannot be interpreted without this mutation-authority
+/// binding, so the cutover intentionally rejects v3 rather than running a
+/// mixed-signing-domain fleet.
+///
+/// Version 5 binds every mutation grant to the successful planning agent's
+/// immutable enrollment/key and to a canonical non-secret execution trust
+/// profile. It also signs that full profile into every successful live result.
+/// Legacy v4 grants and v2 result signatures are intentionally rejected.
+///
+/// Version 6 binds every grant to the exact immutable successful-plan job and
+/// leased attempt, binds every result to the exact immutable agent enrollment,
+/// and advances the trust-profile schema for provider/backend authority. Legacy
+/// v5 digest-only grants and v3 result signatures are intentionally rejected.
+/// Version 6 also adds `raw_plan_digest` as an additive-optional trailing signed
+/// field. Its `None` encoding contributes zero bytes, preserving existing v6
+/// signatures, while result validation requires `Some` for every successful
+/// LivePlan so legacy redacted-digest commitments fail closed at ingestion.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The closed set of wire-protocol versions a peer will accept, gated
 /// fail-closed exactly like [`SUPPORTED_REDACTION_POLICY_VERSIONS`]. During a
@@ -450,7 +704,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// interoperates, then narrow to `&[N]` once every peer is upgraded. Both the CP
 /// (accepting agent requests) and the agent (accepting the CP's advertised
 /// version) reference this ONE constant, so emission and acceptance cannot drift.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[2];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[6];
 
 /// The version an absent [`PROTOCOL_VERSION_HEADER`] is resolved to. A peer that
 /// predates protocol versioning sends no header; it is, by definition, speaking
@@ -475,17 +729,23 @@ pub const PROTOCOL_VERSION_HEADER: &str = "x-ryuki-protocol-version";
 /// rejects stale attempts via `(attempt_id, lease_generation, cp_nonce)`.
 ///
 /// **Signable fields** (fixed order — everything except `signature`; domain
-/// separator `ryuki-v2/signed-envelope`):
-/// `agent_id, platform, job_id, attempt_id, lease_generation, request_id,
+/// separator `ryuki-v4/signed-envelope`):
+/// `agent_id, agent_enrollment_id, platform, job_id, attempt_id, lease_generation, request_id,
 ///  result_id, mode (serialised), status (serialised), job_spec_digest,
-///  approved_plan_digest, evidence_digest, redaction_policy_version,
-///  timestamp (RFC 3339), key_id, cp_nonce`
+///  approved_plan_digest, execution_trust_profile, evidence_digest,
+///  redaction_policy_version, timestamp (RFC 3339), key_id, cp_nonce,
+///  raw_plan_digest (additive-optional trailing field)`
 ///
 /// `result_id` MUST equal [`JobResult::result_id`]; the CP equality-checks this
 /// in S3 to prevent `result_id` forgery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedEnvelope {
     pub agent_id: String,
+    /// Immutable UUID of the exact agent enrollment that authenticated and
+    /// signed this result. Human-readable `agent_id` values and signing keys
+    /// may be reused only by a later enrollment; this value prevents that
+    /// later row from inheriting an earlier result's authority.
+    pub agent_enrollment_id: Uuid,
     pub platform: String,
     pub job_id: Uuid,
     pub attempt_id: Uuid,
@@ -503,10 +763,20 @@ pub struct SignedEnvelope {
     pub job_spec_digest: String,
     /// SHA-256 hex digest of the approved plan — `None` for non-`LiveApply` modes.
     pub approved_plan_digest: Option<String>,
+    /// SHA-256 hex digest of the complete canonical raw plan before redaction.
+    /// Required only for `LivePlan + Planned`; all other mode/status pairs must
+    /// carry `None`. This is deliberately distinct from `evidence_digest`,
+    /// which commits only to the safe post-redaction evidence pack.
+    pub raw_plan_digest: Option<String>,
+    /// Full canonical, non-secret live execution profile. Required by the CP
+    /// for successful LivePlan/LiveApply/LiveDestroy results and absent for
+    /// offline or refused outcomes. Its canonical digest is signed, so neither
+    /// JSON field order nor unknown extension fields can alter its meaning.
+    pub execution_trust_profile: Option<ExecutionTrustProfile>,
     /// SHA-256 hex digest of the (post-redaction) evidence pack.
     pub evidence_digest: String,
     /// Identifier of the redaction policy the agent applied — an opaque slug
-    /// (e.g. [`REDACTION_POLICY_VERSION`] = `"ryuki-redaction-v1"`), NOT a semver
+    /// (e.g. [`REDACTION_POLICY_VERSION`] = `"ryuki-redaction-v2"`), NOT a semver
     /// number. The CP accepts only values in
     /// [`SUPPORTED_REDACTION_POLICY_VERSIONS`] at ingestion.
     pub redaction_policy_version: String,
@@ -527,6 +797,48 @@ pub struct SignedEnvelope {
 #[cfg(test)]
 mod result_status_tests {
     use super::*;
+
+    #[test]
+    fn provider_authority_reference_is_closed_and_non_secret_shaped() {
+        assert!(provider_authority_reference_is_canonical(
+            "provider-authority/vsphere/defra-prod-fixture",
+            "v17"
+        ));
+        for (id, version) in [
+            ("vsphere/fixture", "v1"),
+            ("provider-authority/vsphere/", "v1"),
+            ("provider-authority/vsphere/private host", "v1"),
+            ("provider-authority/vsphere/fixture", "1"),
+            ("provider-authority/vsphere/fixture", "V1"),
+        ] {
+            assert!(!provider_authority_reference_is_canonical(id, version));
+        }
+    }
+
+    #[test]
+    fn backend_credential_authority_reference_is_closed_kind_scoped_and_non_secret_shaped() {
+        assert!(backend_credential_authority_reference_is_canonical(
+            "s3",
+            "backend-credential-authority/s3/defra-prod-fixture",
+            "v17"
+        ));
+        for (kind, id, revision) in [
+            ("s3", "s3/fixture", "v1"),
+            ("s3", "backend-credential-authority/s3/", "v1"),
+            (
+                "s3",
+                "backend-credential-authority/s3/private account",
+                "v1",
+            ),
+            ("s3", "backend-credential-authority/http/fixture", "v1"),
+            ("s3", "backend-credential-authority/s3/fixture", "1"),
+            ("s3", "backend-credential-authority/s3/fixture", "V1"),
+        ] {
+            assert!(!backend_credential_authority_reference_is_canonical(
+                kind, id, revision
+            ));
+        }
+    }
 
     #[test]
     fn result_status_matrix_is_fail_closed() {

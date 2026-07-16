@@ -6,12 +6,12 @@
 //! records a `job_executions` row, and advances `next_run_at` off the DB clock.
 //!
 //! Design choices that matter:
-//! - **Leader election:** each tick takes a transaction-scoped advisory lock
-//!   ([`pg_try_advisory_xact_lock`]). Only one replica wins a given tick; the
-//!   others no-op. The lock auto-releases at COMMIT/ROLLBACK, so a crashed
-//!   leader never wedges the schedule.
-//! - **Claim:** `FOR UPDATE SKIP LOCKED` lets the (single) leader claim due rows
-//!   without blocking on any row another transaction holds.
+//! - **Leader election:** each tick takes a session advisory lock on a dedicated
+//!   close-on-drop connection. Only one replica wins; cancellation or crash
+//!   closes that connection and releases the lock.
+//! - **Short claims:** the leader revalidates and locks each due schedule in its
+//!   own top-level transaction. Population scans commit one bounded page at a
+//!   time instead of retaining one transaction across the whole tick.
 //! - **No backfill storms:** an overdue schedule advances to `NOW() + interval`,
 //!   not `last + interval`, so a leader that was down does NOT replay every
 //!   missed run — it resumes on the normal cadence.
@@ -21,7 +21,9 @@
 //! The pure scheduling math (validation, due predicate, next-run, read-only
 //! classifier) lives in `ryuki_engine::scheduler` and is unit-tested there.
 
-use sqlx::{Acquire, PgPool, Postgres, Transaction};
+use crate::repos::shift_queue::ShiftQueueAuthority;
+use sha2::{Digest, Sha256};
+use sqlx::{Acquire, PgConnection, PgPool, Postgres, Transaction};
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 /// Advisory-lock key for the tick leader election. Distinct from every other
@@ -32,6 +34,34 @@ const SCHEDULER_TICK_LOCK_KEY: i64 = 0x5343_4845_4400;
 /// Most due schedules a single tick will claim and run. A safety bound so one
 /// tick cannot do unbounded work; remaining due rows are picked up next tick.
 const MAX_BATCH: i64 = 100;
+
+/// Hard row ceiling for each population-backed scan page. Repository helpers
+/// independently reject wider limits so a future caller cannot widen it.
+const POPULATION_SCAN_BATCH: i64 = 100;
+
+/// Physical dispatcher protocol installed by migration 163.  Versioned names
+/// are deliberately unknown to a pre-migration binary, fencing its unbounded
+/// job arms after the migration's drain lock commits.
+const POPULATION_SCAN_PROTOCOL_VERSION: i16 = 2;
+const RESTORE_SCAN_JOB_KIND: &str = "restore_overdue_scan_v2";
+const GOLDEN_IMAGE_SCAN_JOB_KIND: &str = "golden_image_stale_scan_v2";
+const SECRET_ROTATION_SCAN_JOB_KIND: &str = "secret_rotation_due_scan_v2";
+
+/// Digest an untrusted legacy tuple with length framing. Only this bounded key
+/// reaches the global queue; raw malformed/oversized authority never does.
+fn restore_authority_quarantine_key(source_ci_key: &str, site: &str, environment: &str) -> String {
+    let mut digest = Sha256::new();
+    for component in [source_ci_key, site, environment] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("restore-authority-{:x}", digest.finalize())
+}
+
+/// Bounded scans continue promptly after a full page. This is also the engine's
+/// minimum legal schedule interval; the normal configured cadence resumes only
+/// after a short/empty page proves cycle exhaustion.
+const POPULATION_SCAN_CONTINUATION_SECS: i64 = 10;
 
 /// How far ahead `maintain_review_scan` (#39) advances a request's
 /// `next_maintain_review_at` after flagging it — the recurring operational-review
@@ -61,6 +91,178 @@ struct DueSchedule {
     id: String,
     job_kind: String,
     interval_secs: i64,
+}
+
+/// Durable progress for one schedule definition's active population cycle.
+#[derive(sqlx::FromRow)]
+struct ScanProgress {
+    job_kind: String,
+    protocol_version: i16,
+    cursor_seq: i64,
+    high_water_seq: i64,
+    cycle_cutoff: chrono::DateTime<chrono::Utc>,
+}
+
+fn is_population_scan(job_kind: &str) -> bool {
+    job_kind == RESTORE_SCAN_JOB_KIND
+        || job_kind == GOLDEN_IMAGE_SCAN_JOB_KIND
+        || job_kind == SECRET_ROTATION_SCAN_JOB_KIND
+}
+
+fn is_legacy_population_scan(job_kind: &str) -> bool {
+    job_kind == "restore_overdue_scan"
+        || job_kind == "golden_image_stale_scan"
+        || job_kind == "secret_rotation_due_scan"
+}
+
+/// Verify the database dispatcher version and mark this transaction as a v2
+/// population scheduler before any job work.  Migration 163's schedule trigger
+/// rejects advancement without this transaction-local marker, so an old binary
+/// can neither execute the renamed branch nor steal it as an "unsupported" job.
+/// The inverse ordering also fails closed: this binary rejects persisted v1
+/// population kinds before the generic unsupported-job branch can advance them.
+async fn admit_population_scan_protocol(
+    tx: &mut Transaction<'_, Postgres>,
+    job_kind: &str,
+) -> Result<(), sqlx::Error> {
+    if is_legacy_population_scan(job_kind) {
+        return Err(sqlx::Error::Protocol(
+            "population scheduler protocol v1 is fenced; migration 163 is required".to_string(),
+        ));
+    }
+    if !is_population_scan(job_kind) {
+        return Ok(());
+    }
+    let installed: i16 = sqlx::query_scalar(
+        "SELECT protocol_version FROM scheduler_protocol_versions \
+         WHERE component = 'population_scan'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if installed != POPULATION_SCAN_PROTOCOL_VERSION {
+        return Err(sqlx::Error::Protocol(format!(
+            "population scheduler protocol mismatch: database={installed}, binary={POPULATION_SCAN_PROTOCOL_VERSION}"
+        )));
+    }
+    let configured: String =
+        sqlx::query_scalar("SELECT set_config('ryuki.scheduler_population_protocol', $1, true)")
+            .bind(POPULATION_SCAN_PROTOCOL_VERSION.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    if configured != POPULATION_SCAN_PROTOCOL_VERSION.to_string() {
+        return Err(sqlx::Error::Protocol(
+            "database refused the population scheduler protocol marker".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn load_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+) -> Result<Option<ScanProgress>, sqlx::Error> {
+    let progress: Option<ScanProgress> = sqlx::query_as(
+        "SELECT job_kind, protocol_version, cursor_seq, high_water_seq, cycle_cutoff \
+         FROM scheduler_scan_progress \
+         WHERE schedule_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(schedule_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match progress {
+        Some(progress)
+            if progress.job_kind == job_kind
+                && progress.protocol_version == POPULATION_SCAN_PROTOCOL_VERSION =>
+        {
+            Ok(Some(progress))
+        }
+        Some(_) => {
+            // An administrator repurposed this schedule definition between
+            // cycles/pages. Old progress belongs to a different population and
+            // must not poison the new job or be interpreted under its keyspace.
+            sqlx::query("DELETE FROM scheduler_scan_progress WHERE schedule_id = $1")
+                .bind(schedule_id)
+                .execute(&mut **tx)
+                .await?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+async fn start_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+    high_water_seq: i64,
+    cycle_cutoff: chrono::DateTime<chrono::Utc>,
+) -> Result<ScanProgress, sqlx::Error> {
+    if high_water_seq < 0 {
+        return Err(sqlx::Error::Protocol(
+            "population scan high-water mark must be non-negative".to_string(),
+        ));
+    }
+    sqlx::query_as(
+        "INSERT INTO scheduler_scan_progress \
+         (schedule_id, job_kind, protocol_version, cursor_seq, high_water_seq, cycle_cutoff) \
+         VALUES ($1, $2, $3, 0, $4, $5) \
+         RETURNING job_kind, protocol_version, cursor_seq, high_water_seq, cycle_cutoff",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .bind(POPULATION_SCAN_PROTOCOL_VERSION)
+    .bind(high_water_seq)
+    .bind(cycle_cutoff)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn advance_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+    cursor_seq: i64,
+) -> Result<(), sqlx::Error> {
+    // RETURNING makes a missing/mismatched state row a hard error. Silently
+    // advancing the schedule without durable progress would starve later keys.
+    let _: i64 = sqlx::query_scalar(
+        "UPDATE scheduler_scan_progress \
+         SET cursor_seq = $3, updated_at = clock_timestamp() \
+         WHERE schedule_id = $1 AND job_kind = $2 \
+           AND cursor_seq < $3 AND $3 <= high_water_seq \
+         RETURNING cursor_seq",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .bind(cursor_seq)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn finish_scan_progress(
+    tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
+    job_kind: &str,
+) -> Result<(), sqlx::Error> {
+    let deleted = sqlx::query(
+        "DELETE FROM scheduler_scan_progress \
+         WHERE schedule_id = $1 AND job_kind = $2",
+    )
+    .bind(schedule_id)
+    .bind(job_kind)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if deleted == 1 {
+        Ok(())
+    } else {
+        Err(sqlx::Error::Protocol(
+            "population scan completed without its locked progress row".to_string(),
+        ))
+    }
 }
 
 /// A schedule as exposed by the read API. No secrets live on a schedule, so the
@@ -232,6 +434,7 @@ fn live_recheck_spec_matches_request(
 
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
+    schedule_id: &str,
     job_kind: &str,
 ) -> Result<(String, Option<String>), sqlx::Error> {
     if !ryuki_engine::scheduler::job_is_schedulable(job_kind) {
@@ -382,29 +585,86 @@ async fn run_job(
                 Some(format!("probed {} connection(s)", connections.len())),
             ))
         }
-        "restore_overdue_scan" => {
-            // Safe-internal write (#52): READ restore-test recency across ALL
-            // sites (the scheduler is a platform-wide internal principal, not
-            // scoped, so site/env are None), classify each system with the PURE
-            // engine, and enqueue ONE deduped shift_queue work item per AT-RISK
-            // system. Reads restore_requests and writes only our own shift_queue
-            // — NO provider/live call. All on `tx`, so a failure rolls back with
-            // this schedule's savepoint. `detail` is kept aggregate-only (a
-            // count) — never per-system ids — because it is surfaced via
-            // /api/ops/scheduler/executions.
-            let rows =
-                crate::repos::restore_requests::restore_test_recency(&mut **tx, None, None).await?;
-            let now_unix = chrono::Utc::now().timestamp();
+        "restore_overdue_scan_v2" => {
+            // Safe-internal write (#52): one immutable first-seen keyset page of
+            // systems per invocation. The fixed high-water mark excludes later
+            // sequence allocations, so concurrent restore planning cannot extend
+            // this cycle. A lower sequence that commits late is revisited after
+            // cycle exhaustion resets the cursor. The page query derives BOTH
+            // recency and latest status and returns at most
+            // POPULATION_SCAN_BATCH rows; therefore
+            // this transaction makes at most 2 * POPULATION_SCAN_BATCH enqueue
+            // attempts. Queue effects and cursor movement commit together.
+            let page_started = std::time::Instant::now();
+            let progress = match load_scan_progress(tx, schedule_id, job_kind).await? {
+                Some(progress) => progress,
+                None => {
+                    let high_water =
+                        crate::repos::restore_requests::scheduler_scan_high_water(&mut **tx)
+                            .await?;
+                    let cycle_cutoff: chrono::DateTime<chrono::Utc> =
+                        sqlx::query_scalar("SELECT clock_timestamp()")
+                            .fetch_one(&mut **tx)
+                            .await?;
+                    start_scan_progress(tx, schedule_id, job_kind, high_water, cycle_cutoff).await?
+                }
+            };
+            let rows = crate::repos::restore_requests::scheduler_scan_page(
+                &mut **tx,
+                progress.cursor_seq,
+                progress.high_water_seq,
+                POPULATION_SCAN_BATCH,
+            )
+            .await?;
+            let now_unix = progress.cycle_cutoff.timestamp();
             let overdue_after_secs = RESTORE_OVERDUE_DAYS * 86_400;
             let mut enqueued: u64 = 0;
+            let mut failed_enqueued: u64 = 0;
+            let mut authority_quarantine_enqueued: u64 = 0;
+            let mut invalid_authority: u64 = 0;
             for row in &rows {
-                // Skip a degenerate empty asset key (source_ci_key is NOT NULL but
-                // has no non-empty CHECK in mig 007): enqueue_if_absent rejects an
-                // empty key, and letting that `?` propagate would abort the WHOLE
-                // tick on every scan — one malformed row poisoning fan-out for every
-                // healthy system. Skip it instead (the recency aggregate would have
-                // grouped it as a degenerate identity anyway).
-                if row.source_ci_key.trim().is_empty() {
+                // Migration 186 classifies legacy provenance and tuple shape.
+                // Emit a durable, digest-only global signal in this SAME
+                // transaction before advancing the cursor. A malformed row is
+                // therefore never silently skipped and never reaches the typed
+                // resource-key writer.
+                if row.authority_quarantined
+                    || !ryuki_engine::backup_engine::is_canonical_restore_authority_component(
+                        &row.source_ci_key,
+                    )
+                    || !ryuki_engine::backup_engine::is_canonical_restore_authority_component(
+                        &row.site,
+                    )
+                    || !ryuki_engine::backup_engine::is_canonical_restore_authority_component(
+                        &row.environment,
+                    )
+                {
+                    invalid_authority += 1;
+                    let quarantine_key = restore_authority_quarantine_key(
+                        &row.source_ci_key,
+                        &row.site,
+                        &row.environment,
+                    );
+                    let metadata = serde_json::json!({
+                        "source_ci_key": quarantine_key.clone(),
+                        "reason": "restore_authority_requires_replan",
+                        "source_ci_key_bytes": row.source_ci_key.len(),
+                        "site_bytes": row.site.len(),
+                        "environment_bytes": row.environment.len(),
+                    })
+                    .to_string();
+                    authority_quarantine_enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                        &mut **tx,
+                        crate::repos::shift_queue::RESTORE_AUTHORITY_QUARANTINED_ITEM_TYPE,
+                        &quarantine_key,
+                        ShiftQueueAuthority::Global,
+                        "Restore authority requires replan",
+                        "A restore-history authority tuple or its maker/checker provenance is \
+                             quarantined. Replan the restore from verified canonical inputs.",
+                        "P1",
+                        &metadata,
+                    )
+                    .await?;
                     continue;
                 }
                 let last_unix = row.last_successful_test.map(|t| t.timestamp());
@@ -413,67 +673,62 @@ async fn run_job(
                     now_unix,
                     overdue_after_secs,
                 );
-                if !recency.is_at_risk() {
+                if recency.is_at_risk() {
+                    let reason = recency.as_str();
+                    // source_ci_key is a config-item identifier (an asset key, not a
+                    // secret) — the same value the public #47 read endpoint returns.
+                    let title = format!("Restore test {reason}: {}", row.source_ci_key);
+                    // Title AND description both key off the single classifier verdict
+                    // (`recency`) so they can never diverge (codex): the verdict is the
+                    // one source of truth for overdue-vs-never-tested, not a second
+                    // read of the Option.
+                    let description = match recency {
+                        ryuki_engine::backup_recency::RestoreTestRecency::NeverTested => format!(
+                            "No successful restore test on record ({} request(s), 0 verified). \
+                             Verify recoverability.",
+                            row.total_requests
+                        ),
+                        _ => {
+                            let last = row
+                                .last_successful_test
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            format!(
+                                "No successful restore test in over {RESTORE_OVERDUE_DAYS} days \
+                                 (last success: {last}). Verify recoverability."
+                            )
+                        }
+                    };
+                    let metadata = serde_json::json!({
+                        "source_ci_key": row.source_ci_key,
+                        "last_successful_test": row.last_successful_test.map(|t| t.to_rfc3339()),
+                        "successful_test_count": row.successful_test_count,
+                        "reason": reason,
+                    })
+                    .to_string();
+                    enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                        &mut **tx,
+                        crate::repos::shift_queue::RESTORE_OVERDUE_ITEM_TYPE,
+                        &row.source_ci_key,
+                        ShiftQueueAuthority::Resource {
+                            site: &row.site,
+                            environment: Some(&row.environment),
+                        },
+                        &title,
+                        &description,
+                        "P2",
+                        &metadata,
+                    )
+                    .await?;
+                }
+
+                // Second signal (#52 slice 2): the same bounded system row also
+                // carries the status of its latest request. A system may
+                // legitimately receive both distinct item types.
+                if row.latest_status != "Failed" {
                     continue;
                 }
-                let reason = recency.as_str();
-                // source_ci_key is a config-item identifier (an asset key, not a
-                // secret) — the same value the public #47 read endpoint returns.
-                let title = format!("Restore test {reason}: {}", row.source_ci_key);
-                // Title AND description both key off the single classifier verdict
-                // (`recency`) so they can never diverge (codex): the verdict is the
-                // one source of truth for overdue-vs-never-tested, not a second
-                // read of the Option.
-                let description = match recency {
-                    ryuki_engine::backup_recency::RestoreTestRecency::NeverTested => format!(
-                        "No successful restore test on record ({} request(s), 0 verified). \
-                         Verify recoverability.",
-                        row.total_requests
-                    ),
-                    _ => {
-                        let last = row
-                            .last_successful_test
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        format!(
-                            "No successful restore test in over {RESTORE_OVERDUE_DAYS} days \
-                             (last success: {last}). Verify recoverability."
-                        )
-                    }
-                };
-                let metadata = serde_json::json!({
-                    "source_ci_key": row.source_ci_key,
-                    "last_successful_test": row.last_successful_test.map(|t| t.to_rfc3339()),
-                    "successful_test_count": row.successful_test_count,
-                    "reason": reason,
-                })
-                .to_string();
-                enqueued += crate::repos::shift_queue::enqueue_if_absent(
-                    &mut **tx,
-                    crate::repos::shift_queue::RESTORE_OVERDUE_ITEM_TYPE,
-                    &row.source_ci_key,
-                    &title,
-                    &description,
-                    "P2",
-                    &metadata,
-                )
-                .await?;
-            }
-            // Second signal (#52 slice 2): systems whose MOST RECENT restore test
-            // FAILED — a known, fresh recoverability failure (vs merely stale).
-            // Blank asset keys are skipped PER-ROW below (in Rust, matching
-            // enqueue_if_absent's trim()), so any whitespace key is excluded. A
-            // system can receive BOTH an overdue AND a failed item (distinct
-            // signals, distinct item_types); dedup is per item_type.
-            let failed = crate::repos::restore_requests::latest_failed_systems(&mut **tx).await?;
-            let mut failed_enqueued: u64 = 0;
-            for source_ci_key in &failed {
-                // Skip a blank asset key with the SAME trim() check enqueue_if_absent
-                // uses, so a tab/newline/space-only key can never abort the tick
-                // (mirrors the overdue arm). The query no longer SQL-filters blanks.
-                if source_ci_key.trim().is_empty() {
-                    continue;
-                }
+                let source_ci_key = &row.source_ci_key;
                 let title = format!("Restore test FAILED (latest): {source_ci_key}");
                 let description = "The most recent restore test for this system FAILED. \
                                    Investigate recoverability."
@@ -487,6 +742,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::RESTORE_FAILED_ITEM_TYPE,
                     source_ci_key,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: Some(&row.environment),
+                    },
                     &title,
                     &description,
                     "P2",
@@ -494,10 +753,39 @@ async fn run_job(
                 )
                 .await?;
             }
+
+            let continuation = rows.len() == POPULATION_SCAN_BATCH as usize;
+            if continuation {
+                let last = rows
+                    .last()
+                    .expect("a full positive-sized restore page has a last row");
+                advance_scan_progress(tx, schedule_id, job_kind, last.scan_seq).await?;
+            } else {
+                finish_scan_progress(tx, schedule_id, job_kind).await?;
+            }
+            tracing::info!(
+                schedule = %schedule_id,
+                job_kind = %job_kind,
+                rows_scanned = rows.len(),
+                enqueue_attempt_ceiling = rows.len().saturating_mul(2),
+                inserted_items = enqueued
+                    .saturating_add(failed_enqueued)
+                    .saturating_add(authority_quarantine_enqueued),
+                invalid_authority_rows = invalid_authority,
+                high_water_seq = progress.high_water_seq,
+                cursor_seq = rows
+                    .last()
+                    .map(|row| row.scan_seq)
+                    .unwrap_or(progress.cursor_seq),
+                continuation,
+                page_duration_ms = page_started.elapsed().as_millis() as u64,
+                "bounded scheduler population page completed"
+            );
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
-                    "enqueued {enqueued} overdue, {failed_enqueued} failed restore item(s)"
+                    "enqueued {enqueued} overdue, {failed_enqueued} failed, \
+                     {authority_quarantine_enqueued} quarantined restore item(s)"
                 )),
             ))
         }
@@ -545,9 +833,8 @@ async fn run_job(
                      Schedule a DR test to verify recoverability.",
                     plan.name, plan.site, plan.next_test_due, last
                 );
-                // `source_ci_key` is the plan id — the enqueue_if_absent dedup predicate
-                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
-                // partial unique index (uq_shift_queue_open_dr_test_overdue) to agree.
+                // Keep the descriptive metadata key aligned with the typed
+                // source identity; authorization and dedup use the typed tuple.
                 let metadata = serde_json::json!({
                     "source_ci_key": plan.id,
                     "site": plan.site,
@@ -559,6 +846,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::DR_TEST_OVERDUE_ITEM_TYPE,
                     &plan.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &plan.site,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     "P2",
@@ -614,9 +905,8 @@ async fn run_job(
                      or reschedule.",
                     wave.scheduled_start
                 );
-                // `source_ci_key` is the wave id — the enqueue_if_absent dedup predicate
-                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
-                // partial unique index (uq_shift_queue_open_patch_wave_overdue) to agree.
+                // Keep the descriptive metadata key aligned with the typed
+                // source identity; authorization and dedup use the typed tuple.
                 let metadata = serde_json::json!({
                     "source_ci_key": wave.id,
                     "scheduled_start": wave.scheduled_start,
@@ -626,6 +916,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::PATCH_WAVE_OVERDUE_ITEM_TYPE,
                     &wave.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &wave.site,
+                        environment: wave.environment.as_deref(),
+                    },
                     &title,
                     &description,
                     "P2",
@@ -640,26 +934,59 @@ async fn run_job(
                 )),
             ))
         }
-        "golden_image_stale_scan" => {
-            // Safe-internal write (#60): READ promoted golden images whose build_date is
-            // older than the monthly refresh window (GOLDEN_IMAGE_STALE_DAYS) — the live
-            // base image has missed its rebuild and lacks recent patches — and enqueue ONE
-            // deduped shift_queue item per stale image. Reads golden_images, writes only
-            // our own shift_queue — NO provider/live/destructive call. The SQL date filter
-            // does the staleness selection on the real build_date column (no parse). All on
-            // `tx` (rolls back with this schedule's savepoint). `detail` is aggregate-only
-            // (counts, never per-image ids) — surfaced via /api/ops/scheduler/executions.
-            let stale = crate::repos::golden_images::stale_promoted_images(
+        "golden_image_stale_scan_v2" => {
+            // Safe-internal write (#60): process one immutable scan_seq page and
+            // evaluate every continuation against the SAME database-clock cutoff.
+            // Later sequence allocations sit above the fixed high-water mark
+            // and wait for the next cycle. One page means at most
+            // POPULATION_SCAN_BATCH rows and enqueue attempts in this transaction.
+            let page_started = std::time::Instant::now();
+            let progress = match load_scan_progress(tx, schedule_id, job_kind).await? {
+                Some(progress) => progress,
+                None => {
+                    let high_water =
+                        crate::repos::golden_images::stale_scan_high_water(&mut **tx).await?;
+                    let cycle_cutoff: chrono::DateTime<chrono::Utc> =
+                        sqlx::query_scalar("SELECT clock_timestamp()")
+                            .fetch_one(&mut **tx)
+                            .await?;
+                    start_scan_progress(tx, schedule_id, job_kind, high_water, cycle_cutoff).await?
+                }
+            };
+            let stale_before = progress
+                .cycle_cutoff
+                .checked_sub_signed(chrono::Duration::days(i64::from(GOLDEN_IMAGE_STALE_DAYS)))
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol(
+                        "golden-image scan cutoff underflowed its stale window".to_string(),
+                    )
+                })?;
+            let page = crate::repos::golden_images::scheduler_scan_page(
                 &mut **tx,
-                GOLDEN_IMAGE_STALE_DAYS,
+                progress.cursor_seq,
+                progress.high_water_seq,
+                POPULATION_SCAN_BATCH,
             )
             .await?;
+            let mut stale_count: u64 = 0;
             let mut enqueued: u64 = 0;
-            for img in &stale {
-                // A blank id can't be a dedup key (enqueue_if_absent rejects it) — skip it.
-                if img.id.trim().is_empty() {
+            let mut invalid_authority: u64 = 0;
+            for img in &page {
+                // Cursor advancement is based on the raw population page. Apply
+                // status and staleness only after LIMIT so fresh/non-promoted
+                // rows cannot hide later sequences or end a cycle early.
+                if img.status != "promoted" || img.build_date >= stale_before {
                     continue;
                 }
+                if !ryuki_engine::backup_engine::is_canonical_restore_authority_component(&img.id)
+                    || !ryuki_engine::backup_engine::is_canonical_restore_authority_component(
+                        &img.site_scope,
+                    )
+                {
+                    invalid_authority += 1;
+                    continue;
+                }
+                stale_count += 1;
                 let title = format!("Golden image stale: {}", img.image_name);
                 let description = format!(
                     "Golden image '{}' ({}) was last built {} — over {GOLDEN_IMAGE_STALE_DAYS} \
@@ -669,9 +996,8 @@ async fn run_job(
                     img.site_scope,
                     img.build_date.to_rfc3339()
                 );
-                // `source_ci_key` is the image id — the enqueue_if_absent dedup predicate
-                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
-                // partial unique index (uq_shift_queue_open_golden_image_stale) to agree.
+                // Keep the descriptive metadata key aligned with the typed
+                // source identity; authorization and dedup use the typed tuple.
                 let metadata = serde_json::json!({
                     "source_ci_key": img.id,
                     "image_name": img.image_name,
@@ -685,6 +1011,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::GOLDEN_IMAGE_STALE_ITEM_TYPE,
                     &img.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &img.site_scope,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     "P3",
@@ -692,11 +1022,35 @@ async fn run_job(
                 )
                 .await?;
             }
+            let continuation = page.len() == POPULATION_SCAN_BATCH as usize;
+            if continuation {
+                let last = page
+                    .last()
+                    .expect("a full positive-sized golden-image page has a last row");
+                advance_scan_progress(tx, schedule_id, job_kind, last.scan_seq).await?;
+            } else {
+                finish_scan_progress(tx, schedule_id, job_kind).await?;
+            }
+            tracing::info!(
+                schedule = %schedule_id,
+                job_kind = %job_kind,
+                rows_scanned = page.len(),
+                enqueue_attempt_ceiling = page.len(),
+                inserted_items = enqueued,
+                invalid_authority_rows = invalid_authority,
+                high_water_seq = progress.high_water_seq,
+                cursor_seq = page
+                    .last()
+                    .map(|row| row.scan_seq)
+                    .unwrap_or(progress.cursor_seq),
+                continuation,
+                page_duration_ms = page_started.elapsed().as_millis() as u64,
+                "bounded scheduler population page completed"
+            );
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
-                    "{} golden image(s) stale, {enqueued} enqueued",
-                    stale.len()
+                    "{stale_count} golden image(s) stale, {enqueued} enqueued"
                 )),
             ))
         }
@@ -748,9 +1102,8 @@ async fn run_job(
                      configuration.",
                     row.site, row.environment
                 );
-                // `source_ci_key` is the request id — the enqueue_if_absent dedup predicate
-                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
-                // partial unique index (uq_shift_queue_open_drift_recheck_overdue) to agree.
+                // Keep the descriptive metadata key aligned with the typed
+                // source identity; authorization and dedup use the typed tuple.
                 let metadata = serde_json::json!({
                     "source_ci_key": request_id,
                     "site": row.site,
@@ -763,6 +1116,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::DRIFT_RECHECK_OVERDUE_ITEM_TYPE,
                     &request_id,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: Some(&row.environment),
+                    },
                     &title,
                     &description,
                     priority,
@@ -884,11 +1241,24 @@ async fn run_job(
             // true) but documents that indefinite suppressions are deliberately left alone.
             // All on `tx`, so a failure rolls back with this schedule's savepoint. `detail`
             // is aggregate-only (a count) — surfaced via /api/ops/scheduler/executions.
+            // Acquire the site-authority lock in a separate statement first. If a
+            // registry mutation was in flight, the following UPDATE receives a
+            // fresh READ COMMITTED snapshot after that generation fence commits.
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock( \
+                     hashtextextended('ryuki.noisy-trigger-site-authority', 0) \
+                 )",
+            )
+            .execute(&mut **tx)
+            .await?;
             let reverted = sqlx::query(
                 "UPDATE noisy_triggers \
                  SET status = 'Active', suppress_until = NULL, updated_at = NOW() \
                  WHERE status = 'Suppressed' AND suppress_until IS NOT NULL \
-                   AND suppress_until <= NOW()",
+                   AND suppress_until <= NOW() AND site IS NOT NULL \
+                   AND site_resolution_generation = ( \
+                       SELECT generation FROM noisy_trigger_site_authority WHERE singleton \
+                   )",
             )
             .execute(&mut **tx)
             .await?
@@ -900,39 +1270,49 @@ async fn run_job(
                 )),
             ))
         }
-        "secret_rotation_due_scan" => {
-            // Safe-internal write (#7): READ secret rotation metadata across ALL sites
-            // (platform-wide internal principal — not scoped), classify each with the
-            // PURE engine, and enqueue ONE deduped shift_queue item per OVERDUE secret.
-            // Reads managed_secrets and writes only our own shift_queue — NO Vault/live
-            // call. All on `tx` (rolls back with this schedule's savepoint). `detail` is
-            // aggregate-only (counts), never per-secret data — it is surfaced via
-            // /api/ops/scheduler/executions. SELECTs ONLY non-sensitive columns — NEVER
-            // `vault_path` (a Vault pointer) or `secret_type`. Excludes `retired`
-            // (decommissioned) and `rotating` (a rotation in flight — its stale past due
-            // date would be a spurious duplicate); `expired`/`failed` ARE kept (overdue,
-            // need attention).
-            #[derive(sqlx::FromRow)]
-            struct SecretScanRow {
-                id: String,
-                name: String,
-                next_rotation_due: String,
-                site: String,
-                owner: String,
-            }
-            let rows: Vec<SecretScanRow> = sqlx::query_as(
-                "SELECT id, name, next_rotation_due, site, owner FROM managed_secrets \
-                 WHERE status NOT IN ('retired', 'rotating') ORDER BY id",
+        "secret_rotation_due_scan_v2" => {
+            // Safe-internal write (#7): process one immutable scan_seq page of
+            // non-sensitive rotation metadata. The high-water mark makes the
+            // cycle finite under concurrent registrations, and the repository
+            // projection never reads vault_path, secret type, or material. Each
+            // page performs at most one enqueue attempt per returned row.
+            let page_started = std::time::Instant::now();
+            let progress = match load_scan_progress(tx, schedule_id, job_kind).await? {
+                Some(progress) => progress,
+                None => {
+                    let high_water =
+                        crate::repos::managed_secrets::rotation_scan_high_water(&mut **tx).await?;
+                    let cycle_cutoff: chrono::DateTime<chrono::Utc> =
+                        sqlx::query_scalar("SELECT clock_timestamp()")
+                            .fetch_one(&mut **tx)
+                            .await?;
+                    start_scan_progress(tx, schedule_id, job_kind, high_water, cycle_cutoff).await?
+                }
+            };
+            let rows = crate::repos::managed_secrets::rotation_scan_page(
+                &mut **tx,
+                progress.cursor_seq,
+                progress.high_water_seq,
+                POPULATION_SCAN_BATCH,
             )
-            .fetch_all(&mut **tx)
             .await?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
+            let now_ms = progress.cycle_cutoff.timestamp_millis();
             let mut overdue: u64 = 0;
             let mut invalid: u64 = 0;
+            let mut invalid_authority: u64 = 0;
             for row in &rows {
-                // Skip a degenerate empty id with the SAME trim() check
-                // enqueue_if_absent uses, so it can never abort the tick.
-                if row.id.trim().is_empty() {
+                // The repository pages the raw population first. Eligibility is
+                // classified here so retired/rotating rows still advance the
+                // monotonic cursor and cannot conceal a later active row.
+                if matches!(row.status.as_str(), "retired" | "rotating") {
+                    continue;
+                }
+                if !ryuki_engine::backup_engine::is_canonical_restore_authority_component(&row.id)
+                    || !ryuki_engine::backup_engine::is_canonical_restore_authority_component(
+                        &row.site,
+                    )
+                {
+                    invalid_authority += 1;
                     continue;
                 }
                 match chrono::DateTime::parse_from_rfc3339(&row.next_rotation_due) {
@@ -968,6 +1348,10 @@ async fn run_job(
                             &mut **tx,
                             crate::repos::shift_queue::SECRET_ROTATION_DUE_ITEM_TYPE,
                             &row.id,
+                            ShiftQueueAuthority::Resource {
+                                site: &row.site,
+                                environment: None,
+                            },
                             &title,
                             &description,
                             "P2",
@@ -999,6 +1383,10 @@ async fn run_job(
                             &mut **tx,
                             crate::repos::shift_queue::SECRET_ROTATION_INVALID_ITEM_TYPE,
                             &row.id,
+                            ShiftQueueAuthority::Resource {
+                                site: &row.site,
+                                environment: None,
+                            },
                             &title,
                             &description,
                             "P2",
@@ -1008,6 +1396,31 @@ async fn run_job(
                     }
                 }
             }
+            let continuation = rows.len() == POPULATION_SCAN_BATCH as usize;
+            if continuation {
+                let last = rows
+                    .last()
+                    .expect("a full positive-sized secret page has a last row");
+                advance_scan_progress(tx, schedule_id, job_kind, last.scan_seq).await?;
+            } else {
+                finish_scan_progress(tx, schedule_id, job_kind).await?;
+            }
+            tracing::info!(
+                schedule = %schedule_id,
+                job_kind = %job_kind,
+                rows_scanned = rows.len(),
+                enqueue_attempt_ceiling = rows.len(),
+                inserted_items = overdue.saturating_add(invalid),
+                invalid_authority_rows = invalid_authority,
+                high_water_seq = progress.high_water_seq,
+                cursor_seq = rows
+                    .last()
+                    .map(|row| row.scan_seq)
+                    .unwrap_or(progress.cursor_seq),
+                continuation,
+                page_duration_ms = page_started.elapsed().as_millis() as u64,
+                "bounded scheduler population page completed"
+            );
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
@@ -1087,6 +1500,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::LEGAL_HOLD_EXPIRY_ITEM_TYPE,
                     &row.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     "P2",
@@ -1176,6 +1593,7 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::RECERTIFICATION_OVERDUE_ITEM_TYPE,
                     &source_ci_key,
+                    ShiftQueueAuthority::Global,
                     &title,
                     &description,
                     "P2",
@@ -1263,6 +1681,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::CERTIFICATE_EXPIRY_ITEM_TYPE,
                     &row.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     priority,
@@ -1277,13 +1699,15 @@ async fn run_job(
                      SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
                          updated_at = NOW() \
                      WHERE item_type = 'certificate-expiring' AND resolved = false \
-                       AND metadata->>'source_ci_key' = $1",
+                       AND visibility_kind = 'resource' \
+                       AND source_ci_key = $1 AND site = $6 AND environment IS NULL",
                 )
                 .bind(&row.id)
                 .bind(&title)
                 .bind(&description)
                 .bind(priority)
                 .bind(&metadata)
+                .bind(&row.site)
                 .execute(&mut **tx)
                 .await?;
             }
@@ -1319,14 +1743,24 @@ async fn run_job(
             // so no actionable row is ever missed; the classifier discards the 7–8 day rows as
             // Current (codex).
             let rows: Vec<GmsaScanRow> = sqlx::query_as(
-                "SELECT id::text, name, sam_account_name, site, status, \
-                        (last_rotation_at + managed_password_interval_days * INTERVAL '1 day') \
+                "SELECT account.id::text, account.name, account.sam_account_name, \
+                        account.site, account.status, \
+                        (account.last_rotation_at \
+                           + account.managed_password_interval_days * INTERVAL '1 day') \
                           AS next_rotation \
-                 FROM gmsa_accounts \
-                 WHERE status <> 'Revoked' AND managed_password_interval_days > 0 \
-                   AND last_rotation_at + managed_password_interval_days * INTERVAL '1 day' \
+                 FROM gmsa_accounts AS account \
+                 JOIN site_registry AS registry \
+                   ON registry.unlocode = account.namespace_owner_site \
+                  AND registry.active \
+                  AND account.namespace_owner_site = account.site \
+                 WHERE account.namespace_state = 'Verified' \
+                   AND account.status <> 'Revoked' \
+                   AND account.managed_password_interval_days > 0 \
+                   AND account.last_rotation_at \
+                         + account.managed_password_interval_days * INTERVAL '1 day' \
                          <= NOW() + INTERVAL '8 days' \
-                 ORDER BY next_rotation",
+                 ORDER BY next_rotation \
+                 FOR SHARE OF registry",
             )
             .fetch_all(&mut **tx)
             .await?;
@@ -1377,6 +1811,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::GMSA_EXPIRY_ITEM_TYPE,
                     &row.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     priority,
@@ -1391,13 +1829,15 @@ async fn run_job(
                      SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
                          updated_at = NOW() \
                      WHERE item_type = 'gmsa-expiring' AND resolved = false \
-                       AND metadata->>'source_ci_key' = $1",
+                       AND visibility_kind = 'resource' \
+                       AND source_ci_key = $1 AND site = $6 AND environment IS NULL",
                 )
                 .bind(&row.id)
                 .bind(&title)
                 .bind(&description)
                 .bind(priority)
                 .bind(&metadata)
+                .bind(&row.site)
                 .execute(&mut **tx)
                 .await?;
             }
@@ -1484,6 +1924,10 @@ async fn run_job(
                     &mut **tx,
                     crate::repos::shift_queue::OOB_CERT_EXPIRY_ITEM_TYPE,
                     &row.id,
+                    ShiftQueueAuthority::Resource {
+                        site: &row.site,
+                        environment: None,
+                    },
                     &title,
                     &description,
                     priority,
@@ -1498,13 +1942,15 @@ async fn run_job(
                      SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
                          updated_at = NOW() \
                      WHERE item_type = 'oob-cert-expiring' AND resolved = false \
-                       AND metadata->>'source_ci_key' = $1",
+                       AND visibility_kind = 'resource' \
+                       AND source_ci_key = $1 AND site = $6 AND environment IS NULL",
                 )
                 .bind(&row.id)
                 .bind(&title)
                 .bind(&description)
                 .bind(priority)
                 .bind(&metadata)
+                .bind(&row.site)
                 .execute(&mut **tx)
                 .await?;
             }
@@ -1625,11 +2071,16 @@ async fn advance_schedule(
     tx: &mut Transaction<'_, Postgres>,
     schedule_id: &str,
     interval_secs: i64,
+    continue_population_scan: bool,
 ) -> Result<(), sqlx::Error> {
-    let bounded = interval_secs.clamp(
-        ryuki_engine::scheduler::MIN_INTERVAL_SECS as i64,
-        ryuki_engine::scheduler::MAX_INTERVAL_SECS as i64,
-    );
+    let bounded = if continue_population_scan {
+        POPULATION_SCAN_CONTINUATION_SECS
+    } else {
+        interval_secs.clamp(
+            ryuki_engine::scheduler::MIN_INTERVAL_SECS as i64,
+            ryuki_engine::scheduler::MAX_INTERVAL_SECS as i64,
+        )
+    };
     sqlx::query(
         "UPDATE schedules \
          SET last_run_at = clock_timestamp(), \
@@ -1651,84 +2102,132 @@ async fn run_and_record(
     tx: &mut Transaction<'_, Postgres>,
     sched: &DueSchedule,
 ) -> Result<(), sqlx::Error> {
-    let (status, detail) = run_job(tx, &sched.job_kind).await?;
+    let (status, detail) = run_job(tx, &sched.id, &sched.job_kind).await?;
+    // A full bounded page leaves its locked progress row in place. Record the
+    // page and schedule a prompt continuation in the SAME transaction. A
+    // short/empty page deleted the row, so the configured cadence resumes.
+    let continue_population_scan = if is_population_scan(&sched.job_kind) {
+        load_scan_progress(tx, &sched.id, &sched.job_kind)
+            .await?
+            .is_some()
+    } else {
+        false
+    };
     insert_execution(tx, &sched.id, &sched.job_kind, &status, &detail).await?;
-    advance_schedule(tx, &sched.id, sched.interval_secs).await?;
+    advance_schedule(tx, &sched.id, sched.interval_secs, continue_population_scan).await?;
     Ok(())
 }
 
-/// Run one scheduler tick: elect leadership, claim every due schedule, and run
-/// each in its OWN savepoint so one failing schedule never rolls back the rest
-/// of the batch. Returns the number of schedules run successfully (0 when this
-/// replica did not win leadership or nothing was due). Idempotent and safe to
-/// call concurrently across replicas — only the leader does work.
-pub async fn tick_once(pool: &PgPool) -> Result<usize, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+/// Revalidate and run one hinted schedule in its own top-level transaction.
+/// The nested savepoint keeps the existing "record failure and advance" behavior
+/// while allowing a failed job body (including cursor/page writes) to roll back
+/// without poisoning the schedule transaction.
+async fn run_due_schedule(
+    connection: &mut PgConnection,
+    hinted: &DueSchedule,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = connection.begin().await?;
+    let sched: Option<DueSchedule> = sqlx::query_as(
+        "SELECT id, job_kind, interval_secs FROM schedules \
+         WHERE id = $1 AND enabled AND next_run_at <= clock_timestamp() \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(&hinted.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(sched) = sched else {
+        tx.commit().await?;
+        return Ok(false);
+    };
 
-    // Leader election: only the replica that wins this tx-scoped lock ticks. The
-    // others see `false` and no-op (their tx rolls back on drop, releasing
-    // nothing they hold). The lock auto-releases at COMMIT below. Combined with
-    // FOR UPDATE SKIP LOCKED on the claim, a given due schedule runs at most once
-    // per tick across the whole fleet.
-    let is_leader: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+    admit_population_scan_protocol(&mut tx, &sched.job_kind).await?;
+    let mut sp = tx.begin().await?;
+    match run_and_record(&mut sp, &sched).await {
+        Ok(()) => {
+            sp.commit().await?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        Err(error) => {
+            // Cursor movement and page effects lived in the savepoint, so this
+            // restores the exact page for a future retry. Preserve the existing
+            // failure policy: record a generic failure and return to the normal
+            // cadence instead of busy-spinning a poisoned job.
+            sp.rollback().await?;
+            tracing::error!(
+                schedule = %sched.id,
+                %error,
+                "scheduler job failed; recording failure and advancing"
+            );
+            insert_execution(
+                &mut tx,
+                &sched.id,
+                &sched.job_kind,
+                "failed",
+                &Some("job failed; see server logs".to_string()),
+            )
+            .await?;
+            advance_schedule(&mut tx, &sched.id, sched.interval_secs, false).await?;
+            tx.commit().await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn tick_as_leader(connection: &mut PgConnection) -> Result<usize, sqlx::Error> {
+    // This is a bounded hint list, not a durable claim. Each row is revalidated
+    // and locked inside its own transaction immediately before execution.
+    let due: Vec<DueSchedule> = sqlx::query_as(
+        "SELECT id, job_kind, interval_secs FROM schedules \
+         WHERE enabled AND next_run_at <= clock_timestamp() \
+         ORDER BY next_run_at ASC, id ASC \
+         LIMIT $1",
+    )
+    .bind(MAX_BATCH)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    let mut ran = 0usize;
+    for sched in &due {
+        if run_due_schedule(connection, sched).await? {
+            ran += 1;
+        }
+    }
+    Ok(ran)
+}
+
+/// Run one scheduler tick. Leadership is session-scoped so each schedule — and
+/// therefore each population page — can use an independent top-level
+/// transaction without allowing another replica to enter between pages. The
+/// checked-out connection is marked close-on-drop before lock acquisition: a
+/// timeout, cancellation, panic, or lost connection therefore releases the
+/// session lock instead of returning a lock-bearing session to the pool.
+pub async fn tick_once(pool: &PgPool) -> Result<usize, sqlx::Error> {
+    let mut leader = pool.acquire().await?;
+    leader.close_on_drop();
+    let is_leader: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(SCHEDULER_TICK_LOCK_KEY)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *leader)
         .await?;
     if !is_leader {
         return Ok(0);
     }
 
-    let due: Vec<DueSchedule> = sqlx::query_as(
-        "SELECT id, job_kind, interval_secs FROM schedules \
-         WHERE enabled AND next_run_at <= NOW() \
-         ORDER BY next_run_at ASC \
-         LIMIT $1 \
-         FOR UPDATE SKIP LOCKED",
-    )
-    .bind(MAX_BATCH)
-    .fetch_all(&mut *tx)
-    .await?;
+    let tick_result = tick_as_leader(&mut leader).await;
+    let unlock_result: Result<bool, sqlx::Error> =
+        sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(SCHEDULER_TICK_LOCK_KEY)
+            .fetch_one(&mut *leader)
+            .await;
 
-    let mut ran = 0usize;
-    for sched in &due {
-        // Per-schedule savepoint: a DB error running or recording THIS schedule
-        // rolls back only its own work, never the claim or the other schedules.
-        let mut sp = tx.begin().await?;
-        match run_and_record(&mut sp, sched).await {
-            Ok(()) => {
-                sp.commit().await?;
-                ran += 1;
-            }
-            Err(error) => {
-                // Roll back the poisoned savepoint (restoring the parent tx to a
-                // healthy state), then record a `failed` execution and STILL
-                // advance in a fresh savepoint so the bad schedule does not stay
-                // due and starve the loop. A genuine DB outage makes the fresh
-                // savepoint fail too, aborting the whole tick — correct: it
-                // retries next interval rather than spinning.
-                sp.rollback().await?;
-                tracing::error!(
-                    schedule = %sched.id,
-                    %error,
-                    "scheduler job failed; recording failure and advancing"
-                );
-                let mut sp2 = tx.begin().await?;
-                insert_execution(
-                    &mut sp2,
-                    &sched.id,
-                    &sched.job_kind,
-                    "failed",
-                    &Some("job failed; see server logs".to_string()),
-                )
-                .await?;
-                advance_schedule(&mut sp2, &sched.id, sched.interval_secs).await?;
-                sp2.commit().await?;
-            }
-        }
+    match (tick_result, unlock_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(ran), Ok(true)) => Ok(ran),
+        (Ok(_), Ok(false)) => Err(sqlx::Error::Protocol(
+            "scheduler leader connection did not own its advisory lock".to_string(),
+        )),
     }
-
-    tx.commit().await?;
-    Ok(ran)
 }
 
 /// List all schedules, newest-created first.
@@ -1739,7 +2238,14 @@ pub async fn list_schedules(
 ) -> Result<Vec<ScheduleView>, sqlx::Error> {
     // `created_at DESC` alone is non-unique → `id` (PK) is the tie-breaker (#14).
     sqlx::query_as(
-        "SELECT id, name, job_kind, interval_secs, enabled, next_run_at, last_run_at \
+        "SELECT id, name, \
+                CASE job_kind \
+                    WHEN 'restore_overdue_scan_v2' THEN 'restore_overdue_scan' \
+                    WHEN 'golden_image_stale_scan_v2' THEN 'golden_image_stale_scan' \
+                    WHEN 'secret_rotation_due_scan_v2' THEN 'secret_rotation_due_scan' \
+                    ELSE job_kind \
+                END AS job_kind, \
+                interval_secs, enabled, next_run_at, last_run_at \
          FROM schedules ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -1761,7 +2267,14 @@ pub async fn list_recent_executions(
     limit: i64,
 ) -> Result<Vec<ExecutionView>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, schedule_id, job_kind, status, detail, started_at, finished_at \
+        "SELECT id, schedule_id, \
+                CASE job_kind \
+                    WHEN 'restore_overdue_scan_v2' THEN 'restore_overdue_scan' \
+                    WHEN 'golden_image_stale_scan_v2' THEN 'golden_image_stale_scan' \
+                    WHEN 'secret_rotation_due_scan_v2' THEN 'secret_rotation_due_scan' \
+                    ELSE job_kind \
+                END AS job_kind, \
+                status, detail, started_at, finished_at \
          FROM job_executions ORDER BY started_at DESC LIMIT $1",
     )
     .bind(limit.clamp(1, 500))
@@ -1793,8 +2306,9 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
     //   genuinely hung tick — one that escapes the DB-level statement/lock
     //   timeouts (#12) via an application-level stall — is aborted and retried on
     //   the next tick rather than starving the loop forever. Dropping the tick
-    //   future rolls back its transaction (the advisory xact lock is released),
-    //   so an abort is safe and the next leader simply retries.
+    //   future rolls back only the active schedule/page transaction and closes
+    //   the leader connection, releasing its session lock. Earlier bounded pages
+    //   remain committed; the durable cursor makes the next leader resume.
     let tick_timeout = Duration::from_secs(tick_secs.saturating_mul(4).max(300));
     tokio::spawn(async move {
         crate::background::register_loop(DURABLE_SCHEDULER_NAME, tick_secs);
@@ -1835,6 +2349,54 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
 mod db_tests {
     use super::*;
     use crate::database::DB_TEST_SERIAL;
+
+    #[test]
+    fn population_scheduler_authority_shape_matches_queue_contract() {
+        for canonical in ["GBLON", "production", "asset-123"] {
+            assert!(
+                ryuki_engine::backup_engine::is_canonical_restore_authority_component(canonical)
+            );
+        }
+        for malformed in ["", " ", "\t", " GBLON", "GBLON ", "prod\n"] {
+            assert!(
+                !ryuki_engine::backup_engine::is_canonical_restore_authority_component(malformed)
+            );
+        }
+        let largest_safe =
+            "x".repeat(ryuki_engine::backup_engine::RESTORE_AUTHORITY_COMPONENT_MAX_BYTES);
+        let oversized =
+            "x".repeat(ryuki_engine::backup_engine::RESTORE_AUTHORITY_COMPONENT_MAX_BYTES + 1);
+        assert!(
+            ryuki_engine::backup_engine::is_canonical_restore_authority_component(&largest_safe)
+        );
+        assert!(!ryuki_engine::backup_engine::is_canonical_restore_authority_component(&oversized));
+    }
+
+    #[test]
+    fn restore_quarantine_key_is_bounded_deterministic_and_tuple_framed() {
+        let key = restore_authority_quarantine_key(" ci", "SITE", "environment");
+        assert_eq!(
+            key,
+            restore_authority_quarantine_key(" ci", "SITE", "environment")
+        );
+        assert!(key.starts_with("restore-authority-"));
+        assert!(key.len() < 100);
+        assert_ne!(
+            restore_authority_quarantine_key("ab", "c", "d"),
+            restore_authority_quarantine_key("a", "bc", "d"),
+            "length framing must prevent concatenation ambiguity"
+        );
+    }
+
+    #[test]
+    fn population_migration_keeps_a_finite_lock_timeout() {
+        let migration =
+            include_str!("../../../migrations/163_scheduler_population_scan_progress.sql");
+        assert!(migration.contains("SET LOCAL lock_timeout = '30s';"));
+        assert!(!migration.contains("lock_timeout = '0'"));
+        assert!(!migration.contains("lock_timeout = '0ms'"));
+        assert!(!migration.contains("lock_timeout='0"));
+    }
 
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
@@ -1911,6 +2473,161 @@ mod db_tests {
             exec_before, exec_after,
             "an advanced schedule is not re-run on the next immediate tick"
         );
+
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Two replicas racing the same due row still produce one execution. The
+    /// session leader lock serializes the ticks, and the second leader (if it
+    /// acquires after the first releases) revalidates that the row is no longer
+    /// due before opening a job transaction.
+    #[tokio::test]
+    async fn concurrent_ticks_execute_a_due_schedule_once() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sched-test-concurrent-leader-2d4";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'concurrent leader test', 'health_probe', 3600, TRUE, \
+                     clock_timestamp() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let (left, right) = tokio::join!(tick_once(pool), tick_once(pool));
+        left.unwrap();
+        right.unwrap();
+
+        let executions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE schedule_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(executions, 1, "one due schedule, one committed execution");
+
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Migration 163 rolling fence: a legacy writer cannot recreate any v1
+    /// population kind, and an old scheduler (which lacks the transaction-local
+    /// v2 marker) cannot advance a renamed row after treating it as unsupported.
+    #[tokio::test]
+    async fn population_protocol_rejects_legacy_writer_and_old_scheduler_advance() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        for (suffix, legacy_kind) in [
+            ("restore", "restore_overdue_scan"),
+            ("golden", "golden_image_stale_scan"),
+            ("secret", "secret_rotation_due_scan"),
+        ] {
+            let mut pre_migration_binary = pool.begin().await.unwrap();
+            assert!(matches!(
+                admit_population_scan_protocol(&mut pre_migration_binary, legacy_kind).await,
+                Err(sqlx::Error::Protocol(_))
+            ));
+            pre_migration_binary.rollback().await.unwrap();
+
+            let id = format!("sched-test-legacy-population-{suffix}");
+            sqlx::query("DELETE FROM schedules WHERE id = $1")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .ok();
+            let inserted = sqlx::query(
+                "INSERT INTO schedules \
+                 (id, name, job_kind, interval_secs, enabled, next_run_at) \
+                 VALUES ($1, 'legacy population writer', $2, 86400, TRUE, \
+                         clock_timestamp())",
+            )
+            .bind(&id)
+            .bind(legacy_kind)
+            .execute(pool)
+            .await;
+            assert!(
+                inserted.is_err(),
+                "legacy kind {legacy_kind} must fail closed"
+            );
+        }
+
+        let id = "sched-test-population-protocol-fence-v2";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules \
+             (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'protocol fence v2', 'secret_rotation_due_scan_v2', \
+                     86400, TRUE, clock_timestamp() + INTERVAL '1 hour')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        let old_advance = sqlx::query(
+            "UPDATE schedules \
+             SET last_run_at = clock_timestamp(), next_run_at = clock_timestamp() + INTERVAL '1 day' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await;
+        assert!(
+            old_advance.is_err(),
+            "an unmarked old scheduler cannot steal v2 work"
+        );
+        let after: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(after, before, "failed legacy advancement is atomic");
+
+        let mut v2 = pool.begin().await.unwrap();
+        admit_population_scan_protocol(&mut v2, SECRET_ROTATION_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE schedules SET next_run_at = clock_timestamp() + INTERVAL '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *v2)
+        .await
+        .expect("v2-marked scheduler transaction may advance");
+        v2.rollback().await.unwrap();
 
         sqlx::query("DELETE FROM schedules WHERE id = $1")
             .bind(id)
@@ -2817,16 +3534,35 @@ mod db_tests {
     /// recency aggregate uses for a success-state row, so backdating it controls
     /// the classified age precisely.
     async fn seed_restore_request(pool: &PgPool, source_ci_key: &str, status: &str, age_secs: i64) {
+        let canonical =
+            ryuki_engine::backup_engine::is_canonical_restore_authority_component(source_ci_key);
+        let approved_or_later = matches!(
+            status,
+            "Approved" | "Locked" | "Executed" | "Verified" | "Completed" | "Failed"
+        );
+        let metadata = if approved_or_later {
+            serde_json::json!({
+                "planned_by": "scheduler.planner",
+                "approver": "scheduler.checker",
+            })
+        } else {
+            serde_json::json!({"planned_by": "scheduler.planner"})
+        };
         sqlx::query(
             "INSERT INTO restore_requests \
              (source_ci_key, restore_type, restore_point, target_site, \
-              target_environment, owner, status, updated_at) \
+              target_environment, owner, status, updated_at, approver, metadata, \
+              authority_state, authority_reason) \
              VALUES ($1, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $2, \
-                     NOW() - make_interval(secs => $3::double precision))",
+                     NOW() - make_interval(secs => $3::double precision), $4, $5, $6, $7)",
         )
         .bind(source_ci_key)
         .bind(status)
         .bind(age_secs as f64)
+        .bind(approved_or_later.then_some("scheduler.checker"))
+        .bind(metadata)
+        .bind(if canonical { "Verified" } else { "Quarantined" })
+        .bind((!canonical).then_some("test-invalid-restore-authority"))
         .execute(pool)
         .await
         .expect("seed restore request");
@@ -2849,7 +3585,7 @@ mod db_tests {
             .ok();
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
-             VALUES ($1, 'test restore scan', 'restore_overdue_scan', 86400, TRUE, \
+             VALUES ($1, 'test restore scan', 'restore_overdue_scan_v2', 86400, TRUE, \
              NOW() - INTERVAL '1 minute')",
         )
         .bind(id)
@@ -2893,6 +3629,358 @@ mod db_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// C184 regression: the scheduler-specific repository boundary returns no
+    /// more than the requested (hard-limited) number of DISTINCT systems,
+    /// carries both signals in the same row, resumes strictly after the last
+    /// key, and excludes a system created above the cycle high-water mark.
+    #[tokio::test]
+    async fn restore_scheduler_page_is_bounded_resumable_and_high_watered() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let cursor = crate::repos::restore_requests::scheduler_scan_high_water(&mut *tx)
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4();
+        let keys = [
+            format!("bounded-restore-a-{suffix}"),
+            format!("bounded-restore-b-{suffix}"),
+            format!("bounded-restore-c-{suffix}"),
+        ];
+        let mut high_water = cursor;
+        for (key, status) in keys.iter().zip(["Completed", "Failed", "Failed"]) {
+            sqlx::query(
+                "INSERT INTO restore_requests \
+                 (source_ci_key, restore_type, restore_point, target_site, \
+                  target_environment, owner, status, updated_at) \
+                 VALUES ($1, 'FullVm', 'rp-bounded', 'GBLON', 'production', \
+                         'scheduler-test', $2, clock_timestamp() - INTERVAL '100 days')",
+            )
+            .bind(key)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            high_water = sqlx::query_scalar(
+                "SELECT scan_seq FROM restore_scheduler_system_summary \
+                 WHERE source_ci_key = $1 AND target_site = 'GBLON' \
+                   AND target_environment = 'production'",
+            )
+            .bind(key)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        }
+        // Facts are a current durable summary: new history for an already-known
+        // tuple updates that row without moving its immutable population cursor.
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status) \
+             VALUES ($1, 'FullVm', 'rp-post-snapshot', 'GBLON', 'production', \
+                     'scheduler-test', 'Failed')",
+        )
+        .bind(&keys[0])
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let after_high_water = format!("bounded-restore-new-{suffix}");
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status) \
+             VALUES ($1, 'FullVm', 'rp-new', 'GBLON', 'production', \
+                     'scheduler-test', 'Failed')",
+        )
+        .bind(&after_high_water)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let first =
+            crate::repos::restore_requests::scheduler_scan_page(&mut *tx, cursor, high_water, 2)
+                .await
+                .unwrap();
+        assert_eq!(
+            first.len(),
+            2,
+            "one call materializes at most its page bound"
+        );
+        assert_eq!(first[0].source_ci_key, keys[0]);
+        assert_eq!(first[0].latest_status, "Failed");
+        assert!(first[0].last_successful_test.is_some());
+        assert_eq!(first[1].source_ci_key, keys[1]);
+        assert_eq!(first[1].latest_status, "Failed");
+        assert!(first[1].last_successful_test.is_none());
+
+        let second = crate::repos::restore_requests::scheduler_scan_page(
+            &mut *tx,
+            first.last().unwrap().scan_seq,
+            high_water,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "the continuation reaches the final old key"
+        );
+        assert_eq!(second[0].source_ci_key, keys[2]);
+        assert!(first
+            .iter()
+            .chain(second.iter())
+            .all(|row| row.source_ci_key != after_high_water));
+
+        tx.rollback().await.unwrap();
+    }
+
+    /// C184 durable-summary regression: concurrent/direct legacy writers for
+    /// one authority tuple converge on exactly one summary row with exact facts;
+    /// scope-key mutation splits the tuple, a 101-row legacy statement applies
+    /// exact count deltas once, delete removes it, and an oversized source key
+    /// never becomes a btree index key.
+    #[tokio::test]
+    async fn restore_scheduler_summary_tracks_concurrent_and_legacy_writers() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("summary-concurrent-{suffix}");
+        let first_id = uuid::Uuid::new_v4();
+        let second_id = uuid::Uuid::new_v4();
+        let first = sqlx::query(
+            "INSERT INTO restore_requests \
+             (id, source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at) \
+             VALUES ($1, $2, 'FullVm', 'rp-summary-a', 'GBLON', 'production', \
+                     'legacy-writer', 'Completed', clock_timestamp() - INTERVAL '100 days')",
+        )
+        .bind(first_id)
+        .bind(&key)
+        .execute(pool);
+        let second = sqlx::query(
+            "INSERT INTO restore_requests \
+             (id, source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at) \
+             VALUES ($1, $2, 'FullVm', 'rp-summary-b', 'GBLON', 'production', \
+                     'legacy-writer', 'Failed', clock_timestamp())",
+        )
+        .bind(second_id)
+        .bind(&key)
+        .execute(pool);
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let summary: (i64, i64, String, i64) = sqlx::query_as(
+            "SELECT total_requests, successful_test_count, latest_status, \
+                    COUNT(*) OVER () \
+             FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 AND target_site = 'GBLON' \
+               AND target_environment = 'production'",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(summary.0, 2, "both concurrent requests are summarized");
+        assert_eq!(summary.1, 1, "the successful history count is exact");
+        assert_eq!(summary.2, "Failed", "latest status uses durable tie-breaks");
+        assert_eq!(summary.3, 1, "one tuple has exactly one summary row");
+
+        let scope_rebind = sqlx::query(
+            "UPDATE restore_requests \
+             SET target_site = 'DEFRA', updated_at = clock_timestamp() + INTERVAL '1 second' \
+             WHERE id = $1",
+        )
+        .bind(second_id)
+        .execute(pool)
+        .await;
+        assert!(
+            scope_rebind.is_err(),
+            "quarantined legacy authority cannot be rebound"
+        );
+        let scopes: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT target_site, total_requests, latest_status \
+             FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 ORDER BY target_site",
+        )
+        .bind(&key)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            scopes,
+            vec![("GBLON".to_string(), 2, "Failed".to_string())],
+            "rejected authority rebinding leaves the summary unchanged"
+        );
+
+        let status_rebind = sqlx::query(
+            "UPDATE restore_requests \
+             SET status = 'Failed', updated_at = clock_timestamp() + INTERVAL '2 seconds' \
+             WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(pool)
+        .await;
+        assert!(
+            status_rebind.is_err(),
+            "quarantined legacy rows cannot acquire operational transitions"
+        );
+        let transitioned: (i64, Option<chrono::DateTime<chrono::Utc>>, String) = sqlx::query_as(
+            "SELECT successful_test_count, last_successful_test, latest_status \
+                 FROM restore_scheduler_system_summary \
+                 WHERE source_ci_key = $1 AND target_site = 'GBLON' \
+                   AND target_environment = 'production'",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(transitioned.0, 1);
+        assert!(transitioned.1.is_some());
+        assert_eq!(transitioned.2, "Failed");
+
+        let oversized_key = format!("legacy-oversized-{suffix}-{}", "x".repeat(4_096));
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status) \
+             VALUES ($1, 'FullVm', 'rp-oversized', 'GBLON', 'production', \
+                     'legacy-writer', 'Failed')",
+        )
+        .bind(&oversized_key)
+        .execute(pool)
+        .await
+        .expect("oversized legacy key is summarized through compact fingerprints");
+        let oversized_summaries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM restore_scheduler_system_summary \
+             WHERE source_fingerprint = md5($1) || md5('GBLON') || md5('production') \
+               AND source_ci_key = $1",
+        )
+        .bind(&oversized_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(oversized_summaries, 1);
+
+        let bulk_key = format!("legacy-bulk-{suffix}");
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at) \
+             SELECT $1, 'FullVm', 'rp-bulk-' || series::text, 'GBLON', \
+                    'production', 'legacy-bulk-writer', \
+                    CASE WHEN series % 2 = 0 THEN 'Completed' ELSE 'Failed' END, \
+                    clock_timestamp() - make_interval(secs => series::double precision) \
+             FROM generate_series(1, 101) AS generated(series)",
+        )
+        .bind(&bulk_key)
+        .execute(pool)
+        .await
+        .expect("one bulk legacy statement refreshes its authority tuple once");
+        let bulk_summary: (i64, i64, String, i64) = sqlx::query_as(
+            "SELECT total_requests, successful_test_count, latest_status, COUNT(*) OVER () \
+             FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 AND target_site = 'GBLON' \
+               AND target_environment = 'production'",
+        )
+        .bind(&bulk_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(bulk_summary, (101, 50, "Failed".to_string(), 1));
+
+        sqlx::query(
+            "DELETE FROM restore_requests \
+             WHERE source_ci_key = $1 OR source_ci_key = $2 OR source_ci_key = $3",
+        )
+        .bind(&key)
+        .bind(&oversized_key)
+        .bind(&bulk_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let leftovers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM restore_scheduler_system_summary \
+             WHERE source_ci_key = $1 OR source_ci_key = $2 OR source_ci_key = $3",
+        )
+        .bind(&key)
+        .bind(&oversized_key)
+        .bind(&bulk_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(leftovers, 0, "delete trigger removes empty summaries");
+    }
+
+    /// Every scheduler repository enforces the complete keyset contract itself:
+    /// non-negative ordered bounds and a production page size in 1..=100. A
+    /// future caller therefore cannot widen or invert a population work unit.
+    #[tokio::test]
+    async fn population_scan_repositories_enforce_page_boundaries() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let oversized = POPULATION_SCAN_BATCH + 1;
+        assert!(matches!(
+            crate::repos::restore_requests::scheduler_scan_page(pool, -1, 0, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::restore_requests::scheduler_scan_page(pool, 2, 1, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::restore_requests::scheduler_scan_page(pool, 0, 0, 0).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::restore_requests::scheduler_scan_page(pool, 0, 0, oversized).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::golden_images::scheduler_scan_page(pool, -1, 0, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::golden_images::scheduler_scan_page(pool, 2, 1, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::golden_images::scheduler_scan_page(pool, 0, 0, 0).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::golden_images::scheduler_scan_page(pool, 0, 0, oversized).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::managed_secrets::rotation_scan_page(pool, -1, 0, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::managed_secrets::rotation_scan_page(pool, 2, 1, 1).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::managed_secrets::rotation_scan_page(pool, 0, 0, 0).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
+        assert!(matches!(
+            crate::repos::managed_secrets::rotation_scan_page(pool, 0, 0, oversized).await,
+            Err(sqlx::Error::Protocol(_))
+        ));
     }
 
     // ---- #7 secret_rotation_due_scan ---------------------------------------
@@ -2939,7 +4027,7 @@ mod db_tests {
             .ok();
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
-             VALUES ($1, 'test secret scan', 'secret_rotation_due_scan', 86400, TRUE, \
+             VALUES ($1, 'test secret scan', 'secret_rotation_due_scan_v2', 86400, TRUE, \
              NOW() - INTERVAL '1 minute')",
         )
         .bind(id)
@@ -2982,6 +4070,490 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// C190 repository regression: one secret page is hard-bounded and ordered
+    /// by the immutable sequence, resumes after its last row, and excludes a
+    /// registration above the cycle high-water mark.
+    #[tokio::test]
+    async fn secret_rotation_scheduler_page_is_bounded_and_high_watered() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let cursor = crate::repos::managed_secrets::rotation_scan_high_water(&mut *tx)
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4();
+        let due = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let last_rotated = (chrono::Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        let ids = [
+            format!("bounded-secret-a-{suffix}"),
+            format!("bounded-secret-b-{suffix}"),
+            format!("bounded-secret-c-{suffix}"),
+        ];
+        let mut high_water = cursor;
+        for (id, status) in ids.iter().zip(["retired", "rotating", "active"]) {
+            sqlx::query(
+                "INSERT INTO managed_secrets \
+                 (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+                  next_rotation_due, status, owner, site) \
+                 VALUES ($1, $1, 'token', 'secret/data/not-selected', 90, $2, $3, \
+                         $4, 'scheduler-test', 'GBLON')",
+            )
+            .bind(id)
+            .bind(&last_rotated)
+            .bind(&due)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            high_water = sqlx::query_scalar(
+                "SELECT scan_seq FROM managed_secret_scheduler_population \
+                 WHERE secret_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        }
+        let after_high_water = format!("bounded-secret-new-{suffix}");
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+              next_rotation_due, status, owner, site) \
+             VALUES ($1, $1, 'token', 'secret/data/not-selected', 90, $2, $3, \
+                     'active', 'scheduler-test', 'GBLON')",
+        )
+        .bind(&after_high_water)
+        .bind(&last_rotated)
+        .bind(&due)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let first =
+            crate::repos::managed_secrets::rotation_scan_page(&mut *tx, cursor, high_water, 2)
+                .await
+                .unwrap();
+        assert_eq!(first.len(), 2, "first page obeys the requested bound");
+        assert_eq!(first[0].status, "retired");
+        assert_eq!(first[1].status, "rotating");
+        let second = crate::repos::managed_secrets::rotation_scan_page(
+            &mut *tx,
+            first.last().unwrap().scan_seq,
+            high_water,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "continuation reaches the final snapshot row"
+        );
+        assert_eq!(second[0].status, "active");
+        let visited: Vec<&str> = first
+            .iter()
+            .chain(second.iter())
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(visited, ids.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!visited.contains(&after_high_water.as_str()));
+
+        tx.rollback().await.unwrap();
+    }
+
+    /// PostgreSQL identity allocation order is not commit order. A lower value
+    /// that is invisible while a cycle passes it is deliberately deferred, then
+    /// recovered when exhaustion resets the next cycle's cursor.
+    #[tokio::test]
+    async fn secret_rotation_late_lower_sequence_is_recovered_next_cycle() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let baseline = crate::repos::managed_secrets::rotation_scan_high_water(pool)
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4();
+        let lower_id = format!("sr-late-lower-{suffix}");
+        let higher_id = format!("sr-early-higher-{suffix}");
+        let last_rotated = (chrono::Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        let due = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let mut delayed = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+              next_rotation_due, status, owner, site) \
+             VALUES ($1, $1, 'token', 'secret/data/not-selected', 90, $2, $3, \
+                     'active', 'scheduler-test', 'GBLON')",
+        )
+        .bind(&lower_id)
+        .bind(&last_rotated)
+        .bind(&due)
+        .execute(&mut *delayed)
+        .await
+        .unwrap();
+        let lower_seq: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM managed_secret_scheduler_population \
+             WHERE secret_id = $1",
+        )
+        .bind(&lower_id)
+        .fetch_one(&mut *delayed)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+              next_rotation_due, status, owner, site) \
+             VALUES ($1, $1, 'token', 'secret/data/not-selected', 90, $2, $3, \
+                     'active', 'scheduler-test', 'GBLON')",
+        )
+        .bind(&higher_id)
+        .bind(&last_rotated)
+        .bind(&due)
+        .execute(pool)
+        .await
+        .unwrap();
+        let higher_seq: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM managed_secret_scheduler_population \
+             WHERE secret_id = $1",
+        )
+        .bind(&higher_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(lower_seq < higher_seq, "allocation order is deterministic");
+
+        let current = crate::repos::managed_secrets::rotation_scan_page(
+            pool,
+            baseline,
+            higher_seq,
+            POPULATION_SCAN_BATCH,
+        )
+        .await
+        .unwrap();
+        assert!(current.iter().any(|row| row.id == higher_id));
+        assert!(current.iter().all(|row| row.id != lower_id));
+
+        delayed.commit().await.unwrap();
+        let next_high_water = crate::repos::managed_secrets::rotation_scan_high_water(pool)
+            .await
+            .unwrap();
+        let next_cycle = crate::repos::managed_secrets::rotation_scan_page(
+            pool,
+            baseline,
+            next_high_water,
+            POPULATION_SCAN_BATCH,
+        )
+        .await
+        .unwrap();
+        assert!(
+            next_cycle.iter().any(|row| row.id == lower_id),
+            "cursor reset recovers the late commit"
+        );
+
+        cleanup_secret_fixture(pool, &lower_id).await;
+        cleanup_secret_fixture(pool, &higher_id).await;
+    }
+
+    /// Queue writes and progress are one atomic page unit. Rolling the job
+    /// transaction back (the persisted state a replacement process observes
+    /// after a crash/restart) exposes no queue write and preserves the exact
+    /// prior cursor; the normal scheduler retry then processes that row once.
+    #[tokio::test]
+    async fn secret_rotation_page_rollback_preserves_restart_retry_point() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let cursor = crate::repos::managed_secrets::rotation_scan_high_water(pool)
+            .await
+            .unwrap();
+        let id = format!("sr-rollback-{}", uuid::Uuid::new_v4());
+        let past = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        seed_managed_secret(pool, &id, "active", &past).await;
+        let sched_id = seed_due_secret_scan(pool).await;
+        let high_water: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM managed_secret_scheduler_population \
+                 WHERE secret_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scheduler_scan_progress \
+             (schedule_id, job_kind, cursor_seq, high_water_seq, cycle_cutoff) \
+             VALUES ($1, 'secret_rotation_due_scan_v2', $2, $3, clock_timestamp())",
+        )
+        .bind(&sched_id)
+        .bind(cursor)
+        .bind(high_water)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let (status, _) = run_job(&mut tx, &sched_id, SECRET_ROTATION_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        assert_eq!(status, "succeeded");
+        tx.rollback().await.unwrap();
+
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            0,
+            "rolled-back page exposes no queue write"
+        );
+        let persisted_cursor: i64 = sqlx::query_scalar(
+            "SELECT cursor_seq FROM scheduler_scan_progress WHERE schedule_id = $1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted_cursor, cursor,
+            "rolled-back page preserves the exact retry cursor"
+        );
+
+        tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            1,
+            "retry processes the same bounded page once"
+        );
+
+        cleanup_secret_fixture(pool, &id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_secret_scan(pool).await;
+    }
+
+    /// Two scheduler replicas racing a population page still commit one page,
+    /// one execution, and one deduped queue item. The losing replica either
+    /// misses the session leader lock or revalidates the now-future schedule.
+    #[tokio::test]
+    async fn concurrent_ticks_commit_one_secret_population_page() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let cursor = crate::repos::managed_secrets::rotation_scan_high_water(pool)
+            .await
+            .unwrap();
+        let id = format!("sr-concurrent-page-{}", uuid::Uuid::new_v4());
+        let past = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        seed_managed_secret(pool, &id, "active", &past).await;
+        let sched_id = seed_due_secret_scan(pool).await;
+        let high_water: i64 = sqlx::query_scalar(
+            "SELECT scan_seq FROM managed_secret_scheduler_population \
+             WHERE secret_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO scheduler_scan_progress \
+             (schedule_id, job_kind, cursor_seq, high_water_seq, cycle_cutoff) \
+             VALUES ($1, 'secret_rotation_due_scan_v2', $2, $3, clock_timestamp())",
+        )
+        .bind(&sched_id)
+        .bind(cursor)
+        .bind(high_water)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let (left, right) = tokio::join!(tick_once(pool), tick_once(pool));
+        left.unwrap();
+        right.unwrap();
+
+        let executions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE schedule_id = $1")
+                .bind(&sched_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(executions, 1, "one population page commits once");
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            1,
+            "one population page exposes one deduped work item"
+        );
+
+        cleanup_secret_fixture(pool, &id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_secret_scan(pool).await;
+    }
+
+    /// A production-sized full page commits exactly its last sequence and uses
+    /// the short continuation cadence. The following page completes the fixed
+    /// snapshot; a registration above its high-water mark is not pulled into
+    /// that active cycle.
+    #[tokio::test]
+    async fn secret_rotation_full_page_commits_bounded_continuation() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let sched_id = seed_due_secret_scan(pool).await;
+        let before = crate::repos::managed_secrets::rotation_scan_high_water(pool)
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4();
+        let prefix = format!("sr-page-{suffix}-");
+        let like_prefix = format!("{prefix}%");
+        let past = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        let mut sequences = Vec::new();
+        for index in 0..(POPULATION_SCAN_BATCH + 1) {
+            let id = format!("{prefix}{index:03}");
+            seed_managed_secret(pool, &id, "active", &past).await;
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT scan_seq FROM managed_secret_scheduler_population \
+                     WHERE secret_id = $1",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sequences.push(seq);
+        }
+        let high_water = *sequences.last().unwrap();
+        let fixed_cutoff: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO scheduler_scan_progress \
+             (schedule_id, job_kind, cursor_seq, high_water_seq, cycle_cutoff) \
+             VALUES ($1, 'secret_rotation_due_scan_v2', $2, $3, $4)",
+        )
+        .bind(&sched_id)
+        .bind(before)
+        .bind(high_water)
+        .bind(fixed_cutoff)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        tick_once(pool).await.unwrap();
+        let (persisted_cursor, persisted_cutoff): (i64, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                "SELECT cursor_seq, cycle_cutoff FROM scheduler_scan_progress \
+             WHERE schedule_id = $1",
+            )
+            .bind(&sched_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted_cursor,
+            sequences[POPULATION_SCAN_BATCH as usize - 1],
+            "one committed work unit advances by exactly one fixed page"
+        );
+        assert_eq!(
+            persisted_cutoff, fixed_cutoff,
+            "continuation preserves the cycle's original database cutoff"
+        );
+        let first_page_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'secret-rotation-due' AND resolved = false \
+               AND metadata->>'source_ci_key' LIKE $1",
+        )
+        .bind(&like_prefix)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(first_page_items, POPULATION_SCAN_BATCH);
+        let prompt_continuation: bool = sqlx::query_scalar(
+            "SELECT next_run_at < clock_timestamp() + INTERVAL '1 minute' \
+             FROM schedules WHERE id = $1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            prompt_continuation,
+            "a full page does not wait for the daily cadence"
+        );
+
+        let new_id = format!("sr-page-new-{suffix}");
+        seed_managed_secret(pool, &new_id, "active", &past).await;
+        let mut due_tx = pool.begin().await.unwrap();
+        admit_population_scan_protocol(&mut due_tx, SECRET_ROTATION_SCAN_JOB_KIND)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE schedules SET next_run_at = clock_timestamp() - INTERVAL '1 second' \
+             WHERE id = $1",
+        )
+        .bind(&sched_id)
+        .execute(&mut *due_tx)
+        .await
+        .unwrap();
+        due_tx.commit().await.unwrap();
+        tick_once(pool).await.unwrap();
+
+        let progress_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduler_scan_progress WHERE schedule_id = $1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(progress_left, 0, "short final page completes the cycle");
+        let snapshot_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'secret-rotation-due' AND resolved = false \
+               AND metadata->>'source_ci_key' LIKE $1",
+        )
+        .bind(&like_prefix)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot_items, POPULATION_SCAN_BATCH + 1);
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &new_id).await,
+            0,
+            "registration above the high-water mark waits for the next cycle"
+        );
+
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' LIKE $1")
+            .bind(&like_prefix)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_secret_fixture(pool, &new_id).await;
+        sqlx::query("DELETE FROM managed_secrets WHERE id LIKE $1")
+            .bind(&like_prefix)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_secret_scan(pool).await;
     }
 
     /// OVERDUE active/expired/failed secrets are enqueued; FUTURE/retired/rotating are
@@ -3069,7 +4641,7 @@ mod db_tests {
         // environment-dependent in a shared DB).
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'secret_rotation_due_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'secret_rotation_due_scan_v2' \
                AND status = 'succeeded' ORDER BY started_at DESC LIMIT 1",
         )
         .bind(&sched_id)
@@ -3464,18 +5036,37 @@ mod db_tests {
         updated_at: chrono::DateTime<chrono::Utc>,
         created_age_secs: i64,
     ) {
+        let canonical =
+            ryuki_engine::backup_engine::is_canonical_restore_authority_component(source_ci_key);
+        let approved_or_later = matches!(
+            status,
+            "Approved" | "Locked" | "Executed" | "Verified" | "Completed" | "Failed"
+        );
+        let metadata = if approved_or_later {
+            serde_json::json!({
+                "planned_by": "scheduler.planner",
+                "approver": "scheduler.checker",
+            })
+        } else {
+            serde_json::json!({"planned_by": "scheduler.planner"})
+        };
         sqlx::query(
             "INSERT INTO restore_requests \
              (id, source_ci_key, restore_type, restore_point, target_site, \
-              target_environment, owner, status, updated_at, created_at) \
+              target_environment, owner, status, updated_at, created_at, approver, \
+              metadata, authority_state, authority_reason) \
              VALUES ($1::uuid, $2, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $3, \
-                     $4, NOW() - make_interval(secs => $5::double precision))",
+                     $4, NOW() - make_interval(secs => $5::double precision), $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(source_ci_key)
         .bind(status)
         .bind(updated_at)
         .bind(created_age_secs as f64)
+        .bind(approved_or_later.then_some("scheduler.checker"))
+        .bind(metadata)
+        .bind(if canonical { "Verified" } else { "Quarantined" })
+        .bind((!canonical).then_some("test-invalid-restore-authority"))
         .execute(pool)
         .await
         .expect("seed restore request (explicit id + timestamps)");
@@ -3554,7 +5145,7 @@ mod db_tests {
         // failed restore item(s)" with two bare count tokens.
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan_v2' \
                AND status = 'succeeded' \
              ORDER BY started_at DESC LIMIT 1",
         )
@@ -3646,7 +5237,7 @@ mod db_tests {
         );
         let succeeded: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan_v2' \
                AND status = 'succeeded'",
         )
         .bind(&sched_id)
@@ -3795,7 +5386,8 @@ mod db_tests {
     }
 
     /// Test 7: migration 122's seed is idempotent AND its seeded row matches the
-    /// shipped contract; the partial unique index rejects a SECOND open duplicate.
+    /// shipped contract; migration 170's typed resource index rejects a SECOND
+    /// open duplicate for the exact same authority tuple.
     #[tokio::test]
     async fn migration_122_is_idempotent_and_index_dedups() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -3806,7 +5398,7 @@ mod db_tests {
         // Re-running the seed INSERT is a clean no-op (ON CONFLICT).
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
-             VALUES ($1, 'Restore overdue scan (all systems)', 'restore_overdue_scan', \
+             VALUES ($1, 'Restore overdue scan (all systems)', 'restore_overdue_scan_v2', \
                      86400, TRUE, NOW(), 'system') \
              ON CONFLICT (id) DO NOTHING",
         )
@@ -3825,46 +5417,53 @@ mod db_tests {
             .await
             .unwrap();
         assert_eq!(name, "Restore overdue scan (all systems)", "seed name");
-        assert_eq!(kind, "restore_overdue_scan", "seed job_kind");
+        assert_eq!(kind, RESTORE_SCAN_JOB_KIND, "seed job_kind");
         assert_eq!(interval, 86400, "seed interval_secs (daily cadence)");
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
 
-        // The partial unique index rejects a SECOND open item for the same
-        // item_type+source_ci_key. First insert succeeds; the direct second
-        // insert (bypassing enqueue_if_absent's NOT EXISTS) hits the index.
+        // The current authority index rejects a SECOND open item for the same
+        // item_type+source/site/environment tuple. Metadata is descriptive only.
         let suffix = uuid::Uuid::new_v4();
         let key = format!("ci-ros-idx-{suffix}");
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('restore-test-overdue', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, environment, scope_provenance) \
+             VALUES ('restore-test-overdue', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'production', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first open item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('restore-test-overdue', 't2', 'd2', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, environment, scope_provenance) \
+             VALUES ('restore-test-overdue', 't2', 'd2', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'production', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the partial unique index rejects a second OPEN duplicate"
+            "the resource authority index rejects a second OPEN duplicate"
         );
 
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
             .ok();
     }
 
-    /// #7: migration 125's seed is idempotent AND its TWO partial unique indexes
-    /// (secret-rotation-due + secret-rotation-invalid-due) each dedup an open item.
+    /// #7: migration 125's seed is idempotent AND migration 170's typed resource
+    /// index dedups both secret-rotation item types by exact authority tuple.
     #[tokio::test]
     async fn migration_125_is_idempotent_and_indexes_dedup() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -3875,7 +5474,7 @@ mod db_tests {
         // Re-running the seed INSERT is a clean no-op (ON CONFLICT).
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
-             VALUES ($1, 'Secret rotation due scan (all secrets)', 'secret_rotation_due_scan', \
+             VALUES ($1, 'Secret rotation due scan (all secrets)', 'secret_rotation_due_scan_v2', \
                      86400, TRUE, NOW(), 'system') \
              ON CONFLICT (id) DO NOTHING",
         )
@@ -3893,37 +5492,46 @@ mod db_tests {
             .await
             .unwrap();
         assert_eq!(name, "Secret rotation due scan (all secrets)", "seed name");
-        assert_eq!(kind, "secret_rotation_due_scan", "seed job_kind");
+        assert_eq!(kind, SECRET_ROTATION_SCAN_JOB_KIND, "seed job_kind");
         assert_eq!(interval, 86400, "seed interval_secs (daily)");
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
 
-        // BOTH partial unique indexes reject a second open item for the same key.
+        // The shared typed resource index rejects a second open item for the
+        // same item type and authority tuple. Metadata is descriptive only.
         for item_type in ["secret-rotation-due", "secret-rotation-invalid-due"] {
             let key = format!("sr-idx-{}-{}", item_type, uuid::Uuid::new_v4());
             let meta = serde_json::json!({ "source_ci_key": key }).to_string();
             sqlx::query(
-                "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-                 VALUES ($1, 't', 'd', 'P2', $2::jsonb)",
+                "INSERT INTO shift_queue \
+                     (item_type, title, description, priority, metadata, source_ci_key, \
+                      visibility_kind, site, scope_provenance) \
+                 VALUES ($1, 't', 'd', 'P2', $2::jsonb, $3, 'resource', 'GBLON', \
+                         'scheduler-resource-v1')",
             )
             .bind(item_type)
             .bind(&meta)
+            .bind(&key)
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("first {item_type} item inserts: {e}"));
             let dup = sqlx::query(
-                "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-                 VALUES ($1, 't2', 'd2', 'P2', $2::jsonb)",
+                "INSERT INTO shift_queue \
+                     (item_type, title, description, priority, metadata, source_ci_key, \
+                      visibility_kind, site, scope_provenance) \
+                 VALUES ($1, 't2', 'd2', 'P2', $2::jsonb, $3, 'resource', 'GBLON', \
+                         'scheduler-resource-v1')",
             )
             .bind(item_type)
             .bind(&meta)
+            .bind(&key)
             .execute(pool)
             .await;
             assert!(
                 dup.is_err(),
-                "the {item_type} index rejects a second OPEN duplicate"
+                "the resource authority index rejects a second OPEN {item_type} duplicate"
             );
-            sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
                 .bind(&key)
                 .execute(pool)
                 .await
@@ -3931,8 +5539,8 @@ mod db_tests {
         }
     }
 
-    /// #17: migration 126's seed is idempotent AND its partial unique index
-    /// (legal-hold-expiring) dedups an open item.
+    /// #17: migration 126's seed is idempotent AND migration 170's typed resource
+    /// index dedups an open legal-hold-expiring item by exact authority tuple.
     #[tokio::test]
     async fn migration_126_is_idempotent_and_index_dedups() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -3968,25 +5576,33 @@ mod db_tests {
         let key = format!("lh-idx-{}", uuid::Uuid::new_v4());
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('legal-hold-expiring', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('legal-hold-expiring', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first legal-hold-expiring item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('legal-hold-expiring', 't2', 'd2', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('legal-hold-expiring', 't2', 'd2', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the legal-hold-expiring index rejects a second OPEN duplicate"
+            "the resource authority index rejects a second OPEN legal-hold duplicate"
         );
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -4065,25 +5681,33 @@ mod db_tests {
         let key = format!("recert-idx-{}@123", uuid::Uuid::new_v4());
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('recertification-overdue', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, scope_provenance) \
+             VALUES ('recertification-overdue', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'global', 'scheduler-global-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first recertification-overdue item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('recertification-overdue', 't2', 'd2', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, scope_provenance) \
+             VALUES ('recertification-overdue', 't2', 'd2', 'P2', $1::jsonb, $2, \
+                     'global', 'scheduler-global-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the recertification-overdue index rejects a second OPEN duplicate"
+            "the global authority index rejects a second OPEN recertification duplicate"
         );
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -4110,7 +5734,7 @@ mod db_tests {
         // Run the scan directly (twice) to prove enqueue + dedup.
         for _ in 0..2 {
             let mut tx = pool.begin().await.unwrap();
-            let (status, _) = run_job(&mut tx, "recertification_overdue_scan")
+            let (status, _) = run_job(&mut tx, "direct-test", "recertification_overdue_scan")
                 .await
                 .unwrap();
             assert_eq!(status, "succeeded");
@@ -4206,7 +5830,7 @@ mod db_tests {
         seed_recert_campaign(pool, &id, &past, "Active").await;
 
         let mut tx = pool.begin().await.unwrap();
-        run_job(&mut tx, "recertification_overdue_scan")
+        run_job(&mut tx, "direct-test", "recertification_overdue_scan")
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -4312,25 +5936,33 @@ mod db_tests {
         let key = format!("cert-idx-{}", uuid::Uuid::new_v4());
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('certificate-expiring', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('certificate-expiring', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first certificate-expiring item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('certificate-expiring', 't2', 'd2', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('certificate-expiring', 't2', 'd2', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the certificate-expiring index rejects a second OPEN duplicate"
+            "the resource authority index rejects a second OPEN certificate duplicate"
         );
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -4354,7 +5986,9 @@ mod db_tests {
 
         let run = |pool: &'static PgPool| async move {
             let mut tx = pool.begin().await.unwrap();
-            let (status, _) = run_job(&mut tx, "certificate_expiry_scan").await.unwrap();
+            let (status, _) = run_job(&mut tx, "direct-test", "certificate_expiry_scan")
+                .await
+                .unwrap();
             assert_eq!(status, "succeeded");
             tx.commit().await.unwrap();
         };
@@ -4419,12 +6053,14 @@ mod db_tests {
         interval_days: i32,
         status: &str,
     ) -> String {
-        let name = format!("svc-test-{}", uuid::Uuid::new_v4().simple());
+        let name = format!("svc-test-{}-gblon", uuid::Uuid::new_v4().simple());
         sqlx::query_scalar::<_, uuid::Uuid>(
             "INSERT INTO gmsa_accounts \
              (name, sam_account_name, dns_host_name, site, status, \
-              managed_password_interval_days, last_rotation_at) \
-             VALUES ($1, $2, $3, 'GBLON', $4, $5, $6::timestamptz) RETURNING id",
+              managed_password_interval_days, last_rotation_at, namespace_owner_site, \
+              namespace_policy_version, namespace_state) \
+             VALUES ($1, $2, $3, 'GBLON', $4, $5, $6::timestamptz, \
+                     'GBLON', $7, 'Verified') RETURNING id",
         )
         .bind(&name)
         .bind(format!("{name}$"))
@@ -4432,6 +6068,7 @@ mod db_tests {
         .bind(status)
         .bind(interval_days)
         .bind(last_rotation_at)
+        .bind(ryuki_engine::site_registry::DIRECTORY_NAMESPACE_POLICY_VERSION)
         .fetch_one(pool)
         .await
         .expect("seed gmsa")
@@ -4481,7 +6118,9 @@ mod db_tests {
 
         let run = |pool: &'static PgPool| async move {
             let mut tx = pool.begin().await.unwrap();
-            let (status, _) = run_job(&mut tx, "gmsa_expiry_scan").await.unwrap();
+            let (status, _) = run_job(&mut tx, "direct-test", "gmsa_expiry_scan")
+                .await
+                .unwrap();
             assert_eq!(status, "succeeded");
             tx.commit().await.unwrap();
         };
@@ -4551,7 +6190,9 @@ mod db_tests {
         let negative_interval = seed_gmsa(pool, &long_ago, -5, "Active").await;
 
         let mut tx = pool.begin().await.unwrap();
-        let (status, _) = run_job(&mut tx, "gmsa_expiry_scan").await.unwrap();
+        let (status, _) = run_job(&mut tx, "direct-test", "gmsa_expiry_scan")
+            .await
+            .unwrap();
         assert_eq!(status, "succeeded");
         tx.commit().await.unwrap();
 
@@ -4612,40 +6253,38 @@ mod db_tests {
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
 
-        // Self-contained index (the local DB may be behind on migrations): create it with the
-        // SAME DDL the migration uses (IF NOT EXISTS → a no-op once the migration has applied),
-        // then prove it rejects a 2nd OPEN duplicate.
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_gmsa_expiring \
-             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
-             WHERE resolved = false AND item_type = 'gmsa-expiring'",
-        )
-        .execute(pool)
-        .await
-        .expect("the gmsa-expiring partial unique index DDL is valid");
-
+        // Migration 170 retired the item-specific metadata index. Exercise the
+        // current typed resource index without mutating the shared schema.
         let key = format!("gmsa-idx-{}", uuid::Uuid::new_v4());
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('gmsa-expiring', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('gmsa-expiring', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first gmsa-expiring item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('gmsa-expiring', 't2', 'd2', 'P3', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('gmsa-expiring', 't2', 'd2', 'P3', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the gmsa-expiring index rejects a second OPEN duplicate"
+            "the resource authority index rejects a second OPEN gMSA duplicate"
         );
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -4714,7 +6353,9 @@ mod db_tests {
 
         let run = |pool: &'static PgPool| async move {
             let mut tx = pool.begin().await.unwrap();
-            let (status, _) = run_job(&mut tx, "oob_cert_expiry_scan").await.unwrap();
+            let (status, _) = run_job(&mut tx, "direct-test", "oob_cert_expiry_scan")
+                .await
+                .unwrap();
             assert_eq!(status, "succeeded");
             tx.commit().await.unwrap();
         };
@@ -4802,39 +6443,38 @@ mod db_tests {
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
 
-        // Self-contained index (the local DB may be behind on migrations): same DDL as the
-        // migration (IF NOT EXISTS → a no-op once it has applied), then prove it dedups.
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_oob_cert_expiring \
-             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
-             WHERE resolved = false AND item_type = 'oob-cert-expiring'",
-        )
-        .execute(pool)
-        .await
-        .expect("the oob-cert-expiring partial unique index DDL is valid");
-
+        // Migration 170 retired the item-specific metadata index. Exercise the
+        // current typed resource index without mutating the shared schema.
         let key = format!("oob-idx-{}", uuid::Uuid::new_v4());
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('oob-cert-expiring', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('oob-cert-expiring', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first oob-cert-expiring item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('oob-cert-expiring', 't2', 'd2', 'P3', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, scope_provenance) \
+             VALUES ('oob-cert-expiring', 't2', 'd2', 'P3', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the oob-cert-expiring index rejects a second OPEN duplicate"
+            "the resource authority index rejects a second OPEN OOB certificate duplicate"
         );
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -4895,7 +6535,9 @@ mod db_tests {
         seed_shift_item(pool, &nullres, true, "NULL").await; // keep (no age anchor)
 
         let mut tx = pool.begin().await.unwrap();
-        let (status, _) = run_job(&mut tx, "shift_queue_prune").await.unwrap();
+        let (status, _) = run_job(&mut tx, "direct-test", "shift_queue_prune")
+            .await
+            .unwrap();
         assert_eq!(status, "succeeded");
         tx.commit().await.unwrap();
 
@@ -5710,7 +7352,7 @@ mod db_tests {
         );
         let succeeded: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan_v2' \
                AND status = 'succeeded'",
         )
         .bind(&sched_id)
@@ -5729,9 +7371,9 @@ mod db_tests {
         }
     }
 
-    /// Slice-2 test 8: migration 123's partial unique index is idempotent (a
-    /// re-create is a no-op) AND rejects a SECOND open restore-test-failed
-    /// duplicate for the same system.
+    /// Slice-2 test 8: migration 170 supersedes migration 123's metadata index;
+    /// the current typed resource index rejects a SECOND open
+    /// restore-test-failed duplicate for the exact same authority tuple.
     #[tokio::test]
     async fn migration_123_is_idempotent_and_index_dedups() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -5739,43 +7381,40 @@ mod db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        // Re-running the index DDL is a clean no-op (IF NOT EXISTS).
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_restore_failed \
-             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
-             WHERE resolved = false AND item_type = 'restore-test-failed'",
-        )
-        .execute(pool)
-        .await
-        .expect("re-creating the index is idempotent");
-
-        // The partial unique index rejects a SECOND open item for the same
-        // item_type+source_ci_key. First insert succeeds; the direct second
-        // insert (bypassing enqueue_if_absent's NOT EXISTS) hits the index.
+        // Do not recreate the retired metadata index: doing so would corrupt
+        // migration 170's shared-schema invariant and make test order matter.
         let suffix = uuid::Uuid::new_v4();
         let key = format!("ci-rf-idx-{suffix}");
         let meta = serde_json::json!({ "source_ci_key": key }).to_string();
         sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('restore-test-failed', 't', 'd', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, environment, scope_provenance) \
+             VALUES ('restore-test-failed', 't', 'd', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'production', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await
         .expect("first open failed item inserts");
         let dup = sqlx::query(
-            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-             VALUES ('restore-test-failed', 't2', 'd2', 'P2', $1::jsonb)",
+            "INSERT INTO shift_queue \
+                 (item_type, title, description, priority, metadata, source_ci_key, \
+                  visibility_kind, site, environment, scope_provenance) \
+             VALUES ('restore-test-failed', 't2', 'd2', 'P2', $1::jsonb, $2, \
+                     'resource', 'GBLON', 'production', 'scheduler-resource-v1')",
         )
         .bind(&meta)
+        .bind(&key)
         .execute(pool)
         .await;
         assert!(
             dup.is_err(),
-            "the partial unique index rejects a second OPEN failed duplicate"
+            "the resource authority index rejects a second OPEN failed duplicate"
         );
 
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&key)
             .execute(pool)
             .await
@@ -5786,7 +7425,7 @@ mod db_tests {
     async fn latest_scan_detail(pool: &PgPool, sched_id: &str) -> String {
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan_v2' \
                AND status = 'succeeded' \
              ORDER BY started_at DESC LIMIT 1",
         )
@@ -6043,9 +7682,11 @@ mod db_tests {
     /// Seed a patch_waves row in status 'Scheduled' with the given window start.
     async fn seed_patch_wave(pool: &PgPool, id: &str, name: &str, start: &str) {
         sqlx::query(
-            "INSERT INTO patch_waves (id, site, os_family, status, name, schedule) \
-             VALUES ($1::uuid, 'TESTSITE', 'Linux', 'Scheduled', $2, \
-                     jsonb_build_object('start', $3::text)) \
+            "INSERT INTO patch_waves \
+                 (id, site, os_family, status, name, schedule, site_scope, environment_scope) \
+             VALUES ($1::uuid, 'GBLON', 'Linux', 'Scheduled', $2, \
+                     jsonb_build_object('start', $3::text), \
+                     jsonb_build_array('GBLON'), jsonb_build_array('production')) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(id)
@@ -6096,7 +7737,8 @@ mod db_tests {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM shift_queue \
              WHERE item_type = 'patch-wave-overdue' AND resolved = false \
-               AND metadata->>'source_ci_key' = $1",
+               AND source_ci_key = $1 AND visibility_kind = 'resource' \
+               AND site = 'GBLON' AND environment = 'production'",
         )
         .bind(wave_id)
         .fetch_one(pool)
@@ -6126,7 +7768,7 @@ mod db_tests {
 
         // Cleanup shift_queue + job_executions BEFORE asserting (mirrors sibling
         // tests' cleanup-before-assert discipline).
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key IN ($1, $2)")
             .bind(&overdue_id)
             .bind(&future_id)
             .execute(pool)
@@ -6185,7 +7827,7 @@ mod db_tests {
         );
 
         // Final cleanup.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key IN ($1, $2)")
             .bind(&overdue_id)
             .bind(&future_id)
             .execute(pool)
@@ -6218,7 +7860,7 @@ mod db_tests {
         sqlx::query(
             "INSERT INTO golden_images \
                  (id, image_name, os_family, os_version, distro, build_date, status, site_scope) \
-             VALUES ($1::uuid, $2, 'Linux', '24.04', 'ubuntu', $3::timestamptz, 'promoted', 'TESTSITE') \
+             VALUES ($1::uuid, $2, 'Linux', '24.04', 'ubuntu', $3::timestamptz, 'promoted', 'GBLON') \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(id)
@@ -6245,7 +7887,7 @@ mod db_tests {
             .ok();
         sqlx::query(
             "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
-             VALUES ($1, 'test golden image scan', 'golden_image_stale_scan', 86400, TRUE, \
+             VALUES ($1, 'test golden image scan', 'golden_image_stale_scan_v2', 86400, TRUE, \
              NOW() - INTERVAL '1 minute')",
         )
         .bind(id)
@@ -6269,12 +7911,113 @@ mod db_tests {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM shift_queue \
              WHERE item_type = 'golden-image-stale' AND resolved = false \
-               AND metadata->>'source_ci_key' = $1",
+               AND source_ci_key = $1 AND visibility_kind = 'resource' \
+               AND site = 'GBLON' AND environment IS NULL",
         )
         .bind(image_id)
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// C187 regression: stale-image selection is a fixed-cutoff, high-watered
+    /// keyset page. A continuation reaches later eligible rows, while an image
+    /// inserted after the snapshot cannot extend the active cycle.
+    #[tokio::test]
+    async fn golden_image_scheduler_page_is_bounded_and_high_watered() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let cursor = crate::repos::golden_images::stale_scan_high_water(&mut *tx)
+            .await
+            .unwrap();
+        let stale_built = chrono::Utc::now() - chrono::Duration::days(60);
+        let fresh_built = chrono::Utc::now() - chrono::Duration::days(1);
+        let suffix = uuid::Uuid::new_v4();
+        let mut expected_ids = Vec::new();
+        let mut high_water = cursor;
+        for index in 0..3 {
+            let id = uuid::Uuid::new_v4();
+            let (status, built) = match index {
+                0 => ("building", stale_built),
+                1 => ("promoted", fresh_built),
+                _ => ("promoted", stale_built),
+            };
+            sqlx::query(
+                "INSERT INTO golden_images \
+                 (id, image_name, os_family, os_version, distro, build_date, status, site_scope) \
+                 VALUES ($1, $2, 'Linux', '24.04', 'ubuntu', $3, $4, $5)",
+            )
+            .bind(id)
+            .bind(format!("bounded-gimg-{index}-{suffix}"))
+            .bind(built)
+            .bind(status)
+            .bind(format!("BOUNDED-{index}-{suffix}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            high_water = sqlx::query_scalar(
+                "SELECT scan_seq FROM golden_image_scheduler_population \
+                 WHERE image_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            expected_ids.push(id.to_string());
+        }
+        let after_high_water = uuid::Uuid::new_v4();
+        let after_high_water_text = after_high_water.to_string();
+        sqlx::query(
+            "INSERT INTO golden_images \
+             (id, image_name, os_family, os_version, distro, build_date, status, site_scope) \
+             VALUES ($1, $2, 'Linux', '24.04', 'ubuntu', $3, 'promoted', $4)",
+        )
+        .bind(after_high_water)
+        .bind(format!("bounded-gimg-new-{suffix}"))
+        .bind(stale_built)
+        .bind(format!("BOUNDED-NEW-{suffix}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let first =
+            crate::repos::golden_images::scheduler_scan_page(&mut *tx, cursor, high_water, 2)
+                .await
+                .unwrap();
+        assert_eq!(first.len(), 2, "first page obeys the requested bound");
+        assert_eq!(first[0].status, "building");
+        assert!(first[1].build_date >= fresh_built);
+        let second = crate::repos::golden_images::scheduler_scan_page(
+            &mut *tx,
+            first.last().unwrap().scan_seq,
+            high_water,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "continuation reaches the final snapshot row"
+        );
+        assert_eq!(second[0].status, "promoted");
+        assert!(second[0].build_date < fresh_built);
+        let visited: Vec<&str> = first
+            .iter()
+            .chain(second.iter())
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            visited,
+            expected_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!visited.contains(&after_high_water_text.as_str()));
+
+        tx.rollback().await.unwrap();
     }
 
     /// A promoted image older than the refresh window enqueues exactly one item; a
@@ -6311,7 +8054,7 @@ mod db_tests {
         let sched_id = seed_due_gimg_scan(pool).await;
 
         // Cleanup shift_queue + job_executions BEFORE asserting.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key IN ($1, $2)")
             .bind(&stale_id)
             .bind(&fresh_id)
             .execute(pool)
@@ -6340,7 +8083,7 @@ mod db_tests {
         // Detail is aggregate-only: "<N> golden image(s) stale, <M> enqueued".
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
-             WHERE schedule_id = $1 AND job_kind = 'golden_image_stale_scan' \
+             WHERE schedule_id = $1 AND job_kind = 'golden_image_stale_scan_v2' \
                AND status = 'succeeded' \
              ORDER BY started_at DESC LIMIT 1",
         )
@@ -6370,7 +8113,7 @@ mod db_tests {
         );
 
         // Final cleanup.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key IN ($1, $2)")
             .bind(&stale_id)
             .bind(&fresh_id)
             .execute(pool)
@@ -6472,7 +8215,8 @@ mod db_tests {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM shift_queue \
              WHERE item_type = 'drift-recheck-overdue' AND resolved = false \
-               AND metadata->>'source_ci_key' = $1",
+               AND source_ci_key = $1 AND visibility_kind = 'resource' \
+               AND site = 'GBLON' AND environment = 'production'",
         )
         .bind(request_id)
         .fetch_one(pool)
@@ -6490,14 +8234,14 @@ mod db_tests {
             return;
         };
 
-        let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        let request_id = seed_operational_request(pool, "GBLON", "production").await;
         // 30 days ago > DRIFT_RECHECK_INTERVAL_DAYS (14) — overdue.
         seed_verified_agent_job(pool, &request_id, "NOW() - INTERVAL '30 days'").await;
 
         let sched_id = seed_due_drift_scan(pool).await;
 
         // Cleanup shift_queue + job_executions BEFORE asserting.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&request_id)
             .execute(pool)
             .await
@@ -6550,7 +8294,7 @@ mod db_tests {
         );
 
         // Final cleanup.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&request_id)
             .execute(pool)
             .await
@@ -6585,7 +8329,7 @@ mod db_tests {
             return;
         };
 
-        let request_id = seed_operational_request(pool, "TESTSITE", "production").await;
+        let request_id = seed_operational_request(pool, "GBLON", "production").await;
         // A 60-day-old apply WOULD be overdue on its own (interval is 14 days)...
         seed_verified_agent_job(pool, &request_id, "NOW() - INTERVAL '60 days'").await;
         // ...but a drift re-check 2 days ago reset the clock.
@@ -6598,7 +8342,7 @@ mod db_tests {
         .expect("set last_drift_check_at");
 
         let sched_id = seed_due_drift_scan(pool).await;
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&request_id)
             .execute(pool)
             .await
@@ -6617,7 +8361,7 @@ mod db_tests {
         );
 
         // Cleanup.
-        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+        sqlx::query("DELETE FROM shift_queue WHERE source_ci_key = $1")
             .bind(&request_id)
             .execute(pool)
             .await
@@ -7018,6 +8762,129 @@ mod db_tests {
             .await
             .ok();
         restore_migration_noise_scan(pool).await;
+    }
+
+    /// C282: the expiry writer uses the same two-statement authority protocol
+    /// as interactive suppress/resolve. A registry cutover already holding the
+    /// lock must complete first; the expiry UPDATE then receives a fresh
+    /// generation snapshot and cannot revive a stale row under its old site.
+    #[tokio::test]
+    async fn noise_suppression_expiry_refreshes_generation_after_registry_cutover() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for _ in 0..1_000 {
+            if crate::contracts::reconcile_noisy_trigger_sites_once(pool)
+                .await
+                .expect("drain noise authority before expiry race")
+                == 0
+            {
+                break;
+            }
+        }
+        let tag = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .to_ascii_uppercase();
+        let site = format!("NE{}", &tag[..8]);
+        let trigger_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO site_registry \
+             (unlocode, code_system, name, country, country_code, timezone, active) \
+             VALUES ($1, 'custom', $2, 'Test country', 'ZZ', 'UTC', TRUE)",
+        )
+        .bind(&site)
+        .bind(format!("Noise expiry race site {tag}"))
+        .execute(pool)
+        .await
+        .expect("register expiry-race site");
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        seed_suppressed_trigger(
+            pool,
+            &trigger_id,
+            &format!("srv-{}-app01", site.to_ascii_lowercase()),
+            &past,
+        )
+        .await;
+
+        // Hold the registry mutation open on one connection. The real expiry
+        // job runs on a second transaction and must block before its UPDATE.
+        let mut registry_tx = pool.begin().await.expect("begin expiry cutover");
+        sqlx::query("UPDATE site_registry SET active = FALSE WHERE unlocode = $1")
+            .bind(&site)
+            .execute(&mut *registry_tx)
+            .await
+            .expect("stage expiry cutover");
+        let expiry_pool = pool.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let expiry = tokio::spawn(async move {
+            let mut job_tx = expiry_pool.begin().await?;
+            let _ = started_tx.send(());
+            let result = run_job(
+                &mut job_tx,
+                "noise-expiry-generation-race",
+                "noise_suppression_expiry_scan",
+            )
+            .await?;
+            job_tx.commit().await?;
+            Ok::<_, sqlx::Error>(result)
+        });
+        started_rx.await.expect("expiry race task started");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !expiry.is_finished(),
+            "expiry writer must wait for the registry authority transaction"
+        );
+        registry_tx.commit().await.expect("commit expiry cutover");
+        let (status, detail) = tokio::time::timeout(std::time::Duration::from_secs(5), expiry)
+            .await
+            .expect("expiry writer unblocks after cutover")
+            .expect("expiry race task joins")
+            .expect("expiry job succeeds");
+        assert_eq!(status, "succeeded");
+        assert!(
+            detail.as_deref().is_some_and(|value| {
+                value.ends_with(" expired suppression(s) reverted to Active")
+            }),
+            "expiry result remains aggregate-only: {detail:?}"
+        );
+        let (row_status, suppress_until_is_null, generation_is_current): (String, bool, bool) =
+            sqlx::query_as(
+                "SELECT status, suppress_until IS NULL, \
+                        site_resolution_generation = ( \
+                            SELECT generation FROM noisy_trigger_site_authority WHERE singleton \
+                        ) \
+                 FROM noisy_triggers WHERE id = $1::uuid",
+            )
+            .bind(&trigger_id)
+            .fetch_one(pool)
+            .await
+            .expect("read stale row after expiry race");
+        assert_eq!(row_status, "Suppressed");
+        assert!(!suppress_until_is_null);
+        assert!(!generation_is_current);
+
+        for _ in 0..1_000 {
+            if crate::contracts::reconcile_noisy_trigger_sites_once(pool)
+                .await
+                .expect("drain noise authority after expiry race")
+                == 0
+            {
+                break;
+            }
+        }
+        sqlx::query("DELETE FROM noisy_triggers WHERE id = $1::uuid")
+            .bind(&trigger_id)
+            .execute(pool)
+            .await
+            .expect("clean expiry-race trigger");
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(pool)
+            .await
+            .expect("clean expiry-race site");
     }
 
     /// Migration 142's seed is idempotent (re-running ON CONFLICT is a clean no-op

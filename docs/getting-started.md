@@ -58,7 +58,10 @@ Wait for `curl --fail http://127.0.0.1:8081/ready` to succeed.
 In a second terminal:
 
 ```bash
+LEPTOS_SITE_ADDR=127.0.0.1:8080 \
 RYUKI_API_URL=http://127.0.0.1:8081 \
+RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 \
+RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true \
 RYUKI_PORTAL_EXECUTION_MODE=live-provider \
 cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 ```
@@ -66,7 +69,13 @@ cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 Open `http://127.0.0.1:8080`. Without `live-provider`, the portal deliberately
 uses its labeled static dry-run data instead of forwarding to the API.
 
-The Compose stack uses different host ports: API `18080`, portal `18000`.
+The Compose stack uses different loopback host ports: API `18080`, portal
+`18000`. Its bridged API uses local authentication rather than mock authority
+on a non-loopback container listener. Before starting the full stack, set
+`RYUKI_LOCAL_AUTH__USERS`, explicit site/environment authority modes (and
+scope lists for `scoped` modes), and a random, at-least-32-byte
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` in the gitignored root `.env`. The default
+Compose portal remains static dry-run at `http://127.0.0.1:18000`.
 
 ### 6. Run tests
 
@@ -93,9 +102,20 @@ Default is **mock-dry-run** — no real Entra ID, all operations are simulated.
 To enable live Entra ID authentication:
 
 1. Register an Entra ID application (see `docs/configuration.md`)
-2. Set `RYUKI_AUTH_MODE=entra-id` in `.env`
-3. Set `RYUKI_ENTRA_TENANT_ID` and `RYUKI_ENTRA_CLIENT_ID`
-4. Restart the API
+2. Export `RYUKI_AUTH_MODE=entra-id`, `RYUKI_ENTRA_TENANT_ID`, and
+   `RYUKI_ENTRA_CLIENT_ID` into the API process (Compose may read them from the
+   gitignored `.env`; direct Cargo runs do not)
+3. Inject a random, at-least-32-byte
+   `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` at runtime
+4. For browser SSO, also set the exact registered
+   `RYUKI_ENTRA_REDIRECT_URI`; omit it only for deliberate bearer-only use
+5. Restart the API and require `/ready`
+
+For a non-Entra provider, the current release has a single generic OIDC + PKCE
+profile under `RYUKI_OIDC__*`. See [Configuration](configuration.md#generic-oidc-current-single-provider-flow).
+The platform boundary specification defines the remaining multi-provider,
+brokered SAML/LDAP, WebAuthn emergency, service OAuth, and workload-identity
+work.
 
 ## Project Structure
 

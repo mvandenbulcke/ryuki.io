@@ -6,8 +6,10 @@ evidence, not acceptance by itself.
 
 The first test has two milestones:
 
-1. **Platform rehearsal** proves the governed lifecycle with `OfflineDryRun`.
-   It must complete before any provider-connected work.
+1. **Platform no-spawn rehearsal** proves the governed control-plane lifecycle,
+   maker/checker handoff, enrollment, protocol, signing, and evidence seams
+   without starting Terraform or Ansible. It must complete before any external-
+   process or provider-connected work.
 2. **First live vSphere test** proves plan, approval, apply, verification, state
    isolation, and cleanup against one approved disposable target.
 
@@ -15,6 +17,15 @@ The live milestone is optional until an operator approves the target and
 credentials. It is blocked, not failed, when those external prerequisites are
 unavailable. It must never be redirected to production merely to make the test
 runnable.
+
+The current source tree also blocks that live milestone by design: production
+external subprocess execution refuses before spawn until a reviewed
+per-command containment adapter can attach before exec, kill all descendants,
+and wait for an empty scope. The live gates below therefore specify future
+acceptance evidence; they do not assert working provider execution in this
+snapshot. The current executable milestone is the no-spawn control-plane and
+pure/stub protocol rehearsal. A successful external `OfflineDryRun` result is
+deferred with the same containment adapter as live execution.
 
 ## Authority and scope
 
@@ -25,9 +36,11 @@ this document disagree, the affected gate is blocked until both are reconciled.
 
 Use the remaining documentation in this order:
 
-1. [Agents & Live Execution](agents-and-live-execution.md),
-   [Multi-Step Orchestration](orchestration.md), and
-   `deploy/proving-ground/README.md` define operator procedures.
+1. [Agents & Live Execution](agents-and-live-execution.md) and
+   `deploy/proving-ground/README.md` define current operator procedures.
+   [Multi-Step Orchestration](orchestration.md) documents the disabled
+   per-step live-apply boundary and future compensation groundwork; it is not
+   an enabled operator procedure in this release.
 2. Files under `docs/design/` and goal-session trackers are historical design
    records. They do not override implemented behavior or this acceptance gate.
 
@@ -129,10 +142,11 @@ audit notes, screenshots, or committed test evidence.
 
 Before Gate 1, initialize one operator shell with the repository paths and
 exact approved inputs below, and keep that shell through Gate 6. After Gate 2,
-write each local login response's `session_id` to the matching mode-`0600`
+write each local login response's `session_token` to the matching mode-`0600`
 header file; unsafe API methods require `X-Ryuki-Session-Id` and reject
-cookie-only authorization. Session IDs are credentials: never print or commit
-them. Assign
+cookie-only authorization. Session tokens are credentials: never print or
+commit them. Administrative session UUIDs are management metadata and cannot
+authenticate. Assign
 each `*_REQUEST_ID` immediately after that request is created in its stated
 gate.
 
@@ -143,32 +157,35 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 PROVING_GROUND_DIR="$REPO_ROOT/deploy/proving-ground"
 TEST_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 AUTH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ryuki-first-test.XXXXXX")
+AUTH_DIR=$(cd "$AUTH_DIR" && pwd -P)
 REQUESTER_HEADERS="$AUTH_DIR/requester.headers"
 ADMIN_HEADERS="$AUTH_DIR/admin.headers"
 
 login_local() {
   local username=$1
   local header_file=$2
-  local password login session_id
+  local password login session_token
   printf '%s password: ' "$username" >&2
   IFS= read -r -s password </dev/tty
   printf '\n' >&2
   login=$(printf '%s' "$password" | \
     jq -Rs --arg username "$username" '{username: $username, password: .}' | \
-    curl --fail-with-body -sS -X POST "$BASE/api/auth/local/login" \
+    curl --disable --fail-with-body -sS --noproxy '*' \
+      -X POST "$BASE/api/auth/local/login" \
       -H 'Content-Type: application/json' --data-binary @-)
   unset password
-  session_id=$(printf '%s' "$login" | jq -er '.session_id')
+  session_token=$(printf '%s' "$login" | jq -er '.session_token')
   unset login
-  printf 'X-Ryuki-Session-Id: %s\n' "$session_id" > "$header_file"
-  unset session_id
+  printf 'X-Ryuki-Session-Id: %s\n' "$session_token" > "$header_file"
+  unset session_token
 }
 
 logout_local() {
   local header_file=$1
   local logout_status=0
   if test -f "$header_file"; then
-    curl --fail-with-body -sS -X POST "$BASE/api/auth/local/logout" \
+    curl --disable --fail-with-body -sS --noproxy '*' \
+      -X POST "$BASE/api/auth/local/logout" \
       -H "@$header_file" >/dev/null || logout_status=$?
     rm -f "$header_file"
   fi
@@ -270,7 +287,7 @@ cd "$PROVING_GROUND_DIR"
 docker compose -f ../compose/compose.yaml build platform-api portal-ui
 docker compose down
 docker compose up -d --wait --force-recreate
-curl --fail http://localhost:18081/ready
+curl --disable --fail --noproxy '*' http://127.0.0.1:18081/ready
 docker image inspect ryuki/platform-api:rust-dev ryuki/portal-ui:rust-dev \
   --format '{{.Id}}'
 ```
@@ -287,13 +304,24 @@ Acceptance requires:
 - API and portal images were rebuilt from `TEST_REVISION`, force-recreated, and
   their image IDs were recorded; a previously built `rust-dev` image is not
   acceptance evidence.
-- the agent self-registers once, persists its token, exits pending approval,
-  and enters its poll loop only after the admin approves it;
-- control plane and agent negotiate protocol v2. Missing or v1 protocol headers
-  are rejected rather than treated as compatible. Record the approved agent's
-  startup log entry `CP wire protocol is compatible` with both
-  `cp_protocol_version=2` and `agent_protocol_version=2`; the protocol rejection
-  tests in Gate 1 are the evidence for missing/v1 fail-closed behavior.
+- before the agent starts, the operator records the preprovisioned Ed25519
+  public-key fingerprint, creates a short-lived challenge for that exact agent
+  id/platform/key through the admin API, and invokes `run-agent.sh
+  --stage-enrollment` with a temporary mode-`0600` administrator session header
+  outside the repository. The response is held only in the private gitignored
+  agent-state directory until consumption; neither challenge field is stored in
+  `.env`. The plaintext challenge is not recorded in test evidence;
+- the agent proves possession of that key, consumes the challenge exactly once,
+  persists its token, exits pending approval, and enters its poll loop only
+  after the admin verifies `cryptographically_admitted: true` and approves the
+  matching fingerprint and platform;
+- control plane and agent negotiate protocol v6. Missing and v1-v5
+  protocol headers are rejected rather than treated as compatible. Record the
+  approved agent's startup log entry `CP wire protocol is compatible` with both
+  `cp_protocol_version=6` and `agent_protocol_version=6`; the protocol rejection
+  tests in Gate 1 are the evidence for older-version fail-closed behavior and
+  for rejection of legacy live grants without exact destination, planning-agent
+  enrollment/key, reviewed execution-profile, and exact plan-row bindings.
 - direct vSphere inventory inspection proves all four recorded VM names are
   absent from the approved target folder/placement before any LivePlan;
 - the host/control-plane clock evidence satisfies the five-second skew bound.
@@ -306,7 +334,7 @@ requester. Re-login after each handoff. Removing a header file without calling
 logout does not revoke its server-side session. Portal-driven steps require the
 equivalent explicit sign-out/sign-in handoff.
 
-## Gate 3: offline rehearsal
+## Gate 3: platform no-spawn rehearsal
 
 Keep live mode disabled for this entire gate.
 
@@ -317,23 +345,32 @@ Keep live mode disabled for this entire gate.
    statuses become `validated`, then `planned`.
 3. Review the plan, approve the request, and lock it. The statuses become
    `approved`, then `locked`.
-4. As the same admin, dispatch the default `OfflineDryRun`. The request becomes
-   `executing`.
-5. Wait for the signed agent result. Do not call `verify` while the request is
-   still `executing`. A successful result moves it to `verifying`.
-6. Run `verify` and require `completed`.
+4. Exercise enrollment, polling, protocol-v6 negotiation, result signing, and
+   evidence handling only through pure/stub tests that do not spawn Terraform
+   or Ansible. Preserve their value-free evidence.
+5. Confirm the production runner reports the missing sealed containment
+   capability before process creation for every external mode, including
+   `OfflineDryRun`. This is expected fail-closed evidence, not a successful
+   dry-run result. Keep the governed request locked for the future containment
+   acceptance wave rather than claiming it reached `verifying` or `completed`.
 
-Pass only when the audit trail attributes creation and approval to different
-principals, the job result signature is accepted, evidence is redacted, and no
-provider resource or Terraform state was created.
+Pass the current milestone only when the audit trail attributes creation and
+approval to different principals, the v6 enrollment/signing/evidence seams are
+exercised without an external child, and no provider resource or Terraform
+state was created.
 
-As the fail-closed check, create and record the separate
-`LIVE_REFUSAL_REQUEST_ID` as the requester. As the admin, govern it through
-lock, then dispatch `LivePlan` while live mode is still disabled. Require a
-signed refusal, a terminal failed request, and no provider or state mutation.
-`LiveApply` cannot be approved without a successful plan and `LiveDestroy` is
-not an operator action, so `LivePlan` is the refusal directly testable here.
-Do not reuse either Gate 3 request in the live gates.
+After the reviewed containment adapter exists, extend this gate with the
+external `OfflineDryRun`: dispatch it, wait for the signed successful result,
+require the request to move from `executing` to `verifying`, then run `verify`
+and require `completed`. Only that future wave may claim successful Terraform
+or Ansible dry-run evidence. It must still prove redaction and that no provider
+resource or state was created.
+
+Preserve a separate governed request for future live-refusal and containment
+acceptance. `LivePlan` with live mode disabled must eventually produce a signed
+refusal with no external spawn, but do not treat a pure/stub assertion as a
+deployed-agent acceptance result. Do not reuse either Gate 3 request in the
+live gates.
 
 ## Gate 4: live plan and state isolation
 
@@ -362,7 +399,7 @@ interval_skew() {
 
 TRUSTED_TIME_URL=https://www.cloudflare.com/
 HOST_TRUST_BEFORE=$(date -u +%s)
-TRUSTED_DATE=$(curl --fail-with-body -sSI "$TRUSTED_TIME_URL" | \
+TRUSTED_DATE=$(curl --disable --fail-with-body -sSI "$TRUSTED_TIME_URL" | \
   awk 'tolower($1) == "date:" { sub(/\r$/, ""); sub(/^[^:]*:[[:space:]]*/, ""); print; exit }')
 HOST_TRUST_AFTER=$(date -u +%s)
 test -n "$TRUSTED_DATE"
@@ -443,9 +480,10 @@ all of the following:
 - the resolved local backend path is absolute and ends with
   `agent-state/terraform-request-$PRIMARY_LIVE_REQUEST_ID.tfstate`;
 - no generic or shared Terraform state path is used;
-- `agent-state/provider-context.sha256` exists and remains unchanged from plan
-  through apply and cleanup, binding the vCenter endpoint/account without
-  recording either value;
+- `agent-state/provider-authority.ref` exists and retains the same opaque,
+  non-secret authority id/version from plan through apply and cleanup; trusted
+  provisioning rotates that version whenever the destination, account, or any
+  credential member changes, without recording or hashing those values;
 - raw Terraform JSON, provider object identifiers, and credentials are absent
   from the portal/API projection, evidence export, screenshots, and
   operator-collected acceptance record. Exact digest-covered plan bytes remain
@@ -502,7 +540,7 @@ path from the locked local template.
 Conclude the isolation probe while it is still `executing`:
 
 ```bash
-curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \
+curl --disable --fail-with-body -sS --noproxy '*' -H "@$ADMIN_HEADERS" \
   -X POST "$BASE/api/requests/$ISOLATION_REQUEST_ID/fail" \
   -H 'Content-Type: application/json' \
   -d '{"reason":"First-test state-isolation probe concluded without apply"}'
@@ -519,7 +557,8 @@ From this point onward, every apply, verify, and cleanup action targets only
    reconciliation:
 
    ```bash
-   LIVE_APPLY=$(curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \
+   LIVE_APPLY=$(curl --disable --fail-with-body -sS --noproxy '*' \
+     -H "@$ADMIN_HEADERS" \
      -X POST "$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/approve-live-apply")
    APPLY_JOB_ID=$(printf '%s' "$LIVE_APPLY" | jq -er '.job_id')
    ```
@@ -552,7 +591,7 @@ value-free evidence. After the provider and state dispositions are known, the
 admin resolves the job with a non-sensitive reason:
 
 ```bash
-curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \
+curl --disable --fail-with-body -sS --noproxy '*' -H "@$ADMIN_HEADERS" \
   -X POST "$BASE/api/admin/agents/jobs/$APPLY_JOB_ID/reconcile" \
   -H 'Content-Type: application/json' \
   -d '{"reason":"Provider and isolated state reconciled under the approved recovery record"}'
@@ -562,7 +601,7 @@ That moves the job to `Failed` but deliberately leaves the parent request at
 `executing`. Conclude it separately:
 
 ```bash
-curl --fail-with-body -sS -H "@$ADMIN_HEADERS" \
+curl --disable --fail-with-body -sS --noproxy '*' -H "@$ADMIN_HEADERS" \
   -X POST "$BASE/api/requests/$PRIMARY_LIVE_REQUEST_ID/fail" \
   -H 'Content-Type: application/json' \
   -d '{"reason":"Live apply did not complete with a provable successful disposition"}'

@@ -1,45 +1,79 @@
 //! Repository functions for `snapshots`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
-//!
-//! # Audit parameter
-//! `transition` accepts an `_audit_action: Option<&str>` parameter for
-//! signature parity with the patch_waves template, but snapshots do not have
-//! a dedicated audit table — the parameter is intentionally unused.
+//! Every public read and transition requires the verified principal's site and
+//! environment scopes. Scope is applied in SQL through the immutable CMDB UUID
+//! relation introduced by migration 168, before rows are ordered, paginated,
+//! locked, or decoded. A legacy row without a resolvable relation is therefore
+//! invisible and immutable through this repository (fail closed).
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::models::{SnapshotRecord, SnapshotStatus};
-use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
 
-/// SELECT column list. UUID → text so sqlx binds into String; JSONB → text
-/// so we can `serde_json::from_str` it. `created_at` and `updated_at` are
-/// part of `SnapshotRecord` (as RFC-3339 strings), so they must be selected.
-pub const COLUMNS: &str = "id::text AS id, \
-     platform_ci_key, \
-     snapshot_purpose, \
-     requested_expiry, \
-     owner, \
-     support_group, \
-     change_context, \
-     status, \
-     policy_decision, \
-     backup_impact, \
-     remediation_plan, \
-     metadata::text AS metadata, \
-     created_at, \
-     updated_at";
+/// SELECT projection for an authorized `snapshots AS s` joined to its
+/// authoritative `configuration_items AS ci` resource. The canonical CI name
+/// is returned instead of the old descriptive copy on `snapshots`, so a CMDB
+/// rename cannot create two competing identities.
+pub const AUTHORIZED_COLUMNS: &str = "s.id::text AS id, \
+     ci.id::text AS configuration_item_id, \
+     ci.ci_name AS platform_ci_key, \
+     ci.site, \
+     ci.environment, \
+     s.created_by, \
+     s.scope_provenance, \
+     s.snapshot_purpose, \
+     s.requested_expiry, \
+     s.owner, \
+     s.support_group, \
+     s.change_context, \
+     s.status, \
+     s.policy_decision, \
+     s.backup_impact, \
+     s.remediation_plan, \
+     s.metadata::text AS metadata, \
+     s.created_at, \
+     s.updated_at";
+
+/// Shared SQL authorization relation. Literal-empty scope arrays mean
+/// unrestricted, matching `AuthSession`; otherwise the canonical value must be
+/// held. A NULL environment is never visible to an environment-scoped actor.
+/// The inner joins also quarantine unresolved legacy rows and CIs whose current
+/// site lacks an exact active site-registry relation.
+const AUTHORIZED_FROM: &str = "snapshots AS s \
+     INNER JOIN configuration_items AS ci ON ci.id = s.configuration_item_id \
+     INNER JOIN site_registry AS sr ON sr.unlocode = ci.site AND sr.active = true";
+const AUTHORIZED_PREDICATE: &str = "(cardinality($1::text[]) = 0 OR ci.site = ANY($1)) \
+     AND (cardinality($2::text[]) = 0 \
+          OR (NULLIF(btrim(ci.environment), '') IS NOT NULL \
+              AND ci.environment = ANY($2)))";
+
+/// One stale-flag request may claim at most this many eligible rows. Claimed
+/// rows transition out of the eligible states, so repeated calls advance the
+/// work set without a deep OFFSET or an unbounded transaction.
+pub const MAX_STALE_SNAPSHOT_BATCH: i64 = 100;
+
+/// Largest legacy OFFSET accepted by the interactive snapshot inventory.
+pub const MAX_SNAPSHOT_LIST_OFFSET: i64 = 10_000;
+
+/// Counting one row beyond the supported offset window is enough to tell
+/// clients that the total is capped without scanning the complete unbounded
+/// governance log.
+pub const MAX_AUTHORIZED_COUNT_SCAN: i64 = MAX_SNAPSHOT_LIST_OFFSET + 1;
 
 // ─── Row struct ──────────────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
 pub struct SnapshotRow {
     pub id: String,
+    pub configuration_item_id: String,
     pub platform_ci_key: String,
+    pub site: String,
+    pub environment: Option<String>,
+    pub created_by: Option<String>,
+    pub scope_provenance: String,
     pub snapshot_purpose: String,
     pub requested_expiry: String,
     pub owner: String,
@@ -87,7 +121,12 @@ impl SnapshotRow {
 
         Ok(SnapshotRecord {
             id: self.id,
+            configuration_item_id: Some(self.configuration_item_id),
             platform_ci_key: self.platform_ci_key,
+            site: Some(self.site),
+            environment: self.environment,
+            created_by: self.created_by,
+            scope_provenance: Some(self.scope_provenance),
             snapshot_purpose: self.snapshot_purpose,
             requested_expiry: self.requested_expiry,
             owner: self.owner,
@@ -125,29 +164,53 @@ pub fn status_str(s: &SnapshotStatus) -> &'static str {
 
 // ─── Repository functions ─────────────────────────────────────────────────────
 
-/// Insert a new snapshot and return the persisted row. The caller supplies the
-/// model with an already-generated UUID string as `id`; we parse it for the PK.
-///
-/// `created_at`/`updated_at` are not bound here — the DB column defaults (NOW())
-/// own them. We `RETURNING` the inserted row so the returned model carries the
-/// DB-authoritative timestamps (the response then matches a subsequent `get`).
-pub async fn insert(
+/// Insert a snapshot bound to the already authorized CMDB UUID. The
+/// `INSERT ... SELECT` repeats both the UUID and canonical-name relation inside
+/// the write, so a stale or mismatched caller-side resolution cannot create a
+/// governance row for a different resource.
+pub async fn insert_authorized(
     executor: impl sqlx::PgExecutor<'_>,
     r: &SnapshotRecord,
+    configuration_item_id: &str,
+    site_scopes: &[String],
+    environment_scopes: &[String],
+    created_by: &str,
 ) -> Result<SnapshotRecord, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let configuration_item_id =
+        Uuid::parse_str(configuration_item_id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
 
     let row: SnapshotRow = sqlx::query_as(&format!(
-        "INSERT INTO snapshots \
-         (id, platform_ci_key, snapshot_purpose, requested_expiry, owner, support_group, \
-          change_context, status, policy_decision, backup_impact, remediation_plan, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb) \
-         RETURNING {COLUMNS}"
+        "WITH inserted AS ( \
+             INSERT INTO snapshots \
+             (id, configuration_item_id, platform_ci_key, created_by, scope_provenance, \
+              snapshot_purpose, requested_expiry, owner, support_group, change_context, \
+              status, policy_decision, backup_impact, remediation_plan, metadata) \
+             SELECT $1, ci.id, ci.ci_name, $6, 'cmdb-configuration-item', \
+                    $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb \
+             FROM configuration_items AS ci \
+             INNER JOIN site_registry AS sr \
+                     ON sr.unlocode = ci.site AND sr.active = true \
+             WHERE ci.id = $2 AND ci.ci_name = $3 \
+               AND (cardinality($4::text[]) = 0 OR ci.site = ANY($4)) \
+               AND (cardinality($5::text[]) = 0 \
+                    OR (NULLIF(btrim(ci.environment), '') IS NOT NULL \
+                        AND ci.environment = ANY($5))) \
+             RETURNING * \
+         ) \
+         SELECT {AUTHORIZED_COLUMNS} \
+         FROM inserted AS s \
+         INNER JOIN configuration_items AS ci ON ci.id = s.configuration_item_id \
+         INNER JOIN site_registry AS sr ON sr.unlocode = ci.site AND sr.active = true"
     ))
     .bind(id)
+    .bind(configuration_item_id)
     .bind(&r.platform_ci_key)
+    .bind(site_scopes)
+    .bind(environment_scopes)
+    .bind(created_by)
     .bind(&r.snapshot_purpose)
     .bind(&r.requested_expiry)
     .bind(&r.owner)
@@ -164,80 +227,149 @@ pub async fn insert(
     row.into_model()
 }
 
-/// Fetch one snapshot by string id. A malformed (non-UUID) id is treated as
-/// `Ok(None)` (callers map to 404) rather than an error — keeping every
-/// handler's not-found behaviour uniform. `Err` is reserved for genuine DB
-/// failures (callers map to 500).
-pub async fn get(pool: &PgPool, id: &str) -> Result<Option<SnapshotRecord>, sqlx::Error> {
+/// Fetch one snapshot only when its authoritative CMDB relation is inside the
+/// supplied scope. Missing, foreign, and unresolved-legacy rows all return
+/// `None`, preserving a single non-enumerating handler response.
+pub async fn get_authorized(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: &str,
+    site_scopes: &[String],
+    environment_scopes: &[String],
+) -> Result<Option<SnapshotRecord>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
         return Ok(None);
     };
 
-    let row: Option<SnapshotRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM snapshots WHERE id = $1"))
-            .bind(uid)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
+         WHERE {AUTHORIZED_PREDICATE} AND s.id = $3"
+    ))
+    .bind(site_scopes)
+    .bind(environment_scopes)
+    .bind(uid)
+    .fetch_optional(executor)
+    .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return ALL snapshots ordered by creation time descending. Used by the
-/// stale-flagging sweep (`snapshot_flag_stale`), which must scan every snapshot;
-/// the paginated list endpoint uses [`list_page`] instead.
-pub async fn list(pool: &PgPool) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
-    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM snapshots ORDER BY created_at DESC, id DESC"
+/// Fetch and lock one authorized snapshot inside a caller-owned transaction.
+/// Review/remediation use this so resource authority, lifecycle transition,
+/// success audit, and commit share one transaction.
+pub async fn get_authorized_for_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: &str,
+    site_scopes: &[String],
+    environment_scopes: &[String],
+) -> Result<Option<SnapshotRecord>, sqlx::Error> {
+    let Ok(uid) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+
+    let row: Option<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
+         WHERE {AUTHORIZED_PREDICATE} AND s.id = $3 \
+         FOR UPDATE OF s FOR SHARE OF ci, sr"
     ))
-    .fetch_all(pool)
+    .bind(site_scopes)
+    .bind(environment_scopes)
+    .bind(uid)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| r.into_model()).transpose()
+}
+
+/// Claim one bounded batch of authorized, expired, still-actionable snapshots.
+/// The scope and lifecycle predicates run before `LIMIT` and locking;
+/// unresolved, foreign, terminal, future-expiry, and malformed-expiry rows do
+/// not enter the engine input. `SKIP LOCKED` lets concurrent workers claim
+/// disjoint rows instead of occupying pool connections behind the same lock.
+pub async fn list_stale_candidates_for_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    site_scopes: &[String],
+    environment_scopes: &[String],
+    limit: i64,
+) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
+    let limit = limit.clamp(1, MAX_STALE_SNAPSHOT_BATCH);
+    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
+         WHERE {AUTHORIZED_PREDICATE} \
+           AND s.status IN ('Draft', 'ReviewRequested', 'ExpiryApproved') \
+           AND CASE \
+                 WHEN pg_input_is_valid(s.requested_expiry, 'timestamptz') \
+                 THEN s.requested_expiry::timestamptz < NOW() \
+                 ELSE false \
+               END \
+         ORDER BY s.created_at ASC, s.id ASC \
+         LIMIT $3 \
+         FOR UPDATE OF s SKIP LOCKED FOR SHARE OF ci, sr"
+    ))
+    .bind(site_scopes)
+    .bind(environment_scopes)
+    .bind(limit)
+    .fetch_all(executor)
     .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-/// List snapshots bounded to one `LIMIT`/`OFFSET` page (#14). SEPARATE from
-/// [`list`] because the stale-flagging sweep needs every snapshot. The
-/// `ORDER BY created_at DESC, id DESC` ends in the unique `id`, so the page is a
-/// stable cut (no overlap/skip across pages with equal `created_at`).
-pub async fn list_page(
-    pool: &PgPool,
+/// List one authorized page. Scope is applied before ordering/pagination, and
+/// [`count_authorized_bounded`] uses the exact same relation and predicate.
+pub async fn list_page_authorized(
+    executor: impl sqlx::PgExecutor<'_>,
+    site_scopes: &[String],
+    environment_scopes: &[String],
     limit: i64,
     offset: i64,
 ) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
     let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM snapshots ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
+        "SELECT {AUTHORIZED_COLUMNS} FROM {AUTHORIZED_FROM} \
+         WHERE {AUTHORIZED_PREDICATE} \
+         ORDER BY s.created_at DESC, s.id DESC LIMIT $3 OFFSET $4"
     ))
+    .bind(site_scopes)
+    .bind(environment_scopes)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-/// Count all snapshots — the pagination total for [`list_page`].
-pub async fn count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
-        .fetch_one(pool)
-        .await
+/// Count at most [`MAX_AUTHORIZED_COUNT_SCAN`] rows from the same authorized
+/// relation used by [`list_page_authorized`]. A result equal to the cap is a
+/// lower bound, not an exact total; the handler marks it as capped.
+pub async fn count_authorized_bounded(
+    executor: impl sqlx::PgExecutor<'_>,
+    site_scopes: &[String],
+    environment_scopes: &[String],
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM ( \
+             SELECT 1 FROM {AUTHORIZED_FROM} \
+             WHERE {AUTHORIZED_PREDICATE} \
+             LIMIT $3 \
+         ) AS bounded_snapshots"
+    ))
+    .bind(site_scopes)
+    .bind(environment_scopes)
+    .bind(MAX_AUTHORIZED_COUNT_SCAN)
+    .fetch_one(executor)
+    .await
 }
 
-/// Atomically transition a snapshot to its new state IFF its current DB status
-/// still equals `expected_status` (optimistic lock). Returns `Ok(None)` when the
-/// row is absent or its status had already changed (caller → 409), or
-/// `Ok(Some(persisted))` on success — the DB row after the write (with the
-/// DB-owned `updated_at`) so the caller's response matches a subsequent `get`.
-///
-/// All mutable columns are updated together with `status` so a single CAS write
-/// keeps all fields in sync. `updated_at` is set to NOW() by the DB.
-///
-/// `_audit_action` is accepted for signature parity with the patch_waves
-/// template but is intentionally unused — snapshots have no audit table yet.
-pub async fn transition(
+/// Atomically transition a snapshot only if both its prior lifecycle state and
+/// current authoritative CMDB scope remain authorized. The scope predicate is
+/// repeated in the UPDATE; a handler-side load can never be used as a stale
+/// authorization decision.
+pub async fn transition_authorized(
     executor: impl sqlx::PgExecutor<'_>,
+    site_scopes: &[String],
+    environment_scopes: &[String],
     expected_status: &str,
     r: &SnapshotRecord,
-    _audit_action: Option<&str>,
 ) -> Result<Option<SnapshotRecord>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(&r.id) else {
         return Ok(None);
@@ -246,16 +378,29 @@ pub async fn transition(
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
 
     let row: Option<SnapshotRow> = sqlx::query_as(&format!(
-        "UPDATE snapshots SET \
-         status = $2, \
-         policy_decision = $3, \
-         backup_impact = $4, \
-         remediation_plan = $5, \
-         metadata = $6::jsonb, \
-         updated_at = NOW() \
-         WHERE id = $1 AND status = $7 \
-         RETURNING {COLUMNS}"
+        "WITH updated AS ( \
+             UPDATE snapshots AS s SET \
+                 status = $4, \
+                 policy_decision = $5, \
+                 backup_impact = $6, \
+                 remediation_plan = $7, \
+                 metadata = $8::jsonb, \
+                 updated_at = NOW() \
+             FROM configuration_items AS ci \
+             INNER JOIN site_registry AS sr \
+                     ON sr.unlocode = ci.site AND sr.active = true \
+             WHERE s.configuration_item_id = ci.id \
+               AND {AUTHORIZED_PREDICATE} \
+               AND s.id = $3 AND s.status = $9 \
+             RETURNING s.* \
+         ) \
+         SELECT {AUTHORIZED_COLUMNS} \
+         FROM updated AS s \
+         INNER JOIN configuration_items AS ci ON ci.id = s.configuration_item_id \
+         INNER JOIN site_registry AS sr ON sr.unlocode = ci.site AND sr.active = true"
     ))
+    .bind(site_scopes)
+    .bind(environment_scopes)
     .bind(uid)
     .bind(status_str(&r.status))
     .bind(&r.policy_decision)

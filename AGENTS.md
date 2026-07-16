@@ -14,14 +14,35 @@ Ryuki Infrastructure Platform — Rust workspace for system engineer platform en
 
 ## Build & Test
 
+For a complete one-shot verification wave, use the bounded disposable target:
+
+```bash
+make verify-clean
+```
+
+This is mandatory for coding agents and CI-style local checks. It disables
+incremental compilation and full debug symbols for the temporary build, checks
+free space and target size between gates, and removes the target on success,
+failure, or interruption. Do not run parallel Cargo build/test/clippy commands
+in the same checkout. Never leave ad-hoc `CARGO_TARGET_DIR` trees behind.
+
+For iterative human development, the individual commands remain available:
+
 ```bash
 cargo build --workspace
 cargo test --workspace
 cargo fmt --check --all
 cargo clippy --workspace -- -D warnings
+./scripts/dependency-audit.sh
 ./scripts/no-secret-scan.sh
 git diff --check
 ```
+
+Use `make cache-status` to inspect the persistent development cache and
+`make clean` when it is no longer useful. The one-shot defaults reserve 30 GiB
+of free disk and cap the disposable target at 64 GiB; override them only with
+`RYUKI_VERIFY_MIN_FREE_GIB` and `RYUKI_VERIFY_MAX_TARGET_GIB` after an explicit
+capacity review.
 
 ## Safety
 

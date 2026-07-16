@@ -597,11 +597,21 @@ fn validate_required_rules(catalog: &Value, errors: &mut Vec<String>) {
 // disabled — and the catalog's full contract stays covered by
 // `validate_catalog_value`.
 fn validate_program_value(program: &str, _catalog: &Value, errors: &mut Vec<String>) {
-    let _ = crate::rust_contract::validate_static_seed_contract(
+    let Some(payload) = crate::rust_contract::validate_static_seed_contract(
         program,
         ENDPOINT,
         "API missing file share NTFS recertification endpoint",
         errors,
+    ) else {
+        return;
+    };
+    expect(
+        payload
+            .get("authenticatedDecisionAttributionRequired")
+            .and_then(Value::as_bool)
+            == Some(true),
+        errors,
+        "API must require authenticated decision attribution",
     );
 }
 

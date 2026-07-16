@@ -35,6 +35,8 @@ PAGES = [
      "Normative dry-run and live vSphere test gates, evidence, and cleanup."),
     ("architecture", "Architecture",
      "The stack, component diagram, key decisions and network policy."),
+    ("platform-security-boundary", "Platform Security Boundary",
+     "Provider-neutral identity, authorization, machine trust, secrets, audit, and production acceptance."),
     ("configuration", "Configuration",
      "Environment variables, providers and platform configuration."),
     ("entra-app-registration", "Entra App Registration",
@@ -46,7 +48,7 @@ PAGES = [
     ("agents-and-live-execution", "Agents & Live Execution",
      "Enrolling execution agents and the signed approval chain that gates a live apply."),
     ("orchestration", "Multi-Step Orchestration",
-     "Dependency-ordered step plans, per-step live approval, and automatic teardown."),
+     "Dependency-ordered step plans, disabled human per-step live approval, and system-owned compensation groundwork."),
     ("notifications", "Notifications",
      "In-app notifications, read receipts, the portal bell, and what emits them."),
     ("using-the-api", "Using the API",
@@ -56,7 +58,10 @@ PAGES = [
 ]
 
 # Pages whose markdown source lives outside docs/<name>.md.
-SOURCE_PATHS = {"api-reference": DOCS / "api" / "endpoints.md"}
+SOURCE_PATHS = {
+    "api-reference": DOCS / "api" / "endpoints.md",
+    "platform-security-boundary": DOCS / "architecture" / "platform-security-boundary.md",
+}
 
 # Machine-generated sources get a provenance note instead of an edit link.
 GENERATED_NOTE = {
@@ -103,7 +108,16 @@ def inline(text: str) -> str:
 
     def link(m):
         label, url = m.group(1), m.group(2)
-        url = re.sub(r"^(?:docs/)?([\w-]+)\.md$", r"\1.html", url)
+        base, separator, fragment = url.partition("#")
+        for page_name, source_path in SOURCE_PATHS.items():
+            relative_source = source_path.relative_to(DOCS).as_posix()
+            if base in {relative_source, f"docs/{relative_source}"}:
+                url = page_name + ".html"
+                if separator:
+                    url += "#" + fragment
+                break
+        else:
+            url = re.sub(r"^(?:docs/)?([\w-]+)\.md$", r"\1.html", url)
         return f'<a href="{url}">{label}</a>'
 
     return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, out)
@@ -210,6 +224,14 @@ def convert(md: str) -> str:
     out, i = [], 0
     in_ul = in_ol = False
 
+    def join_wrapped(parts: list[str]) -> str:
+        """Join soft-wrapped Markdown without splitting hyphenated/path terms."""
+        text = parts[0].strip()
+        for part in parts[1:]:
+            separator = "" if text.endswith(("-", "/")) else " "
+            text += separator + part.strip()
+        return text
+
     def close_lists():
         nonlocal in_ul, in_ol
         if in_ul:
@@ -218,6 +240,22 @@ def convert(md: str) -> str:
         if in_ol:
             out.append("</ol>")
             in_ol = False
+
+    def list_item(pattern: str, line: str) -> str:
+        """Consume one list item, including indented wrapped prose lines."""
+        nonlocal i
+        parts = [re.sub(pattern, "", line, count=1).strip()]
+        while i + 1 < len(lines):
+            following = lines[i + 1]
+            if not following.strip() or not following[:1].isspace():
+                break
+            if re.match(r"^\s*(?:-|\d+\.)\s+", following):
+                break
+            if re.match(r"^\s*(?:#{1,4}\s|```|\|)", following):
+                break
+            i += 1
+            parts.append(lines[i].strip())
+        return join_wrapped(parts)
 
     while i < len(lines):
         line = lines[i]
@@ -263,16 +301,18 @@ def convert(md: str) -> str:
                 close_lists()
                 out.append("<ul>")
                 in_ul = True
-            out.append(f"<li>{inline(re.sub(r'^\s*-\s+', '', line, count=1))}</li>")
+            out.append(f"<li>{inline(list_item(r'^\s*-\s+', line))}</li>")
             i += 1
             continue
 
-        if re.match(r"^\s*\d+\.\s+", line):
+        ordered = re.match(r"^\s*(\d+)\.\s+", line)
+        if ordered:
             if not in_ol:
                 close_lists()
-                out.append("<ol>")
+                start = int(ordered.group(1))
+                out.append("<ol>" if start == 1 else f'<ol start="{start}">')
                 in_ol = True
-            out.append(f"<li>{inline(re.sub(r'^\s*\d+\.\s+', '', line, count=1))}</li>")
+            out.append(f"<li>{inline(list_item(r'^\s*\d+\.\s+', line))}</li>")
             i += 1
             continue
 
@@ -287,11 +327,27 @@ def convert(md: str) -> str:
                 r"^(#{1,4}\s|```|\||\s*-\s|\s*\d+\.\s)", lines[i + 1]):
             i += 1
             para.append(lines[i])
-        out.append(f"<p>{inline(' '.join(para))}</p>")
+        out.append(f"<p>{inline(join_wrapped(para))}</p>")
         i += 1
 
     close_lists()
     return "\n".join(out)
+
+
+def verify_converter() -> None:
+    """Guard list continuation and explicit ordered-list starts."""
+    rendered = convert(
+        "11. Wrapped security-\n"
+        "    boundary item\n"
+        "12. Next item\n\n"
+        "- Provider/\n"
+        "  configuration\n"
+    )
+    assert '<ol start="11">' in rendered
+    assert rendered.count("<ol") == 1
+    assert "Wrapped security-boundary item" in rendered
+    assert "<li>Next item</li>" in rendered
+    assert "<li>Provider/configuration</li>" in rendered
 
 
 DOCS_CSS = r"""
@@ -992,7 +1048,7 @@ def _auth_callback_cookie(route):
     if path == "/api/auth/oidc/callback":
         return "oidc_login_csrf"
     if path == "/api/auth/entra/callback":
-        return "entra_login_csrf"
+        return "__Host-entra_login_csrf"
     return None
 
 
@@ -1094,7 +1150,8 @@ def _permissions_table(route) -> str:
         scope = "The verified interactive principal must hold the `admin` access class."
     elif _is_webhook(route):
         credential = ("The documented webhook signature header authenticates the "
-                      "exact request bytes; no bearer token is used.")
+                      "v1 path/timestamp/delivery envelope and exact-body digest; "
+                      "no bearer token is used.")
         scope = "The integration identifier in the route selects the receiving scope."
     elif _is_public(route):
         credential = ("No user or agent bearer token is required. Operation-specific "
@@ -1399,8 +1456,9 @@ def _render_request_body(route) -> list[str]:
         out.append("<p>This operation does not accept a request body.</p>")
     elif state == "raw":
         out.append('<p class="ep-note">Supply the required opaque request bytes as-is. '
-                   'The exact bytes are covered by <code>X-Hub-Signature-256</code>; '
-                   "do not reserialize them after computing the signature.</p>")
+                   'Their SHA-256 digest is covered, together with the fixed path, '
+                   'timestamp, and delivery id, by <code>X-Hub-Signature-256</code>; '
+                   "do not reserialize them after computing the v1 canonical signature.</p>")
     elif state == "unknown":
         out.append('<p class="ep-note">The route contract cannot determine whether this '
                    "operation accepts a request body. Check the handler contract before "
@@ -1736,6 +1794,7 @@ def render(name, title, description, content, crumb, footnav, sidebar):
 
 
 def main():
+    verify_converter()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--api-doc", default=str(API_DOC_DEFAULT), metavar="PATH",
                     help="api-doc.json to render the API reference from "
@@ -1844,7 +1903,7 @@ def main():
         '<meta name="robots" content="noindex">')
     nf_html = nf_html.replace('<meta property="og:type" content="article">\n', '')
     nf_html = nf_html.replace('<meta property="og:url" content="https://ryuki.io/404.html">\n', '')
-    assert 'noindex' in nf_html and 'canonical' not in nf_html
+    assert 'noindex' in nf_html and 'rel="canonical"' not in nf_html
     (DOCS / "404.html").write_text(nf_html)
     print("docs/404.html")
 

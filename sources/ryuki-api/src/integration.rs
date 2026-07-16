@@ -22,9 +22,12 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::IpAddr;
+use zeroize::Zeroize;
 
 use crate::audit;
 use crate::database::get_db;
+use ryuki_core::config::{AuthMode, RyukiConfig, SecretProvider};
 use ryuki_engine::integration_connections::{
     test_connection_stub, CredentialSource, ExecutionMode, IntegrationConnection, TestResult,
 };
@@ -195,6 +198,15 @@ pub enum CredError {
     /// only, NEVER secret material (see `VaultKv2Resolver`).
     #[error("vault resolver error: {0}")]
     Vault(String),
+    /// Vault-backed credentials must never silently resolve through a mock in
+    /// a production or live posture.
+    #[error("vault resolver unavailable: required configuration is missing")]
+    VaultNotConfigured,
+    /// A configured external secret provider may not fall through to a
+    /// different provider adapter. The provider name is configuration metadata,
+    /// never secret material.
+    #[error("secret resolver unavailable for selected provider '{0}'")]
+    SecretProviderUnavailable(String),
 }
 
 /// Resolved credentials — re-exported from `ryuki_engine::runners` so that
@@ -204,29 +216,58 @@ pub enum CredError {
 pub use ryuki_engine::runners::ResolvedCredentials;
 
 // ---------------------------------------------------------------------------
-// Vault resolver trait + implementations (mock and real KV v2)
+// Provider-neutral secret resolver trait + adapters (development and Vault KV v2)
 // ---------------------------------------------------------------------------
 
-/// Boxed future returned by [`VaultResolver::resolve`] — keeps the trait
-/// object-safe (`&dyn VaultResolver`) while allowing async HTTP resolvers.
-pub type VaultResolveFuture<'a> =
+/// Boxed future returned by [`SecretResolver::resolve`] — keeps the trait
+/// object-safe (`&dyn SecretResolver`) while allowing async provider adapters.
+pub type SecretResolveFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, CredError>> + Send + 'a>>;
 
-pub trait VaultResolver: Send + Sync {
+/// Narrow provider-neutral resolution capability. Domain credential dispatch
+/// depends on this interface, never on a concrete Vault/OpenBao/cloud adapter.
+/// Additional provider capabilities remain separate interfaces per SB-SEC-06.
+pub trait SecretResolver: Send + Sync {
     /// Resolve the secret at `handle`. Returns opaque bytes.
     /// Must NOT log the returned material or include it in any error.
-    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a>;
+    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a>;
 }
 
-/// Mock Vault resolver (default when no Vault is configured). Returns a
-/// deterministic non-secret marker so that vault-sourced connections can be
-/// "resolved" without a real Vault.
-pub struct MockVaultResolver;
+/// Explicit static/mock dry-run secret resolver. Returns a deterministic
+/// non-secret marker so local dry-run connections can be exercised without a
+/// real provider. Selection is guarded by [`mock_secret_resolver_allowed`].
+#[derive(Debug)]
+struct DevelopmentSecretResolver;
 
-impl VaultResolver for MockVaultResolver {
-    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a> {
+impl SecretResolver for DevelopmentSecretResolver {
+    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a> {
         // Return a deterministic stub — NOT real secret material.
-        Box::pin(async move { Ok(format!("mock-vault-resolved:{}", handle).into_bytes()) })
+        Box::pin(async move { Ok(format!("mock-secret-resolved:{handle}").into_bytes()) })
+    }
+}
+
+fn read_unicode_env(name: &str) -> Result<Option<String>, CredError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CredError::Vault(format!(
+            "{name} must contain valid Unicode text"
+        ))),
+    }
+}
+
+fn parse_optional_bool_env(name: &str, raw: Option<String>) -> Result<bool, CredError> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    if raw.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if raw.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(CredError::Vault(format!(
+            "{name} must be exactly 'true' or 'false'"
+        )))
     }
 }
 
@@ -238,9 +279,9 @@ impl VaultResolver for MockVaultResolver {
 /// - `VAULT_ADDR`  — base URL, e.g. `https://vault.internal:8200`
 /// - `VAULT_TOKEN` — the token sent as `X-Vault-Token`
 ///
-/// Both must be non-empty for [`VaultKv2Resolver::from_env`] to return `Some`;
-/// otherwise the platform keeps using [`MockVaultResolver`]
-/// (see [`vault_resolver_from_env`]).
+/// Both must be non-empty for [`VaultKv2Resolver::from_env`] to return `Ok(Some)`.
+/// Missing configuration fails closed except for an explicitly admitted local
+/// static/mock dry-run posture (see [`secret_resolver_from_env`]).
 ///
 /// # Secret handle format (the `credential_ref` of a Vault-sourced connection)
 /// `<mount>/<path>[#<field>]` — e.g. `secret/ryuki/vcenter#password`.
@@ -251,11 +292,122 @@ impl VaultResolver for MockVaultResolver {
 /// # Security invariants
 /// - The token is held in `Zeroizing` memory and NEVER appears in `Debug`,
 ///   errors, or logs.
+/// - Credential-bearing requests use HTTPS. Plain HTTP is limited to an
+///   explicitly enabled loopback-only development endpoint and bypasses
+///   ambient proxies.
+/// - Redirects are disabled, deadlines are finite, and successful response
+///   bodies are streamed under a one-MiB hard limit.
 /// - Resolved secret material is returned to the caller only; it is never
 ///   logged and never included in any error message (errors carry the handle,
 ///   field NAME, and HTTP status only).
+#[derive(Clone)]
+struct VaultEndpoint(reqwest::Url);
+
+impl VaultEndpoint {
+    fn parse(raw: &str, allow_insecure_loopback: bool) -> Result<Self, CredError> {
+        if raw.is_empty() || raw.trim() != raw {
+            return Err(CredError::Vault(
+                "VAULT_ADDR must be non-empty and must not have surrounding whitespace".to_string(),
+            ));
+        }
+
+        let mut url = reqwest::Url::parse(raw)
+            .map_err(|_| CredError::Vault("VAULT_ADDR must be a valid absolute URL".to_string()))?;
+        let Some(host) = url.host_str() else {
+            return Err(CredError::Vault(
+                "VAULT_ADDR must contain a host".to_string(),
+            ));
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(CredError::Vault(
+                "VAULT_ADDR must not contain userinfo".to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(CredError::Vault(
+                "VAULT_ADDR must not contain a query string or fragment".to_string(),
+            ));
+        }
+
+        // The cleartext exception is deliberately DNS-free: only an IP literal
+        // that the standard library proves is loopback is admitted. Hostnames
+        // such as `localhost` can be remapped and are not literal loopback.
+        let literal_loopback = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+        match url.scheme() {
+            "https" => {}
+            "http" if allow_insecure_loopback && literal_loopback => {}
+            "http" => {
+                return Err(CredError::Vault(format!(
+                    "VAULT_ADDR must use HTTPS; plain HTTP is allowed only for an explicitly \
+                     enabled literal-loopback development endpoint via {}",
+                    VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV
+                )));
+            }
+            _ => {
+                return Err(CredError::Vault(
+                    "VAULT_ADDR must use the HTTPS scheme".to_string(),
+                ));
+            }
+        }
+
+        // Requests append beneath an optional reverse-proxy prefix rather than
+        // replacing its final segment.
+        if !url.path().ends_with('/') {
+            let normalized_path = format!("{}/", url.path());
+            url.set_path(&normalized_path);
+        }
+        Ok(Self(url))
+    }
+
+    fn scheme(&self) -> &str {
+        self.0.scheme()
+    }
+
+    fn kv2_read_url(&self, mount: &str, path: &str) -> Result<reqwest::Url, CredError> {
+        let mut url = self.0.clone();
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            CredError::Vault("VAULT_ADDR cannot be used as a hierarchical endpoint".to_string())
+        })?;
+        segments.pop_if_empty();
+        segments.extend(["v1", mount, "data"]);
+        segments.extend(path.split('/'));
+        drop(segments);
+        Ok(url)
+    }
+}
+
+impl std::fmt::Debug for VaultEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Owns a parsed provider response and wipes every JSON string value on every
+/// success/error exit. Object keys are operator-defined field names, while the
+/// values may contain secret material.
+struct ZeroizingSecretJson(Value);
+
+impl Drop for ZeroizingSecretJson {
+    fn drop(&mut self) {
+        fn wipe(value: &mut Value) {
+            match value {
+                Value::String(text) => text.zeroize(),
+                Value::Array(items) => items.iter_mut().for_each(wipe),
+                Value::Object(map) => map.values_mut().for_each(wipe),
+                Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            }
+        }
+        wipe(&mut self.0);
+    }
+}
+
 pub struct VaultKv2Resolver {
-    addr: String,
+    addr: VaultEndpoint,
     token: zeroize::Zeroizing<String>,
     client: reqwest::Client,
 }
@@ -272,41 +424,87 @@ impl std::fmt::Debug for VaultKv2Resolver {
 }
 
 impl VaultKv2Resolver {
-    /// Per-request timeout — a hung Vault must not wedge credential resolution.
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// A stalled connection attempt must not wedge credential resolution.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    /// End-to-end request deadline, including the streamed response body.
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Vault KV values are expected to be small. One MiB leaves ample room for
+    /// legitimate JSON metadata while bounding chunked/lengthless responses.
+    const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
-    /// Construct from explicit parts. Returns `None` unless BOTH `addr` and
-    /// `token` are present and non-blank. Pure (no env access) — the testable
-    /// core of [`Self::from_env`].
-    fn from_parts(addr: Option<String>, token: Option<String>) -> Option<Self> {
-        let addr = addr.map(|a| a.trim().trim_end_matches('/').to_string())?;
-        let token = token.map(|t| t.trim().to_string())?;
-        if addr.is_empty() || token.is_empty() {
-            return None;
+    /// Explicit development-only escape hatch for a literal loopback Vault.
+    /// Remote cleartext endpoints remain forbidden even when this is `true`.
+    const ALLOW_INSECURE_LOOPBACK_ENV: &str = "RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK";
+
+    /// Construct from explicit parts. Both values must be set together and be
+    /// non-blank; partial or explicit-blank configuration is invalid even in
+    /// development mode. Pure (no env access) — the testable core of
+    /// [`Self::from_env`].
+    fn from_parts(
+        addr: Option<String>,
+        token: Option<String>,
+        allow_insecure_loopback: bool,
+    ) -> Result<Option<Self>, CredError> {
+        // Take zeroizing ownership before the all-or-none match so even a
+        // token-only partial configuration is wiped on the rejection path.
+        let token = token.map(zeroize::Zeroizing::new);
+        let (addr, token) = match (addr, token) {
+            (None, None) if !allow_insecure_loopback => return Ok(None),
+            (None, None) => {
+                return Err(CredError::Vault(format!(
+                    "{} requires complete VAULT_ADDR and VAULT_TOKEN configuration",
+                    Self::ALLOW_INSECURE_LOOPBACK_ENV
+                )));
+            }
+            (Some(addr), Some(token)) => (addr, token),
+            _ => {
+                return Err(CredError::Vault(
+                    "VAULT_ADDR and VAULT_TOKEN must be configured together".to_string(),
+                ));
+            }
+        };
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(CredError::Vault(
+                "VAULT_TOKEN must be non-empty printable ASCII without whitespace".to_string(),
+            ));
         }
+        let addr = VaultEndpoint::parse(&addr, allow_insecure_loopback)?;
+
         // Redirects disabled: reqwest strips Authorization/cookies on
         // cross-host redirects but NOT custom headers, so a redirecting
         // (or compromised) endpoint could exfiltrate X-Vault-Token. A real
         // Vault KV v2 API never redirects; any 3xx is treated as an error.
         let client = reqwest::Client::builder()
-            .timeout(Self::TIMEOUT)
+            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .timeout(Self::REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            // Secret-bearing traffic never inherits ambient proxy variables.
+            // Provider-specific proxy support, if ever required, belongs in a
+            // typed adapter configuration with its own trust policy.
+            .no_proxy()
+            .https_only(addr.scheme() == "https")
             .build()
-            .ok()?;
-        Some(Self {
+            .map_err(|_| CredError::Vault("vault HTTP client initialization failed".to_string()))?;
+        Ok(Some(Self {
             addr,
-            token: zeroize::Zeroizing::new(token),
+            token,
             client,
-        })
+        }))
     }
 
     /// Construct from the process environment (`VAULT_ADDR` + `VAULT_TOKEN`).
-    /// Returns `None` when Vault is not configured — callers fall back to the
-    /// mock resolver.
-    pub fn from_env() -> Option<Self> {
+    /// Returns `Ok(None)` when Vault is not configured. The caller decides
+    /// whether the explicit local dry-run mock is admitted. Invalid configured
+    /// endpoints return an error instead of silently selecting the mock.
+    pub fn from_env() -> Result<Option<Self>, CredError> {
+        let allow_insecure_loopback = parse_optional_bool_env(
+            Self::ALLOW_INSECURE_LOOPBACK_ENV,
+            read_unicode_env(Self::ALLOW_INSECURE_LOOPBACK_ENV)?,
+        )?;
         Self::from_parts(
-            std::env::var("VAULT_ADDR").ok(),
-            std::env::var("VAULT_TOKEN").ok(),
+            read_unicode_env("VAULT_ADDR")?,
+            read_unicode_env("VAULT_TOKEN")?,
+            allow_insecure_loopback,
         )
     }
 
@@ -338,6 +536,14 @@ impl VaultKv2Resolver {
                 "invalid vault handle '{handle}': mount and path must be non-empty"
             )));
         }
+        if std::iter::once(mount)
+            .chain(path.split('/'))
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err(CredError::Vault(format!(
+                "invalid vault handle '{handle}': path segments must be non-empty and may not be '.' or '..'"
+            )));
+        }
         Ok((mount, path, field))
     }
 
@@ -345,11 +551,11 @@ impl VaultKv2Resolver {
     /// carries only the handle, the field NAME, and/or the HTTP status.
     async fn resolve_kv2(&self, handle: &str) -> Result<Vec<u8>, CredError> {
         let (mount, path, field) = Self::parse_handle(handle)?;
-        let url = format!("{}/v1/{}/data/{}", self.addr, mount, path);
+        let url = self.addr.kv2_read_url(mount, path)?;
 
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .header("X-Vault-Token", self.token.as_str())
             .send()
             .await
@@ -378,10 +584,42 @@ impl VaultKv2Resolver {
         }
 
         // KV v2 read shape: { "data": { "data": { <field>: <value>, … }, "metadata": … } }
-        let body: serde_json::Value = resp.json().await.map_err(|_| {
-            CredError::Vault(format!("vault response for '{handle}' is not valid JSON"))
-        })?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > Self::MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(CredError::Vault(format!(
+                "vault response for '{handle}' exceeds the {}-byte limit",
+                Self::MAX_RESPONSE_BYTES
+            )));
+        }
+        let mut resp = resp;
+        let mut response_body = zeroize::Zeroizing::new(Vec::new());
+        while let Some(chunk) = resp.chunk().await.map_err(|_| {
+            CredError::Vault(format!("vault response for '{handle}' could not be read"))
+        })? {
+            let new_len = response_body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| {
+                    CredError::Vault(format!(
+                        "vault response for '{handle}' exceeds the {}-byte limit",
+                        Self::MAX_RESPONSE_BYTES
+                    ))
+                })?;
+            if new_len > Self::MAX_RESPONSE_BYTES {
+                return Err(CredError::Vault(format!(
+                    "vault response for '{handle}' exceeds the {}-byte limit",
+                    Self::MAX_RESPONSE_BYTES
+                )));
+            }
+            response_body.extend_from_slice(&chunk);
+        }
+        let body = ZeroizingSecretJson(serde_json::from_slice(response_body.as_slice()).map_err(
+            |_| CredError::Vault(format!("vault response for '{handle}' is not valid JSON")),
+        )?);
         let data = body
+            .0
             .pointer("/data/data")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
@@ -422,27 +660,119 @@ impl VaultKv2Resolver {
     }
 }
 
-impl VaultResolver for VaultKv2Resolver {
-    fn resolve<'a>(&'a self, handle: &'a str) -> VaultResolveFuture<'a> {
+impl SecretResolver for VaultKv2Resolver {
+    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a> {
         Box::pin(self.resolve_kv2(handle))
     }
 }
 
-/// Select the production vault resolver: the real KV v2 client when
-/// `VAULT_ADDR` + `VAULT_TOKEN` are configured, the deterministic mock
-/// otherwise (dev / no-vault environments keep working unchanged).
-pub fn vault_resolver_from_env() -> Box<dyn VaultResolver> {
-    match VaultKv2Resolver::from_env() {
-        Some(real) => Box::new(real),
-        None => Box::new(MockVaultResolver),
+#[derive(Debug)]
+enum SecretResolverSelection {
+    Vault(VaultKv2Resolver),
+    Development(DevelopmentSecretResolver),
+}
+
+impl SecretResolverSelection {
+    fn into_box(self) -> Box<dyn SecretResolver> {
+        match self {
+            Self::Vault(resolver) => Box::new(resolver),
+            Self::Development(resolver) => Box::new(resolver),
+        }
     }
+}
+
+/// The mock secret resolver is a local dry-run compatibility feature, not a
+/// degraded production mode. Both the process posture and the connection must
+/// independently opt into dry-run behavior.
+fn mock_secret_resolver_allowed(auth_mode: &AuthMode, execution_mode: &ExecutionMode) -> bool {
+    matches!(auth_mode, AuthMode::MockDryRun | AuthMode::StaticDryRun)
+        && matches!(execution_mode, ExecutionMode::StaticDryRun)
+}
+
+fn select_secret_resolver(
+    provider: &SecretProvider,
+    configured: Option<VaultKv2Resolver>,
+    allow_mock: bool,
+) -> Result<SecretResolverSelection, CredError> {
+    match (provider, configured) {
+        (SecretProvider::HashicorpVault, Some(real)) => Ok(SecretResolverSelection::Vault(real)),
+        (_, Some(_)) => Err(CredError::SecretProviderUnavailable(
+            provider.as_str().to_string(),
+        )),
+        (_, None) if allow_mock => Ok(SecretResolverSelection::Development(
+            DevelopmentSecretResolver,
+        )),
+        (SecretProvider::HashicorpVault, None) => Err(CredError::VaultNotConfigured),
+        (_, None) => Err(CredError::SecretProviderUnavailable(
+            provider.as_str().to_string(),
+        )),
+    }
+}
+
+fn validate_secret_manager_configuration(
+    provider: &SecretProvider,
+    addr: Option<String>,
+    token: Option<String>,
+    allow_insecure_loopback: Option<String>,
+) -> Result<(), CredError> {
+    let allow_insecure_loopback = parse_optional_bool_env(
+        VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
+        allow_insecure_loopback,
+    )?;
+    let configured = VaultKv2Resolver::from_parts(addr, token, allow_insecure_loopback)?;
+    if configured.is_some() && !matches!(provider, SecretProvider::HashicorpVault) {
+        return Err(CredError::Vault(format!(
+            "VAULT_ADDR and VAULT_TOKEN are configured but secret_provider is '{}'",
+            provider.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate process-owned secret-provider environment before the application
+/// begins serving. No secret value is retained or included in an error.
+pub(crate) fn validate_secret_manager_startup(config: &RyukiConfig) -> Result<(), String> {
+    let invalid = |error: CredError| format!("secret-manager configuration invalid: {error}");
+    // Validate the non-secret development switch before reading VAULT_TOKEN so
+    // a typo cannot cause secret material to be loaded and then ordinarily
+    // dropped on this earlier error path.
+    let allow_insecure_loopback =
+        read_unicode_env(VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV).map_err(&invalid)?;
+    parse_optional_bool_env(
+        VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
+        allow_insecure_loopback.clone(),
+    )
+    .map_err(&invalid)?;
+
+    let addr = read_unicode_env("VAULT_ADDR").map_err(&invalid)?;
+    let token = read_unicode_env("VAULT_TOKEN").map_err(&invalid)?;
+    validate_secret_manager_configuration(
+        &config.secret_provider,
+        addr,
+        token,
+        allow_insecure_loopback,
+    )
+    .map_err(invalid)
+}
+
+/// Select the real KV v2 client when `VAULT_ADDR` + `VAULT_TOKEN` are valid.
+/// Missing configuration selects the deterministic mock only when the supplied
+/// process and connection modes establish an explicit local dry-run posture.
+fn secret_resolver_from_env(
+    provider: &SecretProvider,
+    auth_mode: &AuthMode,
+    execution_mode: &ExecutionMode,
+) -> Result<Box<dyn SecretResolver>, CredError> {
+    let allow_mock = mock_secret_resolver_allowed(auth_mode, execution_mode);
+    select_secret_resolver(provider, VaultKv2Resolver::from_env()?, allow_mock)
+        .map(SecretResolverSelection::into_box)
 }
 
 /// Resolve credentials for a connection, dispatching by source.
 ///
 /// # Arguments
 /// * `conn` — the connection metadata (no secret material in here).
-/// * `vault` — vault resolver implementation (MockVaultResolver for Slice 1).
+/// * `secret_resolver` — provider adapter required only for externally managed secrets.
 /// * `pool` — optional DB pool (required for DbEncrypted source).
 ///
 /// # Security
@@ -450,15 +780,19 @@ pub fn vault_resolver_from_env() -> Box<dyn VaultResolver> {
 /// Never surfaces the resolved material in error messages.
 pub async fn resolve_credentials(
     conn: &IntegrationConnection,
-    vault: &dyn VaultResolver,
+    secret_resolver: Option<&dyn SecretResolver>,
     pool: Option<&sqlx::PgPool>,
 ) -> Result<ResolvedCredentials, CredError> {
     match &conn.credential_source {
         CredentialSource::Vault => {
-            let material = vault.resolve(&conn.credential_ref).await?;
+            let secret_resolver = secret_resolver.ok_or(CredError::VaultNotConfigured)?;
+            let material = secret_resolver.resolve(&conn.credential_ref).await?;
             Ok(ResolvedCredentials {
                 material,
-                descriptor: format!("vault:{}", conn.credential_ref),
+                // This descriptor is Debug-visible in the runner type. Keep it
+                // provider- and locator-free until the versioned keyed
+                // `SecretRef` fingerprint contract is implemented.
+                descriptor: "external-secret:resolved".to_string(),
             })
         }
         CredentialSource::DbEncrypted => {
@@ -508,6 +842,19 @@ pub async fn resolve_credentials(
 // DB row type for integration_connections
 // ---------------------------------------------------------------------------
 
+/// A persisted credential-source value is untrusted database input. Keep the
+/// error deliberately value-free so malformed legacy/corrupt rows cannot turn
+/// secret-looking content into logs or API responses.
+#[derive(Debug, thiserror::Error)]
+#[error("persisted integration credential source is invalid")]
+pub(crate) struct PersistedCredentialSourceError;
+
+pub(crate) fn parse_persisted_credential_source(
+    raw: &str,
+) -> Result<CredentialSource, PersistedCredentialSourceError> {
+    CredentialSource::parse(raw).map_err(|_| PersistedCredentialSourceError)
+}
+
 #[derive(sqlx::FromRow)]
 struct IntegrationConnectionRow {
     id: String,
@@ -528,15 +875,15 @@ struct IntegrationConnectionRow {
 }
 
 impl IntegrationConnectionRow {
-    fn into_connection(self) -> IntegrationConnection {
-        IntegrationConnection {
+    fn try_into_connection(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
+        let credential_source = parse_persisted_credential_source(&self.credential_source)?;
+        Ok(IntegrationConnection {
             id: self.id,
             vendor_type: self.vendor_type,
             name: self.name,
             endpoint_url: self.endpoint_url,
             site_scope: self.site_scope,
-            credential_source: CredentialSource::parse(&self.credential_source)
-                .unwrap_or(CredentialSource::EnvVar),
+            credential_source,
             credential_ref: self.credential_ref,
             status: self.status,
             readiness: self.readiness,
@@ -547,7 +894,7 @@ impl IntegrationConnectionRow {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
-        }
+        })
     }
 
     /// Serialize to JSON for API responses. NEVER includes secret material —
@@ -1205,8 +1552,11 @@ pub async fn integration_list(
         .fetch_one(pool)
         .await
         .map_err(db_err)?;
-        let conns: Vec<IntegrationConnection> =
-            rows.into_iter().map(|r| r.into_connection()).collect();
+        let conns: Vec<IntegrationConnection> = rows
+            .into_iter()
+            .map(IntegrationConnectionRow::try_into_connection)
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
         let json_list: Vec<Value> = conns
             .iter()
             .map(IntegrationConnectionRow::to_json)
@@ -1265,9 +1615,10 @@ pub async fn integration_get(
             Some(r) => {
                 // #2: an out-of-scope connection 404s exactly like a missing one.
                 connection_scope_guard(&session, r.site_scope.as_deref(), &id)?;
+                let conn = r.try_into_connection().map_err(db_err)?;
                 Ok(Json(json!({
                     "source": "database",
-                    "connection": IntegrationConnectionRow::to_json(&r.into_connection()),
+                    "connection": IntegrationConnectionRow::to_json(&conn),
                 })))
             }
             None => Err(integration_not_found(&id)),
@@ -1305,13 +1656,12 @@ pub async fn integration_update(
         .fetch_optional(pool)
         .await
         .map_err(db_err)?;
-        let mut conn = row
-            .ok_or_else(|| integration_not_found(&id))?
-            .into_connection();
-
         // #2: guard on the LOADED row's site_scope (not the body's) BEFORE applying
-        // any update — an out-of-scope id must be indistinguishable from a missing one.
-        connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+        // any update or decoding other persisted fields — an out-of-scope id
+        // must be indistinguishable from a missing one.
+        let row = row.ok_or_else(|| integration_not_found(&id))?;
+        connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
+        let mut conn = row.try_into_connection().map_err(db_err)?;
 
         // HARDENING-1: forbid changing credential_source on update.
         // Changing source types creates edge cases (e.g. a db-encrypted row
@@ -1548,13 +1898,12 @@ pub async fn set_webhook_secret(
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
-    let conn = row
-        .ok_or_else(|| integration_not_found(&id))?
-        .into_connection();
-
     // #2: guard on the LOADED row's site_scope — an out-of-scope id must be
-    // indistinguishable from a missing one (no oracle).
-    connection_scope_guard(&session, conn.site_scope.as_deref(), &id)?;
+    // indistinguishable from a missing one (no oracle), even if another
+    // persisted field is malformed.
+    let row = row.ok_or_else(|| integration_not_found(&id))?;
+    connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
+    let conn = row.try_into_connection().map_err(db_err)?;
 
     if body.webhook_secret.trim().is_empty() {
         return Err(integration_400("webhook_secret must not be empty"));
@@ -1834,8 +2183,11 @@ pub async fn integration_test(
         .fetch_optional(pool)
         .await
         .map_err(db_err)?;
-        row.ok_or_else(|| integration_not_found(&id))?
-            .into_connection()
+        let row = row.ok_or_else(|| integration_not_found(&id))?;
+        // Preserve the no-oracle boundary even when another persisted field is
+        // malformed and row decoding must fail closed.
+        connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
+        row.try_into_connection().map_err(db_err)?
     } else {
         ryuki_engine::integration_connections::get_connection(&id)
             .ok_or_else(|| integration_not_found(&id))?
@@ -1847,11 +2199,29 @@ pub async fn integration_test(
 
     // Attempt credential resolution — the ResolvedCredentials is dropped immediately
     // after use and zeroized. Never included in the response.
-    // Vault-sourced connections resolve through the REAL KV v2 client when
-    // VAULT_ADDR + VAULT_TOKEN are configured; the mock otherwise.
+    // Externally managed connections resolve through the adapter selected by
+    // `secret_provider`. The current `vault` credential-source spelling is a
+    // compatibility representation, not permission to bypass provider
+    // selection. Missing configuration selects the development adapter only
+    // when both process and connection explicitly opt into static/mock dry-run.
     let pool_ref = get_db();
-    let vault = vault_resolver_from_env();
-    let cred_result = resolve_credentials(&conn, vault.as_ref(), pool_ref).await;
+    let cred_result = if conn.credential_source == CredentialSource::Vault {
+        let config = crate::config_store::get_app_config();
+        match secret_resolver_from_env(
+            &config.secret_provider,
+            &config.auth_mode,
+            &conn.execution_mode,
+        ) {
+            Ok(secret_resolver) => {
+                resolve_credentials(&conn, Some(secret_resolver.as_ref()), pool_ref).await
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        // A non-Vault source does not depend on Vault configuration and cannot
+        // accidentally invoke a mock resolver.
+        resolve_credentials(&conn, None, pool_ref).await
+    };
 
     let (cred_status, cred_message) = match cred_result {
         Ok(_creds) => {
@@ -3576,7 +3946,9 @@ pub mod integration_db_tests {
         .await
         .expect("read connection");
         let conn_json = serde_json::to_string(&IntegrationConnectionRow::to_json(
-            &conn_row.into_connection(),
+            &conn_row
+                .try_into_connection()
+                .expect("valid fixture credential source"),
         ))
         .unwrap();
         assert!(
@@ -3615,8 +3987,8 @@ pub mod integration_db_tests {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let vault = MockVaultResolver;
-        let creds = resolve_credentials(&conn_for_resolve, &vault, Some(&pool))
+        let vault = DevelopmentSecretResolver;
+        let creds = resolve_credentials(&conn_for_resolve, Some(&vault), Some(&pool))
             .await
             .expect("resolve must succeed");
 
@@ -3678,8 +4050,8 @@ pub mod integration_db_tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let vault = MockVaultResolver;
-        let creds = resolve_credentials(&conn, &vault, Some(&pool))
+        let vault = DevelopmentSecretResolver;
+        let creds = resolve_credentials(&conn, Some(&vault), Some(&pool))
             .await
             .expect("env-var resolution must succeed");
 
@@ -3731,8 +4103,8 @@ pub mod integration_db_tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let vault = MockVaultResolver;
-        let result = resolve_credentials(&conn, &vault, None).await;
+        let vault = DevelopmentSecretResolver;
+        let result = resolve_credentials(&conn, Some(&vault), None).await;
         assert!(
             matches!(result, Err(CredError::EnvVarMissing(_))),
             "missing env var must produce EnvVarMissing error, got: {:?}",
@@ -3882,9 +4254,11 @@ pub mod integration_db_tests {
         .await
         .expect("read row");
 
-        let response_json =
-            serde_json::to_string(&IntegrationConnectionRow::to_json(&row.into_connection()))
-                .unwrap();
+        let response_json = serde_json::to_string(&IntegrationConnectionRow::to_json(
+            &row.try_into_connection()
+                .expect("valid fixture credential source"),
+        ))
+        .unwrap();
 
         // Plaintext must NOT appear in the response.
         assert!(
@@ -4029,8 +4403,8 @@ pub mod integration_db_tests {
             created_at: now.clone(),
             updated_at: now2,
         };
-        let vault = MockVaultResolver;
-        let creds = resolve_credentials(&conn_for_resolve, &vault, Some(&pool))
+        let vault = DevelopmentSecretResolver;
+        let creds = resolve_credentials(&conn_for_resolve, Some(&vault), Some(&pool))
             .await
             .expect("resolve must still succeed after update");
         assert_eq!(
@@ -4170,9 +4544,9 @@ pub mod integration_db_tests {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let vault = MockVaultResolver;
+        let vault = DevelopmentSecretResolver;
         let cross_result =
-            resolve_credentials(&conn_a_pointing_at_b_secret, &vault, Some(&pool)).await;
+            resolve_credentials(&conn_a_pointing_at_b_secret, Some(&vault), Some(&pool)).await;
         assert!(
             matches!(cross_result, Err(CredError::SecretNotFound)),
             "cross-connection secret access must return SecretNotFound, got: {:?}",
@@ -4184,7 +4558,7 @@ pub mod integration_db_tests {
             credential_ref: secret_a_id.clone(),
             ..conn_a_pointing_at_b_secret
         };
-        let own_creds = resolve_credentials(&conn_a_correct, &vault, Some(&pool))
+        let own_creds = resolve_credentials(&conn_a_correct, Some(&vault), Some(&pool))
             .await
             .expect("conn A must resolve its own secret");
         assert_eq!(
@@ -4448,8 +4822,8 @@ pub mod integration_db_tests {
             created_at: now.clone(),
             updated_at: update_now.clone(),
         };
-        let vault = MockVaultResolver;
-        let creds = resolve_credentials(&conn_for_resolve, &vault, Some(&pool))
+        let vault = DevelopmentSecretResolver;
+        let creds = resolve_credentials(&conn_for_resolve, Some(&vault), Some(&pool))
             .await
             .expect("resolve after atomic update must succeed");
         assert_eq!(
@@ -4595,8 +4969,8 @@ pub mod integration_db_tests {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let vault = MockVaultResolver;
-        let creds = resolve_credentials(&conn_for_resolve, &vault, Some(&pool))
+        let vault = DevelopmentSecretResolver;
+        let creds = resolve_credentials(&conn_for_resolve, Some(&vault), Some(&pool))
             .await
             .expect("resolve must succeed after handler-driven create");
         assert_eq!(
@@ -4696,8 +5070,8 @@ pub mod integration_db_tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        let vault = MockVaultResolver;
-        let resolve_result = resolve_credentials(&conn_denied, &vault, None).await;
+        let vault = DevelopmentSecretResolver;
+        let resolve_result = resolve_credentials(&conn_denied, Some(&vault), None).await;
         assert!(
             matches!(resolve_result, Err(CredError::EnvVarDenied(_))),
             "resolve_credentials must return EnvVarDenied for denied key, got: {:?}",
@@ -5639,12 +6013,13 @@ pub mod integration_db_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests (no DB, no network)
+// Unit tests (no DB; network tests use process-local synthetic HTTP fixtures)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn encrypt_without_key_fails_with_key_unavailable() {
@@ -6129,6 +6504,263 @@ mod unit_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Persisted credential-source decoding and Vault resolver posture
+    // -----------------------------------------------------------------------
+
+    fn persisted_connection_row(credential_source: &str) -> IntegrationConnectionRow {
+        IntegrationConnectionRow {
+            id: "ic-persisted-source-test".to_string(),
+            vendor_type: "vmware".to_string(),
+            name: "Persisted Source Test".to_string(),
+            endpoint_url: "https://vcenter.test.example.com".to_string(),
+            site_scope: None,
+            credential_source: credential_source.to_string(),
+            credential_ref: "RYUKI_INTEGRATION__SHOULD_NOT_BE_READ".to_string(),
+            status: "configured".to_string(),
+            readiness: "configured".to_string(),
+            execution_mode: "static-dry-run".to_string(),
+            last_test_at: None,
+            last_test_result: None,
+            created_by: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn persisted_credential_sources_are_exact_and_fail_closed() {
+        for (raw, expected) in [
+            ("vault", CredentialSource::Vault),
+            ("db-encrypted", CredentialSource::DbEncrypted),
+            ("env-var", CredentialSource::EnvVar),
+        ] {
+            assert_eq!(
+                parse_persisted_credential_source(raw).expect("valid persisted provider"),
+                expected
+            );
+        }
+
+        for raw in [
+            "",
+            "unknown-provider",
+            " env-var ",
+            "ENV-VAR",
+            "vault\0env-var",
+        ] {
+            assert!(
+                parse_persisted_credential_source(raw).is_err(),
+                "persisted provider {raw:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_credential_source_errors_are_redacted() {
+        let raw = "unknown-provider-with-sensitive-marker-DO-NOT-LOG";
+        let error = parse_persisted_credential_source(raw)
+            .expect_err("unknown persisted provider must be rejected");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert_eq!(
+            display,
+            "persisted integration credential source is invalid"
+        );
+        assert!(!display.contains(raw));
+        assert!(!debug.contains(raw));
+        assert!(!debug.contains("DO-NOT-LOG"));
+    }
+
+    #[test]
+    fn persisted_connection_rows_never_reinterpret_unknown_sources_as_env_vars() {
+        let error = persisted_connection_row("future-provider")
+            .try_into_connection()
+            .expect_err("unknown persisted providers must stop row decoding");
+
+        assert_eq!(
+            error.to_string(),
+            "persisted integration credential source is invalid"
+        );
+    }
+
+    #[test]
+    fn development_secret_selection_is_limited_to_explicit_dry_run() {
+        assert!(mock_secret_resolver_allowed(
+            &AuthMode::MockDryRun,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(mock_secret_resolver_allowed(
+            &AuthMode::StaticDryRun,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!mock_secret_resolver_allowed(
+            &AuthMode::EntraId,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!mock_secret_resolver_allowed(
+            &AuthMode::Local,
+            &ExecutionMode::StaticDryRun
+        ));
+        assert!(!mock_secret_resolver_allowed(
+            &AuthMode::MockDryRun,
+            &ExecutionMode::Live
+        ));
+        assert!(!mock_secret_resolver_allowed(
+            &AuthMode::StaticDryRun,
+            &ExecutionMode::Live
+        ));
+    }
+
+    #[test]
+    fn partial_vault_configuration_fails_before_any_mock_selection() {
+        let sensitive_marker = "fixture-sensitive-token-DO-NOT-LOG";
+        let error = VaultKv2Resolver::from_parts(None, Some(sensitive_marker.to_string()), false)
+            .expect_err("partial configuration must be invalid in every posture");
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "vault resolver error: VAULT_ADDR and VAULT_TOKEN must be configured together"
+        );
+        assert!(!message.contains(sensitive_marker));
+
+        let blank_error = VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200".to_string()),
+            Some("   ".to_string()),
+            false,
+        )
+        .expect_err("an explicitly blank token must not mean unconfigured");
+        assert!(!blank_error.to_string().contains("fixture-sensitive"));
+
+        let header_error = VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200".to_string()),
+            Some("fixture\nsecret".to_string()),
+            false,
+        )
+        .expect_err("a token that cannot be a single HTTP header value must fail at startup");
+        assert!(!header_error.to_string().contains("fixture"));
+        assert!(!header_error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn missing_secret_configuration_fails_closed_outside_dry_run() {
+        let error = select_secret_resolver(&SecretProvider::HashicorpVault, None, false)
+            .expect_err("non-dry-run posture must reject missing Vault configuration");
+        assert!(matches!(error, CredError::VaultNotConfigured));
+
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::HashicorpVault, None, true),
+            Ok(SecretResolverSelection::Development(_))
+        ));
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::AwsSecretsManager, None, false),
+            Err(CredError::SecretProviderUnavailable(_))
+        ));
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::AwsSecretsManager, None, true),
+            Ok(SecretResolverSelection::Development(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_valid_vault_configuration_wins_in_every_posture() {
+        let configured = || {
+            VaultKv2Resolver::from_parts(
+                Some("https://vault.example:8200".to_string()),
+                Some("fixture-token".to_string()),
+                false,
+            )
+            .expect("valid Vault configuration")
+        };
+
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::HashicorpVault, configured(), false),
+            Ok(SecretResolverSelection::Vault(_))
+        ));
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::HashicorpVault, configured(), true),
+            Ok(SecretResolverSelection::Vault(_))
+        ));
+        assert!(matches!(
+            select_secret_resolver(&SecretProvider::AzureKeyVault, configured(), true),
+            Err(CredError::SecretProviderUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn startup_secret_configuration_is_complete_typed_and_provider_matched() {
+        assert!(validate_secret_manager_configuration(
+            &SecretProvider::HashicorpVault,
+            None,
+            None,
+            None,
+        )
+        .is_ok());
+
+        for (addr, token) in [
+            (Some("https://vault.example:8200".to_string()), None),
+            (None, Some("fixture-sensitive-token".to_string())),
+            (
+                Some("https://vault.example:8200".to_string()),
+                Some(String::new()),
+            ),
+        ] {
+            let error = validate_secret_manager_configuration(
+                &SecretProvider::HashicorpVault,
+                addr,
+                token,
+                None,
+            )
+            .expect_err("partial or blank startup configuration must fail");
+            assert!(!error.to_string().contains("fixture-sensitive-token"));
+        }
+
+        validate_secret_manager_configuration(
+            &SecretProvider::HashicorpVault,
+            Some("https://vault.example:8200".to_string()),
+            Some("fixture-token".to_string()),
+            Some("false".to_string()),
+        )
+        .expect("complete HTTPS configuration should be admitted");
+
+        validate_secret_manager_configuration(
+            &SecretProvider::HashicorpVault,
+            Some("http://127.0.0.1:8200".to_string()),
+            Some("fixture-token".to_string()),
+            Some("true".to_string()),
+        )
+        .expect("explicit literal-loopback development configuration should be admitted");
+
+        assert!(validate_secret_manager_configuration(
+            &SecretProvider::AwsSecretsManager,
+            Some("https://vault.example:8200".to_string()),
+            Some("fixture-token".to_string()),
+            None,
+        )
+        .expect_err("Vault variables must not configure another provider")
+        .to_string()
+        .contains("aws-secrets-manager"));
+
+        validate_secret_manager_configuration(&SecretProvider::AwsSecretsManager, None, None, None)
+            .expect("an unconfigured non-Vault adapter remains a dependent-operation concern");
+    }
+
+    #[tokio::test]
+    async fn vault_credential_resolution_requires_a_selected_resolver() {
+        let conn = persisted_connection_row("vault")
+            .try_into_connection()
+            .expect("valid Vault fixture");
+        let result = resolve_credentials(&conn, None, None).await;
+
+        assert!(matches!(&result, Err(CredError::VaultNotConfigured)));
+        assert_eq!(
+            result
+                .expect_err("missing resolver must fail closed")
+                .to_string(),
+            "vault resolver unavailable: required configuration is missing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // VaultKv2Resolver — handle parsing, construction, and Debug redaction
     // -----------------------------------------------------------------------
 
@@ -6157,6 +6789,9 @@ mod unit_tests {
             "/x",           // empty mount
             "secret/",      // empty path
             "secret/x/",    // trailing slash (empty leaf)
+            "secret//x",    // empty path segment
+            "secret/../x",  // parent traversal
+            "secret/./x",   // current-directory traversal
             "#field",       // selector only
             "",             // empty
         ] {
@@ -6168,33 +6803,133 @@ mod unit_tests {
     }
 
     #[test]
-    fn vault_resolver_from_parts_requires_both_addr_and_token() {
-        assert!(VaultKv2Resolver::from_parts(None, None).is_none());
-        assert!(VaultKv2Resolver::from_parts(Some("http://v:8200".into()), None).is_none());
-        assert!(VaultKv2Resolver::from_parts(None, Some("tok".into())).is_none());
+    fn vault_transport_policy_is_fail_closed() {
+        assert!(VaultKv2Resolver::from_parts(None, None, false)
+            .unwrap()
+            .is_none());
+        assert!(VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200".into()),
+            None,
+            false
+        )
+        .is_err());
+        assert!(VaultKv2Resolver::from_parts(None, Some("fixture-token".into()), false).is_err());
         assert!(
-            VaultKv2Resolver::from_parts(Some("   ".into()), Some("tok".into())).is_none(),
-            "blank addr must not configure a real resolver"
+            VaultKv2Resolver::from_parts(Some("   ".into()), Some("fixture-token".into()), false,)
+                .is_err(),
+            "blank addr must be invalid rather than absent"
         );
         assert!(
-            VaultKv2Resolver::from_parts(Some("http://v:8200".into()), Some("".into())).is_none(),
-            "blank token must not configure a real resolver"
+            VaultKv2Resolver::from_parts(
+                Some("https://vault.example:8200".into()),
+                Some("".into()),
+                false,
+            )
+            .is_err(),
+            "blank token must be invalid rather than absent"
         );
-        let resolver =
-            VaultKv2Resolver::from_parts(Some("http://v:8200/".into()), Some("tok".into()))
-                .expect("both present → configured");
+
+        let resolver = VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200/".into()),
+            Some("fixture-token".into()),
+            false,
+        )
+        .expect("valid configuration")
+        .expect("both present → configured");
         assert_eq!(
-            resolver.addr, "http://v:8200",
-            "trailing slash must be normalized away"
+            resolver.addr.0.as_str(),
+            "https://vault.example:8200/",
+            "valid HTTPS remains supported"
         );
+
+        let remote_http = VaultKv2Resolver::from_parts(
+            Some("http://vault.example:8200".into()),
+            Some("fixture-token".into()),
+            true,
+        )
+        .expect_err("the development switch must never permit remote HTTP");
+        assert!(remote_http.to_string().contains("must use HTTPS"));
+
+        VaultKv2Resolver::from_parts(
+            Some("http://127.0.0.1:8200".into()),
+            Some("fixture-token".into()),
+            false,
+        )
+        .expect_err("loopback HTTP requires explicit opt-in");
+        VaultKv2Resolver::from_parts(
+            Some("http://127.0.0.1:8200".into()),
+            Some("fixture-token".into()),
+            true,
+        )
+        .expect("explicit loopback development endpoint is valid")
+        .expect("both parts configured");
+
+        VaultKv2Resolver::from_parts(
+            Some("http://127.0.0.1.evil.example:8200".into()),
+            Some("fixture-token".into()),
+            true,
+        )
+        .expect_err("loopback-lookalike hosts must not bypass HTTPS");
+        VaultKv2Resolver::from_parts(
+            Some("http://localhost:8200".into()),
+            Some("fixture-token".into()),
+            true,
+        )
+        .expect_err("a DNS name must not satisfy the literal-loopback exception");
+        VaultKv2Resolver::from_parts(
+            Some("https://operator@vault.example:8200".into()),
+            Some("fixture-token".into()),
+            false,
+        )
+        .expect_err("userinfo in VAULT_ADDR must be rejected");
+        VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200?target=alternate".into()),
+            Some("fixture-token".into()),
+            false,
+        )
+        .expect_err("query-bearing endpoints must be rejected");
+        VaultKv2Resolver::from_parts(
+            Some("https://vault.example:8200#alternate".into()),
+            Some("fixture-token".into()),
+            false,
+        )
+        .expect_err("fragment-bearing endpoints must be rejected");
+
+        assert!(parse_optional_bool_env(
+            VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
+            Some("yes".to_string()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn vault_endpoint_appends_encoded_kv_segments_without_origin_or_query_changes() {
+        let endpoint = VaultEndpoint::parse("https://vault.example:8200/proxy/prefix", false)
+            .expect("typed HTTPS endpoint");
+        let url = endpoint
+            .kv2_read_url("secret", "team/key?alternate=%2Fother")
+            .expect("safe KV URL");
+
+        assert_eq!(
+            url.origin().ascii_serialization(),
+            "https://vault.example:8200"
+        );
+        assert_eq!(
+            url.path(),
+            "/proxy/prefix/v1/secret/data/team/key%3Falternate=%252Fother"
+        );
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
     }
 
     #[test]
     fn vault_resolver_debug_never_prints_the_token() {
         let resolver = VaultKv2Resolver::from_parts(
-            Some("http://vault.internal:8200".into()),
+            Some("https://vault.internal:8200".into()),
             Some("s.VERY-SECRET-VAULT-TOKEN".into()),
+            false,
         )
+        .expect("valid configuration")
         .expect("configured");
         let debug = format!("{resolver:?}");
         assert!(
@@ -6211,13 +6946,169 @@ mod unit_tests {
         );
     }
 
+    async fn read_vault_test_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count =
+                tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buffer))
+                    .await
+                    .expect("test request read timed out")
+                    .expect("test request read failed");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
+        request
+    }
+
     #[tokio::test]
-    async fn mock_vault_resolver_still_returns_deterministic_marker() {
-        let material = MockVaultResolver
+    async fn vault_transport_accepts_explicit_loopback_and_bounded_kv2_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind synthetic Vault endpoint");
+        let address = listener.local_addr().expect("synthetic endpoint address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept Vault request");
+            let request = read_vault_test_request(&mut stream).await;
+            let body = r#"{"data":{"data":{"password":"fixture-value"}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write synthetic Vault response");
+            request
+        });
+
+        let resolver = VaultKv2Resolver::from_parts(
+            Some(format!("http://{address}")),
+            Some("fixture-token".to_string()),
+            true,
+        )
+        .expect("valid loopback configuration")
+        .expect("resolver configured");
+        let material = resolver
+            .resolve("secret/team/service#password")
+            .await
+            .expect("small KV v2 response should resolve");
+        assert_eq!(material, b"fixture-value");
+
+        let request_bytes = server.await.expect("synthetic server task");
+        let request = String::from_utf8_lossy(&request_bytes);
+        assert!(request.starts_with("GET /v1/secret/data/team/service HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-vault-token: fixture-token"),
+            "the bearer reaches only the explicitly enabled loopback fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_transport_never_forwards_token_across_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect fixture");
+        let address = listener.local_addr().expect("redirect endpoint address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for request_number in 0..2 {
+                let wait = if request_number == 0 {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::from_millis(250)
+                };
+                let Ok(Ok((mut stream, _))) = tokio::time::timeout(wait, listener.accept()).await
+                else {
+                    break;
+                };
+                requests.push(read_vault_test_request(&mut stream).await);
+                let response = if request_number == 0 {
+                    format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"data\":{\"data\":{\"value\":\"bad\"}}}".to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write redirect fixture response");
+            }
+            requests
+        });
+
+        let resolver = VaultKv2Resolver::from_parts(
+            Some(format!("http://{address}")),
+            Some("fixture-token".to_string()),
+            true,
+        )
+        .expect("valid loopback configuration")
+        .expect("resolver configured");
+        let error = resolver
+            .resolve("secret/team/service#password")
+            .await
+            .expect_err("Vault redirects must fail closed");
+        assert!(error.to_string().contains("307"));
+
+        let requests = server.await.expect("redirect fixture task");
+        assert_eq!(requests.len(), 1, "the redirect must never be followed");
+    }
+
+    #[tokio::test]
+    async fn vault_transport_rejects_lengthless_oversized_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oversized-response fixture");
+        let address = listener.local_addr().expect("oversized endpoint address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept Vault request");
+            let _request = read_vault_test_request(&mut stream).await;
+            let oversized_json = format!(
+                "{{\"data\":{{\"data\":{{\"password\":\"{}\"}}}}}}",
+                "a".repeat(VaultKv2Resolver::MAX_RESPONSE_BYTES)
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write oversized response headers");
+            // The client is expected to close as soon as the streaming cap is
+            // crossed, so a broken pipe after that point is a valid outcome.
+            let _ = stream.write_all(oversized_json.as_bytes()).await;
+        });
+
+        let resolver = VaultKv2Resolver::from_parts(
+            Some(format!("http://{address}")),
+            Some("fixture-token".to_string()),
+            true,
+        )
+        .expect("valid loopback configuration")
+        .expect("resolver configured");
+        let error = resolver
+            .resolve("secret/team/service#password")
+            .await
+            .expect_err("lengthless oversized responses must fail closed");
+        assert!(error.to_string().contains("exceeds the"));
+        server.await.expect("oversized-response fixture task");
+    }
+
+    #[tokio::test]
+    async fn development_secret_resolver_still_returns_deterministic_marker() {
+        let material = DevelopmentSecretResolver
             .resolve("secret/some/path")
             .await
             .expect("mock always resolves");
-        assert_eq!(material, b"mock-vault-resolved:secret/some/path".to_vec());
+        assert_eq!(material, b"mock-secret-resolved:secret/some/path".to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -6284,7 +7175,9 @@ mod unit_tests {
         let resolver = VaultKv2Resolver::from_parts(
             Some(VAULT_TEST_ADDR.to_string()),
             Some(VAULT_TEST_TOKEN.to_string()),
+            true,
         )
+        .expect("valid loopback development configuration")
         .expect("resolver configured");
 
         // 1. Field-selected read: the REAL value flows back.
@@ -6303,7 +7196,8 @@ mod unit_tests {
 
         // 3. resolve_credentials end-to-end for a Vault-sourced connection:
         //    the platform seam (CredentialSource::Vault) reaches the REAL
-        //    vault and the descriptor carries the handle, never the value.
+        //    adapter and the Debug-visible descriptor carries neither provider
+        //    locator nor value.
         let conn = IntegrationConnection {
             id: "ic-vault-it".to_string(),
             vendor_type: "vmware".to_string(),
@@ -6321,15 +7215,13 @@ mod unit_tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        let creds = resolve_credentials(&conn, &resolver, None)
+        let creds = resolve_credentials(&conn, Some(&resolver), None)
             .await
             .expect("vault-sourced resolve_credentials must succeed");
         assert_eq!(creds.material, secret_value.as_bytes());
-        assert!(
-            creds.descriptor.contains(&path_multi) && !creds.descriptor.contains(&secret_value),
-            "descriptor names the handle, never the value: {}",
-            creds.descriptor
-        );
+        assert_eq!(creds.descriptor, "external-secret:resolved");
+        assert!(!creds.descriptor.contains(&path_multi));
+        assert!(!creds.descriptor.contains(&secret_value));
         drop(creds); // zeroized
 
         // 4. NO LEAKAGE: every error path's message must carry names/paths/
@@ -6349,7 +7241,9 @@ mod unit_tests {
         let bad_token_resolver = VaultKv2Resolver::from_parts(
             Some(VAULT_TEST_ADDR.to_string()),
             Some("wrong-token".to_string()),
+            true,
         )
+        .expect("valid loopback development configuration")
         .expect("configured");
         let denied = bad_token_resolver
             .resolve(&format!("secret/{path_multi}#password"))

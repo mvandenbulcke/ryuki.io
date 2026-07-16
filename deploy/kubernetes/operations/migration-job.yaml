@@ -1,0 +1,94 @@
+# Operations-only template. Do not add this file to a continuously reconciled
+# base or GitOps Application. Render one approved digest, create it once, and
+# retain the generated Job name/logs with the release evidence. Every
+# `111111111111` identity below is the first 12 lowercase hex characters of
+# the admitted image digest and must be rewritten atomically with that image.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: platform-api-migrations-111111111111-
+  namespace: ryuki-platform
+  annotations:
+    ryuki.io/cutover-contract: migration-cutover-v1
+    ryuki.io/release-image: registry.example.invalid/ryuki/platform-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api-migrations
+    app.kubernetes.io/component: database-migration-runner
+    ryuki.io/release-digest-prefix: "111111111111"
+spec:
+  # A failed or timed-out DDL wave requires operator readback before any new
+  # generated Job is created. Kubernetes must never retry the migration writer.
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  # Deliberately no ttlSecondsAfterFinished: evidence retention/deletion is an
+  # explicit release operation, not an automatic recreate loop.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: ryuki-infrastructure-platform
+        app.kubernetes.io/name: platform-api-migrations
+        app.kubernetes.io/component: database-migration-runner
+        ryuki.io/release-digest-prefix: "111111111111"
+    spec:
+      serviceAccountName: platform-api-migrator
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      # Project only CloudNativePG's public CA certificate. SQLx verify-full
+      # uses this file before sending the JIT migration password.
+      volumes:
+        - name: cnpg-ca
+          secret:
+            secretName: ryuki-platform-db-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: platform-api-migrations
+          # Must remain byte-for-byte identical to the replacement verify-only
+          # platform-api image and metadata annotation above.
+          image: registry.example.invalid/ryuki/platform-api@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: cnpg-ca
+              mountPath: /var/run/secrets/ryuki/cnpg
+              readOnly: true
+          envFrom:
+            - configMapRef:
+                name: platform-api-migration-config
+          # The digest-scoped VaultDynamicSecret is created only for this
+          # operation. Import exactly its reviewed URL key.
+          env:
+            - name: RYUKI_MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ryuki-platform-api-migrator-db-111111111111
+                  key: RYUKI_MIGRATION_DATABASE_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

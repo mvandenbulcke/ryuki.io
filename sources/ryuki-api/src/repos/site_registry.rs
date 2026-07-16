@@ -18,7 +18,7 @@
 //! A boolean toggle is idempotent / last-write-wins, so no optimistic-lock
 //! token is needed (unlike lifecycle transitions).
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 // ─── Row struct ───────────────────────────────────────────────────────────────
 
@@ -51,6 +51,20 @@ pub async fn set_active(
         .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Lock one active canonical site for the caller-owned transaction. Creation
+/// handlers call this after deriving namespace ownership and before inserting;
+/// a concurrent deactivation then waits until the audited creation commits.
+/// `FOR SHARE` is intentional: `FOR KEY SHARE` would still allow an update of
+/// the non-key `active` column.
+pub async fn lock_active(conn: &mut PgConnection, unlocode: &str) -> Result<bool, sqlx::Error> {
+    let active: Option<bool> =
+        sqlx::query_scalar("SELECT active FROM site_registry WHERE unlocode = $1 FOR SHARE")
+            .bind(unlocode)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(active == Some(true))
 }
 
 /// Fetch a single site row by unlocode.

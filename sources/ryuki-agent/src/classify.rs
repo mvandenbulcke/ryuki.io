@@ -50,6 +50,10 @@ pub fn classify_client_error(err: &ClientError) -> RetryClass {
         // it), but if one ever reached the outbox classifier it is a structural
         // version mismatch that retrying cannot fix — quarantine it.
         ClientError::IncompatibleProtocol { .. } => RetryClass::Permanent,
+
+        // A rejected endpoint is a local configuration/security-policy error;
+        // retries cannot make an unsafe URL admissible.
+        ClientError::InvalidEndpoint { .. } => RetryClass::Permanent,
     }
 }
 
@@ -175,6 +179,16 @@ mod tests {
     #[test]
     fn status_409_is_permanent() {
         assert_eq!(classify_status(409), RetryClass::Permanent);
+    }
+
+    #[test]
+    fn invalid_endpoint_is_permanent() {
+        assert_eq!(
+            classify_client_error(&ClientError::InvalidEndpoint {
+                reason: "test policy rejection",
+            }),
+            RetryClass::Permanent,
+        );
     }
 
     #[test]

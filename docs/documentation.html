@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -109,12 +125,13 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h1>Documentation</h1><p>Everything you need to run Ryuki — the governed control plane for multi-site infrastructure.</p><div class="doc-grid"><a class="doc-card" href="/getting-started.html"><h2>Getting Started</h2><p>Prerequisites, database setup, first build and run.</p></a>
 <a class="doc-card" href="/first-test.html"><h2>First Test Acceptance</h2><p>Normative dry-run and live vSphere test gates, evidence, and cleanup.</p></a>
 <a class="doc-card" href="/architecture.html"><h2>Architecture</h2><p>The stack, component diagram, key decisions and network policy.</p></a>
+<a class="doc-card" href="/platform-security-boundary.html"><h2>Platform Security Boundary</h2><p>Provider-neutral identity, authorization, machine trust, secrets, audit, and production acceptance.</p></a>
 <a class="doc-card" href="/configuration.html"><h2>Configuration</h2><p>Environment variables, providers and platform configuration.</p></a>
 <a class="doc-card" href="/entra-app-registration.html"><h2>Entra App Registration</h2><p>OIDC / OAuth2 app registration and role setup for Entra ID.</p></a>
 <a class="doc-card" href="/site-management.html"><h2>Site Management</h2><p>UN/LOCODE locations, activation and the admin API.</p></a>
 <a class="doc-card" href="/rbac-and-scoping.html"><h2>RBAC & Scoping</h2><p>Roles, route access classes, site/environment scopes and their enforcement semantics.</p></a>
 <a class="doc-card" href="/agents-and-live-execution.html"><h2>Agents & Live Execution</h2><p>Enrolling execution agents and the signed approval chain that gates a live apply.</p></a>
-<a class="doc-card" href="/orchestration.html"><h2>Multi-Step Orchestration</h2><p>Dependency-ordered step plans, per-step live approval, and automatic teardown.</p></a>
+<a class="doc-card" href="/orchestration.html"><h2>Multi-Step Orchestration</h2><p>Dependency-ordered step plans, disabled human per-step live approval, and system-owned compensation groundwork.</p></a>
 <a class="doc-card" href="/notifications.html"><h2>Notifications</h2><p>In-app notifications, read receipts, the portal bell, and what emits them.</p></a>
 <a class="doc-card" href="/using-the-api.html"><h2>Using the API</h2><p>Authentication, conventions, and a complete request lifecycle with curl.</p></a>
 <a class="doc-card" href="/api-reference.html"><h2>API Reference</h2><p>Route-by-area control-plane reference, plus a bounded machine-readable OpenAPI subset.</p></a></div>

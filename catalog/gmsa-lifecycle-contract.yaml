@@ -61,6 +61,10 @@ requiredInputs:
 requiredGuards:
   - request-context-known
   - service-account-scope-summarized
+  - canonical-name-site-owner-bound
+  - longest-governed-site-suffix-resolved
+  - namespace-provenance-verified
+  - current-owner-site-active
   - kds-root-key-readiness-reviewed
   - retrieval-scope-reviewed
   - kerberos-policy-reviewed
@@ -91,6 +95,9 @@ blockedReasons:
   - gmsa-assignment-disabled
   - gmsa-validation-disabled
   - gmsa-retire-disabled
+  - unverified-namespace-provenance
+  - inactive-owner-site
+  - old-replica-drain-required
   - password-retrieval-disabled
   - managed-password-material-disabled
   - spn-change-disabled
@@ -129,10 +136,18 @@ rules:
     decision: block
     requirement: gMSA lifecycle records review plans only and never creates, assigns, validates, removes, delegates, changes SPNs, retrieves managed passwords, executes workers, or mutates directory service account objects.
     evidence: gMSA lifecycle review summary
+  - id: directory-namespace-owner-required
+    decision: block
+    requirement: A platform-state gMSA create must resolve the longest governed site suffix from the canonical lowercase global name, require that owner site to be active and authorized, and persist directory-namespace-v1 provenance before the unique-name claim. Site-code registration and namespace-changing account writes serialize on one persistence lock, governed site codes are immutable, inactive namespaces remain reserved, and unverified legacy rows remain quarantined from operational reads and writes.
+    evidence: Service account scope summary
   - id: retrieval-scope-review-required
     decision: block
     requirement: KDS root key readiness, password retrieval scope, worker usage, Kerberos policy, SPN policy, and delegation risk must be reviewed before any gMSA lifecycle decision can be accepted.
     evidence: Password retrieval scope review
+  - id: inactive-directory-owner-fails-closed
+    decision: block
+    requirement: Every platform-state inventory read, lookup, host mutation, rotation, retrieval test, and expiry scan requires the persisted namespace owner site to be currently active. Deactivation gates access without rewriting the gMSA, host assignments, or lifecycle status; reactivation restores access only to already-Verified provenance, while rows quarantined during legacy backfill are never auto-promoted. Deployments must drain or fence replicas that predate the active-owner read predicates before relying on deactivation as a read boundary; database triggers independently fence stale account and host-assignment mutations.
+    evidence: Service account scope summary
   - id: approval-worker-and-rollback-required
     decision: block
     requirement: Approval route, worker capability review, rollback plan, and recovery readiness must be present before future directory execution can be considered.

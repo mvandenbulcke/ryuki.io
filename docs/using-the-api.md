@@ -4,7 +4,7 @@ Everything the portal does, it does through this API, and the same surface is
 available to your own tooling: the same authentication, authorization, scopes,
 and audited lifecycle. This guide covers the cross-cutting conventions and a
 complete request lifecycle you can run with curl. The
-[API Reference](api-reference.md) documents every generated route by area.
+[API Reference](api/endpoints.md) documents every generated route by area.
 
 ## Base URL and versioning
 
@@ -20,11 +20,23 @@ server version in `x-api-version`.
 [Configuration](configuration.md)); service API tokens are a separate,
 mode-independent credential type.
 
+Those modes document the current API. The production target supports several
+configured OpenID Connect providers simultaneously, brokered SAML/LDAP/AD,
+local WebAuthn emergency access, OAuth service principals, scoped compatibility
+tokens, and workload identity, all normalized into one principal model. See the
+[Platform Security Boundary Specification](architecture/platform-security-boundary.md#pluggable-authentication-providers).
+
 **Development modes** (`mock-dry-run`, the default, and `static-dry-run`): requests run as a static admin session with no credentials. Nothing to configure; never run these against anything real.
 
-**Local accounts** (`local`): sign in and use the returned session ID. Browser
-safe reads may use the session cookie, but unsafe methods reject cookie-only
-authorization as a CSRF defense; scripts must send `X-Ryuki-Session-Id`.
+**Local accounts** (`local`, current development/migration behavior): sign in
+with a username and password and use the returned `session_token`. It is a
+256-bit opaque `rys_...` bearer disclosed only by the login response and
+cookie; the database stores only its keyed HMAC verifier. Browser safe reads may
+use the session cookie, but unsafe methods reject cookie-only authorization as a
+CSRF defense; scripts send the token in `X-Ryuki-Session-Id` (a compatibility
+header name). Never log, commit, or reuse the token between clients. UUIDs from
+the admin session inventory are non-secret management IDs and cannot
+authenticate.
 
 ```bash
 printf 'Password: ' >&2
@@ -35,12 +47,12 @@ LOGIN=$(printf '%s' "$PASSWORD" | \
   curl --fail-with-body -sS -X POST 'https://<host>/api/auth/local/login' \
     -H 'Content-Type: application/json' --data-binary @-)
 unset PASSWORD
-SESSION_ID=$(printf '%s' "$LOGIN" | jq -er '.session_id')
+SESSION_TOKEN=$(printf '%s' "$LOGIN" | jq -er '.session_token')
 unset LOGIN
 umask 077
 SESSION_HEADER=$(mktemp "${TMPDIR:-/tmp}/ryuki-session.XXXXXX")
-printf 'X-Ryuki-Session-Id: %s\n' "$SESSION_ID" > "$SESSION_HEADER"
-unset SESSION_ID
+printf 'X-Ryuki-Session-Id: %s\n' "$SESSION_TOKEN" > "$SESSION_HEADER"
+unset SESSION_TOKEN
 
 cleanup_session() {
   local logout_status=0
@@ -64,13 +76,24 @@ curl --fail-with-body -sS 'https://<host>/api/requests' \
 curl -s https://<host>/api/requests -H "Authorization: Bearer <entra-jwt>"
 ```
 
-**API tokens** are the right choice for integrations once the platform is using
-database-backed interactive authentication. An interactive Local or Entra
+**Current API tokens** are the available compatibility credential for
+integrations once the platform is using database-backed interactive
+authentication. An interactive Local or Entra
 administrator mints one; another API token cannot mint tokens. The `ryk_...`
 value is returned exactly once. Tokens created while the platform is in
 `mock-dry-run` or `static-dry-run` are persisted with `token_valid: false` and
 cannot authenticate. Usable tokens can carry site and environment scopes, which
 narrow everything the token sees—the recommended blast-radius control.
+
+Current token authority is derived from role names plus optional site and
+environment scope and expiry. It does not yet implement the production token
+contract. The target groups rotated versions into a credential family, binds
+each token to the Ryuki audience and an explicit closed action set, represents
+scope states unambiguously, enforces a short maximum TTL, and rotates by issuing
+a new credential id with a bounded observable overlap before revoking the old
+version. Target tokens never gain browser, interactive, step-up, or emergency
+authority. See
+[service credentials and API tokens](architecture/platform-security-boundary.md#service-credentials-and-api-tokens).
 
 ```bash
 curl -s -X POST https://<host>/api/admin/tokens \
@@ -88,12 +111,43 @@ the route's access class.
 
 | Header | When to send it |
 | --- | --- |
-| `Authorization: Bearer ...` | Human API routes accept a `ryk_...` API token, a validated Entra JWT, or a persisted session UUID as applicable to the configured auth mode. Token minting is the exception: it rejects `ryk_...` credentials and requires an interactive administrator. Agent routes use their own `rya_...` bearer tokens. |
-| `X-Ryuki-Session-Id` | Explicit persisted-session carrier used by the portal and scripts. A `ryuki_session` cookie can authorize safe reads, but cookie-only `POST`, `PUT`, `PATCH`, and `DELETE` requests are rejected as a CSRF defense. |
-| `Content-Type: application/json` | Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: webhook HMAC verification covers the exact bytes sent. |
+| `Authorization: Bearer ...` | Human API routes accept exactly one applicable credential: a `ryk_...` API token, a validated Entra JWT, or an opaque `rys_...` persisted-session token. Token minting rejects `ryk_...` credentials and requires an interactive administrator. Agent routes use their own `rya_...` bearer tokens. |
+| `X-Ryuki-Session-Id` | Compatibility carrier for the opaque `rys_...` session token used by the portal and scripts. Despite the header name, an administrative session UUID is never valid here. HTTPS uses the `__Host-ryuki_session` cookie; explicitly configured non-Secure loopback development uses `ryuki_session`. Either cookie can authorize safe reads only in its matching mode; cookie-only `POST`, `PUT`, `PATCH`, and `DELETE` requests are rejected as a CSRF defense. |
+| `Content-Type: application/json` | Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v1 webhook message covers the exact-body SHA-256 digest. |
 | `x-ryuki-protocol-version` | Required on agent registration, poll, acknowledgement, heartbeat, and result requests. This build accepts version `2`; missing, duplicate, malformed, or unsupported values return `400`. The public-key and OpenAPI bootstrap reads do not require it. |
-| `X-Hub-Signature-256` | Required only by the inbound webhook receiver. Send the hex HMAC-SHA256 of the exact raw body, optionally prefixed with `sha256=`. |
+| `X-Hub-Signature-256` | Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v1 canonical message (fixed POST path, connection ID, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with `sha256=`. |
+| `X-Ryuki-Webhook-Timestamp` | Required by the inbound webhook receiver. Send canonical Unix time in seconds; it is signed and accepted only within five minutes of both receiver clocks. |
+| `X-Ryuki-Webhook-Delivery-Id` | Required by the inbound webhook receiver. Send a unique 1-128 byte identifier using `[A-Za-z0-9._-]`; it is signed and atomically deduplicated per connection. |
 | `Idempotency-Key` | Enables durable deduplication for authenticated, DB-backed human mutations. Use a unique, unguessable key for each logical operation; the emergency-initiate route requires one. |
+
+During the secure-cookie migration, successful login/callback and logout
+responses send the `__Host-ryuki_session` field and a separate `ryuki_session`
+expiry field. Proxies must preserve these as independent `Set-Cookie` header
+fields; they must not comma-join them. The expired legacy name is never accepted
+as an HTTPS credential.
+
+For inbound webhooks, compute the HMAC over this exact UTF-8 v1 message with no
+trailing newline (replace the placeholders with the header/path values and the
+lowercase hex SHA-256 of the exact body bytes):
+
+```text
+ryuki-webhook-v1
+method:POST
+path:/api/integrations/{connection_id}/webhook
+connection-id:{connection_id}
+timestamp:{unix_seconds}
+delivery-id:{delivery_id}
+body-sha256:{lowercase_hex_digest}
+```
+
+Webhook request bodies are capped at 256 KiB independently of the configurable
+whole-API body limit.
+
+Send only one credential carrier per request. Combining
+`X-Ryuki-Session-Id`, `Authorization`, or either session-cookie name;
+duplicating a session cookie; mixing its old/new names; or presenting a
+malformed/invalid prefixed credential fails closed without falling through to
+another identity.
 
 ## Authorization
 
@@ -104,7 +158,7 @@ points also use effective access classes such as composite `read`, `public`,
 narrowed by site and environment scope. [RBAC & Scoping](rbac-and-scoping.md)
 defines these labels and the `404`/`403`/filtered-list behavior. The effective
 access requirement for each route appears in the
-[API Reference](api-reference.md).
+[API Reference](api/endpoints.md).
 
 ## Conventions
 
@@ -115,6 +169,11 @@ and `DELETE` requests when PostgreSQL is available. It is opt-in unless the
 route says otherwise: without a usable key, or without a database, the request
 continues without deduplication. A usable key is 1..200 bytes; an unguessable
 UUID is a good default. Keys are isolated by authenticated principal.
+
+Continuing without PostgreSQL is current development/migration behavior, not a
+production failover guarantee. Production security mutations, sessions,
+replay/idempotency recording, approvals, and authoritative audit fail closed
+when their durable state is unavailable.
 
 The server fingerprints the method, full path and query string, and exact body.
 For the same key and fingerprint, a completed JSON response is replayed with
@@ -181,7 +240,7 @@ when it expires. The configurable global request-body limit defaults to
 
 ### Reference coverage
 
-The HTML [API Reference](api-reference.md) is generated from the registered
+The HTML [API Reference](api/endpoints.md) is generated from the registered
 route surface and covers every generated control-plane route. The
 [machine-readable OpenAPI document](openapi.json) is deliberately bounded
 to the agent protocol, selected public/bootstrap endpoints, and selected
@@ -218,7 +277,7 @@ ADMIN_HEADERS="$AUTH_DIR/admin.headers"
 login_local() {
   local username=$1
   local header_file=$2
-  local password login session_id
+  local password login session_token
   printf '%s password: ' "$username" >&2
   IFS= read -r -s password </dev/tty
   printf '\n' >&2
@@ -227,10 +286,10 @@ login_local() {
     curl --fail-with-body -sS -X POST "$BASE/api/auth/local/login" \
       -H 'Content-Type: application/json' --data-binary @-)
   unset password
-  session_id=$(printf '%s' "$login" | jq -er '.session_id')
+  session_token=$(printf '%s' "$login" | jq -er '.session_token')
   unset login
-  printf 'X-Ryuki-Session-Id: %s\n' "$session_id" > "$header_file"
-  unset session_id
+  printf 'X-Ryuki-Session-Id: %s\n' "$session_token" > "$header_file"
+  unset session_token
 }
 
 logout_local() {

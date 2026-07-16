@@ -67,3 +67,27 @@ Required evidence (from the contract YAML).
     Payload redaction review
     Rollback readiness
     Evidence references
+
+## Local queue authority cutover
+
+Migration `169_servicenow_queue_authorization_scope.sql` is a non-overlapping
+authorization cutover. Before applying it, stop every pre-169 API/portal
+replica and drain its database transactions. Those binaries do not enforce the
+new immutable CI, active-site, environment, owner, creator, and reviewed
+provenance relation on reads or transitions, so schema compatibility alone is
+not an authorization fence.
+
+After the old replica count and active transaction set are proven zero, apply
+the migration, add only explicitly reviewed environment-authority records that
+name exact configuration-item UUIDs, and then start the matching application
+version. Pre-169 writers that ran before the drain leave the all-NULL legacy
+binding shape; the new application quarantines those rows from every list,
+detail, validation, approval, submit, cancel, and history path. A familiar CI
+name is never reconciliation evidence.
+
+Do not roll the application back by itself after reviewed queue rows exist. A
+rollback must first stop and drain the new replicas and then restore a mutually
+compatible database and application release, or retain the new authorization
+reader. Live ServiceNow submission and provider readback remain separately
+blocked until the future integration approval and trusted-access evidence in
+this runbook are satisfied.

@@ -5,12 +5,36 @@ must satisfy. It is mirrored by the static `/api/platform/security-baseline-cont
 endpoint and enforced by the `security-baseline` validator slice. The platform is
 evidence-first and provider-safe: nothing here enables live execution on its own.
 
+## One platform security boundary
+
+Every human, service, agent, webhook, callback, and internal worker must cross
+the same normalized admission, authorization, transition, and audit boundary.
+No portal check, route-local role test, signed payload, development identity, or
+network location grants authority on its own. Production must fail closed on
+invalid configuration and missing identity, database, secret, or signing-key
+dependencies.
+
+The complete target-state invariants and implementation gates are defined in the
+[Platform Security Boundary Specification](platform-security-boundary.md). The
+specification is normative for production acceptance and intentionally
+distinguishes required behavior from what is already implemented.
+
 ## No committed secrets
 
 Secrets must never be committed. Credentials, tokens, private keys, and
 connection material live in the secret provider and are injected at deploy- and
 run-time; manifests and source reference them by name only. The `no-secret-scan`
 script gates every change against access-key, private-key, and token patterns.
+
+## Dependency and cryptographic implementation integrity
+
+Every tracked lockfile is checked against current RustSec advisory data. An
+advisory may be ignored only with a documented applicability decision and an
+executable guard that fails if the affected crate or feature becomes reachable;
+an unverified blanket allowlist is not acceptable. The
+`scripts/dependency-audit.sh` gate enforces this rule for the workspace and
+standalone lockfiles. Cryptographic providers are selected explicitly and must
+pass the same authentication negative tests after a backend change.
 
 ## Execution lifecycle
 

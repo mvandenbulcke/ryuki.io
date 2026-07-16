@@ -1,29 +1,282 @@
-use ryuki_core::config::RyukiConfig;
+use ryuki_core::config::{AuthMode, RyukiConfig};
 
-pub fn load_config() -> RyukiConfig {
-    match RyukiConfig::load() {
-        Ok(config) => {
-            let validation_errors = config.validate();
-            let validation_warnings = config.validation_warnings();
-            if !validation_errors.is_empty() {
-                eprintln!("Configuration validation errors:");
-                for error in &validation_errors {
-                    eprintln!("  - {error}");
-                }
-            }
-            if !validation_warnings.is_empty() {
-                eprintln!("Configuration validation warnings:");
-                for warning in &validation_warnings {
-                    eprintln!("  - {warning}");
-                }
-            }
-            config
+/// Load and validate the startup configuration.
+///
+/// Configuration is a security boundary: parse and validation failures must
+/// stop startup instead of silently selecting permissive development defaults.
+pub fn load_config() -> Result<RyukiConfig, String> {
+    let config =
+        RyukiConfig::load().map_err(|error| format!("failed to load configuration: {error}"))?;
+    validate_loaded_config(config)
+}
+
+/// Applies every process-startup validation step to one already parsed
+/// configuration. Keeping this separate from environment/file loading makes
+/// the fail-closed startup boundary directly testable.
+fn validate_loaded_config(config: RyukiConfig) -> Result<RyukiConfig, String> {
+    validate_loaded_config_with_secret_validation(
+        config,
+        crate::integration::validate_secret_manager_startup,
+    )
+}
+
+fn validate_loaded_config_with_secret_validation(
+    config: RyukiConfig,
+    validate_secret_manager: impl FnOnce(&RyukiConfig) -> Result<(), String>,
+) -> Result<RyukiConfig, String> {
+    let validation_errors = config.validate();
+    if !validation_errors.is_empty() {
+        return Err(format!(
+            "configuration validation failed:\n  - {}",
+            validation_errors.join("\n  - ")
+        ));
+    }
+
+    // Provider credentials and endpoints are process-owned configuration, not
+    // ordinary request data. Reject partial, mismatched, or unsafe transport
+    // state before any listener is opened; dependent operations still fail
+    // closed when the provider is intentionally left entirely unconfigured.
+    validate_secret_manager(&config)?;
+
+    validate_identity_endpoints(&config)?;
+
+    let validation_warnings = config.validation_warnings();
+    if !validation_warnings.is_empty() {
+        eprintln!("Configuration validation warnings:");
+        for warning in &validation_warnings {
+            eprintln!("  - {warning}");
         }
-        Err(e) => {
-            eprintln!("Failed to load configuration: {e}");
-            eprintln!("Falling back to default configuration");
-            RyukiConfig::default()
+    }
+
+    Ok(config)
+}
+
+fn validate_identity_endpoint(label: &str, raw: &str) -> Result<url::Url, String> {
+    crate::oidc_callback::parse_identity_endpoint(raw)
+        .map_err(|reason| format!("{label} is not an admitted identity endpoint ({reason})"))
+}
+
+/// Close the startup-to-runtime gap for browser authorization URLs as well as
+/// the token and JWKS clients. Constructors may then safely assume that every
+/// enabled identity endpoint has passed the same transport policy.
+fn validate_identity_endpoints(config: &RyukiConfig) -> Result<(), String> {
+    if config.oidc.enabled {
+        let issuer = validate_identity_endpoint("oidc.issuer", &config.oidc.issuer)?;
+        if issuer.query().is_some() {
+            return Err("oidc.issuer must not contain a query".into());
         }
+        for (label, endpoint) in [
+            (
+                "oidc.authorize_endpoint",
+                config.oidc.authorize_endpoint.as_str(),
+            ),
+            ("oidc.token_endpoint", config.oidc.token_endpoint.as_str()),
+            ("oidc.jwks_uri", config.oidc.jwks_uri.as_str()),
+            ("oidc.redirect_uri", config.oidc.redirect_uri.as_str()),
+        ] {
+            validate_identity_endpoint(label, endpoint)?;
+        }
+    }
+
+    if config.auth_mode == AuthMode::EntraId {
+        let authority = validate_identity_endpoint("entra_authority", &config.entra_authority)?;
+        if authority.query().is_some() {
+            return Err("entra_authority must not contain a query".into());
+        }
+        if !config.entra_redirect_uri.is_empty() {
+            validate_identity_endpoint("entra_redirect_uri", &config.entra_redirect_uri)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod startup_validation_tests {
+    use super::*;
+
+    fn validate_test_config(config: RyukiConfig) -> Result<RyukiConfig, String> {
+        // Identity/cookie tests are pure and must not depend on an operator's
+        // ambient VAULT_* process environment. Secret-manager snapshots have
+        // dedicated pure tests in integration.rs.
+        validate_loaded_config_with_secret_validation(config, |_| Ok(()))
+    }
+
+    fn configured_oidc() -> RyukiConfig {
+        let mut config = RyukiConfig::default();
+        config.oidc.enabled = true;
+        config.oidc.issuer = "https://identity.example.test".into();
+        config.oidc.authorize_endpoint = "https://identity.example.test/authorize".into();
+        config.oidc.token_endpoint = "https://identity.example.test/token".into();
+        config.oidc.jwks_uri = "https://identity.example.test/jwks".into();
+        config.oidc.redirect_uri = "https://portal.example.test/api/auth/oidc/callback".into();
+        config.oidc.client_id = "client".into();
+        config.oidc.client_secret = "x".repeat(32);
+        config.session.credential_hmac_key = "x".repeat(32);
+        config
+    }
+
+    fn configured_local(platform_url: &str, cookie_secure: bool) -> RyukiConfig {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            platform_url: platform_url.into(),
+            ..Default::default()
+        };
+        // Placeholder credential for tests only; never a runtime secret.
+        config.local_auth = serde_json::from_value(serde_json::json!({
+            "users": "operator:placeholder-pass-1:PlatformAdmin",
+            "site_authority": "global",
+            "environment_authority": "global"
+        }))
+        .expect("placeholder local-auth config should parse");
+        config.session.cookie_secure = cookie_secure;
+        config.session.credential_hmac_key = "x".repeat(32);
+        config
+    }
+
+    #[test]
+    fn identity_endpoint_validation_rejects_each_remote_cleartext_oidc_url() {
+        for label in [
+            "oidc.issuer",
+            "oidc.authorize_endpoint",
+            "oidc.token_endpoint",
+            "oidc.jwks_uri",
+            "oidc.redirect_uri",
+        ] {
+            let mut config = configured_oidc();
+            let cleartext = format!(
+                "http://identity.example.test/{}",
+                label.trim_start_matches("oidc.").replace('_', "-")
+            );
+            match label {
+                "oidc.issuer" => config.oidc.issuer = cleartext,
+                "oidc.authorize_endpoint" => config.oidc.authorize_endpoint = cleartext,
+                "oidc.token_endpoint" => config.oidc.token_endpoint = cleartext,
+                "oidc.jwks_uri" => config.oidc.jwks_uri = cleartext,
+                "oidc.redirect_uri" => config.oidc.redirect_uri = cleartext,
+                _ => unreachable!("closed OIDC endpoint manifest"),
+            }
+
+            let error = validate_identity_endpoints(&config).unwrap_err();
+            assert!(error.contains(label), "wrong field in error: {error}");
+            assert!(error.contains("https-required"), "wrong policy: {error}");
+        }
+    }
+
+    #[test]
+    fn identity_endpoint_validation_rejects_query_bearing_issuer() {
+        let mut config = configured_oidc();
+        config.oidc.issuer = "https://identity.example.test/issuer?alternate=tenant".into();
+        assert_eq!(
+            validate_identity_endpoints(&config).unwrap_err(),
+            "oidc.issuer must not contain a query"
+        );
+    }
+
+    #[test]
+    fn identity_endpoint_validation_covers_entra_authority_and_redirect() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            entra_tenant_id: "synthetic-tenant".into(),
+            entra_client_id: "synthetic-client".into(),
+            entra_authority: "https://login.example.test?alternate=host".into(),
+            entra_redirect_uri: "https://portal.example.test/api/auth/entra/callback".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_identity_endpoints(&config).unwrap_err(),
+            "entra_authority must not contain a query"
+        );
+
+        config.entra_authority = "https://login.example.test".into();
+        config.entra_redirect_uri = "http://portal.example.test/api/auth/entra/callback".into();
+        let error = validate_identity_endpoints(&config).unwrap_err();
+        assert!(error.contains("entra_redirect_uri"));
+        assert!(error.contains("https-required"));
+    }
+
+    #[test]
+    fn identity_endpoint_validation_accepts_distinct_secure_hosts() {
+        let mut config = configured_oidc();
+        config.oidc.authorize_endpoint = "https://authorize.example.test/login".into();
+        config.oidc.token_endpoint = "https://tokens.example.test/exchange".into();
+        config.oidc.jwks_uri = "https://keys.example.test/jwks".into();
+        assert!(validate_identity_endpoints(&config).is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_insecure_cookie_for_https_public_origin() {
+        let mut config = RyukiConfig {
+            platform_url: "https://platform.example.test".into(),
+            ..Default::default()
+        };
+        config.session.cookie_secure = false;
+
+        let error = validate_test_config(config).unwrap_err();
+        assert!(error.contains("session.cookie_secure"));
+        assert!(error.contains("non-loopback public origins"));
+    }
+
+    #[test]
+    fn startup_rejects_insecure_cookie_for_remote_http_public_origin() {
+        let mut config = RyukiConfig {
+            platform_url: "http://platform.example.test".into(),
+            ..Default::default()
+        };
+        config.session.cookie_secure = false;
+
+        let error = validate_test_config(config).unwrap_err();
+        assert!(error.contains("session.cookie_secure"));
+    }
+
+    #[test]
+    fn startup_rejects_insecure_cookie_for_secure_browser_callbacks() {
+        let mut oidc = configured_oidc();
+        oidc.session.cookie_secure = false;
+        let error = validate_test_config(oidc).unwrap_err();
+        assert!(error.contains("oidc.redirect_uri"));
+        assert!(error.contains("cookie_secure=false"));
+
+        let mut entra = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            entra_tenant_id: "configured".into(),
+            entra_client_id: "configured".into(),
+            entra_redirect_uri: "https://portal.example.test/api/auth/entra/callback".into(),
+            ..Default::default()
+        };
+        entra.session.cookie_secure = false;
+        entra.session.credential_hmac_key = "x".repeat(32);
+        let error = validate_test_config(entra).unwrap_err();
+        assert!(error.contains("entra_redirect_uri"));
+        assert!(error.contains("cookie_secure=false"));
+    }
+
+    #[test]
+    fn startup_accepts_explicit_loopback_http_cookie_mode() {
+        for platform_url in [
+            "http://localhost:18080",
+            "http://127.0.0.1:18080",
+            "http://[::1]:18080",
+        ] {
+            let mut config = configured_local(platform_url, false);
+            // Container processes commonly bind the bridge interface while
+            // the published browser origin remains loopback-only.
+            config.server.bind_address = "0.0.0.0:8080".into();
+
+            assert!(
+                validate_test_config(config).is_ok(),
+                "loopback development origin should be admitted: {platform_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_accepts_secure_public_origin_behind_plain_internal_listener() {
+        let mut config = configured_local("https://platform.example.test", true);
+        // TLS may terminate at the trusted ingress; cookie policy follows the
+        // browser-visible origin, not this internal listener address.
+        config.server.bind_address = "0.0.0.0:8080".into();
+        assert!(validate_test_config(config).is_ok());
     }
 }
 
@@ -125,6 +378,7 @@ pub fn get_platform_status() -> serde_json::Value {
         },
         "session": {
             "cookie_max_age_secs": config.session.cookie_max_age_secs,
+            "federated_authority_max_staleness_secs": config.session.federated_authority_max_staleness_secs,
             "cookie_secure": config.session.cookie_secure,
             "cookie_http_only": config.session.cookie_http_only,
             "cookie_same_site": config.session.cookie_same_site,

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use ryuki_engine::auth::{get_entra_config_from_env, AuthSession, EntraConfig};
+use ryuki_engine::auth::{get_entra_config_from_env, ActorClass, AuthSession, EntraConfig};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
@@ -36,9 +36,9 @@ const REFRESH_COOLDOWN: Duration = Duration::from_secs(300);
 /// (current + rotating); this caps the retained key set.
 const MAX_JWKS_KEYS: usize = 32;
 
-/// Upper bound on the JWKS response body (declared length). A real JWKS is a few
-/// KiB; reject anything that claims to be larger before deserializing it.
-const MAX_JWKS_BYTES: u64 = 1 << 20;
+/// Upper bound on the actual streamed JWKS response body. A declared length is
+/// only an early rejection hint; the cumulative bytes remain authoritative.
+const MAX_JWKS_BYTES: usize = 1 << 20;
 
 /// Claims we extract from a validated Entra token. All identity fields except
 /// `sub` are optional; `roles` defaults to empty (a valid identity with zero
@@ -55,6 +55,34 @@ struct EntraClaims {
     preferred_username: Option<String>,
     #[serde(default)]
     roles: Vec<String>,
+    /// Optional Entra credential-kind marker. `app` is an application actor;
+    /// `user` is accepted as human only alongside delegated scopes.
+    #[serde(default)]
+    idtyp: Option<String>,
+    /// Delegated OAuth scopes. A non-empty `scp` is the provider-neutral proof
+    /// that the access token represents a user-delegated authorization.
+    #[serde(default)]
+    scp: Option<String>,
+    /// Client-application identifiers are recorded only to classify a
+    /// scope-less bearer as workload/ambiguous; they never prove a human.
+    #[serde(default)]
+    appid: Option<String>,
+    #[serde(default)]
+    azp: Option<String>,
+}
+
+fn classify_entra_actor(claims: &EntraClaims) -> ActorClass {
+    let has_delegated_scope = claims
+        .scp
+        .as_deref()
+        .is_some_and(|scope| scope.split_ascii_whitespace().next().is_some());
+    match (claims.idtyp.as_deref(), has_delegated_scope) {
+        (Some("app"), _) => ActorClass::Workload,
+        (Some("user"), true) | (None, true) => ActorClass::VerifiedHuman,
+        (Some(_), _) => ActorClass::Unknown,
+        (None, false) if claims.appid.is_some() || claims.azp.is_some() => ActorClass::Workload,
+        (None, false) => ActorClass::Unknown,
+    }
 }
 
 /// The injectable key-resolution seam.
@@ -72,8 +100,14 @@ enum KeySource {
 /// Mutable JWKS state guarded by the cache's `RwLock`.
 struct JwksState {
     keys: HashMap<String, DecodingKey>,
-    fetched_at: Option<Instant>,
+    /// Absolute monotonic deadline for this complete cache generation. A
+    /// generation is cleared, not merely hidden, after this deadline whenever
+    /// a lookup observes expiry.
+    valid_until: Option<Instant>,
     last_refresh_attempt: Option<Instant>,
+    /// Monotonic publication token. A slow/cancelled refresh cannot overwrite
+    /// a generation elected by a later refresh attempt.
+    refresh_generation: u64,
 }
 
 /// Network JWKS cache. The `reqwest::Client` is created once and cloned
@@ -81,7 +115,7 @@ struct JwksState {
 /// stays immutable shared state (no global mutable state).
 struct JwksCache {
     http: reqwest::Client,
-    jwks_uri: String,
+    jwks_uri: reqwest::Url,
     ttl: Duration,
     inner: RwLock<JwksState>,
 }
@@ -106,84 +140,109 @@ struct JwksDocument {
 }
 
 impl JwksCache {
-    fn new(http: reqwest::Client, jwks_uri: String, ttl: Duration) -> Self {
+    fn new(http: reqwest::Client, jwks_uri: reqwest::Url, ttl: Duration) -> Self {
         Self {
             http,
             jwks_uri,
             ttl,
             inner: RwLock::new(JwksState {
                 keys: HashMap::new(),
-                fetched_at: None,
+                valid_until: None,
                 last_refresh_attempt: None,
+                refresh_generation: 0,
             }),
         }
     }
 
     /// Resolves the `DecodingKey` for `kid`, refreshing the keyset on an unknown
     /// `kid` (signing-key rotation) or an expired TTL, subject to a refresh
-    /// cooldown. On fetch failure the stale keyset is kept; fail-closed happens
-    /// at validate time if the `kid` still cannot be found.
+    /// cooldown. Once the absolute deadline passes, a failed refresh or active
+    /// retry cooldown clears the retired generation. Unknown-kid refresh
+    /// failures preserve only a still-fresh generation for legitimate callers.
     async fn decoding_key_for_kid(&self, kid: &str) -> Option<DecodingKey> {
         // Fast path: shared read lock. Hit only when the kid is present AND the
         // keyset is still within its TTL.
         {
             let state = self.inner.read().await;
             if let Some(key) = state.keys.get(kid) {
-                if Self::fresh(&state, self.ttl) {
+                if Self::fresh(&state) {
                     return Some(key.clone());
                 }
             }
         }
 
-        // Slow path: exclusive write lock + double-checked locking.
-        let mut state = self.inner.write().await;
-        if let Some(key) = state.keys.get(kid) {
-            if Self::fresh(&state, self.ttl) {
-                return Some(key.clone());
+        // Elect one cooldown-bounded refresher under the write lock, then drop
+        // the lock before network transfer and JSON parsing. A still-fresh
+        // known key remains available while an unknown kid is being refreshed.
+        let refresh_generation = {
+            let mut state = self.inner.write().await;
+            if let Some(key) = state.keys.get(kid) {
+                if Self::fresh(&state) {
+                    return Some(key.clone());
+                }
             }
-        }
 
-        // Only attempt a network refresh if we have not attempted recently.
-        let now = Instant::now();
-        let cooled_down = state
-            .last_refresh_attempt
-            .map(|t| now.duration_since(t) >= REFRESH_COOLDOWN)
-            .unwrap_or(true);
+            let now = Instant::now();
+            let cooled_down = state
+                .last_refresh_attempt
+                .map(|t| now.duration_since(t) >= REFRESH_COOLDOWN)
+                .unwrap_or(true);
+            if !cooled_down {
+                return Self::resolved_key_or_expire(&mut state, kid);
+            }
 
-        if cooled_down {
-            // Stamp BEFORE the await so concurrent writers see the attempt and
-            // the cooldown is honored even if the fetch is slow.
+            let Some(next_generation) = state.refresh_generation.checked_add(1) else {
+                return Self::resolved_key_or_expire(&mut state, kid);
+            };
             state.last_refresh_attempt = Some(now);
-            match self.fetch_keys().await {
-                Ok(keys) => {
+            state.refresh_generation = next_generation;
+            next_generation
+        };
+
+        let fetched = self.fetch_keys().await;
+        let mut state = self.inner.write().await;
+        if state.refresh_generation == refresh_generation {
+            if let Ok(keys) = fetched {
+                if let Some(valid_until) = Instant::now().checked_add(self.ttl) {
                     state.keys = keys;
-                    state.fetched_at = Some(Instant::now());
-                }
-                Err(_) => {
-                    // Keep the stale map. Fail-closed at validate time.
+                    state.valid_until = Some(valid_until);
+                } else {
+                    state.keys.clear();
+                    state.valid_until = None;
                 }
             }
         }
-
-        state.keys.get(kid).cloned()
+        Self::resolved_key_or_expire(&mut state, kid)
     }
 
-    fn fresh(state: &JwksState, ttl: Duration) -> bool {
-        state.fetched_at.map(|t| t.elapsed() < ttl).unwrap_or(false)
+    fn fresh(state: &JwksState) -> bool {
+        state
+            .valid_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    fn resolved_key_or_expire(state: &mut JwksState, kid: &str) -> Option<DecodingKey> {
+        if Self::fresh(state) {
+            state.keys.get(kid).cloned()
+        } else {
+            state.keys.clear();
+            state.valid_until = None;
+            None
+        }
     }
 
     async fn fetch_keys(&self) -> Result<HashMap<String, DecodingKey>, ()> {
-        let resp = self.http.get(&self.jwks_uri).send().await.map_err(|_| ())?;
+        let resp = self
+            .http
+            .get(self.jwks_uri.clone())
+            .send()
+            .await
+            .map_err(|_| ())?;
         if !resp.status().is_success() {
             return Err(());
         }
-        // Reject an oversized body before buffering/deserializing it — a real
-        // JWKS is a few KiB. Guards the declared-length case; the cache cap below
-        // bounds the retained key set regardless.
-        if resp.content_length().is_some_and(|n| n > MAX_JWKS_BYTES) {
-            return Err(());
-        }
-        let doc: JwksDocument = resp.json().await.map_err(|_| ())?;
+        let doc: JwksDocument =
+            crate::oidc_callback::bounded_json_response(resp, MAX_JWKS_BYTES).await?;
         let mut keys = HashMap::new();
         for jwk in doc.keys {
             // Bound the retained cache: a real signing JWKS holds a handful of
@@ -207,7 +266,13 @@ impl JwksCache {
                 keys.insert(jwk.kid, key);
             }
         }
-        Ok(keys)
+        if keys.is_empty() {
+            // Never publish an empty or entirely unusable document as a new
+            // trust generation. It is a refresh failure, not key rotation.
+            Err(())
+        } else {
+            Ok(keys)
+        }
     }
 }
 
@@ -266,20 +331,14 @@ impl EntraTokenValidator {
         leeway_secs: u64,
     ) -> Self {
         let config = get_entra_config_from_env(tenant_id, client_id, instance);
-        let (issuer, audiences) = Self::derive_issuer_and_audiences(&config);
-        let instance_trimmed = config.instance.trim_end_matches('/');
-        let jwks_uri = format!(
-            "{}/{}/discovery/v2.0/keys",
-            instance_trimmed, config.tenant_id
-        );
-        // A bounded timeout is essential: fetch_keys runs inside the JWKS
-        // write-lock on the token-validation hot path, so a slow/black-holed
-        // Entra JWKS endpoint without a timeout would stall ALL token validation.
+        let (issuer, audiences, jwks_uri) = Self::derive_identity_endpoints(&config)
+            .expect("Entra authority must be a parsed HTTPS URL (loopback HTTP is unit-test only)");
+        // A bounded timeout is essential even though refresh elects its
+        // publication generation under the cache lock and performs network
+        // I/O after releasing it. It bounds the individual unknown-kid caller
+        // and refresh resource use against a slow/black-holed endpoint.
         // (Mirrors the OIDC id-token validator's client.)
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("reqwest client build should not fail");
+        let http = crate::oidc_callback::identity_http_client(&jwks_uri);
         let cache = JwksCache::new(http, jwks_uri, Duration::from_secs(jwks_ttl_secs));
         Self {
             config,
@@ -295,7 +354,8 @@ impl EntraTokenValidator {
     /// tenant/client/authority.
     #[allow(dead_code)]
     pub fn with_static_keys(config: EntraConfig, keys: HashMap<String, DecodingKey>) -> Self {
-        let (issuer, audiences) = Self::derive_issuer_and_audiences(&config);
+        let (issuer, audiences, _) = Self::derive_identity_endpoints(&config)
+            .expect("Entra authority must be a parsed HTTPS URL (loopback HTTP is unit-test only)");
         Self {
             config,
             issuer,
@@ -307,14 +367,42 @@ impl EntraTokenValidator {
 
     /// Issuer = `{authority}/{tenant}/v2.0`; audiences accept both the bare
     /// client id and the `api://{client_id}` form Entra issues for app APIs.
-    fn derive_issuer_and_audiences(config: &EntraConfig) -> (String, Vec<String>) {
-        let authority = config.instance.trim_end_matches('/');
-        let issuer = format!("{}/{}/v2.0", authority, config.tenant_id);
+    fn derive_identity_endpoints(
+        config: &EntraConfig,
+    ) -> Result<(String, Vec<String>, reqwest::Url), &'static str> {
+        let authority = crate::oidc_callback::parse_identity_endpoint(&config.instance)?;
+        if authority.query().is_some() {
+            return Err("authority-query-not-allowed");
+        }
+
+        let issuer = Self::append_authority_segments(
+            authority.clone(),
+            &[config.tenant_id.as_str(), "v2.0"],
+        )?;
+        let jwks_uri = Self::append_authority_segments(
+            authority,
+            &[config.tenant_id.as_str(), "discovery", "v2.0", "keys"],
+        )?;
         let audiences = vec![
             config.client_id.clone(),
             format!("api://{}", config.client_id),
         ];
-        (issuer, audiences)
+        Ok((issuer.to_string(), audiences, jwks_uri))
+    }
+
+    fn append_authority_segments(
+        mut authority: reqwest::Url,
+        segments: &[&str],
+    ) -> Result<reqwest::Url, &'static str> {
+        let mut path = authority
+            .path_segments_mut()
+            .map_err(|_| "authority-cannot-be-base")?;
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+        drop(path);
+        Ok(authority)
     }
 
     async fn resolve_key(&self, kid: &str) -> Option<DecodingKey> {
@@ -399,6 +487,7 @@ impl EntraTokenValidator {
 
         // Step 6: map claims into a verified session.
         let claims = data.claims;
+        let actor_class = classify_entra_actor(&claims);
         let user_id = claims.oid.clone().unwrap_or_else(|| claims.sub.clone());
         let display_name = claims
             .name
@@ -412,6 +501,7 @@ impl EntraTokenValidator {
                 display_name,
                 roles: claims.roles,
                 token_valid: true,
+                actor_class,
                 provider_mode: "entra-id".to_string(),
                 // Entra/OIDC sessions are not scope-restricted (#2).
                 ..Default::default()
@@ -424,11 +514,10 @@ impl EntraTokenValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_crypto;
     use jsonwebtoken::{EncodingKey, Header};
-    use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
-    use rsa::traits::PublicKeyParts;
-    use rsa::{RsaPrivateKey, RsaPublicKey};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_TENANT: &str = "contoso-tenant-0000";
     const TEST_CLIENT: &str = "ryuki-app-client-0000";
@@ -448,24 +537,455 @@ mod tests {
         format!("{}/{}/v2.0", TEST_AUTHORITY, TEST_TENANT)
     }
 
-    /// Generates a throwaway RSA-2048 keypair and derives both the signing
-    /// `EncodingKey` (PKCS#8 DER) and a verifying `DecodingKey` (RSA n/e
-    /// components). No PEM is ever produced, so the secret scan stays clean.
-    fn make_keypair() -> (EncodingKey, DecodingKey, RsaPublicKey) {
-        let mut rng = rand::thread_rng();
-        let private = RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
-        let public = RsaPublicKey::from(&private);
+    #[test]
+    fn test_entra_identity_endpoints_are_parsed_and_secure() {
+        let (issuer, audiences, jwks_uri) =
+            EntraTokenValidator::derive_identity_endpoints(&test_config(true))
+                .expect("HTTPS Entra authority should be accepted");
+        assert_eq!(issuer, expected_issuer());
+        assert_eq!(
+            jwks_uri.as_str(),
+            format!("{}/{}/discovery/v2.0/keys", TEST_AUTHORITY, TEST_TENANT)
+        );
+        assert_eq!(
+            audiences,
+            vec![TEST_CLIENT.to_string(), format!("api://{TEST_CLIENT}")]
+        );
 
-        // jsonwebtoken's `from_rsa_der` feeds bytes to ring's
-        // `RsaKeyPair::from_der`, which expects PKCS#1 (RSAPrivateKey) DER.
-        let der = private.to_pkcs1_der().expect("pkcs1 der");
-        let encoding = EncodingKey::from_rsa_der(der.as_bytes());
+        let mut remote_cleartext = test_config(true);
+        remote_cleartext.instance = "http://idp.example".to_string();
+        assert_eq!(
+            EntraTokenValidator::derive_identity_endpoints(&remote_cleartext).unwrap_err(),
+            "https-required"
+        );
 
-        let n = b64url(public.n().to_bytes_be());
-        let e = b64url(public.e().to_bytes_be());
-        let decoding = DecodingKey::from_rsa_components(&n, &e).expect("decoding key");
+        let mut loopback = test_config(true);
+        loopback.instance = "http://127.0.0.1:8080".to_string();
+        assert!(EntraTokenValidator::derive_identity_endpoints(&loopback).is_ok());
 
-        (encoding, decoding, public)
+        let mut authority_with_query = test_config(true);
+        authority_with_query.instance = "https://idp.example?alternate=origin".to_string();
+        assert_eq!(
+            EntraTokenValidator::derive_identity_endpoints(&authority_with_query).unwrap_err(),
+            "authority-query-not-allowed"
+        );
+    }
+
+    /// Generates a throwaway RSA-2048 keypair through the production AWS-LC
+    /// crypto provider. No PEM or persistent private key is produced.
+    fn make_keypair() -> (EncodingKey, DecodingKey, Vec<u8>) {
+        let keypair = test_crypto::make_rsa_keypair();
+        (keypair.encoding, keypair.decoding, keypair.public_der)
+    }
+
+    fn test_jwks_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_millis(250))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build loopback-only JWKS test client")
+    }
+
+    async fn loopback_jwks_listener() -> (tokio::net::TcpListener, reqwest::Url) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback JWKS test endpoint");
+        let address = listener.local_addr().expect("JWKS test endpoint address");
+        let url = reqwest::Url::parse(&format!("http://{address}/jwks"))
+            .expect("parse loopback JWKS test URL");
+        (listener, url)
+    }
+
+    async fn read_jwks_test_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut chunk))
+                .await
+                .expect("JWKS request read deadline")
+                .expect("read JWKS request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            assert!(
+                request.len() <= 8192,
+                "JWKS test request headers are bounded"
+            );
+            if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    fn padded_jwks_body(target_len: usize, modulus: &str, exponent: &str) -> Vec<u8> {
+        let prefix = format!(
+            r#"{{"keys":[{{"kid":"{TEST_KID}","kty":"RSA","use":"sig","n":"{modulus}","e":"{exponent}"}}],"padding":""#
+        );
+        const SUFFIX: &[u8] = b"\"}";
+        assert!(target_len >= prefix.len() + SUFFIX.len());
+
+        let mut body = Vec::with_capacity(target_len);
+        body.extend_from_slice(prefix.as_bytes());
+        body.resize(target_len - SUFFIX.len(), b'a');
+        body.extend_from_slice(SUFFIX);
+        assert_eq!(body.len(), target_len);
+        body
+    }
+
+    async fn serve_chunked_jwks(listener: tokio::net::TcpListener, body: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.expect("accept JWKS request");
+        read_jwks_test_request(&mut stream).await;
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let chunk_size = (body.len() / 2).max(1);
+        for chunk in body.chunks(chunk_size) {
+            let frame = format!("{:X}\r\n", chunk.len());
+            if stream.write_all(frame.as_bytes()).await.is_err()
+                || stream.write_all(chunk).await.is_err()
+                || stream.write_all(b"\r\n").await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn test_entra_jwks_accepts_chunked_body_at_exact_stream_limit() {
+        let keypair = test_crypto::make_rsa_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(60));
+        let server = tokio::spawn(serve_chunked_jwks(
+            listener,
+            padded_jwks_body(MAX_JWKS_BYTES, &keypair.modulus_b64, &keypair.exponent_b64),
+        ));
+
+        let keys = cache
+            .fetch_keys()
+            .await
+            .expect("an exact-limit chunked JWKS document should be accepted");
+        assert!(keys.contains_key(TEST_KID));
+        server.await.expect("exact-limit JWKS server task");
+    }
+
+    #[tokio::test]
+    async fn test_entra_jwks_rejects_chunked_body_crossing_stream_limit() {
+        let keypair = test_crypto::make_rsa_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(60));
+        let server = tokio::spawn(serve_chunked_jwks(
+            listener,
+            padded_jwks_body(
+                MAX_JWKS_BYTES + 1,
+                &keypair.modulus_b64,
+                &keypair.exponent_b64,
+            ),
+        ));
+
+        assert!(cache.fetch_keys().await.is_err());
+        server.await.expect("oversized JWKS server task");
+    }
+
+    #[tokio::test]
+    async fn test_entra_jwks_never_follows_cross_origin_redirect() {
+        let (source_listener, source_url) = loopback_jwks_listener().await;
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind JWKS redirect target");
+        let target_address = target_listener
+            .local_addr()
+            .expect("JWKS redirect-target address");
+        let source = tokio::spawn(async move {
+            let (mut stream, _) = source_listener
+                .accept()
+                .await
+                .expect("accept original JWKS request");
+            read_jwks_test_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/captured\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write JWKS redirect response");
+        });
+        let target = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), target_listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                return false;
+            };
+            read_jwks_test_request(&mut stream).await;
+            let body = r#"{"keys":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            true
+        });
+
+        let client = crate::oidc_callback::identity_http_client(&source_url);
+        let cache = JwksCache::new(client, source_url, Duration::from_secs(60));
+        assert!(cache.fetch_keys().await.is_err());
+        source.await.expect("original JWKS server task");
+        assert!(
+            !target.await.expect("JWKS redirect-target task"),
+            "a redirect target must never receive a signing-key request"
+        );
+    }
+
+    async fn seed_network_cache(
+        cache: &JwksCache,
+        key: DecodingKey,
+        valid_until: Instant,
+        last_refresh_attempt: Option<Instant>,
+    ) {
+        let mut state = cache.inner.write().await;
+        state.keys.insert(TEST_KID.to_string(), key);
+        state.valid_until = Some(valid_until);
+        state.last_refresh_attempt = last_refresh_attempt;
+    }
+
+    fn network_validator(cache: JwksCache) -> EntraTokenValidator {
+        EntraTokenValidator {
+            config: test_config(true),
+            issuer: expected_issuer(),
+            audiences: vec![TEST_CLIENT.to_string(), format!("api://{TEST_CLIENT}")],
+            keys: KeySource::Network(cache),
+            leeway_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_jwks_fresh_cached_key_is_returned_without_refresh() {
+        let (_enc, dec, _) = make_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(60));
+        seed_network_cache(
+            &cache,
+            dec,
+            Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("represent a fresh cache deadline"),
+            None,
+        )
+        .await;
+        let unexpected_refresh = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        assert!(cache.decoding_key_for_kid(TEST_KID).await.is_some());
+        assert!(
+            !unexpected_refresh.await.expect("JWKS probe task"),
+            "a fresh cached key must not trigger a refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entra_jwks_known_key_remains_nonblocking_during_unknown_kid_refresh() {
+        let (_enc, dec, _) = make_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = std::sync::Arc::new(JwksCache::new(
+            test_jwks_client(),
+            url,
+            Duration::from_secs(60),
+        ));
+        seed_network_cache(
+            &cache,
+            dec,
+            Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("represent a fresh cache deadline"),
+            None,
+        )
+        .await;
+
+        let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+        let (release_refresh_tx, release_refresh_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept JWKS refresh request");
+            read_jwks_test_request(&mut stream).await;
+            refresh_started_tx
+                .send(())
+                .expect("signal that the refresh request is held open");
+            release_refresh_rx
+                .await
+                .expect("release the held JWKS refresh response");
+            let body = r#"{"keys":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write empty JWKS refresh response");
+        });
+
+        let refresh_cache = std::sync::Arc::clone(&cache);
+        let refresh = tokio::spawn(async move {
+            refresh_cache
+                .decoding_key_for_kid("never-published-kid")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), refresh_started_rx)
+            .await
+            .expect("unknown-kid refresh must reach the fixture")
+            .expect("refresh-start signal must remain live");
+
+        let known_key =
+            tokio::time::timeout(Duration::from_secs(1), cache.decoding_key_for_kid(TEST_KID))
+                .await
+                .expect("a fresh known key must not wait behind network refresh");
+        assert!(known_key.is_some());
+
+        release_refresh_tx
+            .send(())
+            .expect("release the unknown-kid refresh fixture");
+        assert!(refresh
+            .await
+            .expect("unknown-kid refresh task must complete")
+            .is_none());
+        server.await.expect("held JWKS server task");
+        assert!(
+            cache.decoding_key_for_kid(TEST_KID).await.is_some(),
+            "an empty refresh document must not replace a still-valid generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_unknown_kid_fails_closed_when_refresh_fails() {
+        let (_enc, dec, _) = make_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(60));
+        seed_network_cache(
+            &cache,
+            dec,
+            Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("represent a fresh cache deadline"),
+            None,
+        )
+        .await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept JWKS refresh request");
+            read_jwks_test_request(&mut stream).await;
+            let body = r#"{"keys":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write empty JWKS refresh response");
+        });
+
+        assert!(cache
+            .decoding_key_for_kid("never-published-kid")
+            .await
+            .is_none());
+        server.await.expect("unknown-kid JWKS server task");
+        assert!(
+            cache.decoding_key_for_kid(TEST_KID).await.is_some(),
+            "a failed unknown-kid refresh must not let the attacker retire a still-valid generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_expired_key_is_rejected_during_refresh_cooldown() {
+        let (enc, dec, _) = make_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(1));
+        let now = Instant::now();
+        seed_network_cache(
+            &cache,
+            dec,
+            now.checked_sub(Duration::from_secs(1))
+                .expect("represent an expired cache deadline"),
+            Some(now),
+        )
+        .await;
+        let unexpected_refresh = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+        let validator = network_validator(cache);
+        let token = sign(&enc, valid_claims());
+
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("unknown-kid"));
+        assert!(
+            !unexpected_refresh.await.expect("JWKS probe task"),
+            "refresh cooldown must remain effective"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_expired_key_is_rejected_when_refresh_fails() {
+        let (enc, dec, _) = make_keypair();
+        let (listener, url) = loopback_jwks_listener().await;
+        let cache = JwksCache::new(test_jwks_client(), url, Duration::from_secs(1));
+        seed_network_cache(
+            &cache,
+            dec,
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("represent an expired cache deadline"),
+            None,
+        )
+        .await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("JWKS refresh request deadline")
+                .expect("accept JWKS refresh request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write failed JWKS refresh response");
+        });
+        let validator = network_validator(cache);
+        let token = sign(&enc, valid_claims());
+
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("unknown-kid"));
+        server.await.expect("JWKS failure server task");
+        let KeySource::Network(cache) = &validator.keys else {
+            panic!("test validator must use the network cache");
+        };
+        assert!(
+            !cache.inner.read().await.keys.contains_key(TEST_KID),
+            "refresh failure must remove the retired Entra key generation"
+        );
     }
 
     fn b64url(bytes: Vec<u8>) -> String {
@@ -483,9 +1003,19 @@ mod tests {
 
     /// Builds a validator with a single static key under TEST_KID.
     fn static_validator(decoding: DecodingKey, enabled: bool) -> EntraTokenValidator {
+        static_validator_with_leeway(decoding, enabled, 60)
+    }
+
+    fn static_validator_with_leeway(
+        decoding: DecodingKey,
+        enabled: bool,
+        leeway_secs: u64,
+    ) -> EntraTokenValidator {
         let mut map = HashMap::new();
         map.insert(TEST_KID.to_string(), decoding);
-        EntraTokenValidator::with_static_keys(test_config(enabled), map)
+        let mut validator = EntraTokenValidator::with_static_keys(test_config(enabled), map);
+        validator.leeway_secs = leeway_secs;
+        validator
     }
 
     /// Signs a claims object with RS256 under TEST_KID using `encoding`.
@@ -510,6 +1040,9 @@ mod tests {
             "exp": now() + 3600,
             "nbf": now() - 60,
             "roles": ["PlatformAdmin"],
+            "idtyp": "user",
+            "scp": "user_impersonation",
+            "azp": TEST_CLIENT,
         })
     }
 
@@ -521,12 +1054,41 @@ mod tests {
 
         let session = validator.validate(&auth(&token)).await;
         assert!(session.token_valid);
+        assert!(session.is_verified_human());
         assert_eq!(session.provider_mode, "entra-id");
         assert_eq!(session.roles, vec!["PlatformAdmin"]);
         // oid preferred over sub.
         assert_eq!(session.user_id, "object-id-1");
         // name preferred for display.
         assert_eq!(session.display_name, "Ada Admin");
+    }
+
+    #[tokio::test]
+    async fn service_principal_and_ambiguous_bearers_are_not_humans() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator(dec, true);
+
+        let mut application = valid_claims();
+        application["idtyp"] = json!("app");
+        application.as_object_mut().unwrap().remove("scp");
+        application["appid"] = json!(TEST_CLIENT);
+        let application = validator.validate(&auth(&sign(&enc, application))).await;
+        assert!(
+            application.token_valid,
+            "the JWT itself remains cryptographically valid"
+        );
+        assert_eq!(application.actor_class, ActorClass::Workload);
+        assert!(!application.is_verified_human());
+
+        let mut ambiguous = valid_claims();
+        ambiguous.as_object_mut().unwrap().remove("idtyp");
+        ambiguous.as_object_mut().unwrap().remove("scp");
+        ambiguous.as_object_mut().unwrap().remove("appid");
+        ambiguous.as_object_mut().unwrap().remove("azp");
+        let ambiguous = validator.validate(&auth(&sign(&enc, ambiguous))).await;
+        assert!(ambiguous.token_valid);
+        assert_eq!(ambiguous.actor_class, ActorClass::Unknown);
+        assert!(!ambiguous.is_verified_human());
     }
 
     #[tokio::test]
@@ -568,6 +1130,38 @@ mod tests {
         let session = validator.validate(&auth(&token)).await;
         assert!(!session.token_valid);
         assert_eq!(session.provider_mode, "entra-id-unverified");
+    }
+
+    #[tokio::test]
+    async fn test_max_admitted_leeway_remains_a_bounded_token_time_window() {
+        const MAX_ADMITTED_LEEWAY_SECS: u64 = 300;
+
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator_with_leeway(dec, true, MAX_ADMITTED_LEEWAY_SECS);
+        let reference_time = now();
+
+        let mut within_window = valid_claims();
+        within_window["exp"] = json!(reference_time - 240);
+        within_window["nbf"] = json!(reference_time + 240);
+        let token = sign(&enc, within_window);
+        assert!(
+            validator.validate(&auth(&token)).await.token_valid,
+            "the reviewed maximum leeway should accommodate timestamps inside five minutes"
+        );
+
+        let mut too_expired = valid_claims();
+        too_expired["exp"] = json!(reference_time - 360);
+        let token = sign(&enc, too_expired);
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("expired"));
+
+        let mut too_early = valid_claims();
+        too_early["nbf"] = json!(reference_time + 360);
+        let token = sign(&enc, too_early);
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(!outcome.session.token_valid);
+        assert_eq!(outcome.failure_reason, Some("not-yet-valid"));
     }
 
     #[tokio::test]
@@ -677,11 +1271,10 @@ mod tests {
     #[tokio::test]
     async fn test_alg_confusion_hs256_rejected() {
         // Sign an HS256 token using the RSA public key bytes as the HMAC secret.
-        let (_enc, dec, public) = make_keypair();
+        let (_enc, dec, public_der) = make_keypair();
         let validator = static_validator(dec, true);
 
-        let public_der = public.to_pkcs1_der().expect("pkcs1 der");
-        let hmac_key = EncodingKey::from_secret(public_der.as_bytes());
+        let hmac_key = EncodingKey::from_secret(&public_der);
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(TEST_KID.to_string());
         let claims = valid_claims();

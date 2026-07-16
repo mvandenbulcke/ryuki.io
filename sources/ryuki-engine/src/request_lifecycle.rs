@@ -876,10 +876,10 @@ pub fn fail_request(request: &Request, reason: &str) -> Result<Request, String> 
 /// reason in metadata. Pure: ryuki-api persists.
 ///
 /// Prior derived artifacts (validation/plan/approval) are PRESERVED as history,
-/// not cleared: the lifecycle is status-gated, so reaching Approved again
-/// requires re-running validate → plan → approve from Intake (each overwrites
-/// its artifact), and no action trusts a stale artifact over the current status.
-/// A future slice may additionally null those columns on rework for tidiness.
+/// not cleared. The persistence boundary advances the request's approval epoch
+/// atomically with this transition, so approval decisions from the prior plan
+/// cannot satisfy the new cycle even though they remain available to auditors.
+/// Reaching Approved again requires validate → plan → fresh current-epoch quorum.
 pub fn rework_request(request: &Request, actor: &str, reason: &str) -> Result<Request, String> {
     if reason.trim().is_empty() {
         return Err("Rework reason cannot be empty".into());

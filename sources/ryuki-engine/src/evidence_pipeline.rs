@@ -26,7 +26,12 @@ const SENSITIVE_VALUE_LABELS: &[&str] = &[
     "pwd",
     "secret",
     "secret_access_key",
+    "access_key",
+    "client_key",
+    "private_key",
+    "secret_key",
     "client_secret",
+    "credential",
     "token",
     "session_token",
     "api_key",
@@ -40,23 +45,115 @@ const SENSITIVE_VALUE_LABELS: &[&str] = &[
 /// / `Authorization: Basic <base64>` riding in a value under a generic key.)
 const SENSITIVE_VALUE_MARKERS: &[&str] = &["bearer ", "authorization: basic "];
 
-/// True if a lowercased evidence value looks like it carries a secret: either a
+const AUTHORIZATION_LABEL: &str = "authorization";
+const AUTHORIZATION_SCHEMES: &[&str] = &["basic", "bearer"];
+const MAX_NESTED_JSON_SECRET_DEPTH: usize = 4;
+
+fn authorization_scheme_bears_secret(value: &str) -> bool {
+    let value_lower = value.trim_start().to_ascii_lowercase();
+    AUTHORIZATION_SCHEMES.iter().any(|scheme| {
+        value_lower.strip_prefix(*scheme).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_whitespace())
+                && !rest.trim().is_empty()
+        })
+    })
+}
+
+/// Recognizes exact `Authorization` fields in valid JSON, including nested
+/// objects and JSON-encoded object strings. Parsing first also covers escaped
+/// key spellings such as `\u0041uthorization` without teaching the fallback a
+/// partial JSON decoder.
+fn structured_authorization_bears_secret(value: &serde_json::Value, depth: usize) -> bool {
+    if depth > MAX_NESTED_JSON_SECRET_DEPTH {
+        return false;
+    }
+
+    match value {
+        serde_json::Value::Object(entries) => entries.iter().any(|(key, value)| {
+            (key.eq_ignore_ascii_case(AUTHORIZATION_LABEL)
+                && value
+                    .as_str()
+                    .is_some_and(authorization_scheme_bears_secret))
+                || structured_authorization_bears_secret(value, depth + 1)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| structured_authorization_bears_secret(value, depth + 1)),
+        serde_json::Value::String(encoded) if depth < MAX_NESTED_JSON_SECRET_DEPTH => {
+            let encoded = encoded.trim_start();
+            if !encoded.starts_with('{') && !encoded.starts_with('[') {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(encoded)
+                .is_ok_and(|nested| structured_authorization_bears_secret(&nested, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn trim_assignment_syntax(value: &str) -> &str {
+    value.trim_start_matches(|character: char| {
+        character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '\\')
+    })
+}
+
+/// Fallback for log lines or provider output that embeds a header or escaped
+/// JSON fragment inside otherwise non-JSON text. The label must start at a word
+/// boundary, be followed by `:`/`=`, and carry a non-empty Basic/Bearer value.
+fn authorization_assignment_bears_secret(value_lower: &str) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = value_lower[offset..].find(AUTHORIZATION_LABEL) {
+        let position = offset + relative;
+        let after_label = position + AUTHORIZATION_LABEL.len();
+        let is_word_boundary = value_lower[..position]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+
+        if is_word_boundary {
+            let after = trim_assignment_syntax(&value_lower[after_label..]);
+            if let Some(assigned) = after.strip_prefix(':').or_else(|| after.strip_prefix('=')) {
+                let assigned = trim_assignment_syntax(assigned);
+                if authorization_scheme_bears_secret(assigned) {
+                    return true;
+                }
+            }
+        }
+
+        offset = after_label;
+    }
+    false
+}
+
+/// True if an evidence value looks like it carries a secret: an exact structured
+/// Authorization credential, a robust embedded Authorization assignment, a
 /// standalone auth marker, or a known secret label immediately followed by a
-/// `:`/`=` delimiter (tolerating quotes/whitespace between them). Requiring the
-/// delimiter avoids redacting an incidental prose mention ("the password was
-/// rotated"); when in doubt this errs toward OVER-redaction, which is fail-safe
-/// for audit/evidence output (it never leaks, only hides).
-fn value_bears_secret(value_lower: &str) -> bool {
+/// `:`/`=` delimiter. Requiring the delimiter avoids redacting an incidental
+/// prose mention ("the password was rotated"); when in doubt this errs toward
+/// OVER-redaction, which is fail-safe for audit/evidence output.
+fn value_bears_secret(value: &str) -> bool {
+    if serde_json::from_str::<serde_json::Value>(value)
+        .is_ok_and(|structured| structured_authorization_bears_secret(&structured, 0))
+    {
+        return true;
+    }
+
+    let value_lower = value.to_lowercase();
     for marker in SENSITIVE_VALUE_MARKERS {
         if value_lower.contains(marker) {
             return true;
         }
     }
+    if authorization_assignment_bears_secret(&value_lower) {
+        return true;
+    }
     for label in SENSITIVE_VALUE_LABELS {
-        let mut rest = value_lower;
+        let mut rest = value_lower.as_str();
         while let Some(pos) = rest.find(label) {
             let after = &rest[pos + label.len()..];
-            let delim = after.trim_start_matches(['"', '\'', ' ', '\t']);
+            let delim = after.trim_start_matches(['"', '\'', '\\', ' ', '\t']);
             if delim.starts_with(':') || delim.starts_with('=') {
                 return true;
             }
@@ -166,7 +263,6 @@ pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
 /// API's audit-read redaction so the two stay consistent.
 pub fn should_redact(key: &str, value: &str) -> bool {
     let key_lower = key.to_lowercase();
-    let value_lower = value.to_lowercase();
 
     for pattern in SENSITIVE_KEY_PATTERNS {
         if key_lower.contains(pattern) {
@@ -174,7 +270,7 @@ pub fn should_redact(key: &str, value: &str) -> bool {
         }
     }
 
-    if value_bears_secret(&value_lower) {
+    if value_bears_secret(value) {
         return true;
     }
 
@@ -415,10 +511,74 @@ mod tests {
             "Authorization: Bearer eyJabc.def.ghi"
         ));
         assert!(should_redact("config", "client_secret=topsecret")); // secret-scan-allow: test fixture, fake value asserting the secret= pattern is caught
+        assert!(should_redact(
+            "execution_log",
+            r#"backend rejected \"client_key\": \"SYNTH-MARKER\""#
+        ));
+        assert!(should_redact(
+            "execution_log",
+            r#"nested={\"client_secret\":\"SYNTH-MARKER\"}"#
+        ));
+        assert!(should_redact("execution_log", "credential=SYNTH-MARKER"));
         assert!(
             !should_redact("status", "deployment ok, no credentials present"),
             "benign evidence must not be over-redacted"
         );
+    }
+
+    #[test]
+    fn test_should_redact_structured_authorization_credentials() {
+        for value in [
+            r#"{"Authorization":"Basic SYNTH-BASIC-MARKER"}"#,
+            r#"{"authorization":"Bearer SYNTH-BEARER-MARKER"}"#,
+            r#"{"headers":{"\u0041uthorization":"Basic SYNTH-UNICODE-MARKER"}}"#,
+            r#"nested={\"Authorization\":\"Basic SYNTH-ESCAPED-MARKER\"}"#,
+            "Authorization = 'Bearer SYNTH-HEADER-MARKER'",
+        ] {
+            assert!(
+                should_redact("execution_log", value),
+                "structured credential must be redacted: {value}"
+            );
+        }
+
+        for value in [
+            r#"{"authorization":"Digest SYNTH-NONSECRET-METADATA"}"#,
+            r#"{"authorization":"Basic"}"#,
+            r#"{"authorization_url":"Basic SYNTH-NONSECRET-METADATA"}"#,
+            r#"{"message":"authorization policy metadata only"}"#,
+        ] {
+            assert!(
+                !should_redact("execution_log", value),
+                "non-credential metadata must not be over-redacted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_and_export_remove_escaped_structured_authorization() {
+        let marker = "SYNTH-STRUCTURED-BASIC-MARKER";
+        let mut pack = EvidencePack {
+            id: "ev-structured-authorization".into(),
+            request_id: "req-structured-authorization".into(),
+            items: vec![EvidenceItem {
+                key: "execution_log".into(),
+                value: format!(r#"provider={{\"Authorization\":\"Basic {marker}\"}}"#),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::ExecutionLog,
+            }],
+            redacted: false,
+            created_at: Utc::now().to_rfc3339(),
+            format: "json".into(),
+            compliance_checks: Vec::new(),
+            metadata: HashMap::new(),
+        };
+
+        redact_evidence(&mut pack).unwrap();
+        assert!(pack.items[0].redacted);
+        assert_eq!(pack.items[0].value, "***REDACTED***");
+        let exported = export_evidence(&pack, "json").unwrap();
+        assert!(!exported.contains(marker));
     }
 
     #[test]

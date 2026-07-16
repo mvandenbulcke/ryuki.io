@@ -163,7 +163,8 @@ pub fn scan_prohibited_json(input: &str) -> Result<Vec<String>, String> {
 // present there: `/api/auth/local/{roles,me,decision}` are mounted via
 // `.route(...)` and the `auth_local_roles` handler emits a `json!({...})` body
 // with `"authenticationMode":"local-mock"`, `"configuredForProduction":false`,
-// `"entraGroupsConfigured":false`, `"requiredProductionProvider":"Microsoft Entra ID"`,
+// `"entraGroupsConfigured":false`, and a generic versioned authenticator-registry
+// production boundary,
 // the `actions` array, per-role `"canRequest"/"canApprove"/...` capability flags
 // and the full role list. The C# parsers (app.MapGet blocks, `new LocalRole(...)`,
 // `NormalizeLocalAction`, `LocalRoleAllows`, `role.CanRequest` switch arms) cannot
@@ -219,14 +220,39 @@ fn validate_program_text(program: &str, access_catalog: &Value, errors: &mut Vec
         "local auth must keep Entra groups unconfigured",
     );
     expect(
-        program.contains("\"requiredProductionProvider\":\"Microsoft Entra ID\""),
+        program.contains(
+            "\"requiredProductionProvider\":\"Versioned authenticator registry (generic OIDC; Entra is one provider)\"",
+        ),
         errors,
-        "local auth must name Microsoft Entra ID as production provider",
+        "local auth must name the generic authenticator registry as production boundary",
     );
     expect(
         program.contains("X-Ryuki-Local-Role"),
         errors,
         "local auth role header must be explicit",
+    );
+
+    let presentations = access_role_presentations_block(program);
+    expect(
+        presentations.is_some(),
+        errors,
+        "API must define one closed ACCESS_ROLE_PRESENTATIONS registry",
+    );
+    expect(
+        program
+            .matches("\"roles\": access_control_roles_json()")
+            .count()
+            == 2,
+        errors,
+        "catalog and local auth roles must both use the shared role generator",
+    );
+    expect(
+        program
+            .matches("let runtime_roles = get_rbac_roles();")
+            .count()
+            == 1,
+        errors,
+        "the shared role generator must derive authority from get_rbac_roles",
     );
 
     for role in access_catalog
@@ -244,16 +270,29 @@ fn validate_program_text(program: &str, access_catalog: &Value, errors: &mut Vec
             continue;
         };
         expect(
-            program.contains(&format!("\"id\":\"{id}\"")),
+            presentations.is_some_and(|block| block.matches(&format!("id: \"{id}\"")).count() == 1),
             errors,
             format!("API missing local role id {id}"),
         );
         expect(
-            program.contains(&format!("\"title\":\"{title}\"")),
+            presentations
+                .is_some_and(|block| block.matches(&format!("title: \"{title}\"")).count() == 1),
             errors,
             format!("API missing local role title {title}"),
         );
     }
+}
+
+fn access_role_presentations_block(program: &str) -> Option<&str> {
+    const MARKER: &str = "const ACCESS_ROLE_PRESENTATIONS: &[AccessRolePresentation] = &[";
+    let mut starts = program.match_indices(MARKER);
+    let (start, _) = starts.next()?;
+    if starts.next().is_some() {
+        return None;
+    }
+    let body_start = start + MARKER.len();
+    let relative_end = program[body_start..].find("\n];")?;
+    Some(&program[body_start..body_start + relative_end])
 }
 
 fn validate_access_catalog_value(access_catalog: &Value, errors: &mut Vec<String>) {
@@ -312,9 +351,14 @@ fn validate_docs_text(readme: &str, doc: &str, errors: &mut Vec<String>) {
         "local auth doc must keep production flag false",
     );
     expect(
-        doc.contains("Microsoft Entra ID"),
+        doc.contains("Production authentication uses the versioned authenticator registry"),
         errors,
-        "local auth doc must state production provider",
+        "local auth doc must state the provider-neutral production boundary",
+    );
+    expect(
+        doc.contains("ordinary and dormant break-glass credentials are separate profiles"),
+        errors,
+        "local auth doc must separate ordinary and break-glass passkeys",
     );
 }
 
@@ -957,5 +1001,29 @@ fn contains_sensitive_assignment(value: &str) -> bool {
 fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>) {
     if !condition {
         errors.push(message.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::access_role_presentations_block;
+
+    #[test]
+    fn role_presentation_registry_is_unique_and_scoped() {
+        let source = r##"
+const ACCESS_ROLE_PRESENTATIONS: &[AccessRolePresentation] = &[
+    AccessRolePresentation {
+        id: "requester",
+        title: "Requester",
+    },
+];
+let decoy = r#"const ACCESS_ROLE_PRESENTATIONS"#;
+"##;
+        let block = access_role_presentations_block(source).expect("one real registry");
+        assert!(block.contains("id: \"requester\""));
+        assert!(block.contains("title: \"Requester\""));
+
+        let duplicated = format!("{source}\n{source}");
+        assert!(access_role_presentations_block(&duplicated).is_none());
     }
 }

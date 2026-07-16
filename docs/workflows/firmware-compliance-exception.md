@@ -50,6 +50,25 @@ Required guards and approvals (from the contract YAML).
     remediation-plan-ready
     evidence-redacted
 
+Runtime risk acceptance uses a two-principal lifecycle:
+
+1. An execute-capable maker submits `POST /api/datacenter/firmware/exception`.
+   The API derives `requested_by` from the verified session and stores a
+   `Pending` row; no exception authority or firmware action is granted.
+   `expiryDays` must be between 1 and 365.
+2. A different principal with the explicit `approve` permission submits
+   `POST /api/datacenter/firmware/exception/{id}/approve` with the pending
+   row's `expectedVersion`. The API derives `approved_by` from that checker,
+   repeats maker/checker separation in the state CAS, and commits the approval
+   with its audit entry in one transaction.
+3. PostgreSQL `CURRENT_DATE` computes and evaluates the inclusive expiry date.
+   Once that date has passed, the exception is ineffective immediately and the
+   device's underlying EOL/version result is used by inventory and reports.
+   A stale approval cannot extend or revive the expired request.
+4. Rows created before this lifecycle are marked `Legacy` and grant no
+   authority because their distinct maker identity cannot be proven. Submit a
+   new request instead of editing or adopting legacy evidence.
+
 ## Prohibitions
 
 Live execution remains blocked until this slice is separately approved for live runs.
@@ -58,6 +77,7 @@ Live execution remains blocked until this slice is separately approved for live 
 - No live provider calls.
 - No live firmware.
 - No raw inventory rows.
+- No client-supplied maker, checker, approval state, or expiry date.
 
 ## Requirements
 

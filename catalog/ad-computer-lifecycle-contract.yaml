@@ -50,6 +50,11 @@ requiredInputs:
 requiredGuards:
   - request-context-known
   - target-scope-summarized
+  - canonical-name-site-owner-bound
+  - server-derived-ou-policy-match
+  - namespace-provenance-verified
+  - current-owner-site-active
+  - quarantine-recovery-maker-checker
   - ou-policy-reviewed
   - lifecycle-action-supported
   - cmdb-state-reviewed
@@ -74,6 +79,9 @@ blockedReasons:
   - computer-disable-disabled
   - computer-delete-disabled
   - computer-recover-disabled
+  - unverified-namespace-provenance
+  - inactive-owner-site
+  - old-replica-drain-required
   - raw-computer-data-disabled
   - principal-identifiers-disabled
   - distinguished-names-disabled
@@ -99,6 +107,18 @@ rules:
     decision: block
     requirement: AD computer lifecycle records review plans only and never prestages, moves, disables, deletes, recovers, reconciles, or mutates directory computer objects.
     evidence: Lifecycle review summary
+  - id: directory-namespace-owner-required
+    decision: block
+    requirement: A platform-state prestage must derive its active owner site from the canonical computer name, persist only the server-derived role/site OU, and retain the directory-namespace-v1 provenance marker; caller-declared site and OU values are compatibility assertions only.
+    evidence: OU policy review
+  - id: quarantine-recovery-maker-checker-required
+    decision: block
+    requirement: Quarantine is terminal for ordinary move, disable, enable, and delete paths. Platform-state recovery requires a fresh version-bound review, a distinct administrator approval, a non-maker administrator apply, one compare-and-set transaction, and an atomic security-audit append; recovery ends in Disabled and never performs a live directory change.
+    evidence: Recovery readiness
+  - id: inactive-directory-owner-fails-closed
+    decision: block
+    requirement: Every platform-state read, mutation, and quarantine-recovery step requires the persisted namespace owner site to be currently active. Deactivation gates access without rewriting computer or review state; reactivation restores access only to already-Verified provenance, while rows quarantined during legacy backfill remain quarantined pending trusted repair. Deployments must drain or fence replicas that predate the active-owner read predicates before relying on deactivation as a read boundary; database triggers independently fence their stale mutation paths.
+    evidence: Target scope summary
   - id: ou-policy-review-required
     decision: block
     requirement: OU policy, lifecycle state, CMDB state, owner, and support group must be reviewed before any lifecycle decision can be accepted.

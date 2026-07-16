@@ -22,17 +22,25 @@
 //!   LiveApply / LiveDestroy → ReconcileRequired (never auto-redispatched).
 
 use axum::{
-    extract::{Extension, Path, Query},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::{Duration, Utc};
+use governor::clock::DefaultClock;
+use governor::state::keyed::DefaultKeyedStateStore;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use ryuki_engine::auth::{check_permission, AuthSession};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -43,9 +51,16 @@ use crate::cp_identity;
 use crate::database::get_db;
 use crate::sha256_hex;
 use ryuki_protocol::{
-    crypto::{sign_vlc, verify_vlc},
-    AgentHeartbeat, AgentHeartbeatResponse, Capabilities, Job, JobLease, JobMode, JobResult,
-    JobResultStatus, JobSpec, JobStatus, VerifiedLiveContext,
+    crypto::{
+        decode_verifying_key, encode_verifying_key, execution_trust_profile_digest, sign_vlc,
+        verify_agent_enrollment_proof, verify_vlc,
+    },
+    AgentHeartbeat, AgentHeartbeatResponse, Capabilities, ExecutionTrustProfile, Job, JobLease,
+    JobMode, JobResult, JobResultStatus, JobSpec, JobStatus, LiveExecutionAuthority,
+    VerifiedLiveContext, AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES, AGENT_ENROLLMENT_CHALLENGE_PREFIX,
+    EXECUTABLE_PROVENANCE_POLICY_VERSION, EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION,
+    EXECUTION_TRUST_PROFILE_SCHEMA_VERSION, PROVIDER_CREDENTIAL_AUTHORITY_MODE,
+    TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,10 +76,217 @@ const LEASE_TTL_SECS: i64 = 300;
 // expiring/reassigning the job while a timed subprocess can still mutate.
 const MAX_LIVE_EXECUTOR_CALL_SECS: i64 = 3 * 600;
 const LIVE_LEASE_TTL_SECS: i64 = MAX_LIVE_EXECUTOR_CALL_SECS + 600;
+/// The bundled agent processes one job at a time. Keep the server-side
+/// admission ceiling equally narrow so a rogue or malfunctioning approved
+/// identity cannot warehouse a platform backlog by polling repeatedly.
+const MAX_ACTIVE_LEASES_PER_AGENT: i64 = 1;
 const _: () = {
     assert!(LIVE_LEASE_TTL_SECS > MAX_LIVE_EXECUTOR_CALL_SECS);
     assert!(LIVE_LEASE_TTL_SECS > LEASE_TTL_SECS);
+    assert!(MAX_ACTIVE_LEASES_PER_AGENT > 0);
 };
+
+// ---------------------------------------------------------------------------
+// Public enrollment admission bounds
+// ---------------------------------------------------------------------------
+
+/// Registration is deliberately public, so it gets a much smaller body budget
+/// than the general API before Axum allocates/deserializes the JSON document.
+const AGENT_REGISTRATION_BODY_LIMIT_BYTES: usize = 32 * 1024;
+const AGENT_ID_MAX_BYTES: usize = 128;
+const AGENT_PLATFORM_MAX_BYTES: usize = 128;
+/// A canonical padded base64 Ed25519 public key is 44 bytes. Keep a small
+/// compatibility margin while still rejecting oversized input before decode.
+const AGENT_PUBLIC_KEY_MAX_BYTES: usize = 64;
+const AGENT_ENROLLMENT_CHALLENGE_BYTES: usize =
+    AGENT_ENROLLMENT_CHALLENGE_PREFIX.len() + AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES;
+/// Base64 for a 64-byte Ed25519 signature is 88 bytes. Keep the bound explicit
+/// so malformed public requests are rejected before decoder allocation.
+const AGENT_ENROLLMENT_PROOF_MAX_BYTES: usize = 96;
+const AGENT_ENROLLMENT_CHALLENGE_DEFAULT_TTL_SECS: i64 = 15 * 60;
+const AGENT_ENROLLMENT_CHALLENGE_MIN_TTL_SECS: i64 = 60;
+const AGENT_ENROLLMENT_CHALLENGE_MAX_TTL_SECS: i64 = 24 * 60 * 60;
+const PUBLIC_KEY_FINGERPRINT_PREFIX: &str = "sha256:";
+const PUBLIC_KEY_FINGERPRINT_HEX_BYTES: usize = 64;
+const CAPABILITY_VERSION_MAX_BYTES: usize = 64;
+const CAPABILITY_PROVIDER_MAX_COUNT: usize = 64;
+const CAPABILITY_PROVIDER_NAME_MAX_BYTES: usize = 128;
+const CAPABILITY_PROVIDER_VERSION_MAX_BYTES: usize = 64;
+const CAPABILITIES_JSON_MAX_BYTES: usize = 16 * 1024;
+
+/// At most this many active pending enrollment records may exist in one control
+/// plane. Approved and revoked agents do not consume the admission budget.
+const MAX_PENDING_AGENT_ENROLLMENTS: i64 = 1024;
+/// Each sweep removes a bounded batch so cleanup cannot monopolize the pool.
+const PENDING_AGENT_ENROLLMENT_CLEANUP_BATCH: i64 = 256;
+/// Non-queueing process-local cap on public registration work. The database
+/// advisory lock below provides the cross-replica serialization needed for the
+/// exact global pending quota.
+const AGENT_REGISTRATION_CONCURRENCY: usize = 8;
+static AGENT_REGISTRATION_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(AGENT_REGISTRATION_CONCURRENCY);
+
+/// Always-on, route-specific admission for the anonymous registration edge.
+/// These budgets remain active when the optional general API limiter is off
+/// and run outside the queueing whole-application concurrency layer.
+const AGENT_REGISTRATION_CLIENT_REQUESTS_PER_SECOND: u32 = 2;
+const AGENT_REGISTRATION_CLIENT_BURST: u32 = 8;
+const AGENT_REGISTRATION_GLOBAL_REQUESTS_PER_SECOND: u32 = 32;
+const AGENT_REGISTRATION_GLOBAL_BURST: u32 = 64;
+const AGENT_REGISTRATION_REJECTION_LOG_SAMPLE_EVERY: u64 = 256;
+
+type AgentRegistrationClientRateLimiter =
+    RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+
+#[derive(Clone)]
+pub(crate) struct AgentRegistrationAdmission {
+    per_client: Arc<AgentRegistrationClientRateLimiter>,
+    global: Arc<DefaultDirectRateLimiter>,
+    in_flight: Arc<tokio::sync::Semaphore>,
+    bucket_salt: [u8; 32],
+    trusted_proxies: Arc<Vec<ryuki_core::config::TrustedProxyNetwork>>,
+    telemetry: Arc<AgentRegistrationAdmissionTelemetry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRegistrationAdmissionRejection {
+    ClientRate,
+    GlobalRate,
+    InFlight,
+}
+
+impl AgentRegistrationAdmissionRejection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientRate => "client_rate",
+            Self::GlobalRate => "global_rate",
+            Self::InFlight => "in_flight",
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentRegistrationAdmissionTelemetry {
+    client_rate: AtomicU64,
+    global_rate: AtomicU64,
+    in_flight: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentRegistrationAdmissionRejectionSnapshot {
+    client_rate: u64,
+    global_rate: u64,
+    in_flight: u64,
+}
+
+impl AgentRegistrationAdmissionTelemetry {
+    fn record(
+        &self,
+        rejection: AgentRegistrationAdmissionRejection,
+    ) -> Option<AgentRegistrationAdmissionRejectionSnapshot> {
+        let counter = match rejection {
+            AgentRegistrationAdmissionRejection::ClientRate => &self.client_rate,
+            AgentRegistrationAdmissionRejection::GlobalRate => &self.global_rate,
+            AgentRegistrationAdmissionRejection::InFlight => &self.in_flight,
+        };
+        let reason_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if reason_count != 1 && reason_count % AGENT_REGISTRATION_REJECTION_LOG_SAMPLE_EVERY != 0 {
+            return None;
+        }
+        Some(self.snapshot())
+    }
+
+    fn snapshot(&self) -> AgentRegistrationAdmissionRejectionSnapshot {
+        AgentRegistrationAdmissionRejectionSnapshot {
+            client_rate: self.client_rate.load(Ordering::Relaxed),
+            global_rate: self.global_rate.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl AgentRegistrationAdmission {
+    pub(crate) fn production(
+        trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
+    ) -> Self {
+        Self::new(
+            AGENT_REGISTRATION_CLIENT_REQUESTS_PER_SECOND,
+            AGENT_REGISTRATION_CLIENT_BURST,
+            AGENT_REGISTRATION_GLOBAL_REQUESTS_PER_SECOND,
+            AGENT_REGISTRATION_GLOBAL_BURST,
+            AGENT_REGISTRATION_CONCURRENCY,
+            trusted_proxies,
+        )
+    }
+
+    fn new(
+        client_per_second: u32,
+        client_burst: u32,
+        global_per_second: u32,
+        global_burst: u32,
+        max_in_flight: usize,
+        trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
+    ) -> Self {
+        let quota = |per_second, burst| {
+            Quota::per_second(NonZeroU32::new(per_second).unwrap_or(NonZeroU32::MIN))
+                .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN))
+        };
+        Self {
+            per_client: Arc::new(RateLimiter::keyed(quota(client_per_second, client_burst))),
+            global: Arc::new(RateLimiter::direct(quota(global_per_second, global_burst))),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight.max(1))),
+            bucket_salt: rand::random(),
+            trusted_proxies: Arc::new(trusted_proxies),
+            telemetry: Arc::new(AgentRegistrationAdmissionTelemetry::default()),
+        }
+    }
+
+    fn try_admit(
+        &self,
+        peer_addr: SocketAddr,
+        headers: &HeaderMap,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, AgentRegistrationAdmissionRejection> {
+        let (client_key, _) = crate::resolve_rate_limit_client_key_from_headers(
+            peer_addr,
+            headers,
+            &self.trusted_proxies,
+        );
+        // The salted fixed bucket namespace bounds keyed limiter state even if
+        // a peer rotates source addresses or forwarded identities.
+        let bucket =
+            crate::bounded_rate_limit_key("agent-registration", &client_key, &self.bucket_salt);
+        self.per_client
+            .check_key(&bucket)
+            .map_err(|_| AgentRegistrationAdmissionRejection::ClientRate)?;
+        self.global
+            .check()
+            .map_err(|_| AgentRegistrationAdmissionRejection::GlobalRate)?;
+        self.in_flight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AgentRegistrationAdmissionRejection::InFlight)
+    }
+
+    fn record_rejection(
+        &self,
+        rejection: AgentRegistrationAdmissionRejection,
+    ) -> Option<AgentRegistrationAdmissionRejectionSnapshot> {
+        self.telemetry.record(rejection)
+    }
+}
+
+/// Stable transaction-scoped PostgreSQL advisory-lock namespace for agent
+/// registration admission. `pg_try_*` is intentional: callers fail fast rather
+/// than holding a database connection while another registration is admitted.
+const AGENT_REGISTRATION_ADVISORY_LOCK_KEY: i64 = 0x5259_554B_4941_4745;
+/// Transaction-local marker consumed by migration 158's fail-closed bridge
+/// triggers. It prevents an older API replica from silently ignoring the v3
+/// challenge-admission contract during a rolling or rollback overlap.
+const AGENT_ENROLLMENT_CONTRACT_SETTING: &str = "ryuki.agent_enrollment_contract";
+/// Transaction-local marker consumed by migration 161. Older API replicas do
+/// not set it, so their capability-blind/unbounded Pending -> Leased UPDATE is
+/// blocked during a rolling deployment or rollback overlap.
+const AGENT_JOB_LEASE_CONTRACT_SETTING: &str = "ryuki.agent_job_lease_contract";
 
 // ---------------------------------------------------------------------------
 // DB row types
@@ -74,13 +296,43 @@ const _: () = {
 struct AgentRow {
     id: Uuid,
     agent_id: String,
-    platform: String,
-    #[allow(dead_code)]
-    capabilities: sqlx::types::Json<Capabilities>,
     #[allow(dead_code)]
     public_key: String,
     token_hash: String,
     status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AgentLeaseAuthorityRow {
+    id: Uuid,
+    platform: String,
+    public_key: String,
+    capabilities: sqlx::types::Json<Value>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AgentEnrollmentChallengeRow {
+    agent_id: String,
+    platform: String,
+    public_key: String,
+    public_key_fingerprint: String,
+    secret_hash: String,
+    status: String,
+    active: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AgentApprovalRow {
+    id: Uuid,
+    status: String,
+    public_key: String,
+    enrollment_expires_at: Option<DateTime<Utc>>,
+    enrollment_challenge_id: Option<Uuid>,
+    challenge_status: Option<String>,
+    challenge_agent_id: Option<String>,
+    challenge_platform: Option<String>,
+    challenge_public_key: Option<String>,
+    consumed_enrollment_id: Option<Uuid>,
 }
 
 #[allow(dead_code)]
@@ -122,34 +374,125 @@ pub(crate) struct LeasedAgentJob {
 /// Body for POST /api/agents/register.
 /// Fields mirror ryuki_protocol::AgentRegistration but we accept them
 /// separately here so we can validate before inserting.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterBody {
+    pub enrollment_challenge_id: Uuid,
+    pub enrollment_challenge: String,
     pub agent_id: String,
     pub platform: String,
     pub capabilities: Capabilities,
     pub public_key: String,
+    pub enrollment_proof: String,
 }
 
 /// Returned once on successful registration. Token is never stored and never
 /// returned again.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct RegisterResponse {
     pub agent_id: String,
     pub token: String,
 }
 
+impl std::fmt::Debug for RegisterResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisterResponse")
+            .field("agent_id", &self.agent_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The agent bearer is another one-time plaintext bootstrap credential. Keep
+/// it out of browser/proxy caches even though registration is a POST and sits
+/// outside the human-route idempotency middleware.
+pub type RegisterHttpResponse = (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    Json<RegisterResponse>,
+);
+
+/// Trusted provisioning request for a single-use agent enrollment grant.
+/// The public key is not secret; storing the exact canonical value lets both
+/// the API and migration trigger reject a substituted key without relying on a
+/// second key registry or provider-specific attestation format.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateEnrollmentChallengeBody {
+    pub agent_id: String,
+    pub platform: String,
+    pub public_key: String,
+    pub expires_in_seconds: Option<i64>,
+}
+
+/// Returned once to the trusted provisioning caller. The plaintext challenge
+/// is never stored and must be delivered to the intended workload over the
+/// operator's existing secret/bootstrap channel.
+#[derive(Serialize)]
+pub struct CreateEnrollmentChallengeResponse {
+    pub enrollment_challenge_id: Uuid,
+    pub enrollment_challenge: String,
+    pub agent_id: String,
+    pub platform: String,
+    pub public_key_fingerprint: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for CreateEnrollmentChallengeResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreateEnrollmentChallengeResponse")
+            .field("enrollment_challenge_id", &self.enrollment_challenge_id)
+            .field("enrollment_challenge", &"<redacted>")
+            .field("agent_id", &self.agent_id)
+            .field("platform", &self.platform)
+            .field("public_key_fingerprint", &self.public_key_fingerprint)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// A one-time plaintext challenge must never be cached or persisted by an
+/// intermediary. In particular, the human-route idempotency middleware treats
+/// `Cache-Control: no-store` as an explicit prohibition on recording a response
+/// body in `idempotency_records`.
+pub type CreateEnrollmentChallengeHttpResponse = (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    Json<CreateEnrollmentChallengeResponse>,
+);
+
 /// Body for POST /api/admin/agents/{id}/approve.
 ///
-/// `platform` is REQUIRED — the admin must authoritatively assign the platform
-/// so the agent's self-declared value cannot be used to lease jobs for a
-/// different platform than the admin intended.
+/// `platform` is REQUIRED and must match the trusted provisioning challenge for
+/// challenge-admitted identities. The challenge issuer, not the public agent,
+/// is the authoritative source of the platform assignment.
 #[derive(Debug, Deserialize)]
 pub struct ApproveBody {
-    /// Authoritative platform assigned by admin (overwrites self-declared).
-    /// Required — approval without an admin-assigned platform is rejected.
+    /// Immutable enrollment row reviewed by the administrator. A stale review
+    /// must never approve a later enrollment that reused the same agent_id.
+    pub enrollment_id: Uuid,
+    /// Non-secret SHA-256 fingerprint displayed by the admin enrollment list.
+    /// Required so approval is bound to the exact reviewed public key as well
+    /// as the immutable row.
+    pub public_key_fingerprint: String,
+    /// Authoritative platform selected during trusted provisioning. Required;
+    /// a mismatch from the consumed challenge is rejected.
     pub platform: String,
     /// Authoritative capabilities assigned by admin (overwrites self-declared).
     pub capabilities: Option<Capabilities>,
+}
+
+/// Body for POST /api/admin/agents/{id}/revoke.
+///
+/// Revocation is bound to the same immutable roster snapshot as approval. Agent
+/// ids may be reused after an expired Pending enrollment is removed, so an id by
+/// itself is not sufficient authority for a terminal state change.
+#[derive(Debug, Deserialize)]
+pub struct RevokeBody {
+    /// Immutable enrollment row reviewed by the administrator.
+    pub enrollment_id: Uuid,
+    /// Non-secret SHA-256 fingerprint displayed by the admin enrollment list.
+    pub public_key_fingerprint: String,
 }
 
 /// Body for POST /api/agents/{id}/jobs/{job}/ack.
@@ -199,8 +542,729 @@ fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn too_many_requests(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": msg.into()})),
+    )
+}
+
+fn agent_registration_admission_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response {
+    let mut response = (status, Json(json!({"error": code, "message": message}))).into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+fn is_agent_registration_request(method: &Method, path: &str) -> bool {
+    *method == Method::POST && path == "/api/agents/register"
+}
+
+/// Fail-fast admission for the anonymous registration route. This path-aware
+/// layer is mounted outside body polling, telemetry, the optional general rate
+/// limiter, and the queueing whole-application concurrency limit. The handler's
+/// semaphore and PostgreSQL advisory lock remain independent defense in depth.
+pub(crate) async fn agent_registration_admission_middleware(
+    State(admission): State<AgentRegistrationAdmission>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_agent_registration_request(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+    let Some(ConnectInfo(peer_addr)) = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .copied()
+    else {
+        tracing::error!("agent registration peer address unavailable; failing admission closed");
+        return agent_registration_admission_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_REGISTRATION_ADMISSION_CONTEXT_UNAVAILABLE",
+            "Agent registration admission context is unavailable",
+        );
+    };
+    let permit = match admission.try_admit(peer_addr, request.headers()) {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            if let Some(totals) = admission.record_rejection(rejection) {
+                tracing::warn!(
+                    reason = rejection.as_str(),
+                    client_rate_total = totals.client_rate,
+                    global_rate_total = totals.global_rate,
+                    in_flight_total = totals.in_flight,
+                    sample_every = AGENT_REGISTRATION_REJECTION_LOG_SAMPLE_EVERY,
+                    "agent registration admission rejections (sampled aggregate)"
+                );
+            }
+            return agent_registration_admission_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "AGENT_REGISTRATION_ADMISSION_EXCEEDED",
+                "Too many agent registration requests",
+            );
+        }
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
 fn parse_agent_job_id(id: &str) -> ApiResult<Uuid> {
     Uuid::parse_str(id).map_err(|_| not_found(format!("job {} not found", id)))
+}
+
+struct ValidatedRegistration<'a> {
+    enrollment_challenge_id: Uuid,
+    enrollment_challenge: &'a str,
+    agent_id: &'a str,
+    platform: &'a str,
+    public_key: &'a str,
+    public_key_fingerprint: String,
+}
+
+fn validate_registration_text(field: &str, value: &str, max_bytes: usize) -> ApiResult<()> {
+    if value.trim().is_empty() {
+        return Err(bad_request(format!("{field} must not be empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(bad_request(format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn public_key_fingerprint(public_key: &str) -> String {
+    format!(
+        "{PUBLIC_KEY_FINGERPRINT_PREFIX}{}",
+        sha256_hex(public_key.trim())
+    )
+}
+
+fn validate_execution_trust_profile(
+    profile: &ExecutionTrustProfile,
+    spec: &JobSpec,
+    platform: &str,
+) -> Result<(), &'static str> {
+    let offering = spec.iac_ref.split('@').next().unwrap_or_default();
+    let (provider_source, provider_version) =
+        ryuki_runner::iac::reviewed_live_provider_identity(offering)
+            .ok_or("execution trust profile offering has no reviewed provider lock")?;
+    let expected_containment = format!(
+        "{}+{}",
+        ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION,
+        TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+    );
+    let backend_supported = matches!(
+        profile.backend_kind.as_str(),
+        "local"
+            | "s3"
+            | "azurerm"
+            | "oss"
+            | "cos"
+            | "gcs"
+            | "etcdv3"
+            | "consul"
+            | "kubernetes"
+            | "http"
+    );
+    let version_valid = !profile.executable_version.is_empty()
+        && profile.executable_version.len() <= 64
+        && profile
+            .executable_version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'));
+    let path_valid = profile.executable_path.starts_with('/')
+        && profile.executable_path.len() <= 4096
+        && !profile.executable_path.chars().any(char::is_control);
+    let executable_digest_valid = profile.executable_sha256.as_deref().is_none_or(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    let backend_authority_digest_valid = profile.backend_authority_digest.len() == 64
+        && profile
+            .backend_authority_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let state_key = spec.state_key.as_deref().unwrap_or_default();
+
+    if profile.schema_version != EXECUTION_TRUST_PROFILE_SCHEMA_VERSION
+        || profile.allowlist_version != EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION
+        || profile.platform != platform
+        || profile.offering != offering
+        || profile.runner_kind != "terraform"
+        || profile.provider_source != provider_source
+        || profile.provider_version != provider_version
+        || !ryuki_protocol::provider_authority_reference_is_canonical(
+            &profile.provider_authority_id,
+            &profile.provider_authority_version,
+        )
+        || !backend_supported
+        || !ryuki_protocol::backend_credential_authority_reference_is_canonical(
+            &profile.backend_kind,
+            &profile.backend_credential_authority_id,
+            &profile.backend_credential_authority_revision,
+        )
+        || !backend_authority_digest_valid
+        || profile.executable_kind != "terraform"
+        || !path_valid
+        || !version_valid
+        || !executable_digest_valid
+        || profile.executable_provenance_policy_version != EXECUTABLE_PROVENANCE_POLICY_VERSION
+        || profile.provider_credential_authority_mode != PROVIDER_CREDENTIAL_AUTHORITY_MODE
+        || profile.backend_credential_authority_mode
+            != ryuki_runner::live::BACKEND_CREDENTIAL_AUTHORITY_POLICY_VERSION
+        || profile.containment_policy_version != expected_containment
+        || profile.iac_digest != spec.iac_digest
+        || profile.state_key != state_key
+    {
+        return Err("execution trust profile is outside the closed reviewed-live policy");
+    }
+    Ok(())
+}
+
+fn invalid_enrollment_challenge() -> (StatusCode, Json<Value>) {
+    // Keep every trust-decision failure deliberately indistinguishable to an
+    // anonymous caller: existence, expiry, identity, key, secret, consumption,
+    // and proof state are all part of the same bootstrap credential boundary.
+    forbidden("invalid or expired agent enrollment challenge")
+}
+
+fn registration_insert_err(error: sqlx::Error) -> (StatusCode, Json<Value>) {
+    // The database trigger repeats the challenge match and expiry check at the
+    // INSERT boundary. If the deadline crosses between the earlier locked read
+    // and that statement, preserve the same anonymous-facing denial instead of
+    // turning a trust-decision race into a distinguishable 500 response.
+    if error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| code == "23514")
+    {
+        invalid_enrollment_challenge()
+    } else {
+        db_err(error)
+    }
+}
+
+fn valid_enrollment_challenge_shape(value: &str) -> bool {
+    value.len() == AGENT_ENROLLMENT_CHALLENGE_BYTES
+        && value.starts_with(AGENT_ENROLLMENT_CHALLENGE_PREFIX)
+        && value[AGENT_ENROLLMENT_CHALLENGE_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_canonical_agent_public_key(value: &str) -> ApiResult<ed25519_dalek::VerifyingKey> {
+    validate_registration_text("public_key", value, AGENT_PUBLIC_KEY_MAX_BYTES)?;
+    let key = decode_verifying_key(value).map_err(|_| {
+        bad_request("public_key must be a valid base64-encoded Ed25519 verifying key")
+    })?;
+    if key.is_weak() {
+        return Err(bad_request(
+            "public_key must not be a weak (small-order) Ed25519 key",
+        ));
+    }
+    if encode_verifying_key(&key) != value {
+        return Err(bad_request(
+            "public_key must use the canonical padded base64 encoding",
+        ));
+    }
+    Ok(key)
+}
+
+/// Stable, non-secret review handle for one canonical capabilities document.
+/// `Capabilities` serializes with fixed field order and provider maps are
+/// `BTreeMap`s; JSONB reads are likewise normalized before reaching this helper.
+fn capabilities_digest(capabilities: &Value) -> String {
+    format!(
+        "{PUBLIC_KEY_FINGERPRINT_PREFIX}{}",
+        sha256_hex(&capabilities.to_string())
+    )
+}
+
+fn valid_public_key_fingerprint_shape(value: &str) -> bool {
+    value.len() == PUBLIC_KEY_FINGERPRINT_PREFIX.len() + PUBLIC_KEY_FINGERPRINT_HEX_BYTES
+        && value.starts_with(PUBLIC_KEY_FINGERPRINT_PREFIX)
+        && value[PUBLIC_KEY_FINGERPRINT_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn pending_enrollment_missing_expiry(
+    status: &str,
+    enrollment_expires_at: Option<DateTime<Utc>>,
+) -> bool {
+    status == "pending" && enrollment_expires_at.is_none()
+}
+
+async fn activate_agent_enrollment_contract_v3(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config($1, '3', TRUE)")
+        .bind(AGENT_ENROLLMENT_CONTRACT_SETTING)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn activate_agent_job_lease_contract_v2(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config($1, '2', TRUE)")
+        .bind(AGENT_JOB_LEASE_CONTRACT_SETTING)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Validate every attacker-sized registration field before public-key decode,
+/// JSON conversion, token generation, or database acquisition.
+fn validate_registration_input(body: &RegisterBody) -> ApiResult<ValidatedRegistration<'_>> {
+    let enrollment_challenge = body.enrollment_challenge.trim();
+    if enrollment_challenge != body.enrollment_challenge
+        || !valid_enrollment_challenge_shape(enrollment_challenge)
+    {
+        return Err(invalid_enrollment_challenge());
+    }
+    validate_registration_text("agent_id", &body.agent_id, AGENT_ID_MAX_BYTES)?;
+    validate_registration_text("platform", &body.platform, AGENT_PLATFORM_MAX_BYTES)?;
+
+    let public_key = body.public_key.trim();
+    let verifying_key = validate_canonical_agent_public_key(public_key)?;
+    validate_registration_text(
+        "enrollment_proof",
+        &body.enrollment_proof,
+        AGENT_ENROLLMENT_PROOF_MAX_BYTES,
+    )?;
+    if body.enrollment_proof.trim() != body.enrollment_proof {
+        return Err(invalid_enrollment_challenge());
+    }
+
+    let mut provider_count = 0usize;
+    for (tool_name, capability) in [
+        ("terraform", body.capabilities.terraform.as_ref()),
+        ("ansible", body.capabilities.ansible.as_ref()),
+    ] {
+        let Some(capability) = capability else {
+            continue;
+        };
+        if capability.version.len() > CAPABILITY_VERSION_MAX_BYTES {
+            return Err(bad_request(format!(
+                "{tool_name} capability version must be at most {CAPABILITY_VERSION_MAX_BYTES} bytes"
+            )));
+        }
+        provider_count = provider_count.saturating_add(capability.provider_versions.len());
+        if provider_count > CAPABILITY_PROVIDER_MAX_COUNT {
+            return Err(bad_request(format!(
+                "capabilities may declare at most {CAPABILITY_PROVIDER_MAX_COUNT} provider versions"
+            )));
+        }
+        for (provider_name, provider_version) in &capability.provider_versions {
+            if provider_name.len() > CAPABILITY_PROVIDER_NAME_MAX_BYTES {
+                return Err(bad_request(format!(
+                    "capability provider names must be at most {CAPABILITY_PROVIDER_NAME_MAX_BYTES} bytes"
+                )));
+            }
+            if provider_version.len() > CAPABILITY_PROVIDER_VERSION_MAX_BYTES {
+                return Err(bad_request(format!(
+                    "capability provider versions must be at most {CAPABILITY_PROVIDER_VERSION_MAX_BYTES} bytes"
+                )));
+            }
+        }
+    }
+
+    // Prove possession before acquiring a database connection. This check alone
+    // does not trust the key; the locked challenge row below must independently
+    // match this exact canonical key and identity.
+    verify_agent_enrollment_proof(
+        body.enrollment_challenge_id,
+        enrollment_challenge,
+        &body.agent_id,
+        &body.platform,
+        public_key,
+        body.enrollment_proof.trim(),
+        &verifying_key,
+    )
+    .map_err(|_| invalid_enrollment_challenge())?;
+
+    Ok(ValidatedRegistration {
+        enrollment_challenge_id: body.enrollment_challenge_id,
+        enrollment_challenge,
+        agent_id: &body.agent_id,
+        platform: &body.platform,
+        public_key,
+        public_key_fingerprint: public_key_fingerprint(public_key),
+    })
+}
+
+/// Validate the administrator-authoritative capability grant before it can be
+/// persisted. Registration data is only an untrusted hint; this stricter path
+/// keeps approved documents canonical and prevents an operator from granting a
+/// shape that the lease matcher must (correctly) reject.
+fn validated_approved_capabilities(capabilities: &Capabilities) -> ApiResult<Value> {
+    let mut provider_count = 0usize;
+    for (tool_name, capability) in [
+        ("terraform", capabilities.terraform.as_ref()),
+        ("ansible", capabilities.ansible.as_ref()),
+    ] {
+        let Some(capability) = capability else {
+            continue;
+        };
+        if capability.version.trim().is_empty()
+            || capability.version.trim() != capability.version
+            || capability.version.len() > CAPABILITY_VERSION_MAX_BYTES
+        {
+            return Err(bad_request(format!(
+                "{tool_name} capability version must be a canonical non-empty string of at most {CAPABILITY_VERSION_MAX_BYTES} bytes"
+            )));
+        }
+        if tool_name == "ansible" && !capability.provider_versions.is_empty() {
+            return Err(bad_request(
+                "ansible capability provider_versions must be empty",
+            ));
+        }
+        provider_count = provider_count.saturating_add(capability.provider_versions.len());
+        if provider_count > CAPABILITY_PROVIDER_MAX_COUNT {
+            return Err(bad_request(format!(
+                "capabilities may declare at most {CAPABILITY_PROVIDER_MAX_COUNT} provider versions"
+            )));
+        }
+        for (provider_name, provider_version) in &capability.provider_versions {
+            if provider_name.trim().is_empty()
+                || provider_name.trim() != provider_name
+                || provider_name.len() > CAPABILITY_PROVIDER_NAME_MAX_BYTES
+            {
+                return Err(bad_request(format!(
+                    "capability provider names must be canonical non-empty strings of at most {CAPABILITY_PROVIDER_NAME_MAX_BYTES} bytes"
+                )));
+            }
+            if provider_version.trim().is_empty()
+                || provider_version.trim() != provider_version
+                || provider_version.len() > CAPABILITY_PROVIDER_VERSION_MAX_BYTES
+            {
+                return Err(bad_request(format!(
+                    "capability provider versions must be canonical non-empty strings of at most {CAPABILITY_PROVIDER_VERSION_MAX_BYTES} bytes"
+                )));
+            }
+        }
+    }
+
+    let approved = serde_json::to_value(capabilities).map_err(db_err)?;
+    if approved.to_string().len() > CAPABILITIES_JSON_MAX_BYTES {
+        return Err(bad_request(format!(
+            "capabilities must serialize to at most {CAPABILITIES_JSON_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(approved)
+}
+
+/// Delete at most `batch` expired Pending enrollments, oldest first.
+///
+/// The production lifecycle sweep and the registration admission path both use
+/// this bounded query. `SKIP LOCKED` prevents cleanup from waiting behind an
+/// administrator who is concurrently approving or revoking an enrollment.
+async fn cleanup_expired_pending_agent_enrollments_with_batch(
+    pool: &PgPool,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    if batch <= 0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        "WITH expired AS ( \
+             SELECT id FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at <= NOW() \
+             ORDER BY enrollment_expires_at, id \
+             FOR UPDATE SKIP LOCKED \
+             LIMIT $1 \
+         ) \
+         DELETE FROM agents AS target \
+         USING expired \
+         WHERE target.id = expired.id",
+    )
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn cleanup_expired_pending_agent_enrollments(
+    pool: &PgPool,
+) -> Result<u64, sqlx::Error> {
+    cleanup_expired_pending_agent_enrollments_with_batch(
+        pool,
+        PENDING_AGENT_ENROLLMENT_CLEANUP_BATCH,
+    )
+    .await
+}
+
+/// Serialize registration admission across replicas, prune a bounded expired
+/// batch, enforce the exact global active-Pending quota, then insert atomically.
+async fn persist_pending_agent_registration(
+    pool: &PgPool,
+    pv: ProtocolVersion,
+    registration: &ValidatedRegistration<'_>,
+    capabilities_json: &Value,
+    max_pending: i64,
+) -> ApiResult<String> {
+    debug_assert!(max_pending > 0);
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    activate_agent_enrollment_contract_v3(&mut tx)
+        .await
+        .map_err(db_err)?;
+
+    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(AGENT_REGISTRATION_ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    if !lock_acquired {
+        return Err(too_many_requests("agent registration is busy; retry later"));
+    }
+
+    // Lock the one-time grant before touching the durable agent identity. Every
+    // mismatch intentionally returns the same anonymous-facing error. The
+    // Ed25519 proof was already checked against the submitted key; this lookup
+    // establishes that trusted provisioning selected that exact key and
+    // identity before registration became reachable.
+    let challenge: Option<AgentEnrollmentChallengeRow> = sqlx::query_as(
+        "SELECT agent_id, platform, public_key, public_key_fingerprint, secret_hash, status, \
+                (status = 'pending' AND expires_at > clock_timestamp()) AS active \
+         FROM agent_enrollment_challenges \
+         WHERE id = $1 \
+         FOR UPDATE",
+    )
+    .bind(registration.enrollment_challenge_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some(challenge) = challenge else {
+        return Err(invalid_enrollment_challenge());
+    };
+    let presented_secret_hash = sha256_hex(registration.enrollment_challenge);
+    use subtle::ConstantTimeEq;
+    let secret_matches: bool = presented_secret_hash
+        .as_bytes()
+        .ct_eq(challenge.secret_hash.as_bytes())
+        .into();
+    if !challenge.active
+        || challenge.status != "pending"
+        || !secret_matches
+        || challenge.agent_id != registration.agent_id
+        || challenge.platform != registration.platform
+        || challenge.public_key != registration.public_key
+        || challenge.public_key_fingerprint != registration.public_key_fingerprint
+    {
+        return Err(invalid_enrollment_challenge());
+    }
+
+    // Let an expired identity re-enroll even if it is not within the oldest
+    // cleanup batch. The row lock is bounded to one attacker-selected unique key.
+    sqlx::query(
+        "DELETE FROM agents \
+         WHERE agent_id = $1 \
+           AND status = 'pending' \
+           AND enrollment_expires_at <= NOW()",
+    )
+    .bind(registration.agent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query(
+        "WITH expired AS ( \
+             SELECT id FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at <= NOW() \
+             ORDER BY enrollment_expires_at, id \
+             FOR UPDATE SKIP LOCKED \
+             LIMIT $1 \
+         ) \
+         DELETE FROM agents AS target \
+         USING expired \
+         WHERE target.id = expired.id",
+    )
+    .bind(PENDING_AGENT_ENROLLMENT_CLEANUP_BATCH)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+
+    let active_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ( \
+             SELECT 1 FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at > NOW() \
+             LIMIT $1 \
+         ) AS active_pending",
+    )
+    .bind(max_pending)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if active_pending >= max_pending {
+        return Err(too_many_requests(
+            "the pending agent enrollment capacity is full; retry after an enrollment is reviewed or expires",
+        ));
+    }
+
+    let token = generate_agent_token();
+    let hash = sha256_hex(&token);
+    let enrollment_id: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status, \
+                             protocol_version, enrollment_challenge_id) \
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7) \
+         ON CONFLICT DO NOTHING \
+         RETURNING id",
+    )
+    .bind(registration.agent_id)
+    .bind(registration.platform)
+    .bind(capabilities_json)
+    .bind(registration.public_key)
+    .bind(&hash)
+    // BIGINT column: the wire version is u32, whose full range fits an i64 losslessly.
+    .bind(i64::from(pv.0))
+    .bind(registration.enrollment_challenge_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(registration_insert_err)?;
+
+    let Some(enrollment_id) = enrollment_id else {
+        return Err(conflict(format!(
+            "agent_id '{}' already registered",
+            registration.agent_id
+        )));
+    };
+
+    // Consume in the same transaction as the identity insert. Re-check expiry
+    // with the database clock at the final write so a challenge that expires
+    // while this request is being processed rolls the insert back. The locked
+    // row plus this status predicate makes replay and concurrent consumption
+    // deterministic: exactly one claimant can commit.
+    let consumed = sqlx::query(
+        "UPDATE agent_enrollment_challenges \
+         SET status = 'consumed', consumed_at = clock_timestamp(), \
+             consumed_enrollment_id = $1 \
+         WHERE id = $2 AND status = 'pending' \
+           AND expires_at > clock_timestamp()",
+    )
+    .bind(enrollment_id)
+    .bind(registration.enrollment_challenge_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if consumed.rows_affected() != 1 {
+        return Err(invalid_enrollment_challenge());
+    }
+
+    tx.commit().await.map_err(db_err)?;
+    Ok(token)
+}
+
+/// Test-only fixture boundary for code outside this module that needs an agent
+/// row. It intentionally exercises migration 158's real admission sequence
+/// instead of weakening the database trigger for direct approved-row inserts.
+#[cfg(test)]
+pub(crate) struct ChallengeAdmittedTestAgent<'a> {
+    pub(crate) agent_id: &'a str,
+    pub(crate) platform: &'a str,
+    pub(crate) public_key: &'a str,
+    pub(crate) token_hash: &'a str,
+    pub(crate) capabilities: &'a Value,
+    pub(crate) final_status: &'a str,
+    pub(crate) last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+pub(crate) async fn seed_challenge_admitted_test_agent(
+    pool: &PgPool,
+    fixture: ChallengeAdmittedTestAgent<'_>,
+) -> Uuid {
+    let ChallengeAdmittedTestAgent {
+        agent_id,
+        platform,
+        public_key,
+        token_hash,
+        capabilities,
+        final_status,
+        last_seen_at,
+    } = fixture;
+    assert!(
+        matches!(final_status, "pending" | "approved" | "revoked"),
+        "unsupported agent fixture status"
+    );
+    let challenge_id = Uuid::new_v4();
+    let challenge = generate_agent_enrollment_challenge();
+    let mut tx = pool.begin().await.expect("begin admitted-agent fixture");
+    activate_agent_enrollment_contract_v3(&mut tx)
+        .await
+        .expect("activate enrollment contract for admitted-agent fixture");
+    sqlx::query(
+        "INSERT INTO agent_enrollment_challenges ( \
+             id, agent_id, platform, public_key, public_key_fingerprint, \
+             secret_hash, ttl_seconds, expires_at, created_by \
+         ) VALUES ($1, $2, $3, $4, $5, $6, 3600, \
+                   statement_timestamp(), 'test-provisioner')",
+    )
+    .bind(challenge_id)
+    .bind(agent_id)
+    .bind(platform)
+    .bind(public_key)
+    .bind(public_key_fingerprint(public_key))
+    .bind(sha256_hex(&challenge))
+    .execute(&mut *tx)
+    .await
+    .expect("seed trusted challenge for admitted-agent fixture");
+
+    let enrollment_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents ( \
+             agent_id, platform, capabilities, public_key, token_hash, status, \
+             enrollment_challenge_id, last_seen_at \
+         ) VALUES ($1, $2, $3::jsonb, $4, $5, 'pending', $6, $7) \
+         RETURNING id",
+    )
+    .bind(agent_id)
+    .bind(platform)
+    .bind(capabilities)
+    .bind(public_key)
+    .bind(token_hash)
+    .bind(challenge_id)
+    .bind(last_seen_at)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert challenge-bound Pending agent fixture");
+
+    sqlx::query(
+        "UPDATE agent_enrollment_challenges \
+         SET status = 'consumed', consumed_at = clock_timestamp(), \
+             consumed_enrollment_id = $1 \
+         WHERE id = $2 AND status = 'pending'",
+    )
+    .bind(enrollment_id)
+    .bind(challenge_id)
+    .execute(&mut *tx)
+    .await
+    .expect("consume admitted-agent fixture challenge");
+
+    if final_status != "pending" {
+        sqlx::query(
+            "UPDATE agents SET status = $1, enrollment_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $2",
+        )
+        .bind(final_status)
+        .bind(enrollment_id)
+        .execute(&mut *tx)
+        .await
+        .expect("transition admitted-agent fixture to final status");
+    }
+    tx.commit()
+        .await
+        .expect("commit admitted-agent fixture transaction");
+    enrollment_id
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +1272,14 @@ fn parse_agent_job_id(id: &str) -> ApiResult<Uuid> {
 // ---------------------------------------------------------------------------
 
 pub const AGENT_TOKEN_PREFIX: &str = "rya_";
+
+fn generate_agent_enrollment_challenge() -> String {
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{AGENT_ENROLLMENT_CHALLENGE_PREFIX}{hex}")
+}
 
 fn generate_agent_token() -> String {
     use rand::{rngs::OsRng, RngCore};
@@ -257,7 +1329,7 @@ async fn authenticate_agent(headers: &HeaderMap, pool: &PgPool) -> ApiResult<Age
 
     use subtle::ConstantTimeEq;
     let row = sqlx::query_as::<_, AgentRow>(
-        "SELECT id, agent_id, platform, capabilities, public_key, token_hash, status \
+        "SELECT id, agent_id, public_key, token_hash, status \
          FROM agents WHERE token_hash = $1",
     )
     .bind(&hash)
@@ -282,9 +1354,183 @@ async fn authenticate_agent(headers: &HeaderMap, pool: &PgPool) -> ApiResult<Age
     Ok(row)
 }
 
+/// Enrollment changes create durable workload credentials, so coarse `admin`
+/// RBAC is not sufficient: the caller must be a currently verified interactive
+/// human with platform-global authority. `token_valid` is set only after the
+/// request authentication boundary admits the current credential/session;
+/// `api-token` is then excluded explicitly so a standing machine credential
+/// cannot mint a transitive agent credential. The provider name is otherwise
+/// deliberately neutral, preserving local and federated direct/persisted human
+/// sessions without a brittle provider allowlist.
+fn is_fresh_unscoped_interactive_human_admin(session: &AuthSession) -> bool {
+    check_permission(session, "admin")
+        && session.is_verified_human()
+        && session.site_scope.is_empty()
+        && session.environment_scope.is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// POST /api/admin/agents/enrollment-challenges
+///
+/// Preprovisions one short-lived bootstrap grant for an exact agent identity
+/// and existing Ed25519 workload key. The plaintext challenge is returned only
+/// in this response; the database retains its hash. Delivery to the intended
+/// workload remains a trusted, provider-neutral provisioning responsibility.
+pub async fn admin_create_agent_enrollment_challenge(
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<CreateEnrollmentChallengeBody>,
+) -> ApiResult<CreateEnrollmentChallengeHttpResponse> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to provision an agent enrollment",
+        ));
+    }
+    if !session.site_scope.is_empty() || !session.environment_scope.is_empty() {
+        return Err(forbidden(
+            "agent fleet operations require an unrestricted (non-scoped) admin",
+        ));
+    }
+    if !is_fresh_unscoped_interactive_human_admin(&session) {
+        return Err(forbidden(
+            "agent enrollment requires a fresh interactive human admin session; API tokens and static/dry-run identities are not accepted",
+        ));
+    }
+
+    validate_registration_text("agent_id", &body.agent_id, AGENT_ID_MAX_BYTES)?;
+    validate_registration_text("platform", &body.platform, AGENT_PLATFORM_MAX_BYTES)?;
+    let public_key = body.public_key.trim();
+    validate_canonical_agent_public_key(public_key)?;
+    let ttl_secs = body
+        .expires_in_seconds
+        .unwrap_or(AGENT_ENROLLMENT_CHALLENGE_DEFAULT_TTL_SECS);
+    if !(AGENT_ENROLLMENT_CHALLENGE_MIN_TTL_SECS..=AGENT_ENROLLMENT_CHALLENGE_MAX_TTL_SECS)
+        .contains(&ttl_secs)
+    {
+        return Err(bad_request(format!(
+            "expires_in_seconds must be between {AGENT_ENROLLMENT_CHALLENGE_MIN_TTL_SECS} and {AGENT_ENROLLMENT_CHALLENGE_MAX_TTL_SECS}"
+        )));
+    }
+    let ttl_seconds = i32::try_from(ttl_secs)
+        .map_err(|_| bad_request("expires_in_seconds is outside the supported database range"))?;
+
+    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    // Serialize trusted issuance with public consumption. Registration uses the
+    // non-queueing variant of this same lock and therefore fails fast while an
+    // administrator is changing bootstrap authority.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AGENT_REGISTRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+    sqlx::query(
+        "UPDATE agent_enrollment_challenges \
+         SET status = 'expired' \
+         WHERE agent_id = $1 AND status = 'pending' \
+           AND expires_at <= clock_timestamp()",
+    )
+    .bind(&body.agent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+
+    let existing_agent: Option<(String, bool)> = sqlx::query_as(
+        "SELECT status, \
+                (status = 'pending' AND enrollment_expires_at IS NOT NULL \
+                 AND enrollment_expires_at <= clock_timestamp()) AS removable \
+         FROM agents WHERE agent_id = $1 FOR UPDATE",
+    )
+    .bind(&body.agent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if let Some((status, removable)) = existing_agent {
+        if !removable {
+            return Err(conflict(format!(
+                "agent_id '{}' already has a {status} identity",
+                body.agent_id
+            )));
+        }
+    }
+
+    let active_challenge: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM agent_enrollment_challenges \
+             WHERE agent_id = $1 AND status = 'pending' \
+         )",
+    )
+    .bind(&body.agent_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if active_challenge {
+        return Err(conflict(format!(
+            "agent_id '{}' already has an active enrollment challenge",
+            body.agent_id
+        )));
+    }
+
+    let enrollment_challenge_id = Uuid::new_v4();
+    let enrollment_challenge = generate_agent_enrollment_challenge();
+    let challenge_hash = sha256_hex(&enrollment_challenge);
+    let fingerprint = public_key_fingerprint(public_key);
+    let expires_at: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO agent_enrollment_challenges ( \
+             id, agent_id, platform, public_key, public_key_fingerprint, \
+             secret_hash, ttl_seconds, expires_at, created_by \
+         ) VALUES ( \
+             $1, $2, $3, $4, $5, $6, $7, statement_timestamp(), $8 \
+         ) \
+         RETURNING expires_at",
+    )
+    .bind(enrollment_challenge_id)
+    .bind(&body.agent_id)
+    .bind(&body.platform)
+    .bind(public_key)
+    .bind(&fingerprint)
+    .bind(&challenge_hash)
+    .bind(ttl_seconds)
+    .bind(&session.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-enrollment-challenge-create",
+            None,
+            "pending",
+            json!({
+                "agent_id": &body.agent_id,
+                "platform": &body.platform,
+                "enrollment_challenge_id": enrollment_challenge_id,
+                "public_key_fingerprint": &fingerprint,
+                "expires_at": expires_at.to_rfc3339(),
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(CreateEnrollmentChallengeResponse {
+            enrollment_challenge_id,
+            enrollment_challenge,
+            agent_id: body.agent_id,
+            platform: body.platform,
+            public_key_fingerprint: fingerprint,
+            expires_at,
+        }),
+    ))
+}
 
 /// POST /api/agents/register
 ///
@@ -295,83 +1541,57 @@ pub async fn register_agent(
     pv: ProtocolVersion,
     _headers: HeaderMap,
     Json(body): Json<RegisterBody>,
-) -> ApiResult<Json<RegisterResponse>> {
-    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
+) -> ApiResult<RegisterHttpResponse> {
+    let _registration_permit = AGENT_REGISTRATION_PERMITS
+        .try_acquire()
+        .map_err(|_| too_many_requests("agent registration is busy; retry later"))?;
 
-    // Minimal input validation.
-    if body.agent_id.trim().is_empty() {
-        return Err(bad_request("agent_id must not be empty"));
-    }
-    if body.platform.trim().is_empty() {
-        return Err(bad_request("platform must not be empty"));
-    }
-    let public_key = body.public_key.trim();
-    if public_key.is_empty() {
-        return Err(bad_request("public_key must not be empty"));
-    }
-    // Validate the Ed25519 verifying key AT REGISTRATION, not lazily at first result
-    // submission. Otherwise an agent can register (and be admin-approved) with a
-    // malformed/garbage key, and every result it later submits fails the decode at
-    // ingestion (agents.rs result path) — a silent per-slot DoS that only surfaces
-    // AFTER approval. Storing the trimmed value also avoids a whitespace-laden key
-    // that the result-side decode would then reject.
-    let vk = ryuki_protocol::crypto::decode_verifying_key(public_key).map_err(|_| {
-        bad_request("public_key must be a valid base64-encoded Ed25519 verifying key")
-    })?;
-    // Also reject WEAK (small-order) keys here: `decode_verifying_key` accepts them, but
-    // result verification uses `verify_strict`, which rejects weak keys — so without this
-    // check a weak key would register/approve yet never verify a result (the same DoS,
-    // narrowed to weak keys). This makes registration agree with result verification.
-    if vk.is_weak() {
-        return Err(bad_request(
-            "public_key must not be a weak (small-order) Ed25519 key",
-        ));
-    }
-
-    let token = generate_agent_token();
-    let hash = sha256_hex(&token);
+    // All attacker-sized fields, including the encoded key, are bounded before
+    // key decode, JSON conversion, token generation, or database acquisition.
+    let registration = validate_registration_input(&body)?;
     let capabilities_json = serde_json::to_value(&body.capabilities).map_err(db_err)?;
-
-    let result = sqlx::query(
-        "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status, protocol_version) \
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6) \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(&body.agent_id)
-    .bind(&body.platform)
-    .bind(&capabilities_json)
-    .bind(public_key)
-    .bind(&hash)
-    // BIGINT column: the wire version is u32, whose full range fits an i64 losslessly.
-    .bind(i64::from(pv.0))
-    .execute(pool)
-    .await
-    .map_err(db_err)?;
-
-    if result.rows_affected() == 0 {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("agent_id '{}' already registered", body.agent_id)})),
-        ));
+    let capabilities_json_bytes = serde_json::to_vec(&capabilities_json)
+        .map_err(db_err)?
+        .len();
+    if capabilities_json_bytes > CAPABILITIES_JSON_MAX_BYTES {
+        return Err(bad_request(format!(
+            "capabilities must serialize to at most {CAPABILITIES_JSON_MAX_BYTES} bytes"
+        )));
     }
+    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
+    let token = persist_pending_agent_registration(
+        pool,
+        pv,
+        &registration,
+        &capabilities_json,
+        MAX_PENDING_AGENT_ENROLLMENTS,
+    )
+    .await?;
 
-    tracing::info!(agent_id = %body.agent_id, platform = %body.platform, "agent registered (pending)");
+    tracing::info!(agent_id = %registration.agent_id, platform = %registration.platform, "agent registered (pending)");
 
-    Ok(Json(RegisterResponse {
-        agent_id: body.agent_id,
-        token,
-    }))
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(RegisterResponse {
+            agent_id: registration.agent_id.to_owned(),
+            token,
+        }),
+    ))
 }
 
 /// POST /api/admin/agents/{agent_id}/approve
 ///
-/// Sets an agent's status to 'approved'. ALWAYS overwrites platform and
-/// (optionally) capabilities with admin-authoritative values — the agent's
-/// self-declared registration data is treated as a hint only.
+/// Sets an agent's status to 'approved'. The platform must match the consumed
+/// trusted challenge; capabilities remain administrator-authoritative and the
+/// agent's self-declared capability document is only a hint.
 ///
-/// `platform` is required in the request body; omitting it is a 400 error.
+/// The request must carry `enrollment_id` and `public_key_fingerprint` from the
+/// current admin roster together with `platform`. Binding approval to the
+/// immutable row and reviewed key prevents a stale page from approving a later
+/// enrollment that reused the same human-readable agent id.
 /// This endpoint sits under `/api/admin/` so the human RBAC middleware enforces
-/// the `admin` permission and agent-token auth cannot reach it.
+/// the `admin` permission. The in-handler human-session gate additionally keeps
+/// agent and API-token credentials from minting a transitive workload identity.
 pub async fn admin_approve_agent(
     Path(agent_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -390,79 +1610,180 @@ pub async fn admin_approve_agent(
     // session-property gate evaluated BEFORE any row lookup, so it leaks no
     // existence oracle. Mirrors the "platform-wide rows only for an unrestricted
     // principal" posture.
-    if is_scoped(&session) {
+    if !session.site_scope.is_empty() || !session.environment_scope.is_empty() {
         return Err(forbidden(
             "agent fleet operations require an unrestricted (non-scoped) admin",
         ));
     }
-    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
-
+    if !is_fresh_unscoped_interactive_human_admin(&session) {
+        return Err(forbidden(
+            "agent enrollment requires a fresh interactive human admin session; API tokens and static/dry-run identities are not accepted",
+        ));
+    }
     if body.platform.trim().is_empty() {
         return Err(bad_request("platform must not be empty"));
     }
+    if !valid_public_key_fingerprint_shape(&body.public_key_fingerprint) {
+        return Err(bad_request(
+            "public_key_fingerprint must be a lowercase sha256 fingerprint",
+        ));
+    }
 
-    let now = Utc::now();
+    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
     let mut tx = pool.begin().await.map_err(db_err)?;
+    // The active-job check must take a fresh statement snapshot after waiting
+    // for the same agent-row lock used by leasing. Do not inherit a database
+    // role override that could retain a pre-wait REPEATABLE READ snapshot.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    activate_agent_enrollment_contract_v3(&mut tx)
+        .await
+        .map_err(db_err)?;
 
-    // Lock the row: 404 an unknown agent, and enforce that revoke is TERMINAL — a
-    // revoked (e.g. compromised) agent can never be silently re-approved; it must
-    // re-enroll (a fresh record + rotated token). Without this guard, an admin
-    // mistake or a stale UI could undo a revocation and re-arm a bad credential.
-    let prior: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1 FOR UPDATE")
-            .bind(&agent_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-    let Some((prior_status,)) = prior else {
+    // Lock and bind the review to the immutable row plus the displayed key
+    // fingerprint. `agent_id` is intentionally reusable after expiry cleanup, so
+    // approving by that human-readable identifier alone would let a stale admin
+    // page approve a replacement key.
+    let prior: Option<AgentApprovalRow> = sqlx::query_as(
+        "SELECT agent.id, agent.status, agent.public_key, agent.enrollment_expires_at, \
+                agent.enrollment_challenge_id, challenge.status AS challenge_status, \
+                challenge.agent_id AS challenge_agent_id, \
+                challenge.platform AS challenge_platform, \
+                challenge.public_key AS challenge_public_key, \
+                challenge.consumed_enrollment_id \
+         FROM agents AS agent \
+         LEFT JOIN agent_enrollment_challenges AS challenge \
+           ON challenge.id = agent.enrollment_challenge_id \
+         WHERE agent.agent_id = $1 \
+         FOR UPDATE OF agent",
+    )
+    .bind(&agent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some(prior) = prior else {
         return Err(not_found(format!("agent '{}' not found", agent_id)));
     };
-    if prior_status == "revoked" {
+    let stored_fingerprint = public_key_fingerprint(&prior.public_key);
+    if prior.id != body.enrollment_id || stored_fingerprint != body.public_key_fingerprint {
+        return Err(conflict(
+            "the reviewed agent enrollment has changed; refresh the enrollment list",
+        ));
+    }
+    if prior.status == "revoked" {
         return Err(conflict(format!(
             "agent '{}' is revoked and cannot be re-approved; it must re-enroll",
             agent_id
         )));
     }
+    // A legacy NULL must fail closed even before the atomic UPDATE predicate.
+    // Expiry itself is decided by PostgreSQL below, never by the process clock.
+    if pending_enrollment_missing_expiry(&prior.status, prior.enrollment_expires_at) {
+        return Err(conflict(format!(
+            "agent '{}' enrollment has no valid expiry; the agent must re-enroll",
+            agent_id
+        )));
+    }
 
-    // Always overwrite platform with the admin-authoritative value; capabilities
-    // are RESET to empty unless the admin explicitly supplies them (the agent's
+    // A Pending row can cross into trust only when its exact preprovisioned
+    // challenge was consumed by a valid Ed25519 proof. Challenge-bound approved
+    // rows retain that same identity/platform binding during capability-only
+    // reapproval. Legacy rows that were already approved remain operable, but a
+    // legacy/unlinked Pending row can never become approved.
+    if prior.status == "pending" || prior.enrollment_challenge_id.is_some() {
+        let challenge_matches = prior.enrollment_challenge_id.is_some()
+            && prior.challenge_status.as_deref() == Some("consumed")
+            && prior.consumed_enrollment_id == Some(prior.id)
+            && prior.challenge_agent_id.as_deref() == Some(agent_id.as_str())
+            && prior.challenge_platform.as_deref() == Some(body.platform.as_str())
+            && prior.challenge_public_key.as_deref() == Some(prior.public_key.as_str());
+        if !challenge_matches {
+            return Err(conflict(
+                "agent enrollment lacks a matching consumed provisioning challenge; re-enroll through trusted provisioning",
+            ));
+        }
+    }
+
+    // Persist the already challenge-authorized platform; capabilities are RESET
+    // to empty unless the admin explicitly supplies them (the agent's
     // self-declared registration capabilities are never trusted for dispatch).
-    if let Some(caps) = &body.capabilities {
-        let caps_json = serde_json::to_value(caps).map_err(db_err)?;
-        sqlx::query(
-            "UPDATE agents SET status = 'approved', platform = $1, capabilities = $2, \
-             updated_at = $3 WHERE agent_id = $4",
+    let approved_capabilities = match &body.capabilities {
+        Some(capabilities) => validated_approved_capabilities(capabilities)?,
+        None => json!({}),
+    };
+    let approved_capabilities_digest = capabilities_digest(&approved_capabilities);
+
+    // Re-approval is also the capability-narrowing path. The agents row is
+    // already locked, which is the same first lock taken by leasing, so no new
+    // assignment can race this check. Refuse a change that would make an
+    // already Leased/Running job incompatible; the administrator may revoke
+    // the identity instead, which fences its next authenticated operation.
+    if prior.status == "approved" {
+        let incompatible_active_job: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM agent_jobs \
+                 WHERE agent_id = $1 AND status IN ('Leased', 'Running') \
+                   AND NOT ryuki_agent_capabilities_satisfy_requirement( \
+                         $2::jsonb, required_capabilities \
+                       ) \
+             )",
         )
-        .bind(&body.platform)
-        .bind(&caps_json)
-        .bind(now)
         .bind(&agent_id)
-        .execute(&mut *tx)
+        .bind(&approved_capabilities)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-    } else {
-        sqlx::query(
-            "UPDATE agents SET status = 'approved', platform = $1, \
-             capabilities = '{}'::jsonb, updated_at = $2 WHERE agent_id = $3",
-        )
-        .bind(&body.platform)
-        .bind(now)
-        .bind(&agent_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        if incompatible_active_job {
+            return Err(conflict(
+                "agent capabilities cannot be narrowed while incompatible jobs are active",
+            ));
+        }
+    }
+
+    let updated = sqlx::query(
+        "UPDATE agents SET status = 'approved', platform = $1, capabilities = $2::jsonb, \
+         enrollment_expires_at = NULL, updated_at = NOW() \
+         WHERE agent_id = $3 AND id = $4 \
+           AND (status = 'approved' OR ( \
+               status = 'pending' \
+               AND enrollment_expires_at IS NOT NULL \
+               AND enrollment_expires_at > clock_timestamp() \
+           ))",
+    )
+    .bind(&body.platform)
+    .bind(&approved_capabilities)
+    .bind(&agent_id)
+    .bind(body.enrollment_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(conflict(format!(
+            "agent '{}' enrollment has expired or changed; refresh and re-enroll",
+            agent_id
+        )));
     }
 
     // Audit ATOMICALLY with the status change (previously only traced — a gap):
-    // actor is the verified admin; detail carries no token hash / public key / caps.
+    // actor is the verified admin; detail carries no token hash, raw key, or
+    // capability document. The digest makes the exact non-secret grant
+    // reviewable without widening the audit payload.
     crate::audit::record_audit_tx(
         &mut tx,
         &session,
         &crate::audit::security_audit(
             "agent-approve",
-            Some(&prior_status),
+            Some(&prior.status),
             "approved",
-            json!({ "agent_id": &agent_id, "platform": &body.platform }),
+            json!({
+                "agent_id": &agent_id,
+                "enrollment_id": body.enrollment_id,
+                "public_key_fingerprint": &body.public_key_fingerprint,
+                "platform": &body.platform,
+                "capabilities_digest": &approved_capabilities_digest,
+            }),
         ),
     )
     .await
@@ -471,12 +1792,19 @@ pub async fn admin_approve_agent(
 
     tracing::info!(
         agent_id = %agent_id,
+        enrollment_id = %body.enrollment_id,
         assigned_platform = %body.platform,
+        capabilities_digest = %approved_capabilities_digest,
         "agent approved (platform authoritatively set)"
     );
-    Ok(Json(
-        json!({"agent_id": agent_id, "status": "approved", "platform": body.platform}),
-    ))
+    Ok(Json(json!({
+        "agent_id": agent_id,
+        "enrollment_id": body.enrollment_id,
+        "public_key_fingerprint": body.public_key_fingerprint,
+        "status": "approved",
+        "platform": body.platform,
+        "capabilities_digest": approved_capabilities_digest,
+    })))
 }
 
 /// POST /api/admin/agents/{agent_id}/revoke
@@ -488,10 +1816,14 @@ pub async fn admin_approve_agent(
 /// via the lease/fencing/reconcile path; this closes the door to NEW work. Admin-
 /// tier (the `/api/admin/` middleware blocks agent-token auth). Idempotent: re-
 /// revoking an already-revoked agent returns 200 without a duplicate audit row.
-/// 404 if the agent is unknown.
+/// The request must carry the immutable enrollment id and reviewed public-key
+/// fingerprint from the current admin roster. A stale snapshot returns 409 and
+/// cannot revoke a replacement enrollment that reused the same agent id. 404 if
+/// the agent is unknown.
 pub async fn admin_revoke_agent(
     Path(agent_id): Path<String>,
     Extension(session): Extension<AuthSession>,
+    Json(body): Json<RevokeBody>,
 ) -> ApiResult<Json<Value>> {
     if !check_permission(&session, "admin") {
         return Err(forbidden("admin permission is required to revoke an agent"));
@@ -504,33 +1836,63 @@ pub async fn admin_revoke_agent(
             "agent fleet operations require an unrestricted (non-scoped) admin",
         ));
     }
+    if !session.is_verified_human() {
+        return Err(forbidden(
+            "agent revocation requires a verified human administrator",
+        ));
+    }
+    if !valid_public_key_fingerprint_shape(&body.public_key_fingerprint) {
+        return Err(bad_request(
+            "public_key_fingerprint must be a lowercase sha256 fingerprint",
+        ));
+    }
     let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
-    let now = Utc::now();
     let mut tx = pool.begin().await.map_err(db_err)?;
+    activate_agent_enrollment_contract_v3(&mut tx)
+        .await
+        .map_err(db_err)?;
 
-    let prior: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1 FOR UPDATE")
+    let prior: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, status, public_key FROM agents WHERE agent_id = $1 FOR UPDATE")
             .bind(&agent_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-    let Some((prior_status,)) = prior else {
+    let Some((enrollment_id, prior_status, stored_public_key)) = prior else {
         return Err(not_found(format!("agent '{}' not found", agent_id)));
     };
+    let stored_fingerprint = public_key_fingerprint(&stored_public_key);
+    if enrollment_id != body.enrollment_id || stored_fingerprint != body.public_key_fingerprint {
+        return Err(conflict(
+            "the reviewed agent enrollment has changed; refresh the enrollment list",
+        ));
+    }
 
     // Idempotent: already revoked → 200, no second state-change audit row.
     if prior_status == "revoked" {
         return Ok(Json(json!({
-            "agent_id": agent_id, "status": "revoked", "already_revoked": true
+            "agent_id": agent_id,
+            "enrollment_id": body.enrollment_id,
+            "public_key_fingerprint": body.public_key_fingerprint,
+            "status": "revoked",
+            "already_revoked": true
         })));
     }
 
-    sqlx::query("UPDATE agents SET status = 'revoked', updated_at = $1 WHERE agent_id = $2")
-        .bind(now)
-        .bind(&agent_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+    let updated = sqlx::query(
+        "UPDATE agents SET status = 'revoked', enrollment_expires_at = NULL, \
+         updated_at = NOW() WHERE agent_id = $1 AND id = $2",
+    )
+    .bind(&agent_id)
+    .bind(body.enrollment_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(conflict(
+            "the reviewed agent enrollment has changed; refresh the enrollment list",
+        ));
+    }
 
     crate::audit::record_audit_tx(
         &mut tx,
@@ -539,7 +1901,11 @@ pub async fn admin_revoke_agent(
             "agent-revoke",
             Some(&prior_status),
             "revoked",
-            json!({ "agent_id": &agent_id }),
+            json!({
+                "agent_id": &agent_id,
+                "enrollment_id": body.enrollment_id,
+                "public_key_fingerprint": &body.public_key_fingerprint,
+            }),
         ),
     )
     .await
@@ -548,10 +1914,16 @@ pub async fn admin_revoke_agent(
 
     tracing::warn!(
         agent_id = %agent_id,
+        enrollment_id = %body.enrollment_id,
         prior_status = %prior_status,
         "agent revoked (its token will be refused on the next call)"
     );
-    Ok(Json(json!({"agent_id": agent_id, "status": "revoked"})))
+    Ok(Json(json!({
+        "agent_id": agent_id,
+        "enrollment_id": body.enrollment_id,
+        "public_key_fingerprint": body.public_key_fingerprint,
+        "status": "revoked"
+    })))
 }
 
 /// GET /api/agents/{agent_id}/jobs
@@ -563,11 +1935,40 @@ pub async fn admin_revoke_agent(
 pub(crate) async fn lease_pending_job(
     pool: &PgPool,
     agent_id: &str,
-    platform: &str,
 ) -> Result<Option<LeasedAgentJob>, sqlx::Error> {
     let attempt_id = Uuid::new_v4();
     let fencing_token = Uuid::new_v4().to_string();
     let cp_nonce = Uuid::new_v4().to_string();
+
+    // The agent lock and lease UPDATE must be separate statements in one READ
+    // COMMITTED transaction. The first statement serializes all polls for this
+    // exact agent across API replicas. A waiter then starts the lease UPDATE
+    // with a fresh statement snapshot and therefore sees the preceding poll's
+    // newly committed active lease. Folding the row lock and capacity check
+    // into one CTE would retain the pre-wait statement snapshot and could
+    // oversubscribe the ceiling.
+    let mut tx = pool.begin().await?;
+    // The security proof below requires a fresh snapshot for statement two
+    // after a concurrent poll releases the agent-row lock. Pin the isolation
+    // level rather than inheriting a cluster/user override such as REPEATABLE
+    // READ, which would retain the pre-wait snapshot and miss the new lease.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    let authority = sqlx::query_as::<_, AgentLeaseAuthorityRow>(
+        "SELECT id, platform, public_key, capabilities \
+         FROM agents \
+         WHERE agent_id = $1 AND status = 'approved' \
+         FOR UPDATE",
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(authority) = authority else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    activate_agent_job_lease_contract_v2(&mut tx).await?;
 
     // A stateful live job is pinned to the first agent that leases its state
     // key. Later plan/apply/destroy jobs, retries, and admin requeues may only
@@ -587,6 +1988,26 @@ pub(crate) async fn lease_pending_job(
          WHERE id = ( \
              SELECT pending.id FROM agent_jobs AS pending \
              WHERE pending.platform = $6 AND pending.status = 'Pending' \
+               AND (pending.agent_id IS NULL OR pending.agent_id = $1) \
+               AND ( \
+                 pending.live_context IS NULL \
+                 OR ( \
+                   pending.live_context->'execution_authority'->>'assigned_agent_id' = $1 \
+                   AND pending.live_context->'execution_authority'->>'assigned_agent_enrollment_id' = $9 \
+                   AND pending.live_context->'execution_authority'->>'assigned_agent_key_fingerprint' = $10 \
+                 ) \
+               ) \
+               AND ryuki_agent_capabilities_satisfy_requirement( \
+                     $7::jsonb, pending.required_capabilities \
+                   ) \
+               AND ( \
+                 SELECT COUNT(*) FROM ( \
+                   SELECT 1 FROM agent_jobs AS active \
+                   WHERE active.agent_id = $1 \
+                     AND active.status IN ('Leased', 'Running') \
+                   LIMIT $8 \
+                 ) AS bounded_active \
+               ) < $8 \
                AND ( \
                  NOT ( \
                    pending.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') \
@@ -643,9 +2064,41 @@ pub(crate) async fn lease_pending_job(
     .bind(&fencing_token)
     .bind(&cp_nonce)
     .bind(LEASE_TTL_SECS as f64)
-    .bind(platform)
-    .fetch_optional(pool)
+    .bind(&authority.platform)
+    .bind(&authority.capabilities.0)
+    .bind(MAX_ACTIVE_LEASES_PER_AGENT)
+    .bind(authority.id.to_string())
+    .bind(public_key_fingerprint(&authority.public_key))
+    .fetch_optional(&mut *tx)
     .await?;
+
+    // Keep the external 204 response deliberately indistinguishable from an
+    // empty or incompatible queue, but make saturation observable internally.
+    // The diagnostic count is bounded by the same server-controlled ceiling;
+    // the predicate in the atomic UPDATE above remains the enforcement point.
+    if row.is_none() {
+        let active_lease_ceiling_reached: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) >= $2 FROM ( \
+                 SELECT 1 FROM agent_jobs \
+                 WHERE agent_id = $1 AND status IN ('Leased', 'Running') \
+                 LIMIT $2 \
+             ) AS bounded_active",
+        )
+        .bind(agent_id)
+        .bind(MAX_ACTIVE_LEASES_PER_AGENT)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_lease_ceiling_reached {
+            tracing::debug!(
+                agent_id = %agent_id,
+                active_lease_limit = MAX_ACTIVE_LEASES_PER_AGENT,
+                reason = "active_lease_ceiling",
+                "agent poll did not lease work"
+            );
+        }
+    }
+
+    tx.commit().await?;
 
     Ok(row.map(|row| LeasedAgentJob {
         row,
@@ -689,7 +2142,7 @@ pub async fn poll_job(
     // SKIP LOCKED ensures two concurrent polls cannot double-lease the same row.
     // lease_deadline is computed entirely in DB time (NOW() + interval) so all
     // lease timing uses the canonical Postgres clock, not the API server clock.
-    let leased = match lease_pending_job(pool, &agent_id, &agent.platform).await {
+    let leased = match lease_pending_job(pool, &agent_id).await {
         Ok(Some(leased)) => leased,
         Ok(None) => {
             // No Pending job available — 204 No Content.
@@ -756,6 +2209,7 @@ pub async fn poll_job(
 
     let job = Job {
         id: row.id,
+        agent_enrollment_id: agent.id,
         platform: row.platform.clone(),
         spec,
         status: JobStatus::Leased,
@@ -805,15 +2259,15 @@ pub async fn ack_job(
     // drive another agent's job to Running (defense-in-depth on top of the
     // fencing_token secret).
     let updated = sqlx::query_scalar::<_, Uuid>(
-        "UPDATE agent_jobs \
+        "UPDATE agent_jobs AS job \
          SET status = 'Running', updated_at = NOW() \
-         WHERE id = $1 \
-           AND agent_id = $4 \
-           AND status = 'Leased' \
-           AND attempt_id = $2 \
-           AND fencing_token = $3 \
-           AND lease_deadline >= NOW() \
-         RETURNING id",
+         WHERE job.id = $1 \
+           AND job.agent_id = $4 \
+           AND job.status = 'Leased' \
+           AND job.attempt_id = $2 \
+           AND job.fencing_token = $3 \
+           AND job.lease_deadline >= NOW() \
+         RETURNING job.id",
     )
     .bind(job_id)
     .bind(body.attempt_id)
@@ -1119,7 +2573,24 @@ fn plan_u32(value: &Value) -> Option<u32> {
     u32::try_from(value.as_u64()?).ok()
 }
 
+fn has_exact_object_keys(value: &Value, expected: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn planned_vm_shape(after: &Value) -> Option<PlannedVmShape> {
+    if !has_exact_object_keys(after, &["name", "num_cpus", "memory", "disk"]) {
+        return None;
+    }
     let after = after.as_object()?;
     let memory_mb = plan_u32(after.get("memory")?)?;
     let cpu = plan_u32(after.get("num_cpus")?)?;
@@ -1131,6 +2602,9 @@ fn planned_vm_shape(after: &Value) -> Option<PlannedVmShape> {
     let [disk] = disks.as_slice() else {
         return None;
     };
+    if !has_exact_object_keys(disk, &["label", "size"]) {
+        return None;
+    }
     if disk.get("label").and_then(Value::as_str) != Some("disk0") {
         return None;
     }
@@ -1148,6 +2622,9 @@ fn record_planned_placement_name(
     logical_name: &str,
     after: &Value,
 ) -> Option<()> {
+    if !has_exact_object_keys(after, &["name"]) {
+        return None;
+    }
     let value = after.get("name")?.as_str()?.to_string();
     let slot = match (resource_type, logical_name) {
         ("vsphere_datacenter", "dc") => &mut names.datacenter,
@@ -1164,9 +2641,10 @@ fn record_planned_placement_name(
     Some(())
 }
 
-/// Parse only the small allowlisted portion needed for an approval decision.
-/// Unknown mutating resource types/actions fail closed and suppress the review
-/// rather than reflecting raw Terraform/provider data.
+/// Parse only the versioned safe-projection envelope emitted by the runner.
+/// Legacy/raw Terraform JSON, unknown fields, incomplete projections, and
+/// unknown mutating resource types/actions all fail closed and suppress the
+/// review rather than reflecting Terraform/provider data.
 fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanReview> {
     let state_key = spec.state_key.clone()?;
     if !ryuki_protocol::is_safe_state_key(&state_key) {
@@ -1179,6 +2657,21 @@ fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanRe
         _ => return None,
     };
     let plan: Value = serde_json::from_slice(evidence).ok()?;
+    if !has_exact_object_keys(
+        &plan,
+        &[
+            "schema_version",
+            "canonical_plan_sha256",
+            "projection_complete",
+            "resource_changes",
+        ],
+    ) || plan.get("schema_version")?.as_str()?
+        != ryuki_protocol::TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION
+        || !plan.get("projection_complete")?.as_bool()?
+        || !is_lowercase_sha256(plan.get("canonical_plan_sha256")?.as_str()?)
+    {
+        return None;
+    }
     let resource_changes = plan.get("resource_changes")?.as_array()?;
     let mut managed_changes = Vec::new();
     let mut counts = PlanChangeCounts::default();
@@ -1186,8 +2679,14 @@ fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanRe
     let mut vm_shape: Option<PlannedVmShape> = None;
 
     for resource in resource_changes {
+        if !has_exact_object_keys(resource, &["mode", "type", "name", "change"]) {
+            return None;
+        }
         let resource_mode = resource.get("mode").and_then(Value::as_str)?;
         let change = resource.get("change")?;
+        if !has_exact_object_keys(change, &["actions", "after"]) {
+            return None;
+        }
         let actions = change.get("actions")?.as_array()?;
         let action = classify_managed_plan_action(actions)?;
 
@@ -1211,10 +2710,6 @@ fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanRe
         if resource_mode != "managed" {
             return None;
         }
-        // A no-op managed resource proves this state already owns
-        // infrastructure outside the one reviewed create. Approval would then
-        // produce a state the guarded single-VM cleanup must refuse.
-        let action = action?;
         if resource.get("type").and_then(Value::as_str) != Some("vsphere_virtual_machine")
             || resource.get("name").and_then(Value::as_str) != Some(expected_resource_name)
         {
@@ -1224,18 +2719,24 @@ fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanRe
             return None;
         }
         vm_shape = Some(planned_vm_shape(change.get("after")?)?);
-        match action {
-            "create" => counts.create += 1,
-            "update" => counts.update += 1,
-            "delete" => counts.delete += 1,
-            "replace" => counts.replace += 1,
-            _ => return None,
+        // Retention may include one exact, allowlisted managed no-op/read so
+        // scheduled drift checks can record a converged projection. Approval
+        // remains stricter below: it requires exactly one create and therefore
+        // cannot authorize this non-mutating shape.
+        if let Some(action) = action {
+            match action {
+                "create" => counts.create += 1,
+                "update" => counts.update += 1,
+                "delete" => counts.delete += 1,
+                "replace" => counts.replace += 1,
+                _ => return None,
+            }
+            managed_changes.push(ManagedPlanChange {
+                resource_type: "virtual_machine",
+                logical_name: expected_resource_name.to_string(),
+                action,
+            });
         }
-        managed_changes.push(ManagedPlanChange {
-            resource_type: "virtual_machine",
-            logical_name: expected_resource_name.to_string(),
-            action,
-        });
     }
 
     let vm_shape = vm_shape?;
@@ -1261,6 +2762,48 @@ fn derive_live_plan_review(spec: &JobSpec, evidence: &[u8]) -> Option<LivePlanRe
         managed_changes,
         counts,
     })
+}
+
+/// Enforce the distinct raw-plan commitment carried by a successful LivePlan.
+/// The evidence digest proves the retained safe-projection bytes; this value
+/// instead commits to the complete canonical Terraform plan that projection
+/// was derived from. Legacy results without the signed commitment and results
+/// whose commitment differs from the digest inside the verified projection
+/// fail closed.
+fn validated_raw_plan_digest(
+    mode: &JobMode,
+    status: &JobResultStatus,
+    signed_raw_plan_digest: Option<&str>,
+    spec: &JobSpec,
+    evidence: &[u8],
+) -> Result<Option<String>, &'static str> {
+    if *mode == JobMode::LivePlan && *status == JobResultStatus::Planned {
+        if derive_live_plan_review(spec, evidence).is_none() {
+            return Err("LivePlan evidence is not a complete supported safe projection");
+        }
+        let signed = signed_raw_plan_digest
+            .ok_or("successful LivePlan result must include signed raw_plan_digest")?;
+        if !is_lowercase_sha256(signed) {
+            return Err("raw_plan_digest must be a lowercase SHA-256 digest");
+        }
+        let projection: Value = serde_json::from_slice(evidence)
+            .map_err(|_| "LivePlan evidence is not a complete supported safe projection")?;
+        let projected = projection
+            .get("canonical_plan_sha256")
+            .and_then(Value::as_str)
+            .ok_or("LivePlan evidence is not a complete supported safe projection")?;
+        if projected != signed {
+            return Err(
+                "raw_plan_digest does not match the canonical plan digest in signed evidence",
+            );
+        }
+        return Ok(Some(signed.to_owned()));
+    }
+
+    if signed_raw_plan_digest.is_some() {
+        return Err("raw_plan_digest is only valid for a successful LivePlan result");
+    }
+    Ok(None)
 }
 
 pub(crate) fn server_live_plan_is_safe_to_approve(spec: &JobSpec, evidence: &[u8]) -> bool {
@@ -1613,7 +3156,7 @@ fn protocol_version_is_supported(v: u32) -> bool {
 /// - absent                     → `PROTOCOL_VERSION_LEGACY` (1)
 ///
 /// The resolved value is then ALWAYS checked against
-/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v2-only allowlist therefore
+/// `SUPPORTED_PROTOCOL_VERSIONS`. The current v6-only allowlist therefore
 /// rejects an absent header as legacy v1; omission is never a compatibility
 /// bypass. Used by the [`ProtocolVersion`] extractor.
 fn resolve_protocol_version(headers: &HeaderMap) -> Result<u32, (StatusCode, Json<Value>)> {
@@ -1834,6 +3377,7 @@ async fn record_live_plan_awaiting_apply(
     job_id: uuid::Uuid,
     result_status_str: &str,
     evidence_digest: &str,
+    raw_plan_digest: &str,
 ) -> Result<(), sqlx::Error> {
     let stages_json =
         match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(stages_val.clone()) {
@@ -1851,6 +3395,10 @@ async fn record_live_plan_awaiting_apply(
                     stage.metadata.insert(
                         "live_plan_evidence_digest".into(),
                         evidence_digest.to_string(),
+                    );
+                    stage.metadata.insert(
+                        "live_plan_raw_plan_digest".into(),
+                        raw_plan_digest.to_string(),
                     );
                 }
                 serde_json::to_value(&stages).unwrap_or(stages_val)
@@ -1908,6 +3456,7 @@ async fn record_live_plan_awaiting_apply(
                     "agent_job_id": job_id.to_string(),
                     "result_status": result_status_str,
                     "evidence_digest": evidence_digest,
+                    "raw_plan_digest": raw_plan_digest,
                     "awaiting_live_apply_approval": true,
                 }),
                 outcome: "planned",
@@ -2004,7 +3553,8 @@ async fn fail_request_with_teardown(
 /// - **Step plan present, completing job's `mode == LivePlan`** (#42 slice
 ///   B1a — the forward per-step live path's human-gated pause point): on
 ///   success, mark the step `AwaitingApproval` and record the LivePlan's
-///   `evidence_digest` onto `job_steps.live_plan_digest` — mirroring exactly
+///   signed raw-plan commitment onto `job_steps.live_plan_digest` — mirroring
+///   exactly
 ///   how `requests_approve_live_apply` already re-derives the same field for
 ///   the single-job live path. Downstream steps are NOT dispatched and the
 ///   request is NOT advanced (stays `executing`): a step's LivePlan
@@ -2026,15 +3576,25 @@ async fn fail_request_with_teardown(
 /// Best-effort and CAS-guarded: a request that is missing (e.g. synthetic test
 /// jobs) or no longer `executing` is left untouched, so this never fails the
 /// result POST.
-async fn backlink_request_execution(
+#[derive(Clone, Copy)]
+struct BacklinkDigests<'a> {
+    evidence: &'a str,
+    raw_plan: Option<&'a str>,
+}
+
+async fn backlink_request_execution_with_raw_plan_digest(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: uuid::Uuid,
     status: &JobResultStatus,
     mode: &JobMode,
     result_status_str: &str,
-    evidence_digest: &str,
+    digests: BacklinkDigests<'_>,
     job_id: uuid::Uuid,
 ) -> Result<(), sqlx::Error> {
+    let BacklinkDigests {
+        evidence: evidence_digest,
+        raw_plan: raw_plan_digest,
+    } = digests;
     let success = matches!(
         status,
         JobResultStatus::CheckOk
@@ -2074,6 +3634,11 @@ async fn backlink_request_execution(
 
     if plan.is_empty() {
         if matches!(mode, JobMode::LivePlan) && success {
+            let raw_plan_digest = raw_plan_digest.ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "successful LivePlan backlink is missing raw_plan_digest".to_string(),
+                )
+            })?;
             return record_live_plan_awaiting_apply(
                 tx,
                 request_id,
@@ -2081,6 +3646,7 @@ async fn backlink_request_execution(
                 job_id,
                 result_status_str,
                 evidence_digest,
+                raw_plan_digest,
             )
             .await;
         }
@@ -2136,7 +3702,12 @@ async fn backlink_request_execution(
             // Do NOT dispatch downstream steps and do NOT advance the
             // request — it stays `executing` until an operator approves this
             // step's live apply (slice B1b).
-            crate::repos::job_steps::record_live_plan_digest(&mut **tx, step.id, evidence_digest)
+            let raw_plan_digest = raw_plan_digest.ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "successful LivePlan backlink is missing raw_plan_digest".to_string(),
+                )
+            })?;
+            crate::repos::job_steps::record_live_plan_digest(&mut **tx, step.id, raw_plan_digest)
                 .await?;
             return Ok(());
         }
@@ -2366,6 +3937,30 @@ async fn backlink_request_execution(
     Ok(())
 }
 
+async fn backlink_request_execution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: uuid::Uuid,
+    status: &JobResultStatus,
+    mode: &JobMode,
+    result_status_str: &str,
+    evidence_digest: &str,
+    job_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    backlink_request_execution_with_raw_plan_digest(
+        tx,
+        request_id,
+        status,
+        mode,
+        result_status_str,
+        BacklinkDigests {
+            evidence: evidence_digest,
+            raw_plan: None,
+        },
+        job_id,
+    )
+    .await
+}
+
 /// Inner implementation that accepts an explicit pool — used by integration
 /// tests that cannot rely on the global `get_db()` singleton.
 async fn post_job_result_with_pool(
@@ -2411,6 +4006,7 @@ async fn post_job_result_with_pool(
         result_id: Option<uuid::Uuid>,
         result_status: Option<String>,
         evidence_digest: Option<String>,
+        raw_plan_digest: Option<String>,
         completed_at: Option<chrono::DateTime<Utc>>,
         // #31 slice 2: the scheduler-set marker distinguishing a drift-recheck
         // LivePlan job (Some("drift_recheck")) from a normal operator job (None).
@@ -2420,7 +4016,7 @@ async fn post_job_result_with_pool(
     let row = sqlx::query_as::<_, JobForResult>(
         "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
          platform, request_id, live_context, \
-         result_id, result_status, evidence_digest, completed_at, origin \
+         result_id, result_status, evidence_digest, raw_plan_digest, completed_at, origin \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(job_id)
@@ -2472,6 +4068,15 @@ async fn post_job_result_with_pool(
 
     verify_envelope(env, &vk)
         .map_err(|_| bad_request("signature verification failed — envelope has been tampered"))?;
+
+    // `agent_id` and even the Ed25519 key may be reused only after a fresh
+    // enrollment row is created. The signed immutable UUID prevents that new
+    // row from completing or inheriting results produced by its predecessor.
+    if env.agent_enrollment_id != agent.id {
+        return Err(bad_request(
+            "envelope.agent_enrollment_id does not match the authenticated enrollment",
+        ));
+    }
 
     // ── Step 4: lease / fencing match ────────────────────────────────────────
     let stored_attempt_id = row
@@ -2577,6 +4182,11 @@ async fn post_job_result_with_pool(
             "outer result.evidence_digest does not match envelope.evidence_digest",
         ));
     }
+    if result.raw_plan_digest != env.raw_plan_digest {
+        return Err(bad_request(
+            "outer result.raw_plan_digest does not match envelope.raw_plan_digest",
+        ));
+    }
 
     // ── Step 5b: redaction_policy_version must be a CP-recognised policy ──────
     //
@@ -2631,6 +4241,30 @@ async fn post_job_result_with_pool(
             "envelope.request_id does not match the dispatched job spec's request_id",
         ));
     }
+
+    // ── Step 7b: canonical live execution profile ──────────────────────────
+    // Every non-refusal live result signs the complete non-secret profile.
+    // Validate the closed schema/allowlist against authoritative stored job
+    // inputs before it can become plan approval provenance.
+    let result_trust_profile_digest = if matches!(
+        stored_mode,
+        JobMode::LivePlan | JobMode::LiveApply | JobMode::LiveDestroy
+    ) && env.status != JobResultStatus::LiveRefused
+    {
+        let profile = env.execution_trust_profile.as_ref().ok_or_else(|| {
+            bad_request("successful live result must include execution_trust_profile")
+        })?;
+        validate_execution_trust_profile(profile, &stored_spec, &row.platform)
+            .map_err(bad_request)?;
+        Some(execution_trust_profile_digest(profile))
+    } else {
+        if env.execution_trust_profile.is_some() {
+            return Err(bad_request(
+                "offline and LiveRefused results must not include execution_trust_profile",
+            ));
+        }
+        None
+    };
 
     // ── Step 8: mode rules + LiveApply approved-plan grant check (S5) ─────────
     //
@@ -2700,6 +4334,39 @@ async fn post_job_result_with_pool(
                     .verifying_key();
                 verify_vlc(&grant, &cp_vk)
                     .map_err(|_| bad_request("approval grant signature is invalid"))?;
+
+                // Destination authority is signed independently from the
+                // agent's result envelope. It must equal the same canonical
+                // platform persisted on the dispatched job, closing replay of
+                // a genuine grant against a different platform backlog.
+                if grant.platform != row.platform {
+                    return Err(bad_request(
+                        "approval grant platform does not match the dispatched job",
+                    ));
+                }
+
+                // The grant is owned by the immutable successful-plan
+                // enrollment, not merely by an agent-id string that could be
+                // re-enrolled later. Compare all three identities plus the
+                // canonical current profile independently at ingestion.
+                if grant.execution_authority.assigned_agent_id != agent.agent_id
+                    || grant.execution_authority.assigned_agent_enrollment_id != agent.id
+                    || grant.execution_authority.assigned_agent_key_fingerprint
+                        != public_key_fingerprint(&agent.public_key)
+                {
+                    return Err(bad_request(
+                        "approval grant is assigned to a different agent enrollment",
+                    ));
+                }
+                let result_profile_digest = result_trust_profile_digest
+                    .as_deref()
+                    .ok_or_else(|| bad_request("live mutation result has no trust profile"))?;
+                if grant.execution_authority.execution_trust_profile_digest != result_profile_digest
+                {
+                    return Err(bad_request(
+                        "execution trust profile differs from the approved plan",
+                    ));
+                }
 
                 // The grant authorizes the exact stored JobSpec, including its
                 // mode, IaC digest/variables, and Terraform state key. This is
@@ -2804,6 +4471,19 @@ async fn post_job_result_with_pool(
         }
     }
 
+    // A successful LivePlan is retained only when the exact signed raw-plan
+    // commitment equals the canonical-plan digest inside the independently
+    // digest-verified safe projection. Legacy results without that distinct
+    // commitment fail closed; no other mode/status may smuggle one.
+    let accepted_raw_plan_digest = validated_raw_plan_digest(
+        &stored_mode,
+        &env.status,
+        env.raw_plan_digest.as_deref(),
+        &stored_spec,
+        &body.evidence,
+    )
+    .map_err(bad_request)?;
+
     // ── Step 9: atomic terminal UPDATE ───────────────────────────────────────
     //
     // Single UPDATE conditioned on (id, attempt_id, lease_generation, status IN
@@ -2887,13 +4567,14 @@ async fn post_job_result_with_pool(
              result_id = $2, \
              result_status = $3, \
              evidence_digest = $4, \
-             evidence_json = $5::jsonb, \
-             signed_envelope = $6::jsonb, \
+             raw_plan_digest = $5, \
+             evidence_json = $6::jsonb, \
+             signed_envelope = $7::jsonb, \
              completed_at = NOW(), \
              updated_at = NOW() \
-         WHERE id = $7 \
-           AND attempt_id = $8 \
-           AND lease_generation = $9 \
+         WHERE id = $8 \
+           AND attempt_id = $9 \
+           AND lease_generation = $10 \
            AND status IN ('Leased', 'Running') \
            AND lease_deadline > NOW() \
          RETURNING id",
@@ -2902,6 +4583,7 @@ async fn post_job_result_with_pool(
     .bind(result.result_id)
     .bind(effective_result_status)
     .bind(&env.evidence_digest)
+    .bind(accepted_raw_plan_digest.as_deref())
     .bind(&evidence_json_for_storage)
     .bind(&envelope_json)
     .bind(job_id)
@@ -2918,13 +4600,16 @@ async fn post_job_result_with_pool(
         // to the spec. This prevents a result from advancing the wrong request
         // if the column and the dispatched spec ever diverge.
         if !requires_reconciliation {
-            backlink_request_execution(
+            backlink_request_execution_with_raw_plan_digest(
                 &mut tx,
                 stored_spec.request_id,
                 &env.status,
                 &stored_mode,
                 effective_result_status,
-                &env.evidence_digest,
+                BacklinkDigests {
+                    evidence: &env.evidence_digest,
+                    raw_plan: accepted_raw_plan_digest.as_deref(),
+                },
                 job_id,
             )
             .await
@@ -3193,21 +4878,21 @@ async fn renew_running_job_lease(
     fence: &RunningLeaseFence,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     sqlx::query_scalar::<_, DateTime<Utc>>(
-        "UPDATE agent_jobs \
+        "UPDATE agent_jobs AS job \
          SET lease_deadline = NOW() + make_interval( \
              secs => CASE \
-                 WHEN mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') THEN $6 \
+                 WHEN job.mode IN ('LivePlan', 'LiveApply', 'LiveDestroy') THEN $6 \
                  ELSE $7 \
              END \
          ) \
-         WHERE id = $1 \
-           AND agent_id = $2 \
-           AND status = 'Running' \
-           AND attempt_id = $3 \
-           AND lease_generation = $4 \
-           AND fencing_token = $5 \
-           AND lease_deadline > NOW() \
-         RETURNING lease_deadline",
+         WHERE job.id = $1 \
+           AND job.agent_id = $2 \
+           AND job.status = 'Running' \
+           AND job.attempt_id = $3 \
+           AND job.lease_generation = $4 \
+           AND job.fencing_token = $5 \
+           AND job.lease_deadline > NOW() \
+         RETURNING job.lease_deadline",
     )
     .bind(fence.job_id)
     .bind(agent_id)
@@ -3589,11 +5274,20 @@ pub async fn create_agent_job(
 // Background lease-expiry sweep
 // ---------------------------------------------------------------------------
 
-/// Spawn a background task that calls `expire_leases` every `interval_secs`.
+async fn sweep_agent_lifecycle(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    // Preserve the pre-existing lease-fencing duty as the first operation: a
+    // later enrollment-cleanup error must not skip the current tick's lease work.
+    let expired_leases = expire_leases(pool).await?;
+    let expired_enrollments = cleanup_expired_pending_agent_enrollments(pool).await?;
+    Ok(expired_enrollments.saturating_add(expired_leases))
+}
+
+/// Spawn a background task that expires agent leases and prunes a bounded batch
+/// of expired Pending enrollments every `interval_secs`.
 ///
 /// Call once at server startup (after the DB pool is available).
 /// The task runs forever; it is cancelled when the tokio runtime shuts down.
-/// `expire_leases` is idempotent, so duplicate sweeps are harmless.
+/// Both operations are idempotent, so duplicate sweeps are harmless.
 /// Heartbeat registry name for the lease-expiry sweep loop.
 const LEASE_EXPIRY_SWEEP_NAME: &str = "lease_expiry_sweep";
 
@@ -3614,7 +5308,7 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match crate::background::run_bounded(timeout, expire_leases(&pool)).await {
+            match crate::background::run_bounded(timeout, sweep_agent_lifecycle(&pool)).await {
                 Ok(_) => {
                     consecutive_failures = 0;
                     crate::background::record_loop_success(LEASE_EXPIRY_SWEEP_NAME);
@@ -3860,6 +5554,202 @@ pub enum CreateLiveApplyJobError {
     Db(#[from] sqlx::Error),
 }
 
+/// Closed authority proof for the two step-scoped live mutation modes. A
+/// human-approved LiveApply carries the admitted session itself; compensating
+/// LiveDestroy is available only to the dedicated control-plane teardown path.
+/// A caller can no longer pass an arbitrary approver string to the signing
+/// choke point.
+pub enum StepLiveJobAuthority<'a> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    VerifiedHuman(&'a AuthSession),
+    SystemAutoTeardown,
+}
+
+/// Exact immutable successful-plan row and leased attempt selected by the
+/// approval flow. A digest is review evidence, not a unique authority key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPlanReference {
+    pub job_id: Uuid,
+    pub attempt_id: Uuid,
+    /// LiveDestroy carries forward the authority that the prior CP-signed
+    /// LiveApply grant used. The exact plan row must recompute to the same
+    /// authority before a rollback grant can be minted.
+    pub expected_execution_authority: Option<LiveExecutionAuthority>,
+}
+
+type SuccessfulPlanAuthorityRow = (
+    String,
+    sqlx::types::Json<Value>,
+    sqlx::types::Json<Value>,
+    Uuid,
+    String,
+    String,
+    String,
+    Option<Uuid>,
+    i64,
+    Option<Uuid>,
+    String,
+    String,
+    Vec<u8>,
+);
+
+/// Resolve and re-verify the exact immutable enrollment and canonical
+/// execution profile that produced the successful plan being approved. The
+/// agent row is share-locked through grant insertion so revocation/key changes
+/// cannot race the mint.
+async fn successful_plan_execution_authority(
+    connection: &mut sqlx::PgConnection,
+    approved_plan: &ApprovedPlanReference,
+    request_id: Uuid,
+    platform: &str,
+    mutation_spec: &JobSpec,
+    approved_plan_digest: &str,
+) -> Result<LiveExecutionAuthority, CreateLiveApplyJobError> {
+    let state_key = mutation_spec
+        .state_key
+        .as_deref()
+        .ok_or(CreateLiveApplyJobError::Invalid(
+            "live mutation has no state key",
+        ))?;
+    let row: Option<SuccessfulPlanAuthorityRow> = sqlx::query_as(
+        "SELECT j.agent_id, j.signed_envelope, j.spec, \
+                a.id, a.public_key, a.status, a.platform, \
+                j.attempt_id, j.lease_generation, j.result_id, \
+                j.evidence_digest, j.raw_plan_digest, eb.bytes \
+         FROM agent_jobs j \
+         JOIN agents a ON a.agent_id = j.agent_id \
+         JOIN evidence_blobs eb ON eb.digest = j.evidence_digest \
+         WHERE j.id = $1 AND j.request_id = $2 AND j.platform = $3 \
+           AND j.mode = 'LivePlan' AND j.status = 'Succeeded' \
+           AND j.result_status = 'planned' \
+           AND j.completed_at IS NOT NULL \
+           AND j.raw_plan_digest = $4 AND j.signed_envelope IS NOT NULL \
+           AND j.spec->>'state_key' = $5 \
+         FOR SHARE OF j, a",
+    )
+    .bind(approved_plan.job_id)
+    .bind(request_id)
+    .bind(platform)
+    .bind(approved_plan_digest)
+    .bind(state_key)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((
+        agent_id,
+        envelope_json,
+        plan_spec_json,
+        enrollment_id,
+        public_key,
+        status,
+        agent_platform,
+        row_attempt_id,
+        row_lease_generation,
+        row_result_id,
+        stored_evidence_digest,
+        stored_raw_plan_digest,
+        stored_evidence,
+    )) = row
+    else {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approved plan has no signed immutable execution authority",
+        ));
+    };
+    if status != "approved" || agent_platform != platform {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "planning agent enrollment is no longer approved for this platform",
+        ));
+    }
+
+    let plan_spec: JobSpec = serde_json::from_value(plan_spec_json.0).map_err(|_| {
+        CreateLiveApplyJobError::Invalid("stored approved-plan job spec is malformed")
+    })?;
+    if plan_spec.mode != JobMode::LivePlan
+        || plan_spec.request_id != mutation_spec.request_id
+        || plan_spec.offering_id != mutation_spec.offering_id
+        || plan_spec.iac_ref != mutation_spec.iac_ref
+        || plan_spec.iac_digest != mutation_spec.iac_digest
+        || plan_spec.vars != mutation_spec.vars
+        || plan_spec.state_key != mutation_spec.state_key
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approved plan job spec differs from the mutation spec",
+        ));
+    }
+    let envelope: ryuki_protocol::SignedEnvelope = serde_json::from_value(envelope_json.0)
+        .map_err(|_| {
+            CreateLiveApplyJobError::Invalid("stored approved-plan signature is malformed")
+        })?;
+    let verifying_key = decode_verifying_key(&public_key).map_err(|_| {
+        CreateLiveApplyJobError::Invalid("planning agent enrollment key is malformed")
+    })?;
+    if row_attempt_id != Some(approved_plan.attempt_id)
+        || row_lease_generation < 0
+        || envelope.job_id != approved_plan.job_id
+        || envelope.attempt_id != approved_plan.attempt_id
+        || envelope.lease_generation != row_lease_generation as u64
+        || row_result_id != Some(envelope.result_id)
+        || envelope.request_id != request_id
+        || envelope.agent_id != agent_id
+        || envelope.agent_enrollment_id != enrollment_id
+        || envelope.platform != platform
+        || envelope.mode != JobMode::LivePlan
+        || envelope.status != JobResultStatus::Planned
+        || envelope.key_id != encode_verifying_key(&verifying_key)
+        || envelope.job_spec_digest != ryuki_protocol::job_spec_digest(&plan_spec)
+        || envelope.evidence_digest != stored_evidence_digest
+        || envelope.raw_plan_digest.as_deref() != Some(stored_raw_plan_digest.as_str())
+        || stored_raw_plan_digest != approved_plan_digest
+        || ryuki_protocol::verify(&envelope, &verifying_key).is_err()
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "stored approved-plan signature or authority is invalid",
+        ));
+    }
+    if ryuki_protocol::sha256_hex(&stored_evidence) != stored_evidence_digest
+        || validated_raw_plan_digest(
+            &JobMode::LivePlan,
+            &JobResultStatus::Planned,
+            envelope.raw_plan_digest.as_deref(),
+            &plan_spec,
+            &stored_evidence,
+        )
+        .ok()
+        .flatten()
+        .as_deref()
+            != Some(stored_raw_plan_digest.as_str())
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "stored approved-plan evidence or raw-plan commitment is invalid",
+        ));
+    }
+    let profile =
+        envelope
+            .execution_trust_profile
+            .as_ref()
+            .ok_or(CreateLiveApplyJobError::Invalid(
+                "approved plan has no execution trust profile",
+            ))?;
+    validate_execution_trust_profile(profile, &plan_spec, platform)
+        .map_err(CreateLiveApplyJobError::Invalid)?;
+
+    let execution_authority = LiveExecutionAuthority {
+        assigned_agent_id: agent_id,
+        assigned_agent_enrollment_id: enrollment_id,
+        assigned_agent_key_fingerprint: public_key_fingerprint(&public_key),
+        execution_trust_profile_digest: execution_trust_profile_digest(profile),
+    };
+    if approved_plan
+        .expected_execution_authority
+        .as_ref()
+        .is_some_and(|expected| expected != &execution_authority)
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "prior live-apply authority differs from the exact approved plan",
+        ));
+    }
+    Ok(execution_authority)
+}
+
 /// Enqueue a new Pending `LiveApply` job with a CP-signed [`VerifiedLiveContext`]
 /// grant attached, and return the job row id.
 ///
@@ -3914,14 +5804,24 @@ pub enum CreateLiveApplyJobError {
 #[allow(clippy::too_many_arguments)]
 pub async fn create_live_apply_job(
     pool: &PgPool,
+    approved_plan: ApprovedPlanReference,
     request_id: Uuid,
     platform: &str,
     spec: &JobSpec,
     approved_plan_digest: &str,
-    approver: &str,
+    session: &AuthSession,
     expiry: DateTime<Utc>,
     cp_key: &ed25519_dalek::SigningKey,
 ) -> Result<Uuid, CreateLiveApplyJobError> {
+    // This is the final signing/persistence choke point. Enforce human
+    // provenance before opening a transaction so machine/unknown/simulated
+    // callers cannot mutate request state, append approval audit, or mint a
+    // CP-signed grant even if a handler or future route is composed incorrectly.
+    if !ryuki_engine::auth::check_human_signoff_permission(session, "admin") {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "live-apply approval requires a verified human administrator",
+        ));
+    }
     // Invariant: this function only creates LiveApply jobs — the grant is
     // meaningless for any other mode, and the S5a-1 verifier only checks grants
     // on LiveApply results. Fail closed (return Err) rather than panic so a
@@ -3944,21 +5844,28 @@ pub async fn create_live_apply_job(
     // statements below run on this transaction; any early `?` return drops it
     // (rollback), so a grant is persisted only on the committed success path.
     let mut tx = pool.begin().await?;
-    let req_status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
+    let request_state: Option<(String, String, String)> =
+        sqlx::query_as("SELECT status, stage, site FROM requests WHERE id = $1 FOR UPDATE")
             .bind(request_id)
             .fetch_optional(&mut *tx)
             .await?;
-    match req_status {
+    let (request_status, request_stage, request_site) = match request_state {
         None => {
             return Err(CreateLiveApplyJobError::Invalid(
                 "request not found; cannot mint a live-apply grant",
             ));
         }
-        Some(status) if crate::contracts::db_status_to_request_status(&status).is_concluded() => {
+        Some((status, _, _))
+            if crate::contracts::db_status_to_request_status(&status).is_concluded() =>
+        {
             return Err(CreateLiveApplyJobError::RequestConcluded);
         }
-        Some(_) => {}
+        Some(state) => state,
+    };
+    if request_site != platform {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "live-apply platform differs from the authoritative request site",
+        ));
     }
 
     // #42 slice 3: never mint a single-shot LiveApply grant for a request that
@@ -3987,6 +5894,7 @@ pub async fn create_live_apply_job(
             "approved_plan_digest must be a 64-character SHA-256 hex string",
         ));
     }
+    let approver = session.user_id.as_str();
     if approver.trim().is_empty() {
         return Err(CreateLiveApplyJobError::Invalid(
             "approver must not be empty",
@@ -4004,17 +5912,31 @@ pub async fn create_live_apply_job(
         ));
     }
 
+    let execution_authority = successful_plan_execution_authority(
+        &mut tx,
+        &approved_plan,
+        request_id,
+        platform,
+        spec,
+        approved_plan_digest,
+    )
+    .await?;
+
     // Build and sign the VerifiedLiveContext grant. This whole-request path
     // mints a legacy/single-job grant (step_job_id: None) — #42 slice B adds
     // the per-step minting path that sets step_job_id: Some(..); this
     // function's contract is unchanged by slice A.
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
+        approved_plan_job_id: approved_plan.job_id,
+        approved_plan_attempt_id: approved_plan.attempt_id,
         approver: approver.to_string(),
         expiry,
         step_job_id: None,
+        execution_authority: execution_authority.clone(),
         signature: String::new(),
     };
     let signed_grant = sign_vlc(unsigned_grant, cp_key);
@@ -4041,8 +5963,8 @@ pub async fn create_live_apply_job(
         // (so step-scoped per-step LiveApply jobs are exempt), so this single-
         // job insert — which leaves step_scoped at its FALSE default — must
         // carry the same `step_scoped = FALSE` predicate here to infer it.
-        "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context) \
-         VALUES ($1, $2, $3, 'LiveApply', $4::jsonb) \
+        "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context, agent_id) \
+         VALUES ($1, $2, $3, 'LiveApply', $4::jsonb, $5) \
          ON CONFLICT (request_id) WHERE mode = 'LiveApply' AND step_scoped = FALSE DO NOTHING \
          RETURNING id",
     )
@@ -4050,11 +5972,32 @@ pub async fn create_live_apply_job(
     .bind(platform)
     .bind(&spec_json)
     .bind(&grant_json)
+    .bind(&execution_authority.assigned_agent_id)
     .fetch_optional(&mut *tx)
     .await?;
     let id = id.ok_or(CreateLiveApplyJobError::Invalid(
         "a live-apply has already been approved for this request",
     ))?;
+    let request_id_text = request_id.to_string();
+    crate::audit::record_audit_tx(
+        &mut tx,
+        session,
+        &crate::audit::AuditRecord {
+            action: "request.approve-live-apply",
+            request_id: Some(&request_id_text),
+            from_status: Some(&request_status),
+            to_status: &request_status,
+            from_stage: Some(&request_stage),
+            to_stage: &request_stage,
+            detail: json!({
+                "agent_job_id": id,
+                "approved_plan_digest": approved_plan_digest,
+                "mode": "LiveApply",
+            }),
+            outcome: "approved",
+        },
+    )
+    .await?;
     // Commit only the success path — the request row lock (and any rows) are
     // released here; every early return above rolled back instead.
     tx.commit().await?;
@@ -4099,18 +6042,19 @@ pub async fn create_live_apply_job(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_step_live_job(
     tx: &mut sqlx::PgConnection,
+    approved_plan: ApprovedPlanReference,
     request_id: Uuid,
     step_id: Uuid,
     platform: &str,
     spec: &JobSpec,
     approved_plan_digest: &str,
-    approver: &str,
+    authority: StepLiveJobAuthority<'_>,
     expiry: DateTime<Utc>,
     cp_key: &ed25519_dalek::SigningKey,
 ) -> Result<Uuid, CreateLiveApplyJobError> {
     // A step live job must be LiveApply or LiveDestroy (both step-scoped,
     // grant-bound, live-mutating), and its spec must be for THIS request.
-    if !matches!(spec.mode, JobMode::LiveApply | JobMode::LiveDestroy) {
+    if !matches!(&spec.mode, JobMode::LiveApply | JobMode::LiveDestroy) {
         return Err(CreateLiveApplyJobError::Invalid(
             "create_step_live_job requires a LiveApply or LiveDestroy spec",
         ));
@@ -4122,25 +6066,65 @@ pub async fn create_step_live_job(
     }
     validate_step_live_state_key(spec, step_id).map_err(CreateLiveApplyJobError::Invalid)?;
 
+    let approver = match (&spec.mode, &authority) {
+        (JobMode::LiveApply, StepLiveJobAuthority::VerifiedHuman(session))
+            if ryuki_engine::auth::check_human_signoff_permission(session, "admin") =>
+        {
+            session.user_id.as_str()
+        }
+        (JobMode::LiveApply, _) => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "step live-apply approval requires a verified human administrator",
+            ));
+        }
+        (JobMode::LiveDestroy, StepLiveJobAuthority::SystemAutoTeardown) => "system:auto-teardown",
+        (JobMode::LiveDestroy, _) => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "step live-destroy requires dedicated system teardown authority",
+            ));
+        }
+        _ => unreachable!("step live mode was validated above"),
+    };
+    match &spec.mode {
+        JobMode::LiveDestroy if approved_plan.expected_execution_authority.is_none() => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "step live-destroy requires the prior signed live-apply authority",
+            ));
+        }
+        JobMode::LiveApply if approved_plan.expected_execution_authority.is_some() => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "step live-apply must derive authority directly from its exact plan",
+            ));
+        }
+        _ => {}
+    }
+
     // Fail closed: never mint a live-apply grant for a CONCLUDED request. Lock
     // the request row so it cannot conclude between this check and the INSERT
     // (same TOCTOU guard as the single-job path). The caller runs this inside
     // its own transaction, so the lock is held until that transaction commits.
-    let req_status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
+    let request_state: Option<(String, String)> =
+        sqlx::query_as("SELECT status, site FROM requests WHERE id = $1 FOR UPDATE")
             .bind(request_id)
             .fetch_optional(&mut *tx)
             .await?;
-    match req_status {
+    let request_site = match request_state {
         None => {
             return Err(CreateLiveApplyJobError::Invalid(
                 "request not found; cannot mint a live-apply grant",
             ));
         }
-        Some(status) if crate::contracts::db_status_to_request_status(&status).is_concluded() => {
+        Some((status, _))
+            if crate::contracts::db_status_to_request_status(&status).is_concluded() =>
+        {
             return Err(CreateLiveApplyJobError::RequestConcluded);
         }
-        Some(_) => {}
+        Some((_, site)) => site,
+    };
+    if request_site != platform {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "step live-job platform differs from the authoritative request site",
+        ));
     }
 
     // The state namespace is derived from a persisted orchestration step, not
@@ -4182,16 +6166,30 @@ pub async fn create_step_live_job(
         ));
     }
 
+    let execution_authority = successful_plan_execution_authority(
+        tx,
+        &approved_plan,
+        request_id,
+        platform,
+        spec,
+        approved_plan_digest,
+    )
+    .await?;
+
     // Generate the job id client-side so it can be bound INTO the grant
     // (step_job_id) before signing — the whole point of the step-scoped grant.
     let job_id = Uuid::new_v4();
     let unsigned_grant = VerifiedLiveContext {
         request_id,
+        platform: platform.to_string(),
         job_spec_digest: ryuki_protocol::job_spec_digest(spec),
         approved_plan_digest: approved_plan_digest.to_string(),
+        approved_plan_job_id: approved_plan.job_id,
+        approved_plan_attempt_id: approved_plan.attempt_id,
         approver: approver.to_string(),
         expiry,
         step_job_id: Some(job_id),
+        execution_authority: execution_authority.clone(),
         signature: String::new(),
     };
     let signed_grant = sign_vlc(unsigned_grant, cp_key);
@@ -4205,7 +6203,7 @@ pub async fn create_step_live_job(
     // the envelope against this column. A LiveDestroy job stored as 'LiveApply'
     // would have its (correctly LiveDestroy) result rejected, stalling the
     // rollback. (spec.mode was validated to LiveApply|LiveDestroy above.)
-    let mode_label = match spec.mode {
+    let mode_label = match &spec.mode {
         JobMode::LiveDestroy => "LiveDestroy",
         _ => "LiveApply",
     };
@@ -4214,8 +6212,8 @@ pub async fn create_step_live_job(
     // ON CONFLICT: per-step single-approval is enforced by the caller's
     // AwaitingApproval->Applying lock, and the client-generated id is unique.
     sqlx::query(
-        "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, step_scoped, live_context) \
-         VALUES ($1, $2, $3, $4, $5, TRUE, $6::jsonb)",
+        "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, step_scoped, live_context, agent_id) \
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6::jsonb, $7)",
     )
     .bind(job_id)
     .bind(request_id)
@@ -4223,6 +6221,7 @@ pub async fn create_step_live_job(
     .bind(&spec_json)
     .bind(mode_label)
     .bind(&grant_json)
+    .bind(&execution_authority.assigned_agent_id)
     .execute(&mut *tx)
     .await?;
 
@@ -4293,7 +6292,10 @@ pub async fn cp_public_key() -> impl IntoResponse {
 /// (and independently of) their own auth.
 pub fn agent_routes() -> Router {
     Router::new()
-        .route("/api/agents/register", post(register_agent))
+        .route(
+            "/api/agents/register",
+            post(register_agent).layer(DefaultBodyLimit::max(AGENT_REGISTRATION_BODY_LIMIT_BYTES)),
+        )
         .route("/api/agents/cp-public-key", get(cp_public_key))
         .route("/api/agents/{agent_id}/jobs", get(poll_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/ack", post(ack_job))
@@ -4342,6 +6344,8 @@ pub const AGENT_ROUTE_PATHS: &[(&str, &str)] = &[
 /// NOT appear in this body so that a caller cannot forge the approving principal.
 #[derive(Debug, Deserialize)]
 pub struct ApproveLiveApplyBody {
+    pub approved_plan_job_id: Uuid,
+    pub approved_plan_attempt_id: Uuid,
     pub request_id: Uuid,
     pub platform: String,
     pub spec: JobSpec,
@@ -4350,7 +6354,8 @@ pub struct ApproveLiveApplyBody {
     pub expiry_seconds: u64,
 }
 
-/// Testable core for live-apply approval (no axum Extension — takes primitives).
+/// Testable core for live-apply approval (no axum Extension — receives the
+/// already-verified session explicitly).
 ///
 /// Validates `expiry_seconds`, computes the absolute expiry, then delegates to
 /// [`create_live_apply_job`] which performs the remaining invariant checks
@@ -4361,7 +6366,7 @@ pub struct ApproveLiveApplyBody {
 pub async fn approve_live_apply_with(
     pool: &PgPool,
     cp_key: &ed25519_dalek::SigningKey,
-    approver: &str,
+    session: &AuthSession,
     body: &ApproveLiveApplyBody,
 ) -> ApiResult<Json<Value>> {
     // Validate expiry bounds here for a clean 400 before we reach create_live_apply_job.
@@ -4380,11 +6385,16 @@ pub async fn approve_live_apply_with(
 
     let job_id = create_live_apply_job(
         pool,
+        ApprovedPlanReference {
+            job_id: body.approved_plan_job_id,
+            attempt_id: body.approved_plan_attempt_id,
+            expected_execution_authority: None,
+        },
         body.request_id,
         &body.platform,
         &body.spec,
         &body.approved_plan_digest,
-        approver,
+        session,
         expiry,
         cp_key,
     )
@@ -4402,7 +6412,7 @@ pub async fn approve_live_apply_with(
 
     Ok(Json(json!({
         "job_id": job_id,
-        "approver": approver,
+        "approver": session.user_id,
         "status": "Pending",
         "mode": "LiveApply"
     })))
@@ -4419,9 +6429,8 @@ pub async fn approve_live_apply_with(
 /// ## Auth posture
 ///
 /// The route sits under `/api/admin/` so the human RBAC middleware already
-/// enforces `admin` permission at the routing layer. The `check_permission`
-/// call below is defense-in-depth: it fires if the middleware assumption ever
-/// changes or the handler is composed without it.
+/// enforces verified-human `admin` permission at the routing layer. The typed
+/// actor check below is defense-in-depth if the handler is ever re-mounted.
 ///
 /// Returns `410 Gone` for every authorized caller. No request body is accepted
 /// and no database or signing-key state is consulted.
@@ -4430,8 +6439,8 @@ pub async fn admin_approve_live_apply_job(
 ) -> ApiResult<Json<Value>> {
     // Defense-in-depth: the /api/admin RBAC middleware already blocks non-admins,
     // but we re-check here so a future re-mount cannot bypass the gate.
-    if !check_permission(&session, "admin") {
-        return Err(forbidden("admin permission required"));
+    if !ryuki_engine::auth::check_human_signoff_permission(&session, "admin") {
+        return Err(forbidden("verified human admin permission required"));
     }
 
     Err((
@@ -4446,13 +6455,18 @@ pub async fn admin_approve_live_apply_job(
 // GET /api/admin/agents — list agents with recent jobs (human RBAC, admin only)
 // ---------------------------------------------------------------------------
 
-/// Minimal agent row projected for the admin list response.
-/// Never includes token_hash or public_key.
+/// Minimal agent row used to build the admin list response. The raw public key
+/// is selected only to derive its non-secret fingerprint and is never returned.
 #[derive(sqlx::FromRow)]
 struct AdminAgentRow {
+    id: Uuid,
+    enrollment_challenge_id: Option<Uuid>,
+    cryptographically_admitted: bool,
     agent_id: String,
     platform: String,
     status: String,
+    public_key: String,
+    capabilities: sqlx::types::Json<Value>,
     last_seen_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
 }
@@ -4484,23 +6498,38 @@ const JOBS_PER_AGENT_CAP: usize = 10;
 ///
 /// # Secret hygiene
 ///
-/// Only non-secret columns are selected: `agent_id`, `platform`, `status`,
-/// `last_seen_at`, `created_at`. `token_hash` and `public_key` are NEVER
-/// included in the query or the response.
+/// `token_hash` is never selected. The public key is selected only long enough
+/// to derive the SHA-256 fingerprint that binds a later approval request; the
+/// raw key is never included in the response. Capabilities contain only tool
+/// and provider versions and are represented by a SHA-256 digest in the roster.
 pub async fn list_agents_with(pool: &PgPool) -> ApiResult<Json<Value>> {
     // -- 1. Fetch agents (newest first, bounded) --
-    let agents: Vec<AdminAgentRow> = sqlx::query_as(
-        "SELECT agent_id, platform, status, last_seen_at, created_at \
-         FROM agents \
-         ORDER BY created_at DESC \
+    let mut agents: Vec<AdminAgentRow> = sqlx::query_as(
+        "SELECT agent.id, agent.enrollment_challenge_id, \
+                EXISTS ( \
+                    SELECT 1 FROM agent_enrollment_challenges AS challenge \
+                    WHERE challenge.id = agent.enrollment_challenge_id \
+                      AND challenge.status = 'consumed' \
+                      AND challenge.consumed_enrollment_id = agent.id \
+                      AND challenge.agent_id = agent.agent_id \
+                      AND challenge.platform = agent.platform \
+                      AND challenge.public_key = agent.public_key \
+                ) AS cryptographically_admitted, \
+                agent.agent_id, agent.platform, agent.status, agent.public_key, \
+                agent.capabilities, agent.last_seen_at, agent.created_at \
+         FROM agents AS agent \
+         ORDER BY agent.created_at DESC \
          LIMIT $1",
     )
-    .bind(LIST_AGENTS_LIMIT)
+    .bind(LIST_AGENTS_LIMIT + 1)
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
 
-    let capped = agents.len() as i64 >= LIST_AGENTS_LIMIT;
+    let capped = agents.len() as i64 > LIST_AGENTS_LIMIT;
+    if capped {
+        agents.truncate(LIST_AGENTS_LIMIT as usize);
+    }
 
     if agents.is_empty() {
         return Ok(Json(json!({ "agents": [], "capped": false })));
@@ -4553,9 +6582,14 @@ pub async fn list_agents_with(pool: &PgPool) -> ApiResult<Json<Value>> {
                 .remove(a.agent_id.as_str())
                 .unwrap_or_default();
             json!({
+                "enrollment_id": a.id,
+                "enrollment_challenge_id": a.enrollment_challenge_id,
+                "cryptographically_admitted": a.cryptographically_admitted,
                 "agent_id": a.agent_id,
                 "platform": a.platform,
                 "status": a.status,
+                "public_key_fingerprint": public_key_fingerprint(&a.public_key),
+                "capabilities_digest": capabilities_digest(&a.capabilities.0),
                 "last_seen_at": a.last_seen_at,
                 "created_at": a.created_at,
                 "jobs": jobs_for_agent,
@@ -4574,7 +6608,11 @@ pub async fn list_agents_with(pool: &PgPool) -> ApiResult<Json<Value>> {
 ///
 /// ## Secret hygiene
 ///
-/// `token_hash` and `public_key` are NEVER included in the response.
+/// `token_hash` and the raw `public_key` are NEVER included in the response.
+/// The immutable enrollment id and a SHA-256 public-key fingerprint are included
+/// so an approval can bind to the exact row/key the administrator reviewed.
+/// `cryptographically_admitted` is derived from the complete consumed-challenge
+/// linkage rather than from a nullable id alone.
 ///
 /// ## Bounds
 ///
@@ -5817,6 +7855,7 @@ struct JobResultRow {
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     result_id: Option<String>,
     evidence_digest: Option<String>,
+    raw_plan_digest: Option<String>,
     signed_envelope: Option<Value>,
 }
 
@@ -5844,7 +7883,7 @@ pub async fn admin_agent_job_result(
     let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
     let row: Option<JobResultRow> = sqlx::query_as(
         "SELECT mode, status, spec, result_status, completed_at, \
-                result_id::text AS result_id, evidence_digest, signed_envelope \
+                result_id::text AS result_id, evidence_digest, raw_plan_digest, signed_envelope \
          FROM agent_jobs WHERE id = $1",
     )
     .bind(uid)
@@ -5920,10 +7959,22 @@ pub async fn admin_agent_job_result(
             Json(json!({"error": "stored result digest failed validation"})),
         ));
     }
-    let plan_review = if row.mode == "LivePlan"
+    let successful_live_plan = row.mode == "LivePlan"
         && row.status == "Succeeded"
-        && row.result_status.as_deref() == Some("planned")
-    {
+        && row.result_status.as_deref() == Some("planned");
+    let plan_review = if successful_live_plan {
+        let stored_raw_plan_digest = row.raw_plan_digest.as_deref().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored raw plan digest failed validation"})),
+            )
+        })?;
+        if envelope.raw_plan_digest.as_deref() != Some(stored_raw_plan_digest) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored raw plan digest failed validation"})),
+            ));
+        }
         let stored_spec: JobSpec = serde_json::from_value(row.spec.0).map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5936,19 +7987,51 @@ pub async fn admin_agent_job_result(
                 Json(json!({"error": "stored job spec failed validation"})),
             ));
         }
-        let evidence: Option<Vec<u8>> =
+        let evidence: Vec<u8> =
             sqlx::query_scalar("SELECT bytes FROM evidence_blobs WHERE digest = $1")
                 .bind(&envelope.evidence_digest)
                 .fetch_optional(pool)
                 .await
-                .map_err(db_err)?;
-        evidence.and_then(|bytes| {
-            if ryuki_protocol::sha256_hex(&bytes) != envelope.evidence_digest {
-                return None;
-            }
-            derive_live_plan_review(&stored_spec, &bytes)
-        })
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "stored plan evidence failed validation"})),
+                    )
+                })?;
+        if ryuki_protocol::sha256_hex(&evidence) != envelope.evidence_digest {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored plan evidence failed validation"})),
+            ));
+        }
+        let validated = validated_raw_plan_digest(
+            &JobMode::LivePlan,
+            &JobResultStatus::Planned,
+            envelope.raw_plan_digest.as_deref(),
+            &stored_spec,
+            &evidence,
+        )
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored raw plan digest failed validation"})),
+            )
+        })?;
+        if validated.as_deref() != Some(stored_raw_plan_digest) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored raw plan digest failed validation"})),
+            ));
+        }
+        derive_live_plan_review(&stored_spec, &evidence)
     } else {
+        if row.raw_plan_digest.is_some() || envelope.raw_plan_digest.is_some() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored raw plan digest failed validation"})),
+            ));
+        }
         None
     };
 
@@ -5958,6 +8041,7 @@ pub async fn admin_agent_job_result(
         "completed_at": row.completed_at.map(|t| t.to_rfc3339()),
         "result_id": row.result_id,
         "evidence_digest": row.evidence_digest,
+        "raw_plan_digest": row.raw_plan_digest,
         "signed_envelope": serde_json::to_value(&envelope).unwrap_or_default(),
         "plan_review": plan_review,
     })))
@@ -6076,6 +8160,11 @@ pub async fn admin_agent_job_get(
 pub fn admin_routes() -> Router {
     Router::new()
         .route("/api/admin/agents", get(admin_list_agents))
+        .route(
+            "/api/admin/agents/enrollment-challenges",
+            post(admin_create_agent_enrollment_challenge)
+                .layer(DefaultBodyLimit::max(AGENT_REGISTRATION_BODY_LIMIT_BYTES)),
+        )
         // Static `liveness` in the `{agent_id}` slot — matchit routes the literal
         // over the param, so it does not shadow `/{agent_id}/approve`.
         .route("/api/admin/agents/liveness", get(admin_agents_liveness))
@@ -6143,9 +8232,350 @@ pub fn admin_routes() -> Router {
 mod tests {
     use super::*;
 
+    type PendingJobLeaseState = (
+        String,
+        Option<String>,
+        Option<Uuid>,
+        Option<String>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    );
+    type UntouchedPendingJobState = (
+        String,
+        Option<String>,
+        Option<Uuid>,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+        i32,
+        i32,
+    );
+
+    fn enrollment_human_admin_session(provider_mode: &str) -> AuthSession {
+        AuthSession {
+            user_id: "test-enrollment-admin".to_string(),
+            display_name: "Test Enrollment Admin".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            actor_class: if provider_mode == "api-token" {
+                ryuki_engine::auth::ActorClass::Workload
+            } else {
+                ryuki_engine::auth::ActorClass::VerifiedHuman
+            },
+            provider_mode: provider_mode.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn live_approver_session(user_id: &str) -> AuthSession {
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = user_id.to_string();
+        session.display_name = format!("{user_id} (test)");
+        session.provider_mode = "local".to_string();
+        session.token_valid = true;
+        session.actor_class = ryuki_engine::auth::ActorClass::VerifiedHuman;
+        session
+    }
+
+    async fn install_live_approval_audit_failure_trigger(pool: &PgPool) {
+        sqlx::query("DROP TRIGGER IF EXISTS zz_ryuki_test_reject_live_approval_audit ON audit_log")
+            .execute(pool)
+            .await
+            .expect("drop stale live-approval audit trigger");
+        sqlx::query("DROP FUNCTION IF EXISTS ryuki_test_reject_live_approval_audit()")
+            .execute(pool)
+            .await
+            .expect("drop stale live-approval audit function");
+        sqlx::query(
+            "CREATE FUNCTION ryuki_test_reject_live_approval_audit() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.actor_principal LIKE 'dbtest-live-audit-failure-%' THEN \
+                 RAISE EXCEPTION 'injected live approval audit failure' USING ERRCODE = '23514'; \
+               END IF; \
+               RETURN NEW; \
+             END $$",
+        )
+        .execute(pool)
+        .await
+        .expect("create live-approval audit function");
+        sqlx::query(
+            "CREATE TRIGGER zz_ryuki_test_reject_live_approval_audit \
+             BEFORE INSERT ON audit_log FOR EACH ROW \
+             EXECUTE FUNCTION ryuki_test_reject_live_approval_audit()",
+        )
+        .execute(pool)
+        .await
+        .expect("create live-approval audit trigger");
+    }
+
+    async fn remove_live_approval_audit_failure_trigger(pool: &PgPool) {
+        sqlx::query("DROP TRIGGER IF EXISTS zz_ryuki_test_reject_live_approval_audit ON audit_log")
+            .execute(pool)
+            .await
+            .expect("drop live-approval audit trigger");
+        sqlx::query("DROP FUNCTION IF EXISTS ryuki_test_reject_live_approval_audit()")
+            .execute(pool)
+            .await
+            .expect("drop live-approval audit function");
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests (no DB)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn enrollment_human_gate_admits_verified_persisted_and_direct_providers() {
+        for provider_mode in ["persisted-session", "local", "entra-id", "oidc"] {
+            let session = enrollment_human_admin_session(provider_mode);
+            assert!(
+                is_fresh_unscoped_interactive_human_admin(&session),
+                "verified unscoped {provider_mode} human admin must remain admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn enrollment_human_gate_rejects_machine_unverified_and_scoped_authority() {
+        let api_token = enrollment_human_admin_session("api-token");
+        assert!(!is_fresh_unscoped_interactive_human_admin(&api_token));
+
+        for actor_class in [
+            ryuki_engine::auth::ActorClass::Workload,
+            ryuki_engine::auth::ActorClass::Unknown,
+            ryuki_engine::auth::ActorClass::Simulated,
+        ] {
+            let mut human_shaped_nonhuman = enrollment_human_admin_session("persisted-session");
+            human_shaped_nonhuman.actor_class = actor_class;
+            assert!(
+                !is_fresh_unscoped_interactive_human_admin(&human_shaped_nonhuman),
+                "the typed actor class must dominate a human-looking carrier label"
+            );
+        }
+
+        let static_session = AuthSession::static_dry_run();
+        assert!(!is_fresh_unscoped_interactive_human_admin(&static_session));
+
+        let mut unverified = enrollment_human_admin_session("entra-id");
+        unverified.token_valid = false;
+        assert!(!is_fresh_unscoped_interactive_human_admin(&unverified));
+
+        let mut site_scoped = enrollment_human_admin_session("persisted-session");
+        site_scoped.site_scope = vec!["SITE-A".to_string()];
+        assert!(!is_fresh_unscoped_interactive_human_admin(&site_scoped));
+
+        let mut environment_scoped = enrollment_human_admin_session("oidc");
+        environment_scoped.environment_scope = vec!["production".to_string()];
+        assert!(!is_fresh_unscoped_interactive_human_admin(
+            &environment_scoped
+        ));
+
+        let mut noncanonical_scope = enrollment_human_admin_session("local");
+        noncanonical_scope.site_scope = vec![String::new()];
+        assert!(!is_fresh_unscoped_interactive_human_admin(
+            &noncanonical_scope
+        ));
+
+        let mut non_admin = enrollment_human_admin_session("entra-id");
+        non_admin.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        assert!(!is_fresh_unscoped_interactive_human_admin(&non_admin));
+    }
+
+    #[tokio::test]
+    async fn enrollment_handlers_reject_nonhuman_admin_before_input_or_database_work() {
+        let mut human_shaped_workload = enrollment_human_admin_session("persisted-session");
+        human_shaped_workload.actor_class = ryuki_engine::auth::ActorClass::Workload;
+        let mut human_shaped_unknown = enrollment_human_admin_session("persisted-session");
+        human_shaped_unknown.actor_class = ryuki_engine::auth::ActorClass::Unknown;
+        let mut human_shaped_simulated = enrollment_human_admin_session("persisted-session");
+        human_shaped_simulated.actor_class = ryuki_engine::auth::ActorClass::Simulated;
+        for machine in [
+            enrollment_human_admin_session("api-token"),
+            human_shaped_workload,
+            human_shaped_unknown,
+            human_shaped_simulated,
+        ] {
+            let challenge = admin_create_agent_enrollment_challenge(
+                Extension(machine.clone()),
+                Json(CreateEnrollmentChallengeBody {
+                    agent_id: String::new(),
+                    platform: String::new(),
+                    public_key: String::new(),
+                    expires_in_seconds: None,
+                }),
+            )
+            .await;
+            assert!(matches!(challenge, Err((StatusCode::FORBIDDEN, _))));
+
+            let approval = admin_approve_agent(
+                Path("untrusted-agent".to_string()),
+                Extension(machine.clone()),
+                Json(ApproveBody {
+                    enrollment_id: Uuid::nil(),
+                    public_key_fingerprint: String::new(),
+                    platform: String::new(),
+                    capabilities: None,
+                }),
+            )
+            .await;
+            assert!(matches!(approval, Err((StatusCode::FORBIDDEN, _))));
+
+            let revocation = admin_revoke_agent(
+                Path("untrusted-agent".to_string()),
+                Extension(machine),
+                Json(RevokeBody {
+                    enrollment_id: Uuid::nil(),
+                    public_key_fingerprint: String::new(),
+                }),
+            )
+            .await;
+            assert!(matches!(revocation, Err((StatusCode::FORBIDDEN, _))));
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_handlers_reject_any_nonempty_scope_vector_before_database_work() {
+        let mut challenge_admin = enrollment_human_admin_session("persisted-session");
+        challenge_admin.environment_scope = vec![String::new()];
+        let challenge = admin_create_agent_enrollment_challenge(
+            Extension(challenge_admin),
+            Json(CreateEnrollmentChallengeBody {
+                agent_id: String::new(),
+                platform: String::new(),
+                public_key: String::new(),
+                expires_in_seconds: None,
+            }),
+        )
+        .await;
+        assert!(matches!(challenge, Err((StatusCode::FORBIDDEN, _))));
+
+        let mut approval_admin = enrollment_human_admin_session("entra-id");
+        approval_admin.site_scope = vec!["SITE-A".to_string()];
+        let approval = admin_approve_agent(
+            Path("untrusted-agent".to_string()),
+            Extension(approval_admin),
+            Json(ApproveBody {
+                enrollment_id: Uuid::nil(),
+                public_key_fingerprint: String::new(),
+                platform: String::new(),
+                capabilities: None,
+            }),
+        )
+        .await;
+        assert!(matches!(approval, Err((StatusCode::FORBIDDEN, _))));
+    }
+
+    fn canonical_execution_trust_profile(spec: &JobSpec, platform: &str) -> ExecutionTrustProfile {
+        ExecutionTrustProfile {
+            schema_version: EXECUTION_TRUST_PROFILE_SCHEMA_VERSION.to_string(),
+            allowlist_version: EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION.to_string(),
+            platform: platform.to_string(),
+            offering: "linux-server-deployment".to_string(),
+            runner_kind: "terraform".to_string(),
+            provider_source: "registry.terraform.io/vmware/vsphere".to_string(),
+            provider_version: "2.16.1".to_string(),
+            provider_authority_id: "provider-authority/vsphere/api-test-fixture".to_string(),
+            provider_authority_version: "v1".to_string(),
+            backend_kind: "local".to_string(),
+            backend_credential_authority_id: "backend-credential-authority/local/api-test-fixture"
+                .to_string(),
+            backend_credential_authority_revision: "v1".to_string(),
+            backend_authority_digest: proto_sha256(
+                format!(
+                    "api-test-local-backend:{}",
+                    spec.state_key.as_deref().unwrap_or_default()
+                )
+                .as_bytes(),
+            ),
+            executable_kind: "terraform".to_string(),
+            executable_path: "/usr/local/bin/terraform".to_string(),
+            executable_version: "1.13.0".to_string(),
+            executable_sha256: None,
+            executable_provenance_policy_version: EXECUTABLE_PROVENANCE_POLICY_VERSION.to_string(),
+            provider_credential_authority_mode: PROVIDER_CREDENTIAL_AUTHORITY_MODE.to_string(),
+            backend_credential_authority_mode:
+                ryuki_runner::live::BACKEND_CREDENTIAL_AUTHORITY_POLICY_VERSION.to_string(),
+            containment_policy_version: format!(
+                "{}+{}",
+                ryuki_runner::exec::RUNNER_CONTAINMENT_POLICY_VERSION,
+                TERRAFORM_STATE_ISOLATION_POLICY_VERSION,
+            ),
+            iac_digest: spec.iac_digest.clone(),
+            state_key: spec.state_key.clone().expect("state key"),
+        }
+    }
+
+    #[test]
+    fn execution_trust_profile_allowlist_is_closed_and_authoritative() {
+        let spec = reviewable_live_plan_spec();
+        let platform = "defra";
+        let canonical = canonical_execution_trust_profile(&spec, platform);
+        assert!(validate_execution_trust_profile(&canonical, &spec, platform).is_ok());
+
+        let mut changed = canonical.clone();
+        changed.schema_version = "unknown-schema".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.allowlist_version = "unknown-allowlist".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.provider_source = "registry.terraform.io/hashicorp/aws".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.provider_version = "2.16.0".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.provider_authority_id = "provider-authority/vsphere/INVALID".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.provider_authority_version = "1".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_kind = "unsupported".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_kind = "remote".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_kind = "pg".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_credential_authority_id =
+            "backend-credential-authority/http/api-test-fixture".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_credential_authority_revision = "1".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_authority_digest = "not-a-digest".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.backend_credential_authority_mode = "ambient-default-chain".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.provider_credential_authority_mode = "instance-metadata".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.containment_policy_version = "process-group-only".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.executable_kind = "terraform-wrapper".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.executable_path = "terraform".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        let mut changed = canonical.clone();
+        changed.executable_version = "1.13.0 --chdir=/tmp".to_string();
+        assert!(validate_execution_trust_profile(&changed, &spec, platform).is_err());
+        assert!(validate_execution_trust_profile(&canonical, &spec, "other").is_err());
+        let mut changed_spec = spec.clone();
+        changed_spec.state_key = Some("request-other".to_string());
+        assert!(validate_execution_trust_profile(&canonical, &changed_spec, platform).is_err());
+        let mut changed_spec = spec.clone();
+        changed_spec.iac_digest = "b".repeat(64);
+        assert!(validate_execution_trust_profile(&canonical, &changed_spec, platform).is_err());
+    }
 
     #[test]
     fn agent_token_has_prefix() {
@@ -6224,7 +8654,7 @@ mod tests {
 
     #[tokio::test]
     async fn caller_supplied_live_apply_endpoint_is_gone() {
-        let result = admin_approve_live_apply_job(Extension(AuthSession::static_dry_run())).await;
+        let result = admin_approve_live_apply_job(Extension(live_approver_session("ops"))).await;
         let Err((status, Json(body))) = result else {
             panic!("legacy live-apply endpoint must remain disabled");
         };
@@ -6252,7 +8682,8 @@ mod tests {
     #[test]
     fn protocol_version_absent_header_is_rejected_as_legacy_v1() {
         // No header at all resolves to legacy v1, which is intentionally outside
-        // the v2-only allowlist because v1 agents do not enforce state isolation.
+        // the v6-only allowlist because older agents lack current state,
+        // enrollment isolation, and exact signed execution-authority controls.
         let err = resolve_protocol_version(&HeaderMap::new())
             .expect_err("an absent header must be rejected as legacy protocol v1");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -6273,6 +8704,17 @@ mod tests {
         ))
         .expect("the current build's version must be accepted");
         assert_eq!(v, ryuki_protocol::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_version_v4_peer_is_rejected_after_execution_authority_cutover() {
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 6);
+        let err = resolve_protocol_version(&hdrs_with_version("4"))
+            .expect_err("a v4 peer cannot parse the required signed execution authority");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("unsupported protocol_version: 4")));
     }
 
     #[test]
@@ -6382,6 +8824,325 @@ mod tests {
         assert_ne!(a, b, "tokens must be unique");
     }
 
+    fn signed_registration_body(
+        enrollment_challenge_id: Uuid,
+        enrollment_challenge: String,
+        agent_id: String,
+        platform: String,
+        key: &ed25519_dalek::SigningKey,
+    ) -> RegisterBody {
+        let public_key = encode_verifying_key(&key.verifying_key());
+        let enrollment_proof = ryuki_protocol::sign_agent_enrollment_proof(
+            enrollment_challenge_id,
+            &enrollment_challenge,
+            &agent_id,
+            &platform,
+            &public_key,
+            key,
+        );
+        RegisterBody {
+            enrollment_challenge_id,
+            enrollment_challenge,
+            agent_id,
+            platform,
+            capabilities: Capabilities::default(),
+            public_key,
+            enrollment_proof,
+        }
+    }
+
+    fn valid_registration_body(agent_id: impl Into<String>) -> RegisterBody {
+        let key = generate_keypair(&mut OsRng);
+        signed_registration_body(
+            Uuid::new_v4(),
+            generate_agent_enrollment_challenge(),
+            agent_id.into(),
+            "ci".to_owned(),
+            &key,
+        )
+    }
+
+    #[test]
+    fn registration_accepts_bounded_legitimate_input() {
+        let body = valid_registration_body("agent-01");
+        let validated =
+            validate_registration_input(&body).expect("ordinary registration must validate");
+        assert_eq!(validated.agent_id, "agent-01");
+        assert_eq!(validated.platform, "ci");
+        assert_eq!(validated.public_key, body.public_key);
+    }
+
+    #[test]
+    fn registration_proof_rejects_substituted_identity_and_malformed_challenge() {
+        let mut changed_identity = valid_registration_body("agent-01");
+        changed_identity.agent_id = "agent-02".to_owned();
+        assert!(matches!(
+            validate_registration_input(&changed_identity),
+            Err((StatusCode::FORBIDDEN, _))
+        ));
+
+        let mut malformed_challenge = valid_registration_body("agent-01");
+        malformed_challenge.enrollment_challenge = "ryc_short".to_owned();
+        assert!(matches!(
+            validate_registration_input(&malformed_challenge),
+            Err((StatusCode::FORBIDDEN, _))
+        ));
+    }
+
+    #[test]
+    fn approved_capability_grants_require_canonical_tool_and_provider_versions() {
+        assert!(validated_approved_capabilities(&test_agent_capabilities()).is_ok());
+
+        let ansible_with_provider = Capabilities {
+            terraform: None,
+            ansible: Some(ryuki_protocol::ToolCapability {
+                version: "2.16.0".to_owned(),
+                provider_versions: std::collections::BTreeMap::from([(
+                    "collection".to_owned(),
+                    "1.0.0".to_owned(),
+                )]),
+            }),
+        };
+        assert!(matches!(
+            validated_approved_capabilities(&ansible_with_provider),
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+
+        let mut blank_provider_version = terraform_test_capabilities("2.16.1");
+        blank_provider_version
+            .terraform
+            .as_mut()
+            .expect("Terraform capability")
+            .provider_versions
+            .insert("vsphere".to_owned(), " ".to_owned());
+        assert!(matches!(
+            validated_approved_capabilities(&blank_provider_version),
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+    }
+
+    #[test]
+    fn enrollment_review_fingerprint_is_canonical_and_strict() {
+        let fingerprint = public_key_fingerprint("reviewed-public-key");
+        assert!(valid_public_key_fingerprint_shape(&fingerprint));
+        assert_eq!(fingerprint.len(), "sha256:".len() + 64);
+        assert!(!valid_public_key_fingerprint_shape(
+            &fingerprint.to_uppercase()
+        ));
+        assert!(!valid_public_key_fingerprint_shape("sha256:short"));
+    }
+
+    #[test]
+    fn pending_enrollment_without_expiry_fails_closed() {
+        assert!(pending_enrollment_missing_expiry("pending", None));
+        assert!(!pending_enrollment_missing_expiry("approved", None));
+        assert!(!pending_enrollment_missing_expiry(
+            "pending",
+            Some(Utc::now())
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_oversized_key_before_decode() {
+        let mut body = valid_registration_body("oversized-key");
+        body.public_key = "!".repeat(AGENT_PUBLIC_KEY_MAX_BYTES + 1);
+        let Err((status, Json(error))) = validate_registration_input(&body) else {
+            panic!("an oversized encoded key must fail before decode");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = error["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("at most 64 bytes"),
+            "the size gate must run before the generic base64 decoder: {message}"
+        );
+    }
+
+    #[test]
+    fn registration_rejects_oversized_identifiers_and_capability_maps() {
+        let mut long_id = valid_registration_body("a".repeat(AGENT_ID_MAX_BYTES + 1));
+        assert!(matches!(
+            validate_registration_input(&long_id),
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+
+        let providers = (0..=CAPABILITY_PROVIDER_MAX_COUNT)
+            .map(|index| (format!("provider-{index}"), "1.0".to_owned()))
+            .collect();
+        long_id.agent_id = "bounded-agent".to_owned();
+        long_id.capabilities.terraform = Some(ryuki_protocol::ToolCapability {
+            version: "1.9".to_owned(),
+            provider_versions: providers,
+        });
+        let Err((status, Json(error))) = validate_registration_input(&long_id) else {
+            panic!("an oversized provider map must be rejected");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("at most 64 provider versions")));
+    }
+
+    #[test]
+    fn registration_admission_enforces_source_global_and_in_flight_budgets() {
+        let headers = HeaderMap::new();
+        let peer: SocketAddr = "192.0.2.10:443".parse().expect("peer address");
+
+        let source_bounded = AgentRegistrationAdmission::new(1, 1, 100, 100, 2, Vec::new());
+        let first = source_bounded
+            .try_admit(peer, &headers)
+            .expect("first request from a source fits its burst");
+        drop(first);
+        assert!(matches!(
+            source_bounded.try_admit(peer, &headers),
+            Err(AgentRegistrationAdmissionRejection::ClientRate)
+        ));
+
+        // A different source resolves to a separate salted fixed bucket. Find
+        // one deterministically instead of accepting a 1/16,384 collision as
+        // test flakiness.
+        let first_bucket = crate::bounded_rate_limit_key(
+            "agent-registration",
+            &peer.ip().to_string(),
+            &source_bounded.bucket_salt,
+        );
+        let other_peer = (11_u8..=254)
+            .map(|last| {
+                format!("192.0.2.{last}:443")
+                    .parse::<SocketAddr>()
+                    .expect("candidate peer")
+            })
+            .find(|candidate| {
+                crate::bounded_rate_limit_key(
+                    "agent-registration",
+                    &candidate.ip().to_string(),
+                    &source_bounded.bucket_salt,
+                ) != first_bucket
+            })
+            .expect("a distinct fixed source bucket");
+        drop(
+            source_bounded
+                .try_admit(other_peer, &headers)
+                .expect("one busy source must not consume another source's budget"),
+        );
+
+        let global_bounded = AgentRegistrationAdmission::new(100, 100, 1, 1, 2, Vec::new());
+        drop(
+            global_bounded
+                .try_admit(peer, &headers)
+                .expect("first request fits the global burst"),
+        );
+        assert!(matches!(
+            global_bounded.try_admit(peer, &headers),
+            Err(AgentRegistrationAdmissionRejection::GlobalRate)
+        ));
+
+        let in_flight_bounded = AgentRegistrationAdmission::new(100, 100, 100, 100, 1, Vec::new());
+        let held = in_flight_bounded
+            .try_admit(peer, &headers)
+            .expect("first request owns the only in-flight slot");
+        assert!(matches!(
+            in_flight_bounded.try_admit(peer, &headers),
+            Err(AgentRegistrationAdmissionRejection::InFlight)
+        ));
+        drop(held);
+        drop(
+            in_flight_bounded
+                .try_admit(peer, &headers)
+                .expect("dropping a request releases its in-flight slot"),
+        );
+    }
+
+    #[test]
+    fn registration_admission_matches_only_the_exact_public_post() {
+        assert!(is_agent_registration_request(
+            &Method::POST,
+            "/api/agents/register"
+        ));
+        assert!(!is_agent_registration_request(
+            &Method::GET,
+            "/api/agents/register"
+        ));
+        assert!(!is_agent_registration_request(
+            &Method::POST,
+            "/api/agents/register/extra"
+        ));
+        assert!(!is_agent_registration_request(
+            &Method::POST,
+            "/api/agents/cp-public-key"
+        ));
+    }
+
+    #[tokio::test]
+    async fn registration_admission_fails_closed_without_peer_context_only_on_its_route() {
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/api/agents/register",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route("/health", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn_with_state(
+                AgentRegistrationAdmission::new(100, 100, 100, 100, 1, Vec::new()),
+                agent_registration_admission_middleware,
+            ));
+
+        let registration = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents/register")
+                    .body(axum::body::Body::empty())
+                    .expect("registration request"),
+            )
+            .await
+            .expect("registration response");
+        assert_eq!(registration.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            registration
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let health = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn registration_route_rejects_body_before_large_json_deserialization() {
+        use tower::ServiceExt;
+
+        let oversized = "x".repeat(AGENT_REGISTRATION_BODY_LIMIT_BYTES + 1);
+        let response = agent_routes()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/agents/register")
+                    .header("content-type", "application/json")
+                    .header(
+                        ryuki_protocol::PROTOCOL_VERSION_HEADER,
+                        ryuki_protocol::PROTOCOL_VERSION.to_string(),
+                    )
+                    .body(axum::body::Body::from(oversized))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     // ── #60 slice 2: write-side evidence offload decision (pure, no DB) ─────
 
     #[test]
@@ -6437,7 +9198,9 @@ mod tests {
 
     fn reviewable_live_plan(actions: &[&str]) -> Value {
         json!({
-            "format_version": "1.2",
+            "schema_version": ryuki_protocol::TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION,
+            "canonical_plan_sha256": "a".repeat(64),
+            "projection_complete": true,
             "resource_changes": [
                 {
                     "mode": "data",
@@ -6470,7 +9233,6 @@ mod tests {
                     "change": {"actions": ["read"], "after": {"name": "Linux Golden"}}
                 },
                 {
-                    "address": "vsphere_virtual_machine.linux_server",
                     "mode": "managed",
                     "type": "vsphere_virtual_machine",
                     "name": "linux_server",
@@ -6480,10 +9242,7 @@ mod tests {
                             "name": "first-test-vm",
                             "num_cpus": 2,
                             "memory": 4096,
-                            "disk": [{"label": "disk0", "size": 80}],
-                            "id": "vm-987654",
-                            "private_ip": "10.25.4.9",
-                            "provider_detail": "MUST-NOT-LEAK"
+                            "disk": [{"label": "disk0", "size": 80}]
                         }
                     }
                 }
@@ -6492,12 +9251,61 @@ mod tests {
     }
 
     #[test]
+    fn raw_plan_digest_accepts_matching_signed_projection_commitment() {
+        let spec = reviewable_live_plan_spec();
+        let evidence = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        let digest = "a".repeat(64);
+        assert_eq!(
+            validated_raw_plan_digest(
+                &JobMode::LivePlan,
+                &JobResultStatus::Planned,
+                Some(&digest),
+                &spec,
+                &evidence,
+            ),
+            Ok(Some(digest)),
+        );
+    }
+
+    #[test]
+    fn raw_plan_digest_rejects_signed_projection_mismatch() {
+        let spec = reviewable_live_plan_spec();
+        let evidence = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        assert_eq!(
+            validated_raw_plan_digest(
+                &JobMode::LivePlan,
+                &JobResultStatus::Planned,
+                Some(&"b".repeat(64)),
+                &spec,
+                &evidence,
+            ),
+            Err("raw_plan_digest does not match the canonical plan digest in signed evidence"),
+        );
+    }
+
+    #[test]
+    fn raw_plan_digest_rejects_legacy_successful_plan_without_commitment() {
+        let spec = reviewable_live_plan_spec();
+        let evidence = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        assert_eq!(
+            validated_raw_plan_digest(
+                &JobMode::LivePlan,
+                &JobResultStatus::Planned,
+                None,
+                &spec,
+                &evidence,
+            ),
+            Err("successful LivePlan result must include signed raw_plan_digest"),
+        );
+    }
+
+    #[test]
     fn live_plan_review_exposes_only_allowlisted_digest_bound_fields() {
         let spec = reviewable_live_plan_spec();
-        let raw_plan = reviewable_live_plan(&["create"]);
+        let safe_projection = reviewable_live_plan(&["create"]);
         let review = derive_live_plan_review(
             &spec,
-            &serde_json::to_vec(&raw_plan).expect("serialize plan"),
+            &serde_json::to_vec(&safe_projection).expect("serialize projection"),
         )
         .expect("supported vSphere plan has a safe review");
         assert!(review.digest_verified);
@@ -6507,15 +9315,59 @@ mod tests {
         assert_eq!(review.managed_changes[0].action, "create");
 
         let rendered = serde_json::to_string(&review).expect("serialize review");
-        for forbidden in [
-            "vm-987654",
-            "10.25.4.9",
-            "MUST-NOT-LEAK",
-            "vsphere_virtual_machine.linux_server",
-        ] {
+        let canonical_digest = "a".repeat(64);
+        for forbidden in ["canonical_plan_sha256", canonical_digest.as_str()] {
             assert!(
                 !rendered.contains(forbidden),
-                "safe projection must not expose raw plan value {forbidden}"
+                "review response must not expose projection internals {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_plan_review_rejects_legacy_raw_plan_and_projection_extras() {
+        let spec = reviewable_live_plan_spec();
+        let mut legacy_raw_plan = reviewable_live_plan(&["create"]);
+        let object = legacy_raw_plan
+            .as_object_mut()
+            .expect("projection fixture is an object");
+        object.remove("schema_version");
+        object.remove("canonical_plan_sha256");
+        object.remove("projection_complete");
+        object.insert("format_version".to_string(), json!("1.2"));
+        assert!(
+            derive_live_plan_review(&spec, &serde_json::to_vec(&legacy_raw_plan).unwrap())
+                .is_none(),
+            "legacy/raw Terraform JSON must never become an approvable review"
+        );
+
+        let mut projection_with_provider_extra = reviewable_live_plan(&["create"]);
+        projection_with_provider_extra["resource_changes"][5]["change"]["after"]
+            ["provider_private"] = json!("MUST-NOT-LEAK");
+        assert!(
+            derive_live_plan_review(
+                &spec,
+                &serde_json::to_vec(&projection_with_provider_extra).unwrap()
+            )
+            .is_none(),
+            "unknown nested projection fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn live_plan_review_requires_current_complete_digest_bound_projection() {
+        let spec = reviewable_live_plan_spec();
+        for (field, value) in [
+            ("schema_version", json!("ryuki-terraform-live-plan-v0")),
+            ("canonical_plan_sha256", json!("A".repeat(64))),
+            ("canonical_plan_sha256", json!("a".repeat(63))),
+            ("projection_complete", json!(false)),
+        ] {
+            let mut projection = reviewable_live_plan(&["create"]);
+            projection[field] = value;
+            assert!(
+                derive_live_plan_review(&spec, &serde_json::to_vec(&projection).unwrap()).is_none(),
+                "approval accepted invalid safe-projection field {field}"
             );
         }
     }
@@ -6523,15 +9375,35 @@ mod tests {
     #[test]
     fn live_plan_review_fails_closed_on_unknown_mutating_resource() {
         let spec = reviewable_live_plan_spec();
-        let raw_plan = json!({
+        let safe_projection = json!({
+            "schema_version": ryuki_protocol::TERRAFORM_LIVE_PLAN_EVIDENCE_SCHEMA_VERSION,
+            "canonical_plan_sha256": "b".repeat(64),
+            "projection_complete": true,
             "resource_changes": [{
+                "mode": "managed",
                 "type": "unknown_provider_object",
-                "change": { "actions": ["create"] }
+                "name": "unknown",
+                "change": { "actions": ["create"], "after": {} }
             }]
         });
         assert!(
-            derive_live_plan_review(&spec, &serde_json::to_vec(&raw_plan).unwrap()).is_none(),
+            derive_live_plan_review(&spec, &serde_json::to_vec(&safe_projection).unwrap())
+                .is_none(),
             "unknown provider mutations must not produce an approvable projection"
+        );
+    }
+
+    #[test]
+    fn live_plan_review_retains_safe_no_op_but_never_approves_it() {
+        let spec = reviewable_live_plan_spec();
+        let safe_no_op = serde_json::to_vec(&reviewable_live_plan(&["no-op"])).unwrap();
+        let review = derive_live_plan_review(&spec, &safe_no_op)
+            .expect("an exact non-mutating projection remains safe to retain");
+        assert_eq!(review.counts, PlanChangeCounts::default());
+        assert!(review.managed_changes.is_empty());
+        assert!(
+            !server_live_plan_is_safe_to_approve(&spec, &safe_no_op),
+            "non-mutating evidence must never authorize an apply"
         );
     }
 
@@ -6716,42 +9588,179 @@ mod tests {
         Some(pool)
     }
 
-    /// Inserts a test agent row directly. Returns (agent_id_str, plaintext_token).
-    async fn seed_agent(pool: &PgPool, agent_id: &str, platform: &str, status: &str) -> String {
+    /// Provision the exact challenge represented by a signed registration
+    /// fixture. Tests that call the persistence boundary directly use this
+    /// helper; handler tests exercise the administrator issuance endpoint.
+    async fn seed_registration_challenge(pool: &PgPool, body: &RegisterBody) {
+        sqlx::query(
+            "INSERT INTO agent_enrollment_challenges ( \
+                 id, agent_id, platform, public_key, public_key_fingerprint, \
+                 secret_hash, ttl_seconds, expires_at, created_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, 3600, \
+                       statement_timestamp(), 'test-provisioner')",
+        )
+        .bind(body.enrollment_challenge_id)
+        .bind(&body.agent_id)
+        .bind(&body.platform)
+        .bind(&body.public_key)
+        .bind(public_key_fingerprint(&body.public_key))
+        .bind(sha256_hex(&body.enrollment_challenge))
+        .execute(pool)
+        .await
+        .expect("seed trusted enrollment challenge");
+    }
+
+    /// Schema-owner-only fixture hook for database-clock boundary tests. The
+    /// production contract intentionally makes both deadlines immutable; DDL is
+    /// transactional here so any failure rolls the trigger state back safely.
+    async fn force_agent_enrollment_deadline_for_test(
+        pool: &PgPool,
+        agent_id: &str,
+        deadline: DateTime<Utc>,
+    ) {
+        let mut tx = pool.begin().await.expect("begin agent deadline fixture");
+        sqlx::query("ALTER TABLE agents DISABLE TRIGGER agents_enrollment_contract_v3_mutation")
+            .execute(&mut *tx)
+            .await
+            .expect("disable agent enrollment guard for fixture");
+        sqlx::query("UPDATE agents SET enrollment_expires_at = $2 WHERE agent_id = $1")
+            .bind(agent_id)
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await
+            .expect("set agent enrollment fixture deadline");
+        sqlx::query("ALTER TABLE agents ENABLE TRIGGER agents_enrollment_contract_v3_mutation")
+            .execute(&mut *tx)
+            .await
+            .expect("restore agent enrollment guard after fixture");
+        tx.commit().await.expect("commit agent deadline fixture");
+    }
+
+    async fn force_challenge_deadline_for_test(
+        pool: &PgPool,
+        challenge_id: Uuid,
+        deadline: DateTime<Utc>,
+    ) {
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin challenge deadline fixture");
+        sqlx::query(
+            "ALTER TABLE agent_enrollment_challenges \
+             DISABLE TRIGGER agent_enrollment_challenge_lifecycle_guard",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("disable challenge lifecycle guard for fixture");
+        sqlx::query("UPDATE agent_enrollment_challenges SET expires_at = $2 WHERE id = $1")
+            .bind(challenge_id)
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await
+            .expect("set challenge fixture deadline");
+        sqlx::query(
+            "ALTER TABLE agent_enrollment_challenges \
+             ENABLE TRIGGER agent_enrollment_challenge_lifecycle_guard",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("restore challenge lifecycle guard after fixture");
+        tx.commit()
+            .await
+            .expect("commit challenge deadline fixture");
+    }
+
+    /// Direct lease-state fixtures deliberately opt into migration 161's v2
+    /// transition contract. Production-path tests should call
+    /// `lease_pending_job` instead so they exercise the real admission gate.
+    async fn begin_agent_job_lease_fixture_tx<'a>(
+        pool: &'a PgPool,
+    ) -> sqlx::Transaction<'a, sqlx::Postgres> {
+        let mut tx = pool.begin().await.expect("begin lease fixture transaction");
+        activate_agent_job_lease_contract_v2(&mut tx)
+            .await
+            .expect("activate v2 lease contract for fixture");
+        tx
+    }
+
+    fn terraform_test_capabilities(vsphere_version: &str) -> Capabilities {
+        Capabilities {
+            terraform: Some(ryuki_protocol::ToolCapability {
+                version: "1.9.5".to_owned(),
+                provider_versions: std::collections::BTreeMap::from([(
+                    "vsphere".to_owned(),
+                    vsphere_version.to_owned(),
+                )]),
+            }),
+            ansible: None,
+        }
+    }
+
+    fn test_agent_capabilities() -> Capabilities {
+        Capabilities {
+            terraform: terraform_test_capabilities("2.16.1").terraform,
+            ansible: Some(ryuki_protocol::ToolCapability {
+                version: "2.16.0".to_owned(),
+                provider_versions: std::collections::BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Inserts a test agent row directly with an explicit administrator-approved
+    /// capability document. Returns the plaintext bearer token.
+    async fn seed_agent_with_capabilities(
+        pool: &PgPool,
+        agent_id: &str,
+        platform: &str,
+        status: &str,
+        capabilities: &Capabilities,
+    ) -> String {
         let token = format!(
             "{AGENT_TOKEN_PREFIX}test{}",
             Uuid::new_v4().to_string().replace('-', "")
         );
         let hash = sha256_hex(&token);
-        sqlx::query(
-            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-             VALUES ($1, $2, '{}'::jsonb, 'test-pubkey', $3, $4) \
-             ON CONFLICT (agent_id) DO UPDATE SET token_hash = $3, status = $4, updated_at = NOW()",
+        let capabilities = serde_json::to_value(capabilities).expect("serialize capabilities");
+        seed_challenge_admitted_test_agent(
+            pool,
+            ChallengeAdmittedTestAgent {
+                agent_id,
+                platform,
+                public_key: "test-pubkey",
+                token_hash: &hash,
+                capabilities: &capabilities,
+                final_status: status,
+                last_seen_at: None,
+            },
         )
-        .bind(agent_id)
-        .bind(platform)
-        .bind(&hash)
-        .bind(status)
-        .execute(pool)
-        .await
-        .expect("seed agent");
+        .await;
         token
     }
 
-    async fn seed_pending_job(pool: &PgPool, platform: &str) -> Uuid {
+    /// Most leasing tests use an agent approved for every embedded test job.
+    async fn seed_agent(pool: &PgPool, agent_id: &str, platform: &str, status: &str) -> String {
+        seed_agent_with_capabilities(pool, agent_id, platform, status, &test_agent_capabilities())
+            .await
+    }
+
+    async fn seed_pending_job_for_iac(pool: &PgPool, platform: &str, iac_ref: &str) -> Uuid {
         use std::collections::BTreeMap;
         let spec = ryuki_protocol::JobSpec {
             request_id: Uuid::new_v4(),
             offering_id: Uuid::new_v4(),
-            iac_ref: "linux-server-deployment@v1".into(),
+            iac_ref: iac_ref.to_owned(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
-            state_key: Some("request-test".to_string()),
+            state_key: Some(format!("request-test-{}", Uuid::new_v4().simple())),
             mode: ryuki_protocol::JobMode::OfflineDryRun,
         };
         create_agent_job(pool, Uuid::new_v4(), platform, &spec, "OfflineDryRun")
             .await
             .expect("seed job")
+    }
+
+    async fn seed_pending_job(pool: &PgPool, platform: &str) -> Uuid {
+        seed_pending_job_for_iac(pool, platform, "linux-server-deployment@v1").await
     }
 
     fn stateful_test_spec(request_id: Uuid, state_key: &str, mode: JobMode) -> JobSpec {
@@ -6772,6 +9781,37 @@ mod tests {
             .execute(pool)
             .await
             .ok();
+        sqlx::query("DELETE FROM agent_enrollment_challenges WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn enrollment_review_binding(pool: &PgPool, agent_id: &str) -> (Uuid, String) {
+        let (id, public_key): (Uuid, String) =
+            sqlx::query_as("SELECT id, public_key FROM agents WHERE agent_id = $1")
+                .bind(agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch enrollment review binding");
+        (id, public_key_fingerprint(&public_key))
+    }
+
+    fn approve_body(enrollment_id: Uuid, public_key_fingerprint: String) -> ApproveBody {
+        ApproveBody {
+            enrollment_id,
+            public_key_fingerprint,
+            platform: "ci".to_owned(),
+            capabilities: None,
+        }
+    }
+
+    fn revoke_body(enrollment_id: Uuid, public_key_fingerprint: String) -> RevokeBody {
+        RevokeBody {
+            enrollment_id,
+            public_key_fingerprint,
+        }
     }
 
     async fn cleanup_jobs_for_platform(pool: &PgPool, platform: &str) {
@@ -6820,6 +9860,7 @@ mod tests {
         };
         let agent_id = format!("revoke-approved-{}", Uuid::new_v4());
         let token = seed_agent(pool, &agent_id, "ci", "approved").await;
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_id).await;
 
         // Token works while approved.
         let mut headers = HeaderMap::new();
@@ -6832,7 +9873,8 @@ mod tests {
         // Revoke.
         let resp = admin_revoke_agent(
             Path(agent_id.clone()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(enrollment_id, fingerprint)),
         )
         .await
         .expect("revoke must succeed");
@@ -6875,6 +9917,7 @@ mod tests {
         let job_id = seed_pending_job(pool, &platform).await;
         let assignee_attempt = Uuid::new_v4();
         let assignee_fencing = Uuid::new_v4().to_string();
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(pool).await;
         sqlx::query(
             "UPDATE agent_jobs \
              SET status = 'Leased', agent_id = $1, attempt_id = $2, fencing_token = $3, \
@@ -6885,9 +9928,10 @@ mod tests {
         .bind(assignee_attempt)
         .bind(&assignee_fencing)
         .bind(job_id)
-        .execute(pool)
+        .execute(&mut *lease_tx)
         .await
         .expect("lease to assignee");
+        lease_tx.commit().await.expect("commit assignee lease");
 
         // The attacker acks the SAME job id with its own (wrong) fencing material.
         let mut headers = HeaderMap::new();
@@ -6962,9 +10006,11 @@ mod tests {
         };
         let pending = format!("revoke-pending-{}", Uuid::new_v4());
         seed_agent(pool, &pending, "ci", "pending").await;
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &pending).await;
         let r = admin_revoke_agent(
             Path(pending.clone()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(enrollment_id, fingerprint.clone())),
         )
         .await
         .expect("revoke pending must succeed");
@@ -6973,7 +10019,8 @@ mod tests {
         // Idempotent re-revoke.
         let again = admin_revoke_agent(
             Path(pending.clone()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(enrollment_id, fingerprint)),
         )
         .await
         .expect("re-revoke must succeed");
@@ -6982,7 +10029,11 @@ mod tests {
         // Unknown agent → 404.
         let missing = admin_revoke_agent(
             Path(format!("nope-{}", Uuid::new_v4())),
-            Extension(AuthSession::static_dry_run()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(
+                Uuid::nil(),
+                public_key_fingerprint("unknown-enrollment"),
+            )),
         )
         .await;
         assert!(
@@ -7004,19 +10055,18 @@ mod tests {
         };
         let agent_id = format!("revoke-terminal-{}", Uuid::new_v4());
         seed_agent(pool, &agent_id, "ci", "approved").await;
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_id).await;
         let _ = admin_revoke_agent(
             Path(agent_id.clone()),
-            Extension(AuthSession::static_dry_run()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(enrollment_id, fingerprint.clone())),
         )
         .await
         .expect("revoke");
         let reapprove = admin_approve_agent(
             Path(agent_id.clone()),
-            Extension(AuthSession::static_dry_run()),
-            Json(ApproveBody {
-                platform: "ci".into(),
-                capabilities: None,
-            }),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(enrollment_id, fingerprint)),
         )
         .await;
         assert!(
@@ -7034,6 +10084,558 @@ mod tests {
         cleanup_agent(pool, &agent_id).await;
     }
 
+    #[tokio::test]
+    async fn db_approve_expired_pending_requires_reenrollment() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("expired-enrollment-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, "ci", "pending").await;
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_id).await;
+        force_agent_enrollment_deadline_for_test(
+            pool,
+            &agent_id,
+            Utc::now() - Duration::seconds(1),
+        )
+        .await;
+
+        let approval = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(enrollment_id, fingerprint)),
+        )
+        .await;
+        assert!(
+            matches!(approval, Err((StatusCode::CONFLICT, _))),
+            "an expired Pending record must not be resurrected by approval: {approval:?}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("read expired enrollment");
+        assert_eq!(status, "pending", "failed approval must not mutate state");
+
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_stale_enrollment_review_cannot_mutate_replacement_key() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("stale-review-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, "ci", "pending").await;
+        let (old_enrollment_id, old_fingerprint) = enrollment_review_binding(pool, &agent_id).await;
+        force_agent_enrollment_deadline_for_test(
+            pool,
+            &agent_id,
+            Utc::now() - Duration::seconds(1),
+        )
+        .await;
+
+        let replacement_body = valid_registration_body(agent_id.clone());
+        seed_registration_challenge(pool, &replacement_body).await;
+        let replacement =
+            validate_registration_input(&replacement_body).expect("replacement input");
+        let replacement_caps = serde_json::to_value(&replacement_body.capabilities).unwrap();
+        persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &replacement,
+            &replacement_caps,
+            MAX_PENDING_AGENT_ENROLLMENTS,
+        )
+        .await
+        .expect("expired identity may create a fresh bounded enrollment");
+        let (new_enrollment_id, new_fingerprint) = enrollment_review_binding(pool, &agent_id).await;
+        assert_ne!(old_enrollment_id, new_enrollment_id);
+        assert_ne!(old_fingerprint, new_fingerprint);
+
+        let stale_approval = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(old_enrollment_id, old_fingerprint.clone())),
+        )
+        .await;
+        assert!(
+            matches!(stale_approval, Err((StatusCode::CONFLICT, _))),
+            "a stale review must not approve the replacement key: {stale_approval:?}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("read replacement status");
+        assert_eq!(
+            status, "pending",
+            "stale approval must not mutate replacement"
+        );
+
+        let stale_revoke = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(old_enrollment_id, old_fingerprint)),
+        )
+        .await;
+        assert!(
+            matches!(stale_revoke, Err((StatusCode::CONFLICT, _))),
+            "a stale review must not revoke the replacement key: {stale_revoke:?}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("read replacement status after stale revoke");
+        assert_eq!(
+            status, "pending",
+            "stale revocation must not mutate replacement"
+        );
+
+        let current_approval = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(new_enrollment_id, new_fingerprint)),
+        )
+        .await;
+        assert!(
+            current_approval.is_ok(),
+            "the exact current row/key review must remain approvable: {current_approval:?}"
+        );
+
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_approval_expiry_is_checked_at_database_mutation_time() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("db-clock-expiry-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, "ci", "pending").await;
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_id).await;
+        force_agent_enrollment_deadline_for_test(
+            pool,
+            &agent_id,
+            Utc::now() + Duration::milliseconds(100),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let approval = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(enrollment_id, fingerprint)),
+        )
+        .await;
+        assert!(
+            matches!(approval, Err((StatusCode::CONFLICT, _))),
+            "the atomic DB-clock predicate must reject after the database deadline: {approval:?}"
+        );
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_enrollment_contract_blocks_old_replica_and_defaults_v3_admission() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let old_agent_id = format!("old-contract-agent-{}", Uuid::new_v4());
+        let old_insert = sqlx::query(
+            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
+             VALUES ($1, 'ci', '{}'::jsonb, 'legacy-pubkey', $2, 'pending')",
+        )
+        .bind(&old_agent_id)
+        .bind(sha256_hex(&format!("old-contract-token-{old_agent_id}")))
+        .execute(pool)
+        .await
+        .expect_err("an old replica without the v3 transaction marker must fail closed");
+        let old_insert_code = old_insert
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(old_insert_code.as_deref(), Some("55000"));
+        let old_row_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&old_agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("check rejected old-contract insert");
+        assert!(!old_row_exists);
+
+        let agent_id = format!("v3-default-admission-{}", Uuid::new_v4());
+        let body = valid_registration_body(agent_id.clone());
+        seed_registration_challenge(pool, &body).await;
+        let registration = validate_registration_input(&body).expect("signed registration fixture");
+        let capabilities = serde_json::to_value(&body.capabilities).unwrap();
+        persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &registration,
+            &capabilities,
+            MAX_PENDING_AGENT_ENROLLMENTS,
+        )
+        .await
+        .expect("v3 registration consumes the preprovisioned challenge");
+
+        let (has_future_expiry, bounds_version): (bool, i16) = sqlx::query_as(
+            "SELECT enrollment_expires_at IS NOT NULL \
+                    AND enrollment_expires_at > clock_timestamp() \
+                    , enrollment_bounds_version \
+             FROM agents WHERE agent_id = $1",
+        )
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("read v3 schema defaults");
+        assert!(has_future_expiry);
+        assert_eq!(bounds_version, 1, "new rows must receive bounded version 1");
+
+        let constraint_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'agents'::regclass \
+               AND conname = 'agents_pending_enrollment_has_expiry'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pending-expiry constraint state");
+        assert!(
+            constraint_validated,
+            "the lifecycle constraint must not preserve legacy NULL rows"
+        );
+
+        let challenge_constraint_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'agents'::regclass \
+               AND conname = 'agents_pending_enrollment_has_challenge'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pending-challenge constraint state");
+        assert!(
+            challenge_constraint_validated,
+            "every Pending row must carry trusted challenge provenance"
+        );
+
+        let challenge_fk_validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'agents'::regclass \
+               AND conname = 'agents_enrollment_challenge_id_fkey'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read named enrollment-challenge foreign key state");
+        assert!(
+            challenge_fk_validated,
+            "the named challenge foreign key must be present and fully validated"
+        );
+
+        let old_approve = sqlx::query(
+            "UPDATE agents SET status = 'approved', platform = 'ci' WHERE agent_id = $1",
+        )
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .expect_err("an old id-only approval must be blocked by the v3 trigger");
+        let old_approve_code = old_approve
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(old_approve_code.as_deref(), Some("55000"));
+
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_id).await;
+        let _ = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(approve_body(enrollment_id, fingerprint.clone())),
+        )
+        .await
+        .expect("the v3 challenge-bound approval must remain available");
+
+        let old_revoke = sqlx::query("UPDATE agents SET status = 'revoked' WHERE agent_id = $1")
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .expect_err("an old id-only revoke must be blocked by the v3 trigger");
+        let old_revoke_code = old_revoke
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(old_revoke_code.as_deref(), Some("55000"));
+        let status: String = sqlx::query_scalar("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("read state after blocked old revoke");
+        assert_eq!(status, "approved");
+
+        let _ = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(revoke_body(enrollment_id, fingerprint)),
+        )
+        .await
+        .expect("the v3 bound revoke must remain available");
+
+        let mut current_tx = pool.begin().await.expect("begin terminal-revoke check");
+        activate_agent_enrollment_contract_v3(&mut current_tx)
+            .await
+            .expect("activate current enrollment marker");
+        let terminal_reapprove =
+            sqlx::query("UPDATE agents SET status = 'approved' WHERE agent_id = $1")
+                .bind(&agent_id)
+                .execute(&mut *current_tx)
+                .await
+                .expect_err("even a marker-aware sibling writer must not undo revocation");
+        let terminal_reapprove_code = terminal_reapprove
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(terminal_reapprove_code.as_deref(), Some("23514"));
+        current_tx
+            .rollback()
+            .await
+            .expect("rollback terminal-revoke check");
+
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_enrollment_authority_and_challenge_lifecycle_are_immutable() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // A marker-aware sibling/direct writer still cannot take over an
+        // approved identity by replacing only its bearer hash.
+        let approved_id = format!("immutable-token-{}", Uuid::new_v4());
+        let original_token = seed_agent(pool, &approved_id, "ci", "approved").await;
+        let original_hash = sha256_hex(&original_token);
+        let replacement_hash = sha256_hex(&format!("replacement-token-{approved_id}"));
+        let mut token_tx = pool.begin().await.expect("begin token takeover check");
+        activate_agent_enrollment_contract_v3(&mut token_tx)
+            .await
+            .expect("activate token immutability contract");
+        let token_error = sqlx::query("UPDATE agents SET token_hash = $2 WHERE agent_id = $1")
+            .bind(&approved_id)
+            .bind(&replacement_hash)
+            .execute(&mut *token_tx)
+            .await
+            .expect_err("an approved agent bearer hash must be immutable");
+        let token_error_code = token_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(token_error_code.as_deref(), Some("23514"));
+        token_tx
+            .rollback()
+            .await
+            .expect("rollback token takeover check");
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT token_hash FROM agents WHERE agent_id = $1")
+                .bind(&approved_id)
+                .fetch_one(pool)
+                .await
+                .expect("read bearer hash after rejected takeover");
+        assert_eq!(stored_hash, original_hash);
+
+        // The database owns the Pending deadline. It cannot be extended, and
+        // an already-expired row cannot cross the trust boundary even when a
+        // sibling supplies the current rolling-deployment marker.
+        let pending_id = format!("immutable-expiry-{}", Uuid::new_v4());
+        seed_agent(pool, &pending_id, "ci", "pending").await;
+        let original_expiry: DateTime<Utc> =
+            sqlx::query_scalar("SELECT enrollment_expires_at FROM agents WHERE agent_id = $1")
+                .bind(&pending_id)
+                .fetch_one(pool)
+                .await
+                .expect("read database-owned pending deadline");
+        let mut expiry_tx = pool.begin().await.expect("begin expiry extension check");
+        activate_agent_enrollment_contract_v3(&mut expiry_tx)
+            .await
+            .expect("activate expiry immutability contract");
+        let expiry_error = sqlx::query(
+            "UPDATE agents \
+             SET enrollment_expires_at = enrollment_expires_at + INTERVAL '1 day' \
+             WHERE agent_id = $1",
+        )
+        .bind(&pending_id)
+        .execute(&mut *expiry_tx)
+        .await
+        .expect_err("a Pending enrollment deadline must not be extendable");
+        let expiry_error_code = expiry_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(expiry_error_code.as_deref(), Some("23514"));
+        expiry_tx
+            .rollback()
+            .await
+            .expect("rollback expiry extension check");
+        let stored_expiry: DateTime<Utc> =
+            sqlx::query_scalar("SELECT enrollment_expires_at FROM agents WHERE agent_id = $1")
+                .bind(&pending_id)
+                .fetch_one(pool)
+                .await
+                .expect("read deadline after rejected extension");
+        assert_eq!(stored_expiry, original_expiry);
+
+        force_agent_enrollment_deadline_for_test(
+            pool,
+            &pending_id,
+            Utc::now() - Duration::seconds(1),
+        )
+        .await;
+        let mut approval_tx = pool.begin().await.expect("begin expired approval check");
+        activate_agent_enrollment_contract_v3(&mut approval_tx)
+            .await
+            .expect("activate expired approval contract");
+        let approval_error = sqlx::query(
+            "UPDATE agents \
+             SET status = 'approved', enrollment_expires_at = NULL \
+             WHERE agent_id = $1",
+        )
+        .bind(&pending_id)
+        .execute(&mut *approval_tx)
+        .await
+        .expect_err("an expired Pending enrollment must not be approved directly");
+        let approval_error_code = approval_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(approval_error_code.as_deref(), Some("23514"));
+        approval_tx
+            .rollback()
+            .await
+            .expect("rollback expired approval check");
+
+        // A provisioning challenge is an immutable, one-use grant. Neither an
+        // active deadline/binding nor a consumed terminal row may be rewritten.
+        let challenge_agent_id = format!("immutable-challenge-{}", Uuid::new_v4());
+        let body = valid_registration_body(challenge_agent_id.clone());
+        let challenge_id = body.enrollment_challenge_id;
+        seed_registration_challenge(pool, &body).await;
+
+        let challenge_expiry_error = sqlx::query(
+            "UPDATE agent_enrollment_challenges \
+             SET expires_at = expires_at + INTERVAL '1 day' WHERE id = $1",
+        )
+        .bind(challenge_id)
+        .execute(pool)
+        .await
+        .expect_err("a provisioning challenge deadline must be immutable");
+        let challenge_expiry_code = challenge_expiry_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(challenge_expiry_code.as_deref(), Some("23514"));
+
+        let challenge_rebind_error = sqlx::query(
+            "UPDATE agent_enrollment_challenges \
+             SET agent_id = $2 WHERE id = $1",
+        )
+        .bind(challenge_id)
+        .bind(format!("rebound-{challenge_agent_id}"))
+        .execute(pool)
+        .await
+        .expect_err("a provisioning challenge identity binding must be immutable");
+        let challenge_rebind_code = challenge_rebind_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(challenge_rebind_code.as_deref(), Some("23514"));
+
+        let registration = validate_registration_input(&body).expect("signed registration fixture");
+        let capabilities = serde_json::to_value(&body.capabilities).unwrap();
+        persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &registration,
+            &capabilities,
+            MAX_PENDING_AGENT_ENROLLMENTS,
+        )
+        .await
+        .expect("consume immutable provisioning challenge");
+
+        let challenge_reopen_error = sqlx::query(
+            "UPDATE agent_enrollment_challenges \
+             SET status = 'pending', consumed_at = NULL, \
+                 consumed_enrollment_id = NULL WHERE id = $1",
+        )
+        .bind(challenge_id)
+        .execute(pool)
+        .await
+        .expect_err("a consumed provisioning challenge must remain terminal");
+        let challenge_reopen_code = challenge_reopen_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(challenge_reopen_code.as_deref(), Some("23514"));
+        let challenge_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_enrollment_challenges WHERE id = $1")
+                .bind(challenge_id)
+                .fetch_one(pool)
+                .await
+                .expect("read terminal provisioning challenge");
+        assert_eq!(challenge_status, "consumed");
+
+        for agent_id in [&approved_id, &pending_id, &challenge_agent_id] {
+            cleanup_agent(pool, agent_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn db_post_cutover_non_pending_agent_inserts_are_blocked() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for forged_status in ["approved", "revoked"] {
+            let agent_id = format!("forged-{forged_status}-{}", Uuid::new_v4());
+            let mut tx = pool.begin().await.expect("begin rejected identity fixture");
+            activate_agent_enrollment_contract_v3(&mut tx)
+                .await
+                .expect("activate current enrollment marker");
+            let error = sqlx::query(
+                "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status, \
+                     enrollment_bounds_version) \
+                 VALUES ($1, 'ci', '{}'::jsonb, 'forged-pubkey', $2, $3, 1)",
+            )
+            .bind(&agent_id)
+            .bind(sha256_hex(&format!("forged-{forged_status}-token-{agent_id}")))
+            .bind(forged_status)
+            .execute(&mut *tx)
+            .await
+            .expect_err("post-cutover writers must not create non-Pending identities");
+            let error_code = error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .map(|code| code.into_owned());
+            assert_eq!(error_code.as_deref(), Some("23514"));
+            tx.rollback()
+                .await
+                .expect("rollback rejected identity fixture");
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                    .bind(&agent_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("check rejected non-Pending identity");
+            assert!(!exists, "the rejected identity must leave no durable row");
+        }
+    }
+
     /// Both approve and revoke require admin (defense in depth beyond middleware).
     #[tokio::test]
     async fn db_revoke_and_approve_require_admin() {
@@ -7045,8 +10647,12 @@ mod tests {
         let agent_id = format!("revoke-authz-{}", Uuid::new_v4());
         seed_agent(pool, &agent_id, "ci", "approved").await;
 
-        let revoke_denied =
-            admin_revoke_agent(Path(agent_id.clone()), Extension(non_admin_session())).await;
+        let revoke_denied = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(non_admin_session()),
+            Json(revoke_body(Uuid::nil(), String::new())),
+        )
+        .await;
         assert!(
             matches!(revoke_denied, Err((StatusCode::FORBIDDEN, _))),
             "non-admin revoke must 403: {revoke_denied:?}"
@@ -7054,10 +10660,7 @@ mod tests {
         let approve_denied = admin_approve_agent(
             Path(agent_id.clone()),
             Extension(non_admin_session()),
-            Json(ApproveBody {
-                platform: "ci".into(),
-                capabilities: None,
-            }),
+            Json(approve_body(Uuid::nil(), String::new())),
         )
         .await;
         assert!(
@@ -7087,21 +10690,23 @@ mod tests {
             return;
         };
         let id = format!("test-agent-{}", Uuid::new_v4());
-
-        let token = generate_agent_token();
-        let hash = sha256_hex(&token);
-        sqlx::query(
-            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-             VALUES ($1, 'ci', '{}'::jsonb, 'pk', $2, 'pending')",
+        let body = valid_registration_body(id.clone());
+        seed_registration_challenge(&pool, &body).await;
+        let registration = validate_registration_input(&body).expect("signed registration fixture");
+        let capabilities = serde_json::to_value(&body.capabilities).unwrap();
+        let token = persist_pending_agent_registration(
+            &pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &registration,
+            &capabilities,
+            MAX_PENDING_AGENT_ENROLLMENTS,
         )
-        .bind(&id)
-        .bind(&hash)
-        .execute(&pool)
         .await
-        .expect("insert");
+        .expect("persist challenge-admitted registration");
+        let hash = sha256_hex(&token);
 
         let row = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, agent_id, platform, capabilities, public_key, token_hash, status \
+            "SELECT id, agent_id, public_key, token_hash, status \
              FROM agents WHERE agent_id = $1",
         )
         .bind(&id)
@@ -7114,6 +10719,450 @@ mod tests {
 
         cleanup_agent(&pool, &id).await;
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_expired_pending_enrollment_cleanup_is_bounded() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let expired_old = format!("cleanup-old-{suffix}");
+        let expired_new = format!("cleanup-new-{suffix}");
+        let active = format!("cleanup-active-{suffix}");
+
+        for (agent_id, expires_at) in [
+            (&expired_old, "2000-01-01T00:00:00Z"),
+            (&expired_new, "2001-01-01T00:00:00Z"),
+            (&active, "2999-01-01T00:00:00Z"),
+        ] {
+            seed_agent(pool, agent_id, "ci", "pending").await;
+            force_agent_enrollment_deadline_for_test(
+                pool,
+                agent_id,
+                expires_at
+                    .parse::<DateTime<Utc>>()
+                    .expect("valid enrollment fixture timestamp"),
+            )
+            .await;
+        }
+
+        let removed = cleanup_expired_pending_agent_enrollments_with_batch(pool, 1)
+            .await
+            .expect("bounded cleanup");
+        assert_eq!(removed, 1, "one-row batch must delete exactly one row");
+
+        let old_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&expired_old)
+                .fetch_one(pool)
+                .await
+                .expect("read old expired enrollment");
+        let new_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&expired_new)
+                .fetch_one(pool)
+                .await
+                .expect("read newer expired enrollment");
+        let active_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&active)
+                .fetch_one(pool)
+                .await
+                .expect("read active enrollment");
+        assert!(!old_exists, "cleanup must remove the oldest expired row");
+        assert!(
+            new_exists,
+            "the batch limit must leave the second expired row"
+        );
+        assert!(
+            active_exists,
+            "cleanup must preserve unexpired Pending rows"
+        );
+
+        for agent_id in [&expired_new, &active] {
+            cleanup_agent(pool, agent_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn db_pending_enrollment_quota_allows_one_then_rejects_growth() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let active_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at > NOW()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count active Pending enrollments");
+        let test_quota = active_before + 1;
+
+        let first_id = format!("quota-first-{}", Uuid::new_v4());
+        let first_body = valid_registration_body(first_id.clone());
+        seed_registration_challenge(pool, &first_body).await;
+        let first = validate_registration_input(&first_body).expect("first input");
+        let first_caps = serde_json::to_value(&first_body.capabilities).unwrap();
+        let first_token = persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &first,
+            &first_caps,
+            test_quota,
+        )
+        .await
+        .expect("the final available Pending slot must be admitted");
+        assert!(first_token.starts_with(AGENT_TOKEN_PREFIX));
+
+        let expires_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT enrollment_expires_at FROM agents WHERE agent_id = $1")
+                .bind(&first_id)
+                .fetch_one(pool)
+                .await
+                .expect("read admitted enrollment expiry");
+        assert!(
+            expires_at.is_some_and(|deadline| deadline > Utc::now()),
+            "an admitted Pending row must have a future expiry"
+        );
+
+        let second_id = format!("quota-second-{}", Uuid::new_v4());
+        let second_body = valid_registration_body(second_id.clone());
+        seed_registration_challenge(pool, &second_body).await;
+        let second = validate_registration_input(&second_body).expect("second input");
+        let second_caps = serde_json::to_value(&second_body.capabilities).unwrap();
+        let rejected = persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &second,
+            &second_caps,
+            test_quota,
+        )
+        .await;
+        assert!(
+            matches!(rejected, Err((StatusCode::TOO_MANY_REQUESTS, _))),
+            "the aggregate cap must reject another unique Pending row: {rejected:?}"
+        );
+        let second_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&second_id)
+                .fetch_one(pool)
+                .await
+                .expect("check rejected enrollment");
+        assert!(!second_exists, "quota rejection must not persist a row");
+
+        cleanup_agent(pool, &first_id).await;
+        cleanup_agent(pool, &second_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_pending_enrollment_quota_is_atomic_under_concurrency() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let active_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at > NOW()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count active Pending enrollments");
+        let test_quota = active_before + 1;
+
+        const CALLERS: usize = 8;
+        let mut tasks = Vec::with_capacity(CALLERS);
+        let mut fixtures = Vec::with_capacity(CALLERS);
+        for index in 0..CALLERS {
+            let agent_id = format!("quota-race-{index}-{}", Uuid::new_v4());
+            let body = valid_registration_body(agent_id.clone());
+            seed_registration_challenge(pool, &body).await;
+            fixtures.push((agent_id, body));
+        }
+        for (agent_id, body) in fixtures {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let registration = validate_registration_input(&body).expect("bounded input");
+                let capabilities = serde_json::to_value(&body.capabilities).unwrap();
+                let result = persist_pending_agent_registration(
+                    &pool,
+                    ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+                    &registration,
+                    &capabilities,
+                    test_quota,
+                )
+                .await;
+                (agent_id, result)
+            }));
+        }
+
+        let mut ids = Vec::with_capacity(CALLERS);
+        let mut admitted = 0usize;
+        for task in tasks {
+            let (agent_id, result) = task.await.expect("registration task");
+            ids.push(agent_id);
+            match result {
+                Ok(token) => {
+                    admitted += 1;
+                    assert!(token.starts_with(AGENT_TOKEN_PREFIX));
+                }
+                Err((StatusCode::TOO_MANY_REQUESTS, _)) => {}
+                other => panic!("concurrent admission returned an unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            admitted, 1,
+            "serialized count-and-insert must admit exactly the final available slot"
+        );
+
+        let active_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agents \
+             WHERE status = 'pending' AND enrollment_expires_at > NOW()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count after concurrent admission");
+        assert_eq!(active_after, active_before + 1);
+
+        for agent_id in ids {
+            cleanup_agent(pool, &agent_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn db_enrollment_challenge_rejects_wrong_identity_key_and_expiry() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let intended_key = generate_keypair(&mut OsRng);
+        let attacker_key = generate_keypair(&mut OsRng);
+        let challenge_id = Uuid::new_v4();
+        let challenge = generate_agent_enrollment_challenge();
+        let intended_id = format!("challenge-intended-{}", Uuid::new_v4());
+        let intended = signed_registration_body(
+            challenge_id,
+            challenge.clone(),
+            intended_id.clone(),
+            "ci".to_owned(),
+            &intended_key,
+        );
+        seed_registration_challenge(pool, &intended).await;
+
+        let wrong_identity = signed_registration_body(
+            challenge_id,
+            challenge.clone(),
+            format!("challenge-attacker-{}", Uuid::new_v4()),
+            "ci".to_owned(),
+            &intended_key,
+        );
+        let wrong_key = signed_registration_body(
+            challenge_id,
+            challenge.clone(),
+            intended_id.clone(),
+            "ci".to_owned(),
+            &attacker_key,
+        );
+        for malicious in [&wrong_identity, &wrong_key] {
+            let registration =
+                validate_registration_input(malicious).expect("self-consistent signed claim");
+            let capabilities = serde_json::to_value(&malicious.capabilities).unwrap();
+            let result = persist_pending_agent_registration(
+                pool,
+                ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+                &registration,
+                &capabilities,
+                MAX_PENDING_AGENT_ENROLLMENTS,
+            )
+            .await;
+            assert!(
+                matches!(result, Err((StatusCode::FORBIDDEN, _))),
+                "a self-signed but non-preprovisioned identity/key must fail closed: {result:?}"
+            );
+        }
+
+        force_challenge_deadline_for_test(pool, challenge_id, Utc::now() - Duration::seconds(1))
+            .await;
+        let registration =
+            validate_registration_input(&intended).expect("intended signed registration");
+        let capabilities = serde_json::to_value(&intended.capabilities).unwrap();
+        let expired = persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &registration,
+            &capabilities,
+            MAX_PENDING_AGENT_ENROLLMENTS,
+        )
+        .await;
+        assert!(matches!(expired, Err((StatusCode::FORBIDDEN, _))));
+        let durable_identity_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&intended_id)
+                .fetch_one(pool)
+                .await
+                .expect("check rejected identity");
+        assert!(
+            !durable_identity_exists,
+            "wrong or expired challenge claims must not allocate a durable identity"
+        );
+        cleanup_agent(pool, &intended_id).await;
+        cleanup_agent(pool, &wrong_identity.agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_enrollment_challenge_is_single_use_under_concurrency_and_replay() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("challenge-race-{}", Uuid::new_v4());
+        let body = valid_registration_body(agent_id.clone());
+        seed_registration_challenge(pool, &body).await;
+
+        let mut tasks = Vec::new();
+        for claim in [body.clone(), body.clone()] {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let registration =
+                    validate_registration_input(&claim).expect("signed registration claim");
+                let capabilities = serde_json::to_value(&claim.capabilities).unwrap();
+                persist_pending_agent_registration(
+                    &pool,
+                    ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+                    &registration,
+                    &capabilities,
+                    MAX_PENDING_AGENT_ENROLLMENTS,
+                )
+                .await
+            }));
+        }
+        let results = [
+            tasks.remove(0).await.expect("first claim task"),
+            tasks.remove(0).await.expect("second claim task"),
+        ];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one concurrent claimant may consume the challenge: {results:?}"
+        );
+        assert!(results.iter().any(|result| {
+            matches!(result, Err((StatusCode::FORBIDDEN, _)))
+                || matches!(result, Err((StatusCode::TOO_MANY_REQUESTS, _)))
+        }));
+
+        let replay_registration =
+            validate_registration_input(&body).expect("replay remains self-consistent");
+        let replay_capabilities = serde_json::to_value(&body.capabilities).unwrap();
+        let replay = persist_pending_agent_registration(
+            pool,
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            &replay_registration,
+            &replay_capabilities,
+            MAX_PENDING_AGENT_ENROLLMENTS,
+        )
+        .await;
+        assert!(
+            matches!(replay, Err((StatusCode::FORBIDDEN, _))),
+            "a committed challenge must never replay: {replay:?}"
+        );
+        let (challenge_status, identity_count): (String, i64) = sqlx::query_as(
+            "SELECT challenge.status, \
+                    (SELECT COUNT(*) FROM agents WHERE agent_id = $2) \
+             FROM agent_enrollment_challenges AS challenge WHERE challenge.id = $1",
+        )
+        .bind(body.enrollment_challenge_id)
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("read consumed challenge");
+        assert_eq!(challenge_status, "consumed");
+        assert_eq!(identity_count, 1);
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn db_admin_provisioned_challenge_drives_registration_and_bound_approval() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let key = generate_keypair(&mut OsRng);
+        let public_key = encode_verifying_key(&key.verifying_key());
+        let agent_id = format!("trusted-enrollment-{}", Uuid::new_v4());
+        let (challenge_headers, Json(challenge)) = admin_create_agent_enrollment_challenge(
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(CreateEnrollmentChallengeBody {
+                agent_id: agent_id.clone(),
+                platform: "ci".to_owned(),
+                public_key,
+                expires_in_seconds: Some(300),
+            }),
+        )
+        .await
+        .expect("trusted administrator provisions challenge");
+        assert_eq!(
+            challenge_headers,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            "the one-time plaintext challenge must never enter an HTTP or idempotency cache"
+        );
+        let challenge_debug = format!("{challenge:?}");
+        assert!(!challenge_debug.contains(&challenge.enrollment_challenge));
+        assert!(challenge_debug.contains("<redacted>"));
+        let registration = signed_registration_body(
+            challenge.enrollment_challenge_id,
+            challenge.enrollment_challenge.clone(),
+            agent_id.clone(),
+            "ci".to_owned(),
+            &key,
+        );
+        let _ = register_agent(
+            ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
+            HeaderMap::new(),
+            Json(registration),
+        )
+        .await
+        .expect("the exact workload key consumes its grant");
+
+        let (enrollment_id, challenge_id, status, secret_hash):
+            (Uuid, Uuid, String, String) = sqlx::query_as(
+            "SELECT agent.id, agent.enrollment_challenge_id, challenge.status, challenge.secret_hash \
+             FROM agents AS agent \
+             JOIN agent_enrollment_challenges AS challenge \
+               ON challenge.id = agent.enrollment_challenge_id \
+             WHERE agent.agent_id = $1",
+        )
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("read cryptographic admission linkage");
+        assert_eq!(challenge_id, challenge.enrollment_challenge_id);
+        assert_eq!(status, "consumed");
+        assert_eq!(secret_hash, sha256_hex(&challenge.enrollment_challenge));
+        assert_ne!(secret_hash, challenge.enrollment_challenge);
+
+        let _ = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(ApproveBody {
+                enrollment_id,
+                public_key_fingerprint: challenge.public_key_fingerprint,
+                platform: "ci".to_owned(),
+                capabilities: None,
+            }),
+        )
+        .await
+        .expect("approval must accept the exact consumed challenge identity");
+        cleanup_agent(pool, &agent_id).await;
     }
 
     /// #run7 wire-contract: register_agent VALIDATES the Ed25519 public_key AT
@@ -7131,10 +11180,13 @@ mod tests {
             return;
         };
         let mk_body = |agent_id: String, public_key: &str| RegisterBody {
+            enrollment_challenge_id: Uuid::new_v4(),
+            enrollment_challenge: generate_agent_enrollment_challenge(),
             agent_id,
             platform: "ci".to_string(),
             capabilities: Capabilities::default(),
             public_key: public_key.to_string(),
+            enrollment_proof: "invalid-before-key-validation".to_owned(),
         };
 
         // Malformed key -> 400 (rejected before any INSERT).
@@ -7178,18 +11230,26 @@ mod tests {
         );
 
         // Valid generated Ed25519 key -> accepted (pending).
-        let key = generate_keypair(&mut OsRng);
-        let pubkey = encode_verifying_key(&key.verifying_key());
         let good_id = format!("goodkey-{}", Uuid::new_v4());
+        let good_body = valid_registration_body(good_id.clone());
+        seed_registration_challenge(pool, &good_body).await;
         let ok = register_agent(
             ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
             HeaderMap::new(),
-            Json(mk_body(good_id.clone(), &pubkey)),
+            Json(good_body),
         )
         .await;
-        let Ok(Json(resp)) = &ok else {
+        let Ok((response_headers, Json(resp))) = &ok else {
             panic!("a valid public_key must register: {ok:?}");
         };
+        assert_eq!(
+            response_headers,
+            &[(axum::http::header::CACHE_CONTROL, "no-store")],
+            "the one-time agent bearer must never be cacheable"
+        );
+        let response_debug = format!("{resp:?}");
+        assert!(!response_debug.contains(&resp.token));
+        assert!(response_debug.contains("<redacted>"));
         assert_eq!(
             resp.agent_id, good_id,
             "the valid registration returns the agent id"
@@ -7209,19 +11269,14 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let key = generate_keypair(&mut OsRng);
-        let pubkey = encode_verifying_key(&key.verifying_key());
         let agent_id = format!("protover-{}", Uuid::new_v4());
+        let body = valid_registration_body(agent_id.clone());
+        seed_registration_challenge(pool, &body).await;
 
         let ok = register_agent(
             ProtocolVersion(ryuki_protocol::PROTOCOL_VERSION),
             HeaderMap::new(),
-            Json(RegisterBody {
-                agent_id: agent_id.clone(),
-                platform: "ci".to_string(),
-                capabilities: Capabilities::default(),
-                public_key: pubkey,
-            }),
+            Json(body),
         )
         .await;
         assert!(ok.is_ok(), "a valid registration must succeed: {ok:?}");
@@ -7381,7 +11436,7 @@ mod tests {
 
         let _agent = authenticate_agent(&headers, &pool).await.expect("auth ok");
 
-        let leased = lease_pending_job(&pool, &agent_id, &platform)
+        let leased = lease_pending_job(&pool, &agent_id)
             .await
             .expect("lease query")
             .expect("must return a row");
@@ -7393,6 +11448,520 @@ mod tests {
         assert_eq!(row.cp_nonce.as_deref(), Some(&*leased.cp_nonce));
         assert!(row.lease_deadline.is_some());
         assert!(row.lease_generation >= 1);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_lease_contract_blocks_old_replica_then_v2_helper_succeeds() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-lease-contract-{}", Uuid::new_v4().simple());
+        let agent_id = format!("lease-contract-agent-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_id, &platform, "approved").await;
+        let job_id = seed_pending_job(&pool, &platform).await;
+
+        let old_update =
+            sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = $1 WHERE id = $2")
+                .bind(&agent_id)
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .expect_err("an old replica without the v2 marker must fail closed");
+        let old_update_code = old_update
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(old_update_code.as_deref(), Some("55000"));
+
+        let rejected_state: (String, Option<String>, Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT status, agent_id, attempt_id, lease_generation \
+             FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read rejected legacy transition");
+        assert_eq!(rejected_state, ("Pending".to_owned(), None, None, 0));
+
+        let leased = lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("v2 lease helper")
+            .expect("the rejected job remains available to the v2 helper");
+        assert_eq!(leased.row.id, job_id);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_lease_enforces_approved_tool_provider_and_priority_eligibility() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-capability-{}", Uuid::new_v4().simple());
+        let capable_agent = format!("capable-{}", Uuid::new_v4());
+        let wrong_provider_agent = format!("wrong-provider-{}", Uuid::new_v4());
+        let missing_provider_agent = format!("missing-provider-{}", Uuid::new_v4());
+        let ansible_agent = format!("ansible-{}", Uuid::new_v4());
+        let empty_agent = format!("empty-capabilities-{}", Uuid::new_v4());
+        let exact_capabilities = terraform_test_capabilities("2.16.1");
+        let wrong_provider_capabilities = terraform_test_capabilities("2.16.0");
+        let missing_provider_capabilities = Capabilities {
+            terraform: Some(ryuki_protocol::ToolCapability {
+                version: "1.9.5".to_owned(),
+                provider_versions: std::collections::BTreeMap::new(),
+            }),
+            ansible: None,
+        };
+        let ansible_capabilities = Capabilities {
+            terraform: None,
+            ansible: Some(ryuki_protocol::ToolCapability {
+                version: "2.16.0".to_owned(),
+                provider_versions: std::collections::BTreeMap::new(),
+            }),
+        };
+        let empty_capabilities = Capabilities::default();
+        seed_agent_with_capabilities(
+            &pool,
+            &capable_agent,
+            &platform,
+            "approved",
+            &exact_capabilities,
+        )
+        .await;
+        seed_agent_with_capabilities(
+            &pool,
+            &wrong_provider_agent,
+            &platform,
+            "approved",
+            &wrong_provider_capabilities,
+        )
+        .await;
+        seed_agent_with_capabilities(
+            &pool,
+            &missing_provider_agent,
+            &platform,
+            "approved",
+            &missing_provider_capabilities,
+        )
+        .await;
+        seed_agent_with_capabilities(
+            &pool,
+            &ansible_agent,
+            &platform,
+            "approved",
+            &ansible_capabilities,
+        )
+        .await;
+        seed_agent_with_capabilities(
+            &pool,
+            &empty_agent,
+            &platform,
+            "approved",
+            &empty_capabilities,
+        )
+        .await;
+
+        let incompatible_high =
+            seed_pending_job_for_iac(&pool, &platform, "patch-maintenance@v1").await;
+        let compatible_low =
+            seed_pending_job_for_iac(&pool, &platform, "linux-server-deployment@v1").await;
+        sqlx::query("UPDATE agent_jobs SET priority = 9 WHERE id = $1")
+            .bind(incompatible_high)
+            .execute(&pool)
+            .await
+            .expect("raise incompatible job priority");
+        sqlx::query("UPDATE agent_jobs SET priority = 1 WHERE id = $1")
+            .bind(compatible_low)
+            .execute(&pool)
+            .await
+            .expect("lower compatible job priority");
+
+        let leased = lease_pending_job(&pool, &capable_agent)
+            .await
+            .expect("capability-aware lease")
+            .expect("lower-priority compatible work remains leaseable");
+        assert_eq!(leased.row.id, compatible_low);
+
+        let denied_state: PendingJobLeaseState = sqlx::query_as(
+            "SELECT status, agent_id, attempt_id, fencing_token, cp_nonce, lease_deadline \
+             FROM agent_jobs WHERE id = $1",
+        )
+        .bind(incompatible_high)
+        .fetch_one(&pool)
+        .await
+        .expect("read incompatible row");
+        assert_eq!(
+            denied_state,
+            ("Pending".to_owned(), None, None, None, None, None)
+        );
+
+        sqlx::query("UPDATE agent_jobs SET status = 'Succeeded' WHERE id = $1")
+            .bind(compatible_low)
+            .execute(&pool)
+            .await
+            .expect("release capable agent slot");
+        let ansible_lease = lease_pending_job(&pool, &ansible_agent)
+            .await
+            .expect("Ansible poll")
+            .expect("an exact Ansible capability must lease the classified playbook");
+        assert_eq!(ansible_lease.row.id, incompatible_high);
+        let another_terraform = seed_pending_job(&pool, &platform).await;
+        assert!(
+            lease_pending_job(&pool, &wrong_provider_agent)
+                .await
+                .expect("wrong-provider poll")
+                .is_none(),
+            "an exact provider-version mismatch must deny the Terraform job"
+        );
+        assert!(
+            lease_pending_job(&pool, &missing_provider_agent)
+                .await
+                .expect("missing-provider poll")
+                .is_none(),
+            "a missing required provider must deny the Terraform job"
+        );
+        assert!(
+            lease_pending_job(&pool, &empty_agent)
+                .await
+                .expect("empty-capability poll")
+                .is_none(),
+            "an empty approved set must not lease any classified job"
+        );
+        let still_pending: (String, Option<String>) =
+            sqlx::query_as("SELECT status, agent_id FROM agent_jobs WHERE id = $1")
+                .bind(another_terraform)
+                .fetch_one(&pool)
+                .await
+                .expect("read denied Terraform job");
+        assert_eq!(still_pending, ("Pending".to_owned(), None));
+
+        // The normalized matcher also supports an explicit reviewed tool
+        // version. It is exact-only; no lexical/range inference is permitted.
+        let approved_json = serde_json::to_value(&exact_capabilities).unwrap();
+        let exact_requirement = json!({
+            "tool": "terraform",
+            "version": "1.9.5",
+            "provider_versions": {"vsphere": "2.16.1"}
+        });
+        let wrong_tool_version = json!({
+            "tool": "terraform",
+            "version": "1.9.6",
+            "provider_versions": {"vsphere": "2.16.1"}
+        });
+        let exact_matches: bool = sqlx::query_scalar(
+            "SELECT ryuki_agent_capabilities_satisfy_requirement($1::jsonb, $2::jsonb)",
+        )
+        .bind(&approved_json)
+        .bind(&exact_requirement)
+        .fetch_one(&pool)
+        .await
+        .expect("evaluate exact requirement");
+        let wrong_version_matches: bool = sqlx::query_scalar(
+            "SELECT ryuki_agent_capabilities_satisfy_requirement($1::jsonb, $2::jsonb)",
+        )
+        .bind(&approved_json)
+        .bind(&wrong_tool_version)
+        .fetch_one(&pool)
+        .await
+        .expect("evaluate wrong tool version");
+        assert!(exact_matches);
+        assert!(!wrong_version_matches);
+
+        let malformed_provider_capabilities = json!({
+            "terraform": {
+                "version": "1.9.5",
+                "provider_versions": {"vsphere": 2}
+            }
+        });
+        let malformed_provider_matches: bool = sqlx::query_scalar(
+            "SELECT ryuki_agent_capabilities_satisfy_requirement($1::jsonb, $2::jsonb)",
+        )
+        .bind(&malformed_provider_capabilities)
+        .bind(&exact_requirement)
+        .fetch_one(&pool)
+        .await
+        .expect("evaluate malformed provider document");
+        assert!(!malformed_provider_matches);
+
+        let ansible_with_provider = json!({
+            "ansible": {
+                "version": "2.16.0",
+                "provider_versions": {"collection": "1.0.0"}
+            }
+        });
+        let ansible_requirement = json!({"tool": "ansible", "provider_versions": {}});
+        let ansible_with_provider_matches: bool = sqlx::query_scalar(
+            "SELECT ryuki_agent_capabilities_satisfy_requirement($1::jsonb, $2::jsonb)",
+        )
+        .bind(&ansible_with_provider)
+        .bind(&ansible_requirement)
+        .fetch_one(&pool)
+        .await
+        .expect("evaluate non-canonical Ansible provider document");
+        assert!(!ansible_with_provider_matches);
+
+        for unclassified_spec in [
+            json!({"iac_ref": "unknown-offering@v1"}),
+            json!({"iac_ref": 42}),
+            json!({"iac_ref": "linux-server-deployment-playbook@v1"}),
+        ] {
+            let requirement: Value =
+                sqlx::query_scalar("SELECT ryuki_agent_job_required_capabilities($1::jsonb)")
+                    .bind(&unclassified_spec)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("derive fail-closed requirement");
+            assert_eq!(
+                requirement,
+                json!({"tool": "unclassified"}),
+                "unknown, malformed, and unwired offering refs must stay held"
+            );
+        }
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        for agent_id in [
+            &capable_agent,
+            &wrong_provider_agent,
+            &missing_provider_agent,
+            &ansible_agent,
+            &empty_agent,
+        ] {
+            cleanup_agent(&pool, agent_id).await;
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_capability_narrowing_is_locked_out_and_affinity_remains_safe() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-cap-narrow-{}", Uuid::new_v4().simple());
+        let agent_a = format!("cap-narrow-a-{}", Uuid::new_v4());
+        let agent_b = format!("cap-narrow-b-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_a, &platform, "approved").await;
+        seed_agent(pool, &agent_b, &platform, "approved").await;
+
+        let request_id = Uuid::new_v4();
+        let state_key = format!("capability-affinity-{request_id}");
+        let plan_spec = stateful_test_spec(request_id, &state_key, JobMode::LivePlan);
+        let plan_id = create_agent_job(pool, request_id, &platform, &plan_spec, "LivePlan")
+            .await
+            .expect("seed stateful plan");
+        assert_eq!(
+            lease_pending_job(pool, &agent_a)
+                .await
+                .expect("lease plan")
+                .expect("agent A is capable")
+                .row
+                .id,
+            plan_id
+        );
+
+        let (enrollment_id, fingerprint) = enrollment_review_binding(pool, &agent_a).await;
+        let incompatible = Capabilities {
+            terraform: None,
+            ansible: Some(ryuki_protocol::ToolCapability {
+                version: "2.16.0".to_owned(),
+                provider_versions: std::collections::BTreeMap::new(),
+            }),
+        };
+        let denied = admin_approve_agent(
+            Path(agent_a.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(ApproveBody {
+                enrollment_id,
+                public_key_fingerprint: fingerprint.clone(),
+                platform: platform.clone(),
+                capabilities: Some(incompatible),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::CONFLICT, _))),
+            "capabilities cannot be narrowed beneath an active job: {denied:?}"
+        );
+
+        let persisted_capabilities: Value =
+            sqlx::query_scalar("SELECT capabilities FROM agents WHERE agent_id = $1")
+                .bind(&agent_a)
+                .fetch_one(pool)
+                .await
+                .expect("read capabilities after denied narrowing");
+        assert_eq!(
+            persisted_capabilities,
+            serde_json::to_value(test_agent_capabilities()).unwrap(),
+            "a denied narrowing must leave the approved authority unchanged"
+        );
+
+        sqlx::query("UPDATE agent_jobs SET status = 'Succeeded' WHERE id = $1")
+            .bind(plan_id)
+            .execute(pool)
+            .await
+            .expect("complete stateful plan");
+        let apply_spec = stateful_test_spec(request_id, &state_key, JobMode::LiveApply);
+        let apply_id = create_agent_job(pool, request_id, &platform, &apply_spec, "LiveApply")
+            .await
+            .expect("seed stateful apply");
+        assert!(
+            lease_pending_job(pool, &agent_b)
+                .await
+                .expect("agent B poll")
+                .is_none(),
+            "capability administration must not weaken state-key affinity"
+        );
+        assert_eq!(
+            lease_pending_job(pool, &agent_a)
+                .await
+                .expect("agent A apply poll")
+                .expect("the unchanged compatible authority remains usable")
+                .row
+                .id,
+            apply_id
+        );
+
+        let compatible = test_agent_capabilities();
+        let approved = admin_approve_agent(
+            Path(agent_a.clone()),
+            Extension(enrollment_human_admin_session("persisted-session")),
+            Json(ApproveBody {
+                enrollment_id,
+                public_key_fingerprint: fingerprint,
+                platform: platform.clone(),
+                capabilities: Some(compatible.clone()),
+            }),
+        )
+        .await
+        .expect("an active job permits an exactly compatible reapproval");
+        let expected_digest = capabilities_digest(&serde_json::to_value(compatible).unwrap());
+        assert_eq!(
+            approved.0["capabilities_digest"].as_str(),
+            Some(expected_digest.as_str())
+        );
+        let audited_digest: String = sqlx::query_scalar(
+            "SELECT detail->>'capabilities_digest' FROM audit_log \
+             WHERE action = 'agent-approve' AND detail->>'agent_id' = $1 LIMIT 1",
+        )
+        .bind(&agent_a)
+        .fetch_one(pool)
+        .await
+        .expect("read capability approval audit digest");
+        assert_eq!(audited_digest, expected_digest);
+
+        let roster = list_agents_with(pool).await.expect("read admin roster").0;
+        let roster_agent = roster["agents"]
+            .as_array()
+            .and_then(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent["agent_id"].as_str() == Some(agent_a.as_str()))
+            })
+            .expect("agent A in admin roster");
+        assert_eq!(
+            roster_agent["capabilities_digest"].as_str(),
+            Some(expected_digest.as_str())
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_agent(pool, &agent_a).await;
+        cleanup_agent(pool, &agent_b).await;
+    }
+
+    #[tokio::test]
+    async fn db_active_lease_ceiling_counts_leased_running_and_expired_until_swept() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!("plt-cap-{}", Uuid::new_v4().simple());
+        let agent_id = format!("single-slot-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_id, &platform, "approved").await;
+        let active_index_present: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM pg_index AS catalog \
+                 JOIN pg_class AS index_class ON index_class.oid = catalog.indexrelid \
+                 WHERE index_class.relname = 'idx_agent_jobs_active_agent' \
+                   AND catalog.indrelid = 'agent_jobs'::regclass \
+                   AND pg_get_indexdef(catalog.indexrelid) LIKE '%(agent_id)%' \
+                   AND pg_get_expr(catalog.indpred, catalog.indrelid) LIKE '%Leased%' \
+                   AND pg_get_expr(catalog.indpred, catalog.indrelid) LIKE '%Running%' \
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect active-agent lease index");
+        assert!(
+            active_index_present,
+            "the bounded admission query requires its partial active-agent index"
+        );
+        let first_job = seed_pending_job(&pool, &platform).await;
+        let second_job = seed_pending_job(&pool, &platform).await;
+
+        let first = lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("first poll")
+            .expect("first slot is available");
+        assert_eq!(first.row.id, first_job);
+        assert!(
+            lease_pending_job(&pool, &agent_id)
+                .await
+                .expect("second poll while Leased")
+                .is_none(),
+            "a Leased row consumes the only active slot"
+        );
+
+        sqlx::query(
+            "UPDATE agent_jobs SET status = 'Running', \
+                 lease_deadline = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(first_job)
+        .execute(&pool)
+        .await
+        .expect("make the first lease Running and expired");
+        assert!(
+            lease_pending_job(&pool, &agent_id)
+                .await
+                .expect("poll before expiry sweep")
+                .is_none(),
+            "an expired-but-unswept Running row still consumes capacity"
+        );
+
+        expire_leases(&pool)
+            .await
+            .expect("sweep expired non-mutating lease");
+        let retried = lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("poll after expiry transition")
+            .expect("leaving active status releases the slot");
+        assert_eq!(
+            retried.row.id, first_job,
+            "the existing non-mutating retry keeps its queue position and remains legitimate"
+        );
+        let untouched_second: UntouchedPendingJobState = sqlx::query_as(
+            "SELECT status, agent_id, attempt_id, lease_generation, fencing_token, cp_nonce, \
+                    lease_deadline, delivery_attempts, priority \
+             FROM agent_jobs WHERE id = $1",
+        )
+        .bind(second_job)
+        .fetch_one(&pool)
+        .await
+        .expect("read untouched second job");
+        assert_eq!(
+            untouched_second,
+            ("Pending".to_owned(), None, None, 0, None, None, None, 0, 5,),
+            "saturated polls must not mutate the denied row or its ordering metadata"
+        );
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
@@ -7419,7 +11988,7 @@ mod tests {
             .await
             .expect("seed live plan");
 
-        let first = lease_pending_job(&pool, &agent_a, &platform)
+        let first = lease_pending_job(&pool, &agent_a)
             .await
             .expect("first lease")
             .expect("plan is leaseable");
@@ -7444,14 +12013,14 @@ mod tests {
         assert_eq!(status, "Pending");
         assert_eq!(assigned_agent.as_deref(), Some(agent_a.as_str()));
         assert!(
-            lease_pending_job(&pool, &agent_b, &platform)
+            lease_pending_job(&pool, &agent_b)
                 .await
                 .expect("agent B poll")
                 .is_none(),
             "a retry must not move to another agent-local backend"
         );
         assert_eq!(
-            lease_pending_job(&pool, &agent_a, &platform)
+            lease_pending_job(&pool, &agent_a)
                 .await
                 .expect("agent A retry")
                 .expect("plan retry remains available")
@@ -7469,12 +12038,12 @@ mod tests {
         let apply_id = create_agent_job(&pool, request_id, &platform, &apply_spec, "LiveApply")
             .await
             .expect("seed live apply");
-        assert!(lease_pending_job(&pool, &agent_b, &platform)
+        assert!(lease_pending_job(&pool, &agent_b)
             .await
             .expect("agent B apply poll")
             .is_none());
         assert_eq!(
-            lease_pending_job(&pool, &agent_a, &platform)
+            lease_pending_job(&pool, &agent_a)
                 .await
                 .expect("agent A apply poll")
                 .expect("apply remains available to agent A")
@@ -7493,12 +12062,12 @@ mod tests {
             create_agent_job(&pool, request_id, &platform, &destroy_spec, "LiveDestroy")
                 .await
                 .expect("seed live destroy");
-        assert!(lease_pending_job(&pool, &agent_b, &platform)
+        assert!(lease_pending_job(&pool, &agent_b)
             .await
             .expect("agent B destroy poll")
             .is_none());
         assert_eq!(
-            lease_pending_job(&pool, &agent_a, &platform)
+            lease_pending_job(&pool, &agent_a)
                 .await
                 .expect("agent A destroy poll")
                 .expect("destroy remains available to agent A")
@@ -7513,65 +12082,151 @@ mod tests {
         pool.close().await;
     }
 
-    // ── two concurrent polls do NOT double-lease the same job ────────────
-
     #[tokio::test]
-    async fn db_concurrent_polls_do_not_double_lease() {
+    async fn db_live_grant_wrong_enrollment_or_key_is_not_leaseable() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-
-        let platform = format!(
-            "plt-{}",
-            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
-        );
-        // Single Pending job.
-        let _ = seed_pending_job(&pool, &platform).await;
-
-        const N: usize = 6;
-        let mut handles = Vec::with_capacity(N);
-        for _ in 0..N {
-            let pool = pool.clone();
-            let platform = platform.clone();
-            handles.push(tokio::spawn(async move {
-                let attempt = Uuid::new_v4();
-                let fencing = Uuid::new_v4().to_string();
-                let nonce = Uuid::new_v4().to_string();
-                let deadline = Utc::now() + Duration::seconds(LEASE_TTL_SECS);
-                sqlx::query_as::<_, AgentJobRow>(&format!(
-                    "UPDATE agent_jobs \
-                     SET status = 'Leased', agent_id = $1, attempt_id = $2, \
-                         lease_generation = lease_generation + 1, fencing_token = $3, \
-                         cp_nonce = $4, lease_deadline = $5, updated_at = NOW() \
-                     WHERE id = ( \
-                         SELECT id FROM agent_jobs \
-                         WHERE platform = $6 AND status = 'Pending' \
-                         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1 \
-                     ) RETURNING {AGENT_JOB_COLUMNS}"
-                ))
-                .bind("race-agent")
-                .bind(attempt)
-                .bind(&fencing)
-                .bind(&nonce)
-                .bind(deadline)
-                .bind(&platform)
-                .fetch_optional(&pool)
+        let platform = format!("plt-grant-owner-{}", Uuid::new_v4().simple());
+        let agent_id = format!("grant-owner-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_id, &platform, "approved").await;
+        let (enrollment_id, public_key): (Uuid, String) =
+            sqlx::query_as("SELECT id, public_key FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(&pool)
                 .await
-                .expect("lease query")
-                .is_some()
+                .expect("load exact enrollment");
+        let request_id = Uuid::new_v4();
+        let state_key = format!("request-{request_id}");
+        let spec = stateful_test_spec(request_id, &state_key, JobMode::LiveApply);
+        let job_id = create_agent_job(&pool, request_id, &platform, &spec, "LiveApply")
+            .await
+            .expect("seed live job");
+
+        let authority_json = |id: Uuid, fingerprint: String| {
+            json!({
+                "execution_authority": {
+                    "assigned_agent_id": agent_id.clone(),
+                    "assigned_agent_enrollment_id": id,
+                    "assigned_agent_key_fingerprint": fingerprint,
+                    "execution_trust_profile_digest": "a".repeat(64),
+                }
+            })
+        };
+        sqlx::query("UPDATE agent_jobs SET agent_id = $1, live_context = $2::jsonb WHERE id = $3")
+            .bind(&agent_id)
+            .bind(authority_json(
+                Uuid::new_v4(),
+                public_key_fingerprint(&public_key),
+            ))
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("seed wrong enrollment authority");
+        assert!(lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("poll")
+            .is_none());
+
+        sqlx::query("UPDATE agent_jobs SET live_context = $1::jsonb WHERE id = $2")
+            .bind(authority_json(enrollment_id, "sha256:wrong".to_string()))
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("seed wrong key authority");
+        assert!(lease_pending_job(&pool, &agent_id)
+            .await
+            .expect("poll")
+            .is_none());
+
+        sqlx::query("UPDATE agent_jobs SET live_context = $1::jsonb WHERE id = $2")
+            .bind(authority_json(
+                enrollment_id,
+                public_key_fingerprint(&public_key),
+            ))
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("seed exact authority");
+        assert_eq!(
+            lease_pending_job(&pool, &agent_id)
+                .await
+                .expect("poll")
+                .expect("exact authority is leaseable")
+                .row
+                .id,
+            job_id
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── concurrent polls obey the per-agent ceiling across connections ──
+
+    #[tokio::test]
+    async fn db_concurrent_same_agent_polls_obey_ceiling_and_agents_are_independent() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-concurrent-cap-{}", Uuid::new_v4().simple());
+        let agent_a = format!("concurrent-a-{}", Uuid::new_v4());
+        let agent_b = format!("concurrent-b-{}", Uuid::new_v4());
+        seed_agent(&pool, &agent_a, &platform, "approved").await;
+        seed_agent(&pool, &agent_b, &platform, "approved").await;
+
+        const CALLERS: usize = 8;
+        for _ in 0..=CALLERS {
+            seed_pending_job(&pool, &platform).await;
+        }
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut handles = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let pool = pool.clone();
+            let agent_id = agent_a.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                lease_pending_job(&pool, &agent_id)
+                    .await
+                    .expect("production lease helper")
+                    .is_some()
             }));
         }
 
-        let mut results = Vec::with_capacity(N);
+        let mut results = Vec::with_capacity(CALLERS);
         for h in handles {
             results.push(h.await.expect("task"));
         }
-
         let leased_count = results.iter().filter(|&&v| v).count();
-        assert_eq!(leased_count, 1, "exactly one poll must win the lease");
+        assert_eq!(
+            leased_count, MAX_ACTIVE_LEASES_PER_AGENT as usize,
+            "cross-connection polls must not exceed the server-controlled ceiling"
+        );
+
+        let active_a: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs \
+             WHERE agent_id = $1 AND status IN ('Leased', 'Running')",
+        )
+        .bind(&agent_a)
+        .fetch_one(&pool)
+        .await
+        .expect("count agent A active leases");
+        assert_eq!(active_a, MAX_ACTIVE_LEASES_PER_AGENT);
+
+        let independent = lease_pending_job(&pool, &agent_b)
+            .await
+            .expect("agent B poll")
+            .expect("a different approved agent has independent capacity");
+        assert_eq!(independent.row.agent_id.as_deref(), Some(agent_b.as_str()));
 
         cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_a).await;
+        cleanup_agent(&pool, &agent_b).await;
         pool.close().await;
     }
 
@@ -7596,6 +12251,7 @@ mod tests {
         let nonce = Uuid::new_v4().to_string();
         let deadline = Utc::now() + Duration::seconds(LEASE_TTL_SECS);
 
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(&pool).await;
         let row = sqlx::query_as::<_, AgentJobRow>(&format!(
             "UPDATE agent_jobs \
              SET status = 'Leased', agent_id = $1, attempt_id = $2, \
@@ -7612,9 +12268,10 @@ mod tests {
         .bind(&nonce)
         .bind(deadline)
         .bind(&platform)
-        .fetch_one(&pool)
+        .fetch_one(&mut *lease_tx)
         .await
         .expect("lease");
+        lease_tx.commit().await.expect("commit lease fixture");
 
         // Correct fencing → Running.
         sqlx::query("UPDATE agent_jobs SET status = 'Running', updated_at = NOW() WHERE id = $1 AND attempt_id = $2 AND fencing_token = $3 AND status = 'Leased'")
@@ -7661,6 +12318,7 @@ mod tests {
         let deadline = Utc::now() + Duration::seconds(LEASE_TTL_SECS);
 
         // Use the subquery form (Postgres UPDATE does not support LIMIT directly).
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(&pool).await;
         sqlx::query(
             "UPDATE agent_jobs SET status = 'Leased', agent_id = $1, attempt_id = $2, \
              lease_generation = 1, fencing_token = $3, cp_nonce = 'nonce', \
@@ -7675,9 +12333,10 @@ mod tests {
         .bind(&real_fencing)
         .bind(deadline)
         .bind(&platform)
-        .execute(&pool)
+        .execute(&mut *lease_tx)
         .await
         .expect("lease");
+        lease_tx.commit().await.expect("commit lease fixture");
 
         // Use wrong fencing token in ack.
         let wrong_fencing = Uuid::new_v4().to_string();
@@ -7859,6 +12518,7 @@ mod tests {
 
     /// Re-Lease a job with a past deadline so the next sweep sees it expired.
     async fn release_expired(pool: &PgPool, job_id: Uuid) {
+        let mut tx = begin_agent_job_lease_fixture_tx(pool).await;
         sqlx::query(
             "UPDATE agent_jobs SET status = 'Leased', agent_id = 'some-agent', \
              attempt_id = gen_random_uuid(), fencing_token = 'fence', cp_nonce = 'nonce', \
@@ -7866,9 +12526,10 @@ mod tests {
              WHERE id = $1",
         )
         .bind(job_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("re-lease");
+        tx.commit().await.expect("commit expired lease fixture");
     }
 
     async fn job_status_and_attempts(pool: &PgPool, job_id: Uuid) -> (String, i32) {
@@ -8576,46 +13237,53 @@ mod tests {
         pool.close().await;
     }
 
-    // ── Fix 3: approval overwrites a mis-declared platform ────────────────
+    // ── Challenge authority: approval cannot replace platform ────────────
 
     #[tokio::test]
-    async fn db_approval_overwrites_self_declared_platform() {
+    async fn db_approval_rejects_platform_different_from_challenge() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
         let agent_id = format!("agent-{}", Uuid::new_v4());
-        // Agent self-declares "attacker-platform" at registration.
+        // Trusted provisioning binds the enrollment to this exact platform.
         let _token = seed_agent(&pool, &agent_id, "attacker-platform", "pending").await;
 
-        // Admin approves and authoritatively assigns "safe-platform".
-        let rows = sqlx::query(
+        // Even a transaction carrying the current mutation marker cannot
+        // replace the challenge issuer's platform during approval.
+        let mut tx = pool.begin().await.expect("begin approval fixture");
+        activate_agent_enrollment_contract_v3(&mut tx)
+            .await
+            .expect("activate v3 approval contract");
+        let error = sqlx::query(
             "UPDATE agents SET status = 'approved', platform = $1, updated_at = NOW() \
              WHERE agent_id = $2",
         )
         .bind("safe-platform")
         .bind(&agent_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
-        .expect("admin approve")
-        .rows_affected();
-        assert_eq!(rows, 1);
+        .expect_err("approval must not replace the challenge-bound platform");
+        let error_code = error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(error_code.as_deref(), Some("23514"));
+        tx.rollback()
+            .await
+            .expect("rollback rejected approval fixture");
 
-        // After approval the stored platform must be the admin-assigned one.
-        let row = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, agent_id, platform, capabilities, public_key, token_hash, status \
-             FROM agents WHERE agent_id = $1",
+        // The original Pending identity remains unchanged.
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT platform, status FROM agents WHERE agent_id = $1",
         )
         .bind(&agent_id)
         .fetch_one(&pool)
         .await
         .expect("read after approval");
 
-        assert_eq!(
-            row.platform, "safe-platform",
-            "admin-assigned platform must overwrite self-declared value"
-        );
-        assert_eq!(row.status, "approved");
+        assert_eq!(row.0, "attacker-platform");
+        assert_eq!(row.1, "pending");
 
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
@@ -8633,12 +13301,12 @@ mod tests {
     };
 
     /// Insert an approved agent with a generated Ed25519 keypair.
-    /// Returns (plaintext token, signing_key).
+    /// Returns (plaintext token, signing_key, immutable enrollment UUID).
     async fn seed_agent_with_key(
         pool: &PgPool,
         agent_id: &str,
         platform: &str,
-    ) -> (String, ed25519_dalek::SigningKey) {
+    ) -> (String, ed25519_dalek::SigningKey, Uuid) {
         let key = generate_keypair(&mut OsRng);
         let pubkey_b64 = encode_verifying_key(&key.verifying_key());
         let token = format!(
@@ -8646,20 +13314,117 @@ mod tests {
             Uuid::new_v4().to_string().replace('-', "")
         );
         let hash = sha256_hex(&token);
-        sqlx::query(
-            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
-             ON CONFLICT (agent_id) DO UPDATE \
-             SET token_hash = $4, status = 'approved', public_key = $3, updated_at = NOW()",
+        let capabilities = serde_json::to_value(test_agent_capabilities())
+            .expect("serialize test agent capabilities");
+        let enrollment_id = seed_challenge_admitted_test_agent(
+            pool,
+            ChallengeAdmittedTestAgent {
+                agent_id,
+                platform,
+                public_key: &pubkey_b64,
+                token_hash: &hash,
+                capabilities: &capabilities,
+                final_status: "approved",
+                last_seen_at: None,
+            },
         )
-        .bind(agent_id)
-        .bind(platform)
-        .bind(&pubkey_b64)
-        .bind(&hash)
+        .await;
+        (token, key, enrollment_id)
+    }
+
+    /// Persist a genuinely successful, signed LivePlan row for the exact
+    /// mutation spec and return its immutable row/attempt identity. Positive
+    /// mint fixtures must use this rather than a digest-only dummy row.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_signed_successful_plan_for_mutation(
+        pool: &PgPool,
+        request_id: Uuid,
+        platform: &str,
+        mutation_spec: &JobSpec,
+        raw_plan_digest: &str,
+        agent_id: &str,
+        agent_enrollment_id: Uuid,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> ApprovedPlanReference {
+        let job_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let result_id = Uuid::new_v4();
+        let cp_nonce = Uuid::new_v4().to_string();
+        let mut plan_spec = mutation_spec.clone();
+        plan_spec.mode = JobMode::LivePlan;
+        assert_eq!(plan_spec.request_id, request_id);
+        let mut projection = reviewable_live_plan(&["create"]);
+        projection["canonical_plan_sha256"] = json!(raw_plan_digest);
+        let evidence = serde_json::to_vec(&projection).expect("safe plan projection JSON");
+        let evidence_digest = proto_sha256(&evidence);
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.to_string(),
+            agent_enrollment_id,
+            platform: platform.to_string(),
+            job_id,
+            attempt_id,
+            lease_generation: 1,
+            request_id,
+            result_id,
+            mode: JobMode::LivePlan,
+            status: JobResultStatus::Planned,
+            job_spec_digest: job_spec_digest(&plan_spec),
+            approved_plan_digest: None,
+            raw_plan_digest: Some(raw_plan_digest.to_string()),
+            execution_trust_profile: Some(canonical_execution_trust_profile(&plan_spec, platform)),
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&signing_key.verifying_key()),
+            cp_nonce: cp_nonce.clone(),
+            signature: String::new(),
+        };
+        let envelope = sign(unsigned, signing_key);
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO UPDATE SET bytes = EXCLUDED.bytes, size_bytes = EXCLUDED.size_bytes",
+        )
+        .bind(&evidence_digest)
+        .bind(&evidence)
+        .bind(evidence.len() as i64)
         .execute(pool)
         .await
-        .expect("seed agent with key");
-        (token, key)
+        .expect("seed exact signed LivePlan evidence");
+        sqlx::query(
+            "INSERT INTO agent_jobs (id, request_id, platform, spec, mode, status, \
+                 agent_id, attempt_id, lease_generation, cp_nonce, result_id, \
+                 result_status, evidence_digest, raw_plan_digest, signed_envelope, completed_at) \
+             VALUES ($1, $2, $3, $4, 'LivePlan', 'Succeeded', $5, $6, 1, $7, \
+                     $8, 'planned', $9, $10, $11, NOW())",
+        )
+        .bind(job_id)
+        .bind(request_id)
+        .bind(platform)
+        .bind(serde_json::to_value(&plan_spec).expect("plan spec JSON"))
+        .bind(agent_id)
+        .bind(attempt_id)
+        .bind(&cp_nonce)
+        .bind(result_id)
+        .bind(&evidence_digest)
+        .bind(raw_plan_digest)
+        .bind(serde_json::to_value(&envelope).expect("signed plan envelope JSON"))
+        .execute(pool)
+        .await
+        .expect("seed exact signed successful LivePlan");
+
+        ApprovedPlanReference {
+            job_id,
+            attempt_id,
+            expected_execution_authority: None,
+        }
+    }
+
+    fn dummy_approved_plan_reference() -> ApprovedPlanReference {
+        ApprovedPlanReference {
+            job_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            expected_execution_authority: None,
+        }
     }
 
     /// Lease a pending job atomically and return the leased row (attempt_id,
@@ -8672,6 +13437,7 @@ mod tests {
         let attempt = Uuid::new_v4();
         let fencing = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
+        let mut tx = begin_agent_job_lease_fixture_tx(pool).await;
         let row = sqlx::query_as::<_, AgentJobRow>(&format!(
             "UPDATE agent_jobs \
              SET status = 'Leased', agent_id = $1, attempt_id = $2, \
@@ -8690,9 +13456,10 @@ mod tests {
         .bind(&nonce)
         .bind(LEASE_TTL_SECS as f64)
         .bind(platform)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .expect("lease job");
+        tx.commit().await.expect("commit lease job fixture");
 
         let gen = row.lease_generation;
         (attempt, fencing, nonce, gen, row)
@@ -8801,6 +13568,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn make_job_result(
         agent_id: &str,
+        agent_enrollment_id: Uuid,
         platform: &str,
         job_row: &AgentJobRow,
         attempt_id: Uuid,
@@ -8814,9 +13582,32 @@ mod tests {
         let result_id = Uuid::new_v4();
         let evidence_digest = proto_sha256(evidence);
         let spec_digest = job_spec_digest(spec);
+        let execution_trust_profile = if matches!(
+            &spec.mode,
+            JobMode::LivePlan | JobMode::LiveApply | JobMode::LiveDestroy
+        ) && !matches!(&status, JobResultStatus::LiveRefused)
+        {
+            Some(canonical_execution_trust_profile(spec, platform))
+        } else {
+            None
+        };
+        let raw_plan_digest =
+            if spec.mode == JobMode::LivePlan && status == JobResultStatus::Planned {
+                serde_json::from_slice::<Value>(evidence)
+                    .ok()
+                    .and_then(|projection| {
+                        projection
+                            .get("canonical_plan_sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            } else {
+                None
+            };
 
         let unsigned_env = SignedEnvelope {
             agent_id: agent_id.to_string(),
+            agent_enrollment_id,
             platform: platform.to_string(),
             job_id: job_row.id,
             attempt_id,
@@ -8827,6 +13618,8 @@ mod tests {
             status: status.clone(),
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: raw_plan_digest.clone(),
+            execution_trust_profile,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -8841,6 +13634,7 @@ mod tests {
             attempt_id,
             result_id,
             status,
+            raw_plan_digest,
             evidence_digest,
             signed_envelope: signed_env,
         };
@@ -8883,7 +13677,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -8894,6 +13689,7 @@ mod tests {
         let evidence = b"check output here";
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -8940,6 +13736,132 @@ mod tests {
         pool.close().await;
     }
 
+    #[tokio::test]
+    async fn db_live_plan_ingest_rejects_raw_bytes_before_terminal_or_blob_write() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("safe-plan-ingest-{}", Uuid::new_v4());
+        let agent_id = format!("safe-plan-agent-{}", Uuid::new_v4());
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let spec = reviewable_live_plan_spec();
+        let job_id = create_agent_job(&pool, spec.request_id, &platform, &spec, "LivePlan")
+            .await
+            .expect("seed LivePlan job");
+        let (attempt_id, fencing, nonce, generation, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        assert_eq!(job_row.id, job_id);
+        ack_to_running(&pool, job_id, attempt_id, &fencing).await;
+
+        let raw_sentinel = format!("RAW-PROVIDER-{}", Uuid::new_v4());
+        let raw_evidence = serde_json::to_vec(&json!({
+            "format_version": "1.2",
+            "provider_private": &raw_sentinel,
+            "resource_changes": []
+        }))
+        .unwrap();
+        let raw_digest = proto_sha256(&raw_evidence);
+        let (raw_result, raw_bytes) = make_job_result(
+            &agent_id,
+            _agent_enrollment_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            generation as u64,
+            &key,
+            &spec,
+            &raw_evidence,
+            JobResultStatus::Planned,
+        );
+        let headers = || {
+            let mut value = HeaderMap::new();
+            value.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            value
+        };
+        let rejected = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            headers(),
+            ResultBody {
+                job_result: raw_result,
+                evidence: raw_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        let Err((rejected_status, Json(rejected_body))) = rejected else {
+            panic!("signed legacy/full plan bytes must be rejected");
+        };
+        assert_eq!(rejected_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected_body["error"], "LivePlan evidence is not a complete supported safe projection",
+            "raw provider bytes must reach the safe-projection gate"
+        );
+        assert!(
+            !rejected_body.to_string().contains(&raw_sentinel),
+            "safe-projection rejection must not echo provider evidence"
+        );
+        let after_rejection = read_job_result_row(&pool, job_id).await;
+        assert_eq!(after_rejection.status, "Running");
+        assert!(after_rejection.result_id.is_none());
+        assert_eq!(
+            count_evidence_blobs(&pool, &raw_digest).await,
+            0,
+            "rejected raw provider bytes must never reach durable blob storage"
+        );
+
+        let safe_evidence = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        let safe_digest = proto_sha256(&safe_evidence);
+        let (safe_result, safe_bytes) = make_job_result(
+            &agent_id,
+            _agent_enrollment_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            generation as u64,
+            &key,
+            &spec,
+            &safe_evidence,
+            JobResultStatus::Planned,
+        );
+        let accepted = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            headers(),
+            ResultBody {
+                job_result: safe_result,
+                evidence: safe_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            accepted.is_ok(),
+            "the current complete safe projection must remain ingestible: {:?}",
+            accepted.err()
+        );
+        let after_acceptance = read_job_result_row(&pool, job_id).await;
+        assert_eq!(after_acceptance.status, "Succeeded");
+        assert_eq!(after_acceptance.result_status.as_deref(), Some("planned"));
+        assert_eq!(
+            count_evidence_blobs(&pool, &safe_digest).await,
+            1,
+            "accepted safe projection remains available for digest-bound review"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        cleanup_evidence_blob(&pool, &raw_digest).await;
+        cleanup_evidence_blob(&pool, &safe_digest).await;
+        pool.close().await;
+    }
+
     // ── #60 slice 2: write-side evidence offload (DB) ────────────────────────
 
     async fn read_evidence_json(pool: &PgPool, job_id: Uuid) -> Option<serde_json::Value> {
@@ -8976,7 +13898,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("offload-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
@@ -8989,6 +13912,7 @@ mod tests {
         let evidence_digest = proto_sha256(&evidence);
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9055,7 +13979,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("inline-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
@@ -9067,6 +13992,7 @@ mod tests {
         let submitted_evidence_json = json!({"summary": "check passed"});
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9128,7 +14054,8 @@ mod tests {
         // Two separate jobs, two separate agents, IDENTICAL evidence bytes.
         for suffix in ["a", "b"] {
             let agent_id = format!("dedup-agent-{suffix}-{}", Uuid::new_v4());
-            let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+            let (token, key, _agent_enrollment_id) =
+                seed_agent_with_key(&pool, &agent_id, &platform).await;
             let _job_id = seed_pending_job(&pool, &platform).await;
             let (attempt_id, fencing, nonce, gen, job_row) =
                 lease_job(&pool, &platform, &agent_id).await;
@@ -9136,6 +14063,7 @@ mod tests {
             let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
             let (job_result, evidence_bytes) = make_job_result(
                 &agent_id,
+                _agent_enrollment_id,
                 &platform,
                 &job_row,
                 attempt_id,
@@ -9192,7 +14120,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("verified-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
@@ -9201,6 +14130,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9257,7 +14187,7 @@ mod tests {
         assert!(redaction_policy_version_is_supported(
             ryuki_protocol::REDACTION_POLICY_VERSION
         ));
-        assert!(redaction_policy_version_is_supported("ryuki-redaction-v1"));
+        assert!(redaction_policy_version_is_supported("ryuki-redaction-v2"));
         // Rejects everything else: bare alphanumeric tokens (codex's bypass),
         // token-shaped strings, an unknown-but-valid semver, free text, and empty.
         for bad in [
@@ -9266,7 +14196,8 @@ mod tests {
             "tokenabc123def456",
             "1.0.0",
             "2.0.0",
-            "ryuki-redaction-v2",
+            "ryuki-redaction-v1",
+            "ryuki-redaction-v3",
             "SUPERSECRET leaked via policy version",
         ] {
             assert!(
@@ -9291,7 +14222,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9309,6 +14241,7 @@ mod tests {
         // (alphanumeric, short, so a charset guard would have let it through).
         let unsigned_env = SignedEnvelope {
             agent_id: agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: platform.clone(),
             job_id: job_row.id,
             attempt_id,
@@ -9319,6 +14252,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: "SUPERSECRET".to_string(),
             timestamp: Utc::now(),
@@ -9332,6 +14267,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::CheckOk,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed_env,
         };
@@ -9396,7 +14332,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9407,6 +14344,7 @@ mod tests {
         let evidence = b"idempotent evidence";
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9494,7 +14432,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9505,6 +14444,7 @@ mod tests {
         let evidence = b"evidence";
         let (mut job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9569,18 +14509,20 @@ mod tests {
         );
         let hash = sha256_hex(&token);
         let pubkey_a = encode_verifying_key(&key_a.verifying_key());
-        sqlx::query(
-            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
-             ON CONFLICT (agent_id) DO UPDATE SET token_hash=$4, status='approved', public_key=$3",
+        let capabilities = json!({});
+        let agent_enrollment_id = seed_challenge_admitted_test_agent(
+            &pool,
+            ChallengeAdmittedTestAgent {
+                agent_id: &agent_id,
+                platform: &platform,
+                public_key: &pubkey_a,
+                token_hash: &hash,
+                capabilities: &capabilities,
+                final_status: "approved",
+                last_seen_at: None,
+            },
         )
-        .bind(&agent_id)
-        .bind(&platform)
-        .bind(&pubkey_a)
-        .bind(&hash)
-        .execute(&pool)
-        .await
-        .expect("enroll key_a");
+        .await;
 
         let _job_id = seed_pending_job(&pool, &platform).await;
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9593,6 +14535,7 @@ mod tests {
         let evidence = b"evidence";
         let (job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9640,7 +14583,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         // First lease.
@@ -9651,6 +14595,7 @@ mod tests {
         let evidence = b"stale evidence";
         let (old_job_result, old_evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             old_attempt,
@@ -9718,7 +14663,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-expired-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, generation, job_row) =
@@ -9727,6 +14673,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9780,7 +14727,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9791,6 +14739,7 @@ mod tests {
         let evidence = b"ev";
         let (mut job_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9840,7 +14789,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -9851,6 +14801,7 @@ mod tests {
         let real_evidence = b"real evidence";
         let (job_result, _) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -9907,7 +14858,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-la-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         // ── seed a LiveApply job ───────────────────────────────────────────
         use std::collections::BTreeMap;
@@ -9940,6 +14892,7 @@ mod tests {
 
             let unsigned = SignedEnvelope {
                 agent_id: agent_id.clone(),
+                agent_enrollment_id: _agent_enrollment_id,
                 platform: platform.clone(),
                 job_id: job_row.id,
                 attempt_id,
@@ -9950,6 +14903,10 @@ mod tests {
                 status: JobResultStatus::Applied,
                 job_spec_digest: spec_digest,
                 approved_plan_digest: plan.clone(),
+                raw_plan_digest: None,
+                execution_trust_profile: Some(canonical_execution_trust_profile(
+                    &spec_la, &platform,
+                )),
                 evidence_digest: evidence_digest_str.clone(),
                 redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
                 timestamp: Utc::now(),
@@ -9963,6 +14920,7 @@ mod tests {
                 attempt_id,
                 result_id,
                 status: JobResultStatus::Applied,
+                raw_plan_digest: None,
                 evidence_digest: evidence_digest_str,
                 signed_envelope: signed,
             };
@@ -10041,7 +14999,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10057,6 +15016,7 @@ mod tests {
         // Non-live envelope WITH approved_plan_digest → must be rejected.
         let unsigned = SignedEnvelope {
             agent_id: agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: platform.clone(),
             job_id: job_row.id,
             attempt_id,
@@ -10067,6 +15027,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: Some(proto_sha256(b"bad plan")),
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -10080,6 +15042,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::CheckOk,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed,
         };
@@ -10124,8 +15087,10 @@ mod tests {
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
         let other_agent_id = format!("s3b-other-{}", Uuid::new_v4());
 
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
-        let (_tok2, _key2) = seed_agent_with_key(&pool, &other_agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (_tok2, _key2, _other_agent_enrollment_id) =
+            seed_agent_with_key(&pool, &other_agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10141,6 +15106,7 @@ mod tests {
         let spec_digest = ryuki_protocol::job_spec_digest(&spec);
         let unsigned = SignedEnvelope {
             agent_id: other_agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: platform.clone(),
             job_id: job_row.id,
             attempt_id,
@@ -10151,6 +15117,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -10164,6 +15132,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::CheckOk,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed,
         };
@@ -10195,6 +15164,309 @@ mod tests {
         pool.close().await;
     }
 
+    #[tokio::test]
+    async fn db_s3b_signed_result_from_different_enrollment_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let agent_id = format!("s3b-enrollment-agent-{}", Uuid::new_v4());
+        let (token, key, authenticated_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, generation, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let replacement_enrollment_id = Uuid::new_v4();
+        assert_ne!(replacement_enrollment_id, authenticated_enrollment_id);
+        let (job_result, evidence) = make_job_result(
+            &agent_id,
+            replacement_enrollment_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            generation as u64,
+            &key,
+            &spec,
+            b"validly signed by the same key but attributed to another enrollment",
+            JobResultStatus::CheckOk,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let response = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            headers,
+            ResultBody {
+                job_result,
+                evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        let (status, _) = response.expect_err("a replacement enrollment must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            read_job_result_row(&pool, job_row.id).await.status,
+            "Running"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_approved_plan_does_not_inherit_same_key_reenrollment() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plan-owner-{}", Uuid::new_v4().simple());
+        let agent_id = format!("plan-owner-agent-{}", Uuid::new_v4());
+        let (_token, key, current_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let plan_spec = reviewable_live_plan_spec();
+        let job_id = create_agent_job(
+            &pool,
+            plan_spec.request_id,
+            &platform,
+            &plan_spec,
+            "LivePlan",
+        )
+        .await
+        .expect("seed successful plan job");
+        let prior_enrollment_id = Uuid::new_v4();
+        assert_ne!(prior_enrollment_id, current_enrollment_id);
+        let approved_plan_digest = proto_sha256(b"approved plan bytes");
+        let mut projection = reviewable_live_plan(&["create"]);
+        projection["canonical_plan_sha256"] = json!(approved_plan_digest);
+        let evidence = serde_json::to_vec(&projection).expect("safe plan projection JSON");
+        let evidence_digest = proto_sha256(&evidence);
+        let plan_attempt_id = Uuid::new_v4();
+        let plan_result_id = Uuid::new_v4();
+        let plan_cp_nonce = Uuid::new_v4().to_string();
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            agent_enrollment_id: prior_enrollment_id,
+            platform: platform.clone(),
+            job_id,
+            attempt_id: plan_attempt_id,
+            lease_generation: 1,
+            request_id: plan_spec.request_id,
+            result_id: plan_result_id,
+            mode: JobMode::LivePlan,
+            status: JobResultStatus::Planned,
+            job_spec_digest: job_spec_digest(&plan_spec),
+            approved_plan_digest: None,
+            raw_plan_digest: Some(approved_plan_digest.clone()),
+            execution_trust_profile: Some(canonical_execution_trust_profile(&plan_spec, &platform)),
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: plan_cp_nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        sqlx::query(
+            "INSERT INTO evidence_blobs (digest, bytes, size_bytes) VALUES ($1, $2, $3) \
+             ON CONFLICT (digest) DO UPDATE SET bytes = EXCLUDED.bytes, size_bytes = EXCLUDED.size_bytes",
+        )
+        .bind(&evidence_digest)
+        .bind(&evidence)
+        .bind(evidence.len() as i64)
+        .execute(&pool)
+        .await
+        .expect("persist prior-enrollment plan evidence");
+        sqlx::query(
+            "UPDATE agent_jobs \
+             SET status = 'Succeeded', agent_id = $1, result_status = 'planned', \
+                 completed_at = NOW(), evidence_digest = $2, raw_plan_digest = $3, \
+                 signed_envelope = $4::jsonb, attempt_id = $5, lease_generation = 1, \
+                 result_id = $6, cp_nonce = $7 WHERE id = $8",
+        )
+        .bind(&agent_id)
+        .bind(&evidence_digest)
+        .bind(&approved_plan_digest)
+        .bind(serde_json::to_value(&signed).expect("serialize signed plan"))
+        .bind(plan_attempt_id)
+        .bind(plan_result_id)
+        .bind(&plan_cp_nonce)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("persist prior-enrollment plan");
+
+        let mut mutation_spec = plan_spec.clone();
+        mutation_spec.mode = JobMode::LiveApply;
+        let approved_plan = ApprovedPlanReference {
+            job_id,
+            attempt_id: plan_attempt_id,
+            expected_execution_authority: None,
+        };
+        let mut connection = pool.acquire().await.expect("plan authority connection");
+        let authority = successful_plan_execution_authority(
+            &mut connection,
+            &approved_plan,
+            plan_spec.request_id,
+            &platform,
+            &mutation_spec,
+            &approved_plan_digest,
+        )
+        .await;
+        assert!(
+            matches!(authority, Err(CreateLiveApplyJobError::Invalid(_))),
+            "a signature from the same key must not transfer an old plan to a new enrollment"
+        );
+        drop(connection);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_plan_authority_uses_exact_row_not_latest_same_digest_profile() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let request_id = Uuid::new_v4();
+        let platform = format!("exact-plan-row-{}", Uuid::new_v4().simple());
+        seed_active_request(&pool, request_id, &platform).await;
+        let agent_id = format!("exact-plan-agent-{}", Uuid::new_v4().simple());
+        let (_token, key, enrollment_id) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let mutation_spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: Default::default(),
+            state_key: Some(format!("request-{request_id}")),
+            mode: JobMode::LiveApply,
+        };
+        let digest = proto_sha256(b"same reviewed plan evidence");
+        let first = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &mutation_spec,
+            &digest,
+            &agent_id,
+            enrollment_id,
+            &key,
+        )
+        .await;
+        let second = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &mutation_spec,
+            &digest,
+            &agent_id,
+            enrollment_id,
+            &key,
+        )
+        .await;
+
+        let second_json: sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar("SELECT signed_envelope FROM agent_jobs WHERE id = $1")
+                .bind(second.job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("second signed plan");
+        let mut second_envelope: SignedEnvelope =
+            serde_json::from_value(second_json.0).expect("second envelope");
+        second_envelope
+            .execution_trust_profile
+            .as_mut()
+            .expect("live profile")
+            .provider_authority_version = "v2".to_string();
+        second_envelope.signature.clear();
+        let second_envelope = sign(second_envelope, &key);
+        sqlx::query("UPDATE agent_jobs SET signed_envelope = $2::jsonb WHERE id = $1")
+            .bind(second.job_id)
+            .bind(serde_json::to_value(&second_envelope).expect("second envelope JSON"))
+            .execute(&pool)
+            .await
+            .expect("install distinct second profile");
+
+        let expected_first_profile = canonical_execution_trust_profile(&mutation_spec, &platform);
+        let expected_first_digest = execution_trust_profile_digest(&expected_first_profile);
+        let expected_second_digest = execution_trust_profile_digest(
+            second_envelope
+                .execution_trust_profile
+                .as_ref()
+                .expect("second live profile"),
+        );
+        assert_ne!(expected_first_digest, expected_second_digest);
+
+        let mut connection = pool.acquire().await.expect("authority connection");
+        let first_authority = successful_plan_execution_authority(
+            &mut connection,
+            &first,
+            request_id,
+            &platform,
+            &mutation_spec,
+            &digest,
+        )
+        .await
+        .expect("exact first plan remains selectable");
+        assert_eq!(
+            first_authority.execution_trust_profile_digest, expected_first_digest,
+            "a newer same-digest row must not replace the selected first authority",
+        );
+        let second_authority = successful_plan_execution_authority(
+            &mut connection,
+            &second,
+            request_id,
+            &platform,
+            &mutation_spec,
+            &digest,
+        )
+        .await
+        .expect("exact second plan is independently selectable");
+        assert_eq!(
+            second_authority.execution_trust_profile_digest,
+            expected_second_digest,
+        );
+        let wrong_attempt = ApprovedPlanReference {
+            job_id: first.job_id,
+            attempt_id: second.attempt_id,
+            expected_execution_authority: None,
+        };
+        assert!(
+            successful_plan_execution_authority(
+                &mut connection,
+                &wrong_attempt,
+                request_id,
+                &platform,
+                &mutation_spec,
+                &digest,
+            )
+            .await
+            .is_err(),
+            "the exact row must reject a mismatched leased attempt",
+        );
+        drop(connection);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+    }
+
     // ── Fix 1: unsigned/forged replay on terminal job → rejected (not 200) ──
     //
     // An attacker with a valid agent token and knowledge of a terminal
@@ -10211,7 +15483,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10224,6 +15497,7 @@ mod tests {
         // First: POST a valid signed result to make the job terminal.
         let (good_result, evidence_bytes) = make_job_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -10318,7 +15592,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10336,6 +15611,7 @@ mod tests {
         let wrong_platform = format!("wrong-{}", Uuid::new_v4());
         let unsigned = SignedEnvelope {
             agent_id: agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: wrong_platform, // mismatch
             job_id: job_row.id,
             attempt_id,
@@ -10346,6 +15622,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -10359,6 +15637,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::CheckOk,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed,
         };
@@ -10401,7 +15680,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await;
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10418,6 +15698,7 @@ mod tests {
         let wrong_request_id = Uuid::new_v4(); // not spec.request_id
         let unsigned = SignedEnvelope {
             agent_id: agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: platform.clone(),
             job_id: job_row.id,
             attempt_id,
@@ -10428,6 +15709,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -10441,6 +15724,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::CheckOk,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed,
         };
@@ -10483,7 +15767,8 @@ mod tests {
         };
         let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
         let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let _job_id = seed_pending_job(&pool, &platform).await; // OfflineDryRun
 
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -10500,6 +15785,7 @@ mod tests {
         // Claim LivePlan in the envelope — job is OfflineDryRun.
         let unsigned = SignedEnvelope {
             agent_id: agent_id.clone(),
+            agent_enrollment_id: _agent_enrollment_id,
             platform: platform.clone(),
             job_id: job_row.id,
             attempt_id,
@@ -10510,6 +15796,8 @@ mod tests {
             status: JobResultStatus::Planned,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -10523,6 +15811,7 @@ mod tests {
             attempt_id,
             result_id,
             status: JobResultStatus::Planned,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed,
         };
@@ -10573,6 +15862,7 @@ mod tests {
         let fencing = Uuid::new_v4().to_string();
 
         // Use the same make_interval(secs => $5) form as the production handler.
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(&pool).await;
         let row = sqlx::query_as::<_, AgentJobRow>(&format!(
             "UPDATE agent_jobs \
              SET status = 'Leased', agent_id = $1, attempt_id = $2, \
@@ -10590,9 +15880,13 @@ mod tests {
         .bind(&fencing)
         .bind(LEASE_TTL_SECS as f64)
         .bind(&platform)
-        .fetch_one(&pool)
+        .fetch_one(&mut *lease_tx)
         .await
         .expect("db-time lease");
+        lease_tx
+            .commit()
+            .await
+            .expect("commit db-time lease fixture");
 
         // lease_deadline must be set and in the future (within TTL + 5s margin).
         let deadline = row.lease_deadline.expect("deadline must be set");
@@ -10624,39 +15918,42 @@ mod tests {
     use ryuki_agent::executor::JobExecutor as AgentJobExecutor;
 
     /// Seed an approved agent whose enrolled public_key equals the given
-    /// agent identity's public_key_b64().  Returns the plaintext bearer token.
+    /// agent identity's public_key_b64(). Returns the plaintext bearer token
+    /// and immutable enrollment UUID.
     async fn seed_agent_from_identity(
         pool: &PgPool,
         agent_id: &str,
         platform: &str,
         identity: &ryuki_agent::identity::AgentIdentity,
-    ) -> String {
+    ) -> (String, Uuid) {
         let pubkey_b64 = identity.public_key_b64();
         let token = format!(
             "{AGENT_TOKEN_PREFIX}s4c{}",
             Uuid::new_v4().to_string().replace('-', "")
         );
         let hash = sha256_hex(&token);
-        sqlx::query(
-            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
-             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
-             ON CONFLICT (agent_id) DO UPDATE \
-             SET token_hash = $4, status = 'approved', public_key = $3, updated_at = NOW()",
+        let capabilities = json!({});
+        let enrollment_id = seed_challenge_admitted_test_agent(
+            pool,
+            ChallengeAdmittedTestAgent {
+                agent_id,
+                platform,
+                public_key: &pubkey_b64,
+                token_hash: &hash,
+                capabilities: &capabilities,
+                final_status: "approved",
+                last_seen_at: None,
+            },
         )
-        .bind(agent_id)
-        .bind(platform)
-        .bind(&pubkey_b64)
-        .bind(&hash)
-        .execute(pool)
-        .await
-        .expect("seed agent from identity");
-        token
+        .await;
+        (token, enrollment_id)
     }
 
     /// Build the `ryuki_protocol::Job` struct that the agent would receive after
     /// leasing and acking, from the leased row's fields.
     fn build_protocol_job(
         job_row: &AgentJobRow,
+        agent_enrollment_id: Uuid,
         attempt_id: Uuid,
         fencing_token: String,
         cp_nonce: String,
@@ -10673,6 +15970,7 @@ mod tests {
         };
         Job {
             id: job_row.id,
+            agent_enrollment_id,
             platform: job_row.platform.clone(),
             spec,
             status: JobStatus::Running,
@@ -10698,7 +15996,8 @@ mod tests {
         let identity = ryuki_agent::identity::AgentIdentity::generate();
 
         // Enroll the agent with this identity's public key.
-        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+        let (token, agent_enrollment_id) =
+            seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
 
         // Seed a pending OfflineDryRun job and lease + ack it.
         let _job_id = seed_pending_job(&pool, &platform).await;
@@ -10707,7 +16006,14 @@ mod tests {
         ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
 
         // Build the Job struct as the agent would see it after poll() + ack().
-        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+        let job = build_protocol_job(
+            &job_row,
+            agent_enrollment_id,
+            attempt_id,
+            fencing.clone(),
+            nonce.clone(),
+            gen,
+        );
 
         // RUN AGENT CODE — execute + sign, exactly as process_job does.
         let executor = ryuki_agent::executor::StubExecutor::check_ok();
@@ -10780,14 +16086,22 @@ mod tests {
         let agent_id = format!("s4c-tagent-{suffix}");
 
         let identity = ryuki_agent::identity::AgentIdentity::generate();
-        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+        let (token, agent_enrollment_id) =
+            seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
 
         let _job_id = seed_pending_job(&pool, &platform).await;
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
         ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
 
-        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+        let job = build_protocol_job(
+            &job_row,
+            agent_enrollment_id,
+            attempt_id,
+            fencing.clone(),
+            nonce.clone(),
+            gen,
+        );
 
         // Execute + sign (normal path).
         let executor = ryuki_agent::executor::StubExecutor::check_ok();
@@ -10876,13 +16190,14 @@ mod tests {
     /// grant may only be minted for a real, non-concluded request — the gate in
     /// `create_live_apply_job` loads `requests.status` — so any test that mints a
     /// grant directly must seed the request first.
-    async fn seed_active_request(pool: &PgPool, request_id: Uuid) {
+    async fn seed_active_request(pool: &PgPool, request_id: Uuid, platform: &str) {
         sqlx::query(
             "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'live-apply-test', 'locked', 'lock', '[]'::jsonb) \
+             VALUES ($1, 'server-deployment', $2, 'prod', 'live-apply-test', 'locked', 'lock', '[]'::jsonb) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(request_id)
+        .bind(platform)
         .execute(pool)
         .await
         .expect("seed active request for live-apply minting");
@@ -10893,12 +16208,16 @@ mod tests {
     /// spec by default; pass a different `grant_request_id` to exercise the
     /// mismatch path. Direct INSERT because `create_agent_job` does not attach a
     /// grant. The process-global CP key is installed via `ensure_test_cp_key`.
+    #[allow(clippy::too_many_arguments)]
     async fn seed_live_apply_job_signed(
         pool: &PgPool,
         platform: &str,
         approved_plan_digest: &str,
         grant_expiry: chrono::DateTime<Utc>,
         grant_request_id: Option<Uuid>,
+        assigned_agent_id: &str,
+        assigned_agent_enrollment_id: Uuid,
+        assigned_agent_public_key: &str,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Uuid {
         use std::collections::BTreeMap;
@@ -10914,11 +16233,22 @@ mod tests {
         };
         let unsigned = VerifiedLiveContext {
             request_id: grant_request_id.unwrap_or(request_id),
+            platform: platform.to_string(),
             job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
             approved_plan_digest: approved_plan_digest.to_string(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-test".to_string(),
             expiry: grant_expiry,
             step_job_id: None,
+            execution_authority: LiveExecutionAuthority {
+                assigned_agent_id: assigned_agent_id.to_string(),
+                assigned_agent_enrollment_id,
+                assigned_agent_key_fingerprint: public_key_fingerprint(assigned_agent_public_key),
+                execution_trust_profile_digest: execution_trust_profile_digest(
+                    &canonical_execution_trust_profile(&spec, platform),
+                ),
+            },
             signature: String::new(),
         };
         let grant = sign_vlc(unsigned, signing_key);
@@ -10939,12 +16269,16 @@ mod tests {
 
     /// Seed a LiveApply job whose grant is signed by the shared global CP key
     /// (the common case — the verifier will accept the signature).
+    #[allow(clippy::too_many_arguments)]
     async fn seed_live_apply_job(
         pool: &PgPool,
         platform: &str,
         approved_plan_digest: &str,
         grant_expiry: chrono::DateTime<Utc>,
         grant_request_id: Option<Uuid>,
+        assigned_agent_id: &str,
+        assigned_agent_enrollment_id: Uuid,
+        assigned_agent_public_key: &str,
     ) -> Uuid {
         let cp_key = ensure_test_cp_key();
         seed_live_apply_job_signed(
@@ -10953,6 +16287,9 @@ mod tests {
             approved_plan_digest,
             grant_expiry,
             grant_request_id,
+            assigned_agent_id,
+            assigned_agent_enrollment_id,
+            assigned_agent_public_key,
             &cp_key,
         )
         .await
@@ -10963,6 +16300,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn make_live_apply_result(
         agent_id: &str,
+        agent_enrollment_id: Uuid,
         platform: &str,
         job_row: &AgentJobRow,
         attempt_id: Uuid,
@@ -10979,6 +16317,7 @@ mod tests {
         let status = JobResultStatus::Applied;
         let unsigned_env = SignedEnvelope {
             agent_id: agent_id.to_string(),
+            agent_enrollment_id,
             platform: platform.to_string(),
             job_id: job_row.id,
             attempt_id,
@@ -10989,6 +16328,8 @@ mod tests {
             status: status.clone(),
             job_spec_digest: spec_digest,
             approved_plan_digest,
+            raw_plan_digest: None,
+            execution_trust_profile: Some(canonical_execution_trust_profile(spec, platform)),
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -11002,6 +16343,7 @@ mod tests {
             attempt_id,
             result_id,
             status,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed_env,
         };
@@ -11021,7 +16363,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-plt-{suffix}");
         let agent_id = format!("s5-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(pool, &agent_id, &platform).await;
 
         let _job_id = seed_live_apply_job(
             pool,
@@ -11029,6 +16372,9 @@ mod tests {
             grant_digest,
             grant_expiry,
             grant_request_id,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
         )
         .await;
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -11038,6 +16384,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence_bytes) = make_live_apply_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -11224,9 +16571,10 @@ mod tests {
         // concluded-status gate in create_live_apply_job loads requests.status.
         sqlx::query(
             "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 's5a2-live-apply', 'locked', 'lock', '[]'::jsonb)",
+             VALUES ($1, 'server-deployment', $2, 'prod', 's5a2-live-apply', 'locked', 'lock', '[]'::jsonb)",
         )
         .bind(request_id)
+        .bind(&platform)
         .execute(&pool)
         .await
         .expect("seed active request for live-apply minting");
@@ -11240,14 +16588,169 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
-
-        let job_id = create_live_apply_job(
+        let plan_agent_id = format!("s5a2-plan-agent-{suffix}");
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
             &pool,
             request_id,
             &platform,
             &spec,
             &plan_digest,
-            "ops-alice",
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
+
+        let jobs_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pre-denial live jobs");
+        let approvals_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pre-denial live approvals");
+        let wrong_site = format!("{platform}-other-site");
+        let site_mismatch = create_live_apply_job(
+            &pool,
+            approved_plan.clone(),
+            request_id,
+            &wrong_site,
+            &spec,
+            &plan_digest,
+            &live_approver_session("ops-alice"),
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(matches!(
+            site_mismatch,
+            Err(CreateLiveApplyJobError::Invalid(
+                "live-apply platform differs from the authoritative request site"
+            ))
+        ));
+        let jobs_after_site_mismatch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count live jobs after request-site mismatch");
+        let approvals_after_site_mismatch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count live approvals after request-site mismatch");
+        assert_eq!(jobs_after_site_mismatch, jobs_before);
+        assert_eq!(approvals_after_site_mismatch, approvals_before);
+
+        for actor_class in [
+            ryuki_engine::auth::ActorClass::Workload,
+            ryuki_engine::auth::ActorClass::Unknown,
+            ryuki_engine::auth::ActorClass::Simulated,
+        ] {
+            let mut nonhuman = live_approver_session("human-shaped-nonhuman");
+            nonhuman.actor_class = actor_class;
+            let denied = create_live_apply_job(
+                &pool,
+                approved_plan.clone(),
+                request_id,
+                &platform,
+                &spec,
+                &plan_digest,
+                &nonhuman,
+                Utc::now() + Duration::hours(1),
+                &cp_key,
+            )
+            .await;
+            assert!(matches!(denied, Err(CreateLiveApplyJobError::Invalid(_))));
+        }
+        let jobs_after_denials: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count post-denial live jobs");
+        let approvals_after_denials: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count post-denial live approvals");
+        assert_eq!(jobs_after_denials, jobs_before);
+        assert_eq!(approvals_after_denials, approvals_before);
+
+        // The offering is part of the reviewed execution semantics. A caller
+        // must not be able to reuse an exact signed plan while substituting a
+        // different offering in the LiveApply spec presented to the signing
+        // choke point.
+        let mut offering_drift_spec = spec.clone();
+        offering_drift_spec.offering_id = Uuid::new_v4();
+        assert_ne!(offering_drift_spec.offering_id, spec.offering_id);
+        let offering_drift = create_live_apply_job(
+            &pool,
+            approved_plan.clone(),
+            request_id,
+            &platform,
+            &offering_drift_spec,
+            &plan_digest,
+            &live_approver_session("ops-alice"),
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(matches!(
+            offering_drift,
+            Err(CreateLiveApplyJobError::Invalid(
+                "approved plan job spec differs from the mutation spec"
+            ))
+        ));
+        let jobs_after_offering_drift: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count live jobs after offering drift");
+        let approvals_after_offering_drift: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count live approvals after offering drift");
+        assert_eq!(
+            jobs_after_offering_drift, jobs_before,
+            "offering drift must mint no LiveApply job"
+        );
+        assert_eq!(
+            approvals_after_offering_drift, approvals_before,
+            "offering drift must append no approval audit"
+        );
+
+        let job_id = create_live_apply_job(
+            &pool,
+            approved_plan.clone(),
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            &live_approver_session("ops-alice"),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -11278,17 +16781,99 @@ mod tests {
         );
         assert_eq!(grant.approved_plan_digest, plan_digest);
         assert_eq!(grant.request_id, request_id);
+        assert_eq!(grant.platform, platform);
+        assert_eq!(grant.approved_plan_job_id, approved_plan.job_id);
+        assert_eq!(grant.approved_plan_attempt_id, approved_plan.attempt_id);
         assert_eq!(
             grant.job_spec_digest,
             ryuki_protocol::job_spec_digest(&spec),
             "grant must bind the exact request-owned JobSpec"
         );
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &plan_agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_live_approval_audit_failure_rolls_back_signed_job() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let platform = format!("audit-rollback-{}", Uuid::new_v4().simple());
+        seed_active_request(&pool, request_id, &platform).await;
+        let actor = format!("dbtest-live-audit-failure-{}", Uuid::new_v4());
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
+            mode: JobMode::LiveApply,
+        };
+        let plan_digest = proto_sha256(b"approved-plan-for-audit-rollback");
+        let plan_agent_id = format!("{platform}-plan-agent");
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
+
+        install_live_approval_audit_failure_trigger(&pool).await;
+        let result = create_live_apply_job(
+            &pool,
+            approved_plan,
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            &live_approver_session(&actor),
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        remove_live_approval_audit_failure_trigger(&pool).await;
+
+        assert!(matches!(result, Err(CreateLiveApplyJobError::Db(_))));
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled-back jobs");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 \
+             AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled-back audits");
+        assert_eq!(job_count, 0, "signed LiveApply job must roll back");
+        assert_eq!(audit_count, 0, "failed audit must not leave an event");
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
             .execute(&pool)
             .await
             .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &plan_agent_id).await;
         pool.close().await;
     }
 
@@ -11328,11 +16913,12 @@ mod tests {
 
         let result = create_live_apply_job(
             &pool,
+            dummy_approved_plan_reference(),
             request_id,
             "s5a2-concluded-plt",
             &spec,
             &proto_sha256(b"approved-plan-bytes"),
-            "ops-alice",
+            &live_approver_session("ops-alice"),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -11377,10 +16963,11 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5a2-e2e-{suffix}");
         let agent_id = format!("s5a2-agent-{suffix}");
-        let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (agent_token, agent_key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let request_id = Uuid::new_v4();
-        seed_active_request(&pool, request_id).await;
+        seed_active_request(&pool, request_id, &platform).await;
         let plan_digest = proto_sha256(b"the-exact-approved-plan");
 
         let spec = JobSpec {
@@ -11392,15 +16979,27 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
-
-        // CP enqueues the job with a production-signed grant.
-        let _job_id = create_live_apply_job(
+        let approved_plan = seed_signed_successful_plan_for_mutation(
             &pool,
             request_id,
             &platform,
             &spec,
             &plan_digest,
-            "ops-alice",
+            &agent_id,
+            _agent_enrollment_id,
+            &agent_key,
+        )
+        .await;
+
+        // CP enqueues the job with a production-signed grant.
+        let _job_id = create_live_apply_job(
+            &pool,
+            approved_plan,
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            &live_approver_session("ops-alice"),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -11415,6 +17014,7 @@ mod tests {
         // Agent builds a result carrying the approved plan digest.
         let (job_result, evidence_bytes) = make_live_apply_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -11477,10 +17077,11 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5a2-neg-{suffix}");
         let agent_id = format!("s5a2-negagent-{suffix}");
-        let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (agent_token, agent_key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let request_id = Uuid::new_v4();
-        seed_active_request(&pool, request_id).await;
+        seed_active_request(&pool, request_id, &platform).await;
         let approved_digest = proto_sha256(b"the-approved-plan");
         let unapproved_digest = proto_sha256(b"a-different-unapproved-plan");
 
@@ -11493,15 +17094,27 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
-
-        // CP signs the grant for `approved_digest`.
-        let _job_id = create_live_apply_job(
+        let approved_plan = seed_signed_successful_plan_for_mutation(
             &pool,
             request_id,
             &platform,
             &spec,
             &approved_digest,
-            "ops-alice",
+            &agent_id,
+            _agent_enrollment_id,
+            &agent_key,
+        )
+        .await;
+
+        // CP signs the grant for `approved_digest`.
+        let _job_id = create_live_apply_job(
+            &pool,
+            approved_plan,
+            request_id,
+            &platform,
+            &spec,
+            &approved_digest,
+            &live_approver_session("ops-alice"),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -11515,6 +17128,7 @@ mod tests {
         // Agent sends the UNAPPROVED digest — mismatch vs the grant.
         let (job_result, evidence_bytes) = make_live_apply_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -11700,7 +17314,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-rexp-{suffix}");
         let agent_id = format!("s5-rexp-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let digest = proto_sha256(b"the-approved-plan");
         let job_id = seed_live_apply_job(
@@ -11709,6 +17324,9 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
         )
         .await;
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -11718,6 +17336,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence_bytes) = make_live_apply_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -11758,18 +17377,17 @@ mod tests {
         // (re-sign with the same CP key so verify_vlc still passes — only the
         // expiry is now stale). This proves the replay path is gated on terminal
         // status, not on a fresh expiry check.
-        let expired_grant = sign_vlc(
-            VerifiedLiveContext {
-                request_id: spec.request_id,
-                job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
-                approved_plan_digest: digest.clone(),
-                approver: "ops-test".to_string(),
-                expiry: Utc::now() - Duration::hours(1),
-                step_job_id: None,
-                signature: String::new(),
-            },
-            &ensure_test_cp_key(),
-        );
+        let stored_grant_json: sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar("SELECT live_context FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read original exact-authority grant");
+        let mut expired_grant: VerifiedLiveContext =
+            serde_json::from_value(stored_grant_json.0).expect("stored grant");
+        expired_grant.expiry = Utc::now() - Duration::hours(1);
+        expired_grant.signature.clear();
+        let expired_grant = sign_vlc(expired_grant, &ensure_test_cp_key());
         sqlx::query("UPDATE agent_jobs SET live_context = $2::jsonb WHERE id = $1")
             .bind(job_id)
             .bind(serde_json::to_value(&expired_grant).expect("grant json"))
@@ -11819,7 +17437,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-forge-{suffix}");
         let agent_id = format!("s5-forge-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let digest = proto_sha256(b"the-approved-plan");
         let job_id = seed_live_apply_job_signed(
@@ -11828,6 +17447,9 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
             &attacker_key, // NOT the CP key
         )
         .await;
@@ -11838,6 +17460,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence_bytes) = make_live_apply_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -11883,11 +17506,11 @@ mod tests {
         use std::collections::BTreeMap;
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
-        seed_active_request(&pool, request_id).await;
         let platform = format!(
             "s5a2-badf-{}",
             &Uuid::new_v4().to_string().replace('-', "")[..8]
         );
+        seed_active_request(&pool, request_id, &platform).await;
         let spec = JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -11902,19 +17525,30 @@ mod tests {
 
         // Empty / non-hex digest.
         assert!(matches!(
-            create_live_apply_job(&pool, request_id, &platform, &spec, "", "ops", future, &cp_key)
-                .await,
+            create_live_apply_job(
+                &pool,
+                dummy_approved_plan_reference(),
+                request_id,
+                &platform,
+                &spec,
+                "",
+                &live_approver_session("ops"),
+                future,
+                &cp_key,
+            )
+            .await,
             Err(CreateLiveApplyJobError::Invalid(_))
         ));
         // Past expiry.
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                dummy_approved_plan_reference(),
                 request_id,
                 &platform,
                 &spec,
                 &good,
-                "ops",
+                &live_approver_session("ops"),
                 Utc::now() - Duration::hours(1),
                 &cp_key
             )
@@ -11925,11 +17559,12 @@ mod tests {
         assert!(matches!(
             create_live_apply_job(
                 &pool,
+                dummy_approved_plan_reference(),
                 request_id,
                 &platform,
                 &spec,
                 &good,
-                "ops",
+                &live_approver_session("ops"),
                 Utc::now() + Duration::hours(MAX_GRANT_TTL_HOURS + 1),
                 &cp_key
             )
@@ -11939,7 +17574,15 @@ mod tests {
         // Empty approver.
         assert!(matches!(
             create_live_apply_job(
-                &pool, request_id, &platform, &spec, &good, "  ", future, &cp_key
+                &pool,
+                dummy_approved_plan_reference(),
+                request_id,
+                &platform,
+                &spec,
+                &good,
+                &live_approver_session("  "),
+                future,
+                &cp_key,
             )
             .await,
             Err(CreateLiveApplyJobError::Invalid(_))
@@ -11961,6 +17604,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn make_live_refused_result(
         agent_id: &str,
+        agent_enrollment_id: Uuid,
         platform: &str,
         job_row: &AgentJobRow,
         attempt_id: Uuid,
@@ -11977,6 +17621,7 @@ mod tests {
         let status = JobResultStatus::LiveRefused;
         let unsigned_env = SignedEnvelope {
             agent_id: agent_id.to_string(),
+            agent_enrollment_id,
             platform: platform.to_string(),
             job_id: job_row.id,
             attempt_id,
@@ -11987,6 +17632,8 @@ mod tests {
             status: status.clone(),
             job_spec_digest: spec_digest,
             approved_plan_digest,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -12000,6 +17647,7 @@ mod tests {
             attempt_id,
             result_id,
             status,
+            raw_plan_digest: None,
             evidence_digest,
             signed_envelope: signed_env,
         };
@@ -12019,7 +17667,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-ref-{suffix}");
         let agent_id = format!("s5-ref-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let digest = proto_sha256(b"the-approved-plan");
         let job_id = seed_live_apply_job(
             &pool,
@@ -12027,6 +17676,9 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
         )
         .await;
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -12035,6 +17687,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence) = make_live_refused_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -12082,7 +17735,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-refd-{suffix}");
         let agent_id = format!("s5-refd-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let digest = proto_sha256(b"the-approved-plan");
         let job_id = seed_live_apply_job(
             &pool,
@@ -12090,6 +17744,9 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
         )
         .await;
         let (attempt_id, fencing, nonce, gen, job_row) =
@@ -12098,6 +17755,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence) = make_live_refused_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -12148,7 +17806,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5-refbad-{suffix}");
         let agent_id = format!("s5-refbad-agent-{suffix}");
-        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (token, key, _agent_enrollment_id) =
+            seed_agent_with_key(&pool, &agent_id, &platform).await;
         let digest = proto_sha256(b"the-approved-plan");
         // Grant signed by a NON-CP key → verify_vlc would fail, so the agent
         // refused. The CP must still record the refusal.
@@ -12158,6 +17817,9 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            _agent_enrollment_id,
+            &encode_verifying_key(&key.verifying_key()),
             &attacker_key,
         )
         .await;
@@ -12167,6 +17829,7 @@ mod tests {
         let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
         let (job_result, evidence) = make_live_refused_result(
             &agent_id,
+            _agent_enrollment_id,
             &platform,
             &job_row,
             attempt_id,
@@ -12226,9 +17889,10 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
-             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'b1b-step-live', 'executing', 'execute', '[]'::jsonb)",
+             VALUES ($1, 'server-deployment', $2, 'prod', 'b1b-step-live', 'executing', 'execute', '[]'::jsonb)",
         )
         .bind(request_id)
+        .bind(&platform)
         .execute(&pool)
         .await
         .expect("seed executing request");
@@ -12267,20 +17931,101 @@ mod tests {
         };
         let spec_one = make_spec(step_one.id);
         let spec_two = make_spec(step_two.id);
+        let approver = live_approver_session("ops-alice");
+        let plan_agent_id = format!("b1b-plan-agent-{}", Uuid::new_v4().simple());
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan_one = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec_one,
+            &digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
+        let approved_plan_two = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec_two,
+            &digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
 
         // Mint TWO step-scoped LiveApply grants for the SAME request — this is
         // the case the single-job unique index would have rejected.
         let mut tx = pool.begin().await.unwrap();
+        let wrong_site = format!("{platform}-other-site");
+        let site_mismatch = create_step_live_job(
+            &mut tx,
+            approved_plan_one.clone(),
+            request_id,
+            step_one.id,
+            &wrong_site,
+            &spec_one,
+            &digest,
+            StepLiveJobAuthority::VerifiedHuman(&approver),
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(matches!(
+            site_mismatch,
+            Err(CreateLiveApplyJobError::Invalid(
+                "step live-job platform differs from the authoritative request site"
+            ))
+        ));
+        let jobs_after_site_mismatch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs \
+             WHERE request_id = $1 AND mode IN ('LiveApply', 'LiveDestroy') AND step_scoped = TRUE",
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count step grants after request-site mismatch");
+        assert_eq!(
+            jobs_after_site_mismatch, 0,
+            "a request-site mismatch must mint no step grant"
+        );
+
+        let mut destroy_without_prior_apply = spec_one.clone();
+        destroy_without_prior_apply.mode = JobMode::LiveDestroy;
+        let unbound_destroy = create_step_live_job(
+            &mut tx,
+            dummy_approved_plan_reference(),
+            request_id,
+            step_one.id,
+            &platform,
+            &destroy_without_prior_apply,
+            &digest,
+            StepLiveJobAuthority::SystemAutoTeardown,
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(matches!(
+            unbound_destroy,
+            Err(CreateLiveApplyJobError::Invalid(
+                "step live-destroy requires the prior signed live-apply authority"
+            ))
+        ));
         let nonexistent_step_id = Uuid::new_v4();
         let nonexistent_step_spec = make_spec(nonexistent_step_id);
         let foreign_owner = create_step_live_job(
             &mut tx,
+            dummy_approved_plan_reference(),
             request_id,
             nonexistent_step_id,
             &platform,
             &nonexistent_step_spec,
             &digest,
-            "ops-alice",
+            StepLiveJobAuthority::VerifiedHuman(&approver),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -12290,14 +18035,64 @@ mod tests {
             "a syntactically valid key without a request-owned step must be rejected"
         );
 
-        let job1 = create_step_live_job(
+        for actor_class in [
+            ryuki_engine::auth::ActorClass::Workload,
+            ryuki_engine::auth::ActorClass::Unknown,
+            ryuki_engine::auth::ActorClass::Simulated,
+        ] {
+            let mut nonhuman = live_approver_session("human-shaped-nonhuman");
+            nonhuman.actor_class = actor_class;
+            let denied = create_step_live_job(
+                &mut tx,
+                approved_plan_one.clone(),
+                request_id,
+                step_one.id,
+                &platform,
+                &spec_one,
+                &digest,
+                StepLiveJobAuthority::VerifiedHuman(&nonhuman),
+                Utc::now() + Duration::hours(1),
+                &cp_key,
+            )
+            .await;
+            assert!(matches!(denied, Err(CreateLiveApplyJobError::Invalid(_))));
+        }
+        let wrong_system_authority = create_step_live_job(
             &mut tx,
+            approved_plan_one.clone(),
             request_id,
             step_one.id,
             &platform,
             &spec_one,
             &digest,
-            "ops-alice",
+            StepLiveJobAuthority::SystemAutoTeardown,
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(matches!(
+            wrong_system_authority,
+            Err(CreateLiveApplyJobError::Invalid(_))
+        ));
+        let denied_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs \
+             WHERE request_id = $1 AND mode = 'LiveApply' AND step_scoped = TRUE",
+        )
+        .bind(request_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count denied step grants");
+        assert_eq!(denied_jobs, 0, "denied authorities must mint no step grant");
+
+        let job1 = create_step_live_job(
+            &mut tx,
+            approved_plan_one.clone(),
+            request_id,
+            step_one.id,
+            &platform,
+            &spec_one,
+            &digest,
+            StepLiveJobAuthority::VerifiedHuman(&approver),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -12305,12 +18100,13 @@ mod tests {
         .expect("first step grant mints");
         let job2 = create_step_live_job(
             &mut tx,
+            approved_plan_two.clone(),
             request_id,
             step_two.id,
             &platform,
             &spec_two,
             &digest,
-            "ops-alice",
+            StepLiveJobAuthority::VerifiedHuman(&approver),
             Utc::now() + Duration::hours(1),
             &cp_key,
         )
@@ -12340,6 +18136,7 @@ mod tests {
                 verify_vlc(&grant, &cp_vk).is_ok(),
                 "grant signature verifies"
             );
+            assert_eq!(grant.platform, platform, "grant binds destination platform");
             assert_eq!(
                 grant.step_job_id,
                 Some(jid),
@@ -12349,6 +18146,13 @@ mod tests {
                 grant.approved_plan_digest, digest,
                 "grant carries the digest"
             );
+            let expected_plan = if jid == job1 {
+                &approved_plan_one
+            } else {
+                &approved_plan_two
+            };
+            assert_eq!(grant.approved_plan_job_id, expected_plan.job_id);
+            assert_eq!(grant.approved_plan_attempt_id, expected_plan.attempt_id);
             assert_eq!(
                 grant.job_spec_digest, expected_spec_digest,
                 "grant binds the exact persisted step JobSpec"
@@ -12378,6 +18182,7 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        cleanup_agent(&pool, &plan_agent_id).await;
         pool.close().await;
     }
 
@@ -12397,7 +18202,8 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5b2-{suffix}");
         let agent_id = format!("s5b2-agent-{suffix}");
-        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+        let (token, agent_enrollment_id) =
+            seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
 
         let digest = proto_sha256(b"the-approved-plan");
         let job_id = seed_live_apply_job(
@@ -12406,12 +18212,22 @@ mod tests {
             &digest,
             Utc::now() + Duration::hours(1),
             None,
+            &agent_id,
+            agent_enrollment_id,
+            &identity.public_key_b64(),
         )
         .await;
         let (attempt_id, fencing, nonce, gen, job_row) =
             lease_job(&pool, &platform, &agent_id).await;
         ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
-        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+        let job = build_protocol_job(
+            &job_row,
+            agent_enrollment_id,
+            attempt_id,
+            fencing.clone(),
+            nonce.clone(),
+            gen,
+        );
 
         // Agent code: a stub Applied execution → the REAL build_signed_result with
         // the matching plan digest (what S5b-2b-ii's loop will do after the gate).
@@ -12422,12 +18238,15 @@ mod tests {
         )
         .execute(&job.spec)
         .expect("stub execute");
-        let agent_body = ryuki_agent::result::build_signed_result(
+        let execution_trust_profile = canonical_execution_trust_profile(&job.spec, &platform);
+        let agent_body = ryuki_agent::result::build_signed_result_with_trust_profile(
             &identity,
             &agent_id,
             &job,
             &evidence,
             Some(digest.clone()),
+            None,
+            Some(execution_trust_profile),
         )
         .expect("build_signed_result for LiveApply Applied must succeed");
 
@@ -12485,7 +18304,7 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5c-t1-{suffix}");
         let request_id = Uuid::new_v4();
-        seed_active_request(&pool, request_id).await;
+        seed_active_request(&pool, request_id, &platform).await;
         let digest = proto_sha256(b"approved-plan-s5c");
 
         let spec = JobSpec {
@@ -12497,8 +18316,24 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
+        let plan_agent_id = format!("s5c-t1-plan-agent-{suffix}");
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
 
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: approved_plan.job_id,
+            approved_plan_attempt_id: approved_plan.attempt_id,
             request_id,
             platform: platform.clone(),
             spec,
@@ -12506,7 +18341,8 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, "sentinel-approver", &body).await;
+        let approver_session = live_approver_session("sentinel-approver");
+        let result = approve_live_apply_with(&pool, &cp_key, &approver_session, &body).await;
         assert!(
             result.is_ok(),
             "approve_live_apply_with must succeed for valid input: {:?}",
@@ -12549,12 +18385,188 @@ mod tests {
         assert_eq!(grant.approved_plan_digest, digest);
         assert_eq!(grant.approver, "sentinel-approver");
         assert_eq!(grant.request_id, request_id);
+        assert_eq!(grant.platform, platform);
+        assert_eq!(grant.approved_plan_job_id, approved_plan.job_id);
+        assert_eq!(grant.approved_plan_attempt_id, approved_plan.attempt_id);
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
+        #[derive(sqlx::FromRow)]
+        struct ApprovalAuditRow {
+            actor_principal: String,
+            actor_display: String,
+            actor_roles: Vec<String>,
+            provider_mode: String,
+            from_status: Option<String>,
+            to_status: String,
+            from_stage: Option<String>,
+            to_stage: String,
+            detail: serde_json::Value,
+            outcome: String,
+            prev_hash: Option<String>,
+            entry_hash: Option<String>,
+        }
+        let audit_row: ApprovalAuditRow = sqlx::query_as(
+            "SELECT actor_principal, actor_display, actor_roles, provider_mode, \
+             from_status, to_status, from_stage, to_stage, detail, outcome, \
+             prev_hash, entry_hash FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("live-apply mint must append one canonical approval audit row");
+        assert_eq!(audit_row.actor_principal, approver_session.user_id);
+        assert_eq!(audit_row.actor_display, approver_session.display_name);
+        assert_eq!(audit_row.actor_roles, approver_session.roles);
+        assert_eq!(audit_row.provider_mode, approver_session.provider_mode);
+        assert_eq!(grant.approver, audit_row.actor_principal);
+        assert_eq!(audit_row.from_status.as_deref(), Some("locked"));
+        assert_eq!(audit_row.to_status, "locked");
+        assert_eq!(audit_row.from_stage.as_deref(), Some("lock"));
+        assert_eq!(audit_row.to_stage, "lock");
+        assert_eq!(audit_row.detail["agent_job_id"], json!(job_id));
+        assert_eq!(audit_row.detail["approved_plan_digest"], json!(digest));
+        assert_eq!(audit_row.detail["mode"], "LiveApply");
+        assert!(audit_row.detail.get("spec").is_none());
+        assert!(audit_row.detail.get("live_context").is_none());
+        assert_eq!(audit_row.outcome, "approved");
+        assert!(audit_row
+            .prev_hash
+            .as_deref()
+            .is_some_and(|h| !h.is_empty()));
+        assert!(audit_row
+            .entry_hash
+            .as_deref()
+            .is_some_and(|h| !h.is_empty()));
+        let chain = crate::audit::verify_audit_chain(&pool)
+            .await
+            .expect("verify audit chain");
+        assert!(
+            chain.verified,
+            "approval must preserve audit chain integrity"
+        );
+        assert!(chain.checked > 0, "the committed approval must be checked");
+        assert_eq!(chain.first_divergent_id, None);
+        assert_eq!(chain.reason, None);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &plan_agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_concurrent_live_approvals_commit_one_job_and_one_audit() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use ryuki_protocol::crypto::sha256_hex as proto_sha256;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let platform = format!("s5c-race-{}", Uuid::new_v4().simple());
+        seed_active_request(&pool, request_id, &platform).await;
+        let digest = proto_sha256(b"approved-plan-live-approval-race");
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            state_key: Some(format!("request-{request_id}")),
+            mode: JobMode::LiveApply,
+        };
+        let plan_agent_id = format!("s5c-race-plan-agent-{}", Uuid::new_v4().simple());
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
+        let session_a = live_approver_session("race-approver-a");
+        let session_b = live_approver_session("race-approver-b");
+
+        let (first, second) = tokio::join!(
+            create_live_apply_job(
+                &pool,
+                approved_plan.clone(),
+                request_id,
+                &platform,
+                &spec,
+                &digest,
+                &session_a,
+                Utc::now() + Duration::hours(1),
+                &cp_key,
+            ),
+            create_live_apply_job(
+                &pool,
+                approved_plan.clone(),
+                request_id,
+                &platform,
+                &spec,
+                &digest,
+                &session_b,
+                Utc::now() + Duration::hours(1),
+                &cp_key,
+            )
+        );
+
+        assert_eq!(
+            first.is_ok() as usize + second.is_ok() as usize,
+            1,
+            "exactly one concurrent mint must win: first={first:?}, second={second:?}"
+        );
+        let loser = if first.is_err() { &first } else { &second };
+        assert!(matches!(
+            loser,
+            Err(CreateLiveApplyJobError::Invalid(
+                "a live-apply has already been approved for this request"
+            ))
+        ));
+
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count raced live-apply jobs");
+        let audit_actors: Vec<String> = sqlx::query_scalar(
+            "SELECT actor_principal FROM audit_log WHERE request_id = $1 \
+             AND action = 'request.approve-live-apply' ORDER BY id",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read raced live-approval audits");
+        assert_eq!(job_count, 1, "unique live-apply slot must hold");
+        assert_eq!(audit_actors.len(), 1, "the losing conflict emits no audit");
+        assert!(
+            audit_actors[0] == session_a.user_id || audit_actors[0] == session_b.user_id,
+            "audit actor must be the verified winning session"
+        );
+        let chain = crate::audit::verify_audit_chain(&pool)
+            .await
+            .expect("verify raced live-approval audit chain");
+        assert!(
+            chain.verified,
+            "concurrent approval must preserve the chain"
+        );
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(request_id)
             .execute(&pool)
             .await
             .ok();
+        cleanup_agent(&pool, &plan_agent_id).await;
         pool.close().await;
     }
 
@@ -12572,7 +18584,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         // Seed an active request so the bad-DIGEST rejection (a post-gate check
         // in create_live_apply_job) is what's exercised — not the concluded gate.
-        seed_active_request(&pool, request_id).await;
+        seed_active_request(&pool, request_id, "any").await;
         let spec = JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -12583,6 +18595,8 @@ mod tests {
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
             platform: "any".into(),
             spec,
@@ -12590,7 +18604,9 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        let result =
+            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
+                .await;
         assert!(result.is_err(), "non-hex digest must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -12620,6 +18636,8 @@ mod tests {
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
             platform: "any".into(),
             spec,
@@ -12627,7 +18645,9 @@ mod tests {
             expiry_seconds: 0,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        let result =
+            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
+                .await;
         assert!(result.is_err(), "zero expiry must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -12657,6 +18677,8 @@ mod tests {
             mode: JobMode::LiveApply,
         };
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
             platform: "any".into(),
             spec,
@@ -12664,7 +18686,9 @@ mod tests {
             expiry_seconds: (MAX_GRANT_TTL_HOURS as u64) * 3600 + 1,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        let result =
+            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
+                .await;
         assert!(result.is_err(), "over-max TTL must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -12694,6 +18718,8 @@ mod tests {
             mode: JobMode::OfflineDryRun,
         };
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             request_id,
             platform: "any".into(),
             spec,
@@ -12701,16 +18727,17 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        let result =
+            approve_live_apply_with(&pool, &cp_key, &live_approver_session("ops-test"), &body)
+                .await;
         assert!(result.is_err(), "OfflineDryRun spec must be rejected");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         pool.close().await;
     }
 
-    /// The approver stored in the grant is the one passed as the `approver` argument
-    /// (simulating session.user_id), NOT any value that could come from the body.
-    /// This test uses a sentinel string to prove provenance.
+    /// The approver stored in the grant and canonical audit row comes from the
+    /// same verified session, never from the request body.
     #[tokio::test]
     async fn db_t1_approver_is_from_param_not_body() {
         let Some(pool) = test_pool().await else {
@@ -12727,9 +18754,10 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5c-t6-{suffix}");
         let request_id = Uuid::new_v4();
-        seed_active_request(&pool, request_id).await;
+        seed_active_request(&pool, request_id, &platform).await;
         let digest = proto_sha256(b"plan-for-approver-test");
         let sentinel_approver = "session-derived-approver-not-from-body";
+        let approver_session = live_approver_session(sentinel_approver);
 
         let spec = JobSpec {
             request_id,
@@ -12740,7 +18768,23 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
+        let plan_agent_id = format!("s5c-t6-plan-agent-{suffix}");
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(&pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
         let body = ApproveLiveApplyBody {
+            approved_plan_job_id: approved_plan.job_id,
+            approved_plan_attempt_id: approved_plan.attempt_id,
             request_id,
             platform: platform.clone(),
             spec,
@@ -12748,7 +18792,7 @@ mod tests {
             expiry_seconds: 3600,
         };
 
-        let result = approve_live_apply_with(&pool, &cp_key, sentinel_approver, &body).await;
+        let result = approve_live_apply_with(&pool, &cp_key, &approver_session, &body).await;
         assert!(result.is_ok(), "approve must succeed: {:?}", result.err());
 
         let json_val = result.unwrap().0;
@@ -12767,12 +18811,22 @@ mod tests {
         let grant: VerifiedLiveContext =
             serde_json::from_value(row.live_context.expect("live_context").0).expect("deserialise");
 
-        // The grant's approver must equal the sentinel passed as the argument,
+        // The grant's approver must equal the verified session principal,
         // proving the body cannot influence it.
         assert_eq!(
             grant.approver, sentinel_approver,
-            "grant.approver must come from the approver param (session), not the body"
+            "grant.approver must come from the session, not the body"
         );
+        let audit_actor: String = sqlx::query_scalar(
+            "SELECT actor_principal FROM audit_log \
+             WHERE request_id = $1 AND action = 'request.approve-live-apply'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("approval audit actor");
+        assert_eq!(audit_actor, sentinel_approver);
+        assert_eq!(grant.approver, audit_actor);
         assert!(verify_vlc(&grant, &cp_vk).is_ok(), "grant must verify");
         assert_eq!(
             grant.job_spec_digest,
@@ -12780,11 +18834,8 @@ mod tests {
             "admin-created grants must bind the exact request-owned JobSpec"
         );
 
-        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &plan_agent_id).await;
         pool.close().await;
     }
 
@@ -12846,6 +18897,27 @@ mod tests {
             .iter()
             .find(|v| v["agent_id"].as_str() == Some(&agent_id_a))
             .expect("agent A entry");
+        assert!(Uuid::parse_str(
+            agent_a_entry["enrollment_id"]
+                .as_str()
+                .expect("immutable enrollment id")
+        )
+        .is_ok());
+        assert!(valid_public_key_fingerprint_shape(
+            agent_a_entry["public_key_fingerprint"]
+                .as_str()
+                .expect("reviewable public-key fingerprint")
+        ));
+        assert!(valid_public_key_fingerprint_shape(
+            agent_a_entry["capabilities_digest"]
+                .as_str()
+                .expect("reviewable capabilities digest")
+        ));
+        assert_eq!(
+            agent_a_entry["cryptographically_admitted"],
+            json!(true),
+            "a post-cutover approved fixture must retain its consumed-challenge provenance"
+        );
         let jobs_a = agent_a_entry["jobs"]
             .as_array()
             .expect("jobs must be array");
@@ -12856,6 +18928,11 @@ mod tests {
             .iter()
             .find(|v| v["agent_id"].as_str() == Some(&agent_id_b))
             .expect("agent B entry");
+        assert_eq!(
+            agent_b_entry["cryptographically_admitted"],
+            json!(true),
+            "a challenge-linked Pending fixture must expose its admission provenance"
+        );
         let jobs_b = agent_b_entry["jobs"]
             .as_array()
             .expect("jobs must be array");
@@ -12915,12 +18992,14 @@ mod tests {
         // check it does NOT appear in the response.
         let _plaintext = seed_agent(&pool, &agent_id, &platform, "pending").await;
 
-        // Retrieve the stored token_hash directly so we can assert it's absent.
-        let hash: String = sqlx::query_scalar("SELECT token_hash FROM agents WHERE agent_id = $1")
-            .bind(&agent_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch token_hash for assertion");
+        // Retrieve the stored token_hash and raw public key directly so we can
+        // assert both are absent while the derived fingerprint is present.
+        let (hash, public_key): (String, String) =
+            sqlx::query_as("SELECT token_hash, public_key FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch stored enrollment values for assertion");
 
         let result = list_agents_with(&pool).await;
         assert!(result.is_ok(), "list must succeed");
@@ -12929,6 +19008,14 @@ mod tests {
         assert!(
             !json_str.contains(&hash),
             "response must not contain the token_hash value"
+        );
+        assert!(
+            !json_str.contains(&public_key),
+            "response must not contain the raw public key"
+        );
+        assert!(
+            json_str.contains(&public_key_fingerprint(&public_key)),
+            "response must contain the reviewable public-key fingerprint"
         );
 
         cleanup_agent(&pool, &agent_id).await;
@@ -13880,10 +19967,29 @@ mod tests {
 
     // ── #42 slice B2-2: auto compensating teardown ──────────────────────────
 
-    /// Seed an executing request whose chain a->b->c has a,b `Applied` and c
-    /// `Applying` (a LiveApply job in flight). Returns (req_id, c's job id).
-    async fn seed_teardown_chain(pool: &PgPool) -> (Uuid, Uuid) {
+    /// Seed an executing request whose chain a->b->c has a,b `Applied` through
+    /// real CP-signed LiveApply grants backed by exact signed LivePlan rows, and
+    /// c `Applying`. An existing identity may be supplied for the full-loop
+    /// test; otherwise this helper owns and returns a fixture agent to clean up.
+    async fn seed_teardown_chain(
+        pool: &PgPool,
+        existing_agent: Option<(&str, Uuid, &ed25519_dalek::SigningKey)>,
+    ) -> (Uuid, Uuid, Option<String>) {
         let req_id = seed_executing_request(pool).await;
+        let (agent_id, agent_key, agent_enrollment_id, owned_agent_id) = match existing_agent {
+            Some((agent_id, enrollment_id, signing_key)) => (
+                agent_id.to_string(),
+                signing_key.clone(),
+                enrollment_id,
+                None,
+            ),
+            None => {
+                let agent_id = format!("teardown-plan-agent-{}", Uuid::new_v4().simple());
+                let (_token, key, enrollment_id) =
+                    seed_agent_with_key(pool, &agent_id, "DEFRA").await;
+                (agent_id.clone(), key, enrollment_id, Some(agent_id))
+            }
+        };
         let mut conn = pool.acquire().await.unwrap();
         crate::repos::job_steps::insert_plan(
             &mut conn,
@@ -13897,16 +20003,92 @@ mod tests {
         .await
         .unwrap();
         drop(conn);
-        // a, b applied (with a recorded plan digest); c applying.
-        sqlx::query(
-            "UPDATE job_steps SET status = 'Applied', live_plan_digest = $2 \
-             WHERE request_id = $1 AND step_key IN ('a', 'b')",
-        )
-        .bind(req_id)
-        .bind("a".repeat(64))
-        .execute(pool)
-        .await
-        .unwrap();
+        let steps = crate::repos::job_steps::load_plan(pool, req_id)
+            .await
+            .expect("teardown steps");
+        let (name, site, environment, cpu, memory_gb): (String, String, String, i32, i32) =
+            sqlx::query_as(
+                "SELECT name, site, environment, cpu, memory_gb FROM requests WHERE id = $1",
+            )
+            .bind(req_id)
+            .fetch_one(pool)
+            .await
+            .expect("teardown request inputs");
+        let metadata = std::collections::HashMap::new();
+        let digest = "a".repeat(64);
+        let cp_key = ensure_test_cp_key();
+        let approver = live_approver_session("teardown-fixture-approver");
+        for step in steps
+            .iter()
+            .filter(|step| matches!(step.step_key.as_str(), "a" | "b"))
+        {
+            let iac_digest = ryuki_runner::iac::offering_iac_digest(&step.iac_ref)
+                .unwrap_or_else(|| "0".repeat(64));
+            let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+                offering_id: &step.iac_ref,
+                request_id: &req_id.to_string(),
+                name: &name,
+                site: &site,
+                environment: &environment,
+                cpu: u32::try_from(cpu).unwrap_or(0),
+                memory_gb: u32::try_from(memory_gb).unwrap_or(0),
+                metadata: &metadata,
+            });
+            let apply_spec = JobSpec {
+                request_id: req_id,
+                offering_id: Uuid::new_v4(),
+                iac_ref: step.iac_ref.clone(),
+                iac_digest,
+                vars,
+                state_key: Some(crate::contracts::step_state_key(step.id)),
+                mode: JobMode::LiveApply,
+            };
+            let approved_plan = seed_signed_successful_plan_for_mutation(
+                pool,
+                req_id,
+                &site,
+                &apply_spec,
+                &digest,
+                &agent_id,
+                agent_enrollment_id,
+                &agent_key,
+            )
+            .await;
+            let mut tx = pool.begin().await.expect("teardown apply tx");
+            let apply_job_id = create_step_live_job(
+                &mut tx,
+                approved_plan,
+                req_id,
+                step.id,
+                &site,
+                &apply_spec,
+                &digest,
+                StepLiveJobAuthority::VerifiedHuman(&approver),
+                Utc::now() + Duration::hours(1),
+                &cp_key,
+            )
+            .await
+            .expect("seed exact applied step grant");
+            sqlx::query(
+                "UPDATE agent_jobs SET status = 'Succeeded', result_status = 'verified', \
+                     completed_at = NOW() WHERE id = $1",
+            )
+            .bind(apply_job_id)
+            .execute(&mut *tx)
+            .await
+            .expect("complete applied fixture row");
+            sqlx::query(
+                "UPDATE job_steps SET status = 'Applied', live_plan_digest = $2, \
+                     agent_job_id = $3 WHERE id = $1",
+            )
+            .bind(step.id)
+            .bind(&digest)
+            .bind(apply_job_id)
+            .execute(&mut *tx)
+            .await
+            .expect("link applied step authority");
+            tx.commit().await.expect("commit applied step authority");
+        }
         let job_c: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
              VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
@@ -13924,7 +20106,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        (req_id, job_c)
+        (req_id, job_c, owned_agent_id)
     }
 
     async fn step_of<'a>(
@@ -13944,8 +20126,8 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
-        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+        let _cp_key = ensure_test_cp_key();
+        let (req_id, job_c, owned_agent_id) = seed_teardown_chain(&pool, None).await;
 
         // c's LiveApply fails -> teardown begins. b (its only Applied dependent
         // is now Failed c) is ready first; a is NOT (b still Applied).
@@ -14044,6 +20226,9 @@ mod tests {
         );
 
         cleanup_step_2b_request(&pool, req_id).await;
+        if let Some(agent_id) = owned_agent_id {
+            cleanup_agent(&pool, &agent_id).await;
+        }
         pool.close().await;
     }
 
@@ -14073,10 +20258,16 @@ mod tests {
         let identity = ryuki_agent::identity::AgentIdentity::generate();
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let agent_id = format!("b23-agent-{suffix}");
-        let token = seed_agent_from_identity(&pool, &agent_id, "DEFRA", &identity).await;
+        let (token, agent_enrollment_id) =
+            seed_agent_from_identity(&pool, &agent_id, "DEFRA", &identity).await;
 
         // Executing request: a, b Applied (with recorded digests), c Applying.
-        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+        let (req_id, job_c, owned_agent_id) = seed_teardown_chain(
+            &pool,
+            Some((&agent_id, agent_enrollment_id, identity.signing_key())),
+        )
+        .await;
+        assert!(owned_agent_id.is_none());
 
         // c's LiveApply FAILS → the teardown begins: b (the deepest applied
         // step) gets a REAL LiveDestroy job + CP-signed step-bound grant.
@@ -14108,6 +20299,7 @@ mod tests {
         let attempt = Uuid::new_v4();
         let fencing = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(&pool).await;
         let job_row = sqlx::query_as::<_, AgentJobRow>(&format!(
             "UPDATE agent_jobs \
              SET status = 'Leased', agent_id = $1, attempt_id = $2, \
@@ -14123,9 +20315,13 @@ mod tests {
         .bind(&nonce)
         .bind(LEASE_TTL_SECS as f64)
         .bind(destroy_job_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *lease_tx)
         .await
         .expect("lease the minted LiveDestroy job");
+        lease_tx
+            .commit()
+            .await
+            .expect("commit LiveDestroy lease fixture");
         assert_eq!(job_row.mode, "LiveDestroy", "the minted job is a destroy");
         ack_to_running(&pool, destroy_job_id, attempt, &fencing).await;
 
@@ -14134,6 +20330,7 @@ mod tests {
         // leaves live_context None for the non-live tests).
         let mut job = build_protocol_job(
             &job_row,
+            agent_enrollment_id,
             attempt,
             fencing.clone(),
             nonce.clone(),
@@ -14168,9 +20365,26 @@ mod tests {
                 "summary": "Destroy complete! Resources: 1 destroyed."
             })),
         };
-        let agent_body =
-            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence, None)
-                .expect("build_signed_result for a LiveDestroy Applied result must succeed");
+        let execution_trust_profile = canonical_execution_trust_profile(&job.spec, &job.platform);
+        assert_eq!(
+            execution_trust_profile_digest(&execution_trust_profile),
+            job.live_context
+                .as_ref()
+                .expect("destroy grant")
+                .execution_authority
+                .execution_trust_profile_digest,
+            "destroy must report the exact profile approved by the successful plan"
+        );
+        let agent_body = ryuki_agent::result::build_signed_result_with_trust_profile(
+            &identity,
+            &agent_id,
+            &job,
+            &evidence,
+            None,
+            None,
+            Some(execution_trust_profile),
+        )
+        .expect("build_signed_result for a LiveDestroy Applied result must succeed");
 
         // Cross the crate boundary and feed the REAL CP verifier.
         let cp_body: ResultBody =
@@ -14222,8 +20436,8 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
-        let (req_id, job_c) = seed_teardown_chain(&pool).await;
+        let _cp_key = ensure_test_cp_key();
+        let (req_id, job_c, owned_agent_id) = seed_teardown_chain(&pool, None).await;
 
         // c fails -> b starts tearing down.
         let mut tx = pool.begin().await.unwrap();
@@ -14284,6 +20498,9 @@ mod tests {
         );
 
         cleanup_step_2b_request(&pool, req_id).await;
+        if let Some(agent_id) = owned_agent_id {
+            cleanup_agent(&pool, &agent_id).await;
+        }
         pool.close().await;
     }
 
@@ -14476,55 +20693,17 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
-        let req_id = seed_executing_request(&pool).await;
-        let mut conn = pool.acquire().await.unwrap();
-        // Three INDEPENDENT steps: 'a' applied, 'b' parked awaiting operator approval,
-        // 'c' a live apply in flight.
-        crate::repos::job_steps::insert_plan(
-            &mut conn,
-            req_id,
-            &[
-                ("a", vec![], "linux-server-deployment"),
-                ("b", vec![], "linux-server-deployment"),
-                ("c", vec![], "linux-server-deployment"),
-            ],
-        )
-        .await
-        .unwrap();
-        drop(conn);
+        let _cp_key = ensure_test_cp_key();
+        // Start from exact signed plan/apply authority for the Applied step;
+        // teardown must never be exercised with a digest-only stand-in.
+        let (req_id, job_c, owned_agent_id) = seed_teardown_chain(&pool, None).await;
+        // Park b at the approval boundary while c remains a live apply in
+        // flight. Clearing b's old fixture link models a not-yet-approved step.
         sqlx::query(
-            "UPDATE job_steps SET status = 'Applied', live_plan_digest = $2 \
-             WHERE request_id = $1 AND step_key = 'a'",
-        )
-        .bind(req_id)
-        .bind("a".repeat(64))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE job_steps SET status = 'AwaitingApproval', live_plan_digest = $2 \
+            "UPDATE job_steps SET status = 'AwaitingApproval', agent_job_id = NULL \
              WHERE request_id = $1 AND step_key = 'b'",
         )
         .bind(req_id)
-        .bind("b".repeat(64))
-        .execute(&pool)
-        .await
-        .unwrap();
-        let job_c: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_jobs (request_id, platform, spec, mode, step_scoped) \
-             VALUES ($1, 'DEFRA', '{}'::jsonb, 'LiveApply', TRUE) RETURNING id",
-        )
-        .bind(req_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE job_steps SET status = 'Applying', agent_job_id = $2 \
-             WHERE request_id = $1 AND step_key = 'c'",
-        )
-        .bind(req_id)
-        .bind(job_c)
         .execute(&pool)
         .await
         .unwrap();
@@ -14565,6 +20744,9 @@ mod tests {
         assert_eq!(status, "executing", "teardown keeps the request executing");
 
         cleanup_step_2b_request(&pool, req_id).await;
+        if let Some(agent_id) = owned_agent_id {
+            cleanup_agent(&pool, &agent_id).await;
+        }
         pool.close().await;
     }
 
@@ -16171,7 +22353,7 @@ mod tests {
         let cp_key = ensure_test_cp_key();
         let platform = format!("plt-slot-{}", Uuid::new_v4().simple());
         // The parent request is mid-apply: Executing (NOT concluded).
-        let req = seed_request_row(pool, "executing").await;
+        let req = seed_request_for_scope(pool, &platform, "production").await;
 
         let spec = JobSpec {
             request_id: req,
@@ -16183,6 +22365,20 @@ mod tests {
             mode: JobMode::LiveApply,
         };
         let plan_digest = proto_sha256(b"approved-plan-bytes");
+        let plan_agent_id = format!("slot-plan-agent-{}", Uuid::new_v4().simple());
+        let (_plan_token, plan_key, plan_enrollment_id) =
+            seed_agent_with_key(pool, &plan_agent_id, &platform).await;
+        let approved_plan = seed_signed_successful_plan_for_mutation(
+            pool,
+            req,
+            &platform,
+            &spec,
+            &plan_digest,
+            &plan_agent_id,
+            plan_enrollment_id,
+            &plan_key,
+        )
+        .await;
         // create_live_apply_job borrows everything (request_id is Copy), so the
         // same args drive all three mint attempts below.
         let grant_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -16190,11 +22386,12 @@ mod tests {
         // 1. Mint the ONE LiveApply job for this request.
         let job_id = create_live_apply_job(
             pool,
+            approved_plan.clone(),
             req,
             &platform,
             &spec,
             &plan_digest,
-            "ops-alice",
+            &live_approver_session("ops-alice"),
             grant_expiry,
             &cp_key,
         )
@@ -16243,11 +22440,12 @@ mod tests {
         //    "scope the index to non-terminal statuses" regression.
         let blocked_by_index = create_live_apply_job(
             pool,
+            approved_plan.clone(),
             req,
             &platform,
             &spec,
             &plan_digest,
-            "ops-alice",
+            &live_approver_session("ops-alice"),
             grant_expiry,
             &cp_key,
         )
@@ -16268,11 +22466,12 @@ mod tests {
         // 6. Now the concluded gate ALSO refuses — a DISTINCT branch from step 4.
         let blocked_by_gate = create_live_apply_job(
             pool,
+            approved_plan,
             req,
             &platform,
             &spec,
             &plan_digest,
-            "ops-alice",
+            &live_approver_session("ops-alice"),
             grant_expiry,
             &cp_key,
         )
@@ -16297,6 +22496,18 @@ mod tests {
             live_apply_count, 1,
             "no-double-apply held: one live-apply slot, ever"
         );
+        let approval_audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 \
+             AND action = 'request.approve-live-apply'",
+        )
+        .bind(req)
+        .fetch_one(pool)
+        .await
+        .expect("count live-approval audits");
+        assert_eq!(
+            approval_audit_count, 1,
+            "the successful mint emits one audit; index/gate losers emit none"
+        );
 
         // Schema-level guard: the unique index must remain ALL-statuses — its
         // predicate is exactly `mode = 'LiveApply'` with NO status clause. This
@@ -16319,6 +22530,7 @@ mod tests {
 
         cleanup_dead_letter_events(pool, job_id).await;
         cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_agent(pool, &plan_agent_id).await;
         cleanup_request_row(pool, req).await;
     }
 
@@ -16529,11 +22741,16 @@ mod tests {
 
         // A NON-pending (Leased) job → 409 (the status CAS misses).
         let leased = seed_pending_job(pool, &platform).await;
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(pool).await;
         sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = 'a' WHERE id = $1")
             .bind(leased)
-            .execute(pool)
+            .execute(&mut *lease_tx)
             .await
             .unwrap();
+        lease_tx
+            .commit()
+            .await
+            .expect("commit reprioritize lease fixture");
         let conflict = admin_set_job_priority(
             Path(leased.to_string()),
             Extension(AuthSession::static_dry_run()),
@@ -16593,11 +22810,16 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        let mut lease_tx = begin_agent_job_lease_fixture_tx(pool).await;
         sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = 'x' WHERE id = $1")
             .bind(a_leased)
-            .execute(pool)
+            .execute(&mut *lease_tx)
             .await
             .unwrap();
+        lease_tx
+            .commit()
+            .await
+            .expect("commit queue-depth lease fixture");
         let _b1 = seed_pending_job(pool, &plat_b).await;
 
         let Json(out) = admin_agent_queue_depth(Extension(AuthSession::static_dry_run()))
@@ -16653,6 +22875,7 @@ mod tests {
         let digest = "b".repeat(64);
         let envelope = SignedEnvelope {
             agent_id: "agent-x".into(),
+            agent_enrollment_id: Uuid::nil(),
             platform: platform.clone(),
             job_id: job,
             attempt_id: Uuid::new_v4(),
@@ -16663,6 +22886,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: "a".repeat(64),
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: digest.clone(),
             redaction_policy_version: REDACTION_POLICY_VERSION.into(),
             timestamp: Utc::now(),
@@ -16732,14 +22957,13 @@ mod tests {
         let platform = format!("plt-plan-review-{}", Uuid::new_v4().simple());
         let job = seed_pending_job(pool, &platform).await;
         let spec = reviewable_live_plan_spec();
-        let mut raw_plan = reviewable_live_plan(&["create"]);
-        raw_plan["resource_changes"][5]["change"]["after"]["id"] = json!("vm-raw-provider-id");
-        raw_plan["resource_changes"][5]["change"]["after"]["secret"] = json!("RAW-SENTINEL");
-        let evidence = serde_json::to_vec(&raw_plan).unwrap();
+        let safe_projection = reviewable_live_plan(&["create"]);
+        let evidence = serde_json::to_vec(&safe_projection).unwrap();
         let digest = ryuki_protocol::sha256_hex(&evidence);
         let result_id = Uuid::new_v4();
         let envelope = SignedEnvelope {
             agent_id: "agent-x".into(),
+            agent_enrollment_id: Uuid::nil(),
             platform: platform.clone(),
             job_id: job,
             attempt_id: Uuid::new_v4(),
@@ -16750,6 +22974,8 @@ mod tests {
             status: JobResultStatus::Planned,
             job_spec_digest: ryuki_protocol::job_spec_digest(&spec),
             approved_plan_digest: None,
+            raw_plan_digest: Some("a".repeat(64)),
+            execution_trust_profile: None,
             evidence_digest: digest.clone(),
             redaction_policy_version: REDACTION_POLICY_VERSION.into(),
             timestamp: Utc::now(),
@@ -16770,11 +22996,12 @@ mod tests {
         sqlx::query(
             "UPDATE agent_jobs SET spec = $1::jsonb, mode = 'LivePlan', status = 'Succeeded', \
              result_status = 'planned', completed_at = NOW(), result_id = $2, \
-             evidence_digest = $3, signed_envelope = $4::jsonb WHERE id = $5",
+             evidence_digest = $3, raw_plan_digest = $4, signed_envelope = $5::jsonb WHERE id = $6",
         )
         .bind(serde_json::to_value(&spec).unwrap())
         .bind(result_id)
         .bind(&digest)
+        .bind("a".repeat(64))
         .bind(serde_json::to_value(&envelope).unwrap())
         .bind(job)
         .execute(pool)
@@ -16791,8 +23018,8 @@ mod tests {
         assert_eq!(out["plan_review"]["counts"]["create"], 1);
         assert_eq!(out["plan_review"]["placement"]["name"], "first-test-vm");
         let rendered = out.to_string();
-        assert!(!rendered.contains("vm-raw-provider-id"));
-        assert!(!rendered.contains("RAW-SENTINEL"));
+        assert!(!rendered.contains("canonical_plan_sha256"));
+        assert!(!rendered.contains(&"a".repeat(64)));
         assert!(out.get("evidence_json").is_none());
         assert!(out.get("spec").is_none());
 
@@ -16821,8 +23048,9 @@ mod tests {
         let result_id = Uuid::new_v4();
         let digest = "c".repeat(64);
         // A pre-guard stored envelope smuggling a secret into the policy-version slot.
-        let envelope = SignedEnvelope {
+        let mut envelope = SignedEnvelope {
             agent_id: "agent-x".into(),
+            agent_enrollment_id: Uuid::nil(),
             platform: platform.clone(),
             job_id: job,
             attempt_id: Uuid::new_v4(),
@@ -16833,6 +23061,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: "a".repeat(64),
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: digest.clone(),
             redaction_policy_version: "SUPERSECRET".into(),
             timestamp: Utc::now(),
@@ -16866,6 +23096,21 @@ mod tests {
             !body.to_string().contains("SUPERSECRET"),
             "read-side rejection must not echo the secret: {body}"
         );
+
+        envelope.redaction_policy_version = "ryuki-redaction-v1".into();
+        sqlx::query("UPDATE agent_jobs SET signed_envelope = $1::jsonb WHERE id = $2")
+            .bind(serde_json::to_value(&envelope).unwrap())
+            .bind(job)
+            .execute(pool)
+            .await
+            .unwrap();
+        let legacy = admin_agent_job_result(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect_err("stored evidence under superseded redaction v1 must not be served");
+        assert_eq!(legacy.0, StatusCode::INTERNAL_SERVER_ERROR);
 
         cleanup_jobs_for_platform(pool, &platform).await;
     }
@@ -17929,10 +24174,7 @@ mod tests {
         let Err((status, _)) = admin_approve_agent(
             Path(agent_id.clone()),
             Extension(scoped),
-            Json(ApproveBody {
-                platform: "ci".into(),
-                capabilities: None,
-            }),
+            Json(approve_body(Uuid::nil(), String::new())),
         )
         .await
         else {
@@ -17952,7 +24194,12 @@ mod tests {
         let agent_id = format!("scope-revoke-agent-{}", Uuid::new_v4().simple());
         let _ = seed_agent(pool, &agent_id, "ci", "approved").await;
         let scoped = scoped_admin_session("GBLON");
-        let Err((status, _)) = admin_revoke_agent(Path(agent_id.clone()), Extension(scoped)).await
+        let Err((status, _)) = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(scoped),
+            Json(revoke_body(Uuid::nil(), String::new())),
+        )
+        .await
         else {
             panic!("scoped revoke_agent must 403");
         };

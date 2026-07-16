@@ -86,9 +86,15 @@ pub struct EventRow {
 /// event is global on BOTH axes (`site IS NULL AND environment IS NULL`). So an
 /// event is visible iff, on each axis, the principal is unrestricted OR the
 /// event's CONCRETE value is in scope — or the event is genuinely global on both
-/// axes (the deliberate observability baseline everyone sees). No concrete
-/// out-of-scope value leaks across either axis. `limit` bounds the page; the `id`
-/// tiebreaker keeps ordering stable within an `occurred_at`.
+/// axes (the deliberate observability baseline everyone sees).
+///
+/// `agent_job` events are the exception to the event row's stored axes. Their
+/// authoritative scope is the immutable `agent_jobs -> requests` relation, just
+/// like [`list_alerts`] and [`ack_alert`]. Generic listing must therefore join
+/// that relation, project its axes, and fail closed for malformed/orphaned jobs;
+/// treating legacy NULL/NULL job events as global would disclose request-bound
+/// operations across sites. `limit` bounds the page; the `id` tiebreaker keeps
+/// ordering stable within an `occurred_at`.
 pub async fn list(
     pool: &sqlx::PgPool,
     event_type: Option<&str>,
@@ -112,38 +118,58 @@ pub async fn list(
     let mut n = 0;
     if event_type.is_some() {
         n += 1;
-        preds.push(format!("event_type = ${n}"));
+        preds.push(format!("e.event_type = ${n}"));
     }
     if aggregate_id.is_some() {
         n += 1;
-        preds.push(format!("aggregate_id = ${n}"));
+        preds.push(format!("e.aggregate_id = ${n}"));
     }
     let site_pos = {
         n += 1;
         n
     };
     preds.push(format!(
-        "(cardinality(${site_pos}::text[]) = 0 OR site = ANY(${site_pos}) \
-         OR (site IS NULL AND environment IS NULL))"
+        "((e.aggregate_type = 'agent_job' \
+            AND r.id IS NOT NULL \
+            AND (cardinality(${site_pos}::text[]) = 0 OR r.site = ANY(${site_pos}))) \
+          OR \
+          (e.aggregate_type <> 'agent_job' \
+            AND (cardinality(${site_pos}::text[]) = 0 OR e.site = ANY(${site_pos}) \
+                 OR (e.site IS NULL AND e.environment IS NULL))))"
     ));
     let env_pos = {
         n += 1;
         n
     };
     preds.push(format!(
-        "(cardinality(${env_pos}::text[]) = 0 OR environment = ANY(${env_pos}) \
-         OR (environment IS NULL AND site IS NULL))"
+        "((e.aggregate_type = 'agent_job' \
+            AND r.id IS NOT NULL \
+            AND (cardinality(${env_pos}::text[]) = 0 OR r.environment = ANY(${env_pos}))) \
+          OR \
+          (e.aggregate_type <> 'agent_job' \
+            AND (cardinality(${env_pos}::text[]) = 0 OR e.environment = ANY(${env_pos}) \
+                 OR (e.environment IS NULL AND e.site IS NULL))))"
     ));
     let limit_pos = {
         n += 1;
         n
     };
     let sql = format!(
-        "SELECT id, event_type, aggregate_type, aggregate_id, site, environment, actor, \
-                payload, occurred_at \
-         FROM domain_events \
+        "SELECT e.id, e.event_type, e.aggregate_type, e.aggregate_id, \
+                CASE WHEN e.aggregate_type = 'agent_job' THEN r.site ELSE e.site END AS site, \
+                CASE WHEN e.aggregate_type = 'agent_job' THEN r.environment ELSE e.environment END AS environment, \
+                e.actor, e.payload, e.occurred_at \
+         FROM domain_events AS e \
+         LEFT JOIN agent_jobs AS j \
+           ON e.aggregate_type = 'agent_job' \
+          AND j.id = CASE \
+                WHEN pg_input_is_valid(e.aggregate_id, 'uuid') \
+                THEN e.aggregate_id::uuid \
+                ELSE NULL \
+              END \
+         LEFT JOIN requests AS r ON r.id = j.request_id \
          WHERE {} \
-         ORDER BY occurred_at DESC, id DESC \
+         ORDER BY e.occurred_at DESC, e.id DESC \
          LIMIT ${limit_pos}",
         preds.join(" AND ")
     );
@@ -175,6 +201,14 @@ pub async fn list(
 /// are NULL, so a site-only alert (a site-scoped SLO/budget breach) never leaks
 /// to an environment-scoped principal, and an env-only alert never leaks to a
 /// site-scoped one — matching the handlers that fail closed for each.
+///
+/// `agent_job` is the exception to the event row's stored axes: jobs are control
+/// plane objects, but each job is authoritatively bound to a request.  Their old
+/// event emitters stored NULL/NULL and put `request_id` only in caller-readable
+/// JSON.  Never trust that payload for authorization.  Join the immutable event
+/// aggregate id through `agent_jobs.request_id` to `requests`, fail closed for
+/// an orphan/malformed link, apply scope before LIMIT/projection, and project the
+/// authoritative request axes into the feed.
 pub async fn list_alerts(
     pool: &sqlx::PgPool,
     aggregate_id: Option<&str>,
@@ -188,38 +222,58 @@ pub async fn list_alerts(
     // dynamically — the old `($n::text IS NULL OR aggregate_id = $n)` shape had the
     // same generic-plan seq-scan risk as `list`. Column literals are compile-time;
     // all values are bound parameters.
-    let mut preds: Vec<String> = vec!["payload->>'to_status' = ANY($1)".to_string()];
+    let mut preds: Vec<String> = vec!["e.payload->>'to_status' = ANY($1)".to_string()];
     let mut n = 1;
     if aggregate_id.is_some() {
         n += 1;
-        preds.push(format!("aggregate_id = ${n}"));
+        preds.push(format!("e.aggregate_id = ${n}"));
     }
     let site_pos = {
         n += 1;
         n
     };
     preds.push(format!(
-        "(cardinality(${site_pos}::text[]) = 0 OR site = ANY(${site_pos}) \
-         OR (site IS NULL AND environment IS NULL))"
+        "((e.aggregate_type = 'agent_job' \
+            AND r.id IS NOT NULL \
+            AND (cardinality(${site_pos}::text[]) = 0 OR r.site = ANY(${site_pos}))) \
+          OR \
+          (e.aggregate_type <> 'agent_job' \
+            AND (cardinality(${site_pos}::text[]) = 0 OR e.site = ANY(${site_pos}) \
+                 OR (e.site IS NULL AND e.environment IS NULL))))"
     ));
     let env_pos = {
         n += 1;
         n
     };
     preds.push(format!(
-        "(cardinality(${env_pos}::text[]) = 0 OR environment = ANY(${env_pos}) \
-         OR (environment IS NULL AND site IS NULL))"
+        "((e.aggregate_type = 'agent_job' \
+            AND r.id IS NOT NULL \
+            AND (cardinality(${env_pos}::text[]) = 0 OR r.environment = ANY(${env_pos}))) \
+          OR \
+          (e.aggregate_type <> 'agent_job' \
+            AND (cardinality(${env_pos}::text[]) = 0 OR e.environment = ANY(${env_pos}) \
+                 OR (e.environment IS NULL AND e.site IS NULL))))"
     ));
     let limit_pos = {
         n += 1;
         n
     };
     let sql = format!(
-        "SELECT id, event_type, aggregate_type, aggregate_id, site, environment, actor, \
-                payload, occurred_at \
-         FROM domain_events \
+        "SELECT e.id, e.event_type, e.aggregate_type, e.aggregate_id, \
+                CASE WHEN e.aggregate_type = 'agent_job' THEN r.site ELSE e.site END AS site, \
+                CASE WHEN e.aggregate_type = 'agent_job' THEN r.environment ELSE e.environment END AS environment, \
+                e.actor, e.payload, e.occurred_at \
+         FROM domain_events AS e \
+         LEFT JOIN agent_jobs AS j \
+           ON e.aggregate_type = 'agent_job' \
+          AND j.id = CASE \
+                WHEN pg_input_is_valid(e.aggregate_id, 'uuid') \
+                THEN e.aggregate_id::uuid \
+                ELSE NULL \
+              END \
+         LEFT JOIN requests AS r ON r.id = j.request_id \
          WHERE {} \
-         ORDER BY occurred_at DESC, id DESC \
+         ORDER BY e.occurred_at DESC, e.id DESC \
          LIMIT ${limit_pos}",
         preds.join(" AND ")
     );
@@ -236,62 +290,73 @@ pub async fn list_alerts(
         .await
 }
 
-/// Acknowledge an alert event (#11 slice 2e): upsert the ack satellite keyed by
-/// the `domain_events` row id. Re-acking updates the actor / time / note in place.
-/// Returns `Ok(false)` when no such event exists (caller → 404) — distinguished
-/// from a genuine DB failure — by checking existence first; the FK would also
-/// reject a bad id, but a clean 404 reads better than a constraint error.
-/// Fetch a single event's (site, environment) scope tags for an authorization
-/// check (#2). Both are nullable (NULL = platform-wide on that axis). Returns
-/// `None` when the event id is unknown so the caller can 404 without a separate
-/// existence query.
-pub async fn event_scope(
-    pool: &sqlx::PgPool,
-    event_id: i64,
-) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
-    sqlx::query_as("SELECT site, environment FROM domain_events WHERE id = $1")
-        .bind(event_id)
-        .fetch_optional(pool)
-        .await
-}
-
+/// Acknowledge one alert only when the same SQL statement can prove it is both
+/// alert-worthy and in the principal's scope.  The INSERT .. SELECT predicate
+/// is the mutation boundary: a denied/missing/non-alert event returns `false`
+/// and cannot race between a separate authorization read and the UPSERT.
+///
+/// Request-linked `agent_job` alerts derive scope from the authoritative
+/// `agent_jobs -> requests` relation, never nullable event axes or payload JSON.
+/// Orphaned jobs/events are deliberately indistinguishable from missing rows.
+#[allow(clippy::too_many_arguments)]
 pub async fn ack_alert(
     pool: &sqlx::PgPool,
     event_id: i64,
     actor: &str,
     note: Option<&str>,
+    alert_aggregate_types: &[String],
     alert_statuses: &[String],
+    site_scopes: &[String],
+    env_scopes: &[String],
 ) -> Result<bool, sqlx::Error> {
-    // Only an ALERT-WORTHY event may be acked. A bare existence check let an operator
-    // ack ANY domain event (an 'intake'/'completed' normal-flow row), writing a dangling
-    // alert_acks row for something the alert feed never surfaces. Gate on the SAME
-    // alert_worthy set list_alerts uses (so ack and the feed cannot drift); a non-alert
-    // id returns false (caller -> 404), identical to a missing one.
-    let exists: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM domain_events \
-         WHERE id = $1 AND payload->>'to_status' = ANY($2)",
-    )
-    .bind(event_id)
-    .bind(alert_statuses)
-    .fetch_optional(pool)
-    .await?;
-    if exists.is_none() {
-        return Ok(false);
-    }
-    sqlx::query(
+    let acknowledged: Option<i64> = sqlx::query_scalar(
         "INSERT INTO alert_acks (event_id, acknowledged_by, acknowledged_at, note) \
-         VALUES ($1, $2, NOW(), $3) \
+         SELECT e.id, $4, NOW(), $5 \
+         FROM domain_events AS e \
+         LEFT JOIN agent_jobs AS j \
+           ON e.aggregate_type = 'agent_job' \
+          AND j.id = CASE \
+                WHEN pg_input_is_valid(e.aggregate_id, 'uuid') \
+                THEN e.aggregate_id::uuid \
+                ELSE NULL \
+              END \
+         LEFT JOIN requests AS r ON r.id = j.request_id \
+         WHERE e.id = $1 \
+           AND EXISTS ( \
+             SELECT 1 \
+             FROM unnest($2::text[], $3::text[]) \
+                  AS eligible(aggregate_type, to_status) \
+             WHERE eligible.aggregate_type = e.aggregate_type \
+               AND eligible.to_status = e.payload->>'to_status' \
+           ) \
+           AND ( \
+             (e.aggregate_type = 'agent_job' \
+               AND r.id IS NOT NULL \
+               AND (cardinality($6::text[]) = 0 OR r.site = ANY($6)) \
+               AND (cardinality($7::text[]) = 0 OR r.environment = ANY($7))) \
+             OR \
+             (e.aggregate_type <> 'agent_job' \
+               AND (cardinality($6::text[]) = 0 OR e.site = ANY($6) \
+                    OR (e.site IS NULL AND e.environment IS NULL)) \
+               AND (cardinality($7::text[]) = 0 OR e.environment = ANY($7) \
+                    OR (e.environment IS NULL AND e.site IS NULL))) \
+           ) \
          ON CONFLICT (event_id) DO UPDATE SET \
            acknowledged_by = EXCLUDED.acknowledged_by, \
            acknowledged_at = NOW(), \
-           note = EXCLUDED.note",
+           note = EXCLUDED.note \
+         RETURNING event_id",
     )
     .bind(event_id)
+    .bind(alert_aggregate_types)
+    .bind(alert_statuses)
     .bind(actor)
     .bind(note)
-    .execute(pool)
+    .bind(site_scopes)
+    .bind(env_scopes)
+    .fetch_optional(pool)
     .await?;
-    Ok(true)
+    Ok(acknowledged.is_some())
 }
 
 /// One acknowledgement, as joined onto an alert in the feed.

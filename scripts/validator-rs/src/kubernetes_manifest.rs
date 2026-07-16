@@ -8,7 +8,48 @@ const NAMESPACE: &str = "ryuki-platform";
 const PART_OF: &str = "ryuki-infrastructure-platform";
 const APPROVED_HOST: &str = "platform.example.invalid";
 const TLS_SECRET_PLACEHOLDER: &str = "platform-tls-placeholder";
+const DEDICATED_INGRESS_CLASS: &str = "ryuki-platform";
+const DEDICATED_INGRESS_INSTANCE: &str = "ryuki-platform";
 const EXPECTED_COMPONENTS: &[&str] = &["portal-ui", "platform-api"];
+const MIGRATION_JOB: &str = "platform-api-migrations";
+const MIGRATION_JOB_TEMPLATE_PATH: &str = "deploy/kubernetes/operations/migration-job.yaml";
+const MIGRATION_CUTOVER_CONTRACT_PATH: &str =
+    "deploy/kubernetes/operations/migration-cutover-contract.yaml";
+const MIGRATION_CREDENTIAL_TEMPLATE_PATH: &str =
+    "deploy/kubernetes/operations/migration-vault-dynamic-secret.yaml";
+const MIGRATION_SERVICE_ACCOUNT: &str = "platform-api-migrator";
+const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
+const CNPG_CA_VOLUME_NAME: &str = "cnpg-ca";
+const CNPG_CA_SECRET_KEY: &str = "ca.crt";
+const CNPG_CA_MOUNT_PATH: &str = "/var/run/secrets/ryuki/cnpg";
+const CNPG_CA_FILE_PATH: &str = "/var/run/secrets/ryuki/cnpg/ca.crt";
+const EXPECTED_CUTOVER_WORKLOAD_KINDS: &[&str] =
+    &["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"];
+const EXPECTED_BASE_WRITER_SELECTORS: &[&str] = &[
+    "app.kubernetes.io/part-of=ryuki-infrastructure-platform,app.kubernetes.io/name=platform-api",
+];
+const EXPECTED_DATABASE_SESSION_FIELDS: &[&str] = &[
+    "pid",
+    "usename",
+    "application_name",
+    "backend_start",
+    "xact_start",
+    "state",
+];
+const EXPECTED_CONFIG_MAPS: &[&str] = &[
+    "platform-api-config",
+    "platform-api-migration-config",
+    "portal-ui-config",
+];
+const EXPECTED_SERVICE_ACCOUNTS: &[&str] = &[
+    "portal-ui",
+    "platform-api",
+    "platform-api-migrator",
+    "vault-db-owner",
+    "vault-db-backup",
+    "vault-api-db",
+    "vault-api-db-migrator",
+];
 const EXPOSED_SERVICES: &[&str] = &["portal-ui", "platform-api"];
 const WORKER_COMPONENTS: &[&str] = &[];
 const INTERNAL_HTTP_SERVICES: &[&str] = &[];
@@ -17,24 +58,29 @@ const ALLOWED_KINDS: &[&str] = &[
     "Namespace",
     "ServiceAccount",
     "Deployment",
+    "Job",
     "Service",
     "Ingress",
     "NetworkPolicy",
+    "ConfigMap",
 ];
-// The default-deny pair plus the app-tier allow rules, extended with the four
-// database-tier policies the CloudNativePG integration adds to the skeleton
+// The default-deny pair plus the app-tier allow rules, extended with the
+// database-tier policies for the API, one-shot migrator, and CloudNativePG
 // (deploy/kubernetes/base/networkpolicies.yaml). These DB policies keep the
 // default-deny posture intact while scoping Postgres traffic to the platform
-// API and the CNPG operator, so they belong in the validated skeleton.
+// API, one-shot migrator, and CNPG operator, so they belong in the validated
+// skeleton.
 const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     "default-deny-ingress",
     "default-deny-egress",
     "allow-ingress-to-portal-ui",
     "allow-ingress-to-platform-api",
-    "allow-portal-ui-egress-to-platform-api",
+    "allow-portal-ui-egress-to-dedicated-ingress-https",
     "allow-egress-to-kube-dns",
     "allow-platform-api-egress-to-db",
     "allow-ingress-to-db-from-platform-api",
+    "allow-platform-api-migrations-egress-to-db",
+    "allow-ingress-to-db-from-platform-api-migrations",
     "allow-db-intra-cluster",
     "allow-ingress-to-db-from-cnpg-operator",
     // Observability scrape access: lets a `monitoring` namespace reach the
@@ -46,10 +92,18 @@ const APPROVED_KEYS: &[&str] = &[
     "kind",
     "metadata",
     "name",
+    "generateName",
     "namespace",
     "labels",
+    "annotations",
     "app.kubernetes.io/part-of",
     "app.kubernetes.io/name",
+    "app.kubernetes.io/instance",
+    "app.kubernetes.io/component",
+    "ryuki.io/secret-family",
+    "ryuki.io/cutover-contract",
+    "ryuki.io/release-image",
+    "ryuki.io/release-digest-prefix",
     "spec",
     "replicas",
     "selector",
@@ -57,6 +111,19 @@ const APPROVED_KEYS: &[&str] = &[
     "template",
     "serviceAccountName",
     "containers",
+    "volumes",
+    "volumeMounts",
+    "mountPath",
+    "readOnly",
+    "secret",
+    "secretName",
+    "items",
+    "envFrom",
+    "configMapRef",
+    "secretRef",
+    "env",
+    "valueFrom",
+    "secretKeyRef",
     "image",
     "imagePullPolicy",
     "ports",
@@ -107,6 +174,7 @@ const APPROVED_KEYS: &[&str] = &[
     "k8s-app",
     "kubernetes.io/metadata.name",
     "automountServiceAccountToken",
+    "data",
     "__file",
     "__document",
 ];
@@ -117,6 +185,29 @@ const APPROVED_SCHEMA_VALUES: &[&str] = &[
     "IfNotPresent",
     "RuntimeDefault",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrationIdentity {
+    digest_prefix: String,
+    job_generate_name: String,
+    secret_name: String,
+    vault_auth_role: String,
+    vault_database_role: String,
+}
+
+impl MigrationIdentity {
+    fn from_image(image: &str) -> Option<Self> {
+        let digest = immutable_image_digest(image)?;
+        let digest_prefix = digest.get(..12)?.to_string();
+        Some(Self {
+            job_generate_name: format!("platform-api-migrations-{digest_prefix}-"),
+            secret_name: format!("ryuki-platform-api-migrator-db-{digest_prefix}"),
+            vault_auth_role: format!("ryuki-api-db-migrator-{digest_prefix}"),
+            vault_database_role: format!("ryuki-schema-migrator-{digest_prefix}"),
+            digest_prefix,
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SourceText {
@@ -129,6 +220,8 @@ struct Context {
     manifests: Vec<Value>,
     #[serde(default, rename = "sourceTexts")]
     source_texts: Vec<SourceText>,
+    #[serde(default, rename = "cutoverContract")]
+    cutover_contract: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +243,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
     let context: Context = serde_json::from_str(&payload)
         .map_err(|error| format!("invalid kubernetes manifest context JSON: {error}"))?;
     let mut errors = validate_documents(&context.manifests);
+    validate_cutover_contract(&context.cutover_contract, &context.manifests, &mut errors);
     validate_source_texts(&context.source_texts, &mut errors);
     Ok(errors)
 }
@@ -184,7 +278,9 @@ fn validate_documents(manifests: &[Value]) -> Vec<String> {
     validate_unique_resources(manifests, &mut errors);
     validate_namespace(manifests, &mut errors);
     validate_standard_metadata(manifests, &mut errors);
+    validate_config_maps(manifests, &mut errors);
     validate_components(manifests, &mut errors);
+    validate_migration_job(manifests, &mut errors);
     validate_services(manifests, &mut errors);
     validate_ingress(manifests, &mut errors);
     validate_network_policies(manifests, &mut errors);
@@ -226,7 +322,9 @@ fn validate_unique_resources(manifests: &[Value], errors: &mut Vec<String>) {
         let Some(kind) = str_at(manifest, &["kind"]) else {
             continue;
         };
-        let Some(name) = str_at(manifest, &["metadata", "name"]) else {
+        let Some(name) = str_at(manifest, &["metadata", "name"])
+            .or_else(|| str_at(manifest, &["metadata", "generateName"]))
+        else {
             continue;
         };
         let namespace = if kind == "Namespace" {
@@ -273,10 +371,17 @@ fn validate_namespace(manifests: &[Value], errors: &mut Vec<String>) {
 fn validate_standard_metadata(manifests: &[Value], errors: &mut Vec<String>) {
     for manifest in manifests {
         let name = str_at(manifest, &["metadata", "name"]);
+        let generated_job = str_at(manifest, &["kind"]) == Some("Job")
+            && name.is_none()
+            && str_at(manifest, &["metadata", "generateName"])
+                .is_some_and(|value| !value.trim().is_empty());
         expect(
-            name.is_some_and(|name| !name.trim().is_empty()),
+            name.is_some_and(|name| !name.trim().is_empty()) || generated_job,
             errors,
-            format!("{} metadata.name is required", manifest_path(manifest)),
+            format!(
+                "{} metadata.name is required except for the operations-only generated Job",
+                manifest_path(manifest)
+            ),
         );
         expect(
             str_at(
@@ -296,6 +401,84 @@ fn validate_standard_metadata(manifests: &[Value], errors: &mut Vec<String>) {
     }
 }
 
+fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
+    let names = names_for(manifests, "ConfigMap");
+    push_diff_error(EXPECTED_CONFIG_MAPS, &names, errors, "missing ConfigMaps");
+    push_unexpected_error(
+        &names,
+        EXPECTED_CONFIG_MAPS,
+        errors,
+        "unexpected ConfigMaps",
+    );
+
+    let find = |name: &str| {
+        manifests
+            .iter()
+            .find(|manifest| {
+                str_at(manifest, &["kind"]) == Some("ConfigMap")
+                    && str_at(manifest, &["metadata", "name"]) == Some(name)
+            })
+            .unwrap_or(&Value::Null)
+    };
+    let api = find("platform-api-config");
+    expect(
+        str_at(api, &["data", "RYUKI_DATABASE__REQUIRED"]) == Some("true")
+            && str_at(api, &["data", "RYUKI_MIGRATION_MODE"]) == Some("verify-only")
+            && str_at(api, &["data", "RYUKI_DATABASE_EXPECTED_ROLE"]) == Some("ryuki_app_runtime")
+            && str_at(api, &["data", "RYUKI_DATABASE_FORBIDDEN_ROLE"])
+                == Some("ryuki_schema_migrator"),
+        errors,
+        "platform-api-config must require the database, use verify-only ryuki_app_runtime, and forbid migrator membership",
+    );
+
+    let migration = find("platform-api-migration-config");
+    let migration_data = object_at(migration, &["data"]);
+    expect(
+        migration_data.is_some_and(|data| data.len() == 5)
+            && str_at(migration, &["data", "RYUKI_MIGRATION_MODE"]) == Some("apply-only")
+            && str_at(
+                migration,
+                &["data", "RYUKI_MIGRATION_STATEMENT_TIMEOUT_SECS"],
+            ) == Some("1800")
+            && str_at(migration, &["data", "RYUKI_MIGRATION_LOCK_TIMEOUT_SECS"]) == Some("60")
+            && str_at(migration, &["data", "RYUKI_MIGRATION_EXPECTED_ROLE"])
+                == Some("ryuki_schema_migrator")
+            && str_at(migration, &["data", "RYUKI_APPLICATION_DATABASE_ROLE"])
+                == Some("ryuki_app_runtime"),
+        errors,
+        "platform-api-migration-config must contain only apply-only mode, 1800/60 timeouts, and exact migrator/application roles",
+    );
+
+    let portal = find("portal-ui-config");
+    let expected_origin = format!("https://{APPROVED_HOST}");
+    expect(
+        str_at(portal, &["data", "RYUKI_API_URL"]) == Some(expected_origin.as_str())
+            && str_at(portal, &["data", "RYUKI_PORTAL_PUBLIC_ORIGIN"])
+                == Some(expected_origin.as_str())
+            && str_at(portal, &["data", "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK"]) == Some("false"),
+        errors,
+        "portal-ui-config must use the exact HTTPS ingress origin with insecure-loopback disabled",
+    );
+
+    for config_map in manifests
+        .iter()
+        .filter(|manifest| str_at(manifest, &["kind"]) == Some("ConfigMap"))
+    {
+        let data = object_at(config_map, &["data"]);
+        expect(
+            data.is_some_and(|entries| {
+                !entries.contains_key("RYUKI_DATABASE_URL")
+                    && !entries.contains_key("RYUKI_MIGRATION_DATABASE_URL")
+            }),
+            errors,
+            format!(
+                "ConfigMap {} must not carry a database connection URL",
+                str_at(config_map, &["metadata", "name"]).unwrap_or("")
+            ),
+        );
+    }
+}
+
 fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
     let service_accounts = names_for(manifests, "ServiceAccount");
     let deployments: Vec<&Value> = manifests
@@ -308,7 +491,7 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
         .collect();
 
     push_diff_error(
-        EXPECTED_COMPONENTS,
+        EXPECTED_SERVICE_ACCOUNTS,
         &service_accounts,
         errors,
         "missing ServiceAccounts",
@@ -321,7 +504,7 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
     );
     push_unexpected_error(
         &service_accounts,
-        EXPECTED_COMPONENTS,
+        EXPECTED_SERVICE_ACCOUNTS,
         errors,
         "unexpected ServiceAccounts",
     );
@@ -411,62 +594,701 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
             errors,
             format!("Deployment {name} container name must match component"),
         );
-        expect(
-            str_at(container, &["image"]) == Some(format!("ryuki/{name}:rust-dev").as_str()),
-            errors,
-            format!("Deployment {name} image must be placeholder ryuki/{name}:rust-dev"),
-        );
-        // relaxed: the real skeleton injects non-secret configuration via
-        // `envFrom: [{ configMapRef: … }]` (deploy/kubernetes/base/deployments.yaml
-        // + configmap.yaml). Inline `env` literals and any Secret reference
-        // (secretRef / secretKeyRef) remain prohibited — those are the genuine
-        // secret-leak concern, also covered by `validate_no_secret_values` — but
-        // a ConfigMap-only `envFrom` is safe config injection and is allowed.
+        validate_container_image(name, container, errors);
+        // Non-secret configuration is imported from one exact ConfigMap. The
+        // API's only explicit env entry is one reviewed Secret key reference;
+        // whole-Secret envFrom imports are forbidden so new Secret fields can
+        // never override policy configuration.
         for (index, item) in containers.iter().enumerate() {
             validate_container_env(name, index, item, errors);
+        }
+        if name == "platform-api" {
+            let pod_spec =
+                value_at(deployment, &["spec", "template", "spec"]).unwrap_or(&Value::Null);
+            validate_cnpg_ca_mount("Deployment platform-api", pod_spec, container, errors);
         }
         validate_target_hardening(name, deployment, errors);
     }
 }
 
-/// Permits ConfigMap-only `envFrom` config injection while forbidding inline
-/// `env` literals and any Secret reference, the genuine secret-leak concern.
+fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
+    let jobs: Vec<&Value> = manifests
+        .iter()
+        .filter(|manifest| str_at(manifest, &["kind"]) == Some("Job"))
+        .collect();
+    expect(
+        jobs.len() == 1,
+        errors,
+        "exactly one operations-only platform-api migration Job template is required",
+    );
+    let job = jobs.first().copied().unwrap_or(&Value::Null);
+    let api_image = platform_api_image(manifests);
+    let migration_identity = api_image.and_then(MigrationIdentity::from_image);
+
+    expect(
+        str_at(job, &["apiVersion"]) == Some("batch/v1")
+            && value_at(job, &["metadata", "name"]).is_none()
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(job, &["metadata", "generateName"])
+                    == Some(identity.job_generate_name.as_str())
+            }),
+        errors,
+        "migration Job must be batch/v1 with a generateName derived from the admitted image digest and no fixed name",
+    );
+    expect(
+        int_at(job, &["spec", "completions"]) == Some(1)
+            && int_at(job, &["spec", "parallelism"]) == Some(1)
+            && int_at(job, &["spec", "backoffLimit"]) == Some(0),
+        errors,
+        "migration Job must run exactly once with completions/parallelism 1 and backoffLimit 0",
+    );
+    expect(
+        object_at(job, &["spec"]).is_some_and(|spec| {
+            object_has_exact_keys(
+                spec,
+                &[
+                    "completions",
+                    "parallelism",
+                    "backoffLimit",
+                    "activeDeadlineSeconds",
+                    "template",
+                ],
+            )
+        }),
+        errors,
+        "migration Job spec must contain only the reviewed one-shot fields; podFailurePolicy and all retry/replacement policy extensions are forbidden",
+    );
+    expect(
+        int_at(job, &["spec", "activeDeadlineSeconds"]) == Some(2400)
+            && value_at(job, &["spec", "ttlSecondsAfterFinished"]).is_none(),
+        errors,
+        "migration Job must use the reviewed 2400-second deadline and forbid automatic TTL deletion/recreation",
+    );
+
+    let pod_template = value_at(job, &["spec", "template"]).unwrap_or(&Value::Null);
+    expect(
+        str_at(
+            pod_template,
+            &["metadata", "labels", "app.kubernetes.io/name"],
+        ) == Some(MIGRATION_JOB)
+            && str_at(
+                pod_template,
+                &["metadata", "labels", "app.kubernetes.io/component"],
+            ) == Some("database-migration-runner"),
+        errors,
+        "migration Job pod labels must identify the database-migration-runner",
+    );
+    let pod_spec = value_at(pod_template, &["spec"]).unwrap_or(&Value::Null);
+    expect(
+        str_at(pod_spec, &["serviceAccountName"]) == Some(MIGRATION_SERVICE_ACCOUNT),
+        errors,
+        format!("migration Job must use ServiceAccount {MIGRATION_SERVICE_ACCOUNT}"),
+    );
+    expect(
+        bool_at(pod_spec, &["automountServiceAccountToken"]) == Some(false),
+        errors,
+        "migration Job must disable ServiceAccount token automount on the pod",
+    );
+    expect(
+        bool_at(pod_spec, &["enableServiceLinks"]) == Some(false),
+        errors,
+        "migration Job must disable injected Service environment variables",
+    );
+    expect(
+        str_at(pod_spec, &["restartPolicy"]) == Some("Never")
+            && int_at(pod_spec, &["terminationGracePeriodSeconds"]) == Some(30),
+        errors,
+        "migration Job must use restartPolicy Never and a 30-second termination grace period",
+    );
+    expect(
+        bool_at(pod_spec, &["hostNetwork"]) != Some(true)
+            && !contains_key(pod_spec, "hostPath")
+            && object(pod_spec).is_none_or(|pod| {
+                !pod.contains_key("initContainers") && !pod.contains_key("ephemeralContainers")
+            }),
+        errors,
+        "migration Job must not use host networking, host paths, init containers, or ephemeral containers",
+    );
+    let pod_security = value_at(pod_spec, &["securityContext"]).unwrap_or(&Value::Null);
+    expect(
+        bool_at(pod_security, &["runAsNonRoot"]) == Some(true)
+            && int_at(pod_security, &["runAsUser"]) == Some(10001)
+            && int_at(pod_security, &["runAsGroup"]) == Some(10001)
+            && str_at(pod_security, &["seccompProfile", "type"]) == Some("RuntimeDefault"),
+        errors,
+        "migration Job pod must use the reviewed non-root identity and RuntimeDefault seccomp",
+    );
+
+    let containers = array_at(pod_spec, &["containers"]);
+    expect(
+        containers.len() == 1,
+        errors,
+        "migration Job must have exactly one container",
+    );
+    let container = containers.first().copied().unwrap_or(&Value::Null);
+    expect(
+        str_at(container, &["name"]) == Some(MIGRATION_JOB),
+        errors,
+        format!("migration Job container must be named {MIGRATION_JOB}"),
+    );
+
+    let job_image = str_at(container, &["image"]);
+    expect(
+        job_image.is_some_and(is_qualified_immutable_image) && job_image == api_image,
+        errors,
+        "migration Job image must be the exact digest-only platform-api Deployment image",
+    );
+    expect(
+        str_at(
+            job,
+            &["metadata", "annotations", "ryuki.io/cutover-contract"],
+        ) == Some("migration-cutover-v1")
+            && str_at(job, &["metadata", "annotations", "ryuki.io/release-image"]) == job_image
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(
+                    job,
+                    &["metadata", "labels", "ryuki.io/release-digest-prefix"],
+                ) == Some(identity.digest_prefix.as_str())
+                    && str_at(
+                        pod_template,
+                        &["metadata", "labels", "ryuki.io/release-digest-prefix"],
+                    ) == Some(identity.digest_prefix.as_str())
+            }),
+        errors,
+        "migration Job metadata, pod label, and image must bind the exact cutover contract and derived digest prefix",
+    );
+    expect(
+        str_at(container, &["imagePullPolicy"]) == Some("IfNotPresent"),
+        errors,
+        "migration Job must set imagePullPolicy to IfNotPresent",
+    );
+
+    for prohibited in [
+        "command",
+        "args",
+        "ports",
+        "readinessProbe",
+        "livenessProbe",
+        "startupProbe",
+        "lifecycle",
+    ] {
+        expect(
+            value_at(container, &[prohibited]).is_none(),
+            errors,
+            format!("migration Job container must not define {prohibited}"),
+        );
+    }
+
+    let env_from = array_at_path(container, &["envFrom"]);
+    let exact_config_ref = env_from.iter().any(|entry| {
+        object(entry).is_some_and(|map| map.len() == 1)
+            && object_at(entry, &["configMapRef"]).is_some_and(|reference| {
+                reference.len() == 1
+                    && str_at(entry, &["configMapRef", "name"])
+                        == Some("platform-api-migration-config")
+            })
+    });
+    expect(
+        env_from.len() == 1
+            && exact_config_ref
+            && env_from
+                .iter()
+                .all(|entry| value_at(entry, &["secretRef"]).is_none()),
+        errors,
+        "migration Job envFrom must contain only platform-api-migration-config and no whole-Secret import",
+    );
+    let env = array_at_path(container, &["env"]);
+    let migration_url = env.first().copied().unwrap_or(&Value::Null);
+    expect(
+        env.len() == 1
+            && object(migration_url).is_some_and(|entry| entry.len() == 2)
+            && str_at(migration_url, &["name"]) == Some("RYUKI_MIGRATION_DATABASE_URL")
+            && object_at(migration_url, &["valueFrom"])
+                .is_some_and(|value_from| value_from.len() == 1)
+            && object_at(migration_url, &["valueFrom", "secretKeyRef"])
+                .is_some_and(|reference| reference.len() == 2)
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(migration_url, &["valueFrom", "secretKeyRef", "name"])
+                    == Some(identity.secret_name.as_str())
+            })
+            && str_at(migration_url, &["valueFrom", "secretKeyRef", "key"])
+                == Some("RYUKI_MIGRATION_DATABASE_URL")
+            && value_at(migration_url, &["value"]).is_none(),
+        errors,
+        "migration Job must import only the digest-scoped migrator URL key through secretKeyRef",
+    );
+
+    validate_cnpg_ca_mount("migration Job", pod_spec, container, errors);
+    validate_migration_job_resources(container, errors);
+    validate_migration_job_security(container, errors);
+}
+
+fn validate_cutover_contract(contract: &Value, manifests: &[Value], errors: &mut Vec<String>) {
+    let api_image = platform_api_image(manifests);
+    let migration_identity = api_image.and_then(MigrationIdentity::from_image);
+    expect(
+        str_at(contract, &["contractVersion"]) == Some("migration-cutover-v1")
+            && str_at(contract, &["release", "namespace"]) == Some(NAMESPACE)
+            && str_at(contract, &["release", "apiDeployment"]) == Some("platform-api")
+            && str_at(contract, &["release", "migrationJobTemplate"])
+                == Some(MIGRATION_JOB_TEMPLATE_PATH)
+            && str_at(contract, &["release", "migrationCredentialTemplate"])
+                == Some(MIGRATION_CREDENTIAL_TEMPLATE_PATH)
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(contract, &["release", "digestPrefix"])
+                    == Some(identity.digest_prefix.as_str())
+            })
+            && str_at(contract, &["release", "apiMigrationMode"]) == Some("verify-only")
+            && str_at(contract, &["release", "jobMigrationMode"]) == Some("apply-only"),
+        errors,
+        format!(
+            "{MIGRATION_CUTOVER_CONTRACT_PATH} must bind the exact namespace, operation template, digest, and startup modes"
+        ),
+    );
+
+    let job = manifests
+        .iter()
+        .find(|manifest| str_at(manifest, &["kind"]) == Some("Job"))
+        .unwrap_or(&Value::Null);
+    let job_image = array_at_path(job, &["spec", "template", "spec", "containers"])
+        .first()
+        .copied()
+        .and_then(|container| str_at(container, &["image"]));
+    expect(
+        str_at(contract, &["release", "image"]) == api_image
+            && api_image == job_image
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(contract, &["execution", "generatedNamePrefix"])
+                    == Some(identity.job_generate_name.as_str())
+                    && str_at(job, &["metadata", "generateName"])
+                        == Some(identity.job_generate_name.as_str())
+            }),
+        errors,
+        "cutover contract, generated Job, and verify-only API must use one exact image and digest-scoped name",
+    );
+
+    expect(
+        string_array_matches_exact(
+            contract,
+            &["drain", "requiredWorkloadKinds"],
+            EXPECTED_CUTOVER_WORKLOAD_KINDS,
+        ) && string_array_matches_exact(
+            contract,
+            &["drain", "requiredBaseWriterSelectors"],
+            EXPECTED_BASE_WRITER_SELECTORS,
+        ) && string_array_matches_exact(
+            contract,
+            &["drain", "databaseSessionReadback", "fields"],
+            EXPECTED_DATABASE_SESSION_FIELDS,
+        ),
+        errors,
+        "cutover contract must retain the exact nonempty writer-kind, base-writer-selector, and database-session evidence inventories",
+    );
+
+    expect(
+        bool_at(contract, &["drain", "withdrawIngressTraffic"]) == Some(true)
+            && bool_at(contract, &["drain", "externalWriterInventoryRequired"]) == Some(true)
+            && bool_at(contract, &["drain", "requireZeroWriterPods"]) == Some(true)
+            && bool_at(contract, &["drain", "requireZeroLeasedOrRunningJobs"]) == Some(true)
+            && bool_at(
+                contract,
+                &[
+                    "drain",
+                    "databaseSessionReadback",
+                    "independentOperatorIdentityRequired",
+                ],
+            ) == Some(true)
+            && bool_at(
+                contract,
+                &[
+                    "drain",
+                    "databaseSessionReadback",
+                    "requireZeroNonOperatorSessions",
+                ],
+            ) == Some(true),
+        errors,
+        "cutover contract must withdraw traffic and prove every writer, lease, job, and non-operator database session drained",
+    );
+
+    expect(
+        str_at(contract, &["credentials", "api", "secretName"]) == Some("ryuki-platform-api-db")
+            && str_at(contract, &["credentials", "api", "secretKey"]) == Some("RYUKI_DATABASE_URL")
+            && str_at(contract, &["credentials", "api", "expectedRole"])
+                == Some("ryuki_app_runtime")
+            && str_at(contract, &["credentials", "api", "delivery"]) == Some("VaultDynamicSecret")
+            && migration_identity.as_ref().is_some_and(|identity| {
+                str_at(contract, &["credentials", "migration", "secretName"])
+                    == Some(identity.secret_name.as_str())
+                    && str_at(
+                        contract,
+                        &["credentials", "migration", "vaultDynamicSecretName"],
+                    ) == Some(identity.secret_name.as_str())
+                    && str_at(contract, &["credentials", "migration", "vaultAuthRole"])
+                        == Some(identity.vault_auth_role.as_str())
+                    && str_at(contract, &["credentials", "migration", "vaultDatabaseRole"])
+                        == Some(identity.vault_database_role.as_str())
+            })
+            && str_at(contract, &["credentials", "migration", "secretKey"])
+                == Some("RYUKI_MIGRATION_DATABASE_URL")
+            && str_at(contract, &["credentials", "migration", "expectedRole"])
+                == Some("ryuki_schema_migrator")
+            && str_at(contract, &["credentials", "migration", "delivery"])
+                == Some("VaultDynamicSecret")
+            && bool_at(contract, &["credentials", "migration", "createAfterDrain"]) == Some(true)
+            && bool_at(
+                contract,
+                &["credentials", "migration", "revokeAndDeleteAfterReadback"],
+            ) == Some(true),
+        errors,
+        "cutover contract must use exact dynamic API/migrator Secret keys and revoke the digest-scoped migration lease after readback",
+    );
+
+    expect(
+        int_at(contract, &["execution", "completions"]) == Some(1)
+            && int_at(contract, &["execution", "parallelism"]) == Some(1)
+            && int_at(contract, &["execution", "backoffLimit"]) == Some(0)
+            && int_at(contract, &["execution", "activeDeadlineSeconds"]) == Some(2400)
+            && str_at(contract, &["execution", "createSemantics"]) == Some("create-once")
+            && bool_at(contract, &["execution", "automaticTtlForbidden"]) == Some(true),
+        errors,
+        "cutover contract must create one non-retrying, non-TTL Job with the reviewed deadline",
+    );
+
+    let expected_sequence: Vec<String> = [
+        "freeze-render-and-digest",
+        "withdraw-traffic",
+        "stop-and-drain-all-writers",
+        "readback-zero-database-sessions",
+        "create-jit-migration-credential",
+        "create-generated-job-once",
+        "wait-for-single-completion",
+        "readback-role-and-migration-ledger",
+        "revoke-jit-migration-credential",
+        "start-matching-verify-only-api",
+        "require-readiness",
+        "enable-matching-workers",
+        "restore-traffic",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    expect(
+        string_array_at(contract, &["sequence"]) == expected_sequence,
+        errors,
+        "cutover contract sequence must drain, run/read back once, revoke migration credentials, and only then start the matching verify-only API/workers",
+    );
+
+    expect(
+        bool_at(contract, &["readback", "requireJobComplete"]) == Some(true)
+            && bool_at(contract, &["readback", "requireSingleSuccessfulPod"]) == Some(true)
+            && bool_at(contract, &["readback", "requireNoRetryPods"]) == Some(true)
+            && bool_at(contract, &["readback", "requireEmbeddedInventoryMatch"]) == Some(true)
+            && bool_at(contract, &["readback", "requireNoDirtyMigration"]) == Some(true)
+            && bool_at(contract, &["readback", "requireDatabaseRoleEvidence"]) == Some(true)
+            && bool_at(contract, &["restart", "requireMatchingApiImage"]) == Some(true)
+            && bool_at(contract, &["restart", "requireVerifyOnlyStartup"]) == Some(true)
+            && bool_at(contract, &["restart", "requireReadyBeforeTraffic"]) == Some(true)
+            && bool_at(contract, &["failure", "keepTrafficAndWritersStopped"]) == Some(true)
+            && bool_at(contract, &["failure", "automaticRetryForbidden"]) == Some(true)
+            && bool_at(
+                contract,
+                &["failure", "olderBinaryAgainstNewSchemaForbidden"],
+            ) == Some(true),
+        errors,
+        "cutover readback/restart/failure gates must fail closed before traffic returns",
+    );
+}
+
+fn validate_migration_job_resources(container: &Value, errors: &mut Vec<String>) {
+    for (class, resource) in [
+        ("requests", "cpu"),
+        ("requests", "memory"),
+        ("limits", "cpu"),
+        ("limits", "memory"),
+    ] {
+        expect(
+            str_at(container, &["resources", class, resource]).is_some(),
+            errors,
+            format!("migration Job must declare resources.{class}.{resource}"),
+        );
+    }
+}
+
+fn validate_migration_job_security(container: &Value, errors: &mut Vec<String>) {
+    let security = value_at(container, &["securityContext"]).unwrap_or(&Value::Null);
+    expect(
+        bool_at(security, &["runAsNonRoot"]) == Some(true)
+            && int_at(security, &["runAsUser"]) == Some(10001)
+            && int_at(security, &["runAsGroup"]) == Some(10001),
+        errors,
+        "migration Job must run as non-root user/group 10001",
+    );
+    expect(
+        bool_at(security, &["allowPrivilegeEscalation"]) == Some(false)
+            && bool_at(security, &["privileged"]) != Some(true)
+            && bool_at(security, &["readOnlyRootFilesystem"]) == Some(true),
+        errors,
+        "migration Job must disable privilege escalation and use a read-only root filesystem",
+    );
+    let capabilities = value_at(security, &["capabilities"]);
+    expect(
+        capabilities.is_some_and(|value| {
+            array_at_path(value, &["drop"])
+                .iter()
+                .any(|entry| entry.as_str() == Some("ALL"))
+                && value_at(value, &["add"]).is_none()
+        }),
+        errors,
+        "migration Job must drop ALL capabilities and add none",
+    );
+    expect(
+        str_at(security, &["seccompProfile", "type"]) == Some("RuntimeDefault"),
+        errors,
+        "migration Job must use RuntimeDefault seccomp",
+    );
+}
+
+fn platform_api_image(manifests: &[Value]) -> Option<&str> {
+    manifests
+        .iter()
+        .find(|manifest| {
+            str_at(manifest, &["kind"]) == Some("Deployment")
+                && str_at(manifest, &["metadata", "name"]) == Some("platform-api")
+        })
+        .and_then(|deployment| {
+            array_at_path(deployment, &["spec", "template", "spec", "containers"])
+                .first()
+                .copied()
+                .and_then(|container| str_at(container, &["image"]))
+        })
+}
+
+fn object_has_exact_keys(map: &Map<String, Value>, expected: &[&str]) -> bool {
+    map.len() == expected.len() && expected.iter().all(|key| map.contains_key(*key))
+}
+
+fn string_array_matches_exact(value: &Value, path: &[&str], expected: &[&str]) -> bool {
+    let actual = string_array_at(value, path);
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
+}
+
+/// Kubernetes and rendered-overlay images must be digest-only and name an
+/// explicit registry. Local Compose development tags are intentionally a
+/// separate surface and cannot satisfy this contract.
+fn validate_container_image(name: &str, container: &Value, errors: &mut Vec<String>) {
+    let image = str_at(container, &["image"]);
+    expect(
+        image.is_some_and(is_qualified_immutable_image),
+        errors,
+        format!(
+            "Deployment {name} image must be a qualified registry/repository@sha256:<64 lowercase hex> reference"
+        ),
+    );
+}
+
+fn is_qualified_immutable_image(image: &str) -> bool {
+    if image.is_empty() || image.trim() != image || image.contains("://") {
+        return false;
+    }
+
+    let mut reference_parts = image.split('@');
+    let Some(name) = reference_parts.next() else {
+        return false;
+    };
+    let Some(digest) = reference_parts.next() else {
+        return false;
+    };
+    if reference_parts.next().is_some() {
+        return false;
+    }
+
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+
+    let Some((registry, repository)) = name.split_once('/') else {
+        return false;
+    };
+    if repository.is_empty() || repository.contains(':') {
+        // A tag is unnecessary beside a digest and makes overlay rewrites more
+        // error-prone; the admitted form is deliberately digest-only.
+        return false;
+    }
+
+    let host = if let Some((host, port)) = registry.rsplit_once(':') {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+        {
+            return false;
+        }
+        host
+    } else {
+        registry
+    };
+    if host.len() > 253
+        || !host.contains('.')
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return false;
+    }
+
+    repository.len() <= 255
+        && repository.split('/').all(|segment| {
+            !segment.is_empty()
+                && !matches!(segment, "." | "..")
+                && segment.len() <= 128
+                && segment
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && segment
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
+}
+
+fn immutable_image_digest(image: &str) -> Option<&str> {
+    if !is_qualified_immutable_image(image) {
+        return None;
+    }
+    image.rsplit_once("@sha256:").map(|(_, digest)| digest)
+}
+
+/// Require one exact ConfigMap import per deployment and one exact database URL
+/// Secret key for the API. Literal values and whole-Secret imports are refused.
 fn validate_container_env(name: &str, index: usize, container: &Value, errors: &mut Vec<String>) {
     let Some(item) = object(container) else {
         return;
     };
+    let expected_config = match name {
+        "portal-ui" => "portal-ui-config",
+        "platform-api" => "platform-api-config",
+        _ => "",
+    };
+    let env_from = item.get("envFrom");
     expect(
-        !item.contains_key("env"),
+        env_from.is_some_and(|value| {
+            value.as_array().is_some_and(|entries| {
+                entries.len() == 1
+                    && object(&entries[0]).is_some_and(|entry| entry.len() == 1)
+                    && object_at(&entries[0], &["configMapRef"])
+                        .is_some_and(|reference| reference.len() == 1)
+                    && str_at(&entries[0], &["configMapRef", "name"]) == Some(expected_config)
+            })
+        }),
         errors,
-        format!("Deployment {name} container {index} must not define inline env in skeleton"),
+        format!("Deployment {name} container {index} must import only ConfigMap {expected_config}"),
     );
-    let Some(env_from) = item.get("envFrom") else {
-        return;
-    };
-    let Some(entries) = env_from.as_array() else {
-        errors.push(format!(
-            "Deployment {name} container {index} envFrom must be a list"
-        ));
-        return;
-    };
-    for entry in entries {
-        let Some(entry_obj) = object(entry) else {
-            continue;
-        };
-        for key in entry_obj.keys() {
-            // `secretRef` is a by-name reference to a Vault/VSO-materialized
-            // Secret (e.g. the DB connection URL), not an inline value, so it
-            // leaks nothing; literal secret values are caught separately by
-            // `validate_no_secret_values`.
-            expect(
-                key == "configMapRef" || key == "secretRef",
-                errors,
-                format!(
-                    "Deployment {name} container {index} envFrom only allows configMapRef or secretRef, found {key}"
-                ),
-            );
-        }
+
+    let env = array_at_path(container, &["env"]);
+    if name == "platform-api" {
+        let entry = env.first().copied().unwrap_or(&Value::Null);
+        expect(
+            env.len() == 1
+                && object(entry).is_some_and(|map| map.len() == 2)
+                && str_at(entry, &["name"]) == Some("RYUKI_DATABASE_URL")
+                && object_at(entry, &["valueFrom"]).is_some_and(|value_from| value_from.len() == 1)
+                && object_at(entry, &["valueFrom", "secretKeyRef"])
+                    .is_some_and(|reference| reference.len() == 2)
+                && str_at(entry, &["valueFrom", "secretKeyRef", "name"])
+                    == Some("ryuki-platform-api-db")
+                && str_at(entry, &["valueFrom", "secretKeyRef", "key"])
+                    == Some("RYUKI_DATABASE_URL")
+                && value_at(entry, &["value"]).is_none(),
+            errors,
+            "Deployment platform-api must import only ryuki-platform-api-db/RYUKI_DATABASE_URL through secretKeyRef",
+        );
+    } else {
+        expect(
+            env.is_empty() && !item.contains_key("env"),
+            errors,
+            format!("Deployment {name} container {index} must not define env"),
+        );
     }
+
+    for entry in array_at_path(container, &["envFrom"]) {
+        expect(
+            value_at(entry, &["secretRef"]).is_none(),
+            errors,
+            format!(
+                "Deployment {name} container {index} must not import a whole Secret through envFrom"
+            ),
+        );
+    }
+    for entry in &env {
+        expect(
+            value_at(entry, &["value"]).is_none(),
+            errors,
+            format!("Deployment {name} container {index} env must not contain literal values"),
+        );
+    }
+}
+
+fn validate_cnpg_ca_mount(
+    owner: &str,
+    pod_spec: &Value,
+    container: &Value,
+    errors: &mut Vec<String>,
+) {
+    let volumes = array_at_path(pod_spec, &["volumes"]);
+    let volume = volumes.first().copied().unwrap_or(&Value::Null);
+    let items = array_at_path(volume, &["secret", "items"]);
+    let item = items.first().copied().unwrap_or(&Value::Null);
+    expect(
+        volumes.len() == 1
+            && object(volume).is_some_and(|map| object_has_exact_keys(map, &["name", "secret"]))
+            && str_at(volume, &["name"]) == Some(CNPG_CA_VOLUME_NAME)
+            && object_at(volume, &["secret"])
+                .is_some_and(|map| object_has_exact_keys(map, &["secretName", "items"]))
+            && str_at(volume, &["secret", "secretName"]) == Some(CNPG_CA_SECRET_NAME)
+            && items.len() == 1
+            && object(item).is_some_and(|map| object_has_exact_keys(map, &["key", "path"]))
+            && str_at(item, &["key"]) == Some(CNPG_CA_SECRET_KEY)
+            && str_at(item, &["path"]) == Some(CNPG_CA_SECRET_KEY),
+        errors,
+        format!(
+            "{owner} must project only {CNPG_CA_SECRET_NAME}/{CNPG_CA_SECRET_KEY} into the CNPG CA volume"
+        ),
+    );
+
+    let mounts = array_at_path(container, &["volumeMounts"]);
+    let mount = mounts.first().copied().unwrap_or(&Value::Null);
+    expect(
+        mounts.len() == 1
+            && object(mount)
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "mountPath", "readOnly"]))
+            && str_at(mount, &["name"]) == Some(CNPG_CA_VOLUME_NAME)
+            && str_at(mount, &["mountPath"]) == Some(CNPG_CA_MOUNT_PATH)
+            && bool_at(mount, &["readOnly"]) == Some(true),
+        errors,
+        format!("{owner} must mount the CNPG CA read-only at {CNPG_CA_FILE_PATH}"),
+    );
 }
 
 fn validate_target_hardening(name: &str, deployment: &Value, errors: &mut Vec<String>) {
@@ -481,6 +1303,26 @@ fn validate_target_hardening(name: &str, deployment: &Value, errors: &mut Vec<St
     validate_target_resources(name, container, errors);
     validate_target_pull_policy(name, container, errors);
     validate_target_security(name, container, errors);
+    validate_target_update_strategy(name, deployment, errors);
+}
+
+fn validate_target_update_strategy(name: &str, deployment: &Value, errors: &mut Vec<String>) {
+    if name != "platform-api" {
+        return;
+    }
+    let strategy = value_at(deployment, &["spec", "strategy"]);
+    expect(
+        strategy.and_then(|value| str_at(value, &["type"])) == Some("Recreate"),
+        errors,
+        "Deployment platform-api must use Recreate to prevent old/new schema, authority, or envFrom secret overlap",
+    );
+    expect(
+        strategy
+            .and_then(Value::as_object)
+            .is_some_and(|value| !value.contains_key("rollingUpdate")),
+        errors,
+        "Deployment platform-api Recreate strategy must not define rollingUpdate",
+    );
 }
 
 fn validate_target_probes(name: &str, container: &Value, errors: &mut Vec<String>) {
@@ -677,6 +1519,11 @@ fn validate_ingress(manifests: &[Value], errors: &mut Vec<String>) {
         "exactly one Ingress is required",
     );
     let ingress = ingresses.first().copied().unwrap_or(&Value::Null);
+    expect(
+        str_at(ingress, &["spec", "ingressClassName"]) == Some(DEDICATED_INGRESS_CLASS),
+        errors,
+        format!("Ingress must use the dedicated {DEDICATED_INGRESS_CLASS} ingress class"),
+    );
     let rules = array_at_path(ingress, &["spec", "rules"]);
     let tls = array_at_path(ingress, &["spec", "tls"]);
     let paths: Vec<&Value> = rules
@@ -832,6 +1679,7 @@ fn validate_network_policies(manifests: &[Value], errors: &mut Vec<String>) {
     validate_platform_api_ingress(&policies, errors);
     validate_portal_ui_egress(&policies, errors);
     validate_platform_api_egress(&policies, errors);
+    validate_migration_database_network(&policies, errors);
     validate_worker_egress(&policies, errors);
     validate_dns_egress(&policies, errors);
     validate_egress_graph(&policies, errors);
@@ -883,9 +1731,9 @@ fn validate_platform_api_ingress(policies: &[&Value], errors: &mut Vec<String>) 
         "platform-api ingress policy must select platform-api",
     );
     expect(
-        has_portal,
+        !has_portal,
         errors,
-        "platform-api ingress must allow portal-ui",
+        "platform-api ingress must not admit portal-ui over cleartext; portal traffic returns through ingress HTTPS",
     );
     expect(
         has_ingress_controller,
@@ -943,7 +1791,10 @@ fn validate_portal_ui_ingress(policies: &[&Value], errors: &mut Vec<String>) {
 }
 
 fn validate_portal_ui_egress(policies: &[&Value], errors: &mut Vec<String>) {
-    let policy = find_policy(policies, "allow-portal-ui-egress-to-platform-api");
+    let policy = find_policy(
+        policies,
+        "allow-portal-ui-egress-to-dedicated-ingress-https",
+    );
     let source = str_at(
         policy,
         &[
@@ -957,16 +1808,7 @@ fn validate_portal_ui_egress(policies: &[&Value], errors: &mut Vec<String>) {
         .first()
         .copied()
         .unwrap_or(&Value::Null);
-    let target_names: Vec<String> = array_at_path(egress, &["to"])
-        .iter()
-        .filter_map(|peer| {
-            str_at(
-                peer,
-                &["podSelector", "matchLabels", "app.kubernetes.io/name"],
-            )
-            .map(str::to_string)
-        })
-        .collect();
+    let targets = array_at_path(egress, &["to"]);
 
     expect(
         source == Some("portal-ui"),
@@ -974,14 +1816,17 @@ fn validate_portal_ui_egress(policies: &[&Value], errors: &mut Vec<String>) {
         "portal-ui egress policy must select portal-ui",
     );
     expect(
-        target_names == vec!["platform-api".to_string()],
+        targets.len() == 1
+            && targets
+                .first()
+                .is_some_and(|peer| ingress_controller_peer(peer)),
         errors,
-        "portal-ui egress must target platform-api only",
+        "portal-ui HTTPS egress must target only the dedicated Ryuki ingress controller pods",
     );
     expect(
-        port_pairs(egress) == vec![("TCP".to_string(), 8080)],
+        port_pairs(egress) == vec![("TCP".to_string(), 443)],
         errors,
-        "portal-ui egress must allow TCP 8080 only",
+        "portal-ui egress must allow ingress HTTPS TCP 443 only",
     );
 }
 
@@ -1019,6 +1864,73 @@ fn validate_platform_api_egress(policies: &[&Value], errors: &mut Vec<String>) {
         port_pairs(egress) == vec![("TCP".to_string(), 8080)],
         errors,
         "platform-api egress must allow TCP 8080 only",
+    );
+}
+
+fn validate_migration_database_network(policies: &[&Value], errors: &mut Vec<String>) {
+    let egress_policy = find_policy(policies, "allow-platform-api-migrations-egress-to-db");
+    let egress_rules = array_at_path(egress_policy, &["spec", "egress"]);
+    let egress = egress_rules.first().copied().unwrap_or(&Value::Null);
+    let targets = array_at_path(egress, &["to"]);
+    expect(
+        str_at(
+            egress_policy,
+            &[
+                "spec",
+                "podSelector",
+                "matchLabels",
+                "app.kubernetes.io/name",
+            ],
+        ) == Some(MIGRATION_JOB)
+            && string_array_at(egress_policy, &["spec", "policyTypes"])
+                == vec!["Egress".to_string()],
+        errors,
+        "migration database egress policy must select only the migration Job",
+    );
+    expect(
+        egress_rules.len() == 1
+            && targets.len() == 1
+            && targets.first().is_some_and(|target| {
+                str_at(target, &["podSelector", "matchLabels", "cnpg.io/cluster"])
+                    == Some("ryuki-platform-db")
+                    && value_at(target, &["namespaceSelector"]).is_none()
+            })
+            && port_pairs(egress) == vec![("TCP".to_string(), 5432)],
+        errors,
+        "migration database egress must target only ryuki-platform-db TCP 5432",
+    );
+
+    let ingress_policy = find_policy(policies, "allow-ingress-to-db-from-platform-api-migrations");
+    let ingress_rules = array_at_path(ingress_policy, &["spec", "ingress"]);
+    let ingress = ingress_rules.first().copied().unwrap_or(&Value::Null);
+    let sources = array_at_path(ingress, &["from"]);
+    expect(
+        str_at(
+            ingress_policy,
+            &["spec", "podSelector", "matchLabels", "cnpg.io/cluster"],
+        ) == Some("ryuki-platform-db")
+            && string_array_at(ingress_policy, &["spec", "policyTypes"])
+                == vec!["Ingress".to_string()],
+        errors,
+        "migration database ingress policy must select only ryuki-platform-db",
+    );
+    expect(
+        ingress_rules.len() == 1
+            && sources.len() == 1
+            && sources.first().is_some_and(|source| {
+                str_at(
+                    source,
+                    &["podSelector", "matchLabels", "app.kubernetes.io/part-of"],
+                ) == Some(PART_OF)
+                    && str_at(
+                        source,
+                        &["podSelector", "matchLabels", "app.kubernetes.io/name"],
+                    ) == Some(MIGRATION_JOB)
+                    && value_at(source, &["namespaceSelector"]).is_none()
+            })
+            && port_pairs(ingress) == vec![("TCP".to_string(), 5432)],
+        errors,
+        "migration database ingress must admit only the migration Job on TCP 5432",
     );
 }
 
@@ -1124,6 +2036,9 @@ fn validate_no_cross_namespace_component_peers(policies: &[&Value], errors: &mut
                 {
                     continue;
                 }
+                if ingress_controller_peer(peer) {
+                    continue;
+                }
                 if object_at(peer, &["namespaceSelector"]).is_none() {
                     continue;
                 }
@@ -1150,11 +2065,12 @@ fn validate_no_cross_namespace_component_peers(policies: &[&Value], errors: &mut
 fn validate_egress_graph(policies: &[&Value], errors: &mut Vec<String>) {
     let mut allowed_edges: BTreeSet<(String, String)> = BTreeSet::new();
     allowed_edges.insert(("*".to_string(), "kube-dns".to_string()));
-    allowed_edges.insert(("portal-ui".to_string(), "platform-api".to_string()));
+    allowed_edges.insert(("portal-ui".to_string(), "ingress-nginx".to_string()));
     // CloudNativePG database tier: the API reaches Postgres, and the cluster's
     // instances talk to each other (replication / instance-manager). Both edges
     // are scoped to the `db` component resolved from the `cnpg.io/cluster` label.
     allowed_edges.insert(("platform-api".to_string(), "db".to_string()));
+    allowed_edges.insert((MIGRATION_JOB.to_string(), "db".to_string()));
     allowed_edges.insert(("db".to_string(), "db".to_string()));
     for target in INTERNAL_HTTP_SERVICES {
         allowed_edges.insert(("platform-api".to_string(), (*target).to_string()));
@@ -1253,7 +2169,7 @@ fn validate_no_secret_values(
             for (key, child) in map {
                 let child_path = format!("{path}.{key}");
                 expect(
-                    !unsafe_manifest_key(key, &child_path, current_kind),
+                    !unsafe_manifest_key(key, child, &child_path, current_kind),
                     errors,
                     format!("{child_path} contains unsafe key"),
                 );
@@ -1396,6 +2312,10 @@ fn ingress_controller_peer(peer: &Value) -> bool {
             peer,
             &["podSelector", "matchLabels", "app.kubernetes.io/name"],
         ) == Some("ingress-nginx")
+        && str_at(
+            peer,
+            &["podSelector", "matchLabels", "app.kubernetes.io/instance"],
+        ) == Some(DEDICATED_INGRESS_INSTANCE)
 }
 
 fn contains_key(value: &Value, key: &str) -> bool {
@@ -1408,8 +2328,19 @@ fn contains_key(value: &Value, key: &str) -> bool {
     }
 }
 
-fn unsafe_manifest_key(key: &str, path: &str, manifest_kind: Option<&str>) -> bool {
+fn unsafe_manifest_key(key: &str, value: &Value, path: &str, manifest_kind: Option<&str>) -> bool {
     if manifest_kind == Some("Ingress") && ingress_schema_key_allowed(key, path) {
+        return false;
+    }
+    if key == "secretName"
+        && matches!(manifest_kind, Some("Deployment") | Some("Job"))
+        && path.contains(".spec.template.spec.volumes[")
+        && path.ends_with(".secret.secretName")
+        && value.as_str() == Some(CNPG_CA_SECRET_NAME)
+    {
+        // The CNPG CA certificate is public trust material. Only its exact key
+        // is projected, so the operator-managed Secret's private CA key never
+        // crosses into either database client workload.
         return false;
     }
     if matches!(key, "host" | "hosts" | "secretName") {
@@ -1457,6 +2388,16 @@ fn ingress_schema_key_allowed(key: &str, path: &str) -> bool {
 fn safe_manifest_value(path: &str, value: &str) -> bool {
     path.ends_with(".__file")
         || APPROVED_SCHEMA_VALUES.contains(&value)
+        || value == "0.0.0.0:8080"
+        || value == format!("https://{APPROVED_HOST}")
+        || (value == CNPG_CA_SECRET_KEY
+            && path.contains(".spec.template.spec.volumes[")
+            && (path.ends_with(".secret.items[0].key") || path.ends_with(".secret.items[0].path")))
+        || (path.contains(".spec.template.spec.containers[")
+            && path.ends_with(".image")
+            && is_qualified_immutable_image(value))
+        || (path.ends_with(".metadata.annotations.ryuki.io/release-image")
+            && is_qualified_immutable_image(value))
         || (value == APPROVED_HOST
             && (path_matches_ingress_host(path) || path_matches_ingress_tls_host_value(path)))
 }
@@ -1757,6 +2698,496 @@ mod tests {
     }
 
     // ── target hardening helpers ──────────────────────────────────────
+
+    #[test]
+    fn rendered_image_rewrites_require_qualified_digest_only_references() {
+        let digest = "a".repeat(64);
+        let admitted = format!("registry.example.invalid/ryuki/portal-ui@sha256:{digest}");
+        assert!(is_qualified_immutable_image(&admitted));
+
+        for rejected in [
+            "ryuki/portal-ui:rust-dev".to_string(),
+            "registry.example.invalid/ryuki/portal-ui:stable".to_string(),
+            format!("ryuki/portal-ui@sha256:{digest}"),
+            format!("https://registry.example.invalid/ryuki/portal-ui@sha256:{digest}"),
+            format!("registry.example.invalid/ryuki/portal-ui:stable@sha256:{digest}"),
+            format!(
+                "registry.example.invalid/ryuki/portal-ui@sha256:{}",
+                "a".repeat(63)
+            ),
+            format!(
+                "registry.example.invalid/ryuki/portal-ui@sha256:{}",
+                "A".repeat(64)
+            ),
+        ] {
+            assert!(
+                !is_qualified_immutable_image(&rejected),
+                "mutable or malformed rendered image must be rejected: {rejected}"
+            );
+            let mut errors = Vec::new();
+            validate_container_image("portal-ui", &json!({ "image": rejected }), &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains("@sha256")),
+                "validator must explain the immutable image contract: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_image_value_is_safe_only_at_a_container_image_path() {
+        let image = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "b".repeat(64)
+        );
+        assert!(safe_manifest_value(
+            "manifests[0].spec.template.spec.containers[0].image",
+            &image,
+        ));
+        assert!(
+            !safe_manifest_value("manifests[0].metadata.labels.note", &image),
+            "qualified registry hostnames are admitted only as validated image fields"
+        );
+    }
+
+    #[test]
+    fn platform_api_rollout_cannot_overlap_old_and_new_replicas() {
+        for strategy in [
+            json!({ "type": "RollingUpdate" }),
+            json!({
+                "type": "Recreate",
+                "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 }
+            }),
+            Value::Null,
+        ] {
+            let deployment = json!({ "spec": { "strategy": strategy } });
+            let mut errors = Vec::new();
+            validate_target_update_strategy("platform-api", &deployment, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "overlapping or absent API rollout strategy must fail closed"
+            );
+        }
+
+        let deployment = json!({ "spec": { "strategy": { "type": "Recreate" } } });
+        let mut errors = Vec::new();
+        validate_target_update_strategy("platform-api", &deployment, &mut errors);
+        assert!(errors.is_empty(), "Recreate should be admitted: {errors:?}");
+    }
+
+    #[test]
+    fn checked_in_platform_api_source_retains_recreate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join("deploy/kubernetes/base/deployments.yaml"))
+            .expect("checked-in Deployments must be readable");
+        let deployments: Vec<Value> = serde_yaml::Deserializer::from_str(&raw)
+            .map(|document| Value::deserialize(document).expect("Deployment YAML must parse"))
+            .collect();
+        let platform_api = deployments
+            .iter()
+            .find(|deployment| {
+                str_at(deployment, &["kind"]) == Some("Deployment")
+                    && str_at(deployment, &["metadata", "name"]) == Some("platform-api")
+            })
+            .expect("platform-api Deployment must remain checked in");
+
+        let mut errors = Vec::new();
+        validate_target_update_strategy("platform-api", platform_api, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "checked-in platform-api must retain non-overlapping Recreate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn checked_in_migration_job_retains_the_one_shot_contract() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let deployments_raw =
+            fs::read_to_string(root.join("deploy/kubernetes/base/deployments.yaml"))
+                .expect("checked-in Deployments must be readable");
+        let platform_api = serde_yaml::Deserializer::from_str(&deployments_raw)
+            .map(|document| Value::deserialize(document).expect("Deployment YAML must parse"))
+            .find(|deployment| {
+                str_at(deployment, &["kind"]) == Some("Deployment")
+                    && str_at(deployment, &["metadata", "name"]) == Some("platform-api")
+            })
+            .expect("platform-api Deployment must remain checked in");
+        let job_raw = fs::read_to_string(root.join(MIGRATION_JOB_TEMPLATE_PATH))
+            .expect("checked-in operations-only migration Job must be readable");
+        let job: Value =
+            serde_yaml::from_str(&job_raw).expect("checked-in migration Job YAML must parse");
+
+        let mut errors = Vec::new();
+        validate_migration_job(&[platform_api, job], &mut errors);
+        assert!(
+            errors.is_empty(),
+            "checked-in migration Job must retain the reviewed one-shot contract: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn platform_api_config_requires_the_database_flag_exactly_true() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join("deploy/kubernetes/base/configmap.yaml"))
+            .expect("checked-in ConfigMaps must be readable");
+        let manifests: Vec<Value> = serde_yaml::Deserializer::from_str(&raw)
+            .map(|document| Value::deserialize(document).expect("ConfigMap YAML must parse"))
+            .collect();
+
+        let mut errors = Vec::new();
+        validate_config_maps(&manifests, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "checked-in ConfigMaps should pass: {errors:?}"
+        );
+
+        for replacement in [Some(json!("false")), None] {
+            let mut invalid = manifests.clone();
+            let api = invalid
+                .iter_mut()
+                .find(|manifest| {
+                    str_at(manifest, &["metadata", "name"]) == Some("platform-api-config")
+                })
+                .expect("platform-api-config");
+            let data = api["data"]
+                .as_object_mut()
+                .expect("platform-api-config data");
+            if let Some(value) = replacement {
+                data.insert("RYUKI_DATABASE__REQUIRED".to_string(), value);
+            } else {
+                data.remove("RYUKI_DATABASE__REQUIRED");
+            }
+
+            let mut errors = Vec::new();
+            validate_config_maps(&invalid, &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("require the database")),
+                "false or missing database-required flag must fail closed: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_cutover_contract_binds_config_secret_digest_and_https_path() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(
+            !root
+                .join("deploy/kubernetes/base/migration-job.yaml")
+                .exists(),
+            "a continuously reconciled base must not contain the migration Job"
+        );
+
+        let mut manifests = Vec::new();
+        for relative in [
+            "deploy/kubernetes/base/configmap.yaml",
+            "deploy/kubernetes/base/deployments.yaml",
+            "deploy/kubernetes/base/networkpolicies.yaml",
+            MIGRATION_JOB_TEMPLATE_PATH,
+        ] {
+            let raw = fs::read_to_string(root.join(relative))
+                .unwrap_or_else(|error| panic!("{relative} must be readable: {error}"));
+            manifests.extend(serde_yaml::Deserializer::from_str(&raw).map(|document| {
+                Value::deserialize(document)
+                    .unwrap_or_else(|error| panic!("{relative} must parse: {error}"))
+            }));
+        }
+        let contract_raw = fs::read_to_string(root.join(MIGRATION_CUTOVER_CONTRACT_PATH))
+            .expect("cutover contract must be readable");
+        let contract: Value =
+            serde_yaml::from_str(&contract_raw).expect("cutover contract must parse");
+
+        let mut errors = Vec::new();
+        validate_config_maps(&manifests, &mut errors);
+        validate_migration_job(&manifests, &mut errors);
+        validate_cutover_contract(&contract, &manifests, &mut errors);
+        let policies: Vec<&Value> = manifests
+            .iter()
+            .filter(|manifest| str_at(manifest, &["kind"]) == Some("NetworkPolicy"))
+            .collect();
+        validate_portal_ui_egress(&policies, &mut errors);
+        let api = manifests
+            .iter()
+            .find(|manifest| {
+                str_at(manifest, &["kind"]) == Some("Deployment")
+                    && str_at(manifest, &["metadata", "name"]) == Some("platform-api")
+            })
+            .expect("platform-api Deployment must be present");
+        let api_container = array_at_path(api, &["spec", "template", "spec", "containers"])[0];
+        validate_container_env("platform-api", 0, api_container, &mut errors);
+
+        assert!(
+            errors.is_empty(),
+            "checked-in cutover objects must retain exact cross-object bindings: {errors:?}"
+        );
+
+        for (pointer, replacement) in [
+            ("/drain/requiredWorkloadKinds", json!(["Deployment"])),
+            ("/drain/requiredBaseWriterSelectors", json!([])),
+            (
+                "/drain/databaseSessionReadback/fields",
+                json!(["pid", "usename"]),
+            ),
+        ] {
+            let mut narrowed = contract.clone();
+            *narrowed
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing contract pointer {pointer}")) = replacement;
+            let mut errors = Vec::new();
+            validate_cutover_contract(&narrowed, &manifests, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains("exact nonempty")),
+                "narrowed cutover inventory {pointer} must fail closed: {errors:?}"
+            );
+        }
+
+        for pointer in [
+            "/release/digestPrefix",
+            "/execution/generatedNamePrefix",
+            "/credentials/migration/vaultDynamicSecretName",
+            "/credentials/migration/secretName",
+            "/credentials/migration/vaultAuthRole",
+            "/credentials/migration/vaultDatabaseRole",
+        ] {
+            let mut stale = contract.clone();
+            *stale
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing contract pointer {pointer}")) = json!("stale");
+            let mut errors = Vec::new();
+            validate_cutover_contract(&stale, &manifests, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "stale digest-scoped contract identity {pointer} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_api_hardening_retains_the_recreate_gate() {
+        let security_context = json!({
+            "runAsNonRoot": true,
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": { "drop": ["ALL"] },
+            "seccompProfile": { "type": "RuntimeDefault" }
+        });
+        let mut deployment = hardened_target_deployment("platform-api", security_context);
+
+        let mut errors = Vec::new();
+        validate_target_hardening("platform-api", &deployment, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must use Recreate")),
+            "the top-level hardening path must retain the non-overlap gate: {errors:?}"
+        );
+
+        deployment["spec"]["strategy"] = json!({ "type": "Recreate" });
+        let mut errors = Vec::new();
+        validate_target_hardening("platform-api", &deployment, &mut errors);
+        assert!(
+            !errors.iter().any(|error| error.contains("Recreate")),
+            "a valid Recreate strategy must satisfy the retained gate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn migration_job_is_one_shot_and_coupled_to_the_api_image() {
+        let image = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "c".repeat(64)
+        );
+        let api = json!({
+            "kind": "Deployment",
+            "metadata": { "name": "platform-api" },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{ "name": "platform-api", "image": image }]
+                    }
+                }
+            }
+        });
+        let job = migration_job_fixture(&image);
+
+        let mut errors = Vec::new();
+        validate_migration_job(&[api.clone(), job.clone()], &mut errors);
+        assert!(
+            errors.is_empty(),
+            "reviewed migration Job should pass: {errors:?}"
+        );
+
+        let mut retrying = job.clone();
+        retrying["spec"]["backoffLimit"] = json!(1);
+        let mut errors = Vec::new();
+        validate_migration_job(&[api.clone(), retrying], &mut errors);
+        assert!(errors.iter().any(|error| error.contains("exactly once")));
+
+        for (field, value) in [
+            (
+                "podFailurePolicy",
+                json!({
+                    "rules": [{
+                        "action": "Ignore",
+                        "onExitCodes": {
+                            "containerName": MIGRATION_JOB,
+                            "operator": "In",
+                            "values": [1]
+                        }
+                    }]
+                }),
+            ),
+            ("podReplacementPolicy", json!("Failed")),
+            ("backoffLimitPerIndex", json!(0)),
+        ] {
+            let mut policy_extended = job.clone();
+            policy_extended["spec"][field] = value;
+            let mut errors = Vec::new();
+            validate_migration_job(&[api.clone(), policy_extended], &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("retry/replacement")),
+                "retry-affecting Job field {field} must be rejected: {errors:?}"
+            );
+        }
+
+        let mut stale_identity = job.clone();
+        stale_identity["metadata"]["generateName"] = json!("platform-api-migrations-111111111111-");
+        let mut errors = Vec::new();
+        validate_migration_job(&[api.clone(), stale_identity], &mut errors);
+        assert!(
+            errors.iter().any(|error| error.contains("derived")),
+            "a stale release identity must not survive an admitted digest change: {errors:?}"
+        );
+
+        let mut missing_ca = job.clone();
+        missing_ca["spec"]["template"]["spec"]["volumes"] = json!([]);
+        let mut errors = Vec::new();
+        validate_migration_job(&[api.clone(), missing_ca], &mut errors);
+        assert!(
+            errors.iter().any(|error| error.contains("CNPG CA")),
+            "the migration client must retain its authenticated CA mount: {errors:?}"
+        );
+
+        let mut custom_command = job.clone();
+        custom_command["spec"]["template"]["spec"]["containers"][0]["args"] = json!(["migrate"]);
+        let mut errors = Vec::new();
+        validate_migration_job(&[api.clone(), custom_command], &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must not define args")));
+
+        let mut different_image = job;
+        different_image["spec"]["template"]["spec"]["containers"][0]["image"] = format!(
+            "registry.example.invalid/ryuki/platform-api@sha256:{}",
+            "d".repeat(64)
+        )
+        .into();
+        let mut errors = Vec::new();
+        validate_migration_job(&[api, different_image], &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact digest-only platform-api")));
+    }
+
+    fn migration_job_fixture(image: &str) -> Value {
+        let identity = MigrationIdentity::from_image(image)
+            .expect("test image must produce a migration identity");
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "generateName": identity.job_generate_name,
+                "annotations": {
+                    "ryuki.io/cutover-contract": "migration-cutover-v1",
+                    "ryuki.io/release-image": image
+                },
+                "labels": {
+                    "ryuki.io/release-digest-prefix": identity.digest_prefix
+                }
+            },
+            "spec": {
+                "completions": 1,
+                "parallelism": 1,
+                "backoffLimit": 0,
+                "activeDeadlineSeconds": 2400,
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app.kubernetes.io/name": MIGRATION_JOB,
+                            "app.kubernetes.io/component": "database-migration-runner",
+                            "ryuki.io/release-digest-prefix": identity.digest_prefix
+                        }
+                    },
+                    "spec": {
+                        "serviceAccountName": MIGRATION_SERVICE_ACCOUNT,
+                        "automountServiceAccountToken": false,
+                        "enableServiceLinks": false,
+                        "restartPolicy": "Never",
+                        "terminationGracePeriodSeconds": 30,
+                        "volumes": [{
+                            "name": CNPG_CA_VOLUME_NAME,
+                            "secret": {
+                                "secretName": CNPG_CA_SECRET_NAME,
+                                "items": [{
+                                    "key": CNPG_CA_SECRET_KEY,
+                                    "path": CNPG_CA_SECRET_KEY
+                                }]
+                            }
+                        }],
+                        "securityContext": {
+                            "runAsNonRoot": true,
+                            "runAsUser": 10001,
+                            "runAsGroup": 10001,
+                            "seccompProfile": { "type": "RuntimeDefault" }
+                        },
+                        "containers": [{
+                            "name": MIGRATION_JOB,
+                            "image": image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "volumeMounts": [{
+                                "name": CNPG_CA_VOLUME_NAME,
+                                "mountPath": CNPG_CA_MOUNT_PATH,
+                                "readOnly": true
+                            }],
+                            "envFrom": [
+                                {
+                                    "configMapRef": {
+                                        "name": "platform-api-migration-config"
+                                    }
+                                }
+                            ],
+                            "env": [{
+                                "name": "RYUKI_MIGRATION_DATABASE_URL",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": identity.secret_name,
+                                        "key": "RYUKI_MIGRATION_DATABASE_URL"
+                                    }
+                                }
+                            }],
+                            "resources": {
+                                "requests": { "cpu": "100m", "memory": "128Mi" },
+                                "limits": { "cpu": "1", "memory": "512Mi" }
+                            },
+                            "securityContext": {
+                                "runAsNonRoot": true,
+                                "runAsUser": 10001,
+                                "runAsGroup": 10001,
+                                "allowPrivilegeEscalation": false,
+                                "readOnlyRootFilesystem": true,
+                                "capabilities": { "drop": ["ALL"] },
+                                "seccompProfile": { "type": "RuntimeDefault" }
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+    }
 
     fn hardened_target_deployment(name: &str, security_context: Value) -> Value {
         let (readiness_path, liveness_path) = target_probe_paths(name);

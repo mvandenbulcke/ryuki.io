@@ -8,21 +8,34 @@
 
 use std::time::Duration;
 
+use crate::security::{
+    insecure_loopback_allowed_from_env, validate_endpoint_origin, PortalConfigError,
+    PortalPublicOrigin,
+};
+
 /// Env var naming the upstream API base URL.
 pub const API_URL_ENV: &str = "RYUKI_API_URL";
 /// Env var selecting the portal execution mode.
 pub const EXECUTION_MODE_ENV: &str = "RYUKI_PORTAL_EXECUTION_MODE";
-/// Env var controlling the Secure flag on the portal-origin cookie.
+/// Optional assertion for the Secure flag derived from the public origin.
 pub const COOKIE_SECURE_ENV: &str = "RYUKI_PORTAL_COOKIE_SECURE";
 
 /// Default upstream base URL for plain-HTTP local development.
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8081";
 /// Opt-in live mode value; anything else stays static-dry-run.
 pub const LIVE_PROVIDER_MODE: &str = "live-provider";
-/// Name of the session cookie on the portal origin.
-pub const PORTAL_SESSION_COOKIE: &str = "ryuki_session";
-/// Header carrying the forwarded session id to the API.
+/// Host-only session cookie used by every HTTPS portal origin. The `__Host-`
+/// prefix is enforced by browsers: it requires `Secure`, `Path=/`, and no
+/// `Domain` attribute, preventing a sibling host from planting a competitor.
+pub const PORTAL_SESSION_COOKIE: &str = "__Host-ryuki_session";
+/// Unprefixed compatibility name used only by the explicitly enabled
+/// plain-HTTP loopback development/test origin, where `__Host-` cookies cannot
+/// be set because the `Secure` attribute is unavailable.
+pub const LOOPBACK_PORTAL_SESSION_COOKIE: &str = "ryuki_session";
+/// Compatibility header carrying the forwarded opaque session token to the API.
 pub const SESSION_ID_HEADER: &str = "X-Ryuki-Session-Id";
+/// Maximum response body accepted from the platform API (1 MiB).
+pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Transport-level failure (connect error, timeout, or upstream 5xx).
 /// Reads may degrade to static fallbacks on this error; mutations never do.
@@ -73,34 +86,81 @@ impl UpstreamResponse {
 
 #[derive(Clone)]
 pub struct UpstreamClient {
-    base_url: String,
+    base_url: reqwest::Url,
     http: reqwest::Client,
     live: bool,
+    cookie_secure: bool,
 }
 
 impl UpstreamClient {
     /// Builds the client once from the environment. `RYUKI_API_URL` defaults
     /// to the local API; live mode is strictly opt-in via
     /// `RYUKI_PORTAL_EXECUTION_MODE=live-provider`.
-    pub fn from_env() -> Self {
+    pub fn from_env(public_origin: &PortalPublicOrigin) -> Result<Self, PortalConfigError> {
         let base_url = std::env::var(API_URL_ENV)
             .ok()
-            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
         let live = std::env::var(EXECUTION_MODE_ENV)
             .map(|mode| mode.trim() == LIVE_PROVIDER_MODE)
             .unwrap_or(false);
-        let http = reqwest::Client::builder()
+        let cookie_secure = cookie_secure_for_origin(public_origin)?;
+        Self::new(
+            &base_url,
+            live,
+            insecure_loopback_allowed_from_env(),
+            cookie_secure,
+        )
+    }
+
+    fn new(
+        base_url: &str,
+        live: bool,
+        allow_insecure_loopback: bool,
+        cookie_secure: bool,
+    ) -> Result<Self, PortalConfigError> {
+        Self::new_with_http_builder(
+            base_url,
+            live,
+            allow_insecure_loopback,
+            cookie_secure,
+            reqwest::Client::builder(),
+        )
+    }
+
+    fn new_with_http_builder(
+        base_url: &str,
+        live: bool,
+        allow_insecure_loopback: bool,
+        cookie_secure: bool,
+        http_builder: reqwest::ClientBuilder,
+    ) -> Result<Self, PortalConfigError> {
+        let base_url = validate_endpoint_origin(base_url, API_URL_ENV, allow_insecure_loopback)?;
+        let https_only = base_url.scheme() == "https";
+        let http = http_builder
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
+            // API session credentials must never traverse ambient HTTP(S) or
+            // ALL_PROXY configuration. This also prevents an explicitly
+            // admitted loopback endpoint from escaping through a proxy.
+            .no_proxy()
+            // A credential-bearing request must never be replayed to a
+            // redirect-selected authority.
+            .redirect(reqwest::redirect::Policy::none())
+            // HTTPS origins remain HTTPS-only below the URL-origin guard;
+            // explicit loopback HTTP keeps its narrowly validated exception.
+            .https_only(https_only)
             .build()
-            .expect("portal upstream HTTP client must build");
-        Self {
+            .map_err(|_| {
+                PortalConfigError::new(API_URL_ENV, "could not initialize the HTTP client")
+            })?;
+        Ok(Self {
             base_url,
             http,
             live,
-        }
+            cookie_secure,
+        })
     }
 
     /// True when the portal runs in `live-provider` mode.
@@ -108,8 +168,27 @@ impl UpstreamClient {
         self.live
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+    /// Secure-cookie policy validated once against the public origin during
+    /// startup. Request handlers never re-read a mutable environment flag.
+    pub fn cookie_secure(&self) -> bool {
+        self.cookie_secure
+    }
+
+    fn url(&self, path: &str) -> Result<reqwest::Url, UpstreamUnreachable> {
+        if !path.starts_with('/') || path.starts_with("//") || path.contains('#') {
+            return Err(UpstreamUnreachable {
+                detail: "upstream path was rejected".to_string(),
+            });
+        }
+        let url = self.base_url.join(path).map_err(|_| UpstreamUnreachable {
+            detail: "upstream path was rejected".to_string(),
+        })?;
+        if url.origin() != self.base_url.origin() {
+            return Err(UpstreamUnreachable {
+                detail: "upstream path was rejected".to_string(),
+            });
+        }
+        Ok(url)
     }
 
     async fn dispatch(
@@ -120,7 +199,7 @@ impl UpstreamClient {
         if let Some(session_id) = session_id {
             request = request.header(SESSION_ID_HEADER, session_id);
         }
-        let response = request.send().await.map_err(|error| UpstreamUnreachable {
+        let mut response = request.send().await.map_err(|error| UpstreamUnreachable {
             detail: redact_transport_error(&error),
         })?;
         let status = response.status().as_u16();
@@ -132,8 +211,30 @@ impl UpstreamClient {
         // Read the total-count header BEFORE consuming the body (response.text()
         // takes ownership). Absent/non-numeric headers degrade to None.
         let total_count = parse_total_count_header(response.headers());
-        let body = response.text().await.map_err(|_| UpstreamUnreachable {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_UPSTREAM_RESPONSE_BYTES as u64)
+        {
+            return Err(UpstreamUnreachable {
+                detail: "upstream response body exceeded limit".to_string(),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| UpstreamUnreachable {
             detail: "upstream body read failed".to_string(),
+        })? {
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .filter(|length| *length <= MAX_UPSTREAM_RESPONSE_BYTES)
+                .ok_or_else(|| UpstreamUnreachable {
+                    detail: "upstream response body exceeded limit".to_string(),
+                })?;
+            body.reserve(next_len.saturating_sub(body.len()));
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(body).map_err(|_| UpstreamUnreachable {
+            detail: "upstream response body was not valid UTF-8".to_string(),
         })?;
         Ok(UpstreamResponse {
             status,
@@ -148,8 +249,8 @@ impl UpstreamClient {
         path: &str,
         session_id: Option<&str>,
     ) -> Result<UpstreamResponse, UpstreamUnreachable> {
-        self.dispatch(self.http.get(self.url(path)), session_id)
-            .await
+        let url = self.url(path)?;
+        self.dispatch(self.http.get(url), session_id).await
     }
 
     /// DELETE an allowlisted API path, forwarding the session id when present.
@@ -158,8 +259,8 @@ impl UpstreamClient {
         path: &str,
         session_id: Option<&str>,
     ) -> Result<UpstreamResponse, UpstreamUnreachable> {
-        self.dispatch(self.http.delete(self.url(path)), session_id)
-            .await
+        let url = self.url(path)?;
+        self.dispatch(self.http.delete(url), session_id).await
     }
 
     /// POST an allowlisted API path with an optional JSON body.
@@ -169,7 +270,8 @@ impl UpstreamClient {
         body: Option<&serde_json::Value>,
         session_id: Option<&str>,
     ) -> Result<UpstreamResponse, UpstreamUnreachable> {
-        let mut request = self.http.post(self.url(path));
+        let url = self.url(path)?;
+        let mut request = self.http.post(url);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -184,7 +286,8 @@ impl UpstreamClient {
         body: &serde_json::Value,
         session_id: Option<&str>,
     ) -> Result<UpstreamResponse, UpstreamUnreachable> {
-        let request = self.http.put(self.url(path)).json(body);
+        let url = self.url(path)?;
+        let request = self.http.put(url).json(body);
         self.dispatch(request, session_id).await
     }
 }
@@ -213,12 +316,53 @@ fn redact_transport_error(error: &reqwest::Error) -> String {
     }
 }
 
-/// True when `RYUKI_PORTAL_COOKIE_SECURE=true`; defaults to false for
-/// plain-HTTP development.
-pub fn cookie_secure_from_env() -> bool {
-    std::env::var(COOKIE_SECURE_ENV)
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Derives the cookie transport policy from the already validated public
+/// origin. The legacy environment value is an optional assertion only: it
+/// cannot silently weaken HTTPS, and false is accepted only for the explicit
+/// loopback-HTTP development/test origin admitted by `PortalPublicOrigin`.
+pub fn cookie_secure_for_origin(
+    public_origin: &PortalPublicOrigin,
+) -> Result<bool, PortalConfigError> {
+    let configured = match std::env::var(COOKIE_SECURE_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(PortalConfigError::new(
+                COOKIE_SECURE_ENV,
+                "must contain valid Unicode",
+            ));
+        }
+    };
+    cookie_secure_for_origin_setting(public_origin, configured.as_deref())
+}
+
+fn cookie_secure_for_origin_setting(
+    public_origin: &PortalPublicOrigin,
+    configured: Option<&str>,
+) -> Result<bool, PortalConfigError> {
+    let required = public_origin.secure_cookies();
+    let Some(configured) = configured else {
+        return Ok(required);
+    };
+    let configured = match configured.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(PortalConfigError::new(
+                COOKIE_SECURE_ENV,
+                "must be true or false",
+            ));
+        }
+    };
+    if configured != required {
+        let reason = if required {
+            "must be true when RYUKI_PORTAL_PUBLIC_ORIGIN uses HTTPS"
+        } else {
+            "must be false for an explicitly enabled loopback HTTP public origin"
+        };
+        return Err(PortalConfigError::new(COOKIE_SECURE_ENV, reason));
+    }
+    Ok(required)
 }
 
 /// Strict UUID syntax check (8-4-4-4-12 lowercase/uppercase hex) without
@@ -232,29 +376,115 @@ pub fn is_uuid_syntax(candidate: &str) -> bool {
         })
 }
 
-/// Parses the `ryuki_session` cookie out of a raw `Cookie` header value and
-/// validates UUID syntax. Never returns malformed values.
-pub fn session_id_from_cookie_header(cookie_header: &str) -> Option<String> {
-    cookie_header
-        .split(';')
-        .filter_map(|pair| {
-            let (name, value) = pair.trim().split_once('=')?;
-            (name.trim() == PORTAL_SESSION_COOKIE).then(|| value.trim().to_string())
-        })
-        .find(|value| is_uuid_syntax(value))
+/// Exact canonical wire-shape check for a 256-bit rys_ session bearer without
+/// decoding or retaining another copy of its secret payload.
+pub fn is_session_bearer_syntax(candidate: &str) -> bool {
+    let Some(payload) = candidate.strip_prefix("rys_") else {
+        return false;
+    };
+    if payload.len() != 43
+        || !payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+
+    // For a 32-byte input, the last base64url character contains four data
+    // bits and two zero padding bits. Restricting it to indices divisible by
+    // four rejects alternate, non-canonical encodings.
+    matches!(
+        payload.as_bytes()[42],
+        b'A' | b'E'
+            | b'I'
+            | b'M'
+            | b'Q'
+            | b'U'
+            | b'Y'
+            | b'c'
+            | b'g'
+            | b'k'
+            | b'o'
+            | b's'
+            | b'w'
+            | b'0'
+            | b'4'
+            | b'8'
+    )
 }
 
-/// Extracts the portal session id from the inbound request cookie, if any.
-/// Only the validated UUID is ever forwarded upstream — never the raw
+/// Returns the only cookie name admitted for the validated public-origin
+/// transport mode. `secure = false` is possible only for the explicitly
+/// enabled loopback HTTP development/test origin.
+pub fn portal_session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        PORTAL_SESSION_COOKIE
+    } else {
+        LOOPBACK_PORTAL_SESSION_COOKIE
+    }
+}
+
+fn is_portal_session_cookie_name(name: &str) -> bool {
+    name == PORTAL_SESSION_COOKIE || name == LOOPBACK_PORTAL_SESSION_COOKIE
+}
+
+/// Parses one or more raw Cookie header values and validates the exact opaque
+/// bearer syntax. Exactly one credential-cookie pair must be present, and its
+/// name must match the validated public-origin mode. Any duplicate active
+/// name, or an old/new-name pair, is ambiguous and fails closed regardless of
+/// value validity or header ordering. Legacy/admin UUID bearers are rejected.
+fn session_id_from_cookie_headers<'a>(
+    cookie_headers: impl IntoIterator<Item = &'a str>,
+    secure: bool,
+) -> Option<String> {
+    let mut credential = None;
+    for cookie_header in cookie_headers {
+        for pair in cookie_header.split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                if is_portal_session_cookie_name(pair) {
+                    return None;
+                }
+                continue;
+            };
+            let name = name.trim();
+            if !is_portal_session_cookie_name(name) {
+                continue;
+            }
+            if credential.is_some() {
+                return None;
+            }
+            credential = Some((name, value.trim()));
+        }
+    }
+
+    let (name, value) = credential?;
+    (name == portal_session_cookie_name(secure) && is_session_bearer_syntax(value))
+        .then(|| value.to_string())
+}
+
+/// Parses a single raw Cookie header with the same duplicate and mode-selection
+/// invariants applied by request extraction.
+pub fn session_id_from_cookie_header(cookie_header: &str, secure: bool) -> Option<String> {
+    session_id_from_cookie_headers([cookie_header], secure)
+}
+
+/// Extracts the portal session token from the inbound request cookie, if any.
+/// Only the validated opaque bearer is ever forwarded upstream — never the raw
 /// `Cookie` header.
 pub async fn session_id_from_request() -> Option<String> {
+    // Use the process-validated client context that the server-function route
+    // installs at startup. Missing context fails closed; request metadata or a
+    // mutable environment value must never select the weaker cookie name.
+    let secure = leptos::prelude::use_context::<UpstreamClient>()?.cookie_secure();
     let headers = leptos_axum::extract::<axum::http::HeaderMap>().await.ok()?;
-    let cookie_header = headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?
-        .to_string();
-    session_id_from_cookie_header(&cookie_header)
+    let cookie_headers = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    session_id_from_cookie_headers(cookie_headers, secure)
 }
 
 /// Default session cookie lifetime when the upstream expiry is absent,
@@ -295,12 +525,11 @@ fn parse_rfc3339_epoch_seconds(timestamp: &str) -> Option<i64> {
 
     let (time, offset_secs) = if let Some(time) = time_with_offset.strip_suffix(['Z', 'z']) {
         (time, 0i64)
-    } else if let Some(position) = time_with_offset.rfind(['+', '-']) {
+    } else {
+        let position = time_with_offset.rfind(['+', '-'])?;
         let (time, offset) = time_with_offset.split_at(position);
         let sign = if offset.starts_with('-') { -1 } else { 1 };
         (time, sign * parse_utc_offset_seconds(&offset[1..])?)
-    } else {
-        return None;
     };
 
     let whole_seconds = time.split('.').next()?;
@@ -343,9 +572,22 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 
 /// Builds the portal-origin session cookie. `max_age_secs = 0` clears it.
 pub fn portal_session_cookie(session_id: &str, max_age_secs: u64, secure: bool) -> String {
-    let mut cookie = format!(
-        "{PORTAL_SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}"
-    );
+    named_portal_session_cookie(
+        portal_session_cookie_name(secure),
+        session_id,
+        max_age_secs,
+        secure,
+    )
+}
+
+fn named_portal_session_cookie(
+    name: &str,
+    session_id: &str,
+    max_age_secs: u64,
+    secure: bool,
+) -> String {
+    let mut cookie =
+        format!("{name}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -354,23 +596,46 @@ pub fn portal_session_cookie(session_id: &str, max_age_secs: u64, secure: bool) 
 
 /// Appends a Set-Cookie header on the portal response that stores the
 /// session id for `max_age_secs` seconds.
-pub fn set_portal_session_cookie(session_id: &str, max_age_secs: u64) {
-    append_set_cookie(&portal_session_cookie(
-        session_id,
-        max_age_secs,
-        cookie_secure_from_env(),
-    ));
+pub fn set_portal_session_cookie(session_id: &str, max_age_secs: u64, secure: bool) {
+    append_set_cookie(&portal_session_cookie(session_id, max_age_secs, secure));
+    if secure {
+        // Retire the old host-only production cookie during migration. A
+        // sibling's parent-Domain cookie cannot be deleted from this host and
+        // therefore remains an explicit fail-closed ambiguity in the parser.
+        append_set_cookie(&named_portal_session_cookie(
+            LOOPBACK_PORTAL_SESSION_COOKIE,
+            "",
+            0,
+            true,
+        ));
+    }
 }
 
 /// Appends a Set-Cookie header that clears the portal session cookie.
-pub fn clear_portal_session_cookie() {
-    append_set_cookie(&portal_session_cookie("", 0, cookie_secure_from_env()));
+pub fn clear_portal_session_cookie(secure: bool) {
+    append_set_cookie(&portal_session_cookie("", 0, secure));
+    if secure {
+        append_set_cookie(&named_portal_session_cookie(
+            LOOPBACK_PORTAL_SESSION_COOKIE,
+            "",
+            0,
+            true,
+        ));
+    }
 }
 
-/// Name of the per-browser CSRF-binding cookie for the Entra ID sign-in flow.
-/// Must match the API's cookie name exactly: the API callback redeems a login
-/// state only when this cookie matches the binding stored with the state.
-pub const ENTRA_LOGIN_BINDING_COOKIE: &str = "entra_login_csrf";
+/// Host-prefixed Entra login binding used by every HTTPS portal origin.
+pub const SECURE_ENTRA_LOGIN_BINDING_COOKIE: &str = "__Host-entra_login_csrf";
+/// Compatibility binding name used only by explicitly enabled loopback HTTP.
+pub const LOOPBACK_ENTRA_LOGIN_BINDING_COOKIE: &str = "entra_login_csrf";
+
+pub fn entra_login_binding_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_ENTRA_LOGIN_BINDING_COOKIE
+    } else {
+        LOOPBACK_ENTRA_LOGIN_BINDING_COOKIE
+    }
+}
 
 /// Builds the Entra login CSRF-binding cookie. HttpOnly (the binding never
 /// reaches page JavaScript), SameSite=Lax so the browser presents it on the
@@ -378,24 +643,53 @@ pub const ENTRA_LOGIN_BINDING_COOKIE: &str = "entra_login_csrf";
 /// the API's 10-minute login-state TTL. `Path=/` so it reaches the API
 /// callback route in same-origin deployments.
 pub fn entra_login_binding_cookie(binding: &str, secure: bool) -> String {
-    let mut cookie = format!(
-        "{ENTRA_LOGIN_BINDING_COOKIE}={binding}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"
-    );
+    let name = entra_login_binding_cookie_name(secure);
+    let mut cookie = format!("{name}={binding}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600");
     if secure {
         cookie.push_str("; Secure");
     }
     cookie
 }
 
+/// Validates that at most one binding cookie matching the process-validated
+/// transport name appears across all inbound `Cookie` header fields. The
+/// sibling-plantable loopback name is not active on HTTPS origins.
+pub fn entra_login_binding_cookie_headers_are_unambiguous<'a>(
+    cookie_headers: impl IntoIterator<Item = &'a str>,
+    secure: bool,
+) -> bool {
+    let expected_name = entra_login_binding_cookie_name(secure);
+    let mut found = false;
+    for cookie_header in cookie_headers {
+        for pair in cookie_header.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((name, _)) = pair.split_once('=') else {
+                if pair == expected_name {
+                    return false;
+                }
+                continue;
+            };
+            if name.trim() != expected_name {
+                continue;
+            }
+            if found {
+                return false;
+            }
+            found = true;
+        }
+    }
+    true
+}
+
 /// Appends a Set-Cookie header carrying the Entra login CSRF binding on the
 /// portal response. The upstream client cannot forward upstream Set-Cookie
 /// headers, so the authorize-url server function re-issues the binding cookie
 /// itself from the API's JSON payload.
-pub fn set_entra_login_binding_cookie(binding: &str) {
-    append_set_cookie(&entra_login_binding_cookie(
-        binding,
-        cookie_secure_from_env(),
-    ));
+pub fn set_entra_login_binding_cookie(binding: &str, secure: bool) {
+    append_set_cookie(&entra_login_binding_cookie(binding, secure));
 }
 
 fn append_set_cookie(cookie: &str) {
@@ -414,6 +708,191 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upstream_requires_https_except_explicit_loopback() {
+        assert!(UpstreamClient::new("https://api.example.test", true, false, true).is_ok());
+        assert!(UpstreamClient::new("http://api.example.test", true, true, false).is_err());
+        assert!(UpstreamClient::new("http://127.0.0.1:8081", true, false, false).is_err());
+        assert!(UpstreamClient::new("http://127.0.0.1:8081", true, true, false).is_ok());
+        assert!(UpstreamClient::new("http://[::1]:8081", true, true, false).is_ok());
+        assert!(UpstreamClient::new("http://localhost:8081", true, true, false).is_ok());
+    }
+
+    #[test]
+    fn cookie_secure_policy_is_derived_from_public_origin() {
+        let https = PortalPublicOrigin::parse("https://portal.example.test", false).unwrap();
+        assert_eq!(cookie_secure_for_origin_setting(&https, None), Ok(true));
+        assert_eq!(
+            cookie_secure_for_origin_setting(&https, Some("true")),
+            Ok(true)
+        );
+        assert!(cookie_secure_for_origin_setting(&https, Some("false")).is_err());
+
+        let loopback = PortalPublicOrigin::parse("http://127.0.0.1:8080", true).unwrap();
+        assert_eq!(cookie_secure_for_origin_setting(&loopback, None), Ok(false));
+        assert_eq!(
+            cookie_secure_for_origin_setting(&loopback, Some("false")),
+            Ok(false)
+        );
+        assert!(cookie_secure_for_origin_setting(&loopback, Some("true")).is_err());
+        assert!(cookie_secure_for_origin_setting(&https, Some("yes")).is_err());
+    }
+
+    #[test]
+    fn upstream_rejects_userinfo_fragments_and_non_origins() {
+        for value in [
+            "https://user@api.example.test",
+            "https://@api.example.test",
+            "HTTPS://@api.example.test",
+            "https://api.example.test/#fragment",
+            "https://api.example.test/?query=1",
+            "https://api.example.test/base",
+        ] {
+            assert!(
+                UpstreamClient::new(value, true, false, true).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    async fn serve_one(listener: tokio::net::TcpListener, response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut stream, _) = listener.accept().await.expect("test client connects");
+        let mut request = vec![0_u8; 16 * 1024];
+        let length = stream
+            .read(&mut request)
+            .await
+            .expect("request is readable");
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("response is writable");
+        String::from_utf8_lossy(&request[..length]).into_owned()
+    }
+
+    fn canonical_test_session(fill: char, canonical_tail: char) -> String {
+        let mut payload = fill.to_string().repeat(42);
+        payload.push(canonical_tail);
+        format!("rys_{payload}")
+    }
+
+    #[tokio::test]
+    async fn loopback_upstream_bypasses_all_proxy_configuration() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target listener binds");
+        let target_address = target_listener
+            .local_addr()
+            .expect("target address is available");
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy listener binds");
+        let proxy_address = proxy_listener
+            .local_addr()
+            .expect("proxy address is available");
+        let target = tokio::spawn(serve_one(
+            target_listener,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+        ));
+        let configured_proxy = reqwest::Proxy::all(format!("http://{proxy_address}"))
+            .expect("test proxy URL is valid");
+        let client = UpstreamClient::new_with_http_builder(
+            &format!("http://{target_address}"),
+            true,
+            true,
+            false,
+            reqwest::Client::builder().proxy(configured_proxy),
+        )
+        .expect("loopback test upstream is allowed");
+        let session = canonical_test_session('A', 'A');
+
+        let response = client
+            .get("/direct", Some(&session))
+            .await
+            .expect("loopback request connects directly");
+
+        assert_eq!(response.status, 200);
+        let target_request = target.await.expect("target server completes");
+        assert!(
+            target_request
+                .to_ascii_lowercase()
+                .contains(&format!("x-ryuki-session-id: {session}")),
+            "the configured loopback upstream receives the session directly"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), proxy_listener.accept())
+                .await
+                .is_err(),
+            "neither ambient nor explicitly seeded proxies may receive a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_do_not_replay_the_session_credential() {
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect listener binds");
+        let redirect_address = redirect_listener
+            .local_addr()
+            .expect("redirect address is available");
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target listener binds");
+        let target_address = target_listener
+            .local_addr()
+            .expect("target address is available");
+        let redirect_response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let first_hop = tokio::spawn(serve_one(redirect_listener, redirect_response));
+
+        let client = UpstreamClient::new(&format!("http://{redirect_address}"), true, true, false)
+            .expect("loopback test upstream is allowed");
+        let session = canonical_test_session('A', 'A');
+        let response = client
+            .get("/redirect", Some(&session))
+            .await
+            .expect("redirect response is returned without following it");
+
+        assert_eq!(response.status, 302);
+        let first_request = first_hop.await.expect("first-hop server completes");
+        assert!(
+            first_request
+                .to_ascii_lowercase()
+                .contains(&format!("x-ryuki-session-id: {session}")),
+            "configured upstream receives the intended session header"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), target_listener.accept())
+                .await
+                .is_err(),
+            "redirect target must not receive any connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_response_is_rejected_before_buffering() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("test address is available");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_UPSTREAM_RESPONSE_BYTES + 1
+        );
+        let server = tokio::spawn(serve_one(listener, response));
+        let client = UpstreamClient::new(&format!("http://{address}"), true, true, false)
+            .expect("loopback test upstream is allowed");
+
+        let error = client
+            .get("/large", None)
+            .await
+            .expect_err("oversized response must fail closed");
+        assert_eq!(error.detail, "upstream response body exceeded limit");
+        server.await.expect("test server completes");
+    }
+
+    #[test]
     fn uuid_syntax_accepts_canonical_uuids_only() {
         assert!(is_uuid_syntax("3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b"));
         assert!(is_uuid_syntax("3F2B8D44-9C1A-4E5F-8A2B-1C9D3E4F5A6B"));
@@ -430,33 +909,132 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_parsing_extracts_validated_session_only() {
-        let session = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
-        let header = format!("theme=dark; ryuki_session={session}; other=1");
+    fn production_session_cookie_parser_accepts_only_one_host_cookie() {
+        let session = canonical_test_session('A', 'A');
+        let header = format!("theme=dark; {PORTAL_SESSION_COOKIE}={session}; other=1");
         assert_eq!(
-            session_id_from_cookie_header(&header),
-            Some(session.to_string())
+            session_id_from_cookie_header(&header, true),
+            Some(session.clone())
         );
         assert_eq!(
-            session_id_from_cookie_header("ryuki_session=not-a-uuid"),
-            None
+            session_id_from_cookie_header(
+                &format!("{PORTAL_SESSION_COOKIE}=3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b"),
+                true,
+            ),
+            None,
+            "legacy/admin UUID bearers must be rejected"
         );
-        assert_eq!(session_id_from_cookie_header("other=value"), None);
+        assert_eq!(
+            session_id_from_cookie_header(
+                &format!("{PORTAL_SESSION_COOKIE}=rys_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"),
+                true,
+            ),
+            None,
+            "non-canonical trailing bits must be rejected"
+        );
+        assert_eq!(session_id_from_cookie_header("other=value", true), None);
+        assert_eq!(
+            session_id_from_cookie_header(
+                &format!("{LOOPBACK_PORTAL_SESSION_COOKIE}={session}"),
+                true,
+            ),
+            None,
+            "production must not accept the old unprefixed singleton"
+        );
     }
 
     #[test]
-    fn portal_session_cookie_sets_security_attributes() {
-        let session = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
-        let cookie = portal_session_cookie(session, 86_400, false);
+    fn loopback_session_cookie_parser_accepts_only_one_legacy_cookie() {
+        let session = canonical_test_session('A', 'A');
         assert_eq!(
-            cookie,
+            session_id_from_cookie_header(
+                &format!("{LOOPBACK_PORTAL_SESSION_COOKIE}={session}"),
+                false,
+            ),
+            Some(session.clone())
+        );
+        assert_eq!(
+            session_id_from_cookie_header(&format!("{PORTAL_SESSION_COOKIE}={session}"), false,),
+            None,
+            "plain-HTTP loopback must not rely on a browser-rejected __Host- cookie"
+        );
+    }
+
+    #[test]
+    fn duplicate_session_cookies_reject_attacker_first_and_attacker_last() {
+        let victim = canonical_test_session('A', 'A');
+        let attacker = canonical_test_session('B', 'E');
+
+        for secure in [true, false] {
+            let name = portal_session_cookie_name(secure);
+            let attacker_first = format!("{name}={attacker}; {name}={victim}");
+            let attacker_last = format!("{name}={victim}; {name}={attacker}");
+            let malformed_first = format!("{name}=malformed; {name}={victim}");
+            let malformed_last = format!("{name}={victim}; {name}=malformed");
+            for header in [
+                attacker_first,
+                attacker_last,
+                malformed_first,
+                malformed_last,
+            ] {
+                assert_eq!(
+                    session_id_from_cookie_header(&header, secure),
+                    None,
+                    "duplicate credential cookies must fail closed: {header}"
+                );
+            }
+        }
+
+        let first_field = format!("{PORTAL_SESSION_COOKIE}={attacker}");
+        let second_field = format!("{PORTAL_SESSION_COOKIE}={victim}");
+        assert_eq!(
+            session_id_from_cookie_headers([first_field.as_str(), second_field.as_str()], true,),
+            None,
+            "duplicates split across Cookie header fields must also fail closed"
+        );
+    }
+
+    #[test]
+    fn old_and_new_session_cookie_names_are_ambiguous_in_either_order() {
+        let old = canonical_test_session('B', 'E');
+        let current = canonical_test_session('A', 'A');
+        let old_first =
+            format!("{LOOPBACK_PORTAL_SESSION_COOKIE}={old}; {PORTAL_SESSION_COOKIE}={current}");
+        let new_first =
+            format!("{PORTAL_SESSION_COOKIE}={current}; {LOOPBACK_PORTAL_SESSION_COOKIE}={old}");
+
+        for secure in [true, false] {
+            assert_eq!(session_id_from_cookie_header(&old_first, secure), None);
+            assert_eq!(session_id_from_cookie_header(&new_first, secure), None);
+        }
+    }
+
+    #[test]
+    fn portal_session_cookie_uses_host_prefix_except_on_loopback_http() {
+        let session = canonical_test_session('A', 'A');
+        let production = portal_session_cookie(&session, 86_400, true);
+        assert_eq!(
+            production,
+            format!(
+                "__Host-ryuki_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400; Secure"
+            )
+        );
+        assert!(!production.contains("Domain="));
+
+        let loopback = portal_session_cookie(&session, 86_400, false);
+        assert_eq!(
+            loopback,
             format!("ryuki_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
         );
-        assert!(portal_session_cookie(session, 86_400, true).ends_with("; Secure"));
+        assert!(!loopback.contains("; Secure"));
 
-        let cleared = portal_session_cookie("", 0, false);
-        assert!(cleared.starts_with("ryuki_session=;"));
+        let cleared = portal_session_cookie("", 0, true);
+        assert!(cleared.starts_with("__Host-ryuki_session=;"));
         assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.ends_with("; Secure"));
+        let loopback_cleared = portal_session_cookie("", 0, false);
+        assert!(loopback_cleared.starts_with("ryuki_session=;"));
+        assert!(loopback_cleared.contains("Max-Age=0"));
     }
 
     #[test]
@@ -466,7 +1044,41 @@ mod tests {
             cookie,
             "entra_login_csrf=binding-value; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"
         );
-        assert!(entra_login_binding_cookie("binding-value", true).ends_with("; Secure"));
+        let secure = entra_login_binding_cookie("binding-value", true);
+        assert!(secure.starts_with("__Host-entra_login_csrf=binding-value;"));
+        assert!(secure.ends_with("; Secure"));
+        assert!(!secure.contains("Domain="));
+    }
+
+    #[test]
+    fn entra_binding_cookie_rejects_matching_duplicates_across_fields() {
+        let first = "__Host-entra_login_csrf=first";
+        let second = "other=value; __Host-entra_login_csrf=second";
+        assert!(!entra_login_binding_cookie_headers_are_unambiguous(
+            [first, second],
+            true
+        ));
+        assert!(!entra_login_binding_cookie_headers_are_unambiguous(
+            ["__Host-entra_login_csrf=first; __Host-entra_login_csrf=second"],
+            true
+        ));
+    }
+
+    #[test]
+    fn entra_binding_cookie_name_is_selected_only_by_validated_origin_mode() {
+        assert!(entra_login_binding_cookie_headers_are_unambiguous(
+            ["entra_login_csrf=sibling-plant; __Host-entra_login_csrf=host-only"],
+            true
+        ));
+        assert!(entra_login_binding_cookie_headers_are_unambiguous(
+            ["__Host-entra_login_csrf=ignored; entra_login_csrf=loopback"],
+            false
+        ));
+        assert_eq!(
+            entra_login_binding_cookie_name(true),
+            "__Host-entra_login_csrf"
+        );
+        assert_eq!(entra_login_binding_cookie_name(false), "entra_login_csrf");
     }
 
     #[test]

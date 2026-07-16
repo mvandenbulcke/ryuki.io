@@ -25,9 +25,12 @@ A single Axum `idempotency_middleware` layer wraps the router:
 1. **Pass-through** when the request is not a mutating method, has no
    `Idempotency-Key` header, has no authenticated session, or no DB is
    configured — zero behavior change for every existing client.
-2. Buffer the request body and compute `fingerprint = sha256(method ++
-   path-and-query ++ body)` so a key reused with a *different* request — even
-   one differing only in query string — is detected.
+2. Buffer the request body and compute an authorized fingerprint from both the
+   request digest (`method`, path-and-query, body) and the server-derived
+   `AuthSession` authority digest. The authority digest binds the principal,
+   provider mode, actor class, token-validity state, and canonicalized role,
+   site-scope, and environment-scope sets. A key reused with a *different*
+   request or a differently authorized credential is therefore detected.
 3. **Atomically claim** the key for `(user_scope, key)`: `INSERT INTO
    idempotency_records (user_scope, key, fingerprint) … ON CONFLICT
    (user_scope, key) DO UPDATE … WHERE <the existing row is an abandoned
@@ -72,12 +75,45 @@ never collide with — or replay — another tenant's response, even if the key
 value is reused or leaked. An unauthenticated mutating request has no session
 and is not deduped (pass-through).
 
+The namespace intentionally remains principal-based, while the stored
+fingerprint is authorization-aware. Two API tokens may share the same
+`owner_principal`, but a role, site-scope, environment-scope, provider, actor
+class, or validity difference changes their fingerprint. Reusing the broader
+token's key with a narrower token therefore returns the different-request 422
+instead of replaying a response before the narrower token reaches its handler
+scope guard. A database-backed HTTP regression covers both site and environment
+attenuation for the canonical R01-MB-C226 path.
+
 ### Storage
 
 `idempotency_records (PRIMARY KEY (user_scope, key), fingerprint,
-response_status, response_body, created_at)`. `response_status`/`response_body`
-are NULL between the claim and the handler completing (the in-flight window the
-409 covers, and the window the TTL reclaim recovers).
+response_status, response_body, response_bytes, created_at)`.
+`response_status`/`response_body` are NULL between the claim and the handler
+completing (the in-flight window the 409 covers, and the window the TTL reclaim
+recovers). `response_bytes` is a generated exact UTF-8 octet count.
+
+### Principal fair-share admission
+
+A fresh key is admitted only while its server-derived principal retains both
+row and response-byte headroom: at most 10,000 live rows and 64 MiB of stored
+response octets. Admission holds a transaction-scoped advisory lock derived
+from the principal, so concurrent fresh keys cannot decide from the same stale
+aggregate. An in-flight row reserves the full 1 MiB response capture ceiling;
+sealing reconciles it to exact generated octets. Existing keys bypass fresh-key
+admission so replay, conflict, and stale same-request takeover remain available
+at quota. A claim or budget-store failure fails closed before the protected
+handler runs.
+
+### Writer-contract cutover
+
+Migration 162 adds a table trigger that requires every INSERT/UPDATE transaction
+to declare writer contract v2 and already hold the matching principal advisory
+lock. This prevents a pre-budget replica from persisting an unaccounted row.
+The checked-in Kubernetes `platform-api` Deployment nevertheless uses
+non-overlapping `Recreate`: pre-162 middleware failed open on a rejected claim,
+so the database fence is defense-in-depth and mixed-version request handling is
+not supported. Rendered production overlays must preserve that cutover for this
+migration.
 
 ## Slice plan
 
@@ -117,3 +153,12 @@ Clients that do not send `Idempotency-Key` get exactly today's behavior (a retry
 still duplicates) — idempotency is opt-in per request, the standard HTTP
 contract. The only handler change is the `no-store` header on one-time-secret
 responses (correct HTTP hardening, independent of this feature).
+
+The fingerprint does not bind a raw token UUID. Credentials with the same
+server-derived principal and identical effective authorization are deliberately
+replay-equivalent; this does not cross the delegated-token scope boundary in
+R01-MB-C226. The generic middleware also does not invent a version for mutable
+resource-specific policy that is absent from `AuthSession`. A future route whose
+response authorization can change without changing the bound session authority
+must opt out with `Cache-Control: no-store` or add an explicit route-level
+revalidation contract before it is eligible for replay.

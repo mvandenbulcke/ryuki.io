@@ -255,11 +255,20 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            platform: "defra".to_string(),
             job_spec_digest: ryuki_protocol::sha256_hex(b"job-spec"),
             approved_plan_digest: "abc123".to_string(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-test".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: None,
+            execution_authority: ryuki_protocol::LiveExecutionAuthority {
+                assigned_agent_id: "agent-test".to_string(),
+                assigned_agent_enrollment_id: Uuid::nil(),
+                assigned_agent_key_fingerprint: "sha256:test".to_string(),
+                execution_trust_profile_digest: ryuki_protocol::sha256_hex(b"profile"),
+            },
             signature: String::new(),
         };
         let signed = sign_vlc(unsigned, &key);

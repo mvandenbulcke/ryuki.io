@@ -168,8 +168,10 @@ pub async fn insert(
     let row: RestoreRequestRow = sqlx::query_as(&format!(
         "INSERT INTO restore_requests \
          (id, source_ci_key, restore_type, restore_point, target_site, target_environment, \
-          verification_plan, retention_need, owner, status, dry_run_plan, approver, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb) \
+          verification_plan, retention_need, owner, status, dry_run_plan, approver, metadata, \
+          authority_state, authority_reason) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, \
+                 'Verified', NULL) \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -335,6 +337,7 @@ pub async fn restore_test_recency(
          FROM restore_requests \
          WHERE ($1::text IS NULL OR target_site = $1) \
            AND ($2::text IS NULL OR target_environment = $2) \
+           AND authority_state = 'Verified' \
          GROUP BY source_ci_key \
          ORDER BY max(updated_at) FILTER (WHERE status IN ('Verified', 'Completed')) \
                   ASC NULLS FIRST, source_ci_key ASC",
@@ -366,6 +369,7 @@ pub async fn restore_test_recency(
 ///
 /// Executor-generic (`impl PgExecutor`) so it runs over a `&PgPool` or inside the
 /// `restore_overdue_scan` tick's `&mut *tx`.
+#[allow(dead_code)]
 pub async fn latest_failed_systems(
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<Vec<String>, sqlx::Error> {
@@ -382,6 +386,95 @@ pub async fn latest_failed_systems(
     .await
 }
 
+// ─── Bounded scheduler projection ──────────────────────────────────────────
+
+/// Repository-level ceiling for one restore scheduler page.  The scheduler
+/// passes the same value, while rejecting wider limits prevents a future caller
+/// from accidentally turning the helper back into a population-wide `fetch_all`.
+const MAX_SCHEDULER_SCAN_PAGE: i64 = 100;
+
+/// One durable protected-system authority tuple in a bounded restore scheduler
+/// page. The summary trigger owns its immutable `scan_seq` and exact recency /
+/// latest-status facts, so later history updates neither move it between pages
+/// nor force the scheduler to regroup the restore-request population.
+#[derive(sqlx::FromRow)]
+pub struct RestoreSchedulerScanRow {
+    pub scan_seq: i64,
+    pub source_ci_key: String,
+    pub site: String,
+    pub environment: String,
+    pub last_successful_test: Option<DateTime<Utc>>,
+    pub successful_test_count: i64,
+    pub total_requests: i64,
+    pub latest_status: String,
+    /// Any quarantined source row makes this authority tuple non-operational
+    /// until the legacy request is explicitly replanned.
+    pub authority_quarantined: bool,
+}
+
+/// Bound the current restore-request cycle by its largest visible sequence.
+/// Later sequence allocations wait for the next cycle; an earlier allocation
+/// that commits late is also recovered after the cursor resets on exhaustion.
+pub async fn scheduler_scan_high_water(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(MAX(scan_seq), 0) \
+         FROM restore_scheduler_system_summary",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Return at most `limit` distinct system/scope tuples in immutable first-seen
+/// order, strictly after `cursor_seq` and no later than the cycle high-water
+/// mark. Target site/environment are typed durable summary columns, not queue
+/// metadata. The query is a direct scan-sequence index page: no base-population
+/// GROUP BY, DISTINCT, or per-page history fan-out remains.
+pub async fn scheduler_scan_page(
+    executor: impl sqlx::PgExecutor<'_>,
+    cursor_seq: i64,
+    high_water_seq: i64,
+    limit: i64,
+) -> Result<Vec<RestoreSchedulerScanRow>, sqlx::Error> {
+    if cursor_seq < 0
+        || high_water_seq < cursor_seq
+        || !(1..=MAX_SCHEDULER_SCAN_PAGE).contains(&limit)
+    {
+        return Err(sqlx::Error::Protocol(
+            "restore scheduler page requires 0 <= cursor <= high-water and limit 1..=100"
+                .to_string(),
+        ));
+    }
+    sqlx::query_as(
+        "SELECT scan_seq, source_ci_key, target_site AS site, \
+                target_environment AS environment, last_successful_test, \
+                successful_test_count, total_requests, latest_status, \
+                EXISTS ( \
+                    SELECT 1 FROM restore_requests AS request \
+                    WHERE request.authority_state = 'Quarantined' \
+                      AND md5(request.source_ci_key) = md5(summary.source_ci_key) \
+                      AND md5(request.target_site) = md5(summary.target_site) \
+                      AND md5(request.target_environment) = md5(summary.target_environment) \
+                      AND request.source_ci_key COLLATE \"C\" = \
+                          summary.source_ci_key COLLATE \"C\" \
+                      AND request.target_site COLLATE \"C\" = \
+                          summary.target_site COLLATE \"C\" \
+                      AND request.target_environment COLLATE \"C\" = \
+                          summary.target_environment COLLATE \"C\" \
+                ) AS authority_quarantined \
+         FROM restore_scheduler_system_summary AS summary \
+         WHERE scan_seq > $1 AND scan_seq <= $2 \
+         ORDER BY scan_seq \
+         LIMIT $3",
+    )
+    .bind(cursor_seq)
+    .bind(high_water_seq)
+    .bind(limit)
+    .fetch_all(executor)
+    .await
+}
+
 /// Atomically transition a restore request to its new state IFF its current DB
 /// status still equals `expected_status` (optimistic lock). Returns `Ok(None)`
 /// when the row is absent or its status had already changed (caller → 409), or
@@ -390,6 +483,11 @@ pub async fn latest_failed_systems(
 ///
 /// All mutable columns are updated together with `status` so a single CAS write
 /// keeps all fields in sync. `updated_at` is set to NOW() by the DB.
+/// Every transition preserves the currently persisted `metadata.planned_by`.
+/// An `Approved` target has the additional atomic maker/checker predicate that
+/// this identity is nonempty and differs from the server-derived approver.
+/// Makerless legacy rows therefore fail closed instead of acquiring fabricated
+/// provenance.
 ///
 /// `_audit_action` is accepted for signature parity with the snapshots template
 /// but is intentionally unused — restore_requests have no audit table yet.
@@ -405,6 +503,7 @@ pub async fn transition(
 
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
     let approver: Option<&String> = r.metadata.get("approver");
+    let planned_by: Option<&String> = r.metadata.get("planned_by");
 
     let row: Option<RestoreRequestRow> = sqlx::query_as(&format!(
         "UPDATE restore_requests SET \
@@ -422,6 +521,20 @@ pub async fn transition(
          metadata = $13::jsonb, \
          updated_at = NOW() \
          WHERE id = $1 AND status = $14 \
+           AND authority_state = 'Verified' \
+           AND metadata->>'planned_by' IS NOT DISTINCT FROM $15 \
+           AND ( \
+             $10 NOT IN ('Approved', 'Locked', 'Executed', 'Verified', \
+                         'Completed', 'Failed') OR ( \
+               metadata->>'planned_by' IS NOT NULL \
+               AND btrim(metadata->>'planned_by') <> '' \
+               AND metadata->>'planned_by' = $15 \
+               AND $12 IS NOT NULL \
+               AND btrim($12) <> '' \
+               AND $12 = btrim($12) \
+               AND metadata->>'planned_by' <> $12 \
+             ) \
+           ) \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
@@ -438,6 +551,7 @@ pub async fn transition(
     .bind(approver)
     .bind(&meta)
     .bind(expected_status)
+    .bind(planned_by)
     .fetch_optional(executor)
     .await?;
 

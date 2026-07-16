@@ -29,13 +29,15 @@
 //!    a 1-byte presence tag (0x00 absent, 0x01 present) followed by the
 //!    length-prefixed value when present (see `write_opt_str`).
 //!
-//! 6. **Additive-optional fields (backward compatibility)** — `Option<Uuid>`
-//!    fields added to an EXISTING signed type after its first release (e.g.
-//!    `VerifiedLiveContext::step_job_id`, #42 slice A) use an ASYMMETRIC
+//! 6. **Additive-optional fields (backward compatibility)** — optional fields
+//!    added to an EXISTING signed type after its first release (e.g.
+//!    `VerifiedLiveContext::step_job_id`, #42 slice A, and
+//!    `SignedEnvelope::raw_plan_digest`) use an ASYMMETRIC
 //!    encoding instead of the presence-tag scheme in (5): `None` contributes
 //!    ZERO bytes; `Some` contributes `0x01 || length-prefixed value` (see
-//!    `write_opt_uuid`). This is deliberate and different from `Option<String>`
-//!    fields that were part of the type's ORIGINAL signable set (which use the
+//!    `write_opt_uuid` / `write_additive_opt_str`). This is deliberate and
+//!    different from optional fields that were part of the type's ORIGINAL
+//!    signable set (which use the
 //!    symmetric presence tag and, if added later, pair with a domain-separator
 //!    bump instead — see `SignedEnvelope::approved_plan_digest` / the `v1`→`v2`
 //!    bump). The asymmetric encoding exists SPECIFICALLY so that a value of
@@ -55,7 +57,9 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
-use crate::types::{JobMode, JobResultStatus, SignedEnvelope, VerifiedLiveContext};
+use crate::types::{
+    ExecutionTrustProfile, JobMode, JobResultStatus, SignedEnvelope, VerifiedLiveContext,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -114,6 +118,64 @@ fn write_opt_str(buf: &mut Vec<u8>, value: &Option<String>) {
     }
 }
 
+/// Append an additive `Option<String>` to the end of an existing signed layout.
+/// `None` contributes zero bytes so signatures issued before the field existed
+/// remain byte-for-byte valid; `Some` is unambiguous and signature-bound.
+#[inline]
+fn write_additive_opt_str(buf: &mut Vec<u8>, value: &Option<String>) {
+    if let Some(value) = value {
+        buf.push(0x01);
+        write_str(buf, value);
+    }
+}
+
+#[inline]
+fn write_opt_execution_trust_profile(buf: &mut Vec<u8>, value: &Option<ExecutionTrustProfile>) {
+    match value {
+        None => buf.push(0x00),
+        Some(profile) => {
+            buf.push(0x01);
+            write_str(buf, &execution_trust_profile_digest(profile));
+        }
+    }
+}
+
+/// Canonical, length-prefixed encoding of the non-secret execution trust
+/// profile. This deliberately never serializes backend HCL or credential data.
+pub fn execution_trust_profile_bytes(profile: &ExecutionTrustProfile) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    write_bytes(&mut buf, b"ryuki-v2/execution-trust-profile");
+    write_str(&mut buf, &profile.schema_version);
+    write_str(&mut buf, &profile.allowlist_version);
+    write_str(&mut buf, &profile.platform);
+    write_str(&mut buf, &profile.offering);
+    write_str(&mut buf, &profile.runner_kind);
+    write_str(&mut buf, &profile.provider_source);
+    write_str(&mut buf, &profile.provider_version);
+    write_str(&mut buf, &profile.provider_authority_id);
+    write_str(&mut buf, &profile.provider_authority_version);
+    write_str(&mut buf, &profile.backend_kind);
+    write_str(&mut buf, &profile.backend_credential_authority_id);
+    write_str(&mut buf, &profile.backend_credential_authority_revision);
+    write_str(&mut buf, &profile.backend_authority_digest);
+    write_str(&mut buf, &profile.executable_kind);
+    write_str(&mut buf, &profile.executable_path);
+    write_str(&mut buf, &profile.executable_version);
+    write_opt_str(&mut buf, &profile.executable_sha256);
+    write_str(&mut buf, &profile.executable_provenance_policy_version);
+    write_str(&mut buf, &profile.provider_credential_authority_mode);
+    write_str(&mut buf, &profile.backend_credential_authority_mode);
+    write_str(&mut buf, &profile.containment_policy_version);
+    write_str(&mut buf, &profile.iac_digest);
+    write_str(&mut buf, &profile.state_key);
+    buf
+}
+
+/// SHA-256 of [`execution_trust_profile_bytes`].
+pub fn execution_trust_profile_digest(profile: &ExecutionTrustProfile) -> String {
+    sha256_hex(&execution_trust_profile_bytes(profile))
+}
+
 /// Append an `Option<Uuid>` to the VLC signing buffer using the established
 /// asymmetric step-binding encoding:
 ///
@@ -163,29 +225,106 @@ fn result_status_label(status: &JobResultStatus) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical byte encoding — agent enrollment proof of possession
+// ---------------------------------------------------------------------------
+
+/// Returns the canonical bytes signed by an agent when consuming a trusted,
+/// preprovisioned enrollment challenge.
+///
+/// The challenge is a one-time bootstrap credential, while the existing
+/// Ed25519 key remains the durable workload identity. Binding both here means
+/// a leaked agent id cannot be squatted and a stolen challenge cannot be used
+/// with a substituted key. The v1 domain is independent of all job/result
+/// signing domains, so an enrollment signature cannot be replayed elsewhere.
+pub fn signing_bytes_agent_enrollment_proof(
+    challenge_id: uuid::Uuid,
+    challenge: &str,
+    agent_id: &str,
+    platform: &str,
+    public_key: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(320);
+    write_bytes(&mut buf, b"ryuki-v1/agent-enrollment-proof");
+    write_str(&mut buf, &challenge_id.hyphenated().to_string());
+    write_str(&mut buf, challenge);
+    write_str(&mut buf, agent_id);
+    write_str(&mut buf, platform);
+    write_str(&mut buf, public_key);
+    buf
+}
+
+/// Sign a one-time enrollment claim with the agent's existing workload key.
+pub fn sign_agent_enrollment_proof(
+    challenge_id: uuid::Uuid,
+    challenge: &str,
+    agent_id: &str,
+    platform: &str,
+    public_key: &str,
+    key: &SigningKey,
+) -> String {
+    let bytes = signing_bytes_agent_enrollment_proof(
+        challenge_id,
+        challenge,
+        agent_id,
+        platform,
+        public_key,
+    );
+    B64.encode(key.sign(&bytes).to_bytes())
+}
+
+/// Verify an enrollment proof against the exact preprovisioned workload key.
+pub fn verify_agent_enrollment_proof(
+    challenge_id: uuid::Uuid,
+    challenge: &str,
+    agent_id: &str,
+    platform: &str,
+    public_key: &str,
+    signature: &str,
+    key: &VerifyingKey,
+) -> Result<(), VerifyError> {
+    let raw = B64.decode(signature)?;
+    let sig_bytes: [u8; 64] = raw
+        .try_into()
+        .map_err(|v: Vec<u8>| VerifyError::BadSignatureLength(v.len()))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let bytes = signing_bytes_agent_enrollment_proof(
+        challenge_id,
+        challenge,
+        agent_id,
+        platform,
+        public_key,
+    );
+    key.verify_strict(&bytes, &signature)
+        .map_err(|_| VerifyError::InvalidSignature)
+}
+
+// ---------------------------------------------------------------------------
 // Canonical byte encoding — SignedEnvelope
 // ---------------------------------------------------------------------------
 
 /// Returns the canonical bytes that are signed / verified for a
 /// [`SignedEnvelope`].  The `signature` field is intentionally excluded.
 ///
-/// **Domain separator**: `ryuki-v2/signed-envelope`
-/// (bumped from v1 when `result_id` was added to the signable set — old v1
-/// signatures cannot be confused with new v2 signatures).
+/// **Domain separator**: `ryuki-v4/signed-envelope`
+/// (bumped from v3 when the immutable agent-enrollment UUID was added).
 ///
-/// Field order (fixed; any change requires another version bump):
-/// domain, agent_id, platform, job_id, attempt_id, lease_generation,
+/// Field order (fixed; except for an explicitly asymmetric trailing optional,
+/// any change requires another version bump):
+/// domain, agent_id, agent_enrollment_id, platform, job_id, attempt_id, lease_generation,
 /// request_id, result_id, mode, status, job_spec_digest, approved_plan_digest,
-/// evidence_digest, redaction_policy_version, timestamp, key_id, cp_nonce.
+/// execution_trust_profile, evidence_digest, redaction_policy_version,
+/// timestamp, key_id, cp_nonce, raw_plan_digest (additive-optional trailing
+/// field).
 pub fn signing_bytes(env: &SignedEnvelope) -> Vec<u8> {
     // Pre-allocate a generous buffer to avoid repeated reallocations.
     let mut buf: Vec<u8> = Vec::with_capacity(512);
 
     // Domain separator — prevents cross-type signature replay and distinguishes
-    // v2 (result_id-bound) envelopes from v1 envelopes.
-    write_bytes(&mut buf, b"ryuki-v2/signed-envelope");
+    // v4 enrollment-bound envelopes cannot be confused with legacy v3 results.
+    write_bytes(&mut buf, b"ryuki-v4/signed-envelope");
 
     write_str(&mut buf, &env.agent_id);
+    write_str(&mut buf, &env.agent_enrollment_id.hyphenated().to_string());
     write_str(&mut buf, &env.platform);
     write_str(&mut buf, &env.job_id.hyphenated().to_string());
     write_str(&mut buf, &env.attempt_id.hyphenated().to_string());
@@ -197,11 +336,13 @@ pub fn signing_bytes(env: &SignedEnvelope) -> Vec<u8> {
     write_str(&mut buf, result_status_label(&env.status));
     write_str(&mut buf, &env.job_spec_digest);
     write_opt_str(&mut buf, &env.approved_plan_digest);
+    write_opt_execution_trust_profile(&mut buf, &env.execution_trust_profile);
     write_str(&mut buf, &env.evidence_digest);
     write_str(&mut buf, &env.redaction_policy_version);
     write_str(&mut buf, &datetime_bytes(&env.timestamp));
     write_str(&mut buf, &env.key_id);
     write_str(&mut buf, &env.cp_nonce);
+    write_additive_opt_str(&mut buf, &env.raw_plan_digest);
 
     buf
 }
@@ -244,22 +385,44 @@ pub fn verify(envelope: &SignedEnvelope, vk: &VerifyingKey) -> Result<(), Verify
 /// Returns the canonical bytes for a [`VerifiedLiveContext`].
 ///
 /// Field order (fixed):
-/// domain, request_id, job_spec_digest, approved_plan_digest, approver, expiry,
-/// step_job_id.
+/// domain, request_id, platform, job_spec_digest, approved_plan_digest,
+/// approved plan job/attempt, approver, expiry, step_job_id, assigned
+/// agent/enrollment/key/profile.
 ///
-/// The v2 domain makes the new required `job_spec_digest` an explicit protocol
-/// boundary: a v1 grant cannot authorize a v2 live mutation. `step_job_id`
-/// retains its asymmetric optional encoding within this new domain.
+/// The v6 domain makes exact immutable plan-row identity an explicit protocol
+/// boundary: a legacy digest-only grant cannot authorize a v6 live mutation.
 pub fn signing_bytes_vlc(ctx: &VerifiedLiveContext) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
 
-    write_bytes(&mut buf, b"ryuki-v2/verified-live-context");
+    write_bytes(&mut buf, b"ryuki-v6/verified-live-context");
     write_str(&mut buf, &ctx.request_id.hyphenated().to_string());
+    write_str(&mut buf, &ctx.platform);
     write_str(&mut buf, &ctx.job_spec_digest);
     write_str(&mut buf, &ctx.approved_plan_digest);
+    write_str(&mut buf, &ctx.approved_plan_job_id.hyphenated().to_string());
+    write_str(
+        &mut buf,
+        &ctx.approved_plan_attempt_id.hyphenated().to_string(),
+    );
     write_str(&mut buf, &ctx.approver);
     write_str(&mut buf, &datetime_bytes(&ctx.expiry));
     write_opt_uuid(&mut buf, &ctx.step_job_id);
+    write_str(&mut buf, &ctx.execution_authority.assigned_agent_id);
+    write_str(
+        &mut buf,
+        &ctx.execution_authority
+            .assigned_agent_enrollment_id
+            .hyphenated()
+            .to_string(),
+    );
+    write_str(
+        &mut buf,
+        &ctx.execution_authority.assigned_agent_key_fingerprint,
+    );
+    write_str(
+        &mut buf,
+        &ctx.execution_authority.execution_trust_profile_digest,
+    );
 
     buf
 }
@@ -310,6 +473,13 @@ pub fn decode_verifying_key(s: &str) -> Result<VerifyingKey, VerifyError> {
     VerifyingKey::from_bytes(&bytes).map_err(|e| VerifyError::KeyMaterial(e.to_string()))
 }
 
+/// Stable non-secret fingerprint used by enrollment review and live grants.
+/// It intentionally matches the control plane's historical fingerprint of the
+/// canonical base64 wire key, rather than silently changing that identity.
+pub fn public_key_fingerprint(public_key: &str) -> String {
+    format!("sha256:{}", sha256_hex(public_key.trim().as_bytes()))
+}
+
 // ---------------------------------------------------------------------------
 // Digest helpers (SHA-256)
 // ---------------------------------------------------------------------------
@@ -321,6 +491,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+/// Return whether `value` is the canonical lowercase hexadecimal encoding of
+/// one SHA-256 digest.
+pub fn sha256_digest_is_canonical(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Compute the canonical `JobSpec` digest: SHA-256 over its JSON serialisation.
@@ -350,6 +529,7 @@ mod tests {
     fn make_envelope(key: &SigningKey) -> SignedEnvelope {
         let unsigned = SignedEnvelope {
             agent_id: "defra-vcenter-01".to_string(),
+            agent_enrollment_id: Uuid::new_v4(),
             platform: "defra".to_string(),
             job_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
@@ -360,6 +540,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: sha256_hex(b"spec-bytes"),
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: sha256_hex(b"evidence-bytes"),
             redaction_policy_version: crate::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -370,14 +552,62 @@ mod tests {
         sign(unsigned, key)
     }
 
+    fn test_execution_authority() -> LiveExecutionAuthority {
+        LiveExecutionAuthority {
+            assigned_agent_id: "agent-test".to_string(),
+            assigned_agent_enrollment_id: Uuid::nil(),
+            assigned_agent_key_fingerprint: "sha256:test".to_string(),
+            execution_trust_profile_digest: sha256_hex(b"profile"),
+        }
+    }
+
+    fn test_execution_trust_profile() -> ExecutionTrustProfile {
+        ExecutionTrustProfile {
+            schema_version: EXECUTION_TRUST_PROFILE_SCHEMA_VERSION.to_string(),
+            allowlist_version: EXECUTION_TRUST_PROFILE_ALLOWLIST_VERSION.to_string(),
+            platform: "defra".to_string(),
+            offering: "linux-server-deployment".to_string(),
+            runner_kind: "terraform".to_string(),
+            provider_source: "registry.terraform.io/vmware/vsphere".to_string(),
+            provider_version: "2.16.1".to_string(),
+            provider_authority_id: "provider-authority/vsphere/test-fixture".to_string(),
+            provider_authority_version: "v1".to_string(),
+            backend_kind: "local".to_string(),
+            backend_credential_authority_id:
+                "backend-credential-authority/local/test-fixture".to_string(),
+            backend_credential_authority_revision: "v1".to_string(),
+            backend_authority_digest: sha256_hex(b"backend-authority"),
+            executable_kind: "terraform".to_string(),
+            executable_path: "/usr/local/bin/terraform".to_string(),
+            executable_version: "1.13.0".to_string(),
+            executable_sha256: None,
+            executable_provenance_policy_version:
+                EXECUTABLE_PROVENANCE_POLICY_VERSION.to_string(),
+            provider_credential_authority_mode:
+                PROVIDER_CREDENTIAL_AUTHORITY_MODE.to_string(),
+            backend_credential_authority_mode:
+                "ryuki.closed-schema-inline-scalars-no-file-ambient-metadata-cli-workload-in-cluster-no-remote-execution.v1"
+                    .to_string(),
+            containment_policy_version:
+                "per-command-attach-before-exec-kill-all-wait-empty-v1+ryuki.terraform-isolated-state-key.v1"
+                    .to_string(),
+            iac_digest: sha256_hex(b"iac"),
+            state_key: "request-test".to_string(),
+        }
+    }
+
     fn make_vlc(key: &SigningKey) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: None,
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         sign_vlc(unsigned, key)
@@ -461,15 +691,152 @@ mod tests {
     #[test]
     fn roundtrip_agent_registration() {
         let key = generate_keypair(&mut OsRng);
+        let challenge_id = Uuid::new_v4();
+        let challenge = "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let agent_id = "gblon-proxmox-01";
+        let platform = "gblon";
+        let public_key = encode_verifying_key(&key.verifying_key());
         let reg = AgentRegistration {
-            agent_id: "gblon-proxmox-01".to_string(),
-            platform: "gblon".to_string(),
+            enrollment_challenge_id: challenge_id,
+            enrollment_challenge: challenge.to_string(),
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
             capabilities: Capabilities::default(),
-            public_key: encode_verifying_key(&key.verifying_key()),
+            public_key: public_key.clone(),
+            enrollment_proof: sign_agent_enrollment_proof(
+                challenge_id,
+                challenge,
+                agent_id,
+                platform,
+                &public_key,
+                &key,
+            ),
         };
         let json = serde_json::to_string(&reg).unwrap();
         let decoded: AgentRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(reg, decoded);
+        let debug = format!("{reg:?}");
+        assert!(!debug.contains(challenge));
+        assert!(!debug.contains(&reg.enrollment_proof));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn enrollment_proof_binds_challenge_identity_platform_and_key() {
+        let key = generate_keypair(&mut OsRng);
+        let other_key = generate_keypair(&mut OsRng);
+        let challenge_id = Uuid::new_v4();
+        let challenge = "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let public_key = encode_verifying_key(&key.verifying_key());
+        let signature = sign_agent_enrollment_proof(
+            challenge_id,
+            challenge,
+            "agent-01",
+            "site-a",
+            &public_key,
+            &key,
+        );
+
+        verify_agent_enrollment_proof(
+            challenge_id,
+            challenge,
+            "agent-01",
+            "site-a",
+            &public_key,
+            &signature,
+            &key.verifying_key(),
+        )
+        .expect("the exact admitted identity must verify");
+
+        for changed in [
+            (
+                Uuid::new_v4(),
+                challenge,
+                "agent-01",
+                "site-a",
+                public_key.as_str(),
+            ),
+            (
+                challenge_id,
+                "ryc_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "agent-01",
+                "site-a",
+                public_key.as_str(),
+            ),
+            (
+                challenge_id,
+                challenge,
+                "agent-02",
+                "site-a",
+                public_key.as_str(),
+            ),
+            (
+                challenge_id,
+                challenge,
+                "agent-01",
+                "site-b",
+                public_key.as_str(),
+            ),
+            (
+                challenge_id,
+                challenge,
+                "agent-01",
+                "site-a",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ),
+        ] {
+            assert!(
+                verify_agent_enrollment_proof(
+                    changed.0,
+                    changed.1,
+                    changed.2,
+                    changed.3,
+                    changed.4,
+                    &signature,
+                    &key.verifying_key(),
+                )
+                .is_err(),
+                "changing any enrollment field must invalidate the proof"
+            );
+        }
+        assert!(
+            verify_agent_enrollment_proof(
+                challenge_id,
+                challenge,
+                "agent-01",
+                "site-a",
+                &public_key,
+                &signature,
+                &other_key.verifying_key(),
+            )
+            .is_err(),
+            "a different workload key must not verify the proof"
+        );
+    }
+
+    #[test]
+    fn enrollment_proof_encoding_is_length_prefixed_and_domain_separated() {
+        let challenge_id = Uuid::nil();
+        let a = signing_bytes_agent_enrollment_proof(challenge_id, "ab", "c", "site", "key");
+        let b = signing_bytes_agent_enrollment_proof(challenge_id, "a", "bc", "site", "key");
+        assert_ne!(a, b, "adjacent enrollment fields must not be ambiguous");
+        assert_ne!(
+            a,
+            signing_bytes_vlc(&VerifiedLiveContext {
+                request_id: challenge_id,
+                platform: "defra".to_owned(),
+                job_spec_digest: "ab".to_owned(),
+                approved_plan_digest: "c".to_owned(),
+                approved_plan_job_id: Uuid::new_v4(),
+                approved_plan_attempt_id: Uuid::new_v4(),
+                approver: "site".to_owned(),
+                expiry: Utc::now(),
+                step_job_id: None,
+                execution_authority: test_execution_authority(),
+                signature: String::new(),
+            }),
+            "enrollment proofs must not share another protocol signing domain"
+        );
     }
 
     #[test]
@@ -556,6 +923,7 @@ mod tests {
         let vlc = make_vlc(&key);
         let job = Job {
             id: job_id,
+            agent_enrollment_id: Uuid::new_v4(),
             platform: "defra".to_string(),
             spec,
             status: JobStatus::Leased,
@@ -582,6 +950,7 @@ mod tests {
             attempt_id: env.attempt_id,
             result_id: env.result_id,
             status: JobResultStatus::Applied,
+            raw_plan_digest: env.raw_plan_digest.clone(),
             evidence_digest: env.evidence_digest.clone(),
             signed_envelope: env,
         };
@@ -621,6 +990,81 @@ mod tests {
     }
 
     #[test]
+    fn absent_raw_plan_digest_preserves_legacy_v4_signing_bytes() {
+        let key = generate_keypair(&mut OsRng);
+        let env = make_envelope(&key);
+        assert!(env.raw_plan_digest.is_none());
+
+        let mut legacy_bytes = Vec::new();
+        write_bytes(&mut legacy_bytes, b"ryuki-v4/signed-envelope");
+        write_str(&mut legacy_bytes, &env.agent_id);
+        write_str(
+            &mut legacy_bytes,
+            &env.agent_enrollment_id.hyphenated().to_string(),
+        );
+        write_str(&mut legacy_bytes, &env.platform);
+        write_str(&mut legacy_bytes, &env.job_id.hyphenated().to_string());
+        write_str(&mut legacy_bytes, &env.attempt_id.hyphenated().to_string());
+        write_u64(&mut legacy_bytes, env.lease_generation);
+        write_str(&mut legacy_bytes, &env.request_id.hyphenated().to_string());
+        write_str(&mut legacy_bytes, &env.result_id.hyphenated().to_string());
+        write_str(&mut legacy_bytes, mode_label(&env.mode));
+        write_str(&mut legacy_bytes, result_status_label(&env.status));
+        write_str(&mut legacy_bytes, &env.job_spec_digest);
+        write_opt_str(&mut legacy_bytes, &env.approved_plan_digest);
+        write_opt_execution_trust_profile(&mut legacy_bytes, &env.execution_trust_profile);
+        write_str(&mut legacy_bytes, &env.evidence_digest);
+        write_str(&mut legacy_bytes, &env.redaction_policy_version);
+        write_str(&mut legacy_bytes, &datetime_bytes(&env.timestamp));
+        write_str(&mut legacy_bytes, &env.key_id);
+        write_str(&mut legacy_bytes, &env.cp_nonce);
+
+        assert_eq!(signing_bytes(&env), legacy_bytes);
+    }
+
+    #[test]
+    fn legacy_v3_envelope_signature_is_rejected_by_the_v4_domain() {
+        let key = generate_keypair(&mut OsRng);
+        let mut legacy = make_envelope(&key);
+        legacy.signature.clear();
+
+        // Reconstruct the complete v3 layout: it predates the immutable
+        // enrollment UUID and uses its own domain separator. A genuine old
+        // signature must never be reinterpreted as a v4 enrollment-bound one.
+        let mut legacy_bytes = Vec::new();
+        write_bytes(&mut legacy_bytes, b"ryuki-v3/signed-envelope");
+        write_str(&mut legacy_bytes, &legacy.agent_id);
+        write_str(&mut legacy_bytes, &legacy.platform);
+        write_str(&mut legacy_bytes, &legacy.job_id.hyphenated().to_string());
+        write_str(
+            &mut legacy_bytes,
+            &legacy.attempt_id.hyphenated().to_string(),
+        );
+        write_u64(&mut legacy_bytes, legacy.lease_generation);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.request_id.hyphenated().to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.result_id.hyphenated().to_string(),
+        );
+        write_str(&mut legacy_bytes, mode_label(&legacy.mode));
+        write_str(&mut legacy_bytes, result_status_label(&legacy.status));
+        write_str(&mut legacy_bytes, &legacy.job_spec_digest);
+        write_opt_str(&mut legacy_bytes, &legacy.approved_plan_digest);
+        write_opt_execution_trust_profile(&mut legacy_bytes, &legacy.execution_trust_profile);
+        write_str(&mut legacy_bytes, &legacy.evidence_digest);
+        write_str(&mut legacy_bytes, &legacy.redaction_policy_version);
+        write_str(&mut legacy_bytes, &datetime_bytes(&legacy.timestamp));
+        write_str(&mut legacy_bytes, &legacy.key_id);
+        write_str(&mut legacy_bytes, &legacy.cp_nonce);
+
+        legacy.signature = B64.encode(key.sign(&legacy_bytes).to_bytes());
+        assert!(verify(&legacy, &key.verifying_key()).is_err());
+    }
+
+    #[test]
     fn sign_verify_vlc_succeeds() {
         let key = generate_keypair(&mut OsRng);
         let vlc = make_vlc(&key);
@@ -652,6 +1096,11 @@ mod tests {
     #[test]
     fn tamper_agent_id_fails() {
         tamper_envelope!(agent_id, "attacker-agent".to_string());
+    }
+
+    #[test]
+    fn tamper_agent_enrollment_id_fails() {
+        tamper_envelope!(agent_enrollment_id, Uuid::new_v4());
     }
 
     #[test]
@@ -700,6 +1149,23 @@ mod tests {
     }
 
     #[test]
+    fn tamper_raw_plan_digest_fails() {
+        let key = generate_keypair(&mut OsRng);
+        let mut unsigned = make_envelope(&key);
+        unsigned.signature.clear();
+        unsigned.mode = JobMode::LivePlan;
+        unsigned.status = JobResultStatus::Planned;
+        unsigned.raw_plan_digest = Some(sha256_hex(b"canonical-raw-plan"));
+        let mut envelope = sign(unsigned, &key);
+        envelope.raw_plan_digest = Some(sha256_hex(b"different-raw-plan"));
+
+        assert!(
+            verify(&envelope, &key.verifying_key()).is_err(),
+            "the raw plan commitment must be signature-bound"
+        );
+    }
+
+    #[test]
     fn tamper_redaction_policy_version_fails() {
         tamper_envelope!(redaction_policy_version, "9.9.9".to_string());
     }
@@ -717,6 +1183,79 @@ mod tests {
         tamper_envelope!(cp_nonce, "forged-nonce".to_string());
     }
 
+    #[test]
+    fn execution_trust_profile_digest_is_deterministic_and_binds_policy() {
+        let profile = test_execution_trust_profile();
+        assert_eq!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&profile.clone())
+        );
+        let mut mutated = profile.clone();
+        mutated.containment_policy_version = "different-containment-v1".to_string();
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+        let mut mutated = profile.clone();
+        mutated.backend_credential_authority_mode = "ambient-default-chain".to_string();
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+        let mut mutated = profile.clone();
+        mutated.backend_credential_authority_id =
+            "backend-credential-authority/local/other-fixture".to_string();
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+        let mut mutated = profile.clone();
+        mutated.backend_credential_authority_revision = "v2".to_string();
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+        let mut mutated = profile.clone();
+        mutated.provider_authority_version = "v2".to_string();
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+        let mut mutated = profile.clone();
+        mutated.backend_authority_digest = sha256_hex(b"other-backend-authority");
+        assert_ne!(
+            execution_trust_profile_digest(&profile),
+            execution_trust_profile_digest(&mutated)
+        );
+    }
+
+    #[test]
+    fn tamper_signed_execution_trust_profile_fails() {
+        let key = generate_keypair(&mut OsRng);
+        let mut unsigned = make_envelope(&key);
+        unsigned.signature.clear();
+        unsigned.execution_trust_profile = Some(test_execution_trust_profile());
+        let mut signed = sign(unsigned, &key);
+        signed
+            .execution_trust_profile
+            .as_mut()
+            .expect("profile")
+            .backend_kind = "s3".to_string();
+        assert!(verify(&signed, &key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn tamper_vlc_plan_owner_or_profile_fails() {
+        let key = generate_keypair(&mut OsRng);
+        let mut grant = make_vlc(&key);
+        grant.execution_authority.assigned_agent_enrollment_id = Uuid::new_v4();
+        assert!(verify_vlc(&grant, &key.verifying_key()).is_err());
+
+        let mut grant = make_vlc(&key);
+        grant.execution_authority.execution_trust_profile_digest = sha256_hex(b"other");
+        assert!(verify_vlc(&grant, &key.verifying_key()).is_err());
+    }
+
     /// Mutating `result_id` after signing must cause verification to fail.
     /// This proves the idempotency key is bound by the signature (fix for
     /// HIGH finding: result_id was previously unsigned and therefore forgeable).
@@ -731,6 +1270,7 @@ mod tests {
         let key = generate_keypair(&mut OsRng);
         let unsigned = SignedEnvelope {
             agent_id: "a".to_string(),
+            agent_enrollment_id: Uuid::new_v4(),
             platform: "p".to_string(),
             job_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
@@ -741,6 +1281,8 @@ mod tests {
             status: JobResultStatus::Applied,
             job_spec_digest: sha256_hex(b"s"),
             approved_plan_digest: Some(sha256_hex(b"plan")),
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: sha256_hex(b"ev"),
             redaction_policy_version: crate::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -752,6 +1294,15 @@ mod tests {
         env.approved_plan_digest = Some(sha256_hex(b"forged-plan"));
         let vk = key.verifying_key();
         assert!(verify(&env, &vk).is_err(), "tampered plan digest must fail");
+    }
+
+    #[test]
+    fn canonical_sha256_digest_requires_lowercase_exact_width() {
+        assert!(sha256_digest_is_canonical(&sha256_hex(b"input")));
+        assert!(!sha256_digest_is_canonical(&"A".repeat(64)));
+        assert!(!sha256_digest_is_canonical(&"0".repeat(63)));
+        assert!(!sha256_digest_is_canonical(&"0".repeat(65)));
+        assert!(!sha256_digest_is_canonical(&format!("{}g", "0".repeat(63))));
     }
 
     // -----------------------------------------------------------------------
@@ -803,6 +1354,11 @@ mod tests {
     }
 
     #[test]
+    fn tamper_vlc_platform_fails() {
+        tamper_vlc!(platform, "another-platform".to_string());
+    }
+
+    #[test]
     fn tamper_vlc_job_spec_digest_fails() {
         tamper_vlc!(job_spec_digest, sha256_hex(b"different-job-spec"));
     }
@@ -810,6 +1366,16 @@ mod tests {
     #[test]
     fn tamper_vlc_approved_plan_digest_fails() {
         tamper_vlc!(approved_plan_digest, sha256_hex(b"forged"));
+    }
+
+    #[test]
+    fn tamper_vlc_approved_plan_job_id_fails() {
+        tamper_vlc!(approved_plan_job_id, Uuid::new_v4());
+    }
+
+    #[test]
+    fn tamper_vlc_approved_plan_attempt_id_fails() {
+        tamper_vlc!(approved_plan_attempt_id, Uuid::new_v4());
     }
 
     #[test]
@@ -823,41 +1389,144 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v2 grant layout and step binding
+    // v6 grant layout, legacy fencing, and step binding
     // -----------------------------------------------------------------------
 
-    /// Pin the v2 signing layout, including the exact JobSpec digest binding.
+    /// Pin the v6 signing layout, including exact plan-row and execution authority.
     #[test]
-    fn vlc_v2_signing_bytes_bind_job_spec_digest() {
+    fn vlc_v6_signing_bytes_bind_exact_plan_and_execution_authority() {
         let request_id = Uuid::new_v4();
+        let platform = "defra".to_string();
         let job_spec_digest = sha256_hex(b"job-spec");
         let approved_plan_digest = sha256_hex(b"plan-bytes");
+        let approved_plan_job_id = Uuid::new_v4();
+        let approved_plan_attempt_id = Uuid::new_v4();
         let approver = "ops-alice".to_string();
         let expiry = Utc::now() + chrono::Duration::hours(1);
 
         let vlc = VerifiedLiveContext {
             request_id,
+            platform: platform.clone(),
             job_spec_digest: job_spec_digest.clone(),
             approved_plan_digest: approved_plan_digest.clone(),
+            approved_plan_job_id,
+            approved_plan_attempt_id,
             approver: approver.clone(),
             expiry,
             step_job_id: None,
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
 
-        // Hand-roll the canonical v2 field order to catch accidental drift.
+        // Hand-roll the canonical v6 field order to catch accidental drift.
         let mut baseline: Vec<u8> = Vec::new();
-        write_bytes(&mut baseline, b"ryuki-v2/verified-live-context");
+        write_bytes(&mut baseline, b"ryuki-v6/verified-live-context");
         write_str(&mut baseline, &request_id.hyphenated().to_string());
+        write_str(&mut baseline, &platform);
         write_str(&mut baseline, &job_spec_digest);
         write_str(&mut baseline, &approved_plan_digest);
+        write_str(
+            &mut baseline,
+            &approved_plan_job_id.hyphenated().to_string(),
+        );
+        write_str(
+            &mut baseline,
+            &approved_plan_attempt_id.hyphenated().to_string(),
+        );
         write_str(&mut baseline, &approver);
         write_str(&mut baseline, &datetime_bytes(&expiry));
+        write_opt_uuid(&mut baseline, &vlc.step_job_id);
+        write_str(&mut baseline, &vlc.execution_authority.assigned_agent_id);
+        write_str(
+            &mut baseline,
+            &vlc.execution_authority
+                .assigned_agent_enrollment_id
+                .hyphenated()
+                .to_string(),
+        );
+        write_str(
+            &mut baseline,
+            &vlc.execution_authority.assigned_agent_key_fingerprint,
+        );
+        write_str(
+            &mut baseline,
+            &vlc.execution_authority.execution_trust_profile_digest,
+        );
 
         assert_eq!(
             signing_bytes_vlc(&vlc),
             baseline,
-            "v2 signing bytes must include the exact JobSpec digest"
+            "v6 signing bytes must include the exact plan row, destination, spec, and authority"
+        );
+    }
+
+    #[test]
+    fn legacy_v5_digest_only_vlc_signature_is_rejected_by_the_v6_domain() {
+        let key = generate_keypair(&mut OsRng);
+        let mut legacy = make_vlc(&key);
+        let mut legacy_bytes = Vec::new();
+        write_bytes(&mut legacy_bytes, b"ryuki-v5/verified-live-context");
+        write_str(
+            &mut legacy_bytes,
+            &legacy.request_id.hyphenated().to_string(),
+        );
+        write_str(&mut legacy_bytes, &legacy.platform);
+        write_str(&mut legacy_bytes, &legacy.job_spec_digest);
+        write_str(&mut legacy_bytes, &legacy.approved_plan_digest);
+        write_str(&mut legacy_bytes, &legacy.approver);
+        write_str(&mut legacy_bytes, &datetime_bytes(&legacy.expiry));
+        write_opt_uuid(&mut legacy_bytes, &legacy.step_job_id);
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_id,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy
+                .execution_authority
+                .assigned_agent_enrollment_id
+                .hyphenated()
+                .to_string(),
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.assigned_agent_key_fingerprint,
+        );
+        write_str(
+            &mut legacy_bytes,
+            &legacy.execution_authority.execution_trust_profile_digest,
+        );
+        legacy.signature = B64.encode(key.sign(&legacy_bytes).to_bytes());
+
+        assert!(
+            verify_vlc(&legacy, &key.verifying_key()).is_err(),
+            "a legacy v5 digest-only grant must not verify under the exact-plan v6 domain"
+        );
+    }
+
+    #[test]
+    fn legacy_vlc_without_platform_does_not_deserialize() {
+        let key = generate_keypair(&mut OsRng);
+        let current = make_vlc(&key);
+        let mut json = serde_json::to_value(current).expect("VLC JSON");
+        json.as_object_mut().expect("VLC object").remove("platform");
+        assert!(
+            serde_json::from_value::<VerifiedLiveContext>(json).is_err(),
+            "platform is required on the current wire; legacy grants fail closed"
+        );
+    }
+
+    #[test]
+    fn legacy_vlc_without_exact_plan_identity_does_not_deserialize() {
+        let key = generate_keypair(&mut OsRng);
+        let current = make_vlc(&key);
+        let mut json = serde_json::to_value(current).expect("VLC JSON");
+        let object = json.as_object_mut().expect("VLC object");
+        object.remove("approved_plan_job_id");
+        object.remove("approved_plan_attempt_id");
+        assert!(
+            serde_json::from_value::<VerifiedLiveContext>(json).is_err(),
+            "exact approved-plan job and attempt are required on the v6 wire"
         );
     }
 
@@ -891,11 +1560,15 @@ mod tests {
         let step_job_id = Uuid::new_v4();
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_job_id),
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         let vlc = sign_vlc(unsigned, &key);
@@ -926,11 +1599,15 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_a),
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         let mut vlc = sign_vlc(unsigned, &key);
@@ -954,11 +1631,15 @@ mod tests {
 
         let unsigned = VerifiedLiveContext {
             request_id: Uuid::new_v4(),
+            platform: "defra".to_string(),
             job_spec_digest: sha256_hex(b"job-spec"),
             approved_plan_digest: sha256_hex(b"plan-bytes"),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_string(),
             expiry: Utc::now() + chrono::Duration::hours(1),
             step_job_id: Some(step_a),
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         let mut vlc = sign_vlc(unsigned, &key);
