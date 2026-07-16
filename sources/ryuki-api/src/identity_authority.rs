@@ -1575,9 +1575,11 @@ mod tests {
         let mut namespace_config = resolution_config.clone();
         namespace_config.oidc.issuer = other_issuer.to_string();
 
-        // The authority upsert and session insert are one transaction. A
-        // post-upsert primary-key failure must roll the epoch change back and
-        // leave every previously valid session usable.
+        // The authority upsert and session insert are one transaction. Reuse
+        // the different-issuer session ID because the epoch trigger removes
+        // same-authority sessions before the insert. The surviving row still
+        // forces a post-upsert primary-key failure, which must roll the epoch
+        // change back and leave every previously valid session usable.
         let failed_credential =
             crate::session_credentials::issue_session_credential(&session).unwrap();
         let failed_role_change = create_federated_session(
@@ -1588,7 +1590,7 @@ mod tests {
             "Test User",
             None,
             &reduced,
-            first,
+            namespace_session,
             failed_credential.verifier(),
             3600,
             &session,

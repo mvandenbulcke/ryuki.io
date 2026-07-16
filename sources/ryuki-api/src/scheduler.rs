@@ -772,6 +772,7 @@ async fn run_job(
                     .saturating_add(failed_enqueued)
                     .saturating_add(authority_quarantine_enqueued),
                 invalid_authority_rows = invalid_authority,
+                authority_quarantine_items = authority_quarantine_enqueued,
                 high_water_seq = progress.high_water_seq,
                 cursor_seq = rows
                     .last()
@@ -784,8 +785,7 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!(
-                    "enqueued {enqueued} overdue, {failed_enqueued} failed, \
-                     {authority_quarantine_enqueued} quarantined restore item(s)"
+                    "enqueued {enqueued} overdue, {failed_enqueued} failed restore item(s)"
                 )),
             ))
         }
@@ -7990,7 +7990,11 @@ mod db_tests {
                 .unwrap();
         assert_eq!(first.len(), 2, "first page obeys the requested bound");
         assert_eq!(first[0].status, "building");
-        assert!(first[1].build_date >= fresh_built);
+        assert_eq!(
+            first[1].build_date.timestamp_micros(),
+            fresh_built.timestamp_micros(),
+            "PostgreSQL preserves the fresh build timestamp at microsecond precision"
+        );
         let second = crate::repos::golden_images::scheduler_scan_page(
             &mut *tx,
             first.last().unwrap().scan_seq,
@@ -8005,7 +8009,10 @@ mod db_tests {
             "continuation reaches the final snapshot row"
         );
         assert_eq!(second[0].status, "promoted");
-        assert!(second[0].build_date < fresh_built);
+        assert!(
+            second[0].build_date.timestamp_micros() < fresh_built.timestamp_micros(),
+            "the final snapshot row is the stale promoted image"
+        );
         let visited: Vec<&str> = first
             .iter()
             .chain(second.iter())
