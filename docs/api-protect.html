@@ -17,31 +17,36 @@
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap">
 <link rel="stylesheet" href="/assets/docs.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
-<header class="site-header">
-  <div class="header-inner">
-    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
-  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
-  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
-  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
-  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
-  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
-</svg><span>ryuki<span class="io">.io</span></span></a>
-    <nav class="header-nav">
-      <a href="/documentation.html">Docs</a>
-      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
-    </nav>
+<div class="site-frame">
+  <div class="utility-rail">
+    <span>Open source / Rust / MIT</span>
+    <span class="bus">Field guide / indexed</span>
   </div>
-</header>
-<div class="docs-shell">
+  <header class="site-header">
+    <div class="topbar">
+      <a class="brand" href="/" aria-label="Ryuki home">
+        <img src="/assets/logo.svg" alt="">
+        <span>ryuki<span class="io">.io</span></span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="/">Home</a>
+        <a href="/documentation.html">Docs</a>
+        <a class="active" aria-current="page" href="/api-reference.html">API</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="gate-state"><span class="lamp green" aria-hidden="true"></span><span>Field guide online</span></div>
+    </div>
+  </header>
+  <div class="docs-shell">
 <button class="sb-toggle" id="sb-toggle" aria-expanded="false" aria-controls="docs-sidebar">Docs navigation <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
 <aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="API reference"><a class="sb-label" href="/documentation.html">Documentation</a><input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" aria-label="Search documentation" autocomplete="off"><div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div><a class="sb-label" href="/api-reference.html">API Reference</a><ul class="sb-list"><li><a class="sb-link" href="/api-activity.html">Activity</a></li><li><a class="sb-link" href="/api-admin.html">Admin</a></li><li><a class="sb-link" href="/api-agents.html">Agents</a></li><li><a class="sb-link" href="/api-analytics.html">Analytics</a></li><li><a class="sb-link" href="/api-approvals.html">Approvals</a></li><li><a class="sb-link" href="/api-audit.html">Audit</a></li><li><a class="sb-link" href="/api-auth.html">Auth</a></li><li><a class="sb-link" href="/api-boundary.html">Boundary</a></li><li><a class="sb-link" href="/api-build.html">Build</a></li><li><a class="sb-link" href="/api-catalog.html">Catalog</a></li><li><a class="sb-link" href="/api-cmdb.html">CMDB</a></li><li><a class="sb-link" href="/api-dashboard.html">Dashboard</a></li><li><a class="sb-link" href="/api-datacenter.html">Datacenter</a></li><li><a class="sb-link" href="/api-events.html">Events</a></li><li><a class="sb-link" href="/api-evidence.html">Evidence</a></li><li><a class="sb-link" href="/api-identity.html">Identity</a></li><li><a class="sb-link" href="/api-images.html">Images</a></li><li><a class="sb-link" href="/api-integrations.html">Integrations</a></li><li><a class="sb-link" href="/api-inventory.html">Inventory</a></li><li><a class="sb-link" href="/api-maintain.html">Maintain</a></li><li><a class="sb-link" href="/api-me.html">Me</a></li><li><a class="sb-link" href="/api-metering.html">Metering</a></li><li><a class="sb-link" href="/api-metrics.html">Metrics</a></li><li><a class="sb-link" href="/api-monitoring.html">Monitoring</a></li><li><a class="sb-link" href="/api-network.html">Network</a></li><li><a class="sb-link" href="/api-notifications.html">Notifications</a></li><li><a class="sb-link" href="/api-observe.html">Observe</a></li><li><a class="sb-link" href="/api-operations.html">Operations</a></li><li><a class="sb-link" href="/api-ops.html">Ops</a></li><li><a class="sb-link" href="/api-patching.html">Patching</a></li><li><a class="sb-link" href="/api-platform.html">Platform</a></li><li><a class="sb-link active" aria-current="page" href="/api-protect.html">Protect</a><ul class="sb-sections"><li><a class="sb-ep" href="#get-api-protect-application-aware-backup-validation-contract">GET /api/protect/application-aware-backup-validation-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-contract">GET /api/protect/backup-coverage-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-gap-contract">GET /api/protect/backup-coverage-gap-contract</a></li><li><a class="sb-ep" href="#get-api-protect-backup-dr-assignment-contract">GET /api/protect/backup-dr-assignment-contract</a></li><li><a class="sb-ep" href="#post-api-protect-backup-coverage-report">POST /api/protect/backup/coverage-report</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-reports">GET /api/protect/backup/coverage-reports</a></li><li><a class="sb-ep" href="#get-api-protect-backup-coverage-reports-id">GET /api/protect/backup/coverage-reports/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-approve">POST /api/protect/backup/restore-approve</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-execute">POST /api/protect/backup/restore-execute</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-plan">POST /api/protect/backup/restore-plan</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restore-tests-recency">GET /api/protect/backup/restore-tests/recency</a></li><li><a class="sb-ep" href="#post-api-protect-backup-restore-validate">POST /api/protect/backup/restore-validate</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restores">GET /api/protect/backup/restores</a></li><li><a class="sb-ep" href="#get-api-protect-backup-restores-id">GET /api/protect/backup/restores/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-controlled-restore-contract">GET /api/protect/controlled-restore-contract</a></li><li><a class="sb-ep" href="#get-api-protect-dr-contract">GET /api/protect/dr-contract</a></li><li><a class="sb-ep" href="#get-api-protect-dr-due-tests">GET /api/protect/dr/due-tests</a></li><li><a class="sb-ep" href="#get-api-protect-dr-plans">GET /api/protect/dr/plans</a></li><li><a class="sb-ep" href="#post-api-protect-dr-plans">POST /api/protect/dr/plans</a></li><li><a class="sb-ep" href="#delete-api-protect-dr-plans-id">DELETE /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-dr-plans-id">GET /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#put-api-protect-dr-plans-id">PUT /api/protect/dr/plans/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-dr-plans-id-rpo-rto">POST /api/protect/dr/plans/{id}/rpo-rto</a></li><li><a class="sb-ep" href="#get-api-protect-dr-readiness">GET /api/protect/dr/readiness</a></li><li><a class="sb-ep" href="#get-api-protect-dr-scenarios">GET /api/protect/dr/scenarios</a></li><li><a class="sb-ep" href="#post-api-protect-dr-tests-complete">POST /api/protect/dr/tests/complete</a></li><li><a class="sb-ep" href="#get-api-protect-dr-tests-results-id">GET /api/protect/dr/tests/results/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-dr-tests-start">POST /api/protect/dr/tests/start</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-air-gap-compliance-contract">GET /api/protect/immutability-air-gap-compliance-contract</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-contract">GET /api/protect/immutability-contract</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-air-gap-id">POST /api/protect/immutability/air-gap/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-check-id">POST /api/protect/immutability/check/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-compliance">GET /api/protect/immutability/compliance</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-noncompliant">GET /api/protect/immutability/noncompliant</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-remediation-id">GET /api/protect/immutability/remediation/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-retention-lock-id">POST /api/protect/immutability/retention-lock/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-immutability-retention-risk">GET /api/protect/immutability/retention-risk</a></li><li><a class="sb-ep" href="#post-api-protect-immutability-verify-all">POST /api/protect/immutability/verify-all</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-contract">GET /api/protect/legal-hold-contract</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-retention-contract">GET /api/protect/legal-hold-retention-contract</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-active">GET /api/protect/legal-hold/active</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-compliance-server">GET /api/protect/legal-hold/compliance/{server}</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-evidence-id">GET /api/protect/legal-hold/evidence/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-legal-hold-expiring">GET /api/protect/legal-hold/expiring</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-extend-id">POST /api/protect/legal-hold/extend/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-place">POST /api/protect/legal-hold/place</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-release-id">POST /api/protect/legal-hold/release/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-legal-hold-validate-id">POST /api/protect/legal-hold/validate/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity">GET /api/protect/repository-capacity</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-contract">GET /api/protect/repository-capacity-contract</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-at-risk">GET /api/protect/repository-capacity/at-risk</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-forecast-id">GET /api/protect/repository-capacity/forecast/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-recommendations-id">GET /api/protect/repository-capacity/recommendations/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-report">GET /api/protect/repository-capacity/report</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-trend-id">GET /api/protect/repository-capacity/trend/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-repository-capacity-update-id">POST /api/protect/repository-capacity/update/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-repository-capacity-id">GET /api/protect/repository-capacity/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-restore-testing-contract">GET /api/protect/restore-testing-contract</a></li><li><a class="sb-ep" href="#get-api-protect-secrets">GET /api/protect/secrets</a></li><li><a class="sb-ep" href="#post-api-protect-secrets">POST /api/protect/secrets</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-contract">GET /api/protect/secrets-contract</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-due">GET /api/protect/secrets/due</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-expiring">GET /api/protect/secrets/expiring</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-fail">POST /api/protect/secrets/fail</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-rotate-all">POST /api/protect/secrets/rotate-all</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-summary">GET /api/protect/secrets/summary</a></li><li><a class="sb-ep" href="#delete-api-protect-secrets-id">DELETE /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-id">GET /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#put-api-protect-secrets-id">PUT /api/protect/secrets/{id}</a></li><li><a class="sb-ep" href="#get-api-protect-secrets-id-history">GET /api/protect/secrets/{id}/history</a></li><li><a class="sb-ep" href="#post-api-protect-secrets-id-rotate">POST /api/protect/secrets/{id}/rotate</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-governance-contract">GET /api/protect/snapshot-governance-contract</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-flag-stale">POST /api/protect/snapshot/flag-stale</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-plan">POST /api/protect/snapshot/plan</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-records">GET /api/protect/snapshot/records</a></li><li><a class="sb-ep" href="#get-api-protect-snapshot-records-id">GET /api/protect/snapshot/records/{id}</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-remediate">POST /api/protect/snapshot/remediate</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-review">POST /api/protect/snapshot/review</a></li><li><a class="sb-ep" href="#post-api-protect-snapshot-validate">POST /api/protect/snapshot/validate</a></li></ul></li><li><a class="sb-link" href="/api-requests.html">Requests</a></li><li><a class="sb-link" href="/api-retire.html">Retire</a></li><li><a class="sb-link" href="/api-software.html">Software</a></li><li><a class="sb-link" href="/api-validation.html">Validation</a></li><li><a class="sb-link" href="/api-vm.html">VM</a></li><li><a class="sb-link" href="/api-workflows.html">Workflows</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
+<div class="doc-readout"><span>Field guide / Protect API</span><span>Reviewable source / main</span></div>
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/</span> <a href="/api-reference.html">API Reference</a> <span>/ Protect</span></nav>
 <h1>Protect API</h1>
 <p>Data protection: backup coverage and gap analysis, DR assignment and plans, restore approvals, and secrets management including rotation.</p>
@@ -2678,8 +2683,21 @@
   <span class="hl-cmd">--data</span> <span class="hl-s">'{"snapshotId":"&lt;string&gt;"}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/protect/snapshot/validate'</span></code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-11 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-platform.html">&larr; Platform</a><a href="/api-requests.html">Requests &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-platform.html">&larr; Platform</a><a href="/api-requests.html">Requests &rarr;</a></nav>
 </main>
+  </div>
+  <footer class="site-footer">
+    <div class="footer-top">
+      <div class="footer-brand"><img src="/assets/logo.svg" alt=""><span>ryuki<span class="io">.io</span></span></div>
+      <nav class="footer-links" aria-label="Footer navigation">
+        <a href="/documentation.html">Documentation</a>
+        <a href="/api-reference.html">API reference</a>
+        <a href="/architecture.html">Architecture</a>
+        <a href="https://github.com/mvandenbulcke/ryuki.io">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom"><span>© 2026 Ryuki · governed infrastructure operations</span><span>Built with Rust · 竜騎</span></div>
+  </footer>
 </div>
 <script>
 (function(){
@@ -2710,7 +2728,7 @@
             byId[en.target.id].classList.add('active');
           }
         });
-      },{rootMargin:'-72px 0px -68% 0px',threshold:0});
+      },{rootMargin:'-96px 0px -68% 0px',threshold:0});
       targets.forEach(function(t){spy.observe(t)});
     }
   }
