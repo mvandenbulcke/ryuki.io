@@ -7,11 +7,13 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "document_version",
     "bundle_id",
     "acceptance_status",
     "production_accepted",
     "trace_id",
     "evidence_instance_id",
+    "applicability_instance_id",
     "control_id",
     "acceptance_case_id",
     "evaluated_applicability",
@@ -37,6 +39,10 @@
     "schema_version": {
       "$ref": "#/$defs/version"
     },
+    "document_version": {
+      "type": "integer",
+      "minimum": 1
+    },
     "bundle_id": {
       "$ref": "#/$defs/identifier"
     },
@@ -50,6 +56,9 @@
       "$ref": "#/$defs/identifier"
     },
     "evidence_instance_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "applicability_instance_id": {
       "$ref": "#/$defs/identifier"
     },
     "control_id": {

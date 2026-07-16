@@ -5,6 +5,7 @@
 //! resolved from its own schema is an error, never an invitation to fetch code
 //! or policy from the network.
 
+use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -958,6 +959,17 @@ fn validate_closure_semantics(
     receipts: &[LoadedDocument],
     errors: &mut Vec<String>,
 ) {
+    validate_closure_semantics_at(root, ledger, bundles, receipts, Utc::now(), errors);
+}
+
+fn validate_closure_semantics_at(
+    root: &Path,
+    ledger: &Value,
+    bundles: &[LoadedDocument],
+    receipts: &[LoadedDocument],
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
     let traces: BTreeMap<String, &Value> = array(ledger, "traces")
         .iter()
         .filter_map(|trace| string_field(trace, "trace_id").map(|id| (id.to_string(), trace)))
@@ -1005,6 +1017,7 @@ fn validate_closure_semantics(
             }
         }
         validate_bundle_applicability(document, trace, errors);
+        validate_bundle_timestamps(document, errors);
         if let Some(target) = bundle
             .get("supersedes_evidence_instance_id")
             .and_then(Value::as_str)
@@ -1018,11 +1031,46 @@ fn validate_closure_semantics(
             evidence_supersession.insert(evidence_id.to_string(), target.to_string());
         }
     }
+    let mut superseded_evidence = BTreeSet::new();
     for (source, target) in &evidence_supersession {
-        if !evidence.contains_key(target) {
+        let mut valid_lineage = source != target;
+        let Some(source_bundle) = evidence.get(source) else {
+            continue;
+        };
+        let Some(target_bundle) = evidence.get(target) else {
             errors.push(format!(
                 "evidence instance {source} supersedes unknown evidence instance {target}"
             ));
+            continue;
+        };
+        for field in ["trace_id", "applicability_instance_id"] {
+            if source_bundle.value.get(field) != target_bundle.value.get(field) {
+                valid_lineage = false;
+                errors.push(format!(
+                    "{}: evidence {source} cannot supersede {target} with a different {field}",
+                    source_bundle.label
+                ));
+            }
+        }
+        let source_version = source_bundle
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let target_version = target_bundle
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if source_version <= target_version {
+            valid_lineage = false;
+            errors.push(format!(
+                "{}: superseding evidence {source} document_version {source_version} must exceed {target_version}",
+                source_bundle.label
+            ));
+        }
+        if valid_lineage {
+            superseded_evidence.insert(target.clone());
         }
     }
     detect_single_edge_cycles("evidence supersession", &evidence_supersession, errors);
@@ -1039,9 +1087,76 @@ fn validate_closure_semantics(
         &traces,
         &controls,
         &evidence,
+        &superseded_evidence,
         receipts,
+        now,
         errors,
     );
+}
+
+fn timestamp_field(
+    document: &LoadedDocument,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Option<DateTime<Utc>> {
+    let raw = string_field(&document.value, field)?;
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(value) => Some(value.with_timezone(&Utc)),
+        Err(error) => {
+            errors.push(format!(
+                "{}: invalid {field} timestamp: {error}",
+                document.label
+            ));
+            None
+        }
+    }
+}
+
+fn optional_timestamp_field(
+    document: &LoadedDocument,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Option<DateTime<Utc>> {
+    if document.value.get(field).is_none_or(Value::is_null) {
+        None
+    } else {
+        timestamp_field(document, field, errors)
+    }
+}
+
+fn validate_bundle_timestamps(document: &LoadedDocument, errors: &mut Vec<String>) {
+    let produced = timestamp_field(document, "produced_at", errors);
+    let verified = optional_timestamp_field(document, "verified_at", errors);
+    let accepted = optional_timestamp_field(document, "accepted_at", errors);
+    let expires = timestamp_field(document, "expires_at", errors);
+
+    if produced
+        .zip(verified)
+        .is_some_and(|(left, right)| left > right)
+    {
+        errors.push(format!(
+            "{}: produced_at must not be after verified_at",
+            document.label
+        ));
+    }
+    if verified
+        .zip(accepted)
+        .is_some_and(|(left, right)| left > right)
+    {
+        errors.push(format!(
+            "{}: verified_at must not be after accepted_at",
+            document.label
+        ));
+    }
+    if accepted
+        .zip(expires)
+        .is_some_and(|(left, right)| left >= right)
+    {
+        errors.push(format!(
+            "{}: accepted_at must be before expires_at",
+            document.label
+        ));
+    }
 }
 
 fn validate_bundle_applicability(
@@ -1118,6 +1233,225 @@ fn validate_bundle_applicability(
     }
 }
 
+fn dimension_map(
+    value: &Value,
+    scope: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> BTreeMap<String, Value> {
+    let mut dimensions = BTreeMap::new();
+    for dimension in array(value, scope) {
+        let name = string_field(dimension, "name").unwrap_or("");
+        let selected = dimension.get("value").cloned().unwrap_or(Value::Null);
+        if dimensions.insert(name.to_string(), selected).is_some() {
+            errors.push(format!(
+                "{context}: duplicate {scope} applicability dimension {name}"
+            ));
+        }
+    }
+    dimensions
+}
+
+fn evaluate_expression(
+    expression: &Value,
+    dimensions: &BTreeMap<String, Value>,
+) -> Result<bool, String> {
+    let operator = string_field(expression, "operator")
+        .ok_or_else(|| "applicability expression omits operator".to_string())?;
+    match operator {
+        "always" => Ok(true),
+        "never" => Ok(false),
+        "all" | "any" => {
+            let operands = array(expression, "operands");
+            let mut results = Vec::with_capacity(operands.len());
+            for operand in operands {
+                results.push(evaluate_expression(operand, dimensions)?);
+            }
+            Ok(if operator == "all" {
+                results.into_iter().all(|result| result)
+            } else {
+                results.into_iter().any(|result| result)
+            })
+        }
+        "not" => Ok(!evaluate_expression(
+            expression
+                .get("operand")
+                .ok_or_else(|| "not expression omits operand".to_string())?,
+            dimensions,
+        )?),
+        "equals" | "not_equals" | "contains" => {
+            let dimension = string_field(expression, "dimension")
+                .ok_or_else(|| format!("{operator} expression omits dimension"))?;
+            let actual = dimensions
+                .get(dimension)
+                .ok_or_else(|| format!("applicability dimension {dimension} is missing"))?;
+            let expected = expression
+                .get("value")
+                .ok_or_else(|| format!("{operator} expression omits value"))?;
+            match operator {
+                "equals" => Ok(actual == expected),
+                "not_equals" => Ok(actual != expected),
+                "contains" => match (actual, expected) {
+                    (Value::Array(values), expected) => Ok(values.contains(expected)),
+                    (Value::String(actual), Value::String(expected)) => {
+                        Ok(actual.contains(expected))
+                    }
+                    _ => Err(format!(
+                        "contains requires an array or string dimension: {dimension}"
+                    )),
+                },
+                _ => unreachable!(),
+            }
+        }
+        "in" | "not_in" => {
+            let dimension = string_field(expression, "dimension")
+                .ok_or_else(|| format!("{operator} expression omits dimension"))?;
+            let actual = dimensions
+                .get(dimension)
+                .ok_or_else(|| format!("applicability dimension {dimension} is missing"))?;
+            if actual.is_array() {
+                return Err(format!(
+                    "{operator} requires a scalar applicability dimension: {dimension}"
+                ));
+            }
+            let present = array(expression, "values").contains(actual);
+            Ok(if operator == "in" { present } else { !present })
+        }
+        _ => Err(format!("unsupported applicability operator {operator}")),
+    }
+}
+
+fn evaluate_trace_scope(
+    document: &LoadedDocument,
+    trace: &Value,
+    instance: &Value,
+    scope: &str,
+    errors: &mut Vec<String>,
+) -> Option<bool> {
+    let dimensions = dimension_map(
+        instance,
+        &format!("{scope}_dimensions"),
+        &document.label,
+        errors,
+    );
+    let expression = trace.pointer(&format!("/applicability_expression/{scope}"))?;
+    match evaluate_expression(expression, &dimensions) {
+        Ok(applicable) => Some(applicable),
+        Err(error) => {
+            let trace_id = string_field(trace, "trace_id").unwrap_or("");
+            errors.push(format!(
+                "{}: cannot evaluate {scope} applicability for trace {trace_id}: {error}",
+                document.label
+            ));
+            None
+        }
+    }
+}
+
+fn validate_bound_bundle_instance(
+    receipt: &LoadedDocument,
+    bundle: &LoadedDocument,
+    trace: &Value,
+    instances: &BTreeMap<String, &Value>,
+    errors: &mut Vec<String>,
+) -> Option<(String, String)> {
+    let trace_id = string_field(trace, "trace_id").unwrap_or("");
+    let instance_id = string_field(&bundle.value, "applicability_instance_id").unwrap_or("");
+    let Some(instance) = instances.get(instance_id) else {
+        errors.push(format!(
+            "{}: evidence {} references unknown applicability instance {instance_id}",
+            receipt.label, bundle.label
+        ));
+        return None;
+    };
+
+    let mut any_applicable = false;
+    for scope in ["implementation", "deployment"] {
+        let expected_applicable =
+            evaluate_trace_scope(receipt, trace, instance, scope, errors).unwrap_or(false);
+        any_applicable |= expected_applicable;
+        let evaluation = bundle
+            .value
+            .pointer(&format!("/evaluated_applicability/{scope}"))
+            .unwrap_or(&Value::Null);
+        let actual_applicable = evaluation
+            .get("applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if actual_applicable != expected_applicable {
+            errors.push(format!(
+                "{}: evidence {} has incorrect {scope} applicability for instance {instance_id}",
+                receipt.label, bundle.label
+            ));
+        }
+
+        let instance_dimensions = dimension_map(
+            instance,
+            &format!("{scope}_dimensions"),
+            &receipt.label,
+            errors,
+        );
+        let declared = string_set(array(
+            trace
+                .get("evidence_instance_dimensions")
+                .unwrap_or(&Value::Null),
+            scope,
+        ));
+        let expected_dimensions: BTreeMap<String, Value> = if expected_applicable {
+            declared
+                .iter()
+                .filter_map(|name| {
+                    instance_dimensions
+                        .get(name)
+                        .cloned()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        if expected_applicable && expected_dimensions.len() != declared.len() {
+            errors.push(format!(
+                "{}: applicability instance {instance_id} omits dimensions required by trace {trace_id} for {scope}",
+                receipt.label
+            ));
+        }
+        let actual_dimensions = dimension_map(
+            evaluation,
+            "dimensions",
+            &format!("{}: evidence {}", receipt.label, bundle.label),
+            errors,
+        );
+        if actual_dimensions != expected_dimensions {
+            errors.push(format!(
+                "{}: evidence {} dimensions do not match applicability instance {instance_id} for {scope}",
+                receipt.label, bundle.label
+            ));
+        }
+    }
+    if !any_applicable {
+        errors.push(format!(
+            "{}: evidence {} binds non-applicable trace {trace_id} instance {instance_id}",
+            receipt.label, bundle.label
+        ));
+    }
+    Some((trace_id.to_string(), instance_id.to_string()))
+}
+
+fn trace_applies_to_instance(
+    receipt: &LoadedDocument,
+    trace: &Value,
+    instance: &Value,
+    errors: &mut Vec<String>,
+) -> bool {
+    let mut applicable = false;
+    for scope in ["implementation", "deployment"] {
+        applicable |=
+            evaluate_trace_scope(receipt, trace, instance, scope, errors).unwrap_or(false);
+    }
+    applicable
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_receipts(
     ledger: &Value,
@@ -1125,7 +1459,9 @@ fn validate_receipts(
     traces: &BTreeMap<String, &Value>,
     controls: &BTreeMap<String, &Value>,
     evidence: &BTreeMap<String, &LoadedDocument>,
+    superseded_evidence: &BTreeSet<String>,
     receipts: &[LoadedDocument],
+    now: DateTime<Utc>,
     errors: &mut Vec<String>,
 ) {
     let mut receipt_map = BTreeMap::new();
@@ -1140,18 +1476,110 @@ fn validate_receipts(
     }
 
     let mut prerequisite_graph = BTreeMap::new();
-    let mut receipt_supersession = BTreeMap::new();
+    let receipt_supersession: BTreeMap<String, String> = receipts
+        .iter()
+        .filter_map(|document| {
+            let receipt_id = string_field(&document.value, "receipt_id")?;
+            let target = document
+                .value
+                .get("supersedes_receipt_id")
+                .and_then(Value::as_str)?;
+            Some((receipt_id.to_string(), target.to_string()))
+        })
+        .collect();
+    let mut superseded_receipts = BTreeSet::new();
+    for (source, target) in &receipt_supersession {
+        let mut valid_lineage = source != target;
+        let Some(source_receipt) = receipt_map.get(source) else {
+            continue;
+        };
+        let Some(target_receipt) = receipt_map.get(target) else {
+            errors.push(format!(
+                "receipt {source} supersedes unknown receipt {target}"
+            ));
+            continue;
+        };
+        if source_receipt.value.get("package_id") != target_receipt.value.get("package_id") {
+            valid_lineage = false;
+            errors.push(format!(
+                "{}: receipt {source} cannot supersede receipt {target} from another package",
+                source_receipt.label
+            ));
+        }
+        let source_version = source_receipt
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let target_version = target_receipt
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if source_version <= target_version {
+            valid_lineage = false;
+            errors.push(format!(
+                "{}: superseding receipt {source} document_version {source_version} must exceed {target_version}",
+                source_receipt.label
+            ));
+        }
+        if valid_lineage {
+            superseded_receipts.insert(target.clone());
+        }
+    }
     for document in receipts {
         let receipt = &document.value;
         let receipt_id = string_field(receipt, "receipt_id").unwrap_or("");
         let package_id = string_field(receipt, "package_id").unwrap_or("");
+        let claims_authoritative_closure = claims_authoritative_closure(receipt);
         validate_ledger_binding(document, ledger, ledger_digest, errors);
+        validate_receipt_timestamps(document, now, claims_authoritative_closure, errors);
+        if claims_authoritative_closure && superseded_receipts.contains(receipt_id) {
+            errors.push(format!(
+                "{}: authoritative receipt {receipt_id} has been superseded",
+                document.label
+            ));
+        }
 
         let evaluated = receipt.get("evaluated_sets").unwrap_or(&Value::Null);
         let trace_ids = string_set(array(evaluated, "trace_ids"));
         let control_ids = string_set(array(evaluated, "control_ids"));
         let case_ids = string_set(array(evaluated, "acceptance_case_ids"));
-        let evidence_ids = string_set(array(evaluated, "evidence_instance_ids"));
+        let mut applicability_instances = BTreeMap::new();
+        for instance in array(receipt, "applicability_instances") {
+            let instance_id = string_field(instance, "instance_id").unwrap_or("");
+            if applicability_instances
+                .insert(instance_id.to_string(), instance)
+                .is_some()
+            {
+                errors.push(format!(
+                    "{}: duplicate applicability instance {instance_id}",
+                    document.label
+                ));
+            }
+            for scope in ["implementation", "deployment"] {
+                dimension_map(
+                    instance,
+                    &format!("{scope}_dimensions"),
+                    &document.label,
+                    errors,
+                );
+            }
+        }
+        let mut evidence_bindings = BTreeMap::new();
+        for binding in array(evaluated, "evidence_bindings") {
+            let evidence_id = string_field(binding, "evidence_instance_id").unwrap_or("");
+            let digest = string_field(binding, "bundle_digest").unwrap_or("");
+            if evidence_bindings
+                .insert(evidence_id.to_string(), digest.to_string())
+                .is_some()
+            {
+                errors.push(format!(
+                    "{}: duplicate evidence binding for {evidence_id}",
+                    document.label
+                ));
+            }
+        }
         let mut projected_controls = BTreeSet::new();
         let mut projected_cases = BTreeSet::new();
         for trace_id in &trace_ids {
@@ -1188,8 +1616,8 @@ fn validate_receipts(
             ));
         }
 
-        let mut evidenced_traces = BTreeSet::new();
-        for evidence_id in &evidence_ids {
+        let mut evidenced_pairs = BTreeSet::new();
+        for (evidence_id, expected_digest) in &evidence_bindings {
             let Some(bundle) = evidence.get(evidence_id) else {
                 errors.push(format!(
                     "{}: receipt references unknown evidence_instance_id {evidence_id}",
@@ -1197,6 +1625,12 @@ fn validate_receipts(
                 ));
                 continue;
             };
+            if bundle.digest != *expected_digest {
+                errors.push(format!(
+                    "{}: evidence {evidence_id} bundle_digest does not match {}",
+                    document.label, bundle.label
+                ));
+            }
             let trace_id = string_field(&bundle.value, "trace_id").unwrap_or("");
             if !trace_ids.contains(trace_id) {
                 errors.push(format!(
@@ -1204,28 +1638,82 @@ fn validate_receipts(
                     document.label
                 ));
             }
-            evidenced_traces.insert(trace_id.to_string());
             validate_bundle_receipt_context(document, bundle, errors);
+            if let Some(trace) = traces.get(trace_id) {
+                if let Some(pair) = validate_bound_bundle_instance(
+                    document,
+                    bundle,
+                    trace,
+                    &applicability_instances,
+                    errors,
+                ) {
+                    if !evidenced_pairs.insert(pair.clone()) {
+                        errors.push(format!(
+                            "{}: multiple evidence bundles cover trace {} instance {}",
+                            document.label, pair.0, pair.1
+                        ));
+                    }
+                }
+            }
+            if claims_authoritative_closure {
+                validate_authoritative_bundle(
+                    document,
+                    evidence_id,
+                    bundle,
+                    superseded_evidence,
+                    now,
+                    errors,
+                );
+                let bundle_rank = bundle
+                    .value
+                    .pointer("/provenance/evidence_tier/rank")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let receipt_rank = receipt
+                    .pointer("/evidence_tier/rank")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                if bundle_rank < receipt_rank {
+                    errors.push(format!(
+                        "{}: evidence {evidence_id} tier rank {bundle_rank} is below receipt rank {receipt_rank}",
+                        document.label
+                    ));
+                }
+            }
         }
 
-        let waived_controls =
-            validate_receipt_waivers(document, package_id, controls, &control_ids, errors);
+        let waived_pairs = validate_receipt_waivers(
+            document,
+            package_id,
+            traces,
+            controls,
+            &trace_ids,
+            &control_ids,
+            &applicability_instances,
+            now,
+            claims_authoritative_closure,
+            errors,
+        );
         for trace_id in &trace_ids {
-            let control_id = traces
-                .get(trace_id)
-                .and_then(|trace| string_field(trace, "control_id"))
-                .unwrap_or("");
-            if !evidenced_traces.contains(trace_id) && !waived_controls.contains(control_id) {
-                errors.push(format!(
-                    "{}: trace {trace_id} has neither evidence nor an authorized waiver",
-                    document.label
-                ));
+            let Some(trace) = traces.get(trace_id) else {
+                continue;
+            };
+            for (instance_id, instance) in &applicability_instances {
+                if trace_applies_to_instance(document, trace, instance, errors)
+                    && !evidenced_pairs.contains(&(trace_id.clone(), instance_id.clone()))
+                    && !waived_pairs.contains(&(trace_id.clone(), instance_id.clone()))
+                {
+                    errors.push(format!(
+                        "{}: trace {trace_id} applicability instance {instance_id} has neither evidence nor an authorized waiver",
+                        document.label
+                    ));
+                }
             }
         }
 
         let accepted_pass = string_field(receipt, "receipt_lifecycle") == Some("accepted")
             && string_field(receipt, "result") == Some("pass");
-        if accepted_pass {
+        if accepted_pass || claims_authoritative_closure {
             let expected: BTreeSet<String> = traces
                 .iter()
                 .filter(|(_, trace)| {
@@ -1243,9 +1731,18 @@ fn validate_receipts(
         }
 
         let mut prerequisites = BTreeSet::new();
+        let mut prerequisite_packages = BTreeSet::new();
         for prerequisite in array(receipt, "prerequisite_receipts") {
             let target_id = string_field(prerequisite, "receipt_id").unwrap_or("");
             prerequisites.insert(target_id.to_string());
+            if let Some(target_package) = string_field(prerequisite, "package_id") {
+                if !prerequisite_packages.insert(target_package.to_string()) {
+                    errors.push(format!(
+                        "{}: duplicate prerequisite package {target_package}",
+                        document.label
+                    ));
+                }
+            }
             let Some(target) = receipt_map.get(target_id) else {
                 errors.push(format!(
                     "{}: prerequisite references unknown receipt {target_id}",
@@ -1253,7 +1750,16 @@ fn validate_receipts(
                 ));
                 continue;
             };
-            for key in ["package_id", "result", "receipt_lifecycle", "expires_at"] {
+            for key in [
+                "document_version",
+                "package_id",
+                "acceptance_status",
+                "production_accepted",
+                "evidence_tier",
+                "result",
+                "receipt_lifecycle",
+                "expires_at",
+            ] {
                 if prerequisite.get(key) != target.value.get(key) {
                     errors.push(format!(
                         "{}: prerequisite {target_id} has a mismatched {key}",
@@ -1267,29 +1773,217 @@ fn validate_receipts(
                     document.label, target.label
                 ));
             }
+            if claims_authoritative_closure {
+                validate_authoritative_prerequisite(
+                    document,
+                    target_id,
+                    target,
+                    &superseded_receipts,
+                    now,
+                    errors,
+                );
+                let target_rank = target
+                    .value
+                    .pointer("/evidence_tier/rank")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let receipt_rank = receipt
+                    .pointer("/evidence_tier/rank")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                if target_rank < receipt_rank {
+                    errors.push(format!(
+                        "{}: prerequisite {target_id} evidence tier rank {target_rank} is below receipt rank {receipt_rank}",
+                        document.label
+                    ));
+                }
+            }
+        }
+        if claims_authoritative_closure {
+            let required = required_prerequisite_packages(package_id);
+            if prerequisite_packages != required {
+                errors.push(format!(
+                    "{}: prerequisite package set {:?} does not match required set {:?}",
+                    document.label, prerequisite_packages, required
+                ));
+            }
         }
         prerequisite_graph.insert(receipt_id.to_string(), prerequisites);
 
-        if let Some(target) = receipt.get("supersedes_receipt_id").and_then(Value::as_str) {
-            if target == receipt_id {
-                errors.push(format!(
-                    "{}: receipt {receipt_id} cannot supersede itself",
-                    document.label
-                ));
-            }
-            receipt_supersession.insert(receipt_id.to_string(), target.to_string());
-        }
-    }
-
-    for (source, target) in &receipt_supersession {
-        if !receipt_map.contains_key(target) {
+        if receipt_supersession
+            .get(receipt_id)
+            .is_some_and(|target| target == receipt_id)
+        {
             errors.push(format!(
-                "receipt {source} supersedes unknown receipt {target}"
+                "{}: receipt {receipt_id} cannot supersede itself",
+                document.label
             ));
         }
     }
+
     detect_single_edge_cycles("receipt supersession", &receipt_supersession, errors);
     detect_multi_edge_cycles("prerequisite receipt", &prerequisite_graph, errors);
+}
+
+fn claims_authoritative_closure(receipt: &Value) -> bool {
+    matches!(
+        string_field(receipt, "acceptance_status"),
+        Some("production_candidate" | "production_accepted")
+    ) || receipt
+        .get("production_accepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || (string_field(receipt, "receipt_lifecycle") == Some("accepted")
+            && string_field(receipt, "result") == Some("pass"))
+}
+
+fn validate_receipt_timestamps(
+    document: &LoadedDocument,
+    now: DateTime<Utc>,
+    authoritative: bool,
+    errors: &mut Vec<String>,
+) {
+    let created = timestamp_field(document, "created_at", errors);
+    let expires = timestamp_field(document, "expires_at", errors);
+    if created
+        .zip(expires)
+        .is_some_and(|(left, right)| left >= right)
+    {
+        errors.push(format!(
+            "{}: created_at must be before expires_at",
+            document.label
+        ));
+    }
+    if authoritative && expires.is_some_and(|expires| expires <= now) {
+        errors.push(format!(
+            "{}: authoritative receipt is expired",
+            document.label
+        ));
+    }
+    if authoritative && created.is_some_and(|created| created > now) {
+        errors.push(format!(
+            "{}: authoritative receipt has a future created_at",
+            document.label
+        ));
+    }
+}
+
+fn validate_authoritative_bundle(
+    receipt: &LoadedDocument,
+    evidence_id: &str,
+    bundle: &LoadedDocument,
+    superseded_evidence: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    for (field, expected) in [
+        ("acceptance_status", "production_accepted"),
+        ("evidence_lifecycle", "accepted"),
+        ("normalized_result", "pass"),
+    ] {
+        if string_field(&bundle.value, field) != Some(expected) {
+            errors.push(format!(
+                "{}: evidence {evidence_id} must have {field}={expected}",
+                receipt.label
+            ));
+        }
+    }
+    if bundle
+        .value
+        .get("production_accepted")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        errors.push(format!(
+            "{}: evidence {evidence_id} is not production accepted",
+            receipt.label
+        ));
+    }
+    if superseded_evidence.contains(evidence_id) {
+        errors.push(format!(
+            "{}: evidence {evidence_id} has been superseded",
+            receipt.label
+        ));
+    }
+    let expires = timestamp_field(bundle, "expires_at", errors);
+    if expires.is_some_and(|expires| expires <= now) {
+        errors.push(format!(
+            "{}: evidence {evidence_id} is expired",
+            receipt.label
+        ));
+    }
+    let accepted = optional_timestamp_field(bundle, "accepted_at", errors);
+    if accepted.is_some_and(|accepted| accepted > now) {
+        errors.push(format!(
+            "{}: evidence {evidence_id} has a future accepted_at",
+            receipt.label
+        ));
+    }
+}
+
+fn validate_authoritative_prerequisite(
+    receipt: &LoadedDocument,
+    target_id: &str,
+    target: &LoadedDocument,
+    superseded_receipts: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    for (field, expected) in [
+        ("acceptance_status", "production_accepted"),
+        ("receipt_lifecycle", "accepted"),
+        ("result", "pass"),
+    ] {
+        if string_field(&target.value, field) != Some(expected) {
+            errors.push(format!(
+                "{}: prerequisite {target_id} must have {field}={expected}",
+                receipt.label
+            ));
+        }
+    }
+    if target
+        .value
+        .get("production_accepted")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        errors.push(format!(
+            "{}: prerequisite {target_id} is not production accepted",
+            receipt.label
+        ));
+    }
+    if superseded_receipts.contains(target_id) {
+        errors.push(format!(
+            "{}: prerequisite {target_id} has been superseded",
+            receipt.label
+        ));
+    }
+    let expires = timestamp_field(target, "expires_at", errors);
+    if expires.is_some_and(|expires| expires <= now) {
+        errors.push(format!(
+            "{}: prerequisite {target_id} is expired",
+            receipt.label
+        ));
+    }
+}
+
+fn required_prerequisite_packages(package_id: &str) -> BTreeSet<String> {
+    let packages: &[&str] = match package_id {
+        "SB-0" => &[],
+        "SB-1" | "SB-2" | "SB-4" | "SB-5" | "SB-6" | "SB-7" => &["SB-0"],
+        "SB-3" => &["SB-0", "SB-1", "SB-2"],
+        "SB-8" => &[
+            "SB-0", "SB-1", "SB-2", "SB-3", "SB-4", "SB-5", "SB-6", "SB-7",
+        ],
+        "SB-9" => &[
+            "SB-0", "SB-1", "SB-2", "SB-3", "SB-4", "SB-5", "SB-6", "SB-7", "SB-8",
+        ],
+        _ => &[],
+    };
+    packages
+        .iter()
+        .map(|package| (*package).to_string())
+        .collect()
 }
 
 fn validate_ledger_binding(
@@ -1354,16 +2048,48 @@ fn validate_bundle_receipt_context(
 fn validate_receipt_waivers(
     document: &LoadedDocument,
     package_id: &str,
+    traces: &BTreeMap<String, &Value>,
     controls: &BTreeMap<String, &Value>,
+    evaluated_traces: &BTreeSet<String>,
     evaluated_controls: &BTreeSet<String>,
+    applicability_instances: &BTreeMap<String, &Value>,
+    now: DateTime<Utc>,
+    authoritative: bool,
     errors: &mut Vec<String>,
-) -> BTreeSet<String> {
+) -> BTreeSet<(String, String)> {
     let mut waived = BTreeSet::new();
+    let mut declared = BTreeSet::new();
     for waiver in array(&document.value, "waivers") {
+        let errors_before = errors.len();
+        let trace_id = string_field(waiver, "trace_id").unwrap_or("");
         let control_id = string_field(waiver, "control_id").unwrap_or("");
-        if !waived.insert(control_id.to_string()) {
+        let instance_id = waiver
+            .pointer("/scope/instance_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let pair = (trace_id.to_string(), instance_id.to_string());
+        if !declared.insert(pair.clone()) {
             errors.push(format!(
-                "{}: duplicate waiver for control {control_id}",
+                "{}: duplicate waiver for trace {trace_id} applicability instance {instance_id}",
+                document.label,
+            ));
+        }
+        let Some(trace) = traces.get(trace_id) else {
+            errors.push(format!(
+                "{}: waiver references unknown trace {trace_id}",
+                document.label
+            ));
+            continue;
+        };
+        if !evaluated_traces.contains(trace_id) {
+            errors.push(format!(
+                "{}: waived trace {trace_id} is absent from the evaluated trace set",
+                document.label
+            ));
+        }
+        if string_field(trace, "control_id") != Some(control_id) {
+            errors.push(format!(
+                "{}: waiver control {control_id} does not match trace {trace_id}",
                 document.label
             ));
         }
@@ -1392,11 +2118,89 @@ fn validate_receipt_waivers(
                 document.label
             ));
         }
-        if string_field(waiver, "compensating_control_id") == Some(control_id) {
+        let compensating = string_field(waiver, "compensating_control_id").unwrap_or("");
+        if compensating == control_id {
             errors.push(format!(
                 "{}: control {control_id} cannot compensate for itself",
                 document.label
             ));
+        }
+        if !controls.contains_key(compensating) {
+            errors.push(format!(
+                "{}: waiver references unknown compensating control {compensating}",
+                document.label
+            ));
+        }
+
+        let Some(instance) = applicability_instances.get(instance_id) else {
+            errors.push(format!(
+                "{}: waiver references unknown applicability instance {instance_id}",
+                document.label
+            ));
+            continue;
+        };
+        let scope = waiver.get("scope").unwrap_or(&Value::Null);
+        if scope != *instance {
+            errors.push(format!(
+                "{}: waiver scope does not exactly match applicability instance {instance_id}",
+                document.label
+            ));
+        }
+        if !trace_applies_to_instance(document, trace, instance, errors) {
+            errors.push(format!(
+                "{}: waiver targets non-applicable trace {trace_id} instance {instance_id}",
+                document.label
+            ));
+        }
+
+        let approved = waiver
+            .pointer("/approval/approved_at")
+            .and_then(Value::as_str)
+            .and_then(|raw| match DateTime::parse_from_rfc3339(raw) {
+                Ok(value) => Some(value.with_timezone(&Utc)),
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: waiver for trace {trace_id} has invalid approved_at: {error}",
+                        document.label
+                    ));
+                    None
+                }
+            });
+        let expires = string_field(waiver, "expires_at").and_then(|raw| {
+            match DateTime::parse_from_rfc3339(raw) {
+                Ok(value) => Some(value.with_timezone(&Utc)),
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: waiver for trace {trace_id} has invalid expires_at: {error}",
+                        document.label
+                    ));
+                    None
+                }
+            }
+        });
+        if approved
+            .zip(expires)
+            .is_some_and(|(approved, expires)| approved >= expires)
+        {
+            errors.push(format!(
+                "{}: waiver approval must precede expiry for trace {trace_id}",
+                document.label
+            ));
+        }
+        if authoritative && approved.is_some_and(|approved| approved > now) {
+            errors.push(format!(
+                "{}: waiver approval is future-dated for trace {trace_id}",
+                document.label
+            ));
+        }
+        if authoritative && expires.is_some_and(|expires| expires <= now) {
+            errors.push(format!(
+                "{}: waiver is expired for trace {trace_id}",
+                document.label
+            ));
+        }
+        if errors.len() == errors_before {
+            waived.insert(pair);
         }
     }
     waived
@@ -2542,6 +3346,327 @@ mod tests {
     }
 
     #[test]
+    fn ac_048_rejects_evidence_digest_substitution() {
+        let ledger = ledger();
+        let trace = &ledger["traces"][0];
+        let bundle = bundle_for_trace("bundle:one", "evidence:one", trace, false);
+        let package = trace["owning_work_package"].as_str().expect("package");
+        let mut receipt = receipt_for_trace(
+            "package-exit-receipt:digest-substitution",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            package,
+            trace,
+            "evidence:one",
+            None,
+            &ledger,
+        );
+        receipt.value["evaluated_sets"]["evidence_bindings"][0]["bundle_digest"] =
+            json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let mut errors = Vec::new();
+        validate_closure_semantics(&root(), &ledger, &[bundle], &[receipt], &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("bundle_digest does not match")));
+    }
+
+    #[test]
+    fn ac_048_rejects_failed_and_expired_authoritative_evidence() {
+        let ledger = ledger();
+        let trace = &ledger["traces"][0];
+        let mut bundle = bundle_for_trace("bundle:stale", "evidence:stale", trace, false);
+        make_bundle_production_accepted(&mut bundle);
+        bundle.value["normalized_result"] = json!("fail");
+        bundle.value["expires_at"] = json!("2026-06-30T00:00:00Z");
+        let package = trace["owning_work_package"].as_str().expect("package");
+        let mut receipt = receipt_for_trace(
+            "package-exit-receipt:stale",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            package,
+            trace,
+            "evidence:stale",
+            None,
+            &ledger,
+        );
+        make_receipt_candidate(&mut receipt);
+
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("normalized_result=pass")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("evidence evidence:stale is expired")));
+    }
+
+    #[test]
+    fn ac_048_rejects_superseded_authoritative_evidence() {
+        let ledger = ledger();
+        let trace = &ledger["traces"][0];
+        let mut old = bundle_for_trace("bundle:old", "evidence:old", trace, false);
+        make_bundle_production_accepted(&mut old);
+        let mut replacement = bundle_for_trace("bundle:new", "evidence:new", trace, false);
+        replacement.value["document_version"] = json!(2);
+        replacement.value["supersedes_evidence_instance_id"] = json!("evidence:old");
+        let package = trace["owning_work_package"].as_str().expect("package");
+        let mut receipt = receipt_for_trace(
+            "package-exit-receipt:superseded",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            package,
+            trace,
+            "evidence:old",
+            None,
+            &ledger,
+        );
+        make_receipt_candidate(&mut receipt);
+
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[old, replacement],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("evidence evidence:old has been superseded")));
+    }
+
+    #[test]
+    fn ac_048_rejects_cross_instance_or_non_monotonic_evidence_supersession() {
+        let (ledger, old, receipt) = authoritative_candidate_fixture();
+        let mut invalid = old.clone();
+        invalid.label = "test:invalid-successor".to_string();
+        invalid.value["bundle_id"] = json!("bundle:invalid-successor");
+        invalid.value["evidence_instance_id"] = json!("evidence:invalid-successor");
+        invalid.value["applicability_instance_id"] = json!("applicability:other");
+        invalid.value["supersedes_evidence_instance_id"] = json!("evidence:authoritative");
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[old, invalid],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("different applicability_instance_id")
+                || error.contains("document_version 1 must exceed 1")
+        }));
+        assert!(!errors
+            .iter()
+            .any(|error| error.contains("evidence evidence:authoritative has been superseded")));
+    }
+
+    #[test]
+    fn ac_048_rejects_missing_normative_prerequisite_package() {
+        let ledger = ledger();
+        let trace = ledger["traces"]
+            .as_array()
+            .expect("traces")
+            .iter()
+            .find(|trace| trace["owning_work_package"] == "SB-1")
+            .expect("SB-1 trace");
+        let mut bundle = bundle_for_trace("bundle:sb1", "evidence:sb1", trace, false);
+        make_bundle_production_accepted(&mut bundle);
+        let mut receipt = receipt_for_trace(
+            "package-exit-receipt:sb1-without-sb0",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "SB-1",
+            trace,
+            "evidence:sb1",
+            None,
+            &ledger,
+        );
+        make_receipt_candidate(&mut receipt);
+
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("prerequisite package set") && error.contains("SB-0") }));
+    }
+
+    #[test]
+    fn ac_048_authoritative_candidate_semantic_baseline_is_clean() {
+        let (ledger, bundle, receipt) = authoritative_candidate_fixture();
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn ac_048_evaluates_closed_recursive_applicability_language() {
+        let dimensions = BTreeMap::from([
+            ("implementation.mode".to_string(), json!("production")),
+            (
+                "implementation.tags".to_string(),
+                json!(["trusted", "pinned"]),
+            ),
+            ("implementation.replicas".to_string(), json!(3)),
+        ]);
+        let expression = json!({
+            "operator": "all",
+            "operands": [
+                {"operator": "equals", "dimension": "implementation.mode", "value": "production"},
+                {"operator": "not_equals", "dimension": "implementation.replicas", "value": 1},
+                {"operator": "contains", "dimension": "implementation.tags", "value": "trusted"},
+                {"operator": "in", "dimension": "implementation.replicas", "values": [2, 3, 4]},
+                {"operator": "not_in", "dimension": "implementation.mode", "values": ["test", "development"]},
+                {"operator": "not", "operand": {"operator": "never"}},
+                {"operator": "any", "operands": [
+                    {"operator": "never"},
+                    {"operator": "always"}
+                ]}
+            ]
+        });
+        assert_eq!(evaluate_expression(&expression, &dimensions), Ok(true));
+    }
+
+    #[test]
+    fn ac_048_rejects_applicability_instance_undercount() {
+        let (ledger, bundle, mut receipt) = authoritative_candidate_fixture();
+        receipt.value["applicability_instances"]
+            .as_array_mut()
+            .expect("instances")
+            .push(json!({
+                "instance_id": "applicability:second",
+                "implementation_dimensions": [],
+                "deployment_dimensions": []
+            }));
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("applicability instance applicability:second")
+                && error.contains("neither evidence nor an authorized waiver")
+        }));
+    }
+
+    #[test]
+    fn ac_048_rejects_scope_mismatched_and_expired_waiver() {
+        let (mut ledger, _bundle, mut receipt) = authoritative_candidate_fixture();
+        ledger["controls"][0]["waivable"] = json!(true);
+        ledger["controls"]
+            .as_array_mut()
+            .expect("controls")
+            .push(json!({
+                "control_id": "SB-TEST-02",
+                "owning_work_package": "SB-0",
+                "waivable": false
+            }));
+        receipt.value["evaluated_sets"]["evidence_bindings"] = json!([]);
+        receipt.value["waivers"] = json!([{
+            "trace_id": "TRACE-TEST-AC-001",
+            "control_id": "SB-TEST-01",
+            "compensating_control_id": "SB-TEST-02",
+            "scope": {
+                "instance_id": "applicability:fixture",
+                "implementation_dimensions": [{
+                    "name": "implementation.unexpected",
+                    "value": "wrong"
+                }],
+                "deployment_dimensions": []
+            },
+            "approval": {"approved_at": "2026-06-01T00:00:00Z"},
+            "expires_at": "2026-07-01T00:00:00Z"
+        }]);
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("waiver scope does not exactly match")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("waiver is expired")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("neither evidence nor an authorized waiver")));
+    }
+
+    #[test]
+    fn ac_048_rejects_receipt_tier_inflation() {
+        let (ledger, bundle, mut receipt) = authoritative_candidate_fixture();
+        receipt.value["evidence_tier"] = json!({"name": "externally_attested", "rank": 3});
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("tier rank 1 is below receipt rank 3")));
+    }
+
+    #[test]
+    fn ac_048_rejects_superseded_authoritative_receipt_directly() {
+        let (ledger, bundle, old) = authoritative_candidate_fixture();
+        let mut replacement = old.clone();
+        replacement.label = "test:replacement-receipt".to_string();
+        replacement.digest =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
+        replacement.value["receipt_id"] = json!("package-exit-receipt:replacement");
+        replacement.value["document_version"] = json!(2);
+        replacement.value["supersedes_receipt_id"] =
+            json!("package-exit-receipt:authoritative-candidate");
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[old, replacement],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("authoritative receipt package-exit-receipt:authoritative-candidate")
+                && error.contains("superseded")
+        }));
+    }
+
+    #[test]
     fn provider_registry_rejects_payload_tamper_and_digest_contract_downgrade() {
         let registry = load("catalog/security-contracts/v1/provider-registry.implementation.json");
         let mut tampered = registry.clone();
@@ -2588,6 +3713,135 @@ mod tests {
         assert!(first.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
+    fn authoritative_candidate_fixture() -> (Value, LoadedDocument, LoadedDocument) {
+        let ledger = json!({
+            "ledger_id": "control-trace:test",
+            "ledger_version": "1.0.0",
+            "controls": [{
+                "control_id": "SB-TEST-01",
+                "owning_work_package": "SB-0",
+                "waivable": false
+            }],
+            "traces": [{
+                "trace_id": "TRACE-TEST-AC-001",
+                "control_id": "SB-TEST-01",
+                "acceptance_case_id": "AC-001",
+                "owning_work_package": "SB-0",
+                "trace_lifecycle": "active",
+                "applicability_expression": {
+                    "implementation": {"operator": "always"},
+                    "deployment": {"operator": "always"}
+                },
+                "evidence_instance_dimensions": {
+                    "implementation": [],
+                    "deployment": []
+                },
+                "minimum_evidence_tier": {
+                    "implementation": {"name": "repository_local", "rank": 1},
+                    "deployment": {"name": "repository_local", "rank": 1}
+                }
+            }]
+        });
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let bundle = LoadedDocument {
+            label: "test:authoritative-bundle".to_string(),
+            digest: digest.to_string(),
+            value: json!({
+                "document_version": 1,
+                "bundle_id": "bundle:authoritative",
+                "evidence_instance_id": "evidence:authoritative",
+                "applicability_instance_id": "applicability:fixture",
+                "acceptance_status": "production_accepted",
+                "production_accepted": true,
+                "trace_id": "TRACE-TEST-AC-001",
+                "control_id": "SB-TEST-01",
+                "acceptance_case_id": "AC-001",
+                "evaluated_applicability": {
+                    "implementation": {"applicable": true, "dimensions": []},
+                    "deployment": {"applicable": true, "dimensions": []}
+                },
+                "normalized_result": "pass",
+                "provenance": {
+                    "evidence_tier": {"name": "repository_local", "rank": 1}
+                },
+                "evidence_lifecycle": "accepted",
+                "produced_at": "2026-07-15T00:00:00Z",
+                "verified_at": "2026-07-15T00:05:00Z",
+                "accepted_at": "2026-07-15T00:10:00Z",
+                "expires_at": "2026-07-17T00:00:00Z",
+                "supersedes_evidence_instance_id": null
+            }),
+        };
+        let ledger_bytes = fs::read(
+            root().join("catalog/security-contracts/v1/control-trace.implementation.json"),
+        )
+        .expect("ledger bytes");
+        let receipt = LoadedDocument {
+            label: "test:authoritative-receipt".to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            value: json!({
+                "document_version": 1,
+                "receipt_id": "package-exit-receipt:authoritative-candidate",
+                "acceptance_status": "production_candidate",
+                "production_accepted": false,
+                "package_id": "SB-0",
+                "ledger_binding": {
+                    "ledger_id": "control-trace:test",
+                    "ledger_version": "1.0.0",
+                    "ledger_digest": format!("sha256:{:x}", Sha256::digest(ledger_bytes))
+                },
+                "evaluated_sets": {
+                    "trace_ids": ["TRACE-TEST-AC-001"],
+                    "control_ids": ["SB-TEST-01"],
+                    "acceptance_case_ids": ["AC-001"],
+                    "evidence_bindings": [{
+                        "evidence_instance_id": "evidence:authoritative",
+                        "bundle_digest": digest
+                    }]
+                },
+                "applicability_instances": [{
+                    "instance_id": "applicability:fixture",
+                    "implementation_dimensions": [],
+                    "deployment_dimensions": []
+                }],
+                "closure_context": {},
+                "prerequisite_receipts": [],
+                "evidence_tier": {"name": "repository_local", "rank": 1},
+                "waivers": [],
+                "result": "blocked",
+                "receipt_lifecycle": "produced",
+                "created_at": "2026-07-15T01:00:00Z",
+                "expires_at": "2026-07-17T00:00:00Z",
+                "supersedes_receipt_id": null
+            }),
+        };
+        (ledger, bundle, receipt)
+    }
+
+    fn closure_test_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-16T00:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn make_bundle_production_accepted(bundle: &mut LoadedDocument) {
+        bundle.value["acceptance_status"] = json!("production_accepted");
+        bundle.value["production_accepted"] = json!(true);
+        bundle.value["normalized_result"] = json!("pass");
+        bundle.value["evidence_lifecycle"] = json!("accepted");
+        bundle.value["verified_at"] = json!("2026-07-15T00:05:00Z");
+        bundle.value["accepted_at"] = json!("2026-07-15T00:10:00Z");
+        bundle.value["expires_at"] = json!("2026-07-17T00:00:00Z");
+    }
+
+    fn make_receipt_candidate(receipt: &mut LoadedDocument) {
+        receipt.value["acceptance_status"] = json!("production_candidate");
+        receipt.value["production_accepted"] = json!(false);
+        receipt.value["created_at"] = json!("2026-07-15T01:00:00Z");
+        receipt.value["expires_at"] = json!("2026-07-17T00:00:00Z");
+    }
+
     fn bundle_for_trace(
         bundle_id: &str,
         evidence_id: &str,
@@ -2607,8 +3861,10 @@ mod tests {
             digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             value: json!({
+                "document_version": 1,
                 "bundle_id": bundle_id,
                 "evidence_instance_id": evidence_id,
+                "applicability_instance_id": "applicability:fixture",
                 "trace_id": trace["trace_id"],
                 "control_id": trace["control_id"],
                 "acceptance_case_id": trace["acceptance_case_id"],
@@ -2623,6 +3879,10 @@ mod tests {
                     }
                 },
                 "provenance": {"evidence_tier": {"name": "externally_attested", "rank": 3}},
+                "produced_at": "2026-01-01T00:00:00Z",
+                "verified_at": null,
+                "accepted_at": null,
+                "expires_at": "2099-01-01T00:00:00Z",
                 "supersedes_evidence_instance_id": null
             }),
         }
@@ -2642,8 +3902,12 @@ mod tests {
             .map(|(id, receipt_digest)| {
                 vec![json!({
                     "package_id": package,
+                    "document_version": 1,
                     "receipt_id": id,
                     "receipt_digest": receipt_digest,
+                    "acceptance_status": "implementation_only",
+                    "production_accepted": false,
+                    "evidence_tier": {"name": "repository_local", "rank": 1},
                     "result": "blocked",
                     "receipt_lifecycle": "produced",
                     "expires_at": "2099-01-01T00:00:00Z"
@@ -2654,11 +3918,21 @@ mod tests {
             root().join("catalog/security-contracts/v1/control-trace.implementation.json"),
         )
         .expect("ledger bytes");
+        let dimensions = |scope: &str| {
+            array(&trace["evidence_instance_dimensions"], scope)
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| json!({"name": name, "value": "fixture"}))
+                .collect::<Vec<_>>()
+        };
         LoadedDocument {
             label: format!("test:{receipt_id}"),
             digest: digest.to_string(),
             value: json!({
+                "document_version": 1,
                 "receipt_id": receipt_id,
+                "acceptance_status": "implementation_only",
+                "production_accepted": false,
                 "package_id": package,
                 "ledger_binding": {
                     "ledger_id": ledger["ledger_id"],
@@ -2669,13 +3943,23 @@ mod tests {
                     "trace_ids": [trace["trace_id"].clone()],
                     "control_ids": [trace["control_id"].clone()],
                     "acceptance_case_ids": [trace["acceptance_case_id"].clone()],
-                    "evidence_instance_ids": [evidence_id]
+                    "evidence_bindings": [{
+                        "evidence_instance_id": evidence_id,
+                        "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }]
                 },
                 "closure_context": {},
+                "applicability_instances": [{
+                    "instance_id": "applicability:fixture",
+                    "implementation_dimensions": dimensions("implementation"),
+                    "deployment_dimensions": dimensions("deployment")
+                }],
                 "prerequisite_receipts": prerequisites,
+                "evidence_tier": {"name": "repository_local", "rank": 1},
                 "waivers": [],
                 "result": "blocked",
                 "receipt_lifecycle": "produced",
+                "created_at": "2026-01-01T00:00:00Z",
                 "expires_at": "2099-01-01T00:00:00Z",
                 "supersedes_receipt_id": null
             }),

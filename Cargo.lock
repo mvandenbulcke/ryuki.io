@@ -3216,6 +3216,7 @@ dependencies = [
 name = "ryuki-validator"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "figment",
  "jsonschema",
  "proc-macro2",
