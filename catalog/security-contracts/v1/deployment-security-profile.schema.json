@@ -1,0 +1,322 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json",
+  "title": "Ryuki Deployment Security Profile",
+  "description": "Executable deployment root. Readiness and production acceptance are evaluated by conformance receipts, never asserted by this document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "schema_version", "contract_kind", "document_id",
+    "document_version", "lifecycle", "applicability",
+    "deployment_profile_version", "deployment_id", "security_profile",
+    "platform_configuration_version", "policy_version", "tenancy_mode",
+    "trust_topology", "provider_registry_ref",
+    "provider_lifecycle_snapshot_ref", "action_resource_registry_ref",
+    "security_limit_profile_ref", "control_plane_topology_ref",
+    "egress_policy_ref", "retention_policy_ref", "enabled_features",
+    "runtime_guard_evidence"
+  ],
+  "properties": {
+    "$schema": { "const": "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json" },
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "deployment-security-profile" },
+    "document_id": { "type": "string", "pattern": "^deployment-security-profile:[a-z0-9][a-z0-9._-]{2,126}$" },
+    "document_version": { "$ref": "#/$defs/positiveVersion" },
+    "lifecycle": { "$ref": "#/$defs/documentLifecycle" },
+    "applicability": { "$ref": "#/$defs/applicability" },
+    "deployment_profile_version": { "$ref": "#/$defs/positiveVersion" },
+    "deployment_id": { "$ref": "#/$defs/deploymentId" },
+    "security_profile": { "$ref": "#/$defs/securityProfile" },
+    "platform_configuration_version": { "$ref": "#/$defs/positiveVersion" },
+    "policy_version": { "$ref": "#/$defs/positiveVersion" },
+    "tenancy_mode": { "enum": ["single_tenant", "multi_tenant"] },
+    "trust_topology": { "$ref": "#/$defs/trustTopology" },
+    "provider_registry_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "provider-registry" } } }
+      ]
+    },
+    "provider_lifecycle_snapshot_ref": { "$ref": "#/$defs/providerLifecycleReference" },
+    "action_resource_registry_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "action-resource-registry" } } }
+      ]
+    },
+    "security_limit_profile_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "security-limit-profile" } } }
+      ]
+    },
+    "control_plane_topology_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "control-plane-topology" } } }
+      ]
+    },
+    "egress_policy_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "egress-policy" } } }
+      ]
+    },
+    "retention_policy_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "retention-policy" } } }
+      ]
+    },
+    "migration_overlay": { "$ref": "#/$defs/migrationOverlay" },
+    "enabled_features": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" }
+    },
+    "runtime_guard_evidence": { "$ref": "#/$defs/runtimeGuardEvidence" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "security_profile": { "const": "production" } }, "required": ["security_profile"] },
+      "then": {
+        "properties": {
+          "runtime_guard_evidence": {
+            "allOf": [
+              { "$ref": "#/$defs/runtimeGuardEvidence" },
+              {
+                "properties": {
+                  "mode": { "const": "receipt_bound" },
+                  "guards": {
+                    "minItems": 8,
+                    "maxItems": 8,
+                    "allOf": [
+                      { "contains": { "properties": { "guard_id": { "const": "durable-postgresql" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "approved-secret-provider" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "https-public-urls" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "secure-cookies" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "non-development-authenticator" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "external-signing-key-material" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "mock-dependencies-disabled" } }, "required": ["guard_id"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "first-owner-path-closed" } }, "required": ["guard_id"] } }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "runtime_guard_evidence": {
+            "allOf": [
+              { "$ref": "#/$defs/runtimeGuardEvidence" },
+              { "properties": { "mode": { "const": "not_applicable" }, "guards": { "maxItems": 0 } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "required": ["migration_overlay"] },
+      "then": {
+        "properties": {
+          "enabled_features": { "not": { "contains": { "enum": ["provider-live-execution", "live-execution"] } } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "security_profile": { "const": "development" } },
+        "required": ["security_profile", "migration_overlay"]
+      },
+      "then": {
+        "properties": {
+          "migration_overlay": {
+            "properties": { "security_profile": { "const": "development" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "security_profile": { "const": "test" } },
+        "required": ["security_profile", "migration_overlay"]
+      },
+      "then": {
+        "properties": {
+          "migration_overlay": {
+            "properties": { "security_profile": { "const": "test" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "security_profile": { "const": "production" } },
+        "required": ["security_profile", "migration_overlay"]
+      },
+      "then": {
+        "properties": {
+          "migration_overlay": {
+            "properties": { "security_profile": { "const": "production" } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positiveVersion": { "type": "integer", "minimum": 1 },
+    "digest": {
+      "description": "SHA-256 of the exact artifact bytes at artifact_locator, with no newline, encoding, or JSON canonicalization transformation; encoded as sha256: plus lowercase hexadecimal.",
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "deploymentId": { "type": "string", "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$" },
+    "securityProfile": { "enum": ["development", "test", "production"] },
+    "artifactLocator": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^(?:[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|json-pointer:#/[A-Za-z0-9_./-]+)$",
+      "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+    },
+    "versionedContentReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "document_id", "document_version", "content_digest", "artifact_locator"],
+      "properties": {
+        "artifact_kind": {
+          "enum": [
+            "deployment-security-profile", "provider-registry", "action-resource-registry",
+            "security-limit-profile", "control-plane-topology",
+            "egress-policy", "retention-policy", "federation-policy",
+            "package-exit-receipt"
+          ]
+        },
+        "document_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": { "$ref": "#/$defs/digest" },
+        "artifact_locator": { "$ref": "#/$defs/artifactLocator" }
+      },
+      "allOf": [
+        { "if": { "properties": { "artifact_kind": { "const": "deployment-security-profile" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^deployment-security-profile:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "provider-registry" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^provider-registry:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "action-resource-registry" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^action-resource-registry:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "security-limit-profile" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^security-limit-profile:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "package-exit-receipt" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^package-exit-receipt:" } } } }
+      ]
+    },
+    "providerLifecycleReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "document_id", "document_version", "content_digest", "artifact_locator", "projection", "required_states"],
+      "properties": {
+        "artifact_kind": { "const": "provider-registry" },
+        "document_id": { "type": "string", "pattern": "^provider-registry:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": { "$ref": "#/$defs/digest" },
+        "artifact_locator": { "$ref": "#/$defs/artifactLocator" },
+        "projection": { "const": "provider_lifecycle" },
+        "required_states": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "const": "active" } }
+      }
+    },
+    "documentLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "effective_at"],
+      "properties": {
+        "state": { "enum": ["implementation_only", "candidate", "active", "deprecated", "retired"] },
+        "effective_at": { "type": "string", "format": "date-time" },
+        "supersedes": { "$ref": "#/$defs/versionedContentReference" }
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluation_scope", "security_profiles", "deployment_ids", "enabled_feature_ids"],
+      "properties": {
+        "evaluation_scope": { "const": "deployment" },
+        "security_profiles": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/securityProfile" } },
+        "deployment_ids": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/deploymentId" } },
+        "enabled_feature_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } }
+      }
+    },
+    "trustTopology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topology_kind", "trust_domain_ids"],
+      "properties": {
+        "topology_kind": { "enum": ["single_trust_domain", "federated_trust_domains"] },
+        "trust_domain_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$" } },
+        "federation_policy_ref": {
+          "allOf": [
+            { "$ref": "#/$defs/versionedContentReference" },
+            { "properties": { "artifact_kind": { "const": "federation-policy" } } }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "topology_kind": { "const": "federated_trust_domains" } }, "required": ["topology_kind"] },
+          "then": { "required": ["federation_policy_ref"], "properties": { "trust_domain_ids": { "minItems": 2 } } },
+          "else": { "properties": { "trust_domain_ids": { "maxItems": 1 } }, "not": { "required": ["federation_policy_ref"] } }
+        }
+      ]
+    },
+    "migrationOverlay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "overlay_id", "overlay_version", "security_profile", "authority_source",
+        "legacy_selector_present", "provider_registry_present",
+        "retirement_deadline", "conflict_telemetry_name", "grants_authority",
+        "live_execution_allowed", "zero_consumer_receipt_ref"
+      ],
+      "properties": {
+        "overlay_id": { "type": "string", "pattern": "^migration-overlay:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "overlay_version": { "$ref": "#/$defs/positiveVersion" },
+        "security_profile": { "$ref": "#/$defs/securityProfile" },
+        "authority_source": { "enum": ["provider_registry", "legacy_auth_mode"] },
+        "legacy_selector_present": { "const": true },
+        "provider_registry_present": { "const": true },
+        "retirement_deadline": { "type": "string", "format": "date-time" },
+        "conflict_telemetry_name": { "type": "string", "pattern": "^[a-z][a-z0-9_.]{2,126}$" },
+        "grants_authority": { "const": false },
+        "live_execution_allowed": { "const": false },
+        "zero_consumer_receipt_ref": {
+          "allOf": [
+            { "$ref": "#/$defs/versionedContentReference" },
+            { "properties": { "artifact_kind": { "const": "package-exit-receipt" } } }
+          ]
+        }
+      }
+    },
+    "guardEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guard_id", "control_ids", "receipt_ref"],
+      "properties": {
+        "guard_id": { "enum": ["durable-postgresql", "approved-secret-provider", "https-public-urls", "secure-cookies", "non-development-authenticator", "external-signing-key-material", "mock-dependencies-disabled", "first-owner-path-closed"] },
+        "control_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^SB-[A-Z0-9]+-[0-9]{2}[A-Z]?$" } },
+        "receipt_ref": {
+          "allOf": [
+            { "$ref": "#/$defs/versionedContentReference" },
+            { "properties": { "artifact_kind": { "const": "package-exit-receipt" } } }
+          ]
+        }
+      }
+    },
+    "runtimeGuardEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "guards", "runtime_cross_check_required"],
+      "properties": {
+        "mode": { "enum": ["not_applicable", "receipt_bound"] },
+        "guards": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/guardEvidence" } },
+        "runtime_cross_check_required": { "const": true }
+      }
+    }
+  }
+}

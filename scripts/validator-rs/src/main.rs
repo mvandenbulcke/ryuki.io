@@ -126,6 +126,7 @@ mod ryuki_engine;
 mod scaffold_docs;
 mod secret_reference;
 mod security_baseline;
+mod security_conformance;
 mod sensitive_output_guardrails;
 mod server_lifecycle;
 mod servicenow_future_api;
@@ -466,6 +467,13 @@ fn run() -> Result<ExitCode, String> {
             let slice = require_slice(&args)?;
             let (root, context_json) = parse_root_args(&args[2..])?;
             let errors = match slice {
+                "security-conformance" => {
+                    let errors = security_conformance::validate_repository(&root)?;
+                    if !errors.is_empty() {
+                        exit_code = ExitCode::FAILURE;
+                    }
+                    errors
+                }
                 "backlog-coverage" => {
                     let context = match context_json {
                         Some(path) => read_context_json(&path)?,
@@ -2384,7 +2392,8 @@ fn usage() -> String {
 fn require_slice(args: &[String]) -> Result<&str, String> {
     match args.get(1).map(String::as_str) {
         Some(
-            "backlog-coverage"
+            "security-conformance"
+            | "backlog-coverage"
             | "server-lifecycle-dry-run"
             | "access-review-recertification"
             | "ad-computer-lifecycle"
@@ -3680,6 +3689,7 @@ fn validate_slice_inner(
     context_json: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     match slice {
+        "security-conformance" => security_conformance::validate_repository(root),
         "backlog-coverage" => {
             let context = match context_json {
                 Some(path) => read_context_json(path)?,
@@ -4402,7 +4412,7 @@ fn run_all_validate(root: &Path, parallel: bool) -> Result<RunAllOutput, String>
     let slices = slices_from_coverage();
     let start = Instant::now();
 
-    let results: Vec<SliceResult> = if parallel {
+    let mut results: Vec<SliceResult> = if parallel {
         slices
             .par_iter()
             .map(|entry| run_one_slice(root, entry, &shared))
@@ -4413,6 +4423,41 @@ fn run_all_validate(root: &Path, parallel: bool) -> Result<RunAllOutput, String>
             .map(|entry| run_one_slice(root, entry, &shared))
             .collect()
     };
+
+    // This is a repository gate, not a COVERAGE_TSV slice.  Its authority is
+    // the closed versioned security-contract set, so it runs exactly once and
+    // cannot disappear when a catalog row is renamed or deduplicated.
+    let gate_start = Instant::now();
+    let gate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        security_conformance::validate_repository(root)
+    }));
+    results.push(match gate {
+        Ok(Ok(errors)) => SliceResult {
+            slice: "security-conformance".to_string(),
+            passed: errors.is_empty(),
+            errors,
+            duration_ms: gate_start.elapsed().as_millis() as u64,
+        },
+        Ok(Err(error)) => SliceResult {
+            slice: "security-conformance".to_string(),
+            passed: false,
+            errors: vec![error],
+            duration_ms: gate_start.elapsed().as_millis() as u64,
+        },
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            SliceResult {
+                slice: "security-conformance".to_string(),
+                passed: false,
+                errors: vec![format!("repository gate panicked: {message}")],
+                duration_ms: gate_start.elapsed().as_millis() as u64,
+            }
+        }
+    });
 
     let total_duration = start.elapsed().as_millis() as u64;
     let passed = results.iter().filter(|r| r.passed).count();

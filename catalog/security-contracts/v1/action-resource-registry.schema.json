@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
+  "title": "Ryuki Action, Resource, and Resolver Registry",
+  "description": "Closed action vocabulary and canonical resource, resolver, HTTP route, and internal worker mappings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
+    "lifecycle",
+    "applicability",
+    "registry_version",
+    "inventory_closure",
+    "actor_kinds",
+    "actions",
+    "resources",
+    "resolvers",
+    "route_mappings",
+    "worker_mappings"
+  ],
+  "properties": {
+    "$schema": { "const": "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json" },
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "action-resource-registry" },
+    "document_id": {
+      "type": "string",
+      "pattern": "^action-resource-registry:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "document_version": { "$ref": "#/$defs/positiveVersion" },
+    "lifecycle": { "$ref": "#/$defs/documentLifecycle" },
+    "applicability": { "$ref": "#/$defs/registryApplicability" },
+    "registry_version": { "$ref": "#/$defs/positiveVersion" },
+    "inventory_closure": { "$ref": "#/$defs/inventoryClosure" },
+    "actor_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/actorKind" }
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/resource" }
+    },
+    "resolvers": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/resolver" }
+    },
+    "route_mappings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/routeMapping" }
+    },
+    "worker_mappings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/workerMapping" }
+    }
+  },
+  "$defs": {
+    "positiveVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "referenceId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "actionId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)+$"
+    },
+    "resourceKind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "resolverId": {
+      "type": "string",
+      "pattern": "^resolver:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "actorKind": {
+      "enum": [
+        "anonymous",
+        "verified-human",
+        "service",
+        "workload",
+        "agent",
+        "system",
+        "webhook"
+      ]
+    },
+    "documentLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "effective_at"],
+      "properties": {
+        "state": { "enum": ["implementation_only", "candidate", "active", "deprecated", "retired"] },
+        "effective_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "registryApplicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluation_scope", "security_profiles", "enabled_feature_ids"],
+      "properties": {
+        "evaluation_scope": { "enum": ["implementation", "deployment"] },
+        "security_profiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["development", "test", "production"] } },
+        "enabled_feature_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } }
+      }
+    },
+    "contentReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_id", "document_version", "content_digest", "artifact_locator"],
+      "properties": {
+        "document_id": { "$ref": "#/$defs/referenceId" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": {
+          "description": "SHA-256 of the exact artifact bytes at artifact_locator, with no transformation; encoded as sha256: plus lowercase hexadecimal.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "artifact_locator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+          "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+        }
+      }
+    },
+    "inventoryClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_status",
+        "router_inventory_equal",
+        "worker_inventory_equal",
+        "unknown_entries_rejected",
+        "inventory_sources"
+      ],
+      "properties": {
+        "coverage_status": { "enum": ["transitional_snapshot", "complete"] },
+        "router_inventory_equal": { "type": "boolean" },
+        "worker_inventory_equal": { "type": "boolean" },
+        "unknown_entries_rejected": { "type": "boolean" },
+        "inventory_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/contentReference" }
+        },
+        "closure_receipt_ref": { "$ref": "#/$defs/contentReference" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "coverage_status": { "const": "complete" } },
+            "required": ["coverage_status"]
+          },
+          "then": {
+            "required": ["closure_receipt_ref"],
+            "properties": {
+              "router_inventory_equal": { "const": true },
+              "worker_inventory_equal": { "const": true },
+              "unknown_entries_rejected": { "const": true }
+            }
+          },
+          "else": { "not": { "required": ["closure_receipt_ref"] } }
+        }
+      ]
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "description",
+        "resource_kind",
+        "permitted_actor_kinds",
+        "authorization_semantics",
+        "obligations",
+        "risk_class",
+        "lifecycle",
+        "applicability_expression"
+      ],
+      "properties": {
+        "action_id": { "$ref": "#/$defs/actionId" },
+        "description": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "resource_kind": { "$ref": "#/$defs/resourceKind" },
+        "permitted_actor_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/actorKind" }
+        },
+        "authorization_semantics": { "enum": ["instance", "query", "global"] },
+        "obligations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "step-up",
+              "maker-checker",
+              "quorum",
+              "idempotency",
+              "audit",
+              "provider-capability",
+              "none"
+            ]
+          }
+        },
+        "risk_class": { "enum": ["ordinary", "sensitive", "privileged", "live-execution"] },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "pattern": "^(?:always|profile in \\{(?:development|test|production)(?:,(?:development|test|production))*\\}|feature:[a-z][a-z0-9._-]{1,95})$" },
+        "superseded_by_action_id": { "$ref": "#/$defs/actionId" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "lifecycle": { "const": "retired" } },
+            "required": ["lifecycle"]
+          },
+          "then": { "required": ["superseded_by_action_id"] },
+          "else": { "not": { "required": ["superseded_by_action_id"] } }
+        },
+        {
+          "if": {
+            "properties": { "obligations": { "contains": { "const": "none" } } },
+            "required": ["obligations"]
+          },
+          "then": { "properties": { "obligations": { "maxItems": 1 } } }
+        }
+      ]
+    },
+    "canonicalResourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "required_fields", "security_version_field", "canonicalization"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/positiveVersion" },
+        "required_fields": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state", "tenant_id"] },
+          "allOf": [
+            { "contains": { "const": "resource_kind" } },
+            { "contains": { "const": "canonical_id" } },
+            { "contains": { "const": "deployment_id" } },
+            { "contains": { "const": "trust_domain_id" } },
+            { "contains": { "const": "resource_version" } },
+            { "contains": { "const": "sensitivity" } },
+            { "contains": { "const": "lifecycle_state" } }
+          ]
+        },
+        "security_version_field": { "const": "resource_version" },
+        "canonicalization": { "const": "resolve-before-policy" }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resource_kind",
+        "canonical_id_pattern",
+        "resolver_id",
+        "resolver_version",
+        "scope_dimensions",
+        "requires_security_version",
+        "aliases_allowed",
+        "sensitivity",
+        "canonical_resource_ref",
+        "lifecycle",
+        "applicability_expression"
+      ],
+      "properties": {
+        "resource_kind": { "$ref": "#/$defs/resourceKind" },
+        "canonical_id_pattern": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "resolver_id": { "$ref": "#/$defs/resolverId" },
+        "resolver_version": { "$ref": "#/$defs/positiveVersion" },
+        "scope_dimensions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "deployment_id",
+              "trust_domain_id",
+              "tenant_id",
+              "site_id",
+              "environment_id",
+              "owner_principal_id"
+            ]
+          }
+        },
+        "requires_security_version": { "type": "boolean" },
+        "aliases_allowed": { "type": "boolean" },
+        "sensitivity": { "enum": ["public", "internal", "confidential", "restricted"] },
+        "canonical_resource_ref": { "$ref": "#/$defs/canonicalResourceRef" },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "resolver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolver_id",
+        "resolver_version",
+        "resource_kind",
+        "mode",
+        "canonical_id_source",
+        "security_version_source",
+        "permit_kind",
+        "fail_closed",
+        "lifecycle",
+        "applicability_expression"
+      ],
+      "properties": {
+        "resolver_id": { "$ref": "#/$defs/resolverId" },
+        "resolver_version": { "$ref": "#/$defs/positiveVersion" },
+        "resource_kind": { "$ref": "#/$defs/resourceKind" },
+        "mode": { "enum": ["instance", "collection", "global"] },
+        "canonical_id_source": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "security_version_source": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "permit_kind": { "enum": ["AuthorizationPermit", "QueryPermit"] },
+        "fail_closed": { "const": true },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "collection" } }, "required": ["mode"] },
+          "then": { "properties": { "permit_kind": { "const": "QueryPermit" } } },
+          "else": { "properties": { "permit_kind": { "const": "AuthorizationPermit" } } }
+        }
+      ]
+    },
+    "routeMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mapping_id",
+        "method",
+        "path_template",
+        "action_id",
+        "resource_kind",
+        "resolver_id",
+        "resolver_version",
+        "permit_kind",
+        "permitted_actor_kinds",
+        "lifecycle",
+        "applicability_expression",
+        "source_file"
+      ],
+      "properties": {
+        "mapping_id": {
+          "type": "string",
+          "pattern": "^route:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"] },
+        "path_template": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9_{}./:-]*$"
+        },
+        "action_id": { "$ref": "#/$defs/actionId" },
+        "resource_kind": { "$ref": "#/$defs/resourceKind" },
+        "resolver_id": { "$ref": "#/$defs/resolverId" },
+        "resolver_version": { "$ref": "#/$defs/positiveVersion" },
+        "permit_kind": { "enum": ["AuthorizationPermit", "QueryPermit"] },
+        "permitted_actor_kinds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/actorKind" } },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "source_file": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_./-]+$"
+        }
+      }
+    },
+    "workerMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mapping_id",
+        "worker_id",
+        "action_id",
+        "resource_kind",
+        "resolver_id",
+        "resolver_version",
+        "permit_kind",
+        "permitted_actor_kinds",
+        "lifecycle",
+        "applicability_expression",
+        "source_file"
+      ],
+      "properties": {
+        "mapping_id": {
+          "type": "string",
+          "pattern": "^worker-mapping:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "worker_id": {
+          "type": "string",
+          "pattern": "^worker:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "action_id": { "$ref": "#/$defs/actionId" },
+        "resource_kind": { "$ref": "#/$defs/resourceKind" },
+        "resolver_id": { "$ref": "#/$defs/resolverId" },
+        "resolver_version": { "$ref": "#/$defs/positiveVersion" },
+        "permit_kind": { "enum": ["AuthorizationPermit", "QueryPermit"] },
+        "permitted_actor_kinds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/actorKind" } },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "source_file": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_./-]+$"
+        }
+      }
+    }
+  }
+}

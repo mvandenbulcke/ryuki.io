@@ -1,0 +1,771 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+  "title": "Ryuki package exit receipt",
+  "description": "Signed or provenance-bound projection of the active ControlTrace ledger and accepted evidence used to evaluate one implementation work package. Schema validity alone never declares package completion.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "receipt_id",
+    "acceptance_status",
+    "production_accepted",
+    "package_id",
+    "ledger_binding",
+    "evaluated_sets",
+    "applicability_instances",
+    "closure_context",
+    "prerequisite_receipts",
+    "input_digests",
+    "output_digests",
+    "evidence_tier",
+    "result",
+    "receipt_lifecycle",
+    "waivers",
+    "retirement_closure",
+    "signer",
+    "provenance",
+    "created_at",
+    "expires_at",
+    "supersedes_receipt_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "#/$defs/version"
+    },
+    "receipt_id": {
+      "$ref": "#/$defs/receiptId"
+    },
+    "acceptance_status": {
+      "$ref": "#/$defs/acceptanceStatus"
+    },
+    "production_accepted": {
+      "type": "boolean"
+    },
+    "package_id": {
+      "$ref": "#/$defs/workPackageId"
+    },
+    "ledger_binding": {
+      "$ref": "#/$defs/ledgerBinding"
+    },
+    "evaluated_sets": {
+      "$ref": "#/$defs/evaluatedSets"
+    },
+    "applicability_instances": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/applicabilityInstance"
+      }
+    },
+    "closure_context": {
+      "$ref": "#/$defs/closureContext"
+    },
+    "prerequisite_receipts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/prerequisiteReceipt"
+      }
+    },
+    "input_digests": {
+      "$ref": "#/$defs/digestSet"
+    },
+    "output_digests": {
+      "$ref": "#/$defs/digestSet"
+    },
+    "evidence_tier": {
+      "$ref": "#/$defs/evidenceTier"
+    },
+    "result": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "receipt_lifecycle": {
+      "type": "string",
+      "enum": [
+        "produced",
+        "verified",
+        "accepted",
+        "expired",
+        "revoked",
+        "superseded"
+      ]
+    },
+    "waivers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/waiver"
+      }
+    },
+    "retirement_closure": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/retirementClosure"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "signer": {
+      "$ref": "#/$defs/signer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "supersedes_receipt_id": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/receiptId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "implementation_only"
+            },
+            "production_accepted": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "production_candidate"
+            },
+            "production_accepted": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "production_accepted"
+            },
+            "production_accepted": {
+              "const": true
+            },
+            "result": {
+              "const": "pass"
+            },
+            "receipt_lifecycle": {
+              "const": "accepted"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": { "receipt_lifecycle": { "const": "accepted" } },
+        "required": ["receipt_lifecycle"]
+      },
+      "then": { "properties": { "result": { "const": "pass" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "receipt_lifecycle": {
+            "enum": [
+              "expired",
+              "revoked",
+              "superseded"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "production_accepted": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "package_id": {
+            "const": "SB-9"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "retirement_closure": {
+            "$ref": "#/$defs/retirementClosure"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:[-+][A-Za-z0-9.-]+)?$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "receiptId": {
+      "type": "string",
+      "pattern": "^package-exit-receipt:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "acceptanceStatus": {
+      "type": "string",
+      "enum": [
+        "implementation_only",
+        "production_candidate",
+        "production_accepted"
+      ]
+    },
+    "workPackageId": {
+      "type": "string",
+      "enum": [
+        "SB-0",
+        "SB-1",
+        "SB-2",
+        "SB-3",
+        "SB-4",
+        "SB-5",
+        "SB-6",
+        "SB-7",
+        "SB-8",
+        "SB-9"
+      ]
+    },
+    "controlId": {
+      "type": "string",
+      "pattern": "^SB-[A-Z][A-Z0-9]*-[0-9]{2}[A-Z]?$"
+    },
+    "acceptanceCaseId": {
+      "type": "string",
+      "pattern": "^AC-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "digestSet": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/digest"
+      }
+    },
+    "ledgerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ledger_id",
+        "ledger_version",
+        "ledger_digest"
+      ],
+      "properties": {
+        "ledger_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "ledger_version": {
+          "$ref": "#/$defs/version"
+        },
+        "ledger_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "evaluatedSets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trace_ids",
+        "control_ids",
+        "acceptance_case_ids",
+        "evidence_instance_ids"
+      ],
+      "properties": {
+        "trace_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "control_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/controlId"
+          }
+        },
+        "acceptance_case_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/acceptanceCaseId"
+          }
+        },
+        "evidence_instance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      }
+    },
+    "scalar": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        }
+      ]
+    },
+    "dimensionName": {
+      "type": "string",
+      "pattern": "^(implementation|deployment)\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "dimensionValue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/scalar"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/scalar"
+          }
+        }
+      ]
+    },
+    "evaluatedDimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/dimensionName"
+        },
+        "value": {
+          "$ref": "#/$defs/dimensionValue"
+        }
+      }
+    },
+    "applicabilityInstance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_id",
+        "implementation_dimensions",
+        "deployment_dimensions"
+      ],
+      "properties": {
+        "instance_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "implementation_dimensions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evaluatedDimension"
+          }
+        },
+        "deployment_dimensions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evaluatedDimension"
+          }
+        }
+      }
+    },
+    "versionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "digest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "versionBindingSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/versionBinding"
+      }
+    },
+    "deploymentProfileBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "deployment_id",
+        "digest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "deployment_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "closureContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "artifact_digest",
+        "deployment_profile",
+        "policy_versions",
+        "configuration_versions",
+        "provider_versions",
+        "adapter_versions",
+        "security_limit_profile"
+      ],
+      "properties": {
+        "source_revision": {
+          "type": "string",
+          "description": "Exact lowercase Git object id; SHA-1 and SHA-256 repositories are supported.",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "artifact_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "deployment_profile": {
+          "$ref": "#/$defs/deploymentProfileBinding"
+        },
+        "policy_versions": {
+          "$ref": "#/$defs/versionBindingSet"
+        },
+        "configuration_versions": {
+          "$ref": "#/$defs/versionBindingSet"
+        },
+        "provider_versions": {
+          "$ref": "#/$defs/versionBindingSet"
+        },
+        "adapter_versions": {
+          "$ref": "#/$defs/versionBindingSet"
+        },
+        "security_limit_profile": {
+          "$ref": "#/$defs/versionBinding"
+        }
+      }
+    },
+    "prerequisiteReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_id",
+        "receipt_id",
+        "receipt_digest",
+        "result",
+        "receipt_lifecycle",
+        "expires_at"
+      ],
+      "properties": {
+        "package_id": {
+          "$ref": "#/$defs/workPackageId"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/receiptId"
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "result": {
+          "const": "pass"
+        },
+        "receipt_lifecycle": {
+          "const": "accepted"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "evidenceTier": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "repository_local"
+            },
+            "rank": {
+              "const": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "operator_environment"
+            },
+            "rank": {
+              "const": 2
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "externally_attested"
+            },
+            "rank": {
+              "const": 3
+            }
+          }
+        }
+      ]
+    },
+    "waiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trace_id",
+        "control_id",
+        "owner",
+        "rationale",
+        "compensating_control_id",
+        "scope",
+        "approval",
+        "expires_at"
+      ],
+      "properties": {
+        "trace_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "control_id": {
+          "$ref": "#/$defs/controlId"
+        },
+        "owner": {
+          "$ref": "#/$defs/identifier"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 2000
+        },
+        "compensating_control_id": {
+          "$ref": "#/$defs/controlId"
+        },
+        "scope": {
+          "$ref": "#/$defs/applicabilityInstance"
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approver_id",
+            "approved_at",
+            "signature_digest"
+          ],
+          "properties": {
+            "approver_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "approved_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "signature_digest": {
+              "$ref": "#/$defs/digest"
+            }
+          }
+        },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "retirementClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zero_consumer_evidence_instance_ids",
+        "zero_live_authority_evidence_instance_ids",
+        "retired_bypass_evidence_instance_ids"
+      ],
+      "properties": {
+        "zero_consumer_evidence_instance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "zero_live_authority_evidence_instance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "retired_bypass_evidence_instance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      }
+    },
+    "signer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "mechanism",
+        "key_id",
+        "signature_digest",
+        "trust_root_version"
+      ],
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mechanism": {
+          "type": "string",
+          "enum": [
+            "sigstore",
+            "x509",
+            "pgp",
+            "workload_identity",
+            "oidc"
+          ]
+        },
+        "key_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "signature_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "trust_root_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "predicate_type",
+        "builder_id",
+        "invocation_id",
+        "statement_digest",
+        "generated_at"
+      ],
+      "properties": {
+        "predicate_type": {
+          "type": "string",
+          "format": "uri"
+        },
+        "builder_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "statement_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
+  "schema_version": "1.0.0",
+  "contract_kind": "provider-registry",
+  "document_id": "provider-registry:repository-implementation-v1",
+  "document_version": 1,
+  "lifecycle": {
+    "state": "implementation_only",
+    "effective_at": "2026-07-16T00:00:00Z"
+  },
+  "applicability": {
+    "evaluation_scope": "implementation",
+    "security_profiles": ["development", "test"],
+    "provider_kinds": ["development-fixture"],
+    "enabled_feature_ids": ["repository-conformance", "static-dry-run"]
+  },
+  "registry_version": 1,
+  "configurations": [
+    {
+      "provider_id": "provider:repository-static-dry-run",
+      "kind": "development-fixture",
+      "config_version": 1,
+      "payload_digest_contract": {
+        "algorithm": "sha-256",
+        "canonicalization": "ryuki-canonical-json-v1",
+        "excluded_json_pointers": ["/payload_digest"],
+        "digest_encoding": "sha256-prefix-lowercase-hex"
+      },
+      "payload_digest": "sha256:618995f3d19566aeb06776c4b06d4877e3fc377f608317b1845c371a6e2db6cb",
+      "immutable": true,
+      "trust_domain_id": "trust-domain:repository-fixture",
+      "allowed_security_profiles": [
+        "development",
+        "test"
+      ],
+      "required_for_profiles": [],
+      "outbound_destinations": [],
+      "credential_refs": [],
+      "claim_assurance_mapping_refs": [],
+      "capability_descriptor": {
+        "descriptor_id": "capability-descriptor:repository-static-dry-run-v1",
+        "descriptor_version": 1,
+        "advertised_capabilities": [
+          "dry-run-only",
+          "static-human-fixture"
+        ],
+        "mandatory_baseline_ref": {
+          "document_id": "baseline:repository-development-fixture-v1",
+          "document_version": 1,
+          "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+          "artifact_locator": "docs/architecture/platform-security-boundary.md"
+        },
+        "implementation_applicable": true,
+        "production_eligible": false
+      },
+      "ownership": {
+        "owning_team": "platform-security",
+        "configuration_change_authority": "authority:repository-security-contract",
+        "lifecycle_change_authority": "authority:repository-security-contract",
+        "audit_class": "security-configuration"
+      },
+      "kind_config": {
+        "configuration_kind": "development-fixture",
+        "fixture_type": "static-human",
+        "loopback_only": true,
+        "isolated_network_required": true,
+        "live_execution_allowed": false
+      }
+    }
+  ],
+  "provider_lifecycle": [
+    {
+      "provider_id": "provider:repository-static-dry-run",
+      "config_version": 1,
+      "lifecycle_record_version": 1,
+      "state": "configured",
+      "effective_at": "2026-07-16T00:00:00Z",
+      "governing_contract_ref": {
+        "document_id": "security-boundary:platform-production-v1",
+        "document_version": 1,
+        "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+        "artifact_locator": "docs/architecture/platform-security-boundary.md"
+      }
+    }
+  ],
+  "provider_id_tombstones": []
+}

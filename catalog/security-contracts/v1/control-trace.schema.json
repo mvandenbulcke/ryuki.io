@@ -1,0 +1,531 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json",
+  "title": "Ryuki ControlTrace ledger",
+  "description": "Static, versioned control-to-acceptance-case trace ledger. Cross-row ownership, uniqueness, coverage, applicability, and supersession invariants are enforced by the security-conformance closure validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ledger_id",
+    "ledger_version",
+    "acceptance_status",
+    "production_accepted",
+    "controls",
+    "acceptance_cases",
+    "traces"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "#/$defs/version"
+    },
+    "ledger_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "ledger_version": {
+      "$ref": "#/$defs/version"
+    },
+    "acceptance_status": {
+      "$ref": "#/$defs/acceptanceStatus"
+    },
+    "production_accepted": {
+      "type": "boolean"
+    },
+    "controls": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/control"
+      }
+    },
+    "acceptance_cases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/acceptanceCase"
+      }
+    },
+    "traces": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/trace"
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "acceptance_status": {
+          "const": "implementation_only"
+        },
+        "production_accepted": {
+          "const": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "acceptance_status": {
+          "const": "production_candidate"
+        },
+        "production_accepted": {
+          "const": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "acceptance_status": {
+          "const": "production_accepted"
+        },
+        "production_accepted": {
+          "const": true
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:[-+][A-Za-z0-9.-]+)?$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "acceptanceStatus": {
+      "type": "string",
+      "enum": [
+        "implementation_only",
+        "production_candidate",
+        "production_accepted"
+      ]
+    },
+    "controlId": {
+      "type": "string",
+      "pattern": "^SB-[A-Z][A-Z0-9]*-[0-9]{2}[A-Z]?$"
+    },
+    "acceptanceCaseId": {
+      "type": "string",
+      "pattern": "^AC-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2,})$"
+    },
+    "workPackageId": {
+      "type": "string",
+      "enum": [
+        "SB-0",
+        "SB-1",
+        "SB-2",
+        "SB-3",
+        "SB-4",
+        "SB-5",
+        "SB-6",
+        "SB-7",
+        "SB-8",
+        "SB-9"
+      ]
+    },
+    "owningTeam": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 80,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_id",
+        "title",
+        "owning_work_package",
+        "owning_team",
+        "waivable"
+      ],
+      "properties": {
+        "control_id": {
+          "$ref": "#/$defs/controlId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 240
+        },
+        "owning_work_package": {
+          "$ref": "#/$defs/workPackageId"
+        },
+        "owning_team": {
+          "$ref": "#/$defs/owningTeam"
+        },
+        "waivable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "acceptanceCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptance_case_id",
+        "title",
+        "owning_work_package",
+        "owning_team"
+      ],
+      "properties": {
+        "acceptance_case_id": {
+          "$ref": "#/$defs/acceptanceCaseId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 500
+        },
+        "owning_work_package": {
+          "$ref": "#/$defs/workPackageId"
+        },
+        "owning_team": {
+          "$ref": "#/$defs/owningTeam"
+        }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trace_id",
+        "control_id",
+        "acceptance_case_id",
+        "owning_work_package",
+        "owning_team",
+        "applicability_expression",
+        "evidence_instance_dimensions",
+        "minimum_evidence_tier",
+        "fixture_or_probe_id",
+        "pass_condition",
+        "trace_lifecycle",
+        "supersedes_trace_id"
+      ],
+      "properties": {
+        "trace_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "control_id": {
+          "$ref": "#/$defs/controlId"
+        },
+        "acceptance_case_id": {
+          "$ref": "#/$defs/acceptanceCaseId"
+        },
+        "owning_work_package": {
+          "$ref": "#/$defs/workPackageId"
+        },
+        "owning_team": {
+          "$ref": "#/$defs/owningTeam"
+        },
+        "applicability_expression": {
+          "$ref": "#/$defs/applicability"
+        },
+        "evidence_instance_dimensions": {
+          "$ref": "#/$defs/evidenceInstanceDimensions"
+        },
+        "minimum_evidence_tier": {
+          "$ref": "#/$defs/minimumEvidenceTier"
+        },
+        "fixture_or_probe_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "pass_condition": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 2000
+        },
+        "trace_lifecycle": {
+          "type": "string",
+          "enum": [
+            "active",
+            "superseded",
+            "retired"
+          ]
+        },
+        "supersedes_trace_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation",
+        "deployment"
+      ],
+      "properties": {
+        "implementation": {
+          "$ref": "#/$defs/expression"
+        },
+        "deployment": {
+          "$ref": "#/$defs/expression"
+        }
+      }
+    },
+    "expression": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator"
+          ],
+          "properties": {
+            "operator": {
+              "enum": [
+                "always",
+                "never"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator",
+            "operands"
+          ],
+          "properties": {
+            "operator": {
+              "enum": [
+                "all",
+                "any"
+              ]
+            },
+            "operands": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/expression"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator",
+            "operand"
+          ],
+          "properties": {
+            "operator": {
+              "const": "not"
+            },
+            "operand": {
+              "$ref": "#/$defs/expression"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator",
+            "dimension",
+            "value"
+          ],
+          "properties": {
+            "operator": {
+              "enum": [
+                "equals",
+                "not_equals",
+                "contains"
+              ]
+            },
+            "dimension": {
+              "$ref": "#/$defs/dimensionName"
+            },
+            "value": {
+              "$ref": "#/$defs/scalar"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator",
+            "dimension",
+            "values"
+          ],
+          "properties": {
+            "operator": {
+              "enum": [
+                "in",
+                "not_in"
+              ]
+            },
+            "dimension": {
+              "$ref": "#/$defs/dimensionName"
+            },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/scalar"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "scalar": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        }
+      ]
+    },
+    "dimensionName": {
+      "type": "string",
+      "pattern": "^(implementation|deployment)\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "evidenceInstanceDimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation",
+        "deployment"
+      ],
+      "properties": {
+        "implementation": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^implementation\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+          }
+        },
+        "deployment": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^deployment\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+          }
+        }
+      }
+    },
+    "minimumEvidenceTier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation",
+        "deployment"
+      ],
+      "properties": {
+        "implementation": {
+          "$ref": "#/$defs/nullableEvidenceTier"
+        },
+        "deployment": {
+          "$ref": "#/$defs/nullableEvidenceTier"
+        }
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "implementation": {
+              "$ref": "#/$defs/evidenceTier"
+            }
+          }
+        },
+        {
+          "properties": {
+            "deployment": {
+              "$ref": "#/$defs/evidenceTier"
+            }
+          }
+        }
+      ]
+    },
+    "nullableEvidenceTier": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/evidenceTier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidenceTier": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "repository_local"
+            },
+            "rank": {
+              "const": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "operator_environment"
+            },
+            "rank": {
+              "const": 2
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "rank"
+          ],
+          "properties": {
+            "name": {
+              "const": "externally_attested"
+            },
+            "rank": {
+              "const": 3
+            }
+          }
+        }
+      ]
+    }
+  }
+}

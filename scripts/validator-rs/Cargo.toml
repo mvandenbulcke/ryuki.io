@@ -14,3 +14,4 @@ rayon = "1"
 toml = "0.8"
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
+jsonschema = { workspace = true }

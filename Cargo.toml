@@ -60,6 +60,7 @@ governor = { version = "0.7", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["limit"] }
 hmac = "0.12"
 sha2 = "0.10"
+jsonschema = { version = "=0.47.0", default-features = false }
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 ryuki-runner = { path = "sources/ryuki-runner" }

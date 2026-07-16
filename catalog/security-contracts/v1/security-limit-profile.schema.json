@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/security-limit-profile.schema.json",
+  "title": "Ryuki Security Limit Profile",
+  "description": "Immutable owner of selected security-relevant values, published defaults, platform hard bounds, failure projections, telemetry, and change authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
+    "lifecycle",
+    "applicability",
+    "profile_version",
+    "hard_bounds_revision",
+    "coverage_status",
+    "normative_categories",
+    "covered_categories",
+    "boundary_fixture_catalog_ref",
+    "immutable",
+    "limits"
+  ],
+  "properties": {
+    "$schema": { "const": "https://ryuki.io/schemas/security-contracts/v1/security-limit-profile.schema.json" },
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "security-limit-profile" },
+    "document_id": {
+      "type": "string",
+      "pattern": "^security-limit-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "document_version": { "$ref": "#/$defs/positiveVersion" },
+    "lifecycle": { "$ref": "#/$defs/documentLifecycle" },
+    "applicability": { "$ref": "#/$defs/limitApplicability" },
+    "profile_version": { "$ref": "#/$defs/positiveVersion" },
+    "hard_bounds_revision": { "$ref": "#/$defs/positiveVersion" },
+    "coverage_status": { "enum": ["transitional_snapshot", "complete"] },
+    "normative_categories": {
+      "const": ["request-bytes", "response-bytes", "parsing-work", "concurrency", "queue-growth", "durable-state-growth", "query-page", "query-lookback", "scheduler-batch", "retention-batch", "subprocess-count", "subprocess-runtime", "subprocess-tree", "output-bytes", "artifact-bytes", "disk-bytes", "memory-bytes", "probe", "retry", "replay-retention", "idempotency-retention", "fairness"]
+    },
+    "covered_categories": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/limitCategory" }
+    },
+    "boundary_fixture_catalog_ref": { "$ref": "#/$defs/contentReference" },
+    "immutable": { "const": true },
+    "limits": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/limit" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "coverage_status": { "const": "complete" } },
+        "required": ["coverage_status"]
+      },
+      "then": {
+        "properties": {
+          "covered_categories": {
+            "const": ["request-bytes", "response-bytes", "parsing-work", "concurrency", "queue-growth", "durable-state-growth", "query-page", "query-lookback", "scheduler-batch", "retention-batch", "subprocess-count", "subprocess-runtime", "subprocess-tree", "output-bytes", "artifact-bytes", "disk-bytes", "memory-bytes", "probe", "retry", "replay-retention", "idempotency-retention", "fairness"]
+          },
+          "limits": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/limit" },
+                {
+                  "required": ["lifecycle", "applicability_expression"],
+                  "properties": {
+                    "enforcement_status": { "not": { "const": "declared_only" } }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positiveVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "referenceId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "limitId": {
+      "type": "string",
+      "pattern": "^limit:[a-z][a-z0-9._-]{2,126}$"
+    },
+    "documentLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "effective_at"],
+      "properties": {
+        "state": { "enum": ["implementation_only", "candidate", "active", "deprecated", "retired"] },
+        "effective_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "limitApplicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluation_scope", "security_profiles", "deployment_ids", "enabled_feature_ids"],
+      "properties": {
+        "evaluation_scope": { "enum": ["implementation", "deployment"] },
+        "security_profiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["development", "test", "production"] } },
+        "deployment_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$" } },
+        "enabled_feature_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } }
+      }
+    },
+    "contentReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_id", "document_version", "content_digest", "artifact_locator"],
+      "properties": {
+        "document_id": { "$ref": "#/$defs/referenceId" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": {
+          "description": "SHA-256 of the exact artifact bytes at artifact_locator, with no transformation; encoded as sha256: plus lowercase hexadecimal.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "artifact_locator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+          "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+        }
+      }
+    },
+    "limitCategory": {
+      "enum": ["request-bytes", "response-bytes", "parsing-work", "concurrency", "queue-growth", "durable-state-growth", "query-page", "query-lookback", "scheduler-batch", "retention-batch", "subprocess-count", "subprocess-runtime", "subprocess-tree", "output-bytes", "artifact-bytes", "disk-bytes", "memory-bytes", "probe", "retry", "replay-retention", "idempotency-retention", "fairness", "cache-capacity", "ttl", "rate"]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority_id", "owning_team", "required_controls"],
+      "properties": {
+        "authority_id": { "$ref": "#/$defs/referenceId" },
+        "owning_team": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "required_controls": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["review", "step-up", "maker-checker", "contract-revision", "new-conformance-evidence"]
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "dimensions"],
+      "properties": {
+        "kind": {
+          "enum": ["global", "replica", "process", "request", "identity", "trust-domain", "tenant", "provider", "worker", "queue", "subprocess"]
+        },
+        "dimensions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["deployment_id", "replica_id", "actor_id", "credential_id", "trust_domain_id", "tenant_id", "provider_id", "worker_id", "queue_id"]
+          }
+        }
+      }
+    },
+    "hardBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum", "maximum", "minimum_inclusive", "maximum_inclusive"],
+      "properties": {
+        "minimum": { "type": "number" },
+        "maximum": { "type": "number" },
+        "minimum_inclusive": { "type": "boolean" },
+        "maximum_inclusive": { "type": "boolean" }
+      }
+    },
+    "failureProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "stable_code", "retryable", "queueing_allowed", "value_free"],
+      "properties": {
+        "mode": {
+          "enum": ["reject-before-allocation", "throttle", "fail-feature-readiness", "truncate-safe", "quarantine", "expire"]
+        },
+        "stable_code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,95}$"
+        },
+        "http_status": {
+          "type": "integer",
+          "minimum": 400,
+          "maximum": 599
+        },
+        "retryable": { "type": "boolean" },
+        "queueing_allowed": { "type": "boolean" },
+        "value_free": { "const": true }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric_name", "cardinality", "value_free"],
+      "properties": {
+        "metric_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{2,126}$"
+        },
+        "cardinality": { "enum": ["constant", "bounded-low"] },
+        "value_free": { "const": true }
+      }
+    },
+    "procedures": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value_change", "bound_change", "rollback", "evidence_requirements"],
+      "properties": {
+        "value_change": { "$ref": "#/$defs/referenceId" },
+        "bound_change": { "$ref": "#/$defs/referenceId" },
+        "rollback": { "$ref": "#/$defs/referenceId" },
+        "evidence_requirements": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/referenceId" }
+        }
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_file", "source_symbol"],
+      "properties": {
+        "source_file": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_./-]+$"
+        },
+        "source_symbol": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_:.-]{1,191}$"
+        },
+        "source_digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["override_id", "selected_value", "scope_dimensions", "tightens_only", "reason"],
+      "properties": {
+        "override_id": { "$ref": "#/$defs/referenceId" },
+        "selected_value": { "type": "number" },
+        "scope_dimensions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["dimension", "value"],
+            "properties": {
+              "dimension": {
+                "enum": ["deployment_id", "replica_id", "trust_domain_id", "tenant_id", "provider_id", "worker_id", "queue_id"]
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            }
+          }
+        },
+        "tightens_only": { "const": true },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limit_id",
+        "category",
+        "description",
+        "selected_value",
+        "published_default",
+        "unit",
+        "scope",
+        "hard_bounds",
+        "owner",
+        "value_change_authority",
+        "bound_change_authority",
+        "failure_projection",
+        "telemetry",
+        "procedures",
+        "enforcement_status",
+        "source_binding",
+        "overrides"
+      ],
+      "properties": {
+        "limit_id": { "$ref": "#/$defs/limitId" },
+        "category": { "$ref": "#/$defs/limitCategory" },
+        "description": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "selected_value": { "type": "number" },
+        "published_default": { "type": "number" },
+        "unit": {
+          "enum": ["bytes", "items", "requests", "connections", "seconds", "milliseconds", "attempts", "processes", "rows", "percent"]
+        },
+        "scope": { "$ref": "#/$defs/scope" },
+        "hard_bounds": { "$ref": "#/$defs/hardBounds" },
+        "owner": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "value_change_authority": { "$ref": "#/$defs/authority" },
+        "bound_change_authority": { "$ref": "#/$defs/authority" },
+        "failure_projection": { "$ref": "#/$defs/failureProjection" },
+        "telemetry": { "$ref": "#/$defs/telemetry" },
+        "procedures": { "$ref": "#/$defs/procedures" },
+        "enforcement_status": { "enum": ["declared_only", "partially_enforced", "enforced"] },
+        "source_binding": { "$ref": "#/$defs/sourceBinding" },
+        "overrides": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/override" }
+        },
+        "lifecycle": { "enum": ["active", "deprecated", "retired"] },
+        "applicability_expression": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}

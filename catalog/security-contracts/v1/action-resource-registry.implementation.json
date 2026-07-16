@@ -1,0 +1,356 @@
+{
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
+  "schema_version": "1.0.0",
+  "contract_kind": "action-resource-registry",
+  "document_id": "action-resource-registry:repository-implementation-v1",
+  "document_version": 1,
+  "lifecycle": {
+    "state": "implementation_only",
+    "effective_at": "2026-07-16T00:00:00Z"
+  },
+  "applicability": {
+    "evaluation_scope": "implementation",
+    "security_profiles": ["development", "test", "production"],
+    "enabled_feature_ids": ["repository-conformance"]
+  },
+  "registry_version": 1,
+  "inventory_closure": {
+    "coverage_status": "transitional_snapshot",
+    "router_inventory_equal": false,
+    "worker_inventory_equal": false,
+    "unknown_entries_rejected": false,
+    "inventory_sources": [
+      {
+        "document_id": "source:ryuki-api-main",
+        "document_version": 1,
+        "content_digest": "sha256:60e34b29e8c2e07ddef007a0f671143e9899d24af62a974cf75231b88cd2df3b",
+        "artifact_locator": "sources/ryuki-api/src/main.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-contracts",
+        "document_version": 1,
+        "content_digest": "sha256:8b6f71e166f8252878a1ad05eecc33c0559370dce2850f343afc9b09740d508b",
+        "artifact_locator": "sources/ryuki-api/src/contracts.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-scheduler",
+        "document_version": 1,
+        "content_digest": "sha256:81eb10af4eeed22e97c8b12a9f665b99c06d8d565d55095413a4d927a82df17a",
+        "artifact_locator": "sources/ryuki-api/src/scheduler.rs"
+      },
+      {
+        "document_id": "source:ryuki-api-agents",
+        "document_version": 1,
+        "content_digest": "sha256:375fb86a7caee72165671c676a7b8da3a6bfff3da2d7e472a8d0c06fac105cb1",
+        "artifact_locator": "sources/ryuki-api/src/agents.rs"
+      }
+    ]
+  },
+  "actor_kinds": [
+    "anonymous",
+    "verified-human",
+    "service",
+    "workload",
+    "agent",
+    "system",
+    "webhook"
+  ],
+  "actions": [
+    {
+      "action_id": "request.read",
+      "description": "Read one canonically resolved request instance.",
+      "resource_kind": "request",
+      "permitted_actor_kinds": [
+        "verified-human",
+        "service"
+      ],
+      "authorization_semantics": "instance",
+      "obligations": [
+        "audit"
+      ],
+      "risk_class": "ordinary",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "action_id": "request.approve",
+      "description": "Approve one request through its canonical transition boundary.",
+      "resource_kind": "request",
+      "permitted_actor_kinds": [
+        "verified-human"
+      ],
+      "authorization_semantics": "instance",
+      "obligations": [
+        "step-up",
+        "maker-checker",
+        "audit"
+      ],
+      "risk_class": "privileged",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "action_id": "audit.read",
+      "description": "Read the bounded audit collection through a query permit.",
+      "resource_kind": "audit-log",
+      "permitted_actor_kinds": [
+        "verified-human",
+        "service"
+      ],
+      "authorization_semantics": "query",
+      "obligations": [
+        "audit"
+      ],
+      "risk_class": "sensitive",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "action_id": "platform.settings.update",
+      "description": "Update the versioned platform configuration.",
+      "resource_kind": "platform-config",
+      "permitted_actor_kinds": [
+        "verified-human"
+      ],
+      "authorization_semantics": "global",
+      "obligations": [
+        "step-up",
+        "maker-checker",
+        "audit"
+      ],
+      "risk_class": "privileged",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "action_id": "agent.heartbeat",
+      "description": "Submit a heartbeat for the authenticated agent instance.",
+      "resource_kind": "agent",
+      "permitted_actor_kinds": [
+        "agent"
+      ],
+      "authorization_semantics": "instance",
+      "obligations": [
+        "audit"
+      ],
+      "risk_class": "sensitive",
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    }
+  ],
+  "resources": [
+    {
+      "resource_kind": "request",
+      "canonical_id_pattern": "^request:[a-z0-9-]+$",
+      "resolver_id": "resolver:request-instance-v1",
+      "resolver_version": 1,
+      "scope_dimensions": [
+        "deployment_id",
+        "trust_domain_id",
+        "tenant_id",
+        "site_id",
+        "environment_id",
+        "owner_principal_id"
+      ],
+      "requires_security_version": true,
+      "aliases_allowed": false,
+      "sensitivity": "confidential",
+      "canonical_resource_ref": {
+        "schema_version": 1,
+        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state"],
+        "security_version_field": "resource_version",
+        "canonicalization": "resolve-before-policy"
+      },
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resource_kind": "audit-log",
+      "canonical_id_pattern": "^audit-log:[a-z0-9-]+$",
+      "resolver_id": "resolver:audit-log-query-v1",
+      "resolver_version": 1,
+      "scope_dimensions": [
+        "deployment_id",
+        "trust_domain_id",
+        "tenant_id",
+        "site_id"
+      ],
+      "requires_security_version": true,
+      "aliases_allowed": false,
+      "sensitivity": "restricted",
+      "canonical_resource_ref": {
+        "schema_version": 1,
+        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state"],
+        "security_version_field": "resource_version",
+        "canonicalization": "resolve-before-policy"
+      },
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resource_kind": "platform-config",
+      "canonical_id_pattern": "^platform-config:[a-z0-9-]+$",
+      "resolver_id": "resolver:platform-config-global-v1",
+      "resolver_version": 1,
+      "scope_dimensions": [
+        "deployment_id"
+      ],
+      "requires_security_version": true,
+      "aliases_allowed": false,
+      "sensitivity": "restricted",
+      "canonical_resource_ref": {
+        "schema_version": 1,
+        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state"],
+        "security_version_field": "resource_version",
+        "canonicalization": "resolve-before-policy"
+      },
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resource_kind": "agent",
+      "canonical_id_pattern": "^agent:[a-z0-9-]+$",
+      "resolver_id": "resolver:agent-instance-v1",
+      "resolver_version": 1,
+      "scope_dimensions": [
+        "deployment_id",
+        "trust_domain_id",
+        "site_id"
+      ],
+      "requires_security_version": true,
+      "aliases_allowed": false,
+      "sensitivity": "confidential",
+      "canonical_resource_ref": {
+        "schema_version": 1,
+        "required_fields": ["resource_kind", "canonical_id", "deployment_id", "trust_domain_id", "site_id", "environment_id", "owner_principal_id", "resource_version", "sensitivity", "lifecycle_state"],
+        "security_version_field": "resource_version",
+        "canonicalization": "resolve-before-policy"
+      },
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    }
+  ],
+  "resolvers": [
+    {
+      "resolver_id": "resolver:request-instance-v1",
+      "resolver_version": 1,
+      "resource_kind": "request",
+      "mode": "instance",
+      "canonical_id_source": "requests.id",
+      "security_version_source": "requests.updated_at",
+      "permit_kind": "AuthorizationPermit",
+      "fail_closed": true,
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resolver_id": "resolver:audit-log-query-v1",
+      "resolver_version": 1,
+      "resource_kind": "audit-log",
+      "mode": "collection",
+      "canonical_id_source": "audit-query.scope",
+      "security_version_source": "control-plane-authority-epoch",
+      "permit_kind": "QueryPermit",
+      "fail_closed": true,
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resolver_id": "resolver:platform-config-global-v1",
+      "resolver_version": 1,
+      "resource_kind": "platform-config",
+      "mode": "global",
+      "canonical_id_source": "deployment-profile.deployment_id",
+      "security_version_source": "platform_configuration_version",
+      "permit_kind": "AuthorizationPermit",
+      "fail_closed": true,
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    },
+    {
+      "resolver_id": "resolver:agent-instance-v1",
+      "resolver_version": 1,
+      "resource_kind": "agent",
+      "mode": "instance",
+      "canonical_id_source": "agents.id",
+      "security_version_source": "agents.authority_version",
+      "permit_kind": "AuthorizationPermit",
+      "fail_closed": true,
+      "lifecycle": "active",
+      "applicability_expression": "always"
+    }
+  ],
+  "route_mappings": [
+    {
+      "mapping_id": "route:request-read-v1",
+      "method": "GET",
+      "path_template": "/api/requests/{id}",
+      "action_id": "request.read",
+      "resource_kind": "request",
+      "resolver_id": "resolver:request-instance-v1",
+      "resolver_version": 1,
+      "permit_kind": "AuthorizationPermit",
+      "permitted_actor_kinds": ["verified-human", "service"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/contracts.rs"
+    },
+    {
+      "mapping_id": "route:request-approve-v1",
+      "method": "POST",
+      "path_template": "/api/requests/{id}/approve",
+      "action_id": "request.approve",
+      "resource_kind": "request",
+      "resolver_id": "resolver:request-instance-v1",
+      "resolver_version": 1,
+      "permit_kind": "AuthorizationPermit",
+      "permitted_actor_kinds": ["verified-human"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/contracts.rs"
+    },
+    {
+      "mapping_id": "route:audit-read-v1",
+      "method": "GET",
+      "path_template": "/api/activity/audit",
+      "action_id": "audit.read",
+      "resource_kind": "audit-log",
+      "resolver_id": "resolver:audit-log-query-v1",
+      "resolver_version": 1,
+      "permit_kind": "QueryPermit",
+      "permitted_actor_kinds": ["verified-human", "service"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/contracts.rs"
+    },
+    {
+      "mapping_id": "route:platform-settings-update-v1",
+      "method": "PUT",
+      "path_template": "/api/admin/platform-settings",
+      "action_id": "platform.settings.update",
+      "resource_kind": "platform-config",
+      "resolver_id": "resolver:platform-config-global-v1",
+      "resolver_version": 1,
+      "permit_kind": "AuthorizationPermit",
+      "permitted_actor_kinds": ["verified-human"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/contracts.rs"
+    },
+    {
+      "mapping_id": "route:agent-heartbeat-v1",
+      "method": "POST",
+      "path_template": "/api/agents/{agent_id}/heartbeat",
+      "action_id": "agent.heartbeat",
+      "resource_kind": "agent",
+      "resolver_id": "resolver:agent-instance-v1",
+      "resolver_version": 1,
+      "permit_kind": "AuthorizationPermit",
+      "permitted_actor_kinds": ["agent"],
+      "lifecycle": "active",
+      "applicability_expression": "always",
+      "source_file": "sources/ryuki-api/src/agents.rs"
+    }
+  ],
+  "worker_mappings": []
+}

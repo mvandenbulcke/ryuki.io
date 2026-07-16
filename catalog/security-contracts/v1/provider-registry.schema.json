@@ -1,0 +1,487 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
+  "title": "Ryuki Provider Registry",
+  "description": "Closed immutable provider configuration and separately versioned lifecycle registry.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
+    "lifecycle",
+    "applicability",
+    "registry_version",
+    "configurations",
+    "provider_lifecycle",
+    "provider_id_tombstones"
+  ],
+  "properties": {
+    "$schema": { "const": "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json" },
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "provider-registry" },
+    "document_id": {
+      "type": "string",
+      "pattern": "^provider-registry:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "document_version": { "$ref": "#/$defs/positiveVersion" },
+    "lifecycle": { "$ref": "#/$defs/documentLifecycle" },
+    "applicability": { "$ref": "#/$defs/registryApplicability" },
+    "registry_version": { "$ref": "#/$defs/positiveVersion" },
+    "configurations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/providerConfiguration" }
+    },
+    "provider_lifecycle": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/lifecycleRecord" }
+    },
+    "provider_id_tombstones": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/providerTombstone" }
+    }
+  },
+  "$defs": {
+    "positiveVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "documentLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "effective_at"],
+      "properties": {
+        "state": { "enum": ["implementation_only", "candidate", "active", "deprecated", "retired"] },
+        "effective_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "registryApplicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluation_scope", "security_profiles", "provider_kinds", "enabled_feature_ids"],
+      "properties": {
+        "evaluation_scope": { "enum": ["implementation", "deployment"] },
+        "security_profiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["development", "test", "production"] } },
+        "provider_kinds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["oidc", "oidc-broker", "local-webauthn", "oauth-service", "api-token", "workload", "secret-service", "key-custody", "certificate-authority", "development-fixture"] } },
+        "enabled_feature_ids": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } }
+      }
+    },
+    "contentReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_id", "document_version", "content_digest", "artifact_locator"],
+      "properties": {
+        "document_id": { "$ref": "#/$defs/referenceId" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": {
+          "description": "SHA-256 of the exact artifact bytes at artifact_locator, with no transformation; encoded as sha256: plus lowercase hexadecimal.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "artifact_locator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+          "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+        }
+      }
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^provider:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "referenceId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "providerConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "kind",
+        "config_version",
+        "payload_digest_contract",
+        "payload_digest",
+        "immutable",
+        "trust_domain_id",
+        "allowed_security_profiles",
+        "required_for_profiles",
+        "outbound_destinations",
+        "credential_refs",
+        "claim_assurance_mapping_refs",
+        "capability_descriptor",
+        "ownership",
+        "kind_config"
+      ],
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/providerId" },
+        "kind": {
+          "enum": [
+            "oidc",
+            "oidc-broker",
+            "local-webauthn",
+            "oauth-service",
+            "api-token",
+            "workload",
+            "secret-service",
+            "key-custody",
+            "certificate-authority",
+            "development-fixture"
+          ]
+        },
+        "config_version": { "$ref": "#/$defs/positiveVersion" },
+        "payload_digest_contract": { "$ref": "#/$defs/payloadDigestContract" },
+        "payload_digest": {
+          "description": "SHA-256 of the UTF-8 ryuki-canonical-json-v1 bytes for this complete provider configuration after removing only the top-level payload_digest member. payload_digest_contract is included in the covered payload.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "immutable": { "const": true },
+        "trust_domain_id": {
+          "type": "string",
+          "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "allowed_security_profiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["development", "test", "production"] }
+        },
+        "required_for_profiles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["development", "test", "production"] }
+        },
+        "outbound_destinations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/typedDestination" }
+        },
+        "credential_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/credentialReference" }
+        },
+        "claim_assurance_mapping_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/contentReference" }
+        },
+        "capability_descriptor": { "$ref": "#/$defs/capabilityDescriptor" },
+        "ownership": { "$ref": "#/$defs/ownership" },
+        "kind_config": {
+          "oneOf": [
+            { "$ref": "#/$defs/oidcConfig" },
+            { "$ref": "#/$defs/localWebauthnConfig" },
+            { "$ref": "#/$defs/oauthServiceConfig" },
+            { "$ref": "#/$defs/apiTokenConfig" },
+            { "$ref": "#/$defs/workloadConfig" },
+            { "$ref": "#/$defs/capabilityProviderConfig" },
+            { "$ref": "#/$defs/developmentFixtureConfig" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "oidc" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "kind_config": {
+                "allOf": [
+                  { "$ref": "#/$defs/oidcConfig" },
+                  { "properties": { "configuration_kind": { "const": "oidc" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "oidc-broker" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "kind_config": {
+                "allOf": [
+                  { "$ref": "#/$defs/oidcConfig" },
+                  { "properties": { "configuration_kind": { "const": "oidc-broker" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "local-webauthn" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "$ref": "#/$defs/localWebauthnConfig" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "oauth-service" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "$ref": "#/$defs/oauthServiceConfig" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "api-token" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "$ref": "#/$defs/apiTokenConfig" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "workload" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "$ref": "#/$defs/workloadConfig" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "secret-service" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "allOf": [{ "$ref": "#/$defs/capabilityProviderConfig" }, { "properties": { "configuration_kind": { "const": "secret-service" } } }] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "key-custody" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "allOf": [{ "$ref": "#/$defs/capabilityProviderConfig" }, { "properties": { "configuration_kind": { "const": "key-custody" } } }] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "certificate-authority" } }, "required": ["kind"] },
+          "then": { "properties": { "kind_config": { "allOf": [{ "$ref": "#/$defs/capabilityProviderConfig" }, { "properties": { "configuration_kind": { "const": "certificate-authority" } } }] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "development-fixture" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "allowed_security_profiles": {
+                "not": { "contains": { "const": "production" } }
+              },
+              "required_for_profiles": {
+                "not": { "contains": { "const": "production" } }
+              },
+              "capability_descriptor": {
+                "properties": { "production_eligible": { "const": false } }
+              },
+              "kind_config": { "$ref": "#/$defs/developmentFixtureConfig" }
+            }
+          }
+        }
+      ]
+    },
+    "payloadDigestContract": {
+      "description": "ryuki-canonical-json-v1 recursively emits RFC 8259 JSON with no insignificant whitespace; preserves array order; orders object member names by ascending Unicode scalar value; emits null/true/false literally; emits numbers with serde_json::Number::to_string; and emits member names and string values with serde_json::to_string. The resulting text is encoded as UTF-8. Only the exact top-level pointer /payload_digest is removed before canonicalization.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "excluded_json_pointers", "digest_encoding"],
+      "properties": {
+        "algorithm": { "const": "sha-256" },
+        "canonicalization": { "const": "ryuki-canonical-json-v1" },
+        "excluded_json_pointers": { "const": ["/payload_digest"] },
+        "digest_encoding": { "const": "sha256-prefix-lowercase-hex" }
+      }
+    },
+    "typedDestination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination_id", "purpose", "protocol", "endpoint_ref", "redirects_allowed"],
+      "properties": {
+        "destination_id": { "$ref": "#/$defs/referenceId" },
+        "purpose": {
+          "enum": ["issuer", "discovery", "authorization", "token", "jwks", "introspection", "logout", "provider-api"]
+        },
+        "protocol": { "enum": ["https", "mtls", "spiffe"] },
+        "endpoint_ref": { "$ref": "#/$defs/contentReference" },
+        "redirects_allowed": { "const": false }
+      }
+    },
+    "credentialReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference_id", "reference_version", "reference_digest", "artifact_locator", "purpose", "value_free"],
+      "properties": {
+        "reference_id": { "$ref": "#/$defs/referenceId" },
+        "reference_version": { "$ref": "#/$defs/positiveVersion" },
+        "reference_digest": {
+          "description": "SHA-256 of the exact value-free reference artifact bytes at artifact_locator, with no transformation; encoded as sha256: plus lowercase hexadecimal.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "artifact_locator": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+          "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+        },
+        "purpose": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" },
+        "value_free": { "const": true }
+      }
+    },
+    "capabilityDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "descriptor_id",
+        "descriptor_version",
+        "advertised_capabilities",
+        "mandatory_baseline_ref",
+        "implementation_applicable",
+        "production_eligible"
+      ],
+      "properties": {
+        "descriptor_id": { "$ref": "#/$defs/referenceId" },
+        "descriptor_version": { "$ref": "#/$defs/positiveVersion" },
+        "advertised_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" }
+        },
+        "mandatory_baseline_ref": { "$ref": "#/$defs/contentReference" },
+        "implementation_applicable": { "const": true },
+        "production_eligible": { "type": "boolean" }
+      }
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owning_team", "configuration_change_authority", "lifecycle_change_authority", "audit_class"],
+      "properties": {
+        "owning_team": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "configuration_change_authority": { "$ref": "#/$defs/referenceId" },
+        "lifecycle_change_authority": { "$ref": "#/$defs/referenceId" },
+        "audit_class": { "enum": ["security-configuration", "identity-lifecycle", "secret-lifecycle", "key-lifecycle"] }
+      }
+    },
+    "oidcConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "issuer_ref", "endpoint_policy_ref", "validation_mode", "client_id_ref", "client_authentication_method", "accepted_audiences_ref", "accepted_algorithms", "redirect_policy_ref", "claim_mapping_ref", "assurance_mapping_ref", "logout_mode", "lifecycle_mode", "revocation_mode"],
+      "properties": {
+        "configuration_kind": { "enum": ["oidc", "oidc-broker"] },
+        "issuer_ref": { "$ref": "#/$defs/contentReference" },
+        "endpoint_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "validation_mode": { "enum": ["jwt-jwks", "authenticated-introspection"] },
+        "client_id_ref": { "$ref": "#/$defs/contentReference" },
+        "client_authentication_method": { "enum": ["private_key_jwt", "mtls", "client_secret_basic", "none-public-client"] },
+        "accepted_audiences_ref": { "$ref": "#/$defs/contentReference" },
+        "accepted_algorithms": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["RS256", "PS256", "ES256", "EdDSA"] } },
+        "redirect_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "claim_mapping_ref": { "$ref": "#/$defs/contentReference" },
+        "assurance_mapping_ref": { "$ref": "#/$defs/contentReference" },
+        "logout_mode": { "enum": ["local-only", "front-channel", "back-channel", "front-and-back-channel"] },
+        "lifecycle_mode": { "enum": ["scim", "reconciliation", "scim-and-reconciliation"] },
+        "revocation_mode": { "enum": ["event", "introspection", "event-and-introspection"] }
+      }
+    },
+    "oidcBrokerConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/oidcConfig" },
+        { "properties": { "configuration_kind": { "const": "oidc-broker" } } }
+      ]
+    },
+    "localWebauthnConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "relying_party_id_ref", "allowed_origins_policy_ref", "authenticator_policy_ref", "purpose", "recovery_ceremony_ref", "session_limit_ids", "step_up_limit_ids"],
+      "properties": {
+        "configuration_kind": { "const": "local-webauthn" },
+        "relying_party_id_ref": { "$ref": "#/$defs/contentReference" },
+        "allowed_origins_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "authenticator_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "purpose": { "enum": ["local-passkey", "break-glass-passkey"] },
+        "recovery_ceremony_ref": { "$ref": "#/$defs/contentReference" },
+        "session_limit_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/referenceId" } },
+        "step_up_limit_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/referenceId" } }
+      }
+    },
+    "oauthServiceConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "issuer_ref", "token_endpoint_ref", "client_authentication_method", "audience_ref", "sender_constraint", "service_mapping_ref"],
+      "properties": {
+        "configuration_kind": { "const": "oauth-service" },
+        "issuer_ref": { "$ref": "#/$defs/contentReference" },
+        "token_endpoint_ref": { "$ref": "#/$defs/contentReference" },
+        "client_authentication_method": { "enum": ["private_key_jwt", "mtls", "workload_federation"] },
+        "audience_ref": { "$ref": "#/$defs/contentReference" },
+        "sender_constraint": { "enum": ["mtls", "dpop", "provider-bound"] },
+        "service_mapping_ref": { "$ref": "#/$defs/contentReference" }
+      }
+    },
+    "apiTokenConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "issuance_policy_ref", "permitted_purposes", "permitted_audiences", "permitted_actions", "permitted_scopes", "ttl_limit_id", "overlap_limit_id", "deprovision_owner"],
+      "properties": {
+        "configuration_kind": { "const": "api-token" },
+        "issuance_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "permitted_purposes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } },
+        "permitted_audiences": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } },
+        "permitted_actions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9_-]+)+$" } },
+        "permitted_scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" } },
+        "ttl_limit_id": { "$ref": "#/$defs/referenceId" },
+        "overlap_limit_id": { "$ref": "#/$defs/referenceId" },
+        "deprovision_owner": { "$ref": "#/$defs/referenceId" }
+      }
+    },
+    "workloadConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "workload_trust_domain_ref", "assertion_profile_ref", "trust_bundle_ref", "proof_of_possession", "rotation_policy_ref", "revocation_source_ref"],
+      "properties": {
+        "configuration_kind": { "const": "workload" },
+        "workload_trust_domain_ref": { "$ref": "#/$defs/contentReference" },
+        "assertion_profile_ref": { "$ref": "#/$defs/contentReference" },
+        "trust_bundle_ref": { "$ref": "#/$defs/contentReference" },
+        "proof_of_possession": { "enum": ["mtls", "signed-assertion", "hardware-key"] },
+        "rotation_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "revocation_source_ref": { "$ref": "#/$defs/contentReference" }
+      }
+    },
+    "capabilityProviderConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "adapter_kind", "endpoint_policy_ref", "authentication_ref", "capability_policy_ref", "rotation_policy_ref", "revocation_policy_ref"],
+      "properties": {
+        "configuration_kind": { "enum": ["secret-service", "key-custody", "certificate-authority"] },
+        "adapter_kind": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" },
+        "endpoint_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "authentication_ref": { "$ref": "#/$defs/contentReference" },
+        "capability_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "rotation_policy_ref": { "$ref": "#/$defs/contentReference" },
+        "revocation_policy_ref": { "$ref": "#/$defs/contentReference" }
+      }
+    },
+    "developmentFixtureConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration_kind", "fixture_type", "loopback_only", "isolated_network_required", "live_execution_allowed"],
+      "properties": {
+        "configuration_kind": { "const": "development-fixture" },
+        "fixture_type": { "enum": ["static-human", "in-memory-secret-provider", "test-workload"] },
+        "loopback_only": { "const": true },
+        "isolated_network_required": { "const": true },
+        "live_execution_allowed": { "const": false }
+      }
+    },
+    "lifecycleRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "config_version", "lifecycle_record_version", "state", "effective_at", "governing_contract_ref"],
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/providerId" },
+        "config_version": { "$ref": "#/$defs/positiveVersion" },
+        "lifecycle_record_version": { "$ref": "#/$defs/positiveVersion" },
+        "state": { "enum": ["configured", "validated", "active", "draining", "quarantined", "removed"] },
+        "effective_at": { "type": "string", "format": "date-time" },
+        "governing_contract_ref": { "$ref": "#/$defs/contentReference" },
+        "transition_receipt_ref": { "$ref": "#/$defs/contentReference" },
+        "supersedes_lifecycle_record_version": { "$ref": "#/$defs/positiveVersion" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "enum": ["validated", "active", "draining", "quarantined", "removed"] } }, "required": ["state"] },
+          "then": { "required": ["transition_receipt_ref"] }
+        }
+      ]
+    },
+    "providerTombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "last_config_version", "removed_lifecycle_record_version", "non_reusable"],
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/providerId" },
+        "last_config_version": { "$ref": "#/$defs/positiveVersion" },
+        "removed_lifecycle_record_version": { "$ref": "#/$defs/positiveVersion" },
+        "non_reusable": { "const": true }
+      }
+    }
+  }
+}

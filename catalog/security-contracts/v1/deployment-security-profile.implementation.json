@@ -1,0 +1,84 @@
+{
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json",
+  "schema_version": "1.0.0",
+  "contract_kind": "deployment-security-profile",
+  "document_id": "deployment-security-profile:repository-implementation-v1",
+  "document_version": 1,
+  "lifecycle": {
+    "state": "implementation_only",
+    "effective_at": "2026-07-16T00:00:00Z"
+  },
+  "applicability": {
+    "evaluation_scope": "deployment",
+    "security_profiles": ["test"],
+    "deployment_ids": ["deployment:repository-conformance-fixture"],
+    "enabled_feature_ids": ["repository-conformance", "static-dry-run"]
+  },
+  "deployment_profile_version": 1,
+  "deployment_id": "deployment:repository-conformance-fixture",
+  "security_profile": "test",
+  "platform_configuration_version": 1,
+  "policy_version": 1,
+  "tenancy_mode": "single_tenant",
+  "trust_topology": {
+    "topology_kind": "single_trust_domain",
+    "trust_domain_ids": ["trust-domain:repository-fixture"]
+  },
+  "provider_registry_ref": {
+    "artifact_kind": "provider-registry",
+    "document_id": "provider-registry:repository-implementation-v1",
+    "document_version": 1,
+    "content_digest": "sha256:cfdcef55625fab3ddb3105af33296e48e7b548391f8a1a792748f0b3dd9856b1",
+    "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json"
+  },
+  "provider_lifecycle_snapshot_ref": {
+    "artifact_kind": "provider-registry",
+    "document_id": "provider-registry:repository-implementation-v1",
+    "document_version": 1,
+    "content_digest": "sha256:cfdcef55625fab3ddb3105af33296e48e7b548391f8a1a792748f0b3dd9856b1",
+    "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json",
+    "projection": "provider_lifecycle",
+    "required_states": ["active"]
+  },
+  "action_resource_registry_ref": {
+    "artifact_kind": "action-resource-registry",
+    "document_id": "action-resource-registry:repository-implementation-v1",
+    "document_version": 1,
+    "content_digest": "sha256:47283f1eb05869b30dfa4276b208d600ec6332dca5f0cd216268e839e5ad0524",
+    "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
+  },
+  "security_limit_profile_ref": {
+    "artifact_kind": "security-limit-profile",
+    "document_id": "security-limit-profile:repository-implementation-v1",
+    "document_version": 1,
+    "content_digest": "sha256:c21074bb33cfa98b111b902027466d707823f7528de235f467172d50cb89abd8",
+    "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
+  },
+  "control_plane_topology_ref": {
+    "artifact_kind": "control-plane-topology",
+    "document_id": "control-plane-topology:repository-specification-v1",
+    "document_version": 1,
+    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "artifact_locator": "docs/architecture/platform-security-boundary.md"
+  },
+  "egress_policy_ref": {
+    "artifact_kind": "egress-policy",
+    "document_id": "egress-policy:repository-specification-v1",
+    "document_version": 1,
+    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "artifact_locator": "docs/architecture/platform-security-boundary.md"
+  },
+  "retention_policy_ref": {
+    "artifact_kind": "retention-policy",
+    "document_id": "retention-policy:repository-specification-v1",
+    "document_version": 1,
+    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "artifact_locator": "docs/architecture/platform-security-boundary.md"
+  },
+  "enabled_features": ["repository-conformance", "static-dry-run"],
+  "runtime_guard_evidence": {
+    "mode": "not_applicable",
+    "guards": [],
+    "runtime_cross_check_required": true
+  }
+}
