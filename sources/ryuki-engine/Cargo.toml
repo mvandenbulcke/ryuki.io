@@ -15,6 +15,6 @@ zeroize = { version = "1", features = ["derive"] }
 strum = { version = "0.28.0", features = ["derive"] }
 # Inbound webhook HMAC-SHA256 verification (#18). All three are already resolved
 # in Cargo.lock (transitive) — declaring them direct adds no new supply-chain crate.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
