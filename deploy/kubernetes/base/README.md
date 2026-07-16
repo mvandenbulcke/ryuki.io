@@ -24,7 +24,12 @@ the latter use `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
 `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. Whole-ConfigMap import is
 forbidden. The release image must bake the
 exact reviewed contract tree into `/app/security-contract` as root-owned regular
-files. The base does not fabricate the admission ConfigMap, and its checked-in
+files, including every content-addressed predecessor from the selected trust
+registry head back to version 1. Startup rejects missing, gapped, relabeled,
+resurrected, or digest-mismatched lineage before any runtime side effect. The
+hash chain is not an external monotonic rollback checkpoint, so production
+remains blocked until that separate authority is available. The base does not
+fabricate the admission ConfigMap, and its checked-in
 image contains only non-production implementation fixtures, so an unoverlaid
 production render remains fail-closed.
 

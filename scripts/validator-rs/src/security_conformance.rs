@@ -19,6 +19,14 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 const CONTRACT_DIR: &str = "catalog/security-contracts/v1";
+const TRUST_REGISTRY_HEAD_LOCATOR: &str =
+    "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json";
+const TRUST_REGISTRY_SCHEMA_NAME: &str = "conformance-trust-root-registry.schema.json";
+const MAX_TRUST_REGISTRY_LINEAGE: usize = 16;
+const MAX_TRUST_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TRUST_REGISTRY_KEYS: usize = 256;
+const MAX_TRUST_REGISTRY_TOMBSTONES: usize = 4096;
+const MAX_TRUST_REGISTRY_SCOPE_ITEMS: usize = 256;
 
 const SCHEMAS: [(&str, &str); 8] = [
     (
@@ -2622,7 +2630,12 @@ fn validate_cross_document_semantics(
         validate_security_limit_profile(root, profile, errors);
     }
     if let Some(registry) = instances.get("conformance-trust-root-registry.implementation.json") {
-        validate_conformance_trust_root_registry(registry, errors);
+        validate_conformance_trust_root_registry(
+            root,
+            registry,
+            deployment.get("conformance_trust_root_registry_ref"),
+            errors,
+        );
         validate_trust_registry_applicability(deployment, registry, errors);
     }
 }
@@ -2659,8 +2672,29 @@ fn validate_bound_document_ref(
     }
 }
 
-fn validate_conformance_trust_root_registry(registry: &Value, errors: &mut Vec<String>) {
-    validate_conformance_trust_root_registry_at(registry, Utc::now(), errors);
+#[derive(Clone, Debug)]
+struct LoadedTrustRegistry {
+    locator: String,
+    value: Value,
+    digest: String,
+}
+
+fn validate_conformance_trust_root_registry(
+    root: &Path,
+    registry: &Value,
+    bound_head_reference: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let lineage = load_conformance_trust_root_registry_lineage(root, registry, errors);
+    if let (Some(reference), Some(head)) = (bound_head_reference, lineage.last()) {
+        if string_field(reference, "content_digest") != Some(head.digest.as_str()) {
+            errors.push(format!(
+                "deployment-security-profile.implementation.json:/conformance_trust_root_registry_ref: content_digest does not match the exact raw bytes of {}; expected {}",
+                head.locator, head.digest
+            ));
+        }
+    }
+    validate_conformance_trust_root_registry_lineage_at(&lineage, Utc::now(), errors);
 }
 
 fn validate_conformance_trust_root_registry_at(
@@ -2668,27 +2702,456 @@ fn validate_conformance_trust_root_registry_at(
     now: DateTime<Utc>,
     errors: &mut Vec<String>,
 ) {
-    const LABEL: &str = "conformance-trust-root-registry.implementation.json";
+    let lineage = [LoadedTrustRegistry {
+        locator: "conformance-trust-root-registry.implementation.json".to_string(),
+        value: registry.clone(),
+        digest: String::new(),
+    }];
+    validate_conformance_trust_root_registry_lineage_at(&lineage, now, errors);
+}
+
+fn load_conformance_trust_root_registry_lineage(
+    root: &Path,
+    head: &Value,
+    errors: &mut Vec<String>,
+) -> Vec<LoadedTrustRegistry> {
+    let Some(head_path) = safe_trust_registry_path(
+        root,
+        TRUST_REGISTRY_HEAD_LOCATOR,
+        TRUST_REGISTRY_HEAD_LOCATOR,
+        errors,
+    ) else {
+        return Vec::new();
+    };
+    let Some(head_bytes) =
+        read_bounded_trust_registry(&head_path, TRUST_REGISTRY_HEAD_LOCATOR, errors)
+    else {
+        return Vec::new();
+    };
+    let parsed_head = match parse_json_strict(&head_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(format!(
+                "{TRUST_REGISTRY_HEAD_LOCATOR}: invalid strict JSON: {error}"
+            ));
+            return Vec::new();
+        }
+    };
+    if &parsed_head != head {
+        errors.push(format!(
+            "{TRUST_REGISTRY_HEAD_LOCATOR}: parsed head differs from the validated implementation instance"
+        ));
+    }
+
+    let schema_path = root.join(CONTRACT_DIR).join(TRUST_REGISTRY_SCHEMA_NAME);
+    let schema = match fs::read(&schema_path) {
+        Ok(bytes) => match parse_json_strict(&bytes) {
+            Ok(schema) => Some(schema),
+            Err(error) => {
+                errors.push(format!(
+                    "{}: cannot strict-parse lineage schema: {error}",
+                    schema_path.display()
+                ));
+                None
+            }
+        },
+        Err(error) => {
+            errors.push(format!(
+                "{}: cannot read lineage schema: {error}",
+                schema_path.display()
+            ));
+            None
+        }
+    };
+    let head_digest = raw_sha256_digest(&head_bytes);
+    let mut newest_to_oldest = vec![LoadedTrustRegistry {
+        locator: TRUST_REGISTRY_HEAD_LOCATOR.to_string(),
+        value: parsed_head,
+        digest: head_digest.clone(),
+    }];
+    let mut locator_digests =
+        BTreeMap::from([(TRUST_REGISTRY_HEAD_LOCATOR.to_string(), head_digest.clone())]);
+    let mut identity_digests = BTreeMap::new();
+    if let (Some(id), Some(version)) = (
+        string_field(&newest_to_oldest[0].value, "document_id"),
+        newest_to_oldest[0]
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64),
+    ) {
+        identity_digests.insert((id.to_string(), version), head_digest);
+    }
+
+    loop {
+        let current = newest_to_oldest
+            .last()
+            .expect("the trust-registry lineage starts with its head");
+        let current_id = string_field(&current.value, "document_id").unwrap_or("");
+        let current_version = current
+            .value
+            .get("document_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let predecessor = current.value.get("predecessor_registry_ref");
+
+        if current_version == 1 {
+            if predecessor.is_some_and(|reference| !reference.is_null()) {
+                errors.push(format!(
+                    "{}: version 1 must have a null predecessor_registry_ref",
+                    current.locator
+                ));
+            }
+            break;
+        }
+        if current_version == 0 {
+            errors.push(format!(
+                "{}: cannot traverse a registry with a non-positive document_version",
+                current.locator
+            ));
+            break;
+        }
+        let Some(predecessor) = predecessor.filter(|reference| !reference.is_null()) else {
+            errors.push(format!(
+                "{}: version {current_version} has an incomplete predecessor lineage",
+                current.locator
+            ));
+            break;
+        };
+        if newest_to_oldest.len() >= MAX_TRUST_REGISTRY_LINEAGE {
+            errors.push(format!(
+                "{}: trust-registry lineage exceeds {MAX_TRUST_REGISTRY_LINEAGE} documents",
+                current.locator
+            ));
+            break;
+        }
+
+        let context = format!("{}:/predecessor_registry_ref", current.locator);
+        if string_field(predecessor, "artifact_kind") != Some("conformance-trust-root-registry") {
+            errors.push(format!(
+                "{context}: artifact_kind must be conformance-trust-root-registry"
+            ));
+        }
+        if string_field(predecessor, "document_id") != Some(current_id) {
+            errors.push(format!(
+                "{context}: predecessor must preserve document_id {current_id}"
+            ));
+        }
+        if predecessor.get("document_version").and_then(Value::as_u64) != Some(current_version - 1)
+        {
+            errors.push(format!(
+                "{context}: predecessor must be exact document_version {}",
+                current_version - 1
+            ));
+        }
+        let Some(locator) = string_field(predecessor, "artifact_locator") else {
+            errors.push(format!("{context}: artifact_locator is required"));
+            break;
+        };
+        let Some(expected_digest) = string_field(predecessor, "content_digest") else {
+            errors.push(format!("{context}: content_digest is required"));
+            break;
+        };
+        if !is_sha256_digest(expected_digest) {
+            errors.push(format!(
+                "{context}: content_digest must be sha256: plus 64 lowercase hexadecimal digits"
+            ));
+        }
+
+        if let Some(previous_digest) = locator_digests.get(locator) {
+            if previous_digest != expected_digest {
+                errors.push(format!(
+                    "{context}: locator {locator} is referenced with conflicting digests"
+                ));
+            } else {
+                errors.push(format!(
+                    "{context}: trust-registry lineage contains a locator cycle at {locator}"
+                ));
+            }
+            break;
+        }
+        let referenced_identity = (
+            string_field(predecessor, "document_id")
+                .unwrap_or("")
+                .to_string(),
+            predecessor
+                .get("document_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        if let Some(previous_digest) = identity_digests.get(&referenced_identity) {
+            if previous_digest != expected_digest {
+                errors.push(format!(
+                    "{context}: registry {}@{} is referenced with conflicting digests",
+                    referenced_identity.0, referenced_identity.1
+                ));
+            } else {
+                errors.push(format!(
+                    "{context}: trust-registry lineage repeats {}@{}",
+                    referenced_identity.0, referenced_identity.1
+                ));
+            }
+            break;
+        }
+
+        let Some(path) = safe_trust_registry_path(root, locator, &context, errors) else {
+            break;
+        };
+        let Some(bytes) = read_bounded_trust_registry(&path, locator, errors) else {
+            break;
+        };
+        let actual_digest = raw_sha256_digest(&bytes);
+        if actual_digest != expected_digest {
+            errors.push(format!(
+                "{context}: content_digest does not match exact raw bytes at {locator}; expected {actual_digest}"
+            ));
+            break;
+        }
+        let value = match parse_json_strict(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("{locator}: invalid strict JSON: {error}"));
+                break;
+            }
+        };
+        if let Some(schema) = schema.as_ref() {
+            validate_instance(locator, TRUST_REGISTRY_SCHEMA_NAME, schema, &value, errors);
+        }
+        validate_declared_schema(locator, TRUST_REGISTRY_SCHEMA_NAME, &value, errors);
+        if string_field(&value, "contract_kind") != Some("conformance-trust-root-registry") {
+            errors.push(format!(
+                "{context}: artifact_kind does not match contract_kind at {locator}"
+            ));
+        }
+        if value.get("document_id") != predecessor.get("document_id") {
+            errors.push(format!(
+                "{context}: document_id does not match the referenced artifact {locator}"
+            ));
+        }
+        if value.get("document_version") != predecessor.get("document_version") {
+            errors.push(format!(
+                "{context}: document_version does not match the referenced artifact {locator}"
+            ));
+        }
+
+        let actual_identity = (
+            string_field(&value, "document_id")
+                .unwrap_or("")
+                .to_string(),
+            value
+                .get("document_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        if let Some(previous_digest) = identity_digests.get(&actual_identity) {
+            if previous_digest != &actual_digest {
+                errors.push(format!(
+                    "{context}: loaded registry {}@{} conflicts with an earlier digest",
+                    actual_identity.0, actual_identity.1
+                ));
+            } else {
+                errors.push(format!(
+                    "{context}: loaded registry repeats {}@{}",
+                    actual_identity.0, actual_identity.1
+                ));
+            }
+            break;
+        }
+
+        locator_digests.insert(locator.to_string(), actual_digest.clone());
+        identity_digests.insert(actual_identity, actual_digest.clone());
+        newest_to_oldest.push(LoadedTrustRegistry {
+            locator: locator.to_string(),
+            value,
+            digest: actual_digest,
+        });
+    }
+
+    newest_to_oldest.reverse();
+    newest_to_oldest
+}
+
+fn read_bounded_trust_registry(
+    path: &Path,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            errors.push(format!("{label}: cannot inspect trust registry: {error}"));
+            return None;
+        }
+    };
+    if metadata.len() > MAX_TRUST_REGISTRY_BYTES {
+        errors.push(format!(
+            "{label}: trust registry exceeds {MAX_TRUST_REGISTRY_BYTES} bytes"
+        ));
+        return None;
+    }
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            errors.push(format!("{label}: cannot read trust registry: {error}"));
+            None
+        }
+    }
+}
+
+fn safe_trust_registry_path(
+    root: &Path,
+    locator: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let relative = Path::new(locator);
+    if locator.is_empty()
+        || locator.contains('\\')
+        || relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        errors.push(format!(
+            "{context}: trust-registry locator must be a normalized relative .json path: {locator:?}"
+        ));
+        return None;
+    }
+
+    let mut candidate = root.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("the path shape was checked above")
+        };
+        candidate.push(name);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: trust-registry locator does not resolve to a file {locator}: {error}"
+                ));
+                return None;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            errors.push(format!(
+                "{context}: trust-registry locator must not traverse a symlink: {locator}"
+            ));
+            return None;
+        }
+        let final_component = index + 1 == components.len();
+        if (!final_component && !metadata.is_dir())
+            || (final_component && !metadata.file_type().is_file())
+        {
+            errors.push(format!(
+                "{context}: trust-registry locator is not a regular JSON file: {locator}"
+            ));
+            return None;
+        }
+    }
+
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(path) => path,
+        Err(error) => {
+            errors.push(format!(
+                "{context}: cannot canonicalize repository root: {error}"
+            ));
+            return None;
+        }
+    };
+    let canonical_target = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            errors.push(format!("{context}: cannot canonicalize {locator}: {error}"));
+            return None;
+        }
+    };
+    if !canonical_target.starts_with(canonical_root) {
+        errors.push(format!(
+            "{context}: trust-registry locator escapes the repository: {locator}"
+        ));
+        return None;
+    }
+    Some(candidate)
+}
+
+fn raw_sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value.as_bytes()[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn validate_conformance_trust_root_registry_lineage_at(
+    lineage: &[LoadedTrustRegistry],
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    if lineage.is_empty() {
+        errors.push("conformance trust-root registry lineage is empty".to_string());
+        return;
+    }
+    if lineage.len() > MAX_TRUST_REGISTRY_LINEAGE {
+        errors.push(format!(
+            "conformance trust-root registry lineage exceeds {MAX_TRUST_REGISTRY_LINEAGE} documents"
+        ));
+    }
+
+    for (index, registry) in lineage.iter().enumerate() {
+        validate_conformance_trust_root_registry_document_at(
+            &registry.value,
+            &registry.locator,
+            now,
+            index + 1 == lineage.len(),
+            errors,
+        );
+    }
+    validate_trust_registry_lineage_transitions(lineage, errors);
+}
+
+fn validate_conformance_trust_root_registry_document_at(
+    registry: &Value,
+    label: &str,
+    now: DateTime<Utc>,
+    is_head: bool,
+    errors: &mut Vec<String>,
+) {
     require_exact_string(
         registry,
         "$schema",
         "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
-        LABEL,
+        label,
         errors,
     );
-    require_exact_string(registry, "schema_version", "1.0.0", LABEL, errors);
+    require_exact_string(registry, "schema_version", "1.0.0", label, errors);
     require_exact_string(
         registry,
         "contract_kind",
         "conformance-trust-root-registry",
-        LABEL,
+        label,
         errors,
     );
     for field in ["document_version", "trust_policy_version"] {
         if registry.get(field).and_then(Value::as_u64).unwrap_or(0) == 0 {
-            errors.push(format!("{LABEL}: {field} must be a positive version"));
+            errors.push(format!("{label}: {field} must be a positive version"));
         }
     }
+    enforce_array_bound(registry, "keys", MAX_TRUST_REGISTRY_KEYS, label, errors);
+    enforce_array_bound(
+        registry,
+        "key_tombstones",
+        MAX_TRUST_REGISTRY_TOMBSTONES,
+        label,
+        errors,
+    );
 
     let acceptance = string_field(registry, "acceptance_status").unwrap_or("");
     let production = registry
@@ -2699,30 +3162,30 @@ fn validate_conformance_trust_root_registry_at(
     let lifecycle_state = string_field(lifecycle, "state").unwrap_or("");
     match acceptance {
         "implementation_only" if production => errors.push(format!(
-            "{LABEL}: implementation_only registry cannot be production accepted"
+            "{label}: implementation_only registry cannot be production accepted"
         )),
         "production_candidate" if production => errors.push(format!(
-            "{LABEL}: production_candidate registry cannot be production accepted"
+            "{label}: production_candidate registry cannot be production accepted"
         )),
         "production_accepted" if !production || lifecycle_state != "active" => errors.push(
-            format!("{LABEL}: production_accepted registry must be active and production accepted"),
+            format!("{label}: production_accepted registry must be active and production accepted"),
         ),
         _ => {}
     }
     if lifecycle_state == "active" && !production {
         errors.push(format!(
-            "{LABEL}: active registry must be production accepted"
+            "{label}: active registry must be production accepted"
         ));
     }
     if let Some(effective_at) = parse_timestamp_value(
         lifecycle,
         "effective_at",
-        &format!("{LABEL}:/lifecycle"),
+        &format!("{label}:/lifecycle"),
         errors,
     ) {
         if lifecycle_state == "active" && effective_at > now {
             errors.push(format!(
-                "{LABEL}:/lifecycle: active effective_at cannot be in the future"
+                "{label}:/lifecycle: active effective_at cannot be in the future"
             ));
         }
     }
@@ -2730,13 +3193,13 @@ fn validate_conformance_trust_root_registry_at(
     let canonicalization = string_set(array(registry, "canonicalization_profiles"));
     if canonicalization != BTreeSet::from(["ryuki-canonical-json-v1".to_string()]) {
         errors.push(format!(
-            "{LABEL}: canonicalization_profiles must contain only ryuki-canonical-json-v1"
+            "{label}: canonicalization_profiles must contain only ryuki-canonical-json-v1"
         ));
     }
     let algorithms = string_set(array(registry, "signature_algorithms"));
     if algorithms != BTreeSet::from(["ed25519".to_string()]) {
         errors.push(format!(
-            "{LABEL}: signature_algorithms must contain only ed25519"
+            "{label}: signature_algorithms must contain only ed25519"
         ));
     }
 
@@ -2745,33 +3208,51 @@ fn validate_conformance_trust_root_registry_at(
         applicability,
         "evaluation_scope",
         "deployment",
-        &format!("{LABEL}:/applicability"),
+        &format!("{label}:/applicability"),
         errors,
     );
     let registry_deployments = unique_string_array(
         applicability,
         "deployment_ids",
-        &format!("{LABEL}:/applicability"),
+        &format!("{label}:/applicability"),
         errors,
     );
     let registry_domains = unique_string_array(
         applicability,
         "trust_domain_ids",
-        &format!("{LABEL}:/applicability"),
+        &format!("{label}:/applicability"),
         errors,
     );
-    unique_string_array(
+    let registry_profiles = unique_string_array(
         applicability,
         "security_profiles",
-        &format!("{LABEL}:/applicability"),
+        &format!("{label}:/applicability"),
         errors,
     );
+    for (field, values) in [
+        ("security_profiles", &registry_profiles),
+        ("deployment_ids", &registry_deployments),
+        ("trust_domain_ids", &registry_domains),
+    ] {
+        if values.len() > MAX_TRUST_REGISTRY_SCOPE_ITEMS {
+            errors.push(format!(
+                "{label}:/applicability: {field} exceeds {MAX_TRUST_REGISTRY_SCOPE_ITEMS} items"
+            ));
+        }
+    }
 
     let mut keys = BTreeMap::new();
     let mut key_material = BTreeSet::new();
+    let mut live_fingerprints = BTreeSet::new();
     let mut successor_edges = BTreeMap::new();
+    let tombstone_index = array(registry, "key_tombstones")
+        .iter()
+        .filter_map(|tombstone| {
+            string_field(tombstone, "key_id").map(|key_id| (key_id.to_string(), tombstone))
+        })
+        .collect::<BTreeMap<_, _>>();
     for (index, key) in array(registry, "keys").iter().enumerate() {
-        let context = format!("{LABEL}:/keys/{index}");
+        let context = format!("{label}:/keys/{index}");
         let key_id = string_field(key, "key_id").unwrap_or("");
         if keys.insert(key_id.to_string(), key).is_some() {
             errors.push(format!("{context}: duplicate key_id {key_id}"));
@@ -2787,8 +3268,15 @@ fn validate_conformance_trust_root_registry_at(
                         "{context}: Ed25519 public key cannot be all zeroes"
                     ));
                 }
+                let fingerprint = raw_sha256_digest(&decoded);
+                live_fingerprints.insert(fingerprint.clone());
                 if !key_material.insert(decoded) {
                     errors.push(format!("{context}: duplicate Ed25519 public-key material"));
+                }
+                if string_field(key, "public_key_fingerprint") != Some(fingerprint.as_str()) {
+                    errors.push(format!(
+                        "{context}: public_key_fingerprint must equal SHA-256 of the decoded raw 32-byte key; expected {fingerprint}"
+                    ));
                 }
             }
             Err(error) => errors.push(format!("{context}: {error}")),
@@ -2799,6 +3287,11 @@ fn validate_conformance_trust_root_registry_at(
             ("trust_domain_ids", &registry_domains),
         ] {
             let values = unique_string_array(key, field, &context, errors);
+            if values.len() > MAX_TRUST_REGISTRY_SCOPE_ITEMS {
+                errors.push(format!(
+                    "{context}: {field} exceeds {MAX_TRUST_REGISTRY_SCOPE_ITEMS} items"
+                ));
+            }
             for value in values.difference(allowed) {
                 errors.push(format!(
                     "{context}: {field} value {value} is outside registry applicability"
@@ -2824,28 +3317,18 @@ fn validate_conformance_trust_root_registry_at(
             errors.push(format!("{context}: valid_from must be before valid_until"));
         }
         let key_lifecycle = string_field(key, "lifecycle").unwrap_or("");
-        let revoked_at = optional_timestamp_value(key, "revoked_at", &context, errors);
-        if key_lifecycle == "revoked" {
-            let Some(revoked_at) = revoked_at else {
-                errors.push(format!("{context}: revoked key requires revoked_at"));
-                continue;
-            };
-            if revoked_at > now {
-                errors.push(format!("{context}: revoked_at cannot be in the future"));
-            }
-            if valid_from.is_some_and(|start| revoked_at < start)
-                || valid_until.is_some_and(|end| revoked_at > end)
-            {
-                errors.push(format!(
-                    "{context}: revoked_at must fall within the key validity window"
-                ));
-            }
-        } else if revoked_at.is_some() {
+        if !matches!(key_lifecycle, "active" | "overlap") {
             errors.push(format!(
-                "{context}: only revoked keys may declare revoked_at"
+                "{context}: live key lifecycle must be active or overlap"
             ));
         }
-        if matches!(key_lifecycle, "active" | "overlap")
+        if key.get("revoked_at").is_some() {
+            errors.push(format!(
+                "{context}: live key must not declare revoked_at; terminal state belongs in a tombstone"
+            ));
+        }
+        if is_head
+            && matches!(key_lifecycle, "active" | "overlap")
             && (valid_from.is_some_and(|start| start > now)
                 || valid_until.is_some_and(|end| end <= now))
         {
@@ -2860,20 +3343,50 @@ fn validate_conformance_trust_root_registry_at(
             successor_edges.insert(key_id.to_string(), target.to_string());
         }
     }
+    if acceptance == "production_accepted"
+        && !keys
+            .values()
+            .any(|key| string_field(key, "lifecycle") == Some("active"))
+    {
+        errors.push(format!(
+            "{label}: production_accepted registry requires at least one active key; overlap-only authority is forbidden"
+        ));
+    }
+    let mut predecessor_successors = BTreeMap::<String, String>::new();
     for (source_id, target_id) in &successor_edges {
         let Some(source) = keys.get(source_id) else {
             continue;
         };
-        let Some(target) = keys.get(target_id) else {
+        if string_field(source, "lifecycle") != Some("active") {
             errors.push(format!(
-                "{LABEL}: key {source_id} supersedes unknown key {target_id}"
+                "{label}: live superseding key {source_id} must be active"
+            ));
+        }
+        if let Some(existing_successor) =
+            predecessor_successors.insert(target_id.clone(), source_id.clone())
+        {
+            errors.push(format!(
+                "{label}: live predecessor {target_id} has multiple successors {existing_successor} and {source_id}"
+            ));
+        }
+        let target = keys.get(target_id).copied();
+        let tombstone_target = tombstone_index.get(target_id).copied();
+        if target.is_none() && tombstone_target.is_none() {
+            errors.push(format!(
+                "{label}: key {source_id} supersedes unknown key {target_id}"
             ));
             continue;
-        };
+        }
+        if target.is_some_and(|target| string_field(target, "lifecycle") != Some("overlap")) {
+            errors.push(format!(
+                "{label}: live predecessor {target_id} of {source_id} must be overlap"
+            ));
+        }
+        let target = target.or(tombstone_target).expect("one target exists");
         for field in ["signer_identity", "algorithm"] {
             if source.get(field) != target.get(field) {
                 errors.push(format!(
-                    "{LABEL}: key {source_id} cannot supersede {target_id} with a different {field}"
+                    "{label}: key {source_id} cannot supersede {target_id} with a different {field}"
                 ));
             }
         }
@@ -2881,6 +3394,7 @@ fn validate_conformance_trust_root_registry_at(
             .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
             .map(|timestamp| timestamp.with_timezone(&Utc));
         let target_start = string_field(target, "valid_from")
+            .or_else(|| string_field(target, "terminated_at"))
             .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
             .map(|timestamp| timestamp.with_timezone(&Utc));
         if source_start
@@ -2888,19 +3402,20 @@ fn validate_conformance_trust_root_registry_at(
             .is_some_and(|(source_start, target_start)| source_start <= target_start)
         {
             errors.push(format!(
-                "{LABEL}: superseding key {source_id} must have a later valid_from than {target_id}"
+                "{label}: superseding key {source_id} must have a later valid_from than {target_id}"
             ));
         }
     }
     detect_single_edge_cycles("conformance key supersession", &successor_edges, errors);
 
     let mut tombstones = BTreeSet::new();
+    let mut tombstone_fingerprints = BTreeSet::new();
     let trust_policy_version = registry
         .get("trust_policy_version")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     for (index, tombstone) in array(registry, "key_tombstones").iter().enumerate() {
-        let context = format!("{LABEL}:/key_tombstones/{index}");
+        let context = format!("{label}:/key_tombstones/{index}");
         let key_id = string_field(tombstone, "key_id").unwrap_or("");
         if !tombstones.insert(key_id.to_string()) {
             errors.push(format!("{context}: duplicate tombstone key_id {key_id}"));
@@ -2911,17 +3426,121 @@ fn validate_conformance_trust_root_registry_at(
             ));
         }
         require_exact_string(tombstone, "algorithm", "ed25519", &context, errors);
-        if parse_timestamp_value(tombstone, "revoked_at", &context, errors)
-            .is_some_and(|timestamp| timestamp > now)
-        {
+        let fingerprint = string_field(tombstone, "public_key_fingerprint").unwrap_or("");
+        if !is_sha256_digest(fingerprint) {
             errors.push(format!(
-                "{context}: tombstone revoked_at cannot be in the future"
+                "{context}: public_key_fingerprint must be sha256: plus 64 lowercase hexadecimal digits"
             ));
         }
+        if !tombstone_fingerprints.insert(fingerprint.to_string()) {
+            errors.push(format!(
+                "{context}: duplicate tombstone public_key_fingerprint {fingerprint}"
+            ));
+        }
+        if live_fingerprints.contains(fingerprint) {
+            errors.push(format!(
+                "{context}: tombstoned public-key material is reused by a live key"
+            ));
+        }
+        let terminal_state = string_field(tombstone, "terminal_state").unwrap_or("");
+        if !matches!(terminal_state, "retired" | "revoked") {
+            errors.push(format!(
+                "{context}: terminal_state must be retired or revoked"
+            ));
+        }
+        let terminated_at = parse_timestamp_value(tombstone, "terminated_at", &context, errors);
+        if terminated_at.is_some_and(|timestamp| timestamp > now) {
+            errors.push(format!(
+                "{context}: tombstone terminated_at cannot be in the future"
+            ));
+        }
+        let signatures_valid_before =
+            optional_timestamp_value(tombstone, "signatures_valid_before", &context, errors);
         let tombstone_policy = tombstone
             .get("trust_policy_version")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let subsequent_revocation = tombstone.get("subsequent_revocation");
+        match terminal_state {
+            "retired" => {
+                let Some(cutoff) = signatures_valid_before else {
+                    errors.push(format!(
+                        "{context}: retired tombstone requires signatures_valid_before"
+                    ));
+                    continue;
+                };
+                if terminated_at.is_some_and(|terminated| cutoff != terminated) {
+                    errors.push(format!(
+                        "{context}: retired signatures_valid_before must equal terminated_at"
+                    ));
+                }
+            }
+            "revoked" => {
+                if signatures_valid_before.is_some() {
+                    errors.push(format!(
+                        "{context}: revoked tombstone must set signatures_valid_before to null"
+                    ));
+                }
+                if subsequent_revocation.is_some_and(|value| !value.is_null()) {
+                    errors.push(format!(
+                        "{context}: directly revoked tombstone must set subsequent_revocation to null"
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if let Some(subsequent_revocation) = subsequent_revocation.filter(|value| !value.is_null())
+        {
+            if terminal_state != "retired" {
+                errors.push(format!(
+                    "{context}: only a retired tombstone may add subsequent_revocation"
+                ));
+            }
+            let revoked_at = parse_timestamp_value(
+                subsequent_revocation,
+                "revoked_at",
+                &format!("{context}/subsequent_revocation"),
+                errors,
+            );
+            if revoked_at.is_some_and(|timestamp| timestamp > now) {
+                errors.push(format!(
+                    "{context}/subsequent_revocation: revoked_at cannot be in the future"
+                ));
+            }
+            if terminated_at
+                .zip(revoked_at)
+                .is_some_and(|(terminated_at, revoked_at)| revoked_at < terminated_at)
+            {
+                errors.push(format!(
+                    "{context}/subsequent_revocation: revoked_at cannot predate terminated_at"
+                ));
+            }
+            if registry_effective_at(registry)
+                .zip(revoked_at)
+                .is_some_and(|(effective_at, revoked_at)| revoked_at > effective_at)
+            {
+                errors.push(format!(
+                    "{context}/subsequent_revocation: revoked_at cannot follow the introducing registry effective_at"
+                ));
+            }
+            if !subsequent_revocation
+                .get("reason")
+                .is_some_and(Value::is_string)
+            {
+                errors.push(format!(
+                    "{context}/subsequent_revocation: reason must be a string"
+                ));
+            }
+            let revocation_policy = subsequent_revocation
+                .get("trust_policy_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if revocation_policy <= tombstone_policy || revocation_policy > trust_policy_version {
+                errors.push(format!(
+                    "{context}/subsequent_revocation: trust_policy_version must advance beyond {tombstone_policy} and be no newer than the registry"
+                ));
+            }
+        }
         if tombstone_policy == 0 || tombstone_policy > trust_policy_version {
             errors.push(format!(
                 "{context}: tombstone trust_policy_version must be nonzero and no newer than the registry"
@@ -2934,19 +3553,555 @@ fn validate_conformance_trust_root_registry_at(
             if successor_id == key_id {
                 errors.push(format!("{context}: tombstone cannot supersede itself"));
             }
-            let Some(successor) = keys.get(successor_id) else {
+            let successor = keys
+                .get(successor_id)
+                .copied()
+                .or_else(|| tombstone_index.get(successor_id).copied());
+            let Some(successor) = successor else {
                 errors.push(format!(
-                    "{context}: superseded_by_key_id references unknown key {successor_id}"
+                    "{context}: superseded_by_key_id references unknown live or tombstoned key {successor_id}"
                 ));
                 continue;
             };
-            if tombstone.get("signer_identity") != successor.get("signer_identity") {
+            for field in ["signer_identity", "algorithm"] {
+                if tombstone.get(field) != successor.get(field) {
+                    errors.push(format!(
+                        "{context}: successor key {successor_id} has a different {field}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn enforce_array_bound(
+    value: &Value,
+    field: &str,
+    maximum: usize,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    if array(value, field).len() > maximum {
+        errors.push(format!(
+            "{context}: {field} exceeds the maximum of {maximum} items"
+        ));
+    }
+}
+
+fn validate_trust_registry_lineage_transitions(
+    lineage: &[LoadedTrustRegistry],
+    errors: &mut Vec<String>,
+) {
+    let Some(genesis) = lineage.first() else {
+        return;
+    };
+    if genesis
+        .value
+        .get("document_version")
+        .and_then(Value::as_u64)
+        != Some(1)
+    {
+        errors.push(format!(
+            "{}: trust-registry lineage must terminate at document_version 1",
+            genesis.locator
+        ));
+    }
+    if genesis
+        .value
+        .get("predecessor_registry_ref")
+        .is_some_and(|reference| !reference.is_null())
+    {
+        errors.push(format!(
+            "{}: genesis predecessor_registry_ref must be null",
+            genesis.locator
+        ));
+    }
+    if !array(&genesis.value, "key_tombstones").is_empty() {
+        errors.push(format!(
+            "{}: genesis registry cannot contain tombstones without prior live-key history",
+            genesis.locator
+        ));
+    }
+    validate_new_key_activation_times(genesis, errors);
+
+    let mut id_to_fingerprint = BTreeMap::<String, String>::new();
+    let mut fingerprint_to_id = BTreeMap::<String, String>::new();
+    let mut terminal_ids = BTreeSet::new();
+    for registry in lineage {
+        for key in array(&registry.value, "keys") {
+            let key_id = string_field(key, "key_id").unwrap_or("");
+            let fingerprint = string_field(key, "public_key_fingerprint").unwrap_or("");
+            bind_historic_key_identity(
+                key_id,
+                fingerprint,
+                &registry.locator,
+                &mut id_to_fingerprint,
+                &mut fingerprint_to_id,
+                errors,
+            );
+            if terminal_ids.contains(key_id) {
                 errors.push(format!(
-                    "{context}: successor key {successor_id} has a different signer_identity"
+                    "{}: tombstoned key_id {key_id} is resurrected as a live key",
+                    registry.locator
+                ));
+            }
+        }
+        for tombstone in array(&registry.value, "key_tombstones") {
+            let key_id = string_field(tombstone, "key_id").unwrap_or("");
+            let fingerprint = string_field(tombstone, "public_key_fingerprint").unwrap_or("");
+            bind_historic_key_identity(
+                key_id,
+                fingerprint,
+                &registry.locator,
+                &mut id_to_fingerprint,
+                &mut fingerprint_to_id,
+                errors,
+            );
+            terminal_ids.insert(key_id.to_string());
+        }
+    }
+
+    for pair in lineage.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        validate_trust_registry_edge(previous, current, errors);
+    }
+}
+
+fn bind_historic_key_identity(
+    key_id: &str,
+    fingerprint: &str,
+    context: &str,
+    id_to_fingerprint: &mut BTreeMap<String, String>,
+    fingerprint_to_id: &mut BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) {
+    if let Some(previous) = id_to_fingerprint.get(key_id) {
+        if previous != fingerprint {
+            errors.push(format!(
+                "{context}: historical key_id {key_id} changes public-key fingerprint from {previous} to {fingerprint}"
+            ));
+        }
+    } else {
+        id_to_fingerprint.insert(key_id.to_string(), fingerprint.to_string());
+    }
+    if let Some(previous) = fingerprint_to_id.get(fingerprint) {
+        if previous != key_id {
+            errors.push(format!(
+                "{context}: historical public-key fingerprint {fingerprint} is relabeled from {previous} to {key_id}"
+            ));
+        }
+    } else {
+        fingerprint_to_id.insert(fingerprint.to_string(), key_id.to_string());
+    }
+}
+
+fn validate_trust_registry_edge(
+    previous: &LoadedTrustRegistry,
+    current: &LoadedTrustRegistry,
+    errors: &mut Vec<String>,
+) {
+    let previous_id = string_field(&previous.value, "document_id").unwrap_or("");
+    let current_id = string_field(&current.value, "document_id").unwrap_or("");
+    let previous_version = previous
+        .value
+        .get("document_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let current_version = current
+        .value
+        .get("document_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if current_id != previous_id {
+        errors.push(format!(
+            "{}: registry document_id changes from {previous_id} to {current_id}",
+            current.locator
+        ));
+    }
+    if current_version != previous_version.saturating_add(1) {
+        errors.push(format!(
+            "{}: document_version {current_version} must immediately follow {previous_version}",
+            current.locator
+        ));
+    }
+
+    let reference = current
+        .value
+        .get("predecessor_registry_ref")
+        .unwrap_or(&Value::Null);
+    for (field, expected) in [
+        (
+            "artifact_kind",
+            Value::String("conformance-trust-root-registry".to_string()),
+        ),
+        ("document_id", Value::String(previous_id.to_string())),
+        ("document_version", Value::from(previous_version)),
+        ("content_digest", Value::String(previous.digest.clone())),
+        ("artifact_locator", Value::String(previous.locator.clone())),
+    ] {
+        if reference.get(field) != Some(&expected) {
+            errors.push(format!(
+                "{}:/predecessor_registry_ref: {field} does not exactly bind {}",
+                current.locator, previous.locator
+            ));
+        }
+    }
+
+    let previous_effective = registry_effective_at(&previous.value);
+    let current_effective = registry_effective_at(&current.value);
+    if previous_effective.zip(current_effective).is_some_and(
+        |(previous_effective, current_effective)| current_effective <= previous_effective,
+    ) {
+        errors.push(format!(
+            "{}: lifecycle.effective_at must strictly increase from {}",
+            current.locator, previous.locator
+        ));
+    }
+    validate_registry_lifecycle_transition(previous, current, errors);
+    if trust_registry_scope_projection(&previous.value)
+        != trust_registry_scope_projection(&current.value)
+    {
+        errors.push(format!(
+            "{}: registry applicability must remain exact across the lineage",
+            current.locator
+        ));
+    }
+
+    let previous_policy = previous
+        .value
+        .get("trust_policy_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let current_policy = current
+        .value
+        .get("trust_policy_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if current_policy < previous_policy || current_policy > previous_policy.saturating_add(1) {
+        errors.push(format!(
+            "{}: trust_policy_version {current_policy} must be between {previous_policy} and {}",
+            current.locator,
+            previous_policy.saturating_add(1)
+        ));
+    }
+    if registry_authority_changed(&previous.value, &current.value)
+        && current_policy != previous_policy.saturating_add(1)
+    {
+        errors.push(format!(
+            "{}: an authority change requires trust_policy_version {}",
+            current.locator,
+            previous_policy.saturating_add(1)
+        ));
+    }
+
+    let previous_keys = trust_registry_records(&previous.value, "keys");
+    let current_keys = trust_registry_records(&current.value, "keys");
+    let previous_tombstones = trust_registry_records(&previous.value, "key_tombstones");
+    let current_tombstones = trust_registry_records(&current.value, "key_tombstones");
+
+    for (key_id, previous_tombstone) in &previous_tombstones {
+        match current_tombstones.get(key_id) {
+            Some(current_tombstone)
+                if tombstone_is_valid_successor(previous_tombstone, current_tombstone) => {}
+            Some(_) => errors.push(format!(
+                "{}: tombstone {key_id} mutates outside the one-way subsequent-revocation overlay",
+                current.locator
+            )),
+            None => errors.push(format!(
+                "{}: predecessor tombstone {key_id} is dropped",
+                current.locator
+            )),
+        }
+        if current_keys.contains_key(key_id) {
+            errors.push(format!(
+                "{}: predecessor tombstone {key_id} is resurrected",
+                current.locator
+            ));
+        }
+    }
+
+    for (key_id, previous_key) in &previous_keys {
+        if let Some(current_key) = current_keys.get(key_id) {
+            if !live_key_is_immutable(previous_key, current_key) {
+                errors.push(format!(
+                    "{}: recurring live key {key_id} changes an immutable authority field",
+                    current.locator
+                ));
+            }
+            validate_live_key_lifecycle_transition(
+                key_id,
+                previous_key,
+                current_key,
+                &current.locator,
+                errors,
+            );
+            continue;
+        }
+        let Some(tombstone) = current_tombstones.get(key_id) else {
+            errors.push(format!(
+                "{}: predecessor live key {key_id} disappears without an immediate tombstone",
+                current.locator
+            ));
+            continue;
+        };
+        for field in [
+            "key_id",
+            "signer_identity",
+            "algorithm",
+            "public_key_fingerprint",
+        ] {
+            if tombstone.get(field) != previous_key.get(field) {
+                errors.push(format!(
+                    "{}: tombstone {key_id} does not preserve predecessor {field}",
+                    current.locator
+                ));
+            }
+        }
+        let terminated_at = string_field(tombstone, "terminated_at")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        let valid_from = string_field(previous_key, "valid_from")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        let valid_until = string_field(previous_key, "valid_until")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        if terminated_at.zip(valid_from.zip(valid_until)).is_some_and(
+            |(terminated_at, (valid_from, valid_until))| {
+                terminated_at < valid_from || terminated_at > valid_until
+            },
+        ) {
+            errors.push(format!(
+                "{}: tombstone {key_id} terminated_at must fall within the predecessor key validity window",
+                current.locator
+            ));
+        }
+    }
+
+    for (key_id, tombstone) in &current_tombstones {
+        if previous_tombstones.contains_key(key_id) {
+            continue;
+        }
+        let Some(previous_key) = previous_keys.get(key_id) else {
+            errors.push(format!(
+                "{}: newly introduced tombstone {key_id} has no immediately preceding live key",
+                current.locator
+            ));
+            continue;
+        };
+        for field in [
+            "key_id",
+            "signer_identity",
+            "algorithm",
+            "public_key_fingerprint",
+        ] {
+            if tombstone.get(field) != previous_key.get(field) {
+                errors.push(format!(
+                    "{}: newly introduced tombstone {key_id} changes predecessor {field}",
+                    current.locator
                 ));
             }
         }
     }
+
+    let current_effective_at = registry_effective_at(&current.value);
+    for (key_id, current_key) in &current_keys {
+        if previous_keys.contains_key(key_id) {
+            continue;
+        }
+        if previous_tombstones.contains_key(key_id) {
+            errors.push(format!(
+                "{}: tombstoned key_id {key_id} cannot become live again",
+                current.locator
+            ));
+        }
+        let valid_from = string_field(current_key, "valid_from")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        if valid_from
+            .zip(current_effective_at)
+            .is_some_and(|(valid_from, effective_at)| valid_from < effective_at)
+        {
+            errors.push(format!(
+                "{}: newly introduced key {key_id} valid_from cannot predate registry effective_at",
+                current.locator
+            ));
+        }
+    }
+}
+
+fn validate_new_key_activation_times(registry: &LoadedTrustRegistry, errors: &mut Vec<String>) {
+    let effective_at = registry_effective_at(&registry.value);
+    let previous_ids = registry
+        .value
+        .get("predecessor_registry_ref")
+        .is_some_and(|value| !value.is_null());
+    for (index, key) in array(&registry.value, "keys").iter().enumerate() {
+        // For a non-genesis document, recurring keys are filtered by the edge
+        // validator below. This local check intentionally covers genesis; the
+        // edge validator calls the same comparison only for newly introduced
+        // keys after identifying its predecessor.
+        if previous_ids {
+            continue;
+        }
+        let valid_from = string_field(key, "valid_from")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        if valid_from
+            .zip(effective_at)
+            .is_some_and(|(valid_from, effective_at)| valid_from < effective_at)
+        {
+            errors.push(format!(
+                "{}:/keys/{index}: newly introduced key valid_from cannot predate registry effective_at",
+                registry.locator
+            ));
+        }
+    }
+}
+
+fn validate_registry_lifecycle_transition(
+    previous: &LoadedTrustRegistry,
+    current: &LoadedTrustRegistry,
+    errors: &mut Vec<String>,
+) {
+    let previous_state = previous
+        .value
+        .get("lifecycle")
+        .and_then(|value| string_field(value, "state"))
+        .unwrap_or("");
+    let current_state = current
+        .value
+        .get("lifecycle")
+        .and_then(|value| string_field(value, "state"))
+        .unwrap_or("");
+    let valid = matches!(
+        (previous_state, current_state),
+        ("implementation_only", "implementation_only" | "candidate")
+            | ("candidate", "candidate" | "active")
+            | ("active", "active" | "deprecated" | "retired")
+            | ("deprecated", "deprecated" | "retired")
+            | ("retired", "retired")
+    );
+    if !valid {
+        errors.push(format!(
+            "{}: registry lifecycle cannot transition from {previous_state} to {current_state}",
+            current.locator
+        ));
+    }
+}
+
+fn registry_effective_at(registry: &Value) -> Option<DateTime<Utc>> {
+    registry
+        .get("lifecycle")
+        .and_then(|lifecycle| string_field(lifecycle, "effective_at"))
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn trust_registry_records(registry: &Value, field: &str) -> BTreeMap<String, Value> {
+    array(registry, field)
+        .iter()
+        .filter_map(|record| {
+            string_field(record, "key_id").map(|key_id| (key_id.to_string(), record.clone()))
+        })
+        .collect()
+}
+
+fn live_key_is_immutable(previous: &Value, current: &Value) -> bool {
+    let mut previous = previous.clone();
+    let mut current = current.clone();
+    if let Some(object) = previous.as_object_mut() {
+        object.remove("lifecycle");
+    }
+    if let Some(object) = current.as_object_mut() {
+        object.remove("lifecycle");
+    }
+    previous == current
+}
+
+fn validate_live_key_lifecycle_transition(
+    key_id: &str,
+    previous: &Value,
+    current: &Value,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let previous_lifecycle = string_field(previous, "lifecycle").unwrap_or("");
+    let current_lifecycle = string_field(current, "lifecycle").unwrap_or("");
+    if !matches!(
+        (previous_lifecycle, current_lifecycle),
+        ("active", "active" | "overlap") | ("overlap", "overlap")
+    ) {
+        errors.push(format!(
+            "{context}: live key {key_id} lifecycle cannot transition from {previous_lifecycle} to {current_lifecycle}"
+        ));
+    }
+}
+
+fn tombstone_is_valid_successor(previous: &Value, current: &Value) -> bool {
+    if previous == current {
+        return true;
+    }
+    if string_field(previous, "terminal_state") != Some("retired")
+        || string_field(current, "terminal_state") != Some("retired")
+        || !previous
+            .get("subsequent_revocation")
+            .is_some_and(Value::is_null)
+        || !current
+            .get("subsequent_revocation")
+            .is_some_and(Value::is_object)
+    {
+        return false;
+    }
+    let terminated_at = string_field(current, "terminated_at")
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    let subsequent_revocation = current
+        .get("subsequent_revocation")
+        .expect("the overlay object was checked above");
+    let revoked_at = string_field(subsequent_revocation, "revoked_at")
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    if terminated_at
+        .zip(revoked_at)
+        .is_some_and(|(terminated_at, revoked_at)| revoked_at < terminated_at)
+    {
+        return false;
+    }
+    let mut previous = previous.clone();
+    let mut current = current.clone();
+    for value in [&mut previous, &mut current] {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("subsequent_revocation");
+        }
+    }
+    previous == current
+}
+
+fn registry_authority_changed(previous: &Value, current: &Value) -> bool {
+    trust_registry_scope_projection(previous) != trust_registry_scope_projection(current)
+        || string_set(array(previous, "canonicalization_profiles"))
+            != string_set(array(current, "canonicalization_profiles"))
+        || string_set(array(previous, "signature_algorithms"))
+            != string_set(array(current, "signature_algorithms"))
+        || trust_registry_records(previous, "keys") != trust_registry_records(current, "keys")
+        || trust_registry_records(previous, "key_tombstones")
+            != trust_registry_records(current, "key_tombstones")
+}
+
+fn trust_registry_scope_projection(
+    registry: &Value,
+) -> (String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let applicability = registry.get("applicability").unwrap_or(&Value::Null);
+    (
+        string_field(applicability, "evaluation_scope")
+            .unwrap_or("")
+            .to_string(),
+        string_set(array(applicability, "security_profiles")),
+        string_set(array(applicability, "deployment_ids")),
+        string_set(array(applicability, "trust_domain_ids")),
+    )
 }
 
 fn validate_trust_registry_applicability(
@@ -3279,7 +4434,9 @@ fn validate_action_resource_registry(root: &Path, registry: &Value, errors: &mut
             root,
             source,
             None,
-            &format!("action-resource-registry.implementation.json:/inventory_closure/inventory_sources/{index}"),
+            &format!(
+                "action-resource-registry.implementation.json:/inventory_closure/inventory_sources/{index}"
+            ),
             errors,
         );
     }
@@ -3755,6 +4912,35 @@ mod tests {
     fn repository_security_contracts_pass_the_real_gate() {
         let errors = validate_repository(&root()).expect("repository validation should run");
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn deployment_profile_binds_exact_trust_registry_head_digest() {
+        let mut deployment =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        deployment["conformance_trust_root_registry_ref"]["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let registry = load(
+            "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json",
+        );
+        let instances = BTreeMap::from([
+            (
+                "deployment-security-profile.implementation.json",
+                deployment,
+            ),
+            (
+                "conformance-trust-root-registry.implementation.json",
+                registry,
+            ),
+        ]);
+        let mut errors = Vec::new();
+
+        validate_cross_document_semantics(&root(), &instances, &mut errors);
+
+        assert!(errors.iter().any(|error| {
+            error.contains("conformance_trust_root_registry_ref")
+                && error.contains("content_digest does not match the exact raw bytes")
+        }));
     }
 
     #[test]
@@ -4325,7 +5511,11 @@ mod tests {
             "key_id": "conformance-key:test-primary",
             "signer_identity": "signer:test",
             "algorithm": "ed25519",
-            "revoked_at": "2026-07-15T00:00:00Z",
+            "public_key_fingerprint": "sha256:72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793",
+            "terminal_state": "revoked",
+            "terminated_at": "2026-07-15T00:00:00Z",
+            "signatures_valid_before": null,
+            "subsequent_revocation": null,
             "reason": "Test terminal revocation record",
             "superseded_by_key_id": null,
             "trust_policy_version": 1
@@ -4338,10 +5528,10 @@ mod tests {
             .any(|error| error.contains("duplicate key_id conformance-key:test-primary")));
         assert!(errors
             .iter()
-            .any(|error| error.contains("revoked key requires revoked_at")));
-        assert!(errors.iter().any(
-            |error| error.contains("tombstoned key_id conformance-key:test-primary is reused")
-        ));
+            .any(|error| error.contains("live key lifecycle must be active or overlap")));
+        assert!(errors.iter().any(|error| {
+            error.contains("tombstoned key_id conformance-key:test-primary is reused")
+        }));
     }
 
     #[test]
@@ -4371,7 +5561,10 @@ mod tests {
         let mut predecessor = registry["keys"][0].clone();
         predecessor["key_id"] = json!("conformance-key:test-predecessor");
         predecessor["public_key_base64"] = json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+        predecessor["public_key_fingerprint"] =
+            json!("sha256:75877bb41d393b5fb8455ce60ecd8dda001d06316496b14dfa7f895656eeca4a");
         predecessor["valid_from"] = json!("2026-07-16T00:30:00+02:00");
+        predecessor["lifecycle"] = json!("overlap");
         registry["keys"][0]["valid_from"] = json!("2026-07-15T23:00:00Z");
         registry["keys"][0]["supersedes_key_id"] = json!("conformance-key:test-predecessor");
         registry["keys"]
@@ -4388,6 +5581,367 @@ mod tests {
             "{}",
             errors.join("\n")
         );
+    }
+
+    #[test]
+    fn trust_registry_requires_single_active_successor_from_overlap() {
+        let rotation = || {
+            let mut registry = trust_registry_fixture();
+            let mut predecessor = registry["keys"][0].clone();
+            predecessor["key_id"] = json!("conformance-key:test-predecessor");
+            predecessor["public_key_base64"] =
+                json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+            predecessor["public_key_fingerprint"] =
+                json!("sha256:75877bb41d393b5fb8455ce60ecd8dda001d06316496b14dfa7f895656eeca4a");
+            predecessor["valid_from"] = json!("2026-07-15T00:00:00Z");
+            predecessor["lifecycle"] = json!("overlap");
+            registry["keys"][0]["valid_from"] = json!("2026-07-15T01:00:00Z");
+            registry["keys"][0]["supersedes_key_id"] = json!("conformance-key:test-predecessor");
+            registry["keys"]
+                .as_array_mut()
+                .expect("keys")
+                .push(predecessor);
+            registry
+        };
+
+        let mut non_active_successor = rotation();
+        non_active_successor["keys"][0]["lifecycle"] = json!("overlap");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(
+            &non_active_successor,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("live superseding key conformance-key:test-primary must be active")
+        }));
+
+        let mut active_predecessor = rotation();
+        active_predecessor["keys"][1]["lifecycle"] = json!("active");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(
+            &active_predecessor,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "live predecessor conformance-key:test-predecessor of conformance-key:test-primary must be overlap",
+            )
+        }));
+
+        let mut multiple_successors = rotation();
+        let mut second_successor = multiple_successors["keys"][0].clone();
+        second_successor["key_id"] = json!("conformance-key:test-tertiary");
+        second_successor["public_key_base64"] =
+            json!("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=");
+        second_successor["public_key_fingerprint"] = json!(raw_sha256_digest(&[3_u8; 32]));
+        second_successor["valid_from"] = json!("2026-07-15T02:00:00Z");
+        multiple_successors["keys"]
+            .as_array_mut()
+            .expect("keys")
+            .push(second_successor);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(
+            &multiple_successors,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "live predecessor conformance-key:test-predecessor has multiple successors",
+            )
+        }));
+    }
+
+    #[test]
+    fn trust_registry_fingerprint_hashes_decoded_raw_key_bytes() {
+        let encoded = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let decoded = decode_canonical_ed25519_public_key(encoded).expect("canonical key");
+        assert_eq!(
+            raw_sha256_digest(&decoded),
+            "sha256:72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793"
+        );
+        assert_ne!(
+            raw_sha256_digest(encoded.as_bytes()),
+            raw_sha256_digest(&decoded)
+        );
+    }
+
+    #[test]
+    fn trust_registry_accepts_valid_bounded_rotation_lineage() {
+        let lineage = valid_rotation_lineage();
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &lineage,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn trust_registry_rejects_wrong_link_policy_and_effective_time() {
+        let mut wrong_link = valid_rotation_lineage();
+        wrong_link[1].value["predecessor_registry_ref"]["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &wrong_link,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("content_digest does not exactly bind")));
+
+        let mut wrong_policy = valid_rotation_lineage();
+        wrong_policy[1].value["trust_policy_version"] = json!(1);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &wrong_policy,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("authority change requires trust_policy_version 2")));
+
+        let mut wrong_effective = valid_rotation_lineage();
+        wrong_effective[1].value["lifecycle"]["effective_at"] = json!("2026-07-14T23:00:00-01:00");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &wrong_effective,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("effective_at must strictly increase")));
+    }
+
+    #[test]
+    fn trust_registry_rejects_dropped_or_mutated_tombstones() {
+        let mut dropped = valid_three_version_lineage();
+        dropped[2].value["key_tombstones"] = json!([]);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &dropped,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("predecessor tombstone") && error.contains("dropped")));
+
+        let mut mutated = valid_three_version_lineage();
+        mutated[2].value["key_tombstones"][0]["reason"] =
+            json!("Mutated terminal record that must be rejected");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &mutated,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("mutates outside")));
+    }
+
+    #[test]
+    fn trust_registry_rejects_key_disappearance_and_resurrection() {
+        let mut disappeared = valid_three_version_lineage();
+        disappeared[2].value["keys"] = json!([]);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &disappeared,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("disappears without an immediate tombstone")));
+
+        let mut resurrected = valid_three_version_lineage();
+        let retired_key = resurrected[0].value["keys"][0].clone();
+        resurrected[2]
+            .value
+            .get_mut("keys")
+            .and_then(Value::as_array_mut)
+            .expect("keys")
+            .push(retired_key);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &resurrected,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("resurrected as a live key")));
+    }
+
+    #[test]
+    fn trust_registry_rejects_key_id_and_material_relabeling() {
+        let mut changed_id_material = valid_three_version_lineage();
+        changed_id_material[2].value["keys"][0]["public_key_base64"] =
+            json!("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=");
+        changed_id_material[2].value["keys"][0]["public_key_fingerprint"] =
+            json!("sha256:648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &changed_id_material,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("historical key_id") && error.contains("changes")));
+
+        let mut relabeled_material = valid_three_version_lineage();
+        let mut alias = relabeled_material[2].value["keys"][0].clone();
+        alias["key_id"] = json!("conformance-key:test-alias");
+        alias["supersedes_key_id"] = Value::Null;
+        relabeled_material[2]
+            .value
+            .get_mut("keys")
+            .and_then(Value::as_array_mut)
+            .expect("keys")
+            .push(alias);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &relabeled_material,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("historical public-key fingerprint") && error.contains("relabeled")
+        }));
+    }
+
+    #[test]
+    fn trust_registry_allows_one_way_subsequent_revocation_overlay() {
+        let mut lineage = valid_three_version_lineage();
+        lineage[2].value["trust_policy_version"] = json!(3);
+        lineage[2].value["key_tombstones"][0]["subsequent_revocation"] = json!({
+            "revoked_at": "2026-07-15T17:00:00Z",
+            "reason": "Emergency revocation after later compromise",
+            "trust_policy_version": 3
+        });
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &lineage,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let mut reversed = lineage;
+        let mut fourth = next_unchanged_registry(&reversed[2], 4, "2026-07-15T20:00:00Z");
+        fourth.value["key_tombstones"][0]["subsequent_revocation"] = Value::Null;
+        reversed.push(fourth);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &reversed,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("mutates outside")));
+    }
+
+    #[test]
+    fn trust_registry_enforces_collection_and_lineage_bounds() {
+        let mut registry = trust_registry_fixture();
+        let key_template = registry["keys"][0].clone();
+        registry["keys"] = Value::Array(
+            (0..=MAX_TRUST_REGISTRY_KEYS)
+                .map(|_| key_template.clone())
+                .collect(),
+        );
+        registry["applicability"]["deployment_ids"] = Value::Array(
+            (0..=MAX_TRUST_REGISTRY_SCOPE_ITEMS)
+                .map(|index| json!(format!("deployment:test-{index}")))
+                .collect(),
+        );
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("keys exceeds the maximum")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("deployment_ids exceeds 256 items")));
+
+        let mut oversized_lineage = Vec::new();
+        for version in 1..=MAX_TRUST_REGISTRY_LINEAGE + 1 {
+            let mut value = trust_registry_fixture();
+            value["document_version"] = json!(version);
+            value["lifecycle"]["effective_at"] = json!(format!("2026-07-15T00:{version:02}:00Z"));
+            oversized_lineage.push(LoadedTrustRegistry {
+                locator: format!("test/registry-v{version}.json"),
+                value,
+                digest: format!("sha256:{version:064x}"),
+            });
+        }
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &oversized_lineage,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("lineage exceeds 16 documents")));
+    }
+
+    #[test]
+    fn trust_registry_lineage_errors_are_deterministic() {
+        let mut lineage = valid_three_version_lineage();
+        lineage[2].value["keys"] = json!([]);
+        lineage[2].value["key_tombstones"][0]["reason"] = json!("Mutated deterministic error");
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &lineage,
+            closure_test_now(),
+            &mut first,
+        );
+        validate_conformance_trust_root_registry_lineage_at(
+            &lineage,
+            closure_test_now(),
+            &mut second,
+        );
+        first.sort();
+        first.dedup();
+        second.sort();
+        second.dedup();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn trust_registry_rejects_overlap_reactivation_and_overlap_only_production() {
+        let mut lineage = valid_three_version_lineage();
+        lineage[1].value["keys"][0]["lifecycle"] = json!("overlap");
+        lineage[2].value["keys"][0]["lifecycle"] = json!("active");
+        lineage[2].value["trust_policy_version"] = json!(3);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_lineage_at(
+            &lineage,
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("lifecycle cannot transition from overlap to active")));
+
+        let mut registry = trust_registry_fixture();
+        registry["acceptance_status"] = json!("production_accepted");
+        registry["production_accepted"] = json!(true);
+        registry["lifecycle"]["state"] = json!("active");
+        registry["keys"][0]["lifecycle"] = json!("overlap");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("overlap-only authority is forbidden")));
     }
 
     #[test]
@@ -4546,6 +6100,7 @@ mod tests {
             "contract_kind": "conformance-trust-root-registry",
             "document_id": "conformance-trust-root-registry:test",
             "document_version": 1,
+            "predecessor_registry_ref": null,
             "acceptance_status": "production_candidate",
             "production_accepted": false,
             "lifecycle": {
@@ -4566,6 +6121,7 @@ mod tests {
                 "signer_identity": "signer:test",
                 "algorithm": "ed25519",
                 "public_key_base64": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "public_key_fingerprint": "sha256:72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793",
                 "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
                 "allowed_evidence_tiers": ["repository_local"],
                 "allowed_package_ids": ["SB-0"],
@@ -4574,11 +6130,89 @@ mod tests {
                 "valid_from": "2026-07-15T00:00:00Z",
                 "valid_until": "2026-07-17T00:00:00Z",
                 "lifecycle": "active",
-                "revoked_at": null,
                 "supersedes_key_id": null
             }],
             "key_tombstones": []
         })
+    }
+
+    fn valid_rotation_lineage() -> Vec<LoadedTrustRegistry> {
+        let root = LoadedTrustRegistry {
+            locator: "test/registry-v1.json".to_string(),
+            value: trust_registry_fixture(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        };
+        let mut rotated = root.value.clone();
+        rotated["document_version"] = json!(2);
+        rotated["predecessor_registry_ref"] = json!({
+            "artifact_kind": "conformance-trust-root-registry",
+            "document_id": "conformance-trust-root-registry:test",
+            "document_version": 1,
+            "content_digest": root.digest.clone(),
+            "artifact_locator": root.locator.clone()
+        });
+        rotated["lifecycle"]["effective_at"] = json!("2026-07-15T12:00:00Z");
+        rotated["trust_policy_version"] = json!(2);
+        let mut successor = rotated["keys"][0].clone();
+        successor["key_id"] = json!("conformance-key:test-secondary");
+        successor["public_key_base64"] = json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+        successor["public_key_fingerprint"] =
+            json!("sha256:75877bb41d393b5fb8455ce60ecd8dda001d06316496b14dfa7f895656eeca4a");
+        successor["valid_from"] = json!("2026-07-15T12:00:01Z");
+        successor["supersedes_key_id"] = json!("conformance-key:test-primary");
+        rotated["keys"] = json!([successor]);
+        rotated["key_tombstones"] = json!([{
+            "key_id": "conformance-key:test-primary",
+            "signer_identity": "signer:test",
+            "algorithm": "ed25519",
+            "public_key_fingerprint": "sha256:72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793",
+            "terminal_state": "retired",
+            "terminated_at": "2026-07-15T12:00:00Z",
+            "signatures_valid_before": "2026-07-15T12:00:00Z",
+            "subsequent_revocation": null,
+            "reason": "Routine rotation of the primary test key",
+            "superseded_by_key_id": "conformance-key:test-secondary",
+            "trust_policy_version": 2
+        }]);
+        vec![
+            root,
+            LoadedTrustRegistry {
+                locator: "test/registry-v2.json".to_string(),
+                value: rotated,
+                digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+        ]
+    }
+
+    fn valid_three_version_lineage() -> Vec<LoadedTrustRegistry> {
+        let mut lineage = valid_rotation_lineage();
+        let third = next_unchanged_registry(&lineage[1], 3, "2026-07-15T18:00:00Z");
+        lineage.push(third);
+        lineage
+    }
+
+    fn next_unchanged_registry(
+        previous: &LoadedTrustRegistry,
+        version: u64,
+        effective_at: &str,
+    ) -> LoadedTrustRegistry {
+        let mut value = previous.value.clone();
+        value["document_version"] = json!(version);
+        value["predecessor_registry_ref"] = json!({
+            "artifact_kind": "conformance-trust-root-registry",
+            "document_id": previous.value["document_id"],
+            "document_version": previous.value["document_version"],
+            "content_digest": previous.digest.clone(),
+            "artifact_locator": previous.locator.clone()
+        });
+        value["lifecycle"]["effective_at"] = json!(effective_at);
+        LoadedTrustRegistry {
+            locator: format!("test/registry-v{version}.json"),
+            value,
+            digest: format!("sha256:{version:064x}"),
+        }
     }
 
     fn make_bundle_production_accepted(bundle: &mut LoadedDocument) {

@@ -4,6 +4,7 @@
   "contract_kind": "conformance-trust-root-registry",
   "document_id": "conformance-trust-root-registry:repository-implementation-v1",
   "document_version": 1,
+  "predecessor_registry_ref": null,
   "acceptance_status": "implementation_only",
   "production_accepted": false,
   "lifecycle": {

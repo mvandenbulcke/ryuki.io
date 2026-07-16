@@ -58,6 +58,11 @@ to the absolute, immutable root; both digests are nonzero
 `sha256:<64 lowercase hex>` values over the respective exact raw bytes; and the
 deployment identity and profile class remain independent pins. See
 [Deployment-security startup admission](configuration.md#deployment-security-startup-admission).
+The selected registry is the head of a bounded, exact N-1 predecessor chain;
+all referenced registry versions must be present as regular `.json` files
+beneath the same immutable contract root. A valid chain alone cannot prevent
+rollback of the profile and head pins as one unit, and production therefore
+remains blocked until an external monotonic head checkpoint exists.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

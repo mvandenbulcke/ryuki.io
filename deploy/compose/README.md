@@ -27,7 +27,11 @@ deployment id, `development|test|production` profile pin, and the normalized
 conformance trust-root registry from the gitignored environment through
 `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
 `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. The registry and profile must
-both reside beneath the root-owned immutable contract root.
+both reside beneath the root-owned immutable contract root. The selected
+registry is a lineage head; every exact N-1 predecessor through version 1 must
+also be baked into that root. Startup verifies the complete bounded chain, but
+the chain is not an external monotonic checkpoint and cannot by itself detect
+rollback of the profile and head pins together.
 The checked-in bundle is `implementation_only`, so it
 is not selected automatically and cannot start this stack. Until an active
 typed provider profile can bind every runtime authentication value, the full

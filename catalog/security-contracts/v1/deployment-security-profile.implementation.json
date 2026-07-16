@@ -28,7 +28,7 @@
     "artifact_kind": "conformance-trust-root-registry",
     "document_id": "conformance-trust-root-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:352ba7deb2ac801404351520d05422f15adc7a7610ee6fed32f62a5ab9766447",
+    "content_digest": "sha256:82af4e321a498182e454de215b6c77a3aded58ae7239c5fd79b24e1aea869e27",
     "artifact_locator": "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json"
   },
   "control_trace_ref": {

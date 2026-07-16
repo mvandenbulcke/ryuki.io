@@ -227,8 +227,8 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable deployment-security contract root |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized profile path relative to the contract root |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw profile bytes |
-| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized `.json` trust-root registry path relative to the immutable contract root |
-| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw trust-root registry bytes |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized `.json` path of the current trust-registry lineage head, relative to the immutable contract root |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of that head's exact raw bytes |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -242,6 +242,18 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_PORTAL_PUBLIC_ORIGIN` | Exact browser origin admitted by the portal (required) |
 | `RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK` | Explicitly permit HTTP only for a loopback portal/API origin |
 | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Runtime-only verifier key required for local, Entra, and OIDC sessions |
+
+The trust-root path and digest pin the current registry head. Every registry
+after version 1 must reference the exact raw bytes of version N-1, and startup
+structurally walks that bounded chain back to version 1. Production trust
+construction additionally binds key identifiers to SHA-256 fingerprints of
+the decoded Ed25519 public-key bytes, carries terminal tombstones forward, and
+rejects gaps, relabeling, resurrection, or policy/effective-time rollback
+before accepting any signing key. Test and development profiles construct no
+signature authority from their structural chain. The chain does not detect
+rollback when the profile and independent head pins are rolled back together;
+production remains blocked until an external monotonic registry-head
+checkpoint is reconciled.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

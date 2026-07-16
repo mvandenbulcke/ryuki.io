@@ -24,8 +24,8 @@ default and empty values fail closed:
 | `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable directory containing the profile and all referenced artifacts |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized relative path beneath that absolute root; absolute paths and traversal are rejected |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Nonzero `sha256:<64 lowercase hex>` digest computed over the profile's exact raw bytes |
-| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized relative `.json` path beneath the same immutable root; absolute paths, traversal, and non-JSON paths are rejected |
-| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently supplied, nonzero `sha256:<64 lowercase hex>` digest computed over the trust-root registry's exact raw bytes |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized relative `.json` path of the current trust-registry lineage head beneath the same immutable root; absolute paths, traversal, and non-JSON paths are rejected |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently supplied, nonzero `sha256:<64 lowercase hex>` digest computed over that head's exact raw bytes |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independent canonical `deployment:` pin that must equal the document's deployment identity |
 | `RYUKI_SECURITY_PROFILE` | Independent profile-class pin, exactly `development`, `test`, or `production`, that must equal the document |
 
@@ -36,6 +36,24 @@ migration-mode or database configuration, application configuration, signing
 keys, workers, router construction, or listener binding. The sole
 configuration-free exception is the read-only `--dump-route-meta` maintenance
 mode, which exits without starting runtime services.
+
+The registry path and digest identify the current lineage head, not a
+standalone key file. Version 1 has no predecessor; each later version contains
+an exact content-addressed reference to version N-1. Preflight walks at most 16
+versions back to version 1 and verifies every raw digest, identifier, and
+contiguous link. For a production profile, trust-store construction then
+verifies every effective-time and policy transition, decoded-key fingerprint,
+and terminal tombstone before signature verification. Test and development
+profiles construct no signature authority from their structural chain.
+Historical snapshots remain lineage evidence only: without an independently
+trusted acceptance timestamp, signer-controlled `signed_at` cannot prove that
+a signature predates cutover. The current implementation therefore admits only
+an active key from the pinned head; overlap, retired, revoked, and historical
+authority all fail closed.
+Rolling back the profile and both independent head pins together is outside
+what a self-contained hash chain can detect, so production admission remains
+unavailable until a durable external monotonic head checkpoint is implemented
+and reconciled.
 
 Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment

@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
 use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::conformance_trust::{
-    ConformanceTrustStore, ConformanceVerificationContext, EvidenceTier,
-    VerifiedConformanceDocument,
+    ConformanceRegistryArtifact, ConformanceTrustAnchor, ConformanceTrustStore,
+    ConformanceVerificationContext, EvidenceTier, VerifiedConformanceDocument,
 };
 use ryuki_core::security_profile::{
     DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile, StartupAdmissionContext,
@@ -148,6 +148,16 @@ impl StartupSecurityPins {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContentReferenceBinding {
+    document_id: String,
+    document_version: u64,
+    content_digest: String,
+    artifact_locator: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConformanceRegistryPredecessorReference {
+    artifact_kind: String,
     document_id: String,
     document_version: u64,
     content_digest: String,
@@ -591,42 +601,36 @@ fn load_pinned_conformance_trust_root_registry(
         );
     }
 
-    let bytes = store.read(
-        &pins.conformance_trust_root_registry_path,
-        MAX_ARTIFACT_BYTES,
-    )?;
-    let actual_digest = raw_digest(&bytes);
-    if actual_digest != pins.conformance_trust_root_registry_digest {
-        return Err(format!(
-            "conformance trust-root registry digest mismatch: expected {}, got {actual_digest}",
-            pins.conformance_trust_root_registry_digest
-        ));
-    }
-    let registry = parse_json_strict(&bytes)
-        .map_err(|error| format!("conformance trust-root registry JSON is invalid: {error}"))?;
-    validate_against_schema(
-        "conformance trust-root registry",
-        CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA,
-        &registry,
-    )?;
-
-    let binding = ReferenceBinding {
+    let head_binding = ReferenceBinding {
         locator: reference.artifact_locator.clone(),
         digest: reference.content_digest.clone(),
         artifact_kind: Some("conformance-trust-root-registry".into()),
         document_id: Some(reference.document_id.clone()),
         document_version: Some(reference.document_version),
     };
-    validate_reference_identity(&binding, &registry)?;
-    validate_typed_reference_document(&binding, &registry)?;
-    validate_conformance_trust_root_registry_lifecycle(&registry, profile, now)?;
+    let lineage = load_conformance_trust_root_registry_lineage(store, head_binding)?;
+    let head = lineage
+        .last()
+        .ok_or_else(|| "conformance trust-root registry lineage is empty".to_string())?;
+    validate_conformance_trust_root_registry_lifecycle(&head.document, profile, now)?;
+
     let trust_store = if profile.security_profile.is_production() {
+        let artifacts = lineage
+            .iter()
+            .map(|artifact| ConformanceRegistryArtifact {
+                artifact_locator: &artifact.locator,
+                raw_bytes: &artifact.raw_bytes,
+            })
+            .collect::<Vec<_>>();
         Some(
-            ConformanceTrustStore::from_bytes(
-                &bytes,
-                &reference.document_id,
-                reference.document_version,
-                &pins.conformance_trust_root_registry_digest,
+            ConformanceTrustStore::from_registry_chain(
+                &artifacts,
+                ConformanceTrustAnchor {
+                    artifact_locator: &reference.artifact_locator,
+                    document_id: &reference.document_id,
+                    document_version: reference.document_version,
+                    content_digest: &pins.conformance_trust_root_registry_digest,
+                },
                 now,
             )
             .map_err(|error| format!("conformance trust-root registry is not trusted: {error}"))?,
@@ -635,6 +639,167 @@ fn load_pinned_conformance_trust_root_registry(
         None
     };
     Ok(trust_store)
+}
+
+#[derive(Debug)]
+struct LoadedConformanceRegistryArtifact {
+    locator: String,
+    raw_bytes: Vec<u8>,
+    document: Value,
+}
+
+fn load_conformance_trust_root_registry_lineage(
+    store: &mut ArtifactStore,
+    head: ReferenceBinding,
+) -> Result<Vec<LoadedConformanceRegistryArtifact>, String> {
+    let mut current = head;
+    let mut newest_to_oldest = Vec::new();
+    let mut locator_digests = BTreeMap::<String, String>::new();
+    let mut identity_digests = BTreeMap::<(String, u64), String>::new();
+
+    loop {
+        if newest_to_oldest.len() >= MAX_REFERENCE_DEPTH {
+            return Err(format!(
+                "conformance trust-root registry lineage exceeds {MAX_REFERENCE_DEPTH} documents"
+            ));
+        }
+        if current.artifact_kind.as_deref() != Some("conformance-trust-root-registry") {
+            return Err(
+                "conformance trust-root registry predecessor has the wrong artifact kind".into(),
+            );
+        }
+        let document_id = current.document_id.as_deref().ok_or_else(|| {
+            "conformance trust-root registry reference omits document_id".to_string()
+        })?;
+        let document_version = current.document_version.ok_or_else(|| {
+            "conformance trust-root registry reference omits document_version".to_string()
+        })?;
+        if document_version == 0 {
+            return Err(
+                "conformance trust-root registry reference requires a positive document_version"
+                    .into(),
+            );
+        }
+        validate_digest_pin(
+            "conformance trust-root registry reference digest",
+            &current.digest,
+        )?;
+        let locator = PathBuf::from(&current.locator);
+        validate_json_relative_path("conformance trust-root registry locator", &locator)?;
+
+        if let Some(previous_digest) = locator_digests.get(&current.locator) {
+            if previous_digest != &current.digest {
+                return Err(format!(
+                    "conformance trust-root registry locator {} is referenced with conflicting digests",
+                    current.locator
+                ));
+            }
+            return Err(format!(
+                "conformance trust-root registry lineage contains a locator cycle at {}",
+                current.locator
+            ));
+        }
+        let identity = (document_id.to_owned(), document_version);
+        if let Some(previous_digest) = identity_digests.get(&identity) {
+            if previous_digest != &current.digest {
+                return Err(format!(
+                    "conformance trust-root registry {document_id}@{document_version} is referenced with conflicting digests"
+                ));
+            }
+            return Err(format!(
+                "conformance trust-root registry lineage repeats {document_id}@{document_version}"
+            ));
+        }
+        locator_digests.insert(current.locator.clone(), current.digest.clone());
+        identity_digests.insert(identity, current.digest.clone());
+
+        let bytes = store.read(&locator, MAX_ARTIFACT_BYTES)?;
+        let actual_digest = raw_digest(&bytes);
+        if actual_digest != current.digest {
+            return Err(format!(
+                "conformance trust-root registry {} digest mismatch: expected {}, got {actual_digest}",
+                current.locator, current.digest
+            ));
+        }
+        let registry = parse_json_strict(&bytes).map_err(|error| {
+            format!(
+                "conformance trust-root registry {} JSON is invalid: {error}",
+                current.locator
+            )
+        })?;
+        validate_against_schema(
+            "conformance trust-root registry",
+            CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA,
+            &registry,
+        )?;
+        validate_reference_identity(&current, &registry)?;
+        validate_typed_reference_document(&current, &registry)?;
+
+        let predecessor_value = registry
+            .get("predecessor_registry_ref")
+            .ok_or_else(|| {
+                format!(
+                    "conformance trust-root registry {document_id}@{document_version} omits predecessor_registry_ref"
+                )
+            })?;
+        let predecessor = if document_version == 1 {
+            if !predecessor_value.is_null() {
+                return Err(
+                    "conformance trust-root registry version 1 must have a null predecessor_registry_ref"
+                        .into(),
+                );
+            }
+            None
+        } else {
+            if predecessor_value.is_null() {
+                return Err(format!(
+                    "conformance trust-root registry {document_id}@{document_version} has an incomplete lineage"
+                ));
+            }
+            let predecessor: ConformanceRegistryPredecessorReference =
+                serde_json::from_value(predecessor_value.clone()).map_err(|error| {
+                    format!(
+                        "conformance trust-root registry {document_id}@{document_version} has an invalid predecessor_registry_ref: {error}"
+                    )
+                })?;
+            if predecessor.artifact_kind != "conformance-trust-root-registry" {
+                return Err(format!(
+                    "conformance trust-root registry {document_id}@{document_version} predecessor has the wrong artifact kind"
+                ));
+            }
+            if predecessor.document_id != document_id {
+                return Err(format!(
+                    "conformance trust-root registry {document_id}@{document_version} predecessor changes document identity"
+                ));
+            }
+            if predecessor.document_version != document_version - 1 {
+                return Err(format!(
+                    "conformance trust-root registry {document_id}@{document_version} predecessor must be version {}",
+                    document_version - 1
+                ));
+            }
+            Some(ReferenceBinding {
+                locator: predecessor.artifact_locator,
+                digest: predecessor.content_digest,
+                artifact_kind: Some(predecessor.artifact_kind),
+                document_id: Some(predecessor.document_id),
+                document_version: Some(predecessor.document_version),
+            })
+        };
+        newest_to_oldest.push(LoadedConformanceRegistryArtifact {
+            locator: current.locator.clone(),
+            raw_bytes: bytes,
+            document: registry,
+        });
+
+        let Some(predecessor) = predecessor else {
+            break;
+        };
+        current = predecessor;
+    }
+
+    newest_to_oldest.reverse();
+    Ok(newest_to_oldest)
 }
 
 fn validate_conformance_trust_root_registry_lifecycle(
@@ -837,7 +1002,7 @@ fn verify_loaded_conformance_documents(
             _ => {
                 return Err(format!(
                     "conformance document {locator} has unknown evidence tier"
-                ))
+                ));
             }
         };
         let proof = trust_store
@@ -2344,6 +2509,7 @@ mod tests {
             "contract_kind": "conformance-trust-root-registry",
             "document_id": "conformance-trust-root-registry:runtime-test",
             "document_version": 1,
+            "predecessor_registry_ref": null,
             "acceptance_status": "production_accepted",
             "production_accepted": true,
             "lifecycle": {"state": "active", "effective_at": "2026-07-15T00:00:00Z"},
@@ -2361,6 +2527,7 @@ mod tests {
                 "signer_identity": "signer:runtime-test",
                 "algorithm": SIGNATURE_ALGORITHM,
                 "public_key_base64": BASE64_STANDARD.encode(key.verifying_key().to_bytes()),
+                "public_key_fingerprint": raw_digest(&key.verifying_key().to_bytes()),
                 "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
                 "allowed_evidence_tiers": ["externally_attested"],
                 "allowed_package_ids": ["SB-0"],
@@ -2369,14 +2536,18 @@ mod tests {
                 "valid_from": "2026-07-15T00:00:00Z",
                 "valid_until": "2026-07-17T00:00:00Z",
                 "lifecycle": "active",
-                "revoked_at": null,
                 "supersedes_key_id": null
             }],
             "key_tombstones": []
         })
     }
 
-    fn signed_closure_document(kind: &str, key: &SigningKey, registry_digest: &str) -> Value {
+    fn signed_closure_document(
+        kind: &str,
+        key: &SigningKey,
+        registry_version: u64,
+        registry_digest: &str,
+    ) -> Value {
         let (schema, id_field, id, purpose, domain) = match kind {
             "conformance-bundle" => (
                 "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
@@ -2408,7 +2579,7 @@ mod tests {
                 "purpose": purpose,
                 "domain": domain,
                 "trust_registry_id": "conformance-trust-root-registry:runtime-test",
-                "trust_registry_version": 1,
+                "trust_registry_version": registry_version,
                 "trust_registry_digest": registry_digest,
                 "signed_at": "2026-07-16T10:00:00Z",
                 "signed_subject_digest": format!("sha256:{}", "a".repeat(64)),
@@ -2710,6 +2881,70 @@ mod tests {
             let bytes = serde_json::to_vec_pretty(&registry).unwrap();
             self.rewrite_trust_root_registry_raw(&bytes);
         }
+
+        fn install_trust_registry_lineage(
+            &mut self,
+            document_count: u64,
+            mut mutate: impl FnMut(u64, &mut Value),
+        ) -> Vec<(String, String)> {
+            assert!(document_count > 0);
+            let template: Value = serde_json::from_slice(
+                &fs::read(self.root.join(TRUST_ROOT_REGISTRY_PATH)).unwrap(),
+            )
+            .unwrap();
+            let mut written = Vec::new();
+            let mut predecessor: Option<(String, String, String, u64)> = None;
+
+            for version in 1..=document_count {
+                let locator = if version == document_count {
+                    TRUST_ROOT_REGISTRY_PATH.to_string()
+                } else {
+                    format!(
+                        "catalog/security-contracts/v1/conformance-trust-root-registry.runtime-test-v{version}.json"
+                    )
+                };
+                let mut registry = template.clone();
+                registry["document_version"] = json!(version);
+                registry["predecessor_registry_ref"] = match &predecessor {
+                    Some((previous_locator, previous_digest, previous_id, previous_version)) => {
+                        json!({
+                            "artifact_kind": "conformance-trust-root-registry",
+                            "document_id": previous_id,
+                            "document_version": previous_version,
+                            "content_digest": previous_digest,
+                            "artifact_locator": previous_locator
+                        })
+                    }
+                    None => Value::Null,
+                };
+                mutate(version, &mut registry);
+                let document_id = registry["document_id"].as_str().unwrap().to_string();
+                let document_version = registry["document_version"].as_u64().unwrap();
+                let digest = write_json(&self.root, &locator, &registry);
+                predecessor = Some((
+                    locator.clone(),
+                    digest.clone(),
+                    document_id,
+                    document_version,
+                ));
+                written.push((locator, digest));
+            }
+
+            let (head_locator, head_digest, head_id, head_version) =
+                predecessor.expect("lineage has at least one registry");
+            self.pins.conformance_trust_root_registry_path = PathBuf::from(&head_locator);
+            self.pins.conformance_trust_root_registry_digest = head_digest.clone();
+            self.rewrite_profile(|profile| {
+                profile["conformance_trust_root_registry_ref"] = json!({
+                    "artifact_kind": "conformance-trust-root-registry",
+                    "document_id": head_id,
+                    "document_version": head_version,
+                    "content_digest": head_digest,
+                    "artifact_locator": head_locator
+                });
+            });
+            written
+        }
     }
 
     fn copy_relative(source_root: &Path, destination_root: &Path, relative: &str) {
@@ -2954,10 +3189,7 @@ mod tests {
 
         let mut malformed = ActiveFixture::build();
         malformed.rewrite_trust_root_registry_raw(b"{\"not\":\"closed\"");
-        assert!(malformed
-            .load()
-            .unwrap_err()
-            .contains("trust-root registry JSON is invalid"));
+        assert!(malformed.load().unwrap_err().contains("JSON is invalid"));
 
         let tampered = ActiveFixture::build();
         fs::OpenOptions::new()
@@ -2966,10 +3198,139 @@ mod tests {
             .unwrap()
             .write_all(b"\n")
             .unwrap();
-        assert!(tampered
+        assert!(tampered.load().unwrap_err().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn complete_two_version_trust_registry_lineage_loads_for_test_profile() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_trust_registry_lineage(2, |_, _| {});
+        assert!(fixture.load().is_ok());
+    }
+
+    #[test]
+    fn trust_registry_lineage_requires_an_exact_predecessor_binding() {
+        let mut missing = ActiveFixture::build();
+        missing.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("predecessor_registry_ref");
+            }
+        });
+        assert!(missing.load().is_err());
+
+        let mut null = ActiveFixture::build();
+        null.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"] = Value::Null;
+            }
+        });
+        assert!(null.load().is_err());
+
+        let mut wrong_kind = ActiveFixture::build();
+        wrong_kind.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["artifact_kind"] = json!("provider-registry");
+            }
+        });
+        assert!(wrong_kind.load().is_err());
+
+        let mut wrong_id = ActiveFixture::build();
+        wrong_id.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["document_id"] =
+                    json!("conformance-trust-root-registry:other-runtime-test");
+            }
+        });
+        assert!(wrong_id
             .load()
             .unwrap_err()
-            .contains("trust-root registry digest mismatch"));
+            .contains("changes document identity"));
+
+        let mut wrong_version = ActiveFixture::build();
+        wrong_version.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["document_version"] = json!(2);
+            }
+        });
+        assert!(wrong_version
+            .load()
+            .unwrap_err()
+            .contains("predecessor must be version 1"));
+
+        let mut wrong_digest = ActiveFixture::build();
+        wrong_digest.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["content_digest"] =
+                    json!(format!("sha256:{}", "b".repeat(64)));
+            }
+        });
+        assert!(wrong_digest.load().unwrap_err().contains("digest mismatch"));
+
+        let mut wrong_locator = ActiveFixture::build();
+        wrong_locator.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["artifact_locator"] =
+                    json!("catalog/security-contracts/v1/missing-registry.json");
+            }
+        });
+        assert!(wrong_locator.load().unwrap_err().contains("is unavailable"));
+    }
+
+    #[test]
+    fn trust_registry_lineage_rejects_locator_conflicts_and_raw_predecessor_tampering() {
+        let mut conflict = ActiveFixture::build();
+        conflict.install_trust_registry_lineage(2, |version, registry| {
+            if version == 2 {
+                registry["predecessor_registry_ref"]["artifact_locator"] =
+                    json!(TRUST_ROOT_REGISTRY_PATH);
+            }
+        });
+        assert!(conflict.load().unwrap_err().contains("conflicting digests"));
+
+        let mut tampered = ActiveFixture::build();
+        let written = tampered.install_trust_registry_lineage(2, |_, _| {});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(tampered.root.join(&written[0].0))
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(tampered.load().unwrap_err().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn trust_registry_lineage_strictly_parses_every_predecessor() {
+        let mut fixture = ActiveFixture::build();
+        let written = fixture.install_trust_registry_lineage(2, |_, _| {});
+        let predecessor_path = fixture.root.join(&written[0].0);
+        let raw = fs::read_to_string(&predecessor_path).unwrap();
+        let duplicate = raw.replacen(
+            "\"schema_version\": \"1.0.0\",",
+            "\"schema_version\": \"1.0.0\",\n  \"schema_version\": \"1.0.0\",",
+            1,
+        );
+        fs::write(&predecessor_path, duplicate.as_bytes()).unwrap();
+        let predecessor_digest = raw_digest(duplicate.as_bytes());
+        fixture.rewrite_trust_root_registry(|registry| {
+            registry["predecessor_registry_ref"]["content_digest"] = json!(predecessor_digest);
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("duplicate JSON object key"));
+    }
+
+    #[test]
+    fn trust_registry_lineage_is_bounded_to_sixteen_documents() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_trust_registry_lineage((MAX_REFERENCE_DEPTH + 1) as u64, |_, _| {});
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("lineage exceeds 16 documents"));
     }
 
     #[test]
@@ -3040,7 +3401,10 @@ mod tests {
     }
 
     #[test]
-    fn production_signature_admission_precedes_the_final_production_block() {
+    fn production_signature_stage_authenticates_before_its_final_defense_in_depth_block() {
+        // Exercise the cryptographic stage in isolation. Full production startup
+        // remains intentionally unreachable earlier in reference traversal until
+        // topology, egress, and retention artifacts have embedded trusted schemas.
         let key = SigningKey::from_bytes(&[23u8; 32]);
         let mut fixture = ActiveFixture::build();
         let mut profile_value: Value = serde_json::from_slice(
@@ -3075,11 +3439,13 @@ mod tests {
         let bundle = signed_closure_document(
             "conformance-bundle",
             &key,
+            1,
             &fixture.pins.conformance_trust_root_registry_digest,
         );
         let receipt = signed_closure_document(
             "package-exit-receipt",
             &key,
+            1,
             &fixture.pins.conformance_trust_root_registry_digest,
         );
         let documents = BTreeMap::from([
@@ -3176,6 +3542,88 @@ mod tests {
             fixed_now(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn production_signature_stage_selects_the_exact_two_version_lineage_head() {
+        let key = SigningKey::from_bytes(&[29u8; 32]);
+        let mut fixture = ActiveFixture::build();
+        let mut profile_value: Value = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        profile_value["security_profile"] = json!("production");
+        profile_value["applicability"]["security_profiles"] = json!(["production"]);
+        profile_value["conformance_trust_root_registry_ref"]["document_id"] =
+            json!("conformance-trust-root-registry:runtime-test");
+        profile_value["conformance_trust_root_registry_ref"]["document_version"] = json!(2);
+        let provisional_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile_value.clone()).unwrap();
+
+        let predecessor_locator =
+            "catalog/security-contracts/v1/conformance-trust-root-registry.runtime-test-v1.json";
+        let mut predecessor = production_trust_registry(&key, &provisional_profile);
+        predecessor["lifecycle"]["effective_at"] = json!("2026-07-14T00:00:00Z");
+        predecessor["keys"][0]["valid_from"] = json!("2026-07-14T00:00:00Z");
+        let predecessor_digest = write_json(&fixture.root, predecessor_locator, &predecessor);
+
+        let mut head = predecessor;
+        head["document_version"] = json!(2);
+        head["lifecycle"]["effective_at"] = json!("2026-07-15T00:00:00Z");
+        head["predecessor_registry_ref"] = json!({
+            "artifact_kind": "conformance-trust-root-registry",
+            "document_id": "conformance-trust-root-registry:runtime-test",
+            "document_version": 1,
+            "content_digest": predecessor_digest,
+            "artifact_locator": predecessor_locator
+        });
+        let head_bytes = serde_json::to_vec_pretty(&head).unwrap();
+        let head_digest = raw_digest(&head_bytes);
+        profile_value["conformance_trust_root_registry_ref"]["content_digest"] = json!(head_digest);
+        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        fixture.rewrite_trust_root_registry_raw(&head_bytes);
+
+        let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
+        let trust_store = load_pinned_conformance_trust_root_registry(
+            &mut artifact_store,
+            &fixture.pins,
+            &profile,
+            fixed_now(),
+        )
+        .expect("complete production registry lineage must load")
+        .expect("production lineage must construct a trust store");
+
+        let bundle = signed_closure_document(
+            "conformance-bundle",
+            &key,
+            2,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let documents = BTreeMap::from([
+            (
+                profile.control_trace_ref.artifact_locator.clone(),
+                json!({
+                    "traces": [{
+                        "trace_id": "TRACE-RUNTIME-TEST",
+                        "owning_work_package": "SB-0"
+                    }]
+                }),
+            ),
+            ("evidence/runtime-v2-bundle.json".into(), bundle),
+        ]);
+        let verified = verify_loaded_conformance_documents(
+            &documents,
+            Some(&trust_store),
+            &profile,
+            fixed_now(),
+        )
+        .expect("the current lineage head must authenticate its exact signed document");
+        assert_eq!(verified.len(), 1);
+        assert!(
+            reject_incomplete_production_startup(&profile, verified.len())
+                .unwrap_err()
+                .contains("1 signed closure documents authenticated")
+        );
     }
 
     #[test]

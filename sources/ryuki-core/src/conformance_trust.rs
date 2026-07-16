@@ -26,6 +26,12 @@ pub const SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const CONFORMANCE_BUNDLE_DOMAIN: &str = "ryuki-v1/conformance-bundle";
 pub const PACKAGE_EXIT_RECEIPT_DOMAIN: &str = "ryuki-v1/package-exit-receipt";
 
+const MAX_REGISTRY_LINEAGE: usize = 16;
+const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_KEYS_PER_REGISTRY: usize = 256;
+const MAX_TOMBSTONES_PER_REGISTRY: usize = 4096;
+const MAX_SCOPE_ITEMS: usize = 256;
+
 const CONFORMANCE_BUNDLE_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json";
 const PACKAGE_EXIT_RECEIPT_SCHEMA_URI: &str =
@@ -123,7 +129,23 @@ impl ConformanceDocumentKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// One exact trust-registry artifact in oldest-to-current order.
+#[derive(Debug, Clone, Copy)]
+pub struct ConformanceRegistryArtifact<'a> {
+    pub artifact_locator: &'a str,
+    pub raw_bytes: &'a [u8],
+}
+
+/// The independently configured pin for the current trust-registry head.
+#[derive(Debug, Clone, Copy)]
+pub struct ConformanceTrustAnchor<'a> {
+    pub artifact_locator: &'a str,
+    pub document_id: &'a str,
+    pub document_version: u64,
+    pub content_digest: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TrustRegistryDocument {
     #[serde(rename = "$schema")]
@@ -132,6 +154,7 @@ struct TrustRegistryDocument {
     contract_kind: String,
     document_id: String,
     document_version: u64,
+    predecessor_registry_ref: Option<PredecessorRegistryRef>,
     acceptance_status: RegistryAcceptanceStatus,
     production_accepted: bool,
     lifecycle: RegistryLifecycle,
@@ -143,6 +166,16 @@ struct TrustRegistryDocument {
     key_tombstones: Vec<KeyTombstone>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PredecessorRegistryRef {
+    artifact_kind: String,
+    document_id: String,
+    document_version: u64,
+    content_digest: String,
+    artifact_locator: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RegistryAcceptanceStatus {
@@ -151,7 +184,7 @@ enum RegistryAcceptanceStatus {
     ProductionAccepted,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RegistryLifecycle {
     state: RegistryLifecycleState,
@@ -168,7 +201,7 @@ enum RegistryLifecycleState {
     Retired,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RegistryApplicability {
     evaluation_scope: String,
@@ -185,13 +218,14 @@ enum SecurityProfile {
     Production,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct VerificationKeyMetadata {
     key_id: String,
     signer_identity: String,
     algorithm: String,
     public_key_base64: String,
+    public_key_fingerprint: String,
     allowed_purposes: Vec<ConformancePurpose>,
     allowed_evidence_tiers: Vec<EvidenceTier>,
     allowed_package_ids: Vec<String>,
@@ -200,7 +234,6 @@ struct VerificationKeyMetadata {
     valid_from: DateTime<Utc>,
     valid_until: DateTime<Utc>,
     lifecycle: KeyLifecycle,
-    revoked_at: Option<DateTime<Utc>>,
     supersedes_key_id: Option<String>,
 }
 
@@ -209,20 +242,37 @@ struct VerificationKeyMetadata {
 enum KeyLifecycle {
     Active,
     Overlap,
-    Revoked,
-    Retired,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct KeyTombstone {
     key_id: String,
     signer_identity: String,
     algorithm: String,
-    revoked_at: DateTime<Utc>,
+    public_key_fingerprint: String,
+    terminal_state: KeyTerminalState,
+    terminated_at: DateTime<Utc>,
+    signatures_valid_before: Option<DateTime<Utc>>,
     reason: String,
     superseded_by_key_id: Option<String>,
     trust_policy_version: u64,
+    subsequent_revocation: Option<SubsequentRevocation>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SubsequentRevocation {
+    revoked_at: DateTime<Utc>,
+    reason: String,
+    trust_policy_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum KeyTerminalState {
+    Retired,
+    Revoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,17 +307,33 @@ struct TrustedKey {
     verifying_key: VerifyingKey,
 }
 
-/// A registry whose identity and raw-byte digest were independently pinned by
-/// its caller. Construction validates every security-relevant registry field.
 #[derive(Debug, Clone)]
-pub struct ConformanceTrustStore {
-    registry_id: String,
-    registry_version: u64,
+struct TrustedRegistrySnapshot {
     registry_digest: String,
     effective_at: DateTime<Utc>,
+    authority_until: Option<DateTime<Utc>>,
     deployment_ids: BTreeSet<String>,
     trust_domain_ids: BTreeSet<String>,
     keys: BTreeMap<String, TrustedKey>,
+}
+
+#[derive(Debug)]
+struct ParsedRegistryArtifact {
+    artifact_locator: String,
+    raw_digest: String,
+    registry: TrustRegistryDocument,
+}
+
+/// An independently pinned, append-only trust-registry lineage.
+///
+/// Historic snapshots are retained only to validate lineage. Until trusted
+/// acceptance-time evidence exists, documents must name the current head.
+#[derive(Debug, Clone)]
+pub struct ConformanceTrustStore {
+    registry_id: String,
+    current_registry_version: u64,
+    snapshots: BTreeMap<u64, TrustedRegistrySnapshot>,
+    terminal_keys: BTreeMap<String, KeyTombstone>,
 }
 
 /// Proof that one exact conformance document passed registry, scope, lifetime,
@@ -333,209 +399,306 @@ impl VerifiedConformanceDocument {
 }
 
 impl ConformanceTrustStore {
-    pub fn from_bytes(
-        bytes: &[u8],
-        expected_registry_id: &str,
-        expected_registry_version: u64,
-        expected_registry_digest: &str,
+    pub fn from_registry_chain(
+        oldest_to_current: &[ConformanceRegistryArtifact<'_>],
+        anchor: ConformanceTrustAnchor<'_>,
         now: DateTime<Utc>,
     ) -> Result<Self, ConformanceTrustError> {
-        require_digest(expected_registry_digest, "registry pin")?;
-        if sha256_digest(bytes) != expected_registry_digest {
-            return Err(invalid(
-                "registry raw bytes do not match the independent digest pin",
-            ));
+        if oldest_to_current.is_empty() || oldest_to_current.len() > MAX_REGISTRY_LINEAGE {
+            return Err(invalid(format!(
+                "registry lineage must contain 1..={MAX_REGISTRY_LINEAGE} artifacts"
+            )));
         }
-        let value = parse_json_strict(bytes)?;
-        Self::from_value(
-            &value,
-            expected_registry_id,
-            expected_registry_version,
-            expected_registry_digest,
-            now,
-        )
-    }
-
-    fn from_value(
-        value: &Value,
-        expected_registry_id: &str,
-        expected_registry_version: u64,
-        expected_registry_digest: &str,
-        now: DateTime<Utc>,
-    ) -> Result<Self, ConformanceTrustError> {
-        canonical_json_bytes(value)?;
-        require_digest(expected_registry_digest, "registry pin")?;
-        let registry: TrustRegistryDocument = serde_json::from_value(value.clone())
-            .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?;
-
-        if registry.schema_uri != TRUST_REGISTRY_SCHEMA_URI
-            || registry.schema_version != TRUST_REGISTRY_SCHEMA_VERSION
-            || registry.contract_kind != TRUST_REGISTRY_CONTRACT_KIND
+        require_digest(anchor.content_digest, "registry anchor digest")?;
+        if !valid_artifact_locator(anchor.artifact_locator)
+            || !valid_scoped_id(anchor.document_id, "conformance-trust-root-registry:")
+            || anchor.document_version == 0
         {
-            return Err(invalid("unsupported registry schema, kind, or version"));
-        }
-        if registry.document_id != expected_registry_id
-            || registry.document_version != expected_registry_version
-            || registry.document_version == 0
-        {
-            return Err(invalid(
-                "registry identity/version does not match its independent pin",
-            ));
-        }
-        if registry.acceptance_status != RegistryAcceptanceStatus::ProductionAccepted
-            || !registry.production_accepted
-            || registry.lifecycle.state != RegistryLifecycleState::Active
-            || registry.lifecycle.effective_at > now
-        {
-            return Err(invalid(
-                "registry is not active production-accepted authority",
-            ));
-        }
-        if registry.trust_policy_version == 0
-            || registry.applicability.evaluation_scope != "deployment"
-            || !registry
-                .applicability
-                .security_profiles
-                .contains(&SecurityProfile::Production)
-            || registry.canonicalization_profiles.as_slice() != [CANONICALIZATION_PROFILE]
-            || registry.signature_algorithms.as_slice() != [SIGNATURE_ALGORITHM]
-        {
-            return Err(invalid(
-                "registry policy, applicability, or crypto profile is not closed",
-            ));
-        }
-        require_unique(
-            &registry.applicability.security_profiles,
-            "security profiles",
-        )?;
-        require_unique(
-            &registry.applicability.deployment_ids,
-            "registry deployments",
-        )?;
-        require_unique(
-            &registry.applicability.trust_domain_ids,
-            "registry trust domains",
-        )?;
-        if registry.applicability.deployment_ids.is_empty()
-            || registry.applicability.trust_domain_ids.is_empty()
-            || registry.keys.is_empty()
-        {
-            return Err(invalid(
-                "registry authority scopes and keys must be non-empty",
-            ));
+            return Err(invalid("invalid independent registry anchor"));
         }
 
-        let deployment_ids = registry
-            .applicability
-            .deployment_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let trust_domain_ids = registry
-            .applicability
-            .trust_domain_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut tombstones = BTreeMap::new();
-        for tombstone in &registry.key_tombstones {
-            validate_tombstone(tombstone, registry.trust_policy_version, now)?;
-            if tombstones
-                .insert(tombstone.key_id.clone(), tombstone.clone())
-                .is_some()
+        let mut seen_locators = BTreeSet::new();
+        let mut parsed = Vec::with_capacity(oldest_to_current.len());
+        for artifact in oldest_to_current {
+            if !valid_artifact_locator(artifact.artifact_locator)
+                || !seen_locators.insert(artifact.artifact_locator.to_owned())
+                || artifact.raw_bytes.is_empty()
+                || artifact.raw_bytes.len() > MAX_REGISTRY_BYTES
             {
-                return Err(invalid("duplicate tombstoned key id"));
+                return Err(invalid(
+                    "invalid, duplicate, empty, or oversized registry artifact",
+                ));
             }
+            let raw_digest = sha256_digest(artifact.raw_bytes);
+            let value = parse_json_strict(artifact.raw_bytes)?;
+            validate_json_shape(&value, 0)?;
+            canonical_json_bytes(&value)?;
+            validate_required_nullable_fields(&value)?;
+            let registry: TrustRegistryDocument = serde_json::from_value(value)
+                .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?;
+            validate_registry_contract(&registry, now)?;
+            parsed.push(ParsedRegistryArtifact {
+                artifact_locator: artifact.artifact_locator.to_owned(),
+                raw_digest,
+                registry,
+            });
         }
 
-        let mut keys = BTreeMap::new();
-        let mut public_key_material = BTreeSet::new();
-        for metadata in registry.keys {
-            validate_key_metadata(&metadata, now)?;
-            if tombstones.contains_key(&metadata.key_id) {
-                return Err(invalid("live and tombstoned key ids overlap"));
-            }
-            if metadata
-                .deployment_ids
-                .iter()
-                .any(|id| !deployment_ids.contains(id))
-                || metadata
-                    .trust_domain_ids
-                    .iter()
-                    .any(|id| !trust_domain_ids.contains(id))
-            {
-                return Err(invalid("key scope exceeds registry applicability"));
-            }
-            let public_key =
-                decode_canonical_base64::<32>(&metadata.public_key_base64, "public key")?;
-            if !public_key_material.insert(public_key) {
-                return Err(invalid("duplicate Ed25519 public-key material"));
-            }
-            let verifying_key = VerifyingKey::from_bytes(&public_key)
-                .map_err(|_| invalid("invalid Ed25519 public key"))?;
-            let key_id = metadata.key_id.clone();
-            if keys
-                .insert(
-                    key_id,
-                    TrustedKey {
-                        metadata,
-                        verifying_key,
-                    },
-                )
-                .is_some()
-            {
-                return Err(invalid("duplicate verification key id"));
-            }
+        let head = parsed.last().expect("non-empty lineage checked above");
+        if head.artifact_locator != anchor.artifact_locator
+            || head.registry.document_id != anchor.document_id
+            || head.registry.document_version != anchor.document_version
+            || head.raw_digest != anchor.content_digest
+        {
+            return Err(invalid(
+                "registry head does not match its independent locator/id/version/digest anchor",
+            ));
         }
 
-        let mut supersession_edges = BTreeMap::new();
-        for key in keys.values() {
-            if let Some(predecessor) = &key.metadata.supersedes_key_id {
-                if predecessor == &key.metadata.key_id
-                    || (!keys.contains_key(predecessor) && !tombstones.contains_key(predecessor))
-                {
-                    return Err(invalid("key supersession target is self or unknown"));
+        let registry_id = parsed[0].registry.document_id.clone();
+        let mut id_to_fingerprint = BTreeMap::<String, String>::new();
+        let mut fingerprint_to_id = BTreeMap::<String, String>::new();
+        let mut historic_keys = BTreeMap::<String, VerificationKeyMetadata>::new();
+        let mut supersession_edges = BTreeMap::<String, String>::new();
+        let mut previous_live = BTreeMap::<String, VerificationKeyMetadata>::new();
+        let mut previous_tombstones = BTreeMap::<String, KeyTombstone>::new();
+        let mut snapshots = BTreeMap::new();
+
+        for (index, artifact) in parsed.iter().enumerate() {
+            let registry = &artifact.registry;
+            let expected_version = u64::try_from(index + 1)
+                .map_err(|_| invalid("registry lineage version overflow"))?;
+            if registry.document_id != registry_id || registry.document_version != expected_version
+            {
+                return Err(invalid(
+                    "registry lineage must keep one id and start at version 1 without gaps",
+                ));
+            }
+            match (index, &registry.predecessor_registry_ref) {
+                (0, None) => {}
+                (0, Some(_)) => {
+                    return Err(invalid("registry version 1 must not have a predecessor"));
                 }
-                if let Some(target) = keys.get(predecessor)
-                    && (target.metadata.signer_identity != key.metadata.signer_identity
-                        || target.metadata.algorithm != key.metadata.algorithm
-                        || target.metadata.valid_from >= key.metadata.valid_from)
-                {
+                (_, None) => {
+                    return Err(invalid("registry version after 1 requires a predecessor"));
+                }
+                (_, Some(reference)) => {
+                    let prior = &parsed[index - 1];
+                    if reference.artifact_kind != TRUST_REGISTRY_CONTRACT_KIND
+                        || reference.document_id != prior.registry.document_id
+                        || reference.document_version != prior.registry.document_version
+                        || reference.content_digest != prior.raw_digest
+                        || reference.artifact_locator != prior.artifact_locator
+                    {
+                        return Err(invalid(
+                            "registry predecessor reference is not the exact prior artifact",
+                        ));
+                    }
+                }
+            }
+
+            if index > 0 {
+                let prior = &parsed[index - 1].registry;
+                if registry.lifecycle.effective_at <= prior.lifecycle.effective_at {
+                    return Err(invalid("registry effective_at must strictly increase"));
+                }
+                if registry.applicability != prior.applicability {
                     return Err(invalid(
-                        "key supersession changes identity/algorithm or is not monotonic",
+                        "registry applicability cannot change within one approved lineage",
                     ));
                 }
-                if let Some(target) = tombstones.get(predecessor)
-                    && (target.signer_identity != key.metadata.signer_identity
-                        || target.algorithm != key.metadata.algorithm)
+                validate_registry_lifecycle_transition(
+                    prior.lifecycle.state,
+                    registry.lifecycle.state,
+                )?;
+                if registry.trust_policy_version < prior.trust_policy_version
+                    || prior
+                        .trust_policy_version
+                        .checked_add(1)
+                        .is_none_or(|maximum| registry.trust_policy_version > maximum)
                 {
-                    return Err(invalid("key supersession changes identity or algorithm"));
+                    return Err(invalid(
+                        "trust policy version must be monotonic and advance by at most one",
+                    ));
                 }
-                supersession_edges.insert(key.metadata.key_id.clone(), predecessor.clone());
-            }
-        }
-        require_acyclic_supersession(&supersession_edges)?;
-        for tombstone in &registry.key_tombstones {
-            if let Some(successor) = &tombstone.superseded_by_key_id {
-                if successor == &tombstone.key_id || !keys.contains_key(successor) {
-                    return Err(invalid("tombstone successor is self or unknown"));
-                }
-                let successor = &keys[successor].metadata;
-                if successor.signer_identity != tombstone.signer_identity
-                    || successor.algorithm != tombstone.algorithm
+                if registry.trust_policy_version == prior.trust_policy_version
+                    && authority_projection_changed(prior, registry)
                 {
-                    return Err(invalid("tombstone successor changes identity or algorithm"));
+                    return Err(invalid(
+                        "authority changed without advancing trust policy version",
+                    ));
                 }
             }
+
+            let deployment_ids = registry
+                .applicability
+                .deployment_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let trust_domain_ids = registry
+                .applicability
+                .trust_domain_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut live = BTreeMap::<String, VerificationKeyMetadata>::new();
+            let mut trusted_keys = BTreeMap::new();
+            let mut live_fingerprints = BTreeSet::new();
+            for metadata in &registry.keys {
+                validate_key_metadata(metadata)?;
+                if metadata
+                    .deployment_ids
+                    .iter()
+                    .any(|id| !deployment_ids.contains(id))
+                    || metadata
+                        .trust_domain_ids
+                        .iter()
+                        .any(|id| !trust_domain_ids.contains(id))
+                {
+                    return Err(invalid("key scope exceeds registry applicability"));
+                }
+                let public_key =
+                    decode_canonical_base64::<32>(&metadata.public_key_base64, "public key")?;
+                let fingerprint = sha256_digest(&public_key);
+                if metadata.public_key_fingerprint != fingerprint {
+                    return Err(invalid(
+                        "public-key fingerprint does not match decoded key bytes",
+                    ));
+                }
+                if live.contains_key(&metadata.key_id)
+                    || !live_fingerprints.insert(fingerprint.clone())
+                {
+                    return Err(invalid("duplicate live key id or fingerprint"));
+                }
+                if let Some(prior) = previous_live.get(&metadata.key_id) {
+                    if !same_key_authority(prior, metadata) {
+                        return Err(invalid("recurring key metadata was relabelled or changed"));
+                    }
+                    validate_key_lifecycle_transition(prior.lifecycle, metadata.lifecycle)?;
+                } else {
+                    if previous_tombstones.contains_key(&metadata.key_id)
+                        || id_to_fingerprint.contains_key(&metadata.key_id)
+                        || fingerprint_to_id.contains_key(&fingerprint)
+                    {
+                        return Err(invalid("historic key id or key material was reused"));
+                    }
+                    if metadata.valid_from < registry.lifecycle.effective_at {
+                        return Err(invalid(
+                            "new key valid_from predates its introducing registry",
+                        ));
+                    }
+                }
+                bind_key_identity(
+                    &mut id_to_fingerprint,
+                    &mut fingerprint_to_id,
+                    &metadata.key_id,
+                    &fingerprint,
+                )?;
+                historic_keys
+                    .entry(metadata.key_id.clone())
+                    .or_insert_with(|| metadata.clone());
+                if let Some(predecessor) = &metadata.supersedes_key_id {
+                    supersession_edges.insert(metadata.key_id.clone(), predecessor.clone());
+                }
+                let verifying_key = VerifyingKey::from_bytes(&public_key)
+                    .map_err(|_| invalid("invalid Ed25519 public key"))?;
+                live.insert(metadata.key_id.clone(), metadata.clone());
+                trusted_keys.insert(
+                    metadata.key_id.clone(),
+                    TrustedKey {
+                        metadata: metadata.clone(),
+                        verifying_key,
+                    },
+                );
+            }
+
+            let mut tombstones = BTreeMap::<String, KeyTombstone>::new();
+            let mut tombstone_fingerprints = BTreeSet::new();
+            for tombstone in &registry.key_tombstones {
+                validate_tombstone_shape(tombstone, registry.trust_policy_version)?;
+                if tombstones.contains_key(&tombstone.key_id)
+                    || !tombstone_fingerprints.insert(tombstone.public_key_fingerprint.clone())
+                    || live.contains_key(&tombstone.key_id)
+                    || live_fingerprints.contains(&tombstone.public_key_fingerprint)
+                {
+                    return Err(invalid("duplicate or overlapping live/tombstoned key"));
+                }
+                let original = historic_keys
+                    .get(&tombstone.key_id)
+                    .ok_or_else(|| invalid("tombstone does not identify a previously live key"))?;
+                validate_tombstone_against_key(
+                    tombstone,
+                    original,
+                    registry.lifecycle.effective_at,
+                )?;
+                bind_key_identity(
+                    &mut id_to_fingerprint,
+                    &mut fingerprint_to_id,
+                    &tombstone.key_id,
+                    &tombstone.public_key_fingerprint,
+                )?;
+                tombstones.insert(tombstone.key_id.clone(), tombstone.clone());
+            }
+
+            if index == 0 && !tombstones.is_empty() {
+                return Err(invalid(
+                    "genesis registry cannot contain historic tombstones",
+                ));
+            }
+            for (key_id, prior_tombstone) in &previous_tombstones {
+                let current = tombstones
+                    .get(key_id)
+                    .ok_or_else(|| invalid("prior tombstone was dropped"))?;
+                if current != prior_tombstone
+                    && !valid_retired_to_revoked_transition(prior_tombstone, current)
+                {
+                    return Err(invalid("prior tombstone was mutated or weakened"));
+                }
+            }
+            for (key_id, prior_key) in &previous_live {
+                if live.contains_key(key_id) {
+                    continue;
+                }
+                let tombstone = tombstones.get(key_id).ok_or_else(|| {
+                    invalid("live key disappeared without an immediate tombstone")
+                })?;
+                if tombstone.signer_identity != prior_key.signer_identity
+                    || tombstone.algorithm != prior_key.algorithm
+                    || tombstone.public_key_fingerprint != prior_key.public_key_fingerprint
+                    || tombstone.trust_policy_version != registry.trust_policy_version
+                    || tombstone.subsequent_revocation.is_some()
+                {
+                    return Err(invalid(
+                        "new tombstone does not exactly terminate the prior key",
+                    ));
+                }
+            }
+
+            validate_supersession(&live, &tombstones, &historic_keys, &supersession_edges)?;
+
+            snapshots.insert(
+                registry.document_version,
+                TrustedRegistrySnapshot {
+                    registry_digest: artifact.raw_digest.clone(),
+                    effective_at: registry.lifecycle.effective_at,
+                    authority_until: parsed
+                        .get(index + 1)
+                        .map(|next| next.registry.lifecycle.effective_at),
+                    deployment_ids,
+                    trust_domain_ids,
+                    keys: trusted_keys,
+                },
+            );
+            previous_live = live;
+            previous_tombstones = tombstones;
         }
+
         Ok(Self {
-            registry_id: registry.document_id,
-            registry_version: registry.document_version,
-            registry_digest: expected_registry_digest.to_owned(),
-            effective_at: registry.lifecycle.effective_at,
-            deployment_ids,
-            trust_domain_ids,
-            keys,
+            registry_id,
+            current_registry_version: anchor.document_version,
+            snapshots,
+            terminal_keys: previous_tombstones,
         })
     }
 
@@ -545,14 +708,6 @@ impl ConformanceTrustStore {
         context: ConformanceVerificationContext<'_>,
         now: DateTime<Utc>,
     ) -> Result<VerifiedConformanceDocument, ConformanceTrustError> {
-        if self.effective_at > now
-            || !self.deployment_ids.contains(context.deployment_id)
-            || !self.trust_domain_ids.contains(context.trust_domain_id)
-        {
-            return Err(ConformanceTrustError::ScopeMismatch(
-                "registry is not current/applicable to deployment and trust domain".into(),
-            ));
-        }
         let identity = document_identity(document)?;
         require_document_scope(document, identity.kind, context)?;
         let signer_value = document
@@ -561,23 +716,49 @@ impl ConformanceTrustStore {
         let signer: ConformanceSignatureMetadata = serde_json::from_value(signer_value.clone())
             .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?;
         validate_signature_contract(&signer, identity.kind)?;
-        if signer.trust_registry_id != self.registry_id
-            || signer.trust_registry_version != self.registry_version
-            || signer.trust_registry_digest != self.registry_digest
+        if signer.trust_registry_version != self.current_registry_version {
+            return Err(ConformanceTrustError::KeyNotAuthorized(
+                "historic registry signatures require trusted acceptance-time evidence".into(),
+            ));
+        }
+        let snapshot = self
+            .snapshots
+            .get(&signer.trust_registry_version)
+            .filter(|snapshot| {
+                signer.trust_registry_id == self.registry_id
+                    && signer.trust_registry_digest == snapshot.registry_digest
+            })
+            .ok_or_else(|| {
+                ConformanceTrustError::ScopeMismatch(
+                    "signer registry identity/version/digest is not in the pinned lineage".into(),
+                )
+            })?;
+        if !snapshot.deployment_ids.contains(context.deployment_id)
+            || !snapshot.trust_domain_ids.contains(context.trust_domain_id)
         {
             return Err(ConformanceTrustError::ScopeMismatch(
-                "signer registry identity/version/digest is not the independent pin".into(),
+                "selected registry is not applicable to deployment and trust domain".into(),
             ));
         }
-        if signer.signed_at < self.effective_at || signer.signed_at > now {
+        if signer.signed_at < snapshot.effective_at
+            || snapshot
+                .authority_until
+                .is_some_and(|until| signer.signed_at >= until)
+            || signer.signed_at > now
+        {
             return Err(ConformanceTrustError::KeyNotAuthorized(
-                "signature timestamp predates the registry or is in the future".into(),
+                "signature timestamp is outside the selected registry authority interval".into(),
             ));
         }
-        let key = self
+        let key = snapshot
             .keys
             .get(&signer.key_id)
             .ok_or_else(|| ConformanceTrustError::UnknownKey(signer.key_id.clone()))?;
+        if self.terminal_keys.contains_key(&signer.key_id) {
+            return Err(ConformanceTrustError::KeyNotAuthorized(
+                "terminal key history cannot authorize a current document".into(),
+            ));
+        }
         authorize_key(key, &signer, context, now)?;
 
         let prepared = prepare_signed_subject(document)?;
@@ -596,8 +777,8 @@ impl ConformanceTrustStore {
             document_version: identity.version,
             key_id: signer.key_id,
             registry_id: self.registry_id.clone(),
-            registry_version: self.registry_version,
-            registry_digest: self.registry_digest.clone(),
+            registry_version: signer.trust_registry_version,
+            registry_digest: signer.trust_registry_digest,
             signed_subject_digest: prepared.digest,
             signed_at: signer.signed_at,
             deployment_id: context.deployment_id.to_owned(),
@@ -711,6 +892,32 @@ fn parse_json_strict(bytes: &[u8]) -> Result<Value, ConformanceTrustError> {
         .end()
         .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?;
     Ok(value)
+}
+
+fn validate_json_shape(value: &Value, depth: usize) -> Result<(), ConformanceTrustError> {
+    if depth > 64 {
+        return Err(invalid("registry JSON exceeds maximum nesting depth"));
+    }
+    match value {
+        Value::Array(values) => {
+            if values.len() > MAX_TOMBSTONES_PER_REGISTRY {
+                return Err(invalid("registry JSON array exceeds maximum length"));
+            }
+            for value in values {
+                validate_json_shape(value, depth + 1)?;
+            }
+        }
+        Value::Object(values) => {
+            if values.len() > MAX_SCOPE_ITEMS {
+                return Err(invalid("registry JSON object exceeds maximum field count"));
+            }
+            for value in values.values() {
+                validate_json_shape(value, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Canonical JSON bytes for `ryuki-canonical-json-v1`.
@@ -903,10 +1110,7 @@ fn authorize_key(
             "identity, purpose, tier, package, deployment, or trust domain".into(),
         ));
     }
-    if !matches!(
-        metadata.lifecycle,
-        KeyLifecycle::Active | KeyLifecycle::Overlap
-    ) || metadata.revoked_at.is_some()
+    if metadata.lifecycle != KeyLifecycle::Active
         || signer.signed_at < metadata.valid_from
         || signer.signed_at >= metadata.valid_until
         || now < metadata.valid_from
@@ -919,13 +1123,88 @@ fn authorize_key(
     Ok(())
 }
 
-fn validate_key_metadata(
-    key: &VerificationKeyMetadata,
+fn validate_registry_contract(
+    registry: &TrustRegistryDocument,
     now: DateTime<Utc>,
 ) -> Result<(), ConformanceTrustError> {
+    if registry.schema_uri != TRUST_REGISTRY_SCHEMA_URI
+        || registry.schema_version != TRUST_REGISTRY_SCHEMA_VERSION
+        || registry.contract_kind != TRUST_REGISTRY_CONTRACT_KIND
+        || !valid_scoped_id(&registry.document_id, "conformance-trust-root-registry:")
+        || registry.document_version == 0
+    {
+        return Err(invalid("unsupported registry schema, kind, id, or version"));
+    }
+    if registry.acceptance_status != RegistryAcceptanceStatus::ProductionAccepted
+        || !registry.production_accepted
+        || registry.lifecycle.state != RegistryLifecycleState::Active
+        || registry.lifecycle.effective_at > now
+    {
+        return Err(invalid(
+            "every lineage snapshot must be active production-accepted authority",
+        ));
+    }
+    if registry.trust_policy_version == 0
+        || registry.applicability.evaluation_scope != "deployment"
+        || !registry
+            .applicability
+            .security_profiles
+            .contains(&SecurityProfile::Production)
+        || registry.canonicalization_profiles.as_slice() != [CANONICALIZATION_PROFILE]
+        || registry.signature_algorithms.as_slice() != [SIGNATURE_ALGORITHM]
+    {
+        return Err(invalid(
+            "registry policy, applicability, or crypto profile is not closed",
+        ));
+    }
+    if registry.keys.is_empty()
+        || registry.keys.len() > MAX_KEYS_PER_REGISTRY
+        || !registry
+            .keys
+            .iter()
+            .any(|key| key.lifecycle == KeyLifecycle::Active)
+        || registry.key_tombstones.len() > MAX_TOMBSTONES_PER_REGISTRY
+        || registry.applicability.security_profiles.len() > 3
+        || registry.applicability.deployment_ids.is_empty()
+        || registry.applicability.deployment_ids.len() > MAX_SCOPE_ITEMS
+        || registry.applicability.trust_domain_ids.is_empty()
+        || registry.applicability.trust_domain_ids.len() > MAX_SCOPE_ITEMS
+        || registry.canonicalization_profiles.len() > MAX_SCOPE_ITEMS
+        || registry.signature_algorithms.len() > MAX_SCOPE_ITEMS
+    {
+        return Err(invalid(
+            "registry collection is empty or exceeds a hard bound",
+        ));
+    }
+    require_unique(
+        &registry.applicability.security_profiles,
+        "security profiles",
+    )?;
+    require_unique(
+        &registry.applicability.deployment_ids,
+        "registry deployments",
+    )?;
+    require_unique(
+        &registry.applicability.trust_domain_ids,
+        "registry trust domains",
+    )?;
+    if let Some(reference) = &registry.predecessor_registry_ref
+        && (reference.artifact_kind != TRUST_REGISTRY_CONTRACT_KIND
+            || !valid_scoped_id(&reference.document_id, "conformance-trust-root-registry:")
+            || reference.document_version == 0
+            || !is_digest(&reference.content_digest)
+            || !valid_artifact_locator(&reference.artifact_locator))
+    {
+        return Err(invalid("invalid predecessor registry reference"));
+    }
+    Ok(())
+}
+
+fn validate_key_metadata(key: &VerificationKeyMetadata) -> Result<(), ConformanceTrustError> {
     if !valid_scoped_id(&key.key_id, "conformance-key:")
         || key.signer_identity.is_empty()
         || key.algorithm != SIGNATURE_ALGORITHM
+        || !is_digest(&key.public_key_fingerprint)
         || key.valid_from >= key.valid_until
         || key.allowed_purposes.is_empty()
         || key.allowed_evidence_tiers.is_empty()
@@ -934,6 +1213,14 @@ fn validate_key_metadata(
         || key.trust_domain_ids.is_empty()
     {
         return Err(invalid("invalid verification-key metadata"));
+    }
+    if key.allowed_purposes.len() > 2
+        || key.allowed_evidence_tiers.len() > 3
+        || key.allowed_package_ids.len() > 10
+        || key.deployment_ids.len() > MAX_SCOPE_ITEMS
+        || key.trust_domain_ids.len() > MAX_SCOPE_ITEMS
+    {
+        return Err(invalid("verification-key scope exceeds a hard bound"));
     }
     require_unique(&key.allowed_purposes, "key purposes")?;
     require_unique(&key.allowed_evidence_tiers, "key evidence tiers")?;
@@ -947,37 +1234,311 @@ fn validate_key_metadata(
     {
         return Err(invalid("unknown package id in key scope"));
     }
-    match key.lifecycle {
-        KeyLifecycle::Revoked => {
-            if key.revoked_at.is_none_or(|revoked_at| {
-                revoked_at > now || revoked_at < key.valid_from || revoked_at > key.valid_until
-            }) {
-                return Err(invalid("revoked key requires an effective revoked_at"));
-            }
-        }
-        _ if key.revoked_at.is_some() => {
-            return Err(invalid("non-revoked key cannot carry revoked_at"));
-        }
-        _ => {}
-    }
     Ok(())
 }
 
-fn validate_tombstone(
+fn validate_tombstone_shape(
     tombstone: &KeyTombstone,
     trust_policy_version: u64,
-    now: DateTime<Utc>,
 ) -> Result<(), ConformanceTrustError> {
     if !valid_scoped_id(&tombstone.key_id, "conformance-key:")
         || tombstone.signer_identity.is_empty()
         || tombstone.algorithm != SIGNATURE_ALGORITHM
-        || tombstone.revoked_at > now
+        || !is_digest(&tombstone.public_key_fingerprint)
         || !(16..=1000).contains(&tombstone.reason.chars().count())
         || tombstone.trust_policy_version == 0
         || tombstone.trust_policy_version > trust_policy_version
         || tombstone.superseded_by_key_id.as_deref() == Some(tombstone.key_id.as_str())
     {
         return Err(invalid("invalid key tombstone"));
+    }
+    match tombstone.terminal_state {
+        KeyTerminalState::Retired => {
+            if tombstone.signatures_valid_before.is_none() {
+                return Err(invalid("retired tombstone requires a signature cutoff"));
+            }
+        }
+        KeyTerminalState::Revoked => {
+            if tombstone.signatures_valid_before.is_some()
+                || tombstone.subsequent_revocation.is_some()
+            {
+                return Err(invalid(
+                    "direct revocation cannot preserve a cutoff or carry an overlay",
+                ));
+            }
+        }
+    }
+    if let Some(revocation) = &tombstone.subsequent_revocation
+        && (!(16..=1000).contains(&revocation.reason.chars().count())
+            || revocation.trust_policy_version <= tombstone.trust_policy_version
+            || revocation.trust_policy_version > trust_policy_version
+            || revocation.revoked_at < tombstone.terminated_at)
+    {
+        return Err(invalid("invalid subsequent key revocation"));
+    }
+    Ok(())
+}
+
+fn validate_tombstone_against_key(
+    tombstone: &KeyTombstone,
+    key: &VerificationKeyMetadata,
+    registry_effective_at: DateTime<Utc>,
+) -> Result<(), ConformanceTrustError> {
+    if tombstone.signer_identity != key.signer_identity
+        || tombstone.algorithm != key.algorithm
+        || tombstone.public_key_fingerprint != key.public_key_fingerprint
+        || tombstone.terminated_at > registry_effective_at
+        || tombstone
+            .subsequent_revocation
+            .as_ref()
+            .is_some_and(|revocation| revocation.revoked_at > registry_effective_at)
+    {
+        return Err(invalid(
+            "tombstone does not match its historic key or transition time",
+        ));
+    }
+    match tombstone.terminal_state {
+        KeyTerminalState::Retired => {
+            let cutoff = tombstone
+                .signatures_valid_before
+                .ok_or_else(|| invalid("retired key is missing its signature cutoff"))?;
+            if cutoff != tombstone.terminated_at
+                || cutoff < key.valid_from
+                || cutoff > key.valid_until
+            {
+                return Err(invalid("retired signature cutoff is outside key validity"));
+            }
+        }
+        KeyTerminalState::Revoked => {
+            if tombstone.terminated_at < key.valid_from || tombstone.terminated_at > key.valid_until
+            {
+                return Err(invalid("direct revocation is outside key validity"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_registry_lifecycle_transition(
+    prior: RegistryLifecycleState,
+    current: RegistryLifecycleState,
+) -> Result<(), ConformanceTrustError> {
+    let allowed = matches!(
+        (prior, current),
+        (
+            RegistryLifecycleState::ImplementationOnly,
+            RegistryLifecycleState::ImplementationOnly | RegistryLifecycleState::Candidate
+        ) | (
+            RegistryLifecycleState::Candidate,
+            RegistryLifecycleState::Candidate | RegistryLifecycleState::Active
+        ) | (
+            RegistryLifecycleState::Active,
+            RegistryLifecycleState::Active
+                | RegistryLifecycleState::Deprecated
+                | RegistryLifecycleState::Retired
+        ) | (
+            RegistryLifecycleState::Deprecated,
+            RegistryLifecycleState::Deprecated | RegistryLifecycleState::Retired
+        ) | (
+            RegistryLifecycleState::Retired,
+            RegistryLifecycleState::Retired
+        )
+    );
+    if allowed {
+        Ok(())
+    } else {
+        Err(invalid("forbidden registry lifecycle transition"))
+    }
+}
+
+fn validate_key_lifecycle_transition(
+    prior: KeyLifecycle,
+    current: KeyLifecycle,
+) -> Result<(), ConformanceTrustError> {
+    if matches!(
+        (prior, current),
+        (
+            KeyLifecycle::Active,
+            KeyLifecycle::Active | KeyLifecycle::Overlap
+        ) | (KeyLifecycle::Overlap, KeyLifecycle::Overlap)
+    ) {
+        Ok(())
+    } else {
+        Err(invalid("forbidden key lifecycle transition"))
+    }
+}
+
+fn authority_projection_changed(
+    prior: &TrustRegistryDocument,
+    current: &TrustRegistryDocument,
+) -> bool {
+    prior.applicability != current.applicability
+        || prior.canonicalization_profiles != current.canonicalization_profiles
+        || prior.signature_algorithms != current.signature_algorithms
+        || prior.keys != current.keys
+        || prior.key_tombstones != current.key_tombstones
+}
+
+fn same_key_authority(prior: &VerificationKeyMetadata, current: &VerificationKeyMetadata) -> bool {
+    prior.key_id == current.key_id
+        && prior.signer_identity == current.signer_identity
+        && prior.algorithm == current.algorithm
+        && prior.public_key_base64 == current.public_key_base64
+        && prior.public_key_fingerprint == current.public_key_fingerprint
+        && prior.allowed_purposes == current.allowed_purposes
+        && prior.allowed_evidence_tiers == current.allowed_evidence_tiers
+        && prior.allowed_package_ids == current.allowed_package_ids
+        && prior.deployment_ids == current.deployment_ids
+        && prior.trust_domain_ids == current.trust_domain_ids
+        && prior.valid_from == current.valid_from
+        && prior.valid_until == current.valid_until
+        && prior.supersedes_key_id == current.supersedes_key_id
+}
+
+fn bind_key_identity(
+    id_to_fingerprint: &mut BTreeMap<String, String>,
+    fingerprint_to_id: &mut BTreeMap<String, String>,
+    key_id: &str,
+    fingerprint: &str,
+) -> Result<(), ConformanceTrustError> {
+    if id_to_fingerprint
+        .get(key_id)
+        .is_some_and(|known| known != fingerprint)
+        || fingerprint_to_id
+            .get(fingerprint)
+            .is_some_and(|known| known != key_id)
+    {
+        return Err(invalid(
+            "key id and public-key fingerprint are not a stable bijection",
+        ));
+    }
+    id_to_fingerprint
+        .entry(key_id.to_owned())
+        .or_insert_with(|| fingerprint.to_owned());
+    fingerprint_to_id
+        .entry(fingerprint.to_owned())
+        .or_insert_with(|| key_id.to_owned());
+    Ok(())
+}
+
+fn valid_retired_to_revoked_transition(prior: &KeyTombstone, current: &KeyTombstone) -> bool {
+    prior.terminal_state == KeyTerminalState::Retired
+        && current.terminal_state == KeyTerminalState::Retired
+        && prior.subsequent_revocation.is_none()
+        && current.subsequent_revocation.is_some()
+        && prior.key_id == current.key_id
+        && prior.signer_identity == current.signer_identity
+        && prior.algorithm == current.algorithm
+        && prior.public_key_fingerprint == current.public_key_fingerprint
+        && prior.terminated_at == current.terminated_at
+        && prior.signatures_valid_before == current.signatures_valid_before
+        && prior.reason == current.reason
+        && prior.superseded_by_key_id == current.superseded_by_key_id
+        && prior.trust_policy_version == current.trust_policy_version
+}
+
+fn validate_supersession(
+    live: &BTreeMap<String, VerificationKeyMetadata>,
+    tombstones: &BTreeMap<String, KeyTombstone>,
+    historic_keys: &BTreeMap<String, VerificationKeyMetadata>,
+    edges: &BTreeMap<String, String>,
+) -> Result<(), ConformanceTrustError> {
+    let mut live_successors = BTreeMap::<String, String>::new();
+    for key in live.values() {
+        let Some(predecessor_id) = &key.supersedes_key_id else {
+            continue;
+        };
+        if key.lifecycle != KeyLifecycle::Active {
+            return Err(invalid("a superseding key must be active"));
+        }
+        if live_successors
+            .insert(predecessor_id.clone(), key.key_id.clone())
+            .is_some()
+        {
+            return Err(invalid("a live key cannot have multiple live successors"));
+        }
+        let predecessor = historic_keys
+            .get(predecessor_id)
+            .ok_or_else(|| invalid("key supersession target is unknown"))?;
+        if predecessor_id == &key.key_id
+            || predecessor.signer_identity != key.signer_identity
+            || predecessor.algorithm != key.algorithm
+            || predecessor.public_key_fingerprint == key.public_key_fingerprint
+            || predecessor.valid_from >= key.valid_from
+        {
+            return Err(invalid(
+                "key supersession is self-referential, relabelled, or non-monotonic",
+            ));
+        }
+        if live
+            .get(predecessor_id)
+            .is_some_and(|predecessor| predecessor.lifecycle != KeyLifecycle::Overlap)
+        {
+            return Err(invalid(
+                "a live supersession target must be verification-only overlap",
+            ));
+        }
+        if let Some(tombstone) = tombstones.get(predecessor_id)
+            && tombstone.superseded_by_key_id.as_deref() != Some(key.key_id.as_str())
+        {
+            return Err(invalid("key/tombstone supersession links are inconsistent"));
+        }
+    }
+    for tombstone in tombstones.values() {
+        let Some(successor_id) = &tombstone.superseded_by_key_id else {
+            continue;
+        };
+        let successor = historic_keys
+            .get(successor_id)
+            .ok_or_else(|| invalid("tombstone successor is unknown"))?;
+        if successor_id == &tombstone.key_id
+            || successor.signer_identity != tombstone.signer_identity
+            || successor.algorithm != tombstone.algorithm
+            || successor.public_key_fingerprint == tombstone.public_key_fingerprint
+            || successor.supersedes_key_id.as_deref() != Some(tombstone.key_id.as_str())
+        {
+            return Err(invalid("tombstone successor is inconsistent"));
+        }
+    }
+    require_acyclic_supersession(edges)
+}
+
+fn validate_required_nullable_fields(value: &Value) -> Result<(), ConformanceTrustError> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| invalid("registry root must be an object"))?;
+    if !root.contains_key("predecessor_registry_ref") {
+        return Err(invalid("missing required predecessor_registry_ref"));
+    }
+    let keys = root
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("keys must be an array"))?;
+    for key in keys {
+        if !key
+            .as_object()
+            .is_some_and(|object| object.contains_key("supersedes_key_id"))
+        {
+            return Err(invalid("missing required supersedes_key_id"));
+        }
+    }
+    let tombstones = root
+        .get("key_tombstones")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("key_tombstones must be an array"))?;
+    for tombstone in tombstones {
+        let Some(object) = tombstone.as_object() else {
+            return Err(invalid("key tombstone must be an object"));
+        };
+        for field in [
+            "signatures_valid_before",
+            "superseded_by_key_id",
+            "subsequent_revocation",
+        ] {
+            if !object.contains_key(field) {
+                return Err(invalid(format!("missing required tombstone field {field}")));
+            }
+        }
     }
     Ok(())
 }
@@ -1104,6 +1665,18 @@ fn valid_package_id(value: &str) -> bool {
     )
 }
 
+fn valid_artifact_locator(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+        && value.ends_with(".json")
+        && value
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
 fn valid_scoped_id(value: &str, prefix: &str) -> bool {
     let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
@@ -1138,30 +1711,42 @@ mod tests {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
 
-    fn registry(key: &SigningKey) -> Value {
+    fn fingerprint(key: &SigningKey) -> String {
+        sha256_digest(&key.verifying_key().to_bytes())
+    }
+
+    fn registry(
+        key: &SigningKey,
+        version: u64,
+        effective_at: &str,
+        trust_policy_version: u64,
+        predecessor_registry_ref: Option<Value>,
+    ) -> Value {
         json!({
             "$schema": TRUST_REGISTRY_SCHEMA_URI,
             "schema_version": "1.0.0",
-            "contract_kind": "conformance-trust-root-registry",
+            "contract_kind": TRUST_REGISTRY_CONTRACT_KIND,
             "document_id": "conformance-trust-root-registry:test-root",
-            "document_version": 3,
+            "document_version": version,
+            "predecessor_registry_ref": predecessor_registry_ref,
             "acceptance_status": "production_accepted",
             "production_accepted": true,
-            "lifecycle": {"state": "active", "effective_at": "2026-01-01T00:00:00Z"},
+            "lifecycle": {"state": "active", "effective_at": effective_at},
             "applicability": {
                 "evaluation_scope": "deployment",
                 "security_profiles": ["production"],
                 "deployment_ids": ["deployment:test"],
                 "trust_domain_ids": ["trust-domain:test"]
             },
-            "trust_policy_version": 2,
+            "trust_policy_version": trust_policy_version,
             "canonicalization_profiles": [CANONICALIZATION_PROFILE],
             "signature_algorithms": [SIGNATURE_ALGORITHM],
             "keys": [{
                 "key_id": "conformance-key:test-key",
                 "signer_identity": "signer:test",
-                "algorithm": "ed25519",
+                "algorithm": SIGNATURE_ALGORITHM,
                 "public_key_base64": BASE64_STANDARD.encode(key.verifying_key().to_bytes()),
+                "public_key_fingerprint": fingerprint(key),
                 "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
                 "allowed_evidence_tiers": ["externally_attested"],
                 "allowed_package_ids": ["SB-0"],
@@ -1170,68 +1755,85 @@ mod tests {
                 "valid_from": "2026-01-01T00:00:00Z",
                 "valid_until": "2027-01-01T00:00:00Z",
                 "lifecycle": "active",
-                "revoked_at": null,
                 "supersedes_key_id": null
             }],
             "key_tombstones": []
         })
     }
 
-    fn unsigned(kind: ConformanceDocumentKind) -> Value {
-        let (schema, contract_kind, id_field, id, purpose, domain) = match kind {
-            ConformanceDocumentKind::ConformanceBundle => (
-                CONFORMANCE_BUNDLE_SCHEMA_URI,
-                "conformance-bundle",
-                "bundle_id",
-                "bundle:test",
-                "conformance_bundle",
-                CONFORMANCE_BUNDLE_DOMAIN,
-            ),
-            ConformanceDocumentKind::PackageExitReceipt => (
-                PACKAGE_EXIT_RECEIPT_SCHEMA_URI,
-                "package-exit-receipt",
-                "receipt_id",
-                "receipt:SB-0:test",
-                "package_exit_receipt",
-                PACKAGE_EXIT_RECEIPT_DOMAIN,
-            ),
-        };
-        let mut document = json!({
-            "$schema": schema,
-            "schema_version": "1.0.0",
-            "contract_kind": contract_kind,
+    fn two_version_chain(key: &SigningKey) -> (Vec<u8>, Vec<u8>, String, String) {
+        let first = serde_json::to_vec(&registry(key, 1, "2026-01-01T00:00:00Z", 1, None)).unwrap();
+        let first_digest = sha256_digest(&first);
+        let predecessor = json!({
+            "artifact_kind": TRUST_REGISTRY_CONTRACT_KIND,
+            "document_id": "conformance-trust-root-registry:test-root",
             "document_version": 1,
+            "content_digest": first_digest,
+            "artifact_locator": "registry/v1.json"
+        });
+        let second = serde_json::to_vec(&registry(
+            key,
+            2,
+            "2026-07-01T00:00:00Z",
+            1,
+            Some(predecessor),
+        ))
+        .unwrap();
+        let second_digest = sha256_digest(&second);
+        (first, second, first_digest, second_digest)
+    }
+
+    fn store_for_chain(
+        first: &[u8],
+        second: &[u8],
+        second_digest: &str,
+    ) -> Result<ConformanceTrustStore, ConformanceTrustError> {
+        ConformanceTrustStore::from_registry_chain(
+            &[
+                ConformanceRegistryArtifact {
+                    artifact_locator: "registry/v1.json",
+                    raw_bytes: first,
+                },
+                ConformanceRegistryArtifact {
+                    artifact_locator: "registry/v2.json",
+                    raw_bytes: second,
+                },
+            ],
+            ConformanceTrustAnchor {
+                artifact_locator: "registry/v2.json",
+                document_id: "conformance-trust-root-registry:test-root",
+                document_version: 2,
+                content_digest: second_digest,
+            },
+            at("2026-07-16T10:01:00Z"),
+        )
+    }
+
+    fn unsigned(registry_version: u64, registry_digest: &str, signed_at: &str) -> Value {
+        json!({
+            "$schema": CONFORMANCE_BUNDLE_SCHEMA_URI,
+            "schema_version": "1.0.0",
+            "contract_kind": "conformance-bundle",
+            "bundle_id": "bundle:test",
+            "document_version": 1,
+            "bindings": {"deployment_profile": {"deployment_id": "deployment:test"}},
+            "provenance": {"evidence_tier": {"name": "externally_attested"}},
             "signer": {
-                "signature_version": "1.0.0",
+                "signature_version": SIGNATURE_VERSION,
                 "identity": "signer:test",
                 "key_id": "conformance-key:test-key",
-                "algorithm": "ed25519",
+                "algorithm": SIGNATURE_ALGORITHM,
                 "canonicalization": CANONICALIZATION_PROFILE,
-                "purpose": purpose,
-                "domain": domain,
+                "purpose": "conformance_bundle",
+                "domain": CONFORMANCE_BUNDLE_DOMAIN,
                 "trust_registry_id": "conformance-trust-root-registry:test-root",
-                "trust_registry_version": 3,
-                "trust_registry_digest": pin(),
-                "signed_at": "2026-07-16T10:00:00Z",
+                "trust_registry_version": registry_version,
+                "trust_registry_digest": registry_digest,
+                "signed_at": signed_at,
                 "signed_subject_digest": pin(),
                 "signature_base64": BASE64_STANDARD.encode([0u8; 64])
             }
-        });
-        document[id_field] = json!(id);
-        match kind {
-            ConformanceDocumentKind::ConformanceBundle => {
-                document["bindings"] =
-                    json!({"deployment_profile": {"deployment_id": "deployment:test"}});
-                document["provenance"] = json!({"evidence_tier": {"name": "externally_attested"}});
-            }
-            ConformanceDocumentKind::PackageExitReceipt => {
-                document["package_id"] = json!("SB-0");
-                document["closure_context"] =
-                    json!({"deployment_profile": {"deployment_id": "deployment:test"}});
-                document["evidence_tier"] = json!({"name": "externally_attested"});
-            }
-        }
-        document
+        })
     }
 
     fn sign(mut document: Value, key: &SigningKey) -> Value {
@@ -1253,295 +1855,298 @@ mod tests {
     }
 
     #[test]
-    fn bundle_and_receipt_round_trip_and_confusion_fail_closed() {
+    fn current_head_signature_verifies_but_historic_signature_is_fenced() {
         let key = SigningKey::from_bytes(&[7; 32]);
+        let (first, second, first_digest, second_digest) = two_version_chain(&key);
+        let store = store_for_chain(&first, &second, &second_digest).unwrap();
         let now = at("2026-07-16T10:01:00Z");
-        let store = ConformanceTrustStore::from_value(
-            &registry(&key),
-            "conformance-trust-root-registry:test-root",
-            3,
-            pin(),
-            now,
-        )
-        .unwrap();
-        for kind in [
-            ConformanceDocumentKind::ConformanceBundle,
-            ConformanceDocumentKind::PackageExitReceipt,
-        ] {
-            let document = sign(unsigned(kind), &key);
-            let verified = store.verify_document(&document, context(), now).unwrap();
-            assert_eq!(verified.kind(), kind);
-            assert_eq!(verified.deployment_id(), "deployment:test");
-            assert_eq!(verified.trust_domain_id(), "trust-domain:test");
-            assert_eq!(verified.package_id(), "SB-0");
-            assert_eq!(verified.evidence_tier(), EvidenceTier::ExternallyAttested);
 
-            let mut field_mutation = document.clone();
-            field_mutation["document_version"] = json!(2);
-            assert_eq!(
-                store.verify_document(&field_mutation, context(), now),
-                Err(ConformanceTrustError::SubjectDigestMismatch)
-            );
+        let current = sign(unsigned(2, &second_digest, "2026-07-16T10:00:00Z"), &key);
+        let verified = store.verify_document(&current, context(), now).unwrap();
+        assert_eq!(verified.registry_version(), 2);
+        assert_eq!(verified.registry_digest(), second_digest);
 
-            let mut signature_mutation = document.clone();
-            let mut bytes = BASE64_STANDARD
-                .decode(
-                    signature_mutation["signer"]["signature_base64"]
-                        .as_str()
-                        .unwrap(),
-                )
-                .unwrap();
-            bytes[0] ^= 1;
-            signature_mutation["signer"]["signature_base64"] = json!(BASE64_STANDARD.encode(bytes));
-            assert_eq!(
-                store.verify_document(&signature_mutation, context(), now),
-                Err(ConformanceTrustError::InvalidSignature)
-            );
-
-            let mut wrong_domain = document.clone();
-            wrong_domain["signer"]["domain"] =
-                json!(if kind == ConformanceDocumentKind::ConformanceBundle {
-                    PACKAGE_EXIT_RECEIPT_DOMAIN
-                } else {
-                    CONFORMANCE_BUNDLE_DOMAIN
-                });
-            assert!(matches!(
-                store.verify_document(&wrong_domain, context(), now),
-                Err(ConformanceTrustError::InvalidContract(_))
-            ));
-        }
+        let historic = sign(unsigned(1, &first_digest, "2026-06-01T00:00:00Z"), &key);
+        assert!(matches!(
+            store.verify_document(&historic, context(), now),
+            Err(ConformanceTrustError::KeyNotAuthorized(message))
+                if message.contains("acceptance-time")
+        ));
     }
 
     #[test]
-    fn key_identity_registry_and_scope_confusion_are_rejected() {
+    fn exact_links_anchor_policy_and_applicability_fail_closed() {
         let key = SigningKey::from_bytes(&[8; 32]);
-        let now = at("2026-07-16T10:01:00Z");
-        let store = ConformanceTrustStore::from_value(
-            &registry(&key),
-            "conformance-trust-root-registry:test-root",
-            3,
-            pin(),
-            now,
-        )
-        .unwrap();
-        let document = sign(unsigned(ConformanceDocumentKind::ConformanceBundle), &key);
-        for (pointer, replacement) in [
-            ("/signer/identity", json!("signer:other")),
-            ("/signer/key_id", json!("conformance-key:other-key")),
-            ("/signer/purpose", json!("package_exit_receipt")),
-            (
-                "/signer/trust_registry_digest",
-                json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            ),
-        ] {
-            let mut mutated = document.clone();
-            *mutated.pointer_mut(pointer).unwrap() = replacement;
-            assert!(store.verify_document(&mutated, context(), now).is_err());
-        }
-        let wrong_scope = ConformanceVerificationContext {
-            deployment_id: "deployment:other",
-            ..context()
-        };
-        assert!(matches!(
-            store.verify_document(&document, wrong_scope, now),
-            Err(ConformanceTrustError::ScopeMismatch(_))
-        ));
+        let successor_key = SigningKey::from_bytes(&[14; 32]);
+        let (first, second, _, _) = two_version_chain(&key);
 
-        let mut later_registry = registry(&key);
-        later_registry["lifecycle"]["effective_at"] = json!("2026-07-16T10:00:30Z");
-        let later_store = ConformanceTrustStore::from_value(
-            &later_registry,
-            "conformance-trust-root-registry:test-root",
-            3,
-            pin(),
-            now,
-        )
-        .unwrap();
+        let mut wrong_link: Value = serde_json::from_slice(&second).unwrap();
+        wrong_link["predecessor_registry_ref"]["content_digest"] = json!(pin());
+        let wrong_link = serde_json::to_vec(&wrong_link).unwrap();
+        let wrong_link_digest = sha256_digest(&wrong_link);
+        assert!(store_for_chain(&first, &wrong_link, &wrong_link_digest).is_err());
+
+        assert!(store_for_chain(&first, &second, pin()).is_err());
+
+        let mut authority_change: Value = serde_json::from_slice(&second).unwrap();
+        authority_change["keys"][0]["lifecycle"] = json!("overlap");
+        let authority_change = serde_json::to_vec(&authority_change).unwrap();
+        let authority_change_digest = sha256_digest(&authority_change);
+        assert!(store_for_chain(&first, &authority_change, &authority_change_digest).is_err());
+
+        let mut applicability_change: Value = serde_json::from_slice(&second).unwrap();
+        applicability_change["applicability"]["deployment_ids"] = json!(["deployment:other"]);
+        applicability_change["keys"][0]["deployment_ids"] = json!(["deployment:other"]);
+        applicability_change["trust_policy_version"] = json!(2);
+        let applicability_change = serde_json::to_vec(&applicability_change).unwrap();
+        let applicability_digest = sha256_digest(&applicability_change);
+        assert!(store_for_chain(&first, &applicability_change, &applicability_digest).is_err());
+
+        let mut unfenced_predecessor: Value = serde_json::from_slice(&second).unwrap();
+        let mut successor = unfenced_predecessor["keys"][0].clone();
+        successor["key_id"] = json!("conformance-key:successor-key");
+        successor["public_key_base64"] =
+            json!(BASE64_STANDARD.encode(successor_key.verifying_key().to_bytes()));
+        successor["public_key_fingerprint"] = json!(fingerprint(&successor_key));
+        successor["valid_from"] = json!("2026-07-01T00:00:00Z");
+        successor["supersedes_key_id"] = json!("conformance-key:test-key");
+        unfenced_predecessor["keys"]
+            .as_array_mut()
+            .unwrap()
+            .push(successor);
+        unfenced_predecessor["trust_policy_version"] = json!(2);
+        let unfenced_predecessor = serde_json::to_vec(&unfenced_predecessor).unwrap();
+        let unfenced_digest = sha256_digest(&unfenced_predecessor);
+        assert!(store_for_chain(&first, &unfenced_predecessor, &unfenced_digest).is_err());
+
+        let mut fenced_predecessor: Value = serde_json::from_slice(&unfenced_predecessor).unwrap();
+        fenced_predecessor["keys"][0]["lifecycle"] = json!("overlap");
+        let fenced_predecessor = serde_json::to_vec(&fenced_predecessor).unwrap();
+        let fenced_digest = sha256_digest(&fenced_predecessor);
+        let store = store_for_chain(&first, &fenced_predecessor, &fenced_digest).unwrap();
+        let old_signature = sign(unsigned(2, &fenced_digest, "2026-07-16T10:00:00Z"), &key);
         assert!(matches!(
-            later_store.verify_document(&document, context(), now),
+            store.verify_document(&old_signature, context(), at("2026-07-16T10:01:00Z")),
             Err(ConformanceTrustError::KeyNotAuthorized(_))
         ));
     }
 
     #[test]
-    fn malformed_noncanonical_base64_and_key_lifecycles_are_rejected() {
+    fn key_material_relabel_and_fingerprint_mismatch_are_rejected() {
         let key = SigningKey::from_bytes(&[9; 32]);
-        let now = at("2026-07-16T10:01:00Z");
-        let mut malformed = registry(&key);
-        malformed["keys"][0]["public_key_base64"] = json!("not-base64");
-        assert!(matches!(
-            ConformanceTrustStore::from_value(
-                &malformed,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now
-            ),
-            Err(ConformanceTrustError::InvalidBase64(_))
-        ));
+        let replacement = SigningKey::from_bytes(&[10; 32]);
+        let (first, second, _, _) = two_version_chain(&key);
 
-        for (field, value) in [
-            ("valid_from", json!("2026-08-01T00:00:00Z")),
-            ("valid_until", json!("2026-07-01T00:00:00Z")),
-            ("lifecycle", json!("retired")),
-        ] {
-            let mut candidate = registry(&key);
-            candidate["keys"][0][field] = value;
-            let store = ConformanceTrustStore::from_value(
-                &candidate,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now,
-            )
-            .unwrap();
-            let document = sign(unsigned(ConformanceDocumentKind::ConformanceBundle), &key);
-            assert!(matches!(
-                store.verify_document(&document, context(), now),
-                Err(ConformanceTrustError::KeyNotAuthorized(_))
-            ));
-        }
-        let mut revoked = registry(&key);
-        revoked["keys"][0]["lifecycle"] = json!("revoked");
-        revoked["keys"][0]["revoked_at"] = json!("2026-07-01T00:00:00Z");
-        let store = ConformanceTrustStore::from_value(
-            &revoked,
-            "conformance-trust-root-registry:test-root",
-            3,
-            pin(),
-            now,
-        )
-        .unwrap();
-        assert!(matches!(
-            store.verify_document(
-                &sign(unsigned(ConformanceDocumentKind::ConformanceBundle), &key),
-                context(),
-                now
-            ),
-            Err(ConformanceTrustError::KeyNotAuthorized(_))
-        ));
+        let mut relabel: Value = serde_json::from_slice(&second).unwrap();
+        relabel["keys"][0]["public_key_base64"] =
+            json!(BASE64_STANDARD.encode(replacement.verifying_key().to_bytes()));
+        relabel["keys"][0]["public_key_fingerprint"] = json!(fingerprint(&replacement));
+        relabel["trust_policy_version"] = json!(2);
+        let relabel = serde_json::to_vec(&relabel).unwrap();
+        let relabel_digest = sha256_digest(&relabel);
+        assert!(store_for_chain(&first, &relabel, &relabel_digest).is_err());
+
+        let mut mismatch: Value = serde_json::from_slice(&second).unwrap();
+        mismatch["keys"][0]["public_key_fingerprint"] = json!(pin());
+        mismatch["trust_policy_version"] = json!(2);
+        let mismatch = serde_json::to_vec(&mismatch).unwrap();
+        let mismatch_digest = sha256_digest(&mismatch);
+        assert!(store_for_chain(&first, &mismatch, &mismatch_digest).is_err());
     }
 
     #[test]
-    fn duplicate_and_tombstoned_keys_and_unknown_registry_fields_fail() {
-        let key = SigningKey::from_bytes(&[10; 32]);
-        let now = at("2026-07-16T10:01:00Z");
-        let registry_bytes = serde_json::to_vec(&registry(&key)).unwrap();
-        let registry_digest = sha256_digest(&registry_bytes);
-        assert!(
-            ConformanceTrustStore::from_bytes(
-                &registry_bytes,
-                "conformance-trust-root-registry:test-root",
-                3,
-                &registry_digest,
-                now,
-            )
-            .is_ok()
+    fn rotation_tombstone_and_later_revocation_overlay_are_append_only() {
+        let retired_key = SigningKey::from_bytes(&[12; 32]);
+        let active_key = SigningKey::from_bytes(&[13; 32]);
+        let first_value = registry(&retired_key, 1, "2026-01-01T00:00:00Z", 1, None);
+        let first = serde_json::to_vec(&first_value).unwrap();
+        let first_digest = sha256_digest(&first);
+
+        let mut second = registry(
+            &active_key,
+            2,
+            "2026-07-01T00:00:00Z",
+            2,
+            Some(json!({
+                "artifact_kind": TRUST_REGISTRY_CONTRACT_KIND,
+                "document_id": "conformance-trust-root-registry:test-root",
+                "document_version": 1,
+                "content_digest": first_digest,
+                "artifact_locator": "registry/v1.json"
+            })),
         );
+        second["keys"][0]["key_id"] = json!("conformance-key:rotation-key");
+        second["keys"][0]["valid_from"] = json!("2026-07-01T00:00:00Z");
+        second["keys"][0]["supersedes_key_id"] = json!("conformance-key:test-key");
+        second["key_tombstones"] = json!([{
+            "key_id": "conformance-key:test-key",
+            "signer_identity": "signer:test",
+            "algorithm": SIGNATURE_ALGORITHM,
+            "public_key_fingerprint": fingerprint(&retired_key),
+            "terminal_state": "retired",
+            "terminated_at": "2026-07-01T00:00:00Z",
+            "signatures_valid_before": "2026-07-01T00:00:00Z",
+            "subsequent_revocation": null,
+            "reason": "scheduled signing key retirement",
+            "superseded_by_key_id": "conformance-key:rotation-key",
+            "trust_policy_version": 2
+        }]);
+        let second = serde_json::to_vec(&second).unwrap();
+        let second_digest = sha256_digest(&second);
+
+        let mut third: Value = serde_json::from_slice(&second).unwrap();
+        third["document_version"] = json!(3);
+        third["lifecycle"]["effective_at"] = json!("2026-07-15T00:00:00Z");
+        third["trust_policy_version"] = json!(3);
+        third["predecessor_registry_ref"] = json!({
+            "artifact_kind": TRUST_REGISTRY_CONTRACT_KIND,
+            "document_id": "conformance-trust-root-registry:test-root",
+            "document_version": 2,
+            "content_digest": second_digest,
+            "artifact_locator": "registry/v2.json"
+        });
+        third["key_tombstones"][0]["subsequent_revocation"] = json!({
+            "revoked_at": "2026-07-15T00:00:00Z",
+            "reason": "post-retirement compromise evidence",
+            "trust_policy_version": 3
+        });
+        let third = serde_json::to_vec(&third).unwrap();
+        let third_digest = sha256_digest(&third);
+        let artifacts = [
+            ConformanceRegistryArtifact {
+                artifact_locator: "registry/v1.json",
+                raw_bytes: &first,
+            },
+            ConformanceRegistryArtifact {
+                artifact_locator: "registry/v2.json",
+                raw_bytes: &second,
+            },
+            ConformanceRegistryArtifact {
+                artifact_locator: "registry/v3.json",
+                raw_bytes: &third,
+            },
+        ];
+        let store = ConformanceTrustStore::from_registry_chain(
+            &artifacts,
+            ConformanceTrustAnchor {
+                artifact_locator: "registry/v3.json",
+                document_id: "conformance-trust-root-registry:test-root",
+                document_version: 3,
+                content_digest: &third_digest,
+            },
+            at("2026-07-16T10:01:00Z"),
+        )
+        .unwrap();
+        let mut document = unsigned(3, &third_digest, "2026-07-16T10:00:00Z");
+        document["signer"]["key_id"] = json!("conformance-key:rotation-key");
         assert!(
-            ConformanceTrustStore::from_bytes(
-                &registry_bytes,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now,
+            store
+                .verify_document(
+                    &sign(document, &active_key),
+                    context(),
+                    at("2026-07-16T10:01:00Z")
+                )
+                .is_ok()
+        );
+
+        let mut dropped: Value = serde_json::from_slice(&third).unwrap();
+        dropped["key_tombstones"] = json!([]);
+        let dropped = serde_json::to_vec(&dropped).unwrap();
+        let dropped_digest = sha256_digest(&dropped);
+        let dropped_artifacts = [
+            artifacts[0],
+            artifacts[1],
+            ConformanceRegistryArtifact {
+                artifact_locator: "registry/v3.json",
+                raw_bytes: &dropped,
+            },
+        ];
+        assert!(
+            ConformanceTrustStore::from_registry_chain(
+                &dropped_artifacts,
+                ConformanceTrustAnchor {
+                    artifact_locator: "registry/v3.json",
+                    document_id: "conformance-trust-root-registry:test-root",
+                    document_version: 3,
+                    content_digest: &dropped_digest,
+                },
+                at("2026-07-16T10:01:00Z"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_required_null_duplicate_json_and_bounds_are_rejected() {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let mut genesis = registry(&key, 1, "2026-01-01T00:00:00Z", 1, None);
+        genesis
+            .as_object_mut()
+            .unwrap()
+            .remove("predecessor_registry_ref");
+        let bytes = serde_json::to_vec(&genesis).unwrap();
+        let digest = sha256_digest(&bytes);
+        assert!(
+            ConformanceTrustStore::from_registry_chain(
+                &[ConformanceRegistryArtifact {
+                    artifact_locator: "registry/v1.json",
+                    raw_bytes: &bytes,
+                }],
+                ConformanceTrustAnchor {
+                    artifact_locator: "registry/v1.json",
+                    document_id: "conformance-trust-root-registry:test-root",
+                    document_version: 1,
+                    content_digest: &digest,
+                },
+                at("2026-07-16T10:01:00Z"),
             )
             .is_err()
         );
 
-        let registry_json = String::from_utf8(registry_bytes).unwrap();
-        let duplicate_json = registry_json.replacen(
+        let valid =
+            serde_json::to_string(&registry(&key, 1, "2026-01-01T00:00:00Z", 1, None)).unwrap();
+        let duplicate = valid.replacen(
             "\"schema_version\":",
             "\"schema_version\":\"1.0.0\",\"schema_version\":",
             1,
         );
-        let duplicate_digest = sha256_digest(duplicate_json.as_bytes());
+        let duplicate_digest = sha256_digest(duplicate.as_bytes());
         assert!(matches!(
-            ConformanceTrustStore::from_bytes(
-                duplicate_json.as_bytes(),
-                "conformance-trust-root-registry:test-root",
-                3,
-                &duplicate_digest,
-                now,
+            ConformanceTrustStore::from_registry_chain(
+                &[ConformanceRegistryArtifact {
+                    artifact_locator: "registry/v1.json",
+                    raw_bytes: duplicate.as_bytes(),
+                }],
+                ConformanceTrustAnchor {
+                    artifact_locator: "registry/v1.json",
+                    document_id: "conformance-trust-root-registry:test-root",
+                    document_version: 1,
+                    content_digest: &duplicate_digest,
+                },
+                at("2026-07-16T10:01:00Z"),
             ),
             Err(ConformanceTrustError::InvalidTypedValue(message))
                 if message.contains("duplicate JSON object key")
         ));
 
-        let mut duplicate = registry(&key);
-        let duplicate_key = duplicate["keys"][0].clone();
-        duplicate["keys"]
-            .as_array_mut()
-            .unwrap()
-            .push(duplicate_key);
+        let mut oversized = registry(&key, 1, "2026-01-01T00:00:00Z", 1, None);
+        let one = oversized["keys"][0].clone();
+        oversized["keys"] = Value::Array(vec![one; MAX_KEYS_PER_REGISTRY + 1]);
+        let oversized = serde_json::to_vec(&oversized).unwrap();
+        let oversized_digest = sha256_digest(&oversized);
         assert!(
-            ConformanceTrustStore::from_value(
-                &duplicate,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now
-            )
-            .is_err()
-        );
-
-        let mut duplicate_material = registry(&key);
-        let mut alias = duplicate_material["keys"][0].clone();
-        alias["key_id"] = json!("conformance-key:alias-key");
-        duplicate_material["keys"]
-            .as_array_mut()
-            .unwrap()
-            .push(alias);
-        assert!(matches!(
-            ConformanceTrustStore::from_value(
-                &duplicate_material,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now
-            ),
-            Err(ConformanceTrustError::InvalidContract(message))
-                if message.contains("duplicate Ed25519 public-key material")
-        ));
-
-        let mut tombstoned = registry(&key);
-        tombstoned["key_tombstones"] = json!([{
-            "key_id": "conformance-key:test-key", "signer_identity": "signer:test",
-            "algorithm": "ed25519", "revoked_at": "2026-06-01T00:00:00Z",
-            "reason": "operator revocation evidence", "superseded_by_key_id": null,
-            "trust_policy_version": 2
-        }]);
-        assert!(
-            ConformanceTrustStore::from_value(
-                &tombstoned,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now
-            )
-            .is_err()
-        );
-
-        let mut unknown = registry(&key);
-        unknown["unknown_critical"] = json!(true);
-        assert!(matches!(
-            ConformanceTrustStore::from_value(
-                &unknown,
-                "conformance-trust-root-registry:test-root",
-                3,
-                pin(),
-                now
-            ),
-            Err(ConformanceTrustError::InvalidTypedValue(_))
-        ));
-
-        assert!(
-            ConformanceTrustStore::from_value(
-                &registry(&key),
-                "conformance-trust-root-registry:test-root",
-                3,
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                now,
+            ConformanceTrustStore::from_registry_chain(
+                &[ConformanceRegistryArtifact {
+                    artifact_locator: "registry/v1.json",
+                    raw_bytes: &oversized,
+                }],
+                ConformanceTrustAnchor {
+                    artifact_locator: "registry/v1.json",
+                    document_id: "conformance-trust-root-registry:test-root",
+                    document_version: 1,
+                    content_digest: &oversized_digest,
+                },
+                at("2026-07-16T10:01:00Z"),
             )
             .is_err()
         );

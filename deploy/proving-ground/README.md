@@ -72,7 +72,10 @@ are supplied through `PG_DEPLOYMENT_SECURITY_PROFILE_PATH`,
 `PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. They must be root-owned regular
 files beneath the immutable
 `/app/security-contract` image tree; the proving ground never selects or
-fabricates a registry, profile, or digest.
+fabricates a registry, profile, or digest. The selected registry is the head of
+an exact, bounded N-1 chain, so every predecessor through version 1 must also
+be present in that tree. The chain does not replace an external monotonic head
+checkpoint and cannot authorize production on its own.
 
 Agent values are parsed as literal `KEY=value` text. HCL spaces, semicolons,
 `$()`, and other shell metacharacters are not evaluated. Do not add an inline
