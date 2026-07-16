@@ -1,13 +1,13 @@
 # connection_health_checks retention prune — bound the fastest-growing history table
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). codex plan NEEDS-CHANGES → APPROVE (the
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). Plan review NEEDS-CHANGES → APPROVE (the
 daily-cap throughput MAJOR fixed by running HOURLY; a closed PruneTarget enum for injection-safety);
-codex impl review NEEDS-CHANGES×2 → APPROVE (a retention index matching the prune's window ORDER BY,
+implementation review NEEDS-CHANGES×2 → APPROVE (a retention index matching the prune's window ORDER BY,
 with explicit `checked_at DESC NULLS LAST` so the planner skips the sort; the test now asserts the
 newest survive). The HIGHEST disk-value prune: the seeded
 `connection_health_sweep` runs every 300s (5 min) and appends ONE `connection_health_checks` row PER
-integration connection PER sweep → ~288 rows/day/connection, unbounded. Reuses the proven, codex-
-approved `job_executions_prune` pattern (720a1d0) by GENERALIZING its helper. Additive: ONE
+integration connection PER sweep → ~288 rows/day/connection, unbounded. Reuses the proven,
+review-approved `job_executions_prune` pattern (720a1d0) by GENERALIZING its helper. Additive: ONE
 generalized helper + ONE scheduler job-kind arm + ONE seed migration.
 
 ## The gap (verified)
@@ -24,7 +24,7 @@ The `job_executions_prune` (720a1d0) keep-newest-N-per-partition + per-run-cap l
 here; only the table / partition column / timestamp column differ. So:
 
 ### Generalized helper + a CLOSED-SET enum (ryuki-api/src/scheduler.rs)
-The SQL identifiers come from a closed `PruneTarget` enum (codex: an allowlist is a stronger
+The SQL identifiers come from a closed `PruneTarget` enum (review note: an allowlist is a stronger
 guarantee than raw `&'static str` — the table/partition/ts can ONLY be one of the enum's hardcoded
 triples, never an arbitrary string):
 ```
@@ -41,10 +41,10 @@ SQL; keep/cap stay bound `$1`/`$2`). `prune_job_executions(conn, keep, cap)` bec
 `prune_history_newest_n(conn, PruneTarget::JobExecutions, keep, cap)` so the existing prune tests are
 unchanged.
 
-### Scheduler arm (ryuki-api/src/scheduler.rs run_job) — HOURLY (codex MAJOR)
+### Scheduler arm (ryuki-api/src/scheduler.rs run_job) — HOURLY (review MAJOR)
 `"connection_health_checks_prune" =>` calls `prune_history_newest_n(tx,
 PruneTarget::ConnectionHealthChecks, KEEP_PER_CONNECTION = 10000, MAX_PER_RUN = 20000)`.
-THROUGHPUT (codex MAJOR): at the 5-min sweep, each connection adds ~288 rows/DAY, so a DAILY prune
+THROUGHPUT (review MAJOR): at the 5-min sweep, each connection adds ~288 rows/DAY, so a DAILY prune
 with cap=20000 only keeps up below ~70 connections — above that the table would grow despite the
 prune. So this prune runs **HOURLY** (interval 3600s, vs the daily job_executions prune): per-run
 growth is #connections × 12, so cap=20000 keeps up to ~1666 connections (huge headroom for a control
@@ -61,7 +61,7 @@ Seed ONE enabled **hourly** `connection_health_checks_prune` schedule (interval 
 throughput rationale above; this differs from the daily job_executions prune because per-connection
 growth is far faster). Fixed UUID `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb` (continues the seed sequence
 …cert=9999, prune=aaaa → chc-prune=bbbb; collides with none). `ON CONFLICT (id) DO NOTHING`. PLUS a
-RETENTION INDEX (codex): `(connection_id, checked_at DESC, id DESC)` matching the prune's window
+RETENTION INDEX (review note): `(connection_id, checked_at DESC, id DESC)` matching the prune's window
 ORDER BY exactly, so the hourly ranking scan on this fastest-growing table is an ordered index scan
 (no sort) — the mig-102 index `(connection_id, checked_at DESC)` is not exact for the `id DESC`
 tiebreak.

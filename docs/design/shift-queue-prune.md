@@ -32,10 +32,10 @@ WHERE resolved = true
 ```
 - Guarded: `retention_days <= 0 || max_per_run <= 0` → `Ok(0)` (never an unbounded/footgun DELETE).
 - `WHERE resolved = true` — OPEN items are never touched (live work). The OUTER DELETE re-asserts the
-  full predicate (not just `id IN`) so the invariant holds even under a concurrent re-open or a manual
-  id-list (codex).
+  full predicate (not just `id IN`) so the invariant holds even under a concurrent re-open or with a
+  manually supplied id list.
 - `resolved = true AND resolved_at IS NULL` (a resolved row with no timestamp — a data anomaly) is
-  KEPT, never pruned: there is no age anchor (codex). A test asserts it survives.
+  KEPT, never pruned: there is no age anchor. A test asserts it survives.
 - A per-run cap bounds the DELETE so the FIRST prune of a years-old backlog drains over several daily
   runs rather than one giant DELETE (the job_executions-prune lesson).
 - `shift_queue` has NO append-only trigger (unlike audit_log/domain_events), so the DELETE is allowed.
@@ -45,14 +45,14 @@ WHERE resolved = true
 
 `run_job` arm `shift_queue_prune` (DAILY): `RETENTION_DAYS = 90` (a quarter of resolved work history
 is ample for triage review), `MAX_PER_RUN = 20000`. (Note: the `shift-resolve` audit records only the
-item id and enqueues are direct inserts, so the audit/event trail is NOT a full row replacement —
-codex; 90 days of in-table history is the actual retention.)
+item id and enqueues are direct inserts, so the audit/event trail is NOT a full row replacement;
+90 days of in-table history is the actual retention.)
 
 Engine `job_is_schedulable` allowlist gains `shift_queue_prune` (safe-internal-write) + matrix/_live
 tests. Migration `137_shift_queue_prune.sql`: seed one enabled DAILY (86400s) schedule (fixed id
 `ffffffff-ffff-4fff-8fff-ffffffffffff` — continues …gmsa=dddd, oob=eeee → shift-queue=ffff; valid
 v4) + a retention index matching the prune's predicate+ORDER BY:
-`(resolved_at ASC NULLS LAST, id ASC) WHERE resolved = true AND resolved_at IS NOT NULL` (codex:
+`(resolved_at ASC NULLS LAST, id ASC) WHERE resolved = true AND resolved_at IS NOT NULL` (review note:
 `resolved` is redundant in the partial key; `id` gives the deterministic tiebreak the ORDER BY uses).
 
 ## Tests

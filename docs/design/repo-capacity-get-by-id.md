@@ -1,6 +1,6 @@
 # repository-capacity GET-by-id + deny_unknown_fields hardening
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, fixed below (no-DB GET →
+Status: design — plan-review round 1 NEEDS-CHANGES, fixed below (no-DB GET →
 404 not 503; flat `/{id}` safe because repo ids are seed-only `repo-*` non-reserved;
 deny_unknown_fields test = unknown-EXTRA-field). Small read-completeness + hardening
 slice (fresh narrow analysis). Same domain, no secrets, no live calls.
@@ -16,7 +16,7 @@ Mirror the by-id READ pattern of `repo_capacity_forecast` (NOT the update's writ
 guard):
 ```rust
 async fn repo_capacity_get(AuthExtractor(session), Path(id)) -> ApiResult {
-    // CODEX FIX (major): no-DB maps to 404 (NOT 503) for read consistency with the
+    // REVIEW FIX (major): no-DB maps to 404 (NOT 503) for read consistency with the
     // other by-id reads (forecast resolves None -> 404), not the update's 503.
     let repo = match get_db() {
         Some(pool) => repos::repository_capacity::get(pool, &id).await.map_err(db_error)?,
@@ -46,7 +46,7 @@ the segment after `/repository-capacity/`, the existing routes use STATIC segmen
 `/{id}` is a PARAM at that level. matchit (axum 0.8) allows static + param siblings
 with STATIC taking precedence (verified), so `GET …/at-risk` still hits
 `repo_capacity_at_risk` and `GET …/{id}` hits the new handler; no build panic.
-RESERVED-WORD safety (codex minor): a flat `/{id}` would make an id EQUAL to a
+RESERVED-WORD safety (review minor): a flat `/{id}` would make an id EQUAL to a
 static sibling unreachable — but that cannot happen here: repository ids are
 seed-only (NO create endpoint) and `repo-*`-formatted (e.g.
 `repo-defra-storeonce-01`, mig 037/038), so none can equal `at-risk`/`report`/etc.
@@ -55,7 +55,7 @@ Flat `/{id}` is therefore safe. A test still asserts the router BUILDS and that
 via the existing `oneshot` harness.
 
 ## 3. `#[serde(deny_unknown_fields)]` on `RepoCapacityUpdateBody`
-The update body lacks it (every sibling mutation body has it). CODEX NIT: the
+The update body lacks it (every sibling mutation body has it). REVIEW NOTE: the
 hardening case is a VALID body carrying an UNKNOWN EXTRA field (e.g.
 `{"used_capacity_tb":1.2,"junk":true}`) — that silently succeeds today, ignoring the
 typo'd/extra key. (A missing required `used_capacity_tb` already 400s.) Add the
@@ -67,7 +67,7 @@ names, so the legacy key still deserializes; only truly-unknown fields are rejec
 1. **GET-by-id happy** (DB): seed a repo, `repo_capacity_get` → 200 with
    repository_id/name/used_capacity_tb/days_until_full/status; matches the update
    handler's projection.
-2. **404**: unknown id → 404; AND no-DB mode → 404 (codex — read consistency, not
+2. **404**: unknown id → 404; AND no-DB mode → 404 (read consistency, not
    503).
 3. **Out-of-scope** (DB): a site-scoped session reading a repo in another site →
    404 (site_scope_guard_or_404, no oracle) — mirror the forecast scope test.

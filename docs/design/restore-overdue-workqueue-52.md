@@ -1,8 +1,8 @@
 # #52 — Route overdue restore tests into the work queue
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, all fixed below. Reuses
+Status: design — plan-review round 1 NEEDS-CHANGES, all fixed below. Reuses
 the #40/#39/#19 durable-scheduler SAFE-INTERNAL-WRITE recipe.
-Codex fixes folded in: (blocker) gate on `is_at_risk()` — the classifier returns
+Review fixes folded in: (blocker) gate on `is_at_risk()` — the classifier returns
 `NeverTested`, not `Overdue`, for never-succeeded; (major) `ON CONFLICT DO NOTHING`
 so a race can't abort the tick; (major) documented the `source_ci_key` global-
 identity invariant (aligned with the #47 aggregate's GROUP BY); (minor) exact
@@ -21,7 +21,7 @@ recoverability shows up in the operations queue without manual polling.
 
 ## Scope (first slice): AT-RISK (overdue OR never-tested)
 A system is flagged when `classify_restore_recency(...).is_at_risk()` is true.
-CODEX FIX (blocker): the classifier returns `RestoreTestRecency::NeverTested` (NOT
+REVIEW FIX (blocker): the classifier returns `RestoreTestRecency::NeverTested` (NOT
 `Overdue`) when `last_successful_test IS NULL`, and `Overdue` only for a stale-but-
 once-successful system. `is_at_risk()` = `!matches!(self, Current)` covers BOTH —
 so the scan flags stale AND never-succeeded systems (the latter ordered most-at-
@@ -32,7 +32,7 @@ This reuses the tested #47 classifier verbatim.
 FAILED-latest (a system whose last success is recent but whose MOST RECENT
 restore_request is `Failed`) is a deliberate OUT-OF-SCOPE follow-up — it needs a
 distinct "latest-status" query, and the overdue signal is the higher-value,
-already-built one. (Codex-review question: must failed-latest be in this slice?)
+already-built one. (Review question: must failed-latest be in this slice?)
 
 ## Why a durable-scheduler job
 Leader-elected (one replica ticks), so each system is flagged once per cadence
@@ -63,7 +63,7 @@ ON CONFLICT DO NOTHING
 ```
 `rows_affected()` (0 or 1) tells the scan whether it enqueued. The `WHERE NOT
 EXISTS` avoids even attempting the insert in the common (already-queued) case;
-CODEX FIX (major): the untargeted `ON CONFLICT DO NOTHING` is the belt-and-
+REVIEW FIX (major): the untargeted `ON CONFLICT DO NOTHING` is the belt-and-
 suspenders so that if a split-brain tick or a future non-leader writer ever races
 between the check and the insert, the second insert hits the partial unique index
 and is silently dropped — it does NOT error and abort the whole scheduler tick.
@@ -76,7 +76,7 @@ operator RESOLVES it (`resolved=true`) and the system is STILL overdue at the ne
 scan, a fresh item is created (correct re-flag); once the system is tested
 successfully it is no longer overdue and nothing is created.
 
-CODEX FIX (major — identity invariant): the dedup key and the all-sites scan key on
+REVIEW FIX (major — identity invariant): the dedup key and the all-sites scan both use
 `source_ci_key` ALONE. This is intentional and consistent with the data model:
 `restore_requests.source_ci_key` is `NOT NULL` (mig 007), and the #47 aggregate
 `restore_test_recency` itself GROUPs BY `source_ci_key` alone (no site/env) — so the
@@ -127,7 +127,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_restore_overdue
     WHERE resolved = false AND item_type = 'restore-test-overdue';
 ```
 This makes a duplicate open item impossible even if a future non-leader path
-enqueues. (Codex-review question: keep the partial unique index, or rely solely on
+enqueues. (Review question: keep the partial unique index, or rely solely on
 the single-leader NOT EXISTS? The index constrains only `resolved=false` rows so it
 does not block the post-resolution re-flag.)
 
@@ -143,7 +143,7 @@ does not block the post-resolution re-flag.)
    `metadata.reason='never_tested'` (NOT `overdue`).
 5. Re-flag after resolution: mark the item `resolved=true`; a subsequent tick (still
    overdue) creates a NEW open item.
-6. Boundary (codex minor): a system whose last success is EXACTLY
+6. Boundary (review minor): a system whose last success is EXACTLY
    `RESTORE_OVERDUE_DAYS*86400` seconds old → NOT flagged (classifier uses
    `age > threshold`); at `+1` second → flagged. Locks the queue behavior at the
    threshold, not just directionally.

@@ -165,7 +165,7 @@
             "type": "string"
           },
           "approved_plan_digest": {
-            "description": "Lowercase SHA-256 digest of the exact reviewed safe projection.",
+            "description": "Lowercase SHA-256 digest of the complete canonical raw Terraform plan. This is distinct from the safe-projection evidence_digest.",
             "pattern": "^[0-9a-f]{64}$",
             "type": "string"
           },
@@ -376,7 +376,17 @@
             "pattern": "^[0-9a-f]{64}$",
             "type": "string"
           },
+          "backend_credential_authority_id": {
+            "description": "Stable, non-secret provisioning-record reference for the backend credential principal. Its backend-kind path component must equal backend_kind.",
+            "pattern": "^backend-credential-authority/[a-z0-9_-]+/[a-z0-9._/-]+$",
+            "type": "string"
+          },
           "backend_credential_authority_mode": {
+            "type": "string"
+          },
+          "backend_credential_authority_revision": {
+            "description": "Immutable authority revision; rotates whenever the backend principal, destination, or credential set changes.",
+            "pattern": "^v[a-z0-9._-]+$",
             "type": "string"
           },
           "backend_kind": {
@@ -461,6 +471,8 @@
           "provider_authority_id",
           "provider_authority_version",
           "backend_kind",
+          "backend_credential_authority_id",
+          "backend_credential_authority_revision",
           "backend_authority_digest",
           "executable_kind",
           "executable_path",
@@ -781,6 +793,18 @@
             "format": "uuid",
             "type": "string"
           },
+          "raw_plan_digest": {
+            "description": "Must equal SignedEnvelope.raw_plan_digest. Present only for LivePlan + Planned.",
+            "oneOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "result_id": {
             "format": "uuid",
             "type": "string"
@@ -797,6 +821,7 @@
           "attempt_id",
           "result_id",
           "status",
+          "raw_plan_digest",
           "evidence_digest",
           "signed_envelope"
         ],
@@ -1262,6 +1287,18 @@
           "platform": {
             "type": "string"
           },
+          "raw_plan_digest": {
+            "description": "Signed digest of the complete canonical raw Terraform plan. Required for LivePlan + Planned and null for every other mode/status; never interchangeable with evidence_digest.",
+            "oneOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "redaction_policy_version": {
             "example": "ryuki-redaction-v2",
             "type": "string"
@@ -1300,6 +1337,7 @@
           "status",
           "job_spec_digest",
           "approved_plan_digest",
+          "raw_plan_digest",
           "execution_trust_profile",
           "evidence_digest",
           "redaction_policy_version",
@@ -1339,6 +1377,8 @@
             "type": "string"
           },
           "approved_plan_digest": {
+            "description": "Raw canonical Terraform plan digest selected from the exact successful LivePlan job and attempt.",
+            "pattern": "^[0-9a-f]{64}$",
             "type": "string"
           },
           "approved_plan_job_id": {

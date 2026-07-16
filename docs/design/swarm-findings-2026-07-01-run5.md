@@ -3,13 +3,13 @@
 A 7-finder discovery+correctness sweep (request-lifecycle / agent-execution / correctness /
 security-authz-secrets / data-retention / observability-ops / api-completeness) → 1 adversarial
 verifier per candidate (default NOT-confirmed). **28 of 40 confirmed**, ranked
-backend-verifiable-first. ALL items here were confirmed by the verifier; the orchestrator (Opus)
+backend-verifiable-first. ALL items here were confirmed by the verifier; the orchestrator
 independently re-verifies before implementing — and ALREADY corrected one (the scope cluster is
 8 handlers, not the 4 the verifiers found; see below).
 
 ## Clusters (confirmed)
 
-### A0. NEW (codex, force-fail review): execution-plane admin surface is NOT site-scoped
+### A0. NEW (force-fail review): execution-plane admin surface is NOT site-scoped
 `agents.rs` does not import `scope_guard_or_404`; NONE of its ~13 admin handlers (reconcile, cancel,
 priority, dead-letter requeue, queue-depth, result, force-fail, …) scope-guard the parent request —
 admin is treated as platform-global. A SCOPED admin (admin role + a `site_scope`) can mutate/
@@ -28,7 +28,7 @@ guarded). See no-db-scope-guard-sweep.md. MEDIUM (no-DB-only). → **being fixed
   site-scope" — LIKELY MOOT: those are admin-only and admin-with-no-scope is unrestricted. VERIFY the
   admin=superuser assumption before acting (the run-3 doc already flagged the integration one moot).
 
-### B0. NEW (codex, decommission-event review): event-feed scope leak for site-only aggregates
+### B0. NEW (decommission-event review): event-feed scope leak for site-only aggregates
 The /api/events feed scope predicate (repos/domain_events.rs:82-83) makes `environment IS NULL` rows
 visible to ANY env-scoped principal (the deliberate permissive policy). A SITE-ONLY aggregate's
 events (site=Some, env=NULL — e.g. decommission, and site-only SLO/budget) therefore leak to an
@@ -36,7 +36,7 @@ env-ONLY-scoped principal (site_scope=[], env_scope=[…]) who is UNRESTRICTED o
 env axis via NULL — even though the site-only handlers (site_scope_guard_or_404) FAIL CLOSED for that
 principal. The decommission observability events (B below) were implemented + REVERTED for this
 reason. Resolving it is a cross-cutting decision (the deliberate permissive policy vs site-only-handler
-strictness; affects SLO/budget too) — flagged as a spawn_task. Until then, the decommission/AD/incident
+strictness; affects SLO/budget too) — tracked as a follow-up task. Until then, the decommission/AD/incident
 lifecycle events (B) are BLOCKED on this decision (they'd hit the same leak).
 
 ### B. Observability — lifecycle transitions emitting NO domain event (can't alert/observe)
@@ -57,7 +57,7 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
   `runbook_active()` — fetch ALL rows (medium-high/S-M). ✅ SHIPPED: `MAX_LIST_ROWS=1000` cap
   (defense-in-depth) on all 4; runbook_active ALSO pushes the active (non-terminal) filter into SQL
   (`WHERE status NOT IN ('completed','failed','rolled-back')`) so it no longer fetches the unbounded
-  terminal-execution history. codex plan+impl APPROVE.
+  terminal-execution history. Plan and implementation review APPROVED.
 
 ### D. Unclamped numeric inputs → 500 / overflow (the validity_days bug class)
 - Unclamped `offset` → negative OFFSET 500 in requests_list + "various SQL queries" (high-medium/S).
@@ -79,7 +79,7 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 - ✅ Compliance controls + findings missing individual GET endpoints (medium/S) — SHIPPED:
   controls already had `compliance_control_get`; findings now have `GET /api/audit/compliance/findings/{id}`
   (`compliance_finding_get` + repo `get_finding`), scoped on the parent report's site (findings have no
-  own site column), out-of-scope 404s like missing (no oracle). codex impl APPROVE; ran green on a fresh DB.
+  own site column), out-of-scope 404s like missing (no oracle). Implementation review APPROVED; ran green on a fresh DB.
 
 ### F. Security — redaction
 - Audit redaction is key-pattern-only — free-text `reason`/`detail` values could carry a secret a
@@ -90,7 +90,7 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 2. Background-loop wedge domain event (B, CRITICAL).
 3. ✅ Offset-clamp sweep (D) — SHIPPED 9f6b8ab (clamp_offset_usize at 3 sites).
 4. ✅ shift_queue prune (C) — SHIPPED: resolved+age prune (a NEW shape — open items never pruned),
-   90-day retention, daily, capped; mig 137 (seed ffff + retention index). codex plan+impl APPROVE.
+   90-day retention, daily, capped; mig 137 (seed ffff + retention index). Plan and implementation review APPROVED.
 5. Lifecycle domain events (B: decommission/AD/incident) — proven event pattern.
 6. ✅ Stuck-job force-fail (E) — SHIPPED (eed6c01): admin force-fail of a Leased non-LiveApply job
    (spec.mode authoritative; LiveApply → reconcile path).
@@ -99,6 +99,6 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
    regression). The A0 agent-job-admin scope-guard sweep + background-loop wedge event remain.
 8. ✅ Compliance finding GET-by-id (E) — SHIPPED: GET /api/audit/compliance/findings/{id}
    (`compliance_finding_get` + repo `get_finding`); parent-report-site scope guard, out-of-scope 404s
-   like missing. codex impl APPROVE; new test green on a fresh DB alongside the 26 compliance tests.
+   like missing. Implementation review APPROVED; new test green on a fresh DB alongside the 26 compliance tests.
    Remaining run-5 backlog: A0 scope sweep (flagged), background-loop wedge event (flagged), B/B0
    lifecycle events (blocked on the B0 scope-policy decision, flagged), F redaction (scope tightly).

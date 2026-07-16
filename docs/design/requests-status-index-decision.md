@@ -2,19 +2,19 @@
 
 Status: **DECIDED — DO NOT ADD NOW (defer).** This closes the measure-first task
 `task_53bc69da` that migration 138 deferred (the `(status, created_at)` requests index
-codex flagged as the highest write-amplification risk). The measurement below does not
+flagged during review as the highest write-amplification risk). The measurement below does not
 justify the index at the current access pattern, and a hard sequencing dependency
 (`task_02ed10ce`) blocks it regardless. Re-evaluate only when the two criteria at the
 bottom are both met.
 
-## What was deferred (and by whom)
+## What was deferred and why
 Migration 138 (`138_list_query_indexes.sql`) added `idx_requests_site_env_created_at`
 `(site, environment, created_at DESC)` — the scoped-principal list, the documented
-"hottest authenticated read path". In the same review codex **deliberately deferred** a
+"hottest authenticated read path". The same review **deliberately deferred** a
 sibling `(status, created_at DESC)` index:
 
 > A status-only index was deliberately deferred (status changes on every lifecycle
-> transition = write amplification; ship the scoped index first and measure — codex).
+> transition = write amplification; ship the scoped index first and measure).
 > — `migrations/138_list_query_indexes.sql:30`
 
 Tracked in `docs/design/swarm-findings-2026-06-30-run7.md:44` as deferral (a),
@@ -51,7 +51,7 @@ sorts. But the population that can reach that path is narrow:
   ("all FAILED across every site"), not a per-request or per-scoped-user hot path.
 
 ## Cost: write amplification here is maximal *and* asymmetric to 138
-The reason this index is uniquely expensive — and the reason codex singled it out — is
+The reason this index is uniquely expensive — and the reason it was singled out — is
 not generic "indexes cost writes". It is that the leading column **mutates on the
 table's most frequent write**, while 138's columns never mutate:
 
@@ -104,7 +104,7 @@ outcome: all cost, contingent benefit. Sequencing matters — the predicate must
 sargable first.
 
 ## Decision
-**Do not add `idx_requests_status_created_at`.** Confirm codex's original instinct with
+**Do not add `idx_requests_status_created_at`.** Confirm the original review decision with
 the added rigor above (the write-amplification asymmetry + the live OR-NULL dependency).
 Close `task_53bc69da`.
 

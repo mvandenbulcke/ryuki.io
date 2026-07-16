@@ -1,7 +1,7 @@
 # Criticality → required_approval_roles policy (the #4 quorum capstone)
 
-Status: DESIGN-ONLY, DEFERRED (codex plan-reviewed twice; implementation deferred to
-a dedicated session). The plan-time wiring below is APPROVED (codex round-2 APPROVE
+Status: DESIGN-ONLY, DEFERRED (plan-reviewed twice; implementation deferred to
+a dedicated session). The plan-time wiring below is APPROVED (round-2 APPROVE
 option A) and the ordering-safety argument holds — BUT a verify-first check found this
 is a 2-PART feature, not the single policy slice the swarm scoped:
 
@@ -19,7 +19,7 @@ To deliver real value this needs BOTH parts, as a dedicated change:
    "standard"), validate it, thread it through the create INSERT. Keeps criticality
    immutable-after-create (so the ordering-safety below still holds). Backward-compat:
    existing `"standard"` rows map to 1.
-2. PLAN-TIME policy: exactly the design below (codex-approved).
+2. PLAN-TIME policy: exactly the design below (review-approved).
 
 The original (part-2-only) design follows, retained for the dedicated session.
 
@@ -74,8 +74,8 @@ with `required_approval_roles = 1` — a window where a concurrent approver coul
 the stale single-approval threshold and advance a high-criticality request with ONE
 approver (a quorum bypass). Setting it while still Validated closes that window.
 
-### Stale-criticality race (codex plan BLOCKER) — VERIFIED NOT REACHABLE TODAY
-Codex flagged: a concurrent PUT changing criticality Low→High BETWEEN the load and
+### Stale-criticality race (plan-review BLOCKER) — VERIFIED NOT REACHABLE TODAY
+Review finding: a concurrent PUT changing criticality Low→High BETWEEN the load and
 the plan-flip (the `enrich_plan_stages_with_terraform().await` window can be seconds)
 would leave the request Planned as High with the stale threshold 1 — a bypass.
 VERIFIED: `criticality` is IMMUTABLE after create — there is NO criticality edit/PUT

@@ -1,7 +1,7 @@
 # GET approval-decisions — surface the individual approval-decision ledger
 
-Status: SHIPPED (codex plan APPROVE + codex impl APPROVE, no defects; an extra
-test assertion added per a non-blocking codex impl note — the happy test now asserts
+Status: SHIPPED (plan APPROVE + implementation APPROVE, no defects; an extra
+test assertion added per a non-blocking implementation-review note — the happy test now asserts
 the two same-tx `decided_at` values are EQUAL, making explicit that the BIGSERIAL id
 ASC tie-breaker is what orders them). 3 plan MINORs folded in — (1) deterministic
 `ORDER BY decided_at ASC, id ASC` since Postgres now() is tx-scoped and same-tx rows

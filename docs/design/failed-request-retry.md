@@ -1,13 +1,13 @@
 # Operator-initiated retry of a FAILED request — POST /api/requests/{id}/retry
 
-Status: **DEFERRED** (codex plan review NEEDS-CHANGES — 2 BLOCKERS). The gap is real, but the
+Status: **DEFERRED** (plan review NEEDS-CHANGES — 2 BLOCKERS). The gap is real, but the
 "one pure fn + one rework-like handler" slice below is UNSAFE: retry of a Failed request is
 entangled with the execution-attempt and approval-quorum machinery, and the *valuable* case
 (execution failures) is exactly the entangled one. A correct retry is an L-effort,
 security-critical change — NOT the small slice the swarm scoped. Recorded here for a proper
 future slice; this session pivoted to the clean, fail-open notification-dispatch feature instead.
 
-## Why deferred — codex plan BLOCKERS (must be solved first)
+## Why deferred — plan BLOCKERS (must be solved first)
 1. **Stale agent jobs go live again.** After Failed→Intake the request is no longer concluded,
    so an OLD dead-lettered job (correctly blocked while Failed by the agents.rs:2622 guard)
    becomes requeueable, and `poll_job` leases any Pending job by platform with no request
@@ -29,7 +29,7 @@ future slice; this session pivoted to the clean, fail-open notification-dispatch
    arbitrary Request.metadata — narrow payload allowlist). MINOR: non-Failed retry maps to 400
    via map_engine_error, not 409.
 
-codex direct answers (still valid for the future slice): Failed-only is correct (do NOT fold in
+Review conclusions (still valid for the future slice): Failed-only is correct (do NOT fold in
 Rejected/Cancelled); `execute` permission is defensible ONCE stale approvals/jobs are fenced;
 single-only is a reasonable first slice. The blockers are about dependent state, not the gate.
 
@@ -80,7 +80,7 @@ failure* an operator legitimately wants to re-run. `Rejected` (a human SoD decis
 retry; reopening those would need their own explicit, separately-authorised path. Slice 1 is
 Failed-only.
 
-### Un-conclude safety (the one subtle point — for codex)
+### Un-conclude safety
 Retry moves a *specific request* Failed → Intake. The `is_concluded()` CLASSIFIER is UNCHANGED
 (`Failed.is_concluded()` stays true; the engine test at request_lifecycle.rs:1625 still holds).
 Every `is_concluded()` consumer checks the request's CURRENT status, and each correctly
@@ -105,13 +105,13 @@ No consumer assumes "ever-Failed ⇒ forever-Failed"; none caches conclusion. So
   scope guard, `retry_request`, `record_audit_local` action `"request.retry"`).
 - Route: `.route("/api/requests/{id}/retry", post(requests_retry))` next to `/rework`.
 
-### Permission tier — `execute` (PROPOSED; codex to confirm)
+### Permission tier — `execute` (PROPOSED)
 Retry is the operational INVERSE of `fail` (which is `execute`-tier, contracts.rs:17571): the
 operator who can fail a request can retry it — symmetric, no asymmetric lockout. Retry cannot
 bypass any gate (it returns to Intake and re-runs the full gauntlet, including re-approval), so
 it does not warrant a higher tier. `rework` is `approve`-tier, but rework bounces an
 *already-approved/locked* request (undoing approval work); retry re-runs a *failed* one. If
-codex prefers `approve` for consistency with the other →Intake transition, that is a one-line
+`approve` is preferred for consistency with the other →Intake transition, that is a one-line
 change.
 
 ## Tests

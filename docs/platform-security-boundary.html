@@ -863,7 +863,7 @@ authentication:
 <li>Update operator, API, Entra, Vault, agent, and incident-response documentation from the final implemented behavior.</li>
 </ul>
 <h2 id="work-that-does-and-does-not-require-trusted-access">Work that does and does not require Trusted Access</h2>
-<p>This split applies the defensive scoping in OpenAI's documented additional safety checks for cybersecurity requests: repository-local identification, prevention, remediation, implementation, and testing remain in scope without production access. The separate requirement for operator authorization over production credentials, external targets, and live-provider actions is Ryuki's own platform safety boundary; the OpenAI article does not itself grant or withhold access to those environments.</p>
+<p>This split establishes a defensive local safety boundary: repository-local identification, prevention, remediation, implementation, and testing remain in scope without production access. Operator authorization is still required for production credentials, external targets, and live-provider actions; local repository access never grants authority over those environments.</p>
 <p>The repository can safely implement and verify the following without production credentials or live-provider access:</p>
 <ul>
 <li>typed profiles, principal/action/resource/decision types, and route coverage;</li>
@@ -948,7 +948,6 @@ authentication:
 </ol>
 <h2 id="standards-and-implementation-references">Standards and implementation references</h2>
 <ul>
-<li><a href="https://help.openai.com/en/articles/20001326-additional-safety-checks-for-biological-and-cybersecurity-requests-in-chatgpt-codex-and-the-api">OpenAI additional safety checks for biological and cybersecurity requests</a></li>
 <li><a href="https://www.rfc-editor.org/rfc/rfc9700.html">OAuth 2.0 Security Best Current Practice (RFC 9700)</a></li>
 <li><a href="https://www.rfc-editor.org/rfc/rfc7636.html">Proof Key for Code Exchange (RFC 7636)</a></li>
 <li><a href="https://www.rfc-editor.org/rfc/rfc8252.html">OAuth 2.0 for Native Apps (RFC 8252)</a></li>

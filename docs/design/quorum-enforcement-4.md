@@ -1,6 +1,6 @@
-# #4 — Multi-role approval quorum ENFORCEMENT (design, codex-reviewed)
+# #4 — Multi-role approval quorum ENFORCEMENT (reviewed design)
 
-Status: design APPROVED-with-changes by GPT-5 Codex (the changes below are folded in).
+Status: design APPROVED-with-changes (the review changes below are folded in).
 Approach **A** (single column + API-layer enforcement; engine `approve_request` unchanged).
 
 ## Goal
@@ -27,10 +27,10 @@ from-status==Planned + completed plan stage and PRODUCE the completed approve st
 evidence / approval_route. Do NOT assume it commits Approved.
 
 New helper `apply_approval_decision_audited` (sibling of `apply_transition_audited`),
-ALL in ONE tx, in this order (codex fix #1 — row lock serializes quorum eval):
+ALL in ONE tx, in this order (review fix #1 — row lock serializes quorum eval):
 1. **`SELECT {REQUEST_COLUMNS} FROM requests WHERE id=$1 FOR UPDATE`** — lock the
    request row first; re-verify status is still `planned` (else 409 transition_conflict).
-2. **Idempotent short-circuit (codex fix #3):** if a decision row already exists for
+2. **Idempotent short-circuit (review fix #3):** if a decision row already exists for
    `(request_id, role=approval_role_for(session))` with decision='approved', do NOT
    re-run/re-audit/re-emit — re-read decisions, compute quorum, return the current
    `(row, QuorumStatus)` unchanged (no duplicate evidence/audit/event).
@@ -40,7 +40,7 @@ ALL in ONE tx, in this order (codex fix #1 — row lock serializes quorum eval):
    WHERE request_id=$1`) → `Vec<ApprovalDecision>`.
 5. `let req = current.required_approval_roles as usize;
    let q = evaluate_quorum(&decisions, req, req);` (required_approvers pinned to req —
-   codex fix #4-ok: distinct-approver floor blocks one actor self-forming a quorum).
+   review fix #4: distinct-approver floor blocks one actor self-forming a quorum).
 6. Branch:
    - `q.quorum_met` → CAS UPDATE status→'approved' (request_status_to_db(Approved))
      with the engine's stages_json/approval_route_json, expected_from='planned';
@@ -50,7 +50,7 @@ ALL in ONE tx, in this order (codex fix #1 — row lock serializes quorum eval):
      UPDATE only stages/approval_route/updated_at (status stays 'planned'); write
      audit (action `request.approval_recorded`, to_status='planned'); emit a DISTINCT
      `request.approval_recorded` event and **NO "Request approved" owner notification**
-     (codex fix #2 — a partial approve must not tell the owner it's approved).
+     (review fix #2 — a partial approve must not tell the owner it's approved).
 7. commit. Return `(DbRequestRow, QuorumStatus)`.
 
 Refactor the shared inner audit+event+notification block out of `apply_transition_audited`
@@ -61,7 +61,7 @@ into a small private fn so both helpers keep audit/event PARITY; non-approve tra
 (approved_roles/required_roles/distinct_approvers/required_approvers/quorum_met) so a
 partial approve returns 200 with status still 'planned' (callers must read quorum_met).
 
-Reject path (codex): `reject_request` stays terminal Planned→Rejected; ensure it takes
+Reject path: `reject_request` stays terminal Planned→Rejected; ensure it takes
 the SAME request-row `FOR UPDATE` lock ordering (lock row → insert decision/transition)
 to avoid a deadlock with the approve helper. A single 'rejected' row makes
 `evaluate_quorum` return rejected=true unconditionally.
@@ -69,7 +69,7 @@ to avoid a deadlock with the approve helper. A single 'rejected' row makes
 No-DB / in-memory arm (15970-15994): NO ledger → stays single-approval unconditionally;
 add a one-line comment that quorum enforcement is DB-only (dry-run limitation).
 
-Read-only `requests_approval_quorum` (~17539, codex fix #6): default both thresholds to
+Read-only `requests_approval_quorum` (~17539, review fix #6): default both thresholds to
 `current.required_approval_roles` (instead of the hardcoded 2/2) when no query override,
 so the reported quorum matches the enforced quorum.
 

@@ -1,8 +1,8 @@
 # #17 (slice 2) — Batch reject
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, all fixed below. Extends
+Status: design — plan-review round 1 NEEDS-CHANGES, all fixed below. Extends
 the existing batch-operations work (`requests_batch_cancel`, slice 1) with the
-sibling terminal verb. Codex fixes: (major) the ≤2000 reason cap is batch-only so
+sibling terminal verb. Review fixes: (major) the ≤2000 reason cap is batch-only so
 single reject is behavior-preserving; (major) the no-DB scope guard added to
 `reject_one` is flagged as a DELIBERATE consistency-hardening change with tests;
 (minor) batch permission denial is audited once with a non-id sentinel, not by
@@ -46,14 +46,14 @@ validation → `reject_one(&session, &request_id, reason)` wrapped in `Json`.
 This keeps single and batch reject identical in SoD/scope/transition/audit —
 exactly how `cancel_one` backs both single and batch cancel.
 
-CODEX FIX (major — reason length): reason validation stays in the CALLER, not in
+REVIEW FIX (major — reason length): reason validation stays in the CALLER, not in
 `reject_one` (which takes an already-validated reason, like `cancel_one`). The
 single handler keeps its EXACT current validation — `reject_control_chars` +
 non-empty, NO `>2000` cap — so it is behavior-preserving. The `≤2000` cap is
 applied ONLY in the batch handler (matching `requests_batch_cancel`'s cap); it is a
 deliberate batch-only policy, not a change to the single endpoint.
 
-CODEX FIX (major — no-DB scope hardening, DELIBERATE behavior change): the CURRENT
+REVIEW FIX (major — no-DB scope hardening, DELIBERATE behavior change): the CURRENT
 no-DB `requests_reject` does NOT run the in-memory `is_scoped`/`row_scope_permits`
 guard — only its DB path scopes (`scope_guard_or_404`). `reject_one` ADDS that
 guard to the no-DB path, mirroring `cancel_one`, so an out-of-scope id 404s in
@@ -79,7 +79,7 @@ async fn requests_batch_reject(AuthExtractor(session), Json(b): Json<BatchReject
     -> ApiResult
 ```
 1. `check_permission(&session, "approve")` once → 403 (whole batch) if absent.
-   CODEX FIX (minor): audit the denial EXACTLY ONCE with a non-id sentinel —
+   REVIEW FIX (minor): audit the denial EXACTLY ONCE with a non-id sentinel —
    `record_transition_denied(&session, "batch", "request.reject")` — NOT by looping
    the ids (that would both be wasteful and risk an existence oracle on a denied
    caller). `"batch"` is a clear non-id placeholder for the `request_id` field.
@@ -115,7 +115,7 @@ the batch-cancel route (contracts.rs:149).
    already-terminal id (engine 4xx) → `succeeded=1 failed=2`, per-id statuses
    correct, HTTP 200.
 3. **Permission**: a non-approver (e.g. auditor) → whole batch 403 (mirrors
-   `requests_reject_rejected_for_auditor`), nothing rejected. (Codex note: if the
+   `requests_reject_rejected_for_auditor`), nothing rejected. (Review note: if the
    test asserts the denial audit row, assert by count/action/outcome — the durable
    audit parses the non-UUID `"batch"` sentinel to a NULL `request_id`, so don't
    assert `request_id = 'batch'`.)
@@ -126,7 +126,7 @@ the batch-cancel route (contracts.rs:149).
 5. **Shape**: empty ids → 400; >100 ids → 400; duplicate ids deduped (acted once).
 6. **Scope** (DB): an out-of-scope id for a scoped session → that item 404s
    (no oracle), in-scope item still rejected.
-7. **No-DB scope hardening** (codex): with no DB, a scoped session rejecting an
+7. **No-DB scope hardening**: with no DB, a scoped session rejecting an
    out-of-scope in-memory request → 404 (single handler AND inside a batch),
    proving `reject_one` closed the no-DB scope gap consistently with `cancel_one`.
 8. **Single reject unchanged otherwise**: the existing `requests_reject_*` tests

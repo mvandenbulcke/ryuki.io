@@ -1,6 +1,6 @@
 # Operator triage list for shift_queue
 
-Status: design (pre-codex-plan-review). Additive read-only operator view over the
+Status: design (before plan review). Additive read-only operator view over the
 `shift_queue` work-item table. NO migration, NO engine change. Picked by the fresh
 analysis swarm (S effort, low risk, CI-verifiable).
 
@@ -39,7 +39,7 @@ pub struct ShiftQueueFilter<'a> {
     pub resolved: Option<bool>,
     pub acknowledged: Option<bool>,
     pub escalated: Option<bool>,
-    /// codex MINOR: triage UNASSIGNED work. Some(true) => assigned_to IS NULL;
+    /// Review requirement: triage UNASSIGNED work. Some(true) => assigned_to IS NULL;
     /// Some(false) => IS NOT NULL; None => no filter.
     pub unassigned: Option<bool>,
 }
@@ -62,8 +62,8 @@ WHERE ($1::text IS NULL OR item_type = $1)
   AND ($4::bool IS NULL OR resolved = $4)
   AND ($5::bool IS NULL OR acknowledged = $5)
   AND ($6::bool IS NULL OR escalated = $6)
-  AND ($7::bool IS NULL OR (assigned_to IS NULL) = $7)   -- codex MINOR: unassigned
-ORDER BY priority ASC, created_at ASC, id ASC            -- codex MAJOR: id tiebreak
+  AND ($7::bool IS NULL OR (assigned_to IS NULL) = $7)   -- unassigned filter
+ORDER BY priority ASC, created_at ASC, id ASC            -- stable id tiebreak
 LIMIT $8 OFFSET $9
 ```
 ORDER: `priority ASC` (P1<P2<P3) then `created_at ASC` (OLDEST-waiting first — the
@@ -126,7 +126,7 @@ pagination pattern) — no COUNT query.
 - sources/ryuki-api/src/contracts.rs (`ShiftListParams`, `shift_list` + route + db tests).
 NO migration, NO engine change.
 
-## AUTHZ (codex MAJOR, rounds 1-2)
+## Authorization review findings (major, rounds 1-2)
 SAFE-method reads are gated by `read_permission_for`/`read_authorized`, NOT
 `route_permission_for` (whose `/api/ops`→`execute` applies to UNSAFE methods only) —
 so an ordinary GET defaults to the `audit` tier (`audit || request`). The shift queue
@@ -134,8 +134,8 @@ is OPERATOR working data (open-item descriptions + assignees), so:
 - CENTRAL gate: a new `execute`-read tier — `is_execute_read_path` matches
   `/api/ops/shift/...`, `read_permission_for` returns `"execute"`, `read_authorized`
   enforces it. This covers the WHOLE per-item shift read family (summary / handover /
-  my-items / stale / items) and any future shift read — closing the equivalent
-  `/handover` leak codex found, not just `/items`. The static `/api/ops/shift-contract`
+  my-items / stale / items) and any future shift read — closing the `/handover`
+  exposure identified during review, not just `/items`. The static `/api/ops/shift-contract`
   (not under `/shift/`) stays ordinary-readable.
 - DEFENSE-IN-DEPTH: `shift_list` ALSO does an in-handler `check_permission(execute)`
   (belt-and-suspenders; covered by its own auditor-403 test).

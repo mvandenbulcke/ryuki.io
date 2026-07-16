@@ -1,6 +1,6 @@
 # GET /api/admin/tokens/{id} — token read-by-id
 
-Status: design (pre-codex-plan-review). Small read-completeness win (narrow scan).
+Status: design (pre-plan-review). Small read-completeness win (narrow scan).
 
 ## Goal
 `/api/admin/tokens` has create (POST), list (GET), revoke (DELETE /{id}), but no
@@ -20,7 +20,7 @@ owner, expiry, validity) without scanning the full list. Add `GET
   ```
   (reuse `TokenListRow` via `fetch_optional`). NOTE: `token_hash` is DELIBERATELY
   excluded — the secret is NEVER returned (identical to the list's projection).
-- `None` ⇒ a GENERIC token-not-found 404 (codex: NOT revoke's "no active token"
+- `None` ⇒ a GENERIC token-not-found 404 (review note: NOT revoke's "no active token"
   message — revoke filters `revoked_at IS NULL`, but this GET uses `WHERE id = $1`
   only, so a REVOKED token is still readable like the list; 404 means genuinely
   absent). `Some(row)` ⇒ the SAME per-row JSON the list builds — factor the
@@ -36,11 +36,11 @@ onto the existing `/api/admin/tokens/{id}` path (which has DELETE), so NO new pa
 and NO matchit collision (method-routing on the same path).
 
 ## Tests
-1. **No-secret projection** (the load-bearing one, codex): assert the GET-by-id
+1. **No-secret projection** (the load-bearing one): assert the GET-by-id
    response carries `token_hash == null` (the list's deliberate shape) and NEVER a
    real hash/plaintext — only the metadata fields. (The shared helper guarantees
    parity with the list.)
-1b. **Revoked token is readable** (codex): a soft-revoked token (revoked_at set) is
+1b. **Revoked token is readable**: a soft-revoked token (revoked_at set) is
    still returned by GET-by-id (200, with revoked_at) — NOT 404 — matching the list
    (the GET does not filter revoked_at).
 2. **By-id happy** (DB, if a token-seed/insert helper exists): create/seed a token,

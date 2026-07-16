@@ -10,7 +10,7 @@ operator who KNOWS the job is garbage (dead agent, bad spec, decommissioned plat
 terminally fail it NOW — they must wait out N lease-expiry cycles + the dead-letter cap. This adds
 an admin force-fail for a `Leased` job.
 
-## Scope: Leased + NON-LiveApply mode ONLY (safety) — codex blocker
+## Scope: Leased + NON-LiveApply mode ONLY (safety requirement)
 
 Cancel covers `Pending` (not yet leased). This covers `Leased` jobs whose mode is `OfflineDryRun`
 or `LivePlan` — modes that NEVER touch real infrastructure (offline validation / read-only plan).
@@ -21,7 +21,7 @@ match).
 EXCLUDED → 409:
 - `Running` (agent acked and is EXECUTING) — a running job belongs on the lease-expiry / reconcile
   path, not a blunt force-fail.
-- `Leased` **LiveApply** (codex blocker): `Leased` is NOT a mode-agnostic "touched no infra"
+- `Leased` **LiveApply** (safety blocker): `Leased` is NOT a mode-agnostic "touched no infra"
   predicate — the agent has the work, and with out-of-order ack/result delivery a `LiveApply` agent
   could have STARTED applying real infra before/while acking. Force-failing it → `Failed` would
   reject a late result and strand unreconciled infra. So a `Leased LiveApply` must go through the
@@ -38,7 +38,7 @@ EXCLUDED → 409:
 - in one tx, `SELECT status, platform, spec FROM agent_jobs WHERE id = $1 FOR UPDATE` (lock the
   row); not found → **404**; decode the dispatched `JobSpec`. The **`spec.mode` is AUTHORITATIVE**
   (the scalar `mode` column is NOT load-bearing — the agent routes by `spec.mode`, and a row can
-  carry `spec.mode=LiveApply` with a different column mode — codex B1). Decide on `spec.mode`:
+  carry `spec.mode=LiveApply` with a different column mode — review finding B1). Decide on `spec.mode`:
   `status != 'Leased'` → **409** (`Pending`→use-cancel / `Running`→reconcile-path / terminal);
   `Leased` + `spec.mode == LiveApply` → **409** (protect real infra); else CAS
   `UPDATE … SET status='Failed' WHERE id=$1 AND status='Leased'` (still Leased under the row lock).
@@ -58,14 +58,14 @@ EXCLUDED → 409:
   `agent-job-force-failed` audit row; one `job.force_failed` event with `to_status`
   `admin-force-failed` NOT in `alert_worthy_statuses()`; parent request still actionable; the status
   is now `Failed` (so the result CAS `status IN ('Leased','Running')` rejects a late result).
-- force-fail a `Leased LiveApply` job → **409** (codex nit) and the row stays `Leased`, no audit.
+- force-fail a `Leased LiveApply` job → **409** and the row stays `Leased`, no audit.
 - force-fail a `Running` job → 409.
 - force-fail a `Pending` job → 409.
 - unknown id → 404; non-admin → 403.
 
-## Deferred: scoped-admin scope guard (codex B2 — SYSTEMIC, not force-fail-specific)
+## Deferred: scoped-admin scope guard (review finding B2 — SYSTEMIC, not force-fail-specific)
 
-Codex flagged that the handler enforces only `check_permission("admin")` and does not
+Review identified that the handler enforces only `check_permission("admin")` and does not
 `scope_guard_or_404` the parent request, so a scoped admin (admin role + a `site_scope`) could
 force-fail an out-of-scope job. This is REAL but SYSTEMIC: `agents.rs` does not import
 `scope_guard_or_404`, and NONE of its ~13 admin handlers (reconcile, cancel, priority, dead-letter

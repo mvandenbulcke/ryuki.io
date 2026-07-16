@@ -55,11 +55,11 @@ TB→GB conversion, centered projection, commitment savings, compliance % div-by
   storage USAGE isn't tracked (VmUtilization has only provisioned storage_gb; get_site_capacity sets
   used_storage = total_storage), so current_storage_pct was always 100%, projected = 100+2.2*months
   always > 80, at_risk_storage always true → the recommendation ALWAYS said "Capacity expansion
-  recommended" regardless of real CPU/memory. FIX (codex plan-reviewed — three states risky/not-risky/
+  recommended" regardless of real CPU/memory. FIX (plan review covered three states: risky/not-risky/
   NOT-MEASURABLE): storage_at_risk=false + storage_risk_assessed=false + a storage_note, storage
-  utilization %s set to null (no fabricated value), recommendation driven by cpu||mem ONLY, dead
+  utilization values set to null (no fabricated value), recommendation driven by cpu||mem ONLY, dead
   storage computation removed. +strengthened test (recommendation.contains("expansion") == cpu||mem).
-  No portal/handler consumer of storage_at_risk. codex plan+impl reviewed.
+  No portal/handler consumer of storage_at_risk. Plan and implementation reviewed.
 
 ---
 
@@ -78,7 +78,7 @@ guards). Only the INCIDENT machine had a real gap.
   (contaminating the compliance/review record). Unlike decommission/AD/cert, which all guard their
   terminal states. FIX: fail-closed guard `if ctx.status != "active" { Err }` in all three pure fns
   (only an active incident is mutable). +unit test test_resolved_incident_is_terminal_and_immutable.
-  15 incident engine tests + 7 incident DB tests green. codex review pending.
+  15 incident engine tests + 7 incident DB tests green. Review pending.
 
 ## Flagged (low, task_7981ce77)
 - secrets_deregister hardcodes audit from_status="active" regardless of the real prior status, and its
@@ -102,7 +102,7 @@ all verified sound.
   available=N-1 (the second overwriting the first → duplicate IP + wrong counter). FIX: moved the FULL
   locked-subnet re-read + reservation re-read + build_reservation + counter compute INSIDE the tx under
   the subnet FOR UPDATE (the unlocked pre-read is now only a fast not-found/scope check); decrement via
-  saturating_sub. +handler test (two reserves → distinct IPs, counters move by exactly 2). codex review
+  saturating_sub. +handler test (two reserves → distinct IPs, counters move by exactly 2). Review
   pending.
 
 ## Flagged (task_3c4259be)
@@ -156,14 +156,14 @@ scope per-item; suppress_trigger CAS `WHERE status <> 'Suppressed'`; scheduler s
   ~21033) — SHIPPED: `overall_status = if errored_count>0 {"degraded"} else {"ok"}` reported "ok" while
   SLOs/budgets were actively breached (breached_count>0), so a health gate reading the field saw green.
   FIX: 3-way `errored>0 -> degraded; breached>0 -> breached; else ok`. +test (a breaching SLO ->
-  breached_count>=1 AND overall_status != "ok"). codex review pending.
+  breached_count>=1 AND overall_status != "ok"). Review pending.
 
 ## Shipped (2/2 confirmed)
 - ✅ **ack_alert accepts ANY domain_event id** (med) — SHIPPED (commit 1c5b367): no alert-worthy guard, so
   acking a non-alert ('completed'/'intake') event succeeded + wrote a dangling alert_acks row. FIX:
   ack_alert takes `alert_statuses: &[String]` + gates on `payload->>'to_status' = ANY($2)` (the same
   alert_worthy set list_alerts uses); a non-alert id 404s like a missing one. Both single + batch paths
-  covered via ack_alert_one. +test (platform-wide non-alert event -> 404 + no alert_acks row). codex APPROVE.
+  covered via ack_alert_one. +test (platform-wide non-alert event -> 404 + no alert_acks row). Review APPROVED.
 
 ## Re-verified FALSE POSITIVE (the finder's main claim was wrong)
 - **"noise suppression never auto-expires -> hidden from detection forever"** — RE-VERIFIED FALSE on the
@@ -184,7 +184,7 @@ Result: SOUND. No clean bug — the DATA-SAFETY-CRITICAL paths all verify clean:
 (Planned->Approved->execute enforced + tested), retention boundaries (classify_restore_recency uses
 strict `>`, conservative), legal-hold state machine (release/extend guard Active; double-release
 rejected), classify_legal_hold_expiry boundaries, snapshot governance (stale `<` + eligible-status
-filter prevents re-flag loops), audit-retention `beyond` clamp to [0,total]. NO data-loss, legal-hold-
+filter prevents re-flag loops), audit-retention `beyond` clamp to [0,total]. NO data-loss, legal-hold
 bypass, or wrong-restore bug. (The decommission path doesn't call legal-hold check_compliance, but it's
 dry-run — no real purge to bypass.)
 
@@ -192,7 +192,7 @@ The 3 findings were RE-VERIFIED as false-positives / by-design (NOT fixed):
 - **"DR test startable on a Draft plan"** — FALSE POSITIVE. build_dr_plan creates plans as Draft (line
   445) and the existing tests (start_test on a fresh Draft plan) ASSERT SUCCESS — so the intended
   workflow is create(Draft) -> TEST -> approve/activate based on results. Testing a Draft plan is the
-  whole point; a status guard (which I drafted then REVERTED) would break the established, tested
+  whole point; a status guard was drafted and then reverted because it would break the established, tested
   behavior. (Same false-positive shape as patch_reboot's status-agnostic planning endpoint.)
 - **get_expiring_holds includes already-expired holds** (no `> now` lower bound) — a SEMANTIC judgment
   (is `/legal-hold/expiring` "approaching expiry" or "needs expiry attention incl. overdue"?). Changing
@@ -210,4 +210,4 @@ finding is the throughline: across run-8 MANY "findings" were deliberate design 
 positives I correctly did NOT "fix" (the maintenance-window inclusive-end, patch_reboot status-agnostic,
 the noise-suppression detection claim, the DR-test-on-Draft workflow). Remaining high-value: the
 owner-decision items (A0/B0 etc.), the flagged follow-ups, + larger data/execution-plane build-out.
-SESSION: 21 codex-reviewed commits across run-5/6/7/8.
+SESSION: 21 reviewed commits across run-5/6/7/8.

@@ -1,8 +1,8 @@
 # Audit integration-connection DELETE — close the destructive-mutation forensic gap
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/S). codex plan NEEDS-CHANGES → APPROVE (the
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/S). Plan review NEEDS-CHANGES → APPROVE (the
 no-DB TOCTOU MAJOR fixed with an atomic engine `delete_connection_returning`; `from_status: None`;
-cascade documented), codex impl review APPROVE (the "exactly one" count assertion added). The
+cascade documented), implementation review APPROVE (the "exactly one" count assertion added). The
 integration-connection MUTATION
 handlers write NO audit_log row — only `integration_test` audits (integration.rs:1114). Slice 1
 closes the WORST hole: `integration_delete` (an irreversible op on a credential-bearing provider
@@ -31,7 +31,7 @@ let deleted: Option<(String, Option<String>)> = sqlx::query_as(
 let Some((vendor_type, site_scope)) = deleted else { return integration_not_found(&id) };  // (rolls back the empty tx)
 audit::record_audit_tx(&mut tx, &session, &audit::AuditRecord {
     action: "integration.connection.deleted",
-    request_id: None, from_status: None, to_status: "deleted",   // from_status None — we do not read a prior runtime status (codex MINOR)
+    request_id: None, from_status: None, to_status: "deleted",   // from_status None — we do not read a prior runtime status (MINOR)
     from_stage: None, to_stage: "security",
     detail: json!({ "connection_id": id, "vendor_type": vendor_type, "site_scope": site_scope }),
     outcome: "success",
@@ -46,7 +46,7 @@ NOT surfaced in the event (no secret name/ref). The `record_audit_tx` failure pa
 tx via `?`, so there is never a committed delete without its audit row.)
 
 ### No-DB branch (integration.rs:1030)
-ATOMIC remove-and-return (codex MAJOR — avoid the `get_connection` then `delete_connection` TOCTOU
+ATOMIC remove-and-return (MAJOR — avoid the `get_connection` then `delete_connection` TOCTOU
 of two separate mutex acquisitions): add an engine `delete_connection_returning(id) ->
 Option<IntegrationConnection>` that removes AND returns the deleted connection under ONE lock. On
 `Some(conn)`: `record_audit_local` with the same AuditRecord (`vendor_type`/`site_scope` from the

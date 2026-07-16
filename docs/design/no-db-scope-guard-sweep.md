@@ -24,7 +24,7 @@ Confirmed MISSING the no-DB guard (READ each branch — grep is unreliable for t
 
 Already guarded (DO NOT touch): `approve` (`is_scoped` form @ 16480), `verify` (`scope_guard_or_404`
 @ 16883, after clone), `protect` (`scope_guard_or_404` @ 17013, after clone), `reject` (17414),
-`fail` (17662), `cancel` (17771). (Codex CORRECTED an earlier hand audit that wrongly flagged
+`fail` (17662), `cancel` (17771). (Review corrected an earlier hand audit that wrongly flagged
 verify/protect — those use a MULTI-LINE `scope_guard_or_404` the grep missed.)
 
 ## Severity
@@ -56,7 +56,7 @@ No engine change, no migration, no new helper. An unrestricted principal passes 
 One no-DB test (`requests_lifecycle_mutations_no_db_are_site_scoped`), mirroring
 `requests_reject_no_db_is_site_scoped_single_and_batch` + `metrics_budget_is_site_scoped`:
 **FAIL-CLOSED first** — `if get_db().is_some() { eprintln!("SKIP: no-DB scope test requires no-DB
-mode"); return; }` so it can NEVER false-green via the DB branch (codex B2: `get_db()` reads the
+mode"); return; }` so it can NEVER false-green via the DB branch (review finding B2: `get_db()` reads the
 process-global pool, not the env var — a prior DB test could have initialized it; a present pool
 would take the DB branch and 404 as not-found). Then seed one DEFRA/Planned in-memory request; build
 an execute-tier GBLON-scoped session (`static_dry_run()` + `APP_ROLE_VMWARE_OPERATOR` +

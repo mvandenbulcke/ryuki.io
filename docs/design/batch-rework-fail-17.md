@@ -1,6 +1,6 @@
 # Batch request rework + fail (#17 slice 3)
 
-Status: design (pre-codex-plan-review). Completes the request batch-ops surface:
+Status: design (pre-plan-review). Completes the request batch-ops surface:
 cancel + reject already shipped; this adds rework + fail. Additive, NO migration,
 no engine change, CI-verifiable. Reuses the proven `requests_batch_reject` template.
 
@@ -100,7 +100,7 @@ Plus a regression proving the **no-DB scope-gap closure**: a site-scoped session
 calling the SINGLE rework/fail on an out-of-scope request in no-DB mode → 404 (was a
 silent cross-scope action before this slice).
 
-### Codex plan-review additions (folded in — plan otherwise APPROVED)
+### Plan-review additions (folded in — plan otherwise APPROVED)
 - **(MAJOR) no-DB BATCH scope** (not just single): for both batch/rework + batch/fail,
   a site-scoped session with one in-scope + one out-of-scope id → the in-scope item
   succeeds, the out-of-scope item is a per-id 404, the out-of-scope row is UNCHANGED,

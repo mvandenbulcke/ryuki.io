@@ -1,8 +1,8 @@
 # Operator resolution of a ReconcileRequired agent job — POST .../jobs/{id}/reconcile
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/M). codex plan APPROVE (3 MINORs folded in:
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/M). Plan review APPROVED (3 MINORs folded in:
 request_id in the response, the non-alerting resolution event, the request-stays-Executing test);
-codex impl review APPROVE (no findings). The COMPANION to the just-shipped
+implementation review APPROVED (no findings). The COMPANION to the just-shipped
 reconcile-required ALERT (dcb8413): now that operators are alerted to a `ReconcileRequired` job,
 they need the action to CLOSE it. Together these close both ReconcileRequired gaps (no event → no
 exit). Additive admin endpoint, NO migration (`Failed` is already a terminal status).
@@ -39,7 +39,7 @@ for the audit:
 5. Audit: `record_audit_tx` + `security_audit("agent-job-reconcile-resolved",
    Some("reconcile-required"), "failed", { job_id, request_id, platform, reason })`. The free-text
    `reason` lives ONLY in the audit_log detail (operator-authored audit trail).
-6. RESOLUTION EVENT (codex): the reconcile-required Critical alert is event-lifecycle-based (a
+6. RESOLUTION EVENT: the reconcile-required Critical alert is event-lifecycle-based (a
    `job.reconcile_required` domain event surfaced by the alert feed). To close that lifecycle, emit a
    NON-ALERTING `job.reconcile_resolved` domain event in the same tx (aggregate_type `agent_job`,
    `to_status` `"reconcile-resolved"` — NOT in the classifier / `alert_worthy_statuses()`, so it does
@@ -50,7 +50,7 @@ for the audit:
 7. Commit. Return `{ job_id, request_id, status: "Failed", resolved: true, note: "the parent request
    remains Executing; conclude it with POST /api/requests/{id}/fail. A live-apply cannot be retried
    in place (its slot is permanently consumed); re-attempting requires a fresh request" }` —
-   `request_id` so the operator's next `/fail` target is unambiguous (codex MINOR). NOTE (run-7): the
+   `request_id` so the operator's next `/fail` target is unambiguous (minor review finding). NOTE (run-7): the
    note says **conclude with `/fail`**, NOT "retry" — there is no in-place live-apply retry (see
    "Out of scope" below); the original "fail or retry it separately" wording overpromised a
    capability that does not exist.
@@ -68,12 +68,12 @@ operator `reason` is operator-authored audit text, the correct place for it.
 ## Tests (agents.rs db tests + a no-DB 403)
 - happy (DB): seed a `ReconcileRequired` LiveApply job whose parent request is `Executing` → POST
   resolve → 200 `{status:"Failed", resolved:true, request_id}`; the job row is now `Failed`; the
-  PARENT REQUEST is STILL `Executing` (job-scoped resolve does not touch it — codex); one
+  PARENT REQUEST is STILL `Executing` (job-scoped resolve does not touch it); one
   `agent-job-reconcile-resolved` audit row with the reason + request_id; one non-alerting
   `job.reconcile_resolved` domain event (and it is NOT alert-worthy).
 - wrong-status + double-resolve (DB): a `Pending` (or `Failed`) job → 409 (only ReconcileRequired
   resolvable); a SECOND resolve of the now-`Failed` job → 409 and writes NO second audit row
-  (race-safe + non-duplicating — not "idempotent" in the API-result sense; codex).
+  (race-safe + non-duplicating — not "idempotent" in the API-result sense).
 - unknown (DB/no-DB): unknown job_id → 404; malformed id → 404.
 - 403 (no-DB): a non-admin session → 403.
 - empty reason → 400.

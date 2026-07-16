@@ -2252,13 +2252,11 @@ from the active trace ledger.
 
 ## Work that does and does not require Trusted Access
 
-This split applies the defensive scoping in OpenAI's documented additional
-safety checks for cybersecurity requests: repository-local identification,
-prevention, remediation, implementation, and testing remain in scope without
-production access. The separate requirement for operator authorization over
-production credentials, external targets, and live-provider actions is Ryuki's
-own platform safety boundary; the OpenAI article does not itself grant or
-withhold access to those environments.
+This split establishes a defensive local safety boundary: repository-local
+identification, prevention, remediation, implementation, and testing remain in
+scope without production access. Operator authorization is still required for
+production credentials, external targets, and live-provider actions; local
+repository access never grants authority over those environments.
 
 The repository can safely implement and verify the following without production
 credentials or live-provider access:
@@ -2557,7 +2555,6 @@ the explicit `AC-nnn` value rather than relying on display order.
 
 ## Standards and implementation references
 
-- [OpenAI additional safety checks for biological and cybersecurity requests](https://help.openai.com/en/articles/20001326-additional-safety-checks-for-biological-and-cybersecurity-requests-in-chatgpt-codex-and-the-api)
 - [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700.html)
 - [Proof Key for Code Exchange (RFC 7636)](https://www.rfc-editor.org/rfc/rfc7636.html)
 - [OAuth 2.0 for Native Apps (RFC 8252)](https://www.rfc-editor.org/rfc/rfc8252.html)

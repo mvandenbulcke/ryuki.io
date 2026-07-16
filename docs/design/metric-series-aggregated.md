@@ -1,12 +1,12 @@
 # Metric series aggregation — time-bucketed rollups
 
-Status: SHIPPED (codex plan NEEDS-CHANGES → 1 MAJOR + 3 MINOR folded in; codex impl
+Status: SHIPPED (plan review NEEDS-CHANGES → 1 MAJOR + 3 MINOR folded in; implementation review
 NEEDS-CHANGES → 1 MAJOR + 1 MINOR folded in → impl round-2 APPROVE. Impl MAJOR: the
 LIMIT must run NEWEST-first (the window lower-bound is not bucket-aligned, so a span×limit
-window can straddle > limit labels) — fixed with a `ORDER BY bucket DESC LIMIT` subquery
+window can straddle > limit labels) — fixed with an `ORDER BY bucket DESC LIMIT` subquery
 re-sorted ASC, proven by a fixed-date `metric_aggregated_limit_keeps_newest_buckets` test.
 Impl MINOR: the non-UTC test now uses `SET LOCAL TIME ZONE` in a rolled-back tx so it never
-persists on the pooled connection. See "## Codex plan-review fixes" at the end.)
+persists on the pooled connection. See "## Plan-review fixes" at the end.)
 Verify-first swarm 2026-06-29 finding #10.
 VERIFIED: `GET /api/metrics/series` (metrics_series, contracts.rs:19826) returns the most-
 recent ≤10k RAW samples (fetch_metric_series_rows: `ORDER BY observed_at DESC LIMIT 10000`)
@@ -27,7 +27,7 @@ change (SQL aggregation), NO change to the existing endpoints.
 - `granularity` required, ALLOWLISTED to a client-friendly set mapped to the Postgres
   `date_trunc` field — `hourly→hour`, `daily→day`, `weekly→week`, `monthly→month`; any
   other value → 400. (Allowlist → a fixed `&'static str` field; NEVER raw client text in
-  SQL — and it is BOUND, not interpolated, so it cannot be an injection vector even
+  SQL — and it is BOUND, not interpolated, so it cannot be an injection vector even as
   defense-in-depth.)
 - `enforce_scope_filters(&session, site, environment)` → the resolved (f_site, f_env), the
   same #2 scope push the raw series uses (a scoped principal is narrowed to its scope).
@@ -100,12 +100,12 @@ Use a fresh-UUID metric_key prefix to isolate from shared-DB samples.
 - Per-bucket forecasting (the raw /series endpoint already forecasts; aggregation is for
   historical trend, not projection).
 - `sum`/percentiles per bucket (min/max/mean/count is the swarm's spec; extensible later).
-- A rollup/materialized-aggregate layer (codex) — a future optimization for very
+- A rollup/materialized-aggregate layer — a future optimization for very
   high-cardinality metrics; the window bound below makes the on-read scan bounded enough.
 - Explicit `from`/`to` window params — the default bounded lookback covers the "last N
   buckets" use case; an explicit window is a follow-up.
 
-## Codex plan-review fixes (SUPERSEDE the body where they conflict)
+## Plan-review fixes (SUPERSEDE the body where they conflict)
 - **MAJOR — bound the scan (no all-history aggregation).** `LIMIT` after `GROUP BY` caps
   returned buckets but NOT rows scanned; on an append-only table with only the series index,
   the original query would aggregate ALL history for a metric/scope on every read. FIX: add a
@@ -132,7 +132,7 @@ Use a fresh-UUID metric_key prefix to isolate from shared-DB samples.
   filling (a period with no samples produces no bucket). `weekly` uses PostgreSQL's
   ISO-8601 Monday-start week, truncated at UTC.
 
-## Test additions (codex Q8)
+## Test additions from review
 - A **non-UTC DB-session** test: on a connection with `SET TIME ZONE` to a non-UTC zone,
   bucket a sample whose UTC calendar day differs from its local day, and assert the bucket
   start is the UTC day — proving the 3-arg `date_trunc(field, ts, 'UTC')` ignores the

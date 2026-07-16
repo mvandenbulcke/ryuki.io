@@ -12,7 +12,7 @@ aggregates; there is no single-job state read.
 ## Approach
 
 `GET /api/admin/agents/jobs/{job_id}/state` (admin-tier, read-only). Parses the id before `get_db`
-(a malformed id 404s even during a DB outage — codex precedent from `…/result`). Projects only the
+(a malformed id 404s even during a DB outage — matching the precedent from `…/result`). Projects only the
 NON-SECRET operational/lifecycle columns:
 `id, request_id, platform, mode, status, result_status, agent_id, lease_deadline,
 delivery_attempts, evidence_digest, created_at, updated_at, completed_at`.
@@ -27,7 +27,7 @@ Routing — `…/state` is a 5-segment path, the SAME shape as `/result` etc., N
 `…/agents/{agent_id}/approve|revoke`, and because matchit prioritizes the static `jobs` segment over
 the `{agent_id}` param, `POST /api/admin/agents/jobs/approve` would resolve to `jobs/{job_id=approve}`
 and (since the bare route is GET-only) return 405 — silently breaking approve/revoke for an agent
-literally named "jobs" (codex). The 5-segment `…/state` avoids that 4-segment level entirely. (The
+literally named "jobs". The 5-segment `…/state` avoids that 4-segment level entirely. (The
 `full_app_route_tree_builds_without_panic` test only proves the tree BUILDS, not method dispatch — it
 is necessary but not sufficient for this class of collision.)
 

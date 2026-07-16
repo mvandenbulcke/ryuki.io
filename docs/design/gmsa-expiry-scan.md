@@ -35,9 +35,9 @@ ORDER BY next_rotation
 The prefilter window is **8 days** while the classifier window is **7** — the prefilter is a strict
 SUPERSET of the actionable set, so even a ~1h DST calendar-day-vs-86.4M-ms drift (if the DB ran off
 UTC) can't push a 7-day-actionable row outside the prefilter; the classifier discards the 7–8 day
-rows as `Current` (codex).
+rows as `Current`.
 (a Revoked account is decommissioned — not rotation-relevant; `managed_password_interval_days > 0`
-guards against bad source data turning a 0/negative interval into permanent overdue noise — codex;
+guards against bad source data turning a 0/negative interval into permanent overdue noise;
 integer-times-interval avoids text interval parsing; predicate on the COMPUTED next_rotation, NOT the
 possibly-stale `status` column — the cert-scan lesson). The SQL predicate (DB `NOW()`) is a COARSE
 PREFILTER; the pure classifier (CP-clock `now_ms`) is the AUTHORITATIVE actionability guard — a row
@@ -50,7 +50,7 @@ place, mirroring the cert scan's ON-CONFLICT-DO-NOTHING refresh). Priority: Over
 (security-hygiene degradation, not an outage like an expired cert), DueSoon → P3. The queue item is
 framed as **"verify AD-side rotation / refresh the control-plane record"**, NOT "rotate the password
 manually" — AD auto-rotates the managed password, so an overdue `last_rotation_at` means stale CP
-telemetry or broken AD-side rotation, both of which call for VERIFICATION (codex). Reads
+telemetry or broken AD-side rotation, both of which call for VERIFICATION. Reads
 `gmsa_accounts`, writes only `shift_queue` — NO gMSA mutation. Surfaced fields (name,
 sam_account_name, site, status, next_rotation) are non-secret identity — the gMSA password is never
 in this table.

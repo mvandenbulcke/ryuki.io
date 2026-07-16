@@ -41,13 +41,13 @@ in `agents.rs`:
   reason}` — the free-text reason lives ONLY in the audit row;
 - emit a NON-alerting `job.cancelled` domain event (aggregate `agent_job`) with
   **`to_status: "admin-cancelled"`** — a marker that is deliberately NOT in
-  `alert_worthy_statuses()`, so the alert feed's coarse SQL prefilter never even FETCHES it (codex
-  B1: relying on `classify()` to drop a prefilter-matched `"cancelled"` is fragile — a future
+  `alert_worthy_statuses()`, so the alert feed's coarse SQL prefilter never even FETCHES it (review
+  finding B1: relying on `classify()` to drop a prefilter-matched `"cancelled"` is fragile — a future
   `severity_for_agent_job_status` change could silently page cancels; using a non-prefilter status
   is the robust `reconcile-resolved` precedent). Payload carries only static secret-safe fields
   (NO reason);
 - commit; response `{job_id, request_id, status: "Cancelled", cancelled: true}`.
-- **Job-scoped** (codex B2): the cancel transitions ONLY the job. Its parent request stays in its
+- **Job-scoped** (review finding B2): the cancel transitions ONLY the job. Its parent request stays in its
   prior state (`executing`) — it is NOT stranded into an invalid state: `executing` is non-concluded,
   so the operator completes the 2-step workflow with the EXISTING, well-tested
   `POST /api/requests/{id}/fail` (valid from any non-concluded state) or a retry. Auto-failing the
@@ -65,8 +65,8 @@ in `agents.rs`:
   `agent-job-cancelled` audit row (with the reason); one `job.cancelled` domain event whose
   `to_status` is `admin-cancelled`; the test asserts `admin-cancelled` is NOT in
   `event_alerts::alert_worthy_statuses()` — the set the alert feed's SQL prefilter keys on — so the
-  prefilter can never fetch a cancel event (codex B1); and the PARENT REQUEST is still present and
-  `executing` (actionable — codex B2).
+  prefilter can never fetch a cancel event (review finding B1); and the PARENT REQUEST is still present and
+  `executing` (actionable — review finding B2).
 - Cancel a `Leased` job → 409 (and the row stays `Leased`, no audit).
 - Cancel an unknown id → 404 (no audit).
 - Double-cancel → second is 409.

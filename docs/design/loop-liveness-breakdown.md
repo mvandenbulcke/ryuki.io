@@ -1,6 +1,6 @@
 # Per-loop background-loop liveness breakdown
 
-Status: design (pre-codex-plan-review). Additive read-only observability over the
+Status: design (awaiting plan review). Additive read-only observability over the
 shipped heartbeat registry + aggregate probe. NO migration, NO new state, pure core.
 Picked by the fresh analysis swarm (S effort, low risk, CI-verifiable).
 
@@ -51,7 +51,7 @@ identical; its existing tests still pass). `Serialize` derive on `LoopStatus`
 
 ## Handler + route (main.rs — beside /api/platform/health/dependencies)
 The (status-code, body) construction is a PURE fn in background.rs so the 200/503
-logic is deterministically testable WITHOUT the process-global registry (codex MAJOR
+logic is deterministically testable WITHOUT the process-global registry (MAJOR
 — the handler test cannot assert a fixed code against global state):
 ```rust
 // background.rs (pure)
@@ -93,7 +93,7 @@ wall-clock flakiness):
 4. Regression: `classify_loop_liveness` still classifies identically after the
    threshold extraction (the existing tests cover this; add one cross-check that the
    per-loop `overdue` set matches classify's `down` membership for the same entries).
-5. `loop_liveness_payload` (PURE — codex MAJOR): a report with an overdue loop →
+5. `loop_liveness_payload` (PURE — MAJOR): a report with an overdue loop →
    code 503 + overall "down"; an all-fresh report → 200 + "healthy"; an EMPTY report
    → 200 + "degraded". Body carries loops/overall/overdue_count/registered_count.
 HANDLER (light, no DB, registry-tolerant):

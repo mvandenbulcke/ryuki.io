@@ -20,7 +20,7 @@ triggering path is traced). 4 candidates → 3 CONFIRMED + fixed, 1 correctly RE
   `check_results` row per enabled health_check per tick, with NO prune (the run-3 sweep covered
   `job_executions` + `connection_health_checks` but missed this sibling). FIX: `PruneTarget::CheckResults`
   on the generalized prune + a `check_results_prune` job-kind (mig 133) running HOURLY (a daily cap of
-  20000 only keeps up below ~833 checks; hourly → ~20000-check headroom — codex) + a retention index.
+  20000 only keeps up below ~833 checks; hourly → ~20000-check headroom) + a retention index.
 
 ## Refuted (adversarial verify caught — NOT a bug)
 - **Multi-role approval quorum "unsatisfiable by two same-role approvers" + ON CONFLICT clobber**:
@@ -33,4 +33,4 @@ triggering path is traced). 4 candidates → 3 CONFIRMED + fixed, 1 correctly RE
 ## Notes
 - The `validity_days` cap is the only MAJOR — a real, scriptable, in-range-input handler panic any
   execute-tier principal could trigger; fixed at the validation boundary so every call path is safe.
-- Bug 2's clamp is untested (a 1-line robustness fix; codex did not block on the missing handler test).
+- Bug 2's clamp is untested (a 1-line robustness fix; review did not block on the missing handler test).

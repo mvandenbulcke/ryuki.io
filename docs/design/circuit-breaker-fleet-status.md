@@ -1,8 +1,8 @@
 # Fleet-wide circuit-breaker status — GET /api/integrations/circuits
 
-Status: SHIPPED (fresh discovery swarm, CONFIRMED H / S / low-risk). codex plan review
+Status: SHIPPED (fresh discovery swarm, CONFIRMED H / S / low-risk). Plan review
 NEEDS-CHANGES → APPROVE (route-shadow MAJOR closed by the `ic-` id prefix; now-after-SELECT,
-state allow-list, FK-cascade MINORs folded in); codex impl review APPROVE (no defects; the
+state allow-list, FK-cascade MINORs folded in); implementation review APPROVE (no defects; the
 half_open/closed allow-list test coverage added per the residual note). The SMALLEST additive
 read: the one durable failing-integration signal with NO aggregate operator view. NO migration,
 NO hot-path, NO mutation.
@@ -28,7 +28,7 @@ listing the table IS the actionable set (open + half_open). One additive admin r
 1. `require_admin(&session)?` (the per-connection circuit read is admin-gated; match it).
 2. No DB → `{ "source": "no-db", "breakers": [] }` (no durable breakers without a DB).
 3. Query (a new list SELECT that ALSO returns `connection_id`, which `BreakerRow` omits — the
-   adversarial's mechanical note). Use an explicit state ALLOW-LIST (codex MINOR) — defense beyond
+   adversarial's mechanical note). Use an explicit state ALLOW-LIST (review MINOR) — defense beyond
    the mig 106 `CHECK (state IN ('closed','open','half_open'))`, so no corrupt/unknown state can
    ever enter the actionable list:
    ```
@@ -38,7 +38,7 @@ listing the table IS the actionable set (open + half_open). One additive admin r
    ```
    (`ORDER BY opened_at_unix DESC` surfaces the most-recently-tripped first; `NULLS LAST` covers a
    `half_open` row whose `opened_at_unix` the mig-106 CHECK does not require.)
-4. Sample the shared DB clock via `DB_NOW_UNIX` (integration.rs:1482) AFTER the list SELECT (codex
+4. Sample the shared DB clock via `DB_NOW_UNIX` (integration.rs:1482) AFTER the list SELECT (review
    MINOR) — so a breaker opened between the two statements can never have `opened_at_unix > now_unix`
    (which would make the derived cooldown math odd). The same clock the per-connection read uses, so
    `allow_now`/`cooldown_remaining_secs` never skew between workers.
@@ -49,7 +49,7 @@ listing the table IS the actionable set (open + half_open). One additive admin r
 6. Return `{ "source": "db", "now_unix": <db clock>, "breakers": [ {connection_id, state,
    consecutive_failures, consecutive_successes, opened_at_unix, allow_now, cooldown_remaining_secs} ] }`.
 
-### Route — no shadow (codex MAJOR, resolved)
+### Route — no shadow (review MAJOR, resolved)
 `.route("/api/integrations/circuits", get(integration_circuits_list))` — a STATIC segment in the
 `{id}` slot, exactly like the shipped `/api/integrations/credentials/expiring` (integration.rs:1715).
 A `connection_id` can NEVER be the literal `circuits`: ids are SERVER-MINTED by `new_connection_id`
@@ -58,7 +58,7 @@ client-supplied-id path — `integration_create` binds the server-generated id).
 `circuits` literal cannot shadow any real `/api/integrations/{id}`. (`circuits` ≠ the other static
 `credentials` segment either.) Route-tree smoke additionally confirms axum accepts the tree.
 
-### No orphans (codex MINOR, resolved)
+### No orphans (review MINOR, resolved)
 `circuit_breakers.connection_id REFERENCES integration_connections(id) ON DELETE CASCADE` (mig
 106:12), so deleting a connection cascades away its breaker — the list never shows a breaker for a
 since-deleted connection.

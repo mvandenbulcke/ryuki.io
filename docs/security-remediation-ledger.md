@@ -1,6 +1,6 @@
 # Security Remediation Ledger
 
-This ledger tracks the 231 reportable findings from Codex Security scan `130831dd-558e-46db-8ec5-20f929ddefe6` of revision `8212748308372e92d9cf794907d85fe103afd1da`.
+This ledger tracks the 231 reportable findings from the repository security scan `130831dd-558e-46db-8ec5-20f929ddefe6` of revision `8212748308372e92d9cf794907d85fe103afd1da`.
 
 The current dirty worktree is authoritative. The prior fix report was revalidated against the current source, focused regressions, and the final clean repository gates. Every row uses exactly one final status:
 

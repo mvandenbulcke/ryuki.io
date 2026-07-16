@@ -1,7 +1,8 @@
 # Scheduled secret-rotation-due scan — durable-scheduler job kind
 
-Status: implemented (codex plan NEEDS-CHANGES → all 3 MAJOR + 3 MINOR folded in, see
-"## Codex plan-review fixes" at the end — they SUPERSEDE the original single-signal arm).
+Status: implemented (plan review required changes; all 3 major and 3 minor findings
+were incorporated. See "## Plan-review fixes" at the end; they supersede the original
+single-signal arm).
 Verify-first swarm 2026-06-29 finding #7.
 VERIFIED: `job_is_schedulable` (ryuki-engine/scheduler.rs:104) lists exactly 4 write
 kinds (synthetic_health_run, maintain_review_scan, connection_health_sweep,
@@ -50,11 +51,11 @@ fn, write only our own shift_queue — no provider/live call).
   `secret_type`. `retired` excluded (decommissioned); `rotating` excluded (a rotation is
   in flight — its stale past `next_rotation_due` would be a spurious duplicate). `expired`
   / `failed` are KEPT — they are overdue and need attention.
-- Dueness in RUST, not SQL (codex gotcha #1): for each row, `chrono::DateTime::
-  parse_from_rfc3339(&row.next_rotation_due)` — on `Err`, **SUPERSEDED by codex MAJOR 1
+- Dueness in RUST, not SQL (implementation note): for each row, `chrono::DateTime::
+  parse_from_rfc3339(&row.next_rotation_due)` — on `Err`, **SUPERSEDED by MAJOR 1
   below**: instead of silently skipping, enqueue a SECOND `secret-rotation-invalid-due`
   signal (the tick still never `?`-aborts on a bad row). Skip blank `id` too. On `Ok`,
-  `classify_secret_rotation_recency(next_due_ms, now_ms)` (MILLIS — codex MINOR 3); if
+  `classify_secret_rotation_recency(next_due_ms, now_ms)` (MILLIS — MINOR 3); if
   `is_due()`, enqueue the overdue item. (This avoids the `next_rotation_due::timestamptz`
   cast the on-demand handler uses, which would throw and abort the tick on a malformed value.)
 - `enqueue_if_absent(&mut **tx, SECRET_ROTATION_DUE_ITEM_TYPE, &row.id, &title,
@@ -64,17 +65,17 @@ fn, write only our own shift_queue — no provider/live call).
   - description = a human line with site/owner/due-date,
   - metadata JSON = `{ "source_ci_key": row.id, "name", "site", "owner",
     "next_rotation_due", "reason": "overdue" }` — NEVER `vault_path`/`secret_type`.
-- Return `("succeeded", ...)` with an AGGREGATE-ONLY detail (codex gotcha #2; surfaced via
+- Return `("succeeded", ...)` with an AGGREGATE-ONLY detail (privacy review finding; surfaced via
   /api/ops/scheduler/executions — never per-secret data). SHIPPED format is the TWO-count
-  `"enqueued {overdue} overdue, {invalid} invalid secret rotation item(s)"` (codex MAJOR 1),
+  `"enqueued {overdue} overdue, {invalid} invalid secret rotation item(s)"` (MAJOR 1),
   not the single-count sketch.
 
 ## shift_queue item type (ryuki-api/repos/shift_queue.rs)
-`pub const SECRET_ROTATION_DUE_ITEM_TYPE: &str = "secret-rotation-due";` PLUS (codex
+`pub const SECRET_ROTATION_DUE_ITEM_TYPE: &str = "secret-rotation-due";` PLUS (per
 MAJOR 1) `pub const SECRET_ROTATION_INVALID_ITEM_TYPE: &str = "secret-rotation-invalid-due";`
 
 ## Migration 125 (migrations/125_secret_rotation_due_scan.sql)
-Mirror 122. Latest migration is 124 → 125 is next. NOTE (codex MAJOR 1): the SHIPPED
+Mirror 122. Latest migration is 124 → 125 is next. NOTE (MAJOR 1): the SHIPPED
 migration has TWO partial unique indexes — the overdue one below AND a
 `uq_shift_queue_open_secret_rotation_invalid` for the `secret-rotation-invalid-due` signal
 (see the migration file). The single-index block below is the original sketch.
@@ -119,7 +120,7 @@ dependent). Cleanup the planted secrets + schedules; re-seed the migration sched
 - A dedicated "stuck rotation" detector for secrets parked in `rotating` (we EXCLUDE
   `rotating` here to avoid duplicate noise; surfacing a stuck rotation is a separate job).
 
-## Codex plan-review fixes (SUPERSEDE the above where they conflict)
+## Plan-review fixes (SUPERSEDE the above where they conflict)
 - **MAJOR 1 — surface malformed dates (no silent blind spot).** The arm is now TWO-signal
   (like `restore_overdue_scan`'s overdue+failed): on `parse_from_rfc3339` Err, instead of
   silently skipping, enqueue a SECOND deduped item `secret-rotation-invalid-due` (const

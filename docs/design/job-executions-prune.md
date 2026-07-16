@@ -1,8 +1,8 @@
 # Scheduler job_executions retention prune — bound the unbounded run history
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). codex plan NEEDS-CHANGES → APPROVE (the
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). Plan review NEEDS-CHANGES → APPROVE (the
 one-shot-DELETE MAJOR fixed with a per-run batch cap; keep sized to the 5-min cadence; NULLS LAST +
-keep/cap guard + stable tiebreak), codex impl review APPROVE (tie-case test now forces an identical
+keep/cap guard + stable tiebreak), implementation review APPROVE (tie-case test now forces an identical
 timestamp; doc wording). Directly serves the standing goal's
 disk-space concern: `job_executions` (mig 095) appends a row for EVERY scheduler run — the hourly
 self-health probe alone is ~720 rows/month, plus every scan/sweep — and NOTHING ever prunes it, so
@@ -21,24 +21,24 @@ persist), so it does not bound a live schedule's history. The table grows foreve
 ## Design — a newest-N-per-schedule prune (mirrors the scheduler job-kind shape)
 A daily PRUNE job that keeps the newest `KEEP_PER_SCHEDULE` rows per `schedule_id` and deletes the
 rest — regardless of age, so every schedule retains its recent history for debugging while total
-rows are bounded to `KEEP_PER_SCHEDULE × #schedules` (codex/adversarial preferred newest-N over a
+rows are bounded to `KEEP_PER_SCHEDULE × #schedules` (adversarial review preferred newest-N over a
 pure time-window, which would wipe a quiet schedule's whole history).
 
-### Retention constant — sized to the FASTEST cadence (codex MAJOR 2)
+### Retention constant — sized to the FASTEST cadence (MAJOR 2)
 The seeded schedules' fastest cadence is `connection_health_sweep` at **300s (5 min)** = 288 runs/day
 (others: 2× hourly, the rest daily). So `keep_per_schedule = 10000` gives the 5-min sweep ~35 days,
 the hourly probes ~14 months, the daily scans ~27 years — all BOUNDED (total ≤ 10000 × #live
 schedules ≈ <100k rows, a small table). Over-retaining the slow schedules is harmless (rows are
 tiny); the point is the hard logical bound + ≥30 days for the fastest schedule.
 
-### Prune helper + scheduler arm (ryuki-api/src/scheduler.rs) — BATCHED (codex MAJOR 1)
+### Prune helper + scheduler arm (ryuki-api/src/scheduler.rs) — BATCHED (MAJOR 1)
 A small free fn, unit-testable with a low `keep` + cap. A PER-RUN CAP bounds the victim set so the
 FIRST prune of a years-old backlog never does one giant unbounded DELETE (WAL/locks/dead-tuples/
 statement-timeout); a large backlog drains over a few daily runs, then steady-state deletes only the
 day's new over-cap rows:
 ```
 async fn prune_job_executions(conn, keep_per_schedule: i64, max_per_run: i64) -> Result<u64, sqlx::Error> {
-  if keep_per_schedule <= 0 || max_per_run <= 0 { return Ok(0); }   // guard (codex MINOR) — never delete-all
+  if keep_per_schedule <= 0 || max_per_run <= 0 { return Ok(0); }   // guard (MINOR) — never delete-all
   DELETE FROM job_executions WHERE id IN (
     SELECT id FROM (
       SELECT id, started_at, ROW_NUMBER() OVER (
@@ -54,7 +54,7 @@ async fn prune_job_executions(conn, keep_per_schedule: i64, max_per_run: i64) ->
 The `"job_executions_prune" =>` run_job arm calls it with `const KEEP_PER_SCHEDULE: i64 = 10000` +
 `const MAX_PER_RUN: i64 = 20000`, returning `Some("pruned {n} old job_executions row(s)")`.
 - `started_at` is `NOT NULL` (mig 095:53) so no NULLs arise, but `NULLS LAST` is added defensively
-  (codex MINOR) so a hypothetical NULL could never be retained ahead of real rows.
+  (MINOR) so a hypothetical NULL could never be retained ahead of real rows.
 - `id DESC` is a STABLE TIE-BREAK (NOT chronological — ids are not time-sortable), only to make
   "newest N" deterministic when two rows share `started_at`. A tie-case test covers it.
 - SELF-DELETION SAFE: the prune's OWN `job_executions` row is recorded by the tick AFTER `run_job`

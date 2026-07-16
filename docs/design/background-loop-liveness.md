@@ -1,8 +1,8 @@
 # Background-loop liveness in platform_self_health (swarm follow-on)
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, all fixed below. Builds on
+Status: design — plan-review round 1 NEEDS-CHANGES, all fixed below. Builds on
 the background-loop timeout slice (background.rs). Fresh-swarm rank #3/#5.
-Codex fixes (2 rounds): (blocker) timeout-AND-backoff-aware threshold
+Review fixes (2 rounds): (blocker) timeout-AND-backoff-aware threshold
 `2*iteration_timeout(interval) + 2*interval` — a 2x-interval (and even a bare
 2*timeout) budget false-positived on a slow timed iteration + a backoff retry;
 (major) `down` justified by the actual contract (platform_self_health is the
@@ -40,7 +40,7 @@ pub fn record_loop_success(name: &'static str);
 /// age_secs = last_success.elapsed().as_secs() computed at call time.
 pub fn loop_liveness() -> Vec<LoopLiveness>;   // LoopLiveness { name, interval_secs, age_secs }
 ```
-LOCK HYGIENE (codex minor): the registry is a `std::sync::Mutex<HashMap<...>>` in a
+LOCK HYGIENE (review minor): the registry is a `std::sync::Mutex<HashMap<...>>` in a
 `LazyLock`. All three fns are SYNCHRONOUS and never hold the guard across an
 `.await` — `loop_liveness()` copies each entry into the returned `Vec` while holding
 the lock, then DROPS the lock before the (pure) classifier runs. Use the existing
@@ -57,11 +57,11 @@ register_loop runs as the FIRST statement of the spawned future (before any awai
 so the baseline is set the instant the task starts.
 
 ## Pure verdict (`background.rs`, mirrors classify_scheduler_liveness)
-THRESHOLD (codex blocker fix): a 2x-INTERVAL budget is WRONG — the loop work is
+THRESHOLD (review blocker fix): a 2x-INTERVAL budget is WRONG — the loop work is
 timeout-bounded at `iteration_timeout(interval) = max(4*interval, 300s)`, so a
 legitimately-slow iteration (the loop blocks in `work.await` for up to that timeout,
 recording nothing) plus the interval wait can exceed 2x interval and falsely report
-`down`. The silence budget must be TIMEOUT-AND-BACKOFF-aware (codex round 2): one slow
+`down`. The silence budget must be TIMEOUT-AND-BACKOFF-aware (review round 2): one slow
 iteration can consume the full `iteration_timeout` (T), then the loop sleeps a
 backoff (≥ 1 interval I) and the retry can consume another T before recording
 success — a legitimately-healthy silence of up to ~`2T + 2I`. So:
@@ -82,7 +82,7 @@ idempotency sweep) — the deliberate price of zero false 503s on a status endpo
 /// so the aggregate probe is actionable.
 pub fn classify_loop_liveness(entries: &[LoopLiveness]) -> ryuki_engine::self_health::DependencyProbe;
 ```
-SEVERITY = `down` (codex major — justified, not parity-only): `platform_self_health`
+SEVERITY = `down` (review major — justified, not parity-only): `platform_self_health`
 is the dependency/STATUS endpoint (`GET /api/platform/.../dependencies`), NOT the
 k8s gate — the k8s liveness/readiness probes hit `/healthz` + `/readyz` (the basic
 `health` fn), per deploy/kubernetes/base/deployments.yaml. So a loop `down` makes
@@ -111,7 +111,7 @@ the DB is down (and the DB probe already covers that case separately).
 ## Tests
 - `classify_loop_liveness` (pure, no registry, no DB): empty ⇒ degraded; all ages
   ≤ threshold ⇒ healthy; one age > threshold ⇒ down AND the down detail NAMES the
-  overdue loop (codex minor — assert the name + that it is sorted/deterministic when
+  overdue loop (review minor — assert the name + that it is sorted/deterministic when
   multiple overdue); boundary at `2*iteration_timeout(interval) + 2*interval`
   exactly ⇒ healthy, `+1` ⇒ down (mirrors the scheduler's strict `>` semantics).
   Cover a small interval (30 ⇒ 2*300+60 = 660s) and the long one (3600 ⇒

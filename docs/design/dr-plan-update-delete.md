@@ -1,6 +1,6 @@
 # DR-plan general update (PUT) — CRUD edit
 
-Status: design — codex round 1 (1 blocker + 3 majors + 1 minor) → SCOPE NARROWED to
+Status: design — round 1 review (1 blocker + 3 majors + 1 minor) → SCOPE NARROWED to
 PUT-only (the blocker was DELETE-specific; DELETE deferred) → round 2 left only 2
 LOWs, both folded in (axum deny_unknown_fields is 422 not 400; advertise PUT in
 dr_contract). PUT concerns resolved: scalar-name sync, central /api/protect→execute
@@ -16,7 +16,7 @@ fields, mirroring the existing `dr_plan_update_rpo_rto` handler
 (contracts.rs:31246) — the proven get→scope-guard→pure-transform→xmin-CAS→audit→
 commit→write-through shape — so RBAC/scope/audit/concurrency stay identical.
 
-## Why DELETE is deferred (codex blocker)
+## Why DELETE is deferred (review blocker)
 A DELETE needs to protect dr_test_runs history, but `dr_test_runs.plan_id` has NO
 FK (mig 088) and `dr_test_start` resolves the plan from the in-memory store
 (get_plan_from_store) before inserting a run — so a concurrent start_test can
@@ -30,11 +30,11 @@ carefully; this slice ships the clean, race-free PUT. (Tracked as a follow-up.)
 Editable: `name`, `targetSite`, `systems`, `rpo`, `rto`. IMMUTABLE via PUT:
 - `site` — it is the SCOPE key; editing it would move the resource across RBAC
   scopes. Like the connection-update HARDENING-1 rule, `site` cannot change;
-  delete+recreate instead. (codex confirmed this immutability design is correct.)
+  delete+recreate instead. Review confirmed this immutability design is correct.
 - `status` — there is no DR-plan status-transition endpoint (plans are created
   `Draft`); a general PUT must NOT silently change lifecycle state.
 - `id` / `last_tested` / `next_test_due` — server-owned; preserved.
-`#[serde(deny_unknown_fields)]` on the body (codex) so a `site`/`status` smuggling
+`#[serde(deny_unknown_fields)]` on the body so a `site`/`status` smuggling
 attempt is a 400, not silently ignored.
 
 ## Engine (`sources/ryuki-engine/src/dr_testing.rs`)
@@ -45,7 +45,7 @@ validation: trim-non-empty `name`/`target_site`, non-empty `systems`, `rpo>0`,
 `last_tested`/`next_test_due`. Pure; unit-tested (happy + each validation +
 field-preservation).
 
-## Repo (`sources/ryuki-api/src/repos/dr_plans.rs`) — scalar `name` sync (codex major)
+## Repo (`sources/ryuki-api/src/repos/dr_plans.rs`) — scalar `name` sync (major)
 `transition` currently sets `status, plan_json, updated_at` but NOT the scalar
 `name` column — fine for rpo-rto (name unchanged) but a general PUT that edits the
 name would leave `dr_plans.name` stale (the denormalized scalar used by indexes/
@@ -70,9 +70,9 @@ plan_json) after a PUT.
 - Route next to the existing DR-plan routes (contracts.rs ~1503):
   `.route("/api/protect/dr/plans/{id}", put(dr_plan_update))`.
 - ALSO add `PUT /api/protect/dr/plans/{id}` to the `dr_contract` endpoint list
-  (contracts.rs ~31462) so the self-describing contract advertises it (codex).
+  (contracts.rs ~31462) so the self-describing contract advertises it.
 
-## Permission / scope (codex authz major — RESOLVED: central gate)
+## Permission / scope (authorization major — RESOLVED: central gate)
 `/api/protect/*` is centrally capability-gated to the `execute` permission
 (main.rs:498/700 + the check_permission layer at main.rs:928); the per-handler
 `guard_body_site_scope` adds site-scope on top. So PUT is NOT "guarded by
@@ -91,7 +91,7 @@ No schema change — reuses `dr_plans` (`transition` already stamps `updated_at`
    `dr-plan-update` row exists.
 2. **Validation**: empty name → 400; empty systems → 400; rpo=0 → 400 (engine unit
    + one DB 400).
-3. **Unknown-field rejection** (codex): a body carrying `site` or `status` → the
+3. **Unknown-field rejection**: a body carrying `site` or `status` → the
    axum `deny_unknown_fields` rejection, which is **422 Unprocessable Entity** for a
    plain `Json<T>` extractor in axum 0.8 (NOT 400). Assert 422 — unless the project
    wraps `Json` in a custom extractor that maps serde errors to 400, in which case

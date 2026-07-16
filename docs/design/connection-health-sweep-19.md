@@ -31,16 +31,16 @@ insert writes only our own `connection_health_checks`; NO provider/live call). T
 schedulable but NOT read_only.
 
 ## API `run_job` arm `"connection_health_sweep"` (ALL on the tick tx)
-1. List ALL integration connections (codex fix: `integration_connections` has NO
+1. List ALL integration connections (review fix: `integration_connections` has NO
    `enabled` column — do not invent a filter; probe every connection).
 2. For each, run `test_connection_stub(&conn)` (pure dry-run) and insert a
    `connection_health_checks` row via a tx-aware repo fn (mirror the on-demand
    probe's INSERT, executor-generic so it runs on `&mut *tx`). credential_status:
-   use a DETERMINISTIC STUB value (codex fix — do NOT call the live
+   use a DETERMINISTIC STUB value (review fix — do NOT call the live
    `resolve_credentials`; the safety argument is stub-only), e.g. the same
    ref-presence verdict the stub implies.
 3. Also UPDATE the connection's `last_test_at` / `last_test_result` in the SAME tx
-   (codex fix) — mirror the on-demand probe so the integrations list shows the
+   (review fix) — mirror the on-demand probe so the integrations list shows the
    scheduled freshness (the portal table reads those columns).
 4. `detail` aggregate-only: `"probed N connection(s)"`.
 A DB error rolls back within the schedule's savepoint (existing tick semantics).
@@ -48,11 +48,11 @@ A DB error rolls back within the schedule's savepoint (existing tick semantics).
 ## Migration 120
 Seed one enabled `connection_health_sweep` schedule (every 300s — connection
 freshness on a 5-min cadence; SLO/dashboards tolerate that), fixed id, ON CONFLICT
-DO NOTHING. NO new index (codex: migration 102 already created
+DO NOTHING. NO new index (review note: migration 102 already created
 `idx_connection_health_checks_conn` on `(connection_id, checked_at DESC)`). No new
 table or column.
 
-## Scale (codex note)
+## Scale
 Growth is ~`288 * connection_count` rows/day at the 300s cadence — fine for dozens
 of connections. A retention/pruning policy for `connection_health_checks` is a
 follow-up if connection cardinality ever grows to hundreds.
