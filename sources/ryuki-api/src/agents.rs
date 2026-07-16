@@ -6824,7 +6824,10 @@ pub async fn admin_dead_lettered_jobs(
         let site_restricted = !site_filter.is_empty();
         let env_restricted = !env_filter.is_empty();
         sqlx::query_as(
-            "SELECT aj.id::text AS job_id, aj.request_id::text AS request_id, \
+            // The joined request is the authoritative spec.request_id and is the row
+            // whose scope was checked. Never project the independently stored scalar
+            // agent_jobs.request_id to a scoped caller.
+            "SELECT aj.id::text AS job_id, r.id::text AS request_id, \
                     aj.platform, aj.mode, aj.delivery_attempts, aj.created_at, aj.updated_at \
              FROM agent_jobs aj \
              JOIN requests r ON r.id::text = (aj.spec->>'request_id') \
@@ -7293,6 +7296,7 @@ pub async fn admin_cancel_pending_job(
     let uid = Uuid::parse_str(&job_id)
         .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
     let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut scoped_request_id = None;
 
     // run-5 A0: by-id site/env scope guard for a SCOPED principal — a FOR UPDATE
     // pre-read resolves the parent request via the AUTHORITATIVE spec.request_id and
@@ -7313,6 +7317,7 @@ pub async fn admin_cancel_pending_job(
             }
             Some(spec_json) => match serde_json::from_value::<JobSpec>(spec_json.0) {
                 Ok(spec) => {
+                    scoped_request_id = Some(spec.request_id.to_string());
                     let row: Option<(String, String)> =
                         sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
                             .bind(spec.request_id)
@@ -7348,7 +7353,7 @@ pub async fn admin_cancel_pending_job(
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
-    let Some((request_id, platform)) = updated else {
+    let Some((scalar_request_id, platform)) = updated else {
         // Distinguish not-found (404), a protected teardown job (409), and wrong-status
         // (409) with a clean re-read of both status and mode.
         let existing: Option<(String, String)> =
@@ -7370,6 +7375,9 @@ pub async fn admin_cancel_pending_job(
         tx.rollback().await.map_err(db_err)?;
         return error;
     };
+    // For a scoped caller, project the same authoritative spec request id that
+    // passed authorization. Unrestricted callers retain the existing scalar view.
+    let request_id = scoped_request_id.unwrap_or(scalar_request_id);
 
     // Audit the operator action — the free-text reason lives ONLY here.
     crate::audit::record_audit_tx(
@@ -8108,8 +8116,8 @@ pub async fn admin_agent_job_get(
     // request_id column is NOT load-bearing) and 404 an out-of-scope (or orphaned/
     // malformed) job with the SAME body a missing job returns. Unrestricted
     // principals skip it unchanged.
-    if is_scoped(&session) {
-        let in_scope = match sqlx::query_scalar::<_, sqlx::types::Json<Value>>(
+    let scoped_request_id = if is_scoped(&session) {
+        let spec = match sqlx::query_scalar::<_, sqlx::types::Json<Value>>(
             "SELECT spec FROM agent_jobs WHERE id = $1",
         )
         .bind(uid)
@@ -8117,28 +8125,33 @@ pub async fn admin_agent_job_get(
         .await
         .map_err(db_err)?
         {
-            None => false,
+            None => return Err(not_found(format!("agent job '{job_id}' not found"))),
             Some(spec_json) => match serde_json::from_value::<JobSpec>(spec_json.0) {
-                Ok(spec) => {
-                    let req: Option<(String, String)> =
-                        sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
-                            .bind(spec.request_id)
-                            .fetch_optional(pool)
-                            .await
-                            .map_err(db_err)?;
-                    matches!(req, Some((ref site, ref env)) if row_scope_permits(&session, site, env))
-                }
-                Err(_) => false,
+                Ok(spec) => spec,
+                Err(_) => return Err(not_found(format!("agent job '{job_id}' not found"))),
             },
         };
+        let req: Option<(String, String)> =
+            sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
+                .bind(spec.request_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_err)?;
+        let in_scope =
+            matches!(req, Some((ref site, ref env)) if row_scope_permits(&session, site, env));
         if !in_scope {
             return Err(not_found(format!("agent job '{job_id}' not found")));
         }
-    }
+        Some(spec.request_id.to_string())
+    } else {
+        None
+    };
 
     Ok(Json(json!({
         "job_id": r.id,
-        "request_id": r.request_id,
+        // A scoped caller sees the same authoritative parent id that passed the
+        // scope check, never an independently stored scalar id.
+        "request_id": scoped_request_id.unwrap_or(r.request_id),
         "platform": r.platform,
         "mode": r.mode,
         "status": r.status,
@@ -23870,6 +23883,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_scope_cancel_projects_authoritative_spec_request_id() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        ensure_cancelled_status_allowed(pool).await;
+        let platform = format!("plt-scope-cxl-id-{}", Uuid::new_v4().simple());
+        let scalar_request = seed_request_for_scope(pool, "DEFRA", "production").await;
+        let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
+        let job = seed_job_in_status(pool, &platform, scalar_request, "Pending").await;
+        let spec = dead_letter_spec(spec_request, JobMode::OfflineDryRun);
+        sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
+            .bind(serde_json::to_value(&spec).expect("spec serialises"))
+            .bind(job)
+            .execute(pool)
+            .await
+            .expect("make request ids divergent");
+
+        let Json(out) = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(scoped_admin_session("GBLON")),
+            Json(CancelJobBody {
+                reason: "scope projection regression".into(),
+            }),
+        )
+        .await
+        .expect("the spec parent is in scope");
+        assert_eq!(out["request_id"], json!(spec_request.to_string()));
+        assert_ne!(out["request_id"], json!(scalar_request.to_string()));
+
+        let audited_request_id: String = sqlx::query_scalar(
+            "SELECT detail->>'request_id' FROM audit_log \
+             WHERE action = 'agent-job-cancelled' AND detail->>'job_id' = $1 \
+             ORDER BY occurred_at DESC LIMIT 1",
+        )
+        .bind(job.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("read cancellation audit");
+        assert_eq!(audited_request_id, spec_request.to_string());
+        let event_request_id: String = sqlx::query_scalar(
+            "SELECT payload->>'request_id' FROM domain_events \
+             WHERE event_type = 'job.cancelled' AND aggregate_id = $1 \
+             ORDER BY occurred_at DESC LIMIT 1",
+        )
+        .bind(job.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("read cancellation event");
+        assert_eq!(event_request_id, spec_request.to_string());
+
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_request_and_jobs(pool, scalar_request).await;
+        cleanup_request_and_jobs(pool, spec_request).await;
+    }
+
+    #[tokio::test]
     async fn db_scope_priority_out_of_scope_is_404() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
@@ -23966,6 +24037,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_scope_job_get_projects_authoritative_spec_request_id() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-scope-get-id-{}", Uuid::new_v4().simple());
+        let scalar_request = seed_request_for_scope(pool, "DEFRA", "production").await;
+        let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
+        let job = seed_job_in_status(pool, &platform, scalar_request, "Pending").await;
+        let spec = dead_letter_spec(spec_request, JobMode::OfflineDryRun);
+        sqlx::query("UPDATE agent_jobs SET spec = $1 WHERE id = $2")
+            .bind(serde_json::to_value(&spec).expect("spec serialises"))
+            .bind(job)
+            .execute(pool)
+            .await
+            .expect("make request ids divergent");
+
+        let Json(out) = admin_agent_job_get(
+            Path(job.to_string()),
+            Extension(scoped_admin_session("GBLON")),
+        )
+        .await
+        .expect("the spec parent is in scope");
+        assert_eq!(out["request_id"], json!(spec_request.to_string()));
+        assert_ne!(out["request_id"], json!(scalar_request.to_string()));
+
+        cleanup_request_and_jobs(pool, scalar_request).await;
+        cleanup_request_and_jobs(pool, spec_request).await;
+    }
+
+    #[tokio::test]
     async fn db_scope_dead_lettered_scoped_sees_only_in_scope() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         let Some(pool) = handler_pool_lenient().await else {
@@ -23998,6 +24101,41 @@ mod tests {
         );
         cleanup_request_and_jobs(pool, req_in).await;
         cleanup_request_and_jobs(pool, req_out).await;
+    }
+
+    #[tokio::test]
+    async fn db_scope_dead_lettered_projects_authoritative_spec_request_id() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-scope-dl-id-{}", Uuid::new_v4().simple());
+        let scalar_request = seed_request_for_scope(pool, "DEFRA", "production").await;
+        let spec_request = seed_request_for_scope(pool, "GBLON", "production").await;
+        let job = seed_dead_lettered_job_full(
+            pool,
+            &platform,
+            scalar_request,
+            spec_request,
+            JobMode::OfflineDryRun,
+        )
+        .await;
+
+        let Json(out) = admin_dead_lettered_jobs(Extension(scoped_admin_session("GBLON")))
+            .await
+            .expect("the spec parent is in scope");
+        let listed = out["dead_lettered_jobs"]
+            .as_array()
+            .expect("dead-lettered jobs array")
+            .iter()
+            .find(|entry| entry["job_id"] == json!(job.to_string()))
+            .expect("divergent job must be listed by its in-scope spec parent");
+        assert_eq!(listed["request_id"], json!(spec_request.to_string()));
+        assert_ne!(listed["request_id"], json!(scalar_request.to_string()));
+
+        cleanup_request_and_jobs(pool, scalar_request).await;
+        cleanup_request_and_jobs(pool, spec_request).await;
     }
 
     #[tokio::test]

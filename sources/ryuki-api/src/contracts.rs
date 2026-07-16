@@ -65776,11 +65776,11 @@ mod db_lifecycle_tests {
             .ok();
     }
 
-    /// C086/W05C-C01: request-linked agent-job events use the request relation
-    /// as their authority in both the generic and alert feeds. Event
-    /// NULL/spoofed axes and payload request_id are not trusted; feed projection
-    /// and the atomic ack predicate agree, including under a simultaneous
-    /// authorized/foreign acknowledgement attempt.
+    /// C086/W05C-C01: request-linked agent-job events use spec.request_id as
+    /// their authority in both the generic and alert feeds. The independent
+    /// scalar request_id, NULL/spoofed event axes, and payload request_id are not
+    /// trusted; feed projection and the atomic ack predicate agree, including
+    /// under a simultaneous authorized/foreign acknowledgement attempt.
     #[tokio::test]
     async fn request_linked_agent_job_alert_scope_is_authoritative_and_atomic() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -65788,21 +65788,32 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        let request_id = Uuid::new_v4();
+        let spec_request_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO requests \
              (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
              VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', \
                      'production', 'agent-alert-scope-test', 2, 4, 'alert-owner')",
         )
-        .bind(request_id)
+        .bind(spec_request_id)
         .execute(pool)
         .await
         .expect("seed authoritative request");
+        let scalar_request_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests \
+             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', 'intake', 'intake', 'GBLON', \
+                     'test', 'agent-alert-scalar-scope-test', 2, 4, 'alert-owner')",
+        )
+        .bind(scalar_request_id)
+        .execute(pool)
+        .await
+        .expect("seed divergent scalar request");
 
         let job_id = Uuid::new_v4();
         let spec = json!({
-            "request_id": request_id,
+            "request_id": spec_request_id,
             "offering_id": Uuid::new_v4(),
             "iac_ref": "request-preflight@v1",
             "iac_digest": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -65814,7 +65825,7 @@ mod db_lifecycle_tests {
              VALUES ($1, $2, 'scope-test', $3, 'OfflineDryRun')",
         )
         .bind(job_id)
-        .bind(request_id)
+        .bind(scalar_request_id)
         .bind(spec)
         .execute(pool)
         .await
@@ -65828,8 +65839,9 @@ mod db_lifecycle_tests {
                 event_type: "job.dead_lettered",
                 aggregate_type: "agent_job",
                 aggregate_id: &job_id_string,
-                // Deliberately contradictory: neither event axes nor payload
-                // may override the authoritative DEFRA/production request.
+                // Deliberately contradictory: neither the scalar request id,
+                // event axes, nor payload may override the authoritative
+                // DEFRA/production spec request.
                 site: Some("GBLON"),
                 environment: Some("test"),
                 actor: "system",
@@ -65946,8 +65958,56 @@ mod db_lifecycle_tests {
         assert_eq!(ack_count_after, 1);
         assert_eq!(acknowledged_by, "agent-alert-defra");
 
-        // A request-linked shape whose job/request relation cannot be proven is
-        // hidden and unacknowledgeable even to an unrestricted administrator.
+        // A request-linked shape whose spec parent is malformed is hidden and
+        // unacknowledgeable even to an unrestricted administrator. The guarded
+        // UUID cast must fail closed rather than abort the feed query.
+        let malformed_job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agent_jobs (id, request_id, platform, spec, mode) \
+             VALUES ($1, $2, 'scope-test', '{\"request_id\":\"not-a-uuid\"}'::jsonb, \
+                     'OfflineDryRun')",
+        )
+        .bind(malformed_job_id)
+        .bind(scalar_request_id)
+        .execute(pool)
+        .await
+        .expect("seed malformed-spec agent job");
+        let malformed_job_id_string = malformed_job_id.to_string();
+        let malformed_event = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "job.dead_lettered",
+                aggregate_type: "agent_job",
+                aggregate_id: &malformed_job_id_string,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({"to_status": "dead-lettered"}),
+            },
+        )
+        .await
+        .expect("seed malformed-spec alert");
+        let Json(malformed_events) = events_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: Some("job.dead_lettered".to_string()),
+                aggregate_id: Some(malformed_job_id_string),
+                limit: Some(50),
+            }),
+        )
+        .await
+        .expect("query malformed-spec generic events");
+        assert!(
+            malformed_events["events"].as_array().unwrap().is_empty(),
+            "malformed-spec agent-job events must fail closed even for unrestricted readers"
+        );
+        assert!(matches!(
+            ack_alert_one(&AuthSession::static_dry_run(), pool, malformed_event, None,).await,
+            Err((StatusCode::NOT_FOUND, _))
+        ));
+
+        // A missing job link is likewise hidden and unacknowledgeable even to
+        // an unrestricted administrator.
         let orphan_job_id = Uuid::new_v4().to_string();
         let orphan_event = crate::repos::domain_events::insert(
             pool,
@@ -65967,7 +66027,7 @@ mod db_lifecycle_tests {
             AuthExtractor(AuthSession::static_dry_run()),
             Query(EventsQuery {
                 event_type: Some("job.dead_lettered".to_string()),
-                aggregate_id: Some(orphan_job_id.clone()),
+                aggregate_id: Some(orphan_job_id),
                 limit: Some(50),
             }),
         )
@@ -65992,7 +66052,13 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
-        cleanup_request(pool, request_id).await;
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(malformed_job_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_request(pool, spec_request_id).await;
+        cleanup_request(pool, scalar_request_id).await;
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the

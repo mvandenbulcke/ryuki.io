@@ -89,9 +89,9 @@ pub struct EventRow {
 /// axes (the deliberate observability baseline everyone sees).
 ///
 /// `agent_job` events are the exception to the event row's stored axes. Their
-/// authoritative scope is the immutable `agent_jobs -> requests` relation, just
-/// like [`list_alerts`] and [`ack_alert`]. Generic listing must therefore join
-/// that relation, project its axes, and fail closed for malformed/orphaned jobs;
+/// authoritative scope is `agent_jobs.spec.request_id -> requests`, just like
+/// [`list_alerts`] and [`ack_alert`]. Generic listing must therefore join that
+/// relation, project its axes, and fail closed for malformed/orphaned jobs;
 /// treating legacy NULL/NULL job events as global would disclose request-bound
 /// operations across sites. `limit` bounds the page; the `id` tiebreaker keeps
 /// ordering stable within an `occurred_at`.
@@ -167,7 +167,11 @@ pub async fn list(
                 THEN e.aggregate_id::uuid \
                 ELSE NULL \
               END \
-         LEFT JOIN requests AS r ON r.id = j.request_id \
+         LEFT JOIN requests AS r ON r.id = CASE \
+                WHEN pg_input_is_valid(j.spec->>'request_id', 'uuid') \
+                THEN (j.spec->>'request_id')::uuid \
+                ELSE NULL \
+              END \
          WHERE {} \
          ORDER BY e.occurred_at DESC, e.id DESC \
          LIMIT ${limit_pos}",
@@ -206,9 +210,9 @@ pub async fn list(
 /// plane objects, but each job is authoritatively bound to a request.  Their old
 /// event emitters stored NULL/NULL and put `request_id` only in caller-readable
 /// JSON.  Never trust that payload for authorization.  Join the immutable event
-/// aggregate id through `agent_jobs.request_id` to `requests`, fail closed for
-/// an orphan/malformed link, apply scope before LIMIT/projection, and project the
-/// authoritative request axes into the feed.
+/// aggregate id through `agent_jobs.spec.request_id` to `requests`, fail closed
+/// for an orphan/malformed link, apply scope before LIMIT/projection, and project
+/// the authoritative request axes into the feed.
 pub async fn list_alerts(
     pool: &sqlx::PgPool,
     aggregate_id: Option<&str>,
@@ -271,7 +275,11 @@ pub async fn list_alerts(
                 THEN e.aggregate_id::uuid \
                 ELSE NULL \
               END \
-         LEFT JOIN requests AS r ON r.id = j.request_id \
+         LEFT JOIN requests AS r ON r.id = CASE \
+                WHEN pg_input_is_valid(j.spec->>'request_id', 'uuid') \
+                THEN (j.spec->>'request_id')::uuid \
+                ELSE NULL \
+              END \
          WHERE {} \
          ORDER BY e.occurred_at DESC, e.id DESC \
          LIMIT ${limit_pos}",
@@ -296,8 +304,9 @@ pub async fn list_alerts(
 /// and cannot race between a separate authorization read and the UPSERT.
 ///
 /// Request-linked `agent_job` alerts derive scope from the authoritative
-/// `agent_jobs -> requests` relation, never nullable event axes or payload JSON.
-/// Orphaned jobs/events are deliberately indistinguishable from missing rows.
+/// `agent_jobs.spec.request_id -> requests` relation, never the independently
+/// stored scalar request id, nullable event axes, or payload JSON. Orphaned
+/// jobs/events are deliberately indistinguishable from missing rows.
 #[allow(clippy::too_many_arguments)]
 pub async fn ack_alert(
     pool: &sqlx::PgPool,
@@ -320,7 +329,11 @@ pub async fn ack_alert(
                 THEN e.aggregate_id::uuid \
                 ELSE NULL \
               END \
-         LEFT JOIN requests AS r ON r.id = j.request_id \
+         LEFT JOIN requests AS r ON r.id = CASE \
+                WHEN pg_input_is_valid(j.spec->>'request_id', 'uuid') \
+                THEN (j.spec->>'request_id')::uuid \
+                ELSE NULL \
+              END \
          WHERE e.id = $1 \
            AND EXISTS ( \
              SELECT 1 \
