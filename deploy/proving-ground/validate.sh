@@ -57,6 +57,23 @@ is_nonzero_sha256_digest() {
   [[ "$digest" != "sha256:$(printf '%064d' 0)" ]]
 }
 
+# Exercise the reusable admission-pin guards before reading operator input.
+# These mutations keep absolute/traversing/non-JSON paths and malformed or zero
+# digests from becoming accepted through a future shell refactor.
+for rejected_path in /absolute/registry.json ../registry.json registry/../root.json registry/root.yaml; do
+  if is_security_profile_path "$rejected_path"; then
+    fail "unsafe admission JSON path passed the normalized-path guard: $rejected_path"
+  fi
+done
+for rejected_digest in \
+  "sha256:$(printf '%064d' 0)" \
+  "sha256:$(printf '%063d' 1)" \
+  "sha256:$(printf '%064d' 1 | tr '0-9' 'A-J')"; do
+  if is_nonzero_sha256_digest "$rejected_digest"; then
+    fail "unsafe admission digest passed the nonzero SHA-256 guard"
+  fi
+done
+
 is_deployment_id() {
   [[ "$1" =~ ^deployment:[a-z0-9][a-z0-9._-]{2,126}$ ]]
 }
@@ -347,6 +364,8 @@ if [[ "$ENV_FILE" == "$HERE/env.example" ]]; then
   # Compose interpolation and rendered-boundary checks can still be exercised.
   PG_DEPLOYMENT_SECURITY_PROFILE_PATH=sentinel/proving-ground-profile.json
   PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST="sha256:$(printf '%064d' 1)"
+  PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH=sentinel/conformance-trust-root-registry.json
+  PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST="sha256:$(printf '%064d' 2)"
   PG_EXPECTED_DEPLOYMENT_ID=deployment:proving-ground-template
   PG_SECURITY_PROFILE=test
 else
@@ -356,6 +375,12 @@ else
   PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST="$(
     compose_env_value PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST "$ENV_FILE"
   )" || fail "PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST is missing"
+  PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH="$(
+    compose_env_value PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH "$ENV_FILE"
+  )" || fail "PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH is missing"
+  PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST="$(
+    compose_env_value PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST "$ENV_FILE"
+  )" || fail "PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST is missing"
   PG_EXPECTED_DEPLOYMENT_ID="$(
     compose_env_value PG_EXPECTED_DEPLOYMENT_ID "$ENV_FILE"
   )" || fail "PG_EXPECTED_DEPLOYMENT_ID is missing"
@@ -366,6 +391,10 @@ else
     fail "PG_DEPLOYMENT_SECURITY_PROFILE_PATH must be a safe relative .json path without dot segments"
   is_nonzero_sha256_digest "$PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST" || \
     fail "PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST must be a nonzero sha256: digest with 64 lowercase hex digits"
+  is_security_profile_path "$PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH" || \
+    fail "PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH must be a safe relative .json path without dot segments"
+  is_nonzero_sha256_digest "$PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST" || \
+    fail "PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST must be a nonzero sha256: digest with 64 lowercase hex digits"
   is_deployment_id "$PG_EXPECTED_DEPLOYMENT_ID" || \
     fail "PG_EXPECTED_DEPLOYMENT_ID must be a canonical deployment: id"
   [[ "$PG_SECURITY_PROFILE" == "test" ]] || \
@@ -567,6 +596,8 @@ fi
 export PG_DB_PASSWORD PG_SESSION_CREDENTIAL_HMAC_KEY PG_ACCEPTANCE_REVISION
 export PG_DEPLOYMENT_SECURITY_PROFILE_PATH
 export PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST PG_EXPECTED_DEPLOYMENT_ID
+export PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
+export PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
 export PG_SECURITY_PROFILE
 
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$HERE/compose.yaml")
@@ -577,6 +608,8 @@ RENDERED_CONFIG_JSON="$("${COMPOSE[@]}" config --format json)" || \
 jq -e \
   --arg profile_path "$PG_DEPLOYMENT_SECURITY_PROFILE_PATH" \
   --arg profile_digest "$PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST" \
+  --arg trust_registry_path "$PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH" \
+  --arg trust_registry_digest "$PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST" \
   --arg deployment_id "$PG_EXPECTED_DEPLOYMENT_ID" \
   --arg security_profile "$PG_SECURITY_PROFILE" '
   .services["platform-api"].environment.RYUKI_SECURITY_CONTRACT_ROOT
@@ -585,6 +618,10 @@ jq -e \
     == $profile_path
   and .services["platform-api"].environment.RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
     == $profile_digest
+  and .services["platform-api"].environment.RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
+    == $trust_registry_path
+  and .services["platform-api"].environment.RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
+    == $trust_registry_digest
   and .services["platform-api"].environment.RYUKI_EXPECTED_DEPLOYMENT_ID
     == $deployment_id
   and .services["platform-api"].environment.RYUKI_SECURITY_PROFILE

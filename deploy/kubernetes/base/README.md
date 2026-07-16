@@ -15,10 +15,14 @@ Base manifests define the portable Kubernetes skeleton for Ryuki Infrastructure 
 ## Database configuration delivery
 
 The API Deployment and one-shot migration Job both require an operator-owned
-`platform-security-admission-config`. Five individual `configMapKeyRef` entries
-import the absolute image path `/app/security-contract`, relative profile path,
-raw-byte SHA-256 profile digest, expected deployment id, and explicit production
-profile; whole-ConfigMap import is forbidden. The release image must bake the
+`platform-security-admission-config`. Seven individual `configMapKeyRef`
+entries import the absolute image path `/app/security-contract`, relative
+profile path, raw-byte SHA-256 profile digest, expected deployment id, explicit
+production profile, and the normalized relative `.json` path plus independently
+pinned nonzero raw-byte SHA-256 digest for the conformance trust-root registry;
+the latter use `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. Whole-ConfigMap import is
+forbidden. The release image must bake the
 exact reviewed contract tree into `/app/security-contract` as root-owned regular
 files. The base does not fabricate the admission ConfigMap, and its checked-in
 image contains only non-production implementation fixtures, so an unoverlaid

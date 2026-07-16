@@ -116,6 +116,41 @@ fn security_admission_precedes_key_workers_router_and_listener() {
 }
 
 #[test]
+fn independent_trust_root_pins_are_required_before_startup_side_effects() {
+    let temp = TempDir::new().expect("temporary directory");
+    let key_path = temp.path().join("must-not-be-created.key");
+
+    let output = run_bounded(
+        Command::new(BINARY)
+            .env_clear()
+            .env("RYUKI_SECURITY_CONTRACT_ROOT", temp.path())
+            .env(
+                "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
+                "profiles/test.json",
+            )
+            .env(
+                "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+                format!("sha256:{}", "a".repeat(64)),
+            )
+            .env("RYUKI_EXPECTED_DEPLOYMENT_ID", "deployment:pin-test")
+            .env("RYUKI_SECURITY_PROFILE", "test")
+            .env("RYUKI_CP_SIGNING_KEY_PATH", &key_path),
+        "independent trust-root pin admission",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(
+        stderr.contains("RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH"),
+        "missing trust-root pin must fail first: {stderr}"
+    );
+    assert!(
+        !key_path.exists(),
+        "trust-root pin failure created a signing key"
+    );
+}
+
+#[test]
 fn route_metadata_maintenance_mode_remains_configuration_free() {
     let mut child = Command::new(BINARY)
         .arg("--dump-route-meta")
@@ -130,6 +165,14 @@ fn route_metadata_maintenance_mode_remains_configuration_free() {
         )
         .env(
             "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+            "not-a-sha256-digest",
+        )
+        .env(
+            "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH",
+            "../outside-root.json",
+        )
+        .env(
+            "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST",
             "not-a-sha256-digest",
         )
         .env("RYUKI_EXPECTED_DEPLOYMENT_ID", "NOT_CANONICAL")

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+  "schema_version": "1.0.0",
+  "contract_kind": "conformance-trust-root-registry",
+  "document_id": "conformance-trust-root-registry:repository-implementation-v1",
+  "document_version": 1,
+  "acceptance_status": "implementation_only",
+  "production_accepted": false,
+  "lifecycle": {
+    "state": "implementation_only",
+    "effective_at": "2026-07-16T00:00:00Z"
+  },
+  "applicability": {
+    "evaluation_scope": "deployment",
+    "security_profiles": [
+      "test"
+    ],
+    "deployment_ids": [
+      "deployment:repository-conformance-fixture"
+    ],
+    "trust_domain_ids": [
+      "trust-domain:repository-fixture"
+    ]
+  },
+  "trust_policy_version": 1,
+  "canonicalization_profiles": [
+    "ryuki-canonical-json-v1"
+  ],
+  "signature_algorithms": [
+    "ed25519"
+  ],
+  "keys": [],
+  "key_tombstones": []
+}

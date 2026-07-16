@@ -116,7 +116,7 @@ cargo build --workspace
 cargo test --workspace
 
 # Run API on the portal's default upstream port. Pass any additional auth
-# settings and all five security-admission inputs explicitly; do not source
+# settings and all seven security-admission inputs explicitly; do not source
 # .env as executable shell code.
 # Export RYUKI_DATABASE_URL in this shell without committing its value.
 RYUKI_MIGRATION_MODE=local-auto \
@@ -134,8 +134,12 @@ RYUKI_PORTAL_EXECUTION_MODE=live-provider \
 
 API startup also requires `RYUKI_SECURITY_CONTRACT_ROOT`,
 `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH`,
-`RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST`, `RYUKI_EXPECTED_DEPLOYMENT_ID`, and
-`RYUKI_SECURITY_PROFILE` to have been exported for a reviewed active contract.
+`RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST`,
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH`,
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`,
+`RYUKI_EXPECTED_DEPLOYMENT_ID`, and `RYUKI_SECURITY_PROFILE` to have been
+exported for a reviewed active contract and independently approved trust-root
+registry.
 The checked-in `implementation_only` fixtures are validation inputs and cannot
 start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
 before using the API command above; no runnable digest is inferred from Git.
@@ -223,6 +227,8 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable deployment-security contract root |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized profile path relative to the contract root |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw profile bytes |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized `.json` trust-root registry path relative to the immutable contract root |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw trust-root registry bytes |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |

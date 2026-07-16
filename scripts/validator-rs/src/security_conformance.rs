@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 const CONTRACT_DIR: &str = "catalog/security-contracts/v1";
 
-const SCHEMAS: [(&str, &str); 7] = [
+const SCHEMAS: [(&str, &str); 8] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -28,6 +28,10 @@ const SCHEMAS: [(&str, &str); 7] = [
     (
         "conformance-bundle.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+    ),
+    (
+        "conformance-trust-root-registry.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
     ),
     (
         "control-trace.schema.json",
@@ -51,7 +55,7 @@ const SCHEMAS: [(&str, &str); 7] = [
     ),
 ];
 
-const INSTANCES: [(&str, &str); 5] = [
+const INSTANCES: [(&str, &str); 6] = [
     (
         "action-resource-registry.implementation.json",
         "action-resource-registry.schema.json",
@@ -59,6 +63,10 @@ const INSTANCES: [(&str, &str); 5] = [
     (
         "control-trace.implementation.json",
         "control-trace.schema.json",
+    ),
+    (
+        "conformance-trust-root-registry.implementation.json",
+        "conformance-trust-root-registry.schema.json",
     ),
     (
         "deployment-security-profile.implementation.json",
@@ -735,12 +743,6 @@ fn validate_declared_schema(
     instance: &Value,
     errors: &mut Vec<String>,
 ) {
-    // ControlTrace intentionally has no `$schema` instance member because its
-    // closed schema predates the other four executable roots.  Its mapping is
-    // nevertheless fixed by the exact file inventory above.
-    if file_name == "control-trace.implementation.json" {
-        return;
-    }
     let expected = SCHEMAS
         .iter()
         .find_map(|(name, id)| (*name == schema_name).then_some(*id));
@@ -1452,6 +1454,86 @@ fn trace_applies_to_instance(
     applicable
 }
 
+fn validate_evidence_binding_reference(
+    receipt: &LoadedDocument,
+    binding: &Value,
+    bundle: &LoadedDocument,
+    errors: &mut Vec<String>,
+) {
+    let evidence_id = string_field(binding, "evidence_instance_id").unwrap_or("");
+    let context = format!("{}: evidence binding {evidence_id}", receipt.label);
+    require_reference_string(
+        binding,
+        "artifact_kind",
+        "conformance-bundle",
+        &context,
+        errors,
+    );
+    require_reference_string(binding, "artifact_locator", &bundle.label, &context, errors);
+    require_matching_reference_field(binding, &bundle.value, "bundle_id", &context, errors);
+    require_matching_reference_field(binding, &bundle.value, "document_version", &context, errors);
+}
+
+fn validate_prerequisite_reference(
+    receipt: &LoadedDocument,
+    reference: &Value,
+    target: &LoadedDocument,
+    errors: &mut Vec<String>,
+) {
+    let target_id = string_field(reference, "receipt_id").unwrap_or("");
+    let context = format!("{}: prerequisite {target_id}", receipt.label);
+    require_reference_string(
+        reference,
+        "artifact_kind",
+        "package-exit-receipt",
+        &context,
+        errors,
+    );
+    require_reference_string(
+        reference,
+        "artifact_locator",
+        &target.label,
+        &context,
+        errors,
+    );
+    require_matching_reference_field(reference, &target.value, "receipt_id", &context, errors);
+    require_matching_reference_field(
+        reference,
+        &target.value,
+        "document_version",
+        &context,
+        errors,
+    );
+}
+
+fn require_reference_string(
+    reference: &Value,
+    field: &str,
+    expected: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    if string_field(reference, field) != Some(expected) {
+        errors.push(format!(
+            "{context}: {field} must exactly reference {expected}"
+        ));
+    }
+}
+
+fn require_matching_reference_field(
+    reference: &Value,
+    target: &Value,
+    field: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    if reference.get(field) != target.get(field) {
+        errors.push(format!(
+            "{context}: {field} does not match the referenced closure document"
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_receipts(
     ledger: &Value,
@@ -1569,9 +1651,8 @@ fn validate_receipts(
         let mut evidence_bindings = BTreeMap::new();
         for binding in array(evaluated, "evidence_bindings") {
             let evidence_id = string_field(binding, "evidence_instance_id").unwrap_or("");
-            let digest = string_field(binding, "bundle_digest").unwrap_or("");
             if evidence_bindings
-                .insert(evidence_id.to_string(), digest.to_string())
+                .insert(evidence_id.to_string(), binding)
                 .is_some()
             {
                 errors.push(format!(
@@ -1617,7 +1698,7 @@ fn validate_receipts(
         }
 
         let mut evidenced_pairs = BTreeSet::new();
-        for (evidence_id, expected_digest) in &evidence_bindings {
+        for (evidence_id, binding) in &evidence_bindings {
             let Some(bundle) = evidence.get(evidence_id) else {
                 errors.push(format!(
                     "{}: receipt references unknown evidence_instance_id {evidence_id}",
@@ -1625,12 +1706,13 @@ fn validate_receipts(
                 ));
                 continue;
             };
-            if bundle.digest != *expected_digest {
+            if string_field(binding, "bundle_digest") != Some(bundle.digest.as_str()) {
                 errors.push(format!(
                     "{}: evidence {evidence_id} bundle_digest does not match {}",
                     document.label, bundle.label
                 ));
             }
+            validate_evidence_binding_reference(document, binding, bundle, errors);
             let trace_id = string_field(&bundle.value, "trace_id").unwrap_or("");
             if !trace_ids.contains(trace_id) {
                 errors.push(format!(
@@ -1750,6 +1832,7 @@ fn validate_receipts(
                 ));
                 continue;
             };
+            validate_prerequisite_reference(document, prerequisite, target, errors);
             for key in [
                 "document_version",
                 "package_id",
@@ -1993,6 +2076,17 @@ fn validate_ledger_binding(
     errors: &mut Vec<String>,
 ) {
     let binding = document.value.get("ledger_binding").unwrap_or(&Value::Null);
+    let context = format!("{}: ledger_binding", document.label);
+    require_reference_string(binding, "artifact_kind", "control-trace", &context, errors);
+    require_reference_string(
+        binding,
+        "artifact_locator",
+        "catalog/security-contracts/v1/control-trace.implementation.json",
+        &context,
+        errors,
+    );
+    require_matching_reference_field(binding, ledger, "document_id", &context, errors);
+    require_matching_reference_field(binding, ledger, "document_version", &context, errors);
     for key in ["ledger_id", "ledger_version"] {
         if binding.get(key) != ledger.get(key) {
             errors.push(format!(
@@ -2475,6 +2569,22 @@ fn validate_cross_document_semantics(
         instances.get("security-limit-profile.implementation.json"),
         errors,
     );
+    validate_bound_document_ref(
+        deployment,
+        "conformance_trust_root_registry_ref",
+        "conformance-trust-root-registry",
+        "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json",
+        instances.get("conformance-trust-root-registry.implementation.json"),
+        errors,
+    );
+    validate_bound_document_ref(
+        deployment,
+        "control_trace_ref",
+        "control-trace",
+        "catalog/security-contracts/v1/control-trace.implementation.json",
+        instances.get("control-trace.implementation.json"),
+        errors,
+    );
 
     let deployment_id = string_field(deployment, "deployment_id").unwrap_or("");
     let profile = string_field(deployment, "security_profile").unwrap_or("");
@@ -2511,6 +2621,10 @@ fn validate_cross_document_semantics(
     if let Some(profile) = instances.get("security-limit-profile.implementation.json") {
         validate_security_limit_profile(root, profile, errors);
     }
+    if let Some(registry) = instances.get("conformance-trust-root-registry.implementation.json") {
+        validate_conformance_trust_root_registry(registry, errors);
+        validate_trust_registry_applicability(deployment, registry, errors);
+    }
 }
 
 fn validate_bound_document_ref(
@@ -2542,6 +2656,403 @@ fn validate_bound_document_ref(
                 "{path}: {key} does not match the referenced implementation document"
             ));
         }
+    }
+}
+
+fn validate_conformance_trust_root_registry(registry: &Value, errors: &mut Vec<String>) {
+    validate_conformance_trust_root_registry_at(registry, Utc::now(), errors);
+}
+
+fn validate_conformance_trust_root_registry_at(
+    registry: &Value,
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    const LABEL: &str = "conformance-trust-root-registry.implementation.json";
+    require_exact_string(
+        registry,
+        "$schema",
+        "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+        LABEL,
+        errors,
+    );
+    require_exact_string(registry, "schema_version", "1.0.0", LABEL, errors);
+    require_exact_string(
+        registry,
+        "contract_kind",
+        "conformance-trust-root-registry",
+        LABEL,
+        errors,
+    );
+    for field in ["document_version", "trust_policy_version"] {
+        if registry.get(field).and_then(Value::as_u64).unwrap_or(0) == 0 {
+            errors.push(format!("{LABEL}: {field} must be a positive version"));
+        }
+    }
+
+    let acceptance = string_field(registry, "acceptance_status").unwrap_or("");
+    let production = registry
+        .get("production_accepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let lifecycle = registry.get("lifecycle").unwrap_or(&Value::Null);
+    let lifecycle_state = string_field(lifecycle, "state").unwrap_or("");
+    match acceptance {
+        "implementation_only" if production => errors.push(format!(
+            "{LABEL}: implementation_only registry cannot be production accepted"
+        )),
+        "production_candidate" if production => errors.push(format!(
+            "{LABEL}: production_candidate registry cannot be production accepted"
+        )),
+        "production_accepted" if !production || lifecycle_state != "active" => errors.push(
+            format!("{LABEL}: production_accepted registry must be active and production accepted"),
+        ),
+        _ => {}
+    }
+    if lifecycle_state == "active" && !production {
+        errors.push(format!(
+            "{LABEL}: active registry must be production accepted"
+        ));
+    }
+    if let Some(effective_at) = parse_timestamp_value(
+        lifecycle,
+        "effective_at",
+        &format!("{LABEL}:/lifecycle"),
+        errors,
+    ) {
+        if lifecycle_state == "active" && effective_at > now {
+            errors.push(format!(
+                "{LABEL}:/lifecycle: active effective_at cannot be in the future"
+            ));
+        }
+    }
+
+    let canonicalization = string_set(array(registry, "canonicalization_profiles"));
+    if canonicalization != BTreeSet::from(["ryuki-canonical-json-v1".to_string()]) {
+        errors.push(format!(
+            "{LABEL}: canonicalization_profiles must contain only ryuki-canonical-json-v1"
+        ));
+    }
+    let algorithms = string_set(array(registry, "signature_algorithms"));
+    if algorithms != BTreeSet::from(["ed25519".to_string()]) {
+        errors.push(format!(
+            "{LABEL}: signature_algorithms must contain only ed25519"
+        ));
+    }
+
+    let applicability = registry.get("applicability").unwrap_or(&Value::Null);
+    require_exact_string(
+        applicability,
+        "evaluation_scope",
+        "deployment",
+        &format!("{LABEL}:/applicability"),
+        errors,
+    );
+    let registry_deployments = unique_string_array(
+        applicability,
+        "deployment_ids",
+        &format!("{LABEL}:/applicability"),
+        errors,
+    );
+    let registry_domains = unique_string_array(
+        applicability,
+        "trust_domain_ids",
+        &format!("{LABEL}:/applicability"),
+        errors,
+    );
+    unique_string_array(
+        applicability,
+        "security_profiles",
+        &format!("{LABEL}:/applicability"),
+        errors,
+    );
+
+    let mut keys = BTreeMap::new();
+    let mut key_material = BTreeSet::new();
+    let mut successor_edges = BTreeMap::new();
+    for (index, key) in array(registry, "keys").iter().enumerate() {
+        let context = format!("{LABEL}:/keys/{index}");
+        let key_id = string_field(key, "key_id").unwrap_or("");
+        if keys.insert(key_id.to_string(), key).is_some() {
+            errors.push(format!("{context}: duplicate key_id {key_id}"));
+        }
+        require_exact_string(key, "algorithm", "ed25519", &context, errors);
+        match string_field(key, "public_key_base64")
+            .ok_or_else(|| "public_key_base64 is missing".to_string())
+            .and_then(decode_canonical_ed25519_public_key)
+        {
+            Ok(decoded) => {
+                if decoded.iter().all(|byte| *byte == 0) {
+                    errors.push(format!(
+                        "{context}: Ed25519 public key cannot be all zeroes"
+                    ));
+                }
+                if !key_material.insert(decoded) {
+                    errors.push(format!("{context}: duplicate Ed25519 public-key material"));
+                }
+            }
+            Err(error) => errors.push(format!("{context}: {error}")),
+        }
+
+        for (field, allowed) in [
+            ("deployment_ids", &registry_deployments),
+            ("trust_domain_ids", &registry_domains),
+        ] {
+            let values = unique_string_array(key, field, &context, errors);
+            for value in values.difference(allowed) {
+                errors.push(format!(
+                    "{context}: {field} value {value} is outside registry applicability"
+                ));
+            }
+        }
+        for field in [
+            "allowed_purposes",
+            "allowed_evidence_tiers",
+            "allowed_package_ids",
+        ] {
+            if unique_string_array(key, field, &context, errors).is_empty() {
+                errors.push(format!("{context}: {field} must not be empty"));
+            }
+        }
+
+        let valid_from = parse_timestamp_value(key, "valid_from", &context, errors);
+        let valid_until = parse_timestamp_value(key, "valid_until", &context, errors);
+        if valid_from
+            .zip(valid_until)
+            .is_some_and(|(start, end)| start >= end)
+        {
+            errors.push(format!("{context}: valid_from must be before valid_until"));
+        }
+        let key_lifecycle = string_field(key, "lifecycle").unwrap_or("");
+        let revoked_at = optional_timestamp_value(key, "revoked_at", &context, errors);
+        if key_lifecycle == "revoked" {
+            let Some(revoked_at) = revoked_at else {
+                errors.push(format!("{context}: revoked key requires revoked_at"));
+                continue;
+            };
+            if revoked_at > now {
+                errors.push(format!("{context}: revoked_at cannot be in the future"));
+            }
+            if valid_from.is_some_and(|start| revoked_at < start)
+                || valid_until.is_some_and(|end| revoked_at > end)
+            {
+                errors.push(format!(
+                    "{context}: revoked_at must fall within the key validity window"
+                ));
+            }
+        } else if revoked_at.is_some() {
+            errors.push(format!(
+                "{context}: only revoked keys may declare revoked_at"
+            ));
+        }
+        if matches!(key_lifecycle, "active" | "overlap")
+            && (valid_from.is_some_and(|start| start > now)
+                || valid_until.is_some_and(|end| end <= now))
+        {
+            errors.push(format!(
+                "{context}: {key_lifecycle} key is outside its validity window"
+            ));
+        }
+        if let Some(target) = key.get("supersedes_key_id").and_then(Value::as_str) {
+            if target == key_id {
+                errors.push(format!("{context}: key cannot supersede itself"));
+            }
+            successor_edges.insert(key_id.to_string(), target.to_string());
+        }
+    }
+    for (source_id, target_id) in &successor_edges {
+        let Some(source) = keys.get(source_id) else {
+            continue;
+        };
+        let Some(target) = keys.get(target_id) else {
+            errors.push(format!(
+                "{LABEL}: key {source_id} supersedes unknown key {target_id}"
+            ));
+            continue;
+        };
+        for field in ["signer_identity", "algorithm"] {
+            if source.get(field) != target.get(field) {
+                errors.push(format!(
+                    "{LABEL}: key {source_id} cannot supersede {target_id} with a different {field}"
+                ));
+            }
+        }
+        let source_start = string_field(source, "valid_from")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        let target_start = string_field(target, "valid_from")
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+        if source_start
+            .zip(target_start)
+            .is_some_and(|(source_start, target_start)| source_start <= target_start)
+        {
+            errors.push(format!(
+                "{LABEL}: superseding key {source_id} must have a later valid_from than {target_id}"
+            ));
+        }
+    }
+    detect_single_edge_cycles("conformance key supersession", &successor_edges, errors);
+
+    let mut tombstones = BTreeSet::new();
+    let trust_policy_version = registry
+        .get("trust_policy_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    for (index, tombstone) in array(registry, "key_tombstones").iter().enumerate() {
+        let context = format!("{LABEL}:/key_tombstones/{index}");
+        let key_id = string_field(tombstone, "key_id").unwrap_or("");
+        if !tombstones.insert(key_id.to_string()) {
+            errors.push(format!("{context}: duplicate tombstone key_id {key_id}"));
+        }
+        if keys.contains_key(key_id) {
+            errors.push(format!(
+                "{context}: tombstoned key_id {key_id} is reused by a key record"
+            ));
+        }
+        require_exact_string(tombstone, "algorithm", "ed25519", &context, errors);
+        if parse_timestamp_value(tombstone, "revoked_at", &context, errors)
+            .is_some_and(|timestamp| timestamp > now)
+        {
+            errors.push(format!(
+                "{context}: tombstone revoked_at cannot be in the future"
+            ));
+        }
+        let tombstone_policy = tombstone
+            .get("trust_policy_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if tombstone_policy == 0 || tombstone_policy > trust_policy_version {
+            errors.push(format!(
+                "{context}: tombstone trust_policy_version must be nonzero and no newer than the registry"
+            ));
+        }
+        if let Some(successor_id) = tombstone
+            .get("superseded_by_key_id")
+            .and_then(Value::as_str)
+        {
+            if successor_id == key_id {
+                errors.push(format!("{context}: tombstone cannot supersede itself"));
+            }
+            let Some(successor) = keys.get(successor_id) else {
+                errors.push(format!(
+                    "{context}: superseded_by_key_id references unknown key {successor_id}"
+                ));
+                continue;
+            };
+            if tombstone.get("signer_identity") != successor.get("signer_identity") {
+                errors.push(format!(
+                    "{context}: successor key {successor_id} has a different signer_identity"
+                ));
+            }
+        }
+    }
+}
+
+fn validate_trust_registry_applicability(
+    deployment: &Value,
+    registry: &Value,
+    errors: &mut Vec<String>,
+) {
+    let context = "conformance-trust-root-registry.implementation.json:/applicability";
+    let applicability = registry.get("applicability").unwrap_or(&Value::Null);
+    let deployment_applicability = deployment.get("applicability").unwrap_or(&Value::Null);
+    for field in ["security_profiles", "deployment_ids"] {
+        let expected = string_set(array(deployment_applicability, field));
+        let actual = string_set(array(applicability, field));
+        if actual != expected {
+            errors.push(format!(
+                "{context}: {field} {:?} does not exactly match deployment profile {:?}",
+                actual, expected
+            ));
+        }
+    }
+    let expected_domains = string_set(array(
+        deployment.get("trust_topology").unwrap_or(&Value::Null),
+        "trust_domain_ids",
+    ));
+    let actual_domains = string_set(array(applicability, "trust_domain_ids"));
+    if actual_domains != expected_domains {
+        errors.push(format!(
+            "{context}: trust_domain_ids {:?} do not exactly match deployment trust topology {:?}",
+            actual_domains, expected_domains
+        ));
+    }
+}
+
+fn parse_timestamp_value(
+    value: &Value,
+    field: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<DateTime<Utc>> {
+    let Some(raw) = string_field(value, field) else {
+        errors.push(format!("{context}: {field} must be a timestamp"));
+        return None;
+    };
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(timestamp) => Some(timestamp.with_timezone(&Utc)),
+        Err(error) => {
+            errors.push(format!("{context}: invalid {field}: {error}"));
+            None
+        }
+    }
+}
+
+fn optional_timestamp_value(
+    value: &Value,
+    field: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) -> Option<DateTime<Utc>> {
+    if value.get(field).is_none_or(Value::is_null) {
+        None
+    } else {
+        parse_timestamp_value(value, field, context, errors)
+    }
+}
+
+fn decode_canonical_ed25519_public_key(encoded: &str) -> Result<Vec<u8>, String> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() != 44 || bytes[43] != b'=' || bytes[..43].contains(&b'=') {
+        return Err(
+            "public_key_base64 must be canonical padded standard base64 for 32 bytes".to_string(),
+        );
+    }
+    let mut decoded = Vec::with_capacity(32);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let a = standard_base64_value(chunk[0])?;
+        let b = standard_base64_value(chunk[1])?;
+        let c = standard_base64_value(chunk[2])?;
+        let final_chunk = index == 10;
+        let d = if final_chunk {
+            if chunk[3] != b'=' || c & 0b11 != 0 {
+                return Err("public_key_base64 has non-canonical padding bits".to_string());
+            }
+            0
+        } else {
+            standard_base64_value(chunk[3])?
+        };
+        decoded.push((a << 2) | (b >> 4));
+        decoded.push((b << 4) | (c >> 2));
+        if !final_chunk {
+            decoded.push((c << 6) | d);
+        }
+    }
+    if decoded.len() != 32 {
+        return Err("public_key_base64 must decode to exactly 32 bytes".to_string());
+    }
+    Ok(decoded)
+}
+
+fn standard_base64_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err("public_key_base64 contains a non-standard base64 character".to_string()),
     }
 }
 
@@ -2924,13 +3435,18 @@ fn validate_content_reference(
         }
     };
     let actual_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
-    let digest_field = if reference.contains_key("content_digest") {
-        "content_digest"
-    } else if reference.contains_key("reference_digest") {
-        "reference_digest"
-    } else {
+    let digest_field = [
+        "content_digest",
+        "reference_digest",
+        "bundle_digest",
+        "receipt_digest",
+        "ledger_digest",
+    ]
+    .into_iter()
+    .find(|field| reference.contains_key(*field));
+    let Some(digest_field) = digest_field else {
         errors.push(format!(
-            "{context}: artifact_locator requires content_digest or reference_digest"
+            "{context}: artifact_locator requires a supported content digest field"
         ));
         return;
     };
@@ -2942,13 +3458,29 @@ fn validate_content_reference(
 
     if target.extension().and_then(|extension| extension.to_str()) == Some("json") {
         if let Ok(document) = serde_json::from_slice::<Value>(&bytes) {
-            for key in ["document_id", "document_version"] {
+            for key in [
+                "document_id",
+                "document_version",
+                "bundle_id",
+                "receipt_id",
+                "ledger_id",
+            ] {
                 if reference.get(key).is_some()
                     && document.get(key).is_some()
                     && reference.get(key) != document.get(key)
                 {
                     errors.push(format!(
                         "{context}: {key} does not match artifact_locator {locator}"
+                    ));
+                }
+            }
+            if let (Some(reference_kind), Some(document_kind)) = (
+                reference.get("artifact_kind"),
+                document.get("contract_kind"),
+            ) {
+                if reference_kind != document_kind {
+                    errors.push(format!(
+                        "{context}: artifact_kind does not match artifact_locator {locator}"
                     ));
                 }
             }
@@ -2987,6 +3519,7 @@ fn safe_repository_path(
 ) -> Option<PathBuf> {
     let relative = Path::new(locator);
     if locator.is_empty()
+        || locator.contains('\\')
         || relative
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -3103,6 +3636,36 @@ fn validate_implementation_only_honesty(
             errors.push(format!(
                 "{file_name}: implementation-only document cannot cite an accepted receipt"
             ));
+        }
+    }
+    if let Some(registry) = instances.get("conformance-trust-root-registry.implementation.json") {
+        require_exact_string(
+            registry,
+            "acceptance_status",
+            "implementation_only",
+            "conformance-trust-root-registry.implementation.json",
+            errors,
+        );
+        require_exact_bool(
+            registry,
+            "production_accepted",
+            false,
+            "conformance-trust-root-registry.implementation.json",
+            errors,
+        );
+        require_exact_string(
+            registry.get("lifecycle").unwrap_or(&Value::Null),
+            "state",
+            "implementation_only",
+            "conformance-trust-root-registry.implementation.json:/lifecycle",
+            errors,
+        );
+        for (index, key) in array(registry, "keys").iter().enumerate() {
+            if matches!(string_field(key, "lifecycle"), Some("active" | "overlap")) {
+                errors.push(format!(
+                    "conformance-trust-root-registry.implementation.json:/keys/{index}: repository implementation fixture cannot carry active signing authority"
+                ));
+            }
         }
     }
     for document in bundles {
@@ -3368,6 +3931,68 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("bundle_digest does not match")));
+    }
+
+    #[test]
+    fn ac_048_rejects_wrong_closure_reference_kind_identity_version_and_locator() {
+        for (field, wrong, expected_error) in [
+            (
+                "artifact_kind",
+                json!("package-exit-receipt"),
+                "artifact_kind must exactly reference conformance-bundle",
+            ),
+            (
+                "bundle_id",
+                json!("bundle:wrong"),
+                "bundle_id does not match the referenced closure document",
+            ),
+            (
+                "document_version",
+                json!(99),
+                "document_version does not match the referenced closure document",
+            ),
+            (
+                "artifact_locator",
+                json!("catalog/security-contracts/v1/conformance-bundles/wrong.json"),
+                "artifact_locator must exactly reference test:authoritative-bundle",
+            ),
+        ] {
+            let (ledger, bundle, mut receipt) = authoritative_candidate_fixture();
+            receipt.value["evaluated_sets"]["evidence_bindings"][0][field] = wrong;
+            let mut errors = Vec::new();
+            validate_closure_semantics_at(
+                &root(),
+                &ledger,
+                &[bundle],
+                &[receipt],
+                closure_test_now(),
+                &mut errors,
+            );
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "missing {expected_error}: {}",
+                errors.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn ac_048_rejects_noncanonical_ledger_locator() {
+        let (ledger, bundle, mut receipt) = authoritative_candidate_fixture();
+        receipt.value["ledger_binding"]["artifact_locator"] =
+            json!("catalog/security-contracts/v1/./control-trace.implementation.json");
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle],
+            &[receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("artifact_locator must exactly reference catalog/security-contracts/v1/control-trace.implementation.json")
+        }));
     }
 
     #[test]
@@ -3687,6 +4312,85 @@ mod tests {
     }
 
     #[test]
+    fn trust_registry_rejects_duplicate_revoked_and_tombstoned_key_reuse() {
+        let mut registry = trust_registry_fixture();
+        let duplicate = registry["keys"][0].clone();
+        registry["keys"]
+            .as_array_mut()
+            .expect("keys")
+            .push(duplicate);
+        registry["keys"][0]["lifecycle"] = json!("revoked");
+        registry["keys"][0]["revoked_at"] = Value::Null;
+        registry["key_tombstones"] = json!([{
+            "key_id": "conformance-key:test-primary",
+            "signer_identity": "signer:test",
+            "algorithm": "ed25519",
+            "revoked_at": "2026-07-15T00:00:00Z",
+            "reason": "Test terminal revocation record",
+            "superseded_by_key_id": null,
+            "trust_policy_version": 1
+        }]);
+
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate key_id conformance-key:test-primary")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("revoked key requires revoked_at")));
+        assert!(errors.iter().any(
+            |error| error.contains("tombstoned key_id conformance-key:test-primary is reused")
+        ));
+    }
+
+    #[test]
+    fn trust_registry_rejects_invalid_key_window_and_scope_escape() {
+        let mut registry = trust_registry_fixture();
+        registry["keys"][0]["valid_from"] = json!("2026-07-18T00:00:00Z");
+        registry["keys"][0]["valid_until"] = json!("2026-07-17T00:00:00Z");
+        registry["keys"][0]["deployment_ids"] = json!(["deployment:outside"]);
+        registry["keys"][0]["public_key_base64"] =
+            json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("valid_from must be before valid_until")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("outside registry applicability")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("Ed25519 public key cannot be all zeroes")));
+    }
+
+    #[test]
+    fn trust_registry_compares_supersession_times_as_instants() {
+        let mut registry = trust_registry_fixture();
+        let mut predecessor = registry["keys"][0].clone();
+        predecessor["key_id"] = json!("conformance-key:test-predecessor");
+        predecessor["public_key_base64"] = json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+        predecessor["valid_from"] = json!("2026-07-16T00:30:00+02:00");
+        registry["keys"][0]["valid_from"] = json!("2026-07-15T23:00:00Z");
+        registry["keys"][0]["supersedes_key_id"] = json!("conformance-key:test-predecessor");
+        registry["keys"]
+            .as_array_mut()
+            .expect("keys")
+            .push(predecessor);
+
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("must have a later valid_from")),
+            "{}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
     fn credential_reference_digest_uses_its_schema_field() {
         let locator = "docs/architecture/platform-security-boundary.md";
         let bytes = fs::read(root().join(locator)).expect("source artifact");
@@ -3715,6 +4419,8 @@ mod tests {
 
     fn authoritative_candidate_fixture() -> (Value, LoadedDocument, LoadedDocument) {
         let ledger = json!({
+            "document_id": "control-trace:test",
+            "document_version": 1,
             "ledger_id": "control-trace:test",
             "ledger_version": "1.0.0",
             "controls": [{
@@ -3787,6 +4493,10 @@ mod tests {
                 "production_accepted": false,
                 "package_id": "SB-0",
                 "ledger_binding": {
+                    "artifact_kind": "control-trace",
+                    "document_id": "control-trace:test",
+                    "document_version": 1,
+                    "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json",
                     "ledger_id": "control-trace:test",
                     "ledger_version": "1.0.0",
                     "ledger_digest": format!("sha256:{:x}", Sha256::digest(ledger_bytes))
@@ -3797,6 +4507,10 @@ mod tests {
                     "acceptance_case_ids": ["AC-001"],
                     "evidence_bindings": [{
                         "evidence_instance_id": "evidence:authoritative",
+                        "bundle_id": "bundle:authoritative",
+                        "document_version": 1,
+                        "artifact_kind": "conformance-bundle",
+                        "artifact_locator": "test:authoritative-bundle",
                         "bundle_digest": digest
                     }]
                 },
@@ -3823,6 +4537,48 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-07-16T00:00:00Z")
             .expect("fixed timestamp")
             .with_timezone(&Utc)
+    }
+
+    fn trust_registry_fixture() -> Value {
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "conformance-trust-root-registry",
+            "document_id": "conformance-trust-root-registry:test",
+            "document_version": 1,
+            "acceptance_status": "production_candidate",
+            "production_accepted": false,
+            "lifecycle": {
+                "state": "candidate",
+                "effective_at": "2026-07-15T00:00:00Z"
+            },
+            "applicability": {
+                "evaluation_scope": "deployment",
+                "security_profiles": ["test"],
+                "deployment_ids": ["deployment:test"],
+                "trust_domain_ids": ["trust-domain:test"]
+            },
+            "trust_policy_version": 1,
+            "canonicalization_profiles": ["ryuki-canonical-json-v1"],
+            "signature_algorithms": ["ed25519"],
+            "keys": [{
+                "key_id": "conformance-key:test-primary",
+                "signer_identity": "signer:test",
+                "algorithm": "ed25519",
+                "public_key_base64": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
+                "allowed_evidence_tiers": ["repository_local"],
+                "allowed_package_ids": ["SB-0"],
+                "deployment_ids": ["deployment:test"],
+                "trust_domain_ids": ["trust-domain:test"],
+                "valid_from": "2026-07-15T00:00:00Z",
+                "valid_until": "2026-07-17T00:00:00Z",
+                "lifecycle": "active",
+                "revoked_at": null,
+                "supersedes_key_id": null
+            }],
+            "key_tombstones": []
+        })
     }
 
     fn make_bundle_production_accepted(bundle: &mut LoadedDocument) {
@@ -3904,6 +4660,8 @@ mod tests {
                     "package_id": package,
                     "document_version": 1,
                     "receipt_id": id,
+                    "artifact_kind": "package-exit-receipt",
+                    "artifact_locator": format!("test:{id}"),
                     "receipt_digest": receipt_digest,
                     "acceptance_status": "implementation_only",
                     "production_accepted": false,
@@ -3935,6 +4693,10 @@ mod tests {
                 "production_accepted": false,
                 "package_id": package,
                 "ledger_binding": {
+                    "artifact_kind": "control-trace",
+                    "document_id": ledger["document_id"],
+                    "document_version": ledger["document_version"],
+                    "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json",
                     "ledger_id": ledger["ledger_id"],
                     "ledger_version": ledger["ledger_version"],
                     "ledger_digest": format!("sha256:{:x}", Sha256::digest(ledger_bytes))
@@ -3945,6 +4707,10 @@ mod tests {
                     "acceptance_case_ids": [trace["acceptance_case_id"].clone()],
                     "evidence_bindings": [{
                         "evidence_instance_id": evidence_id,
+                        "bundle_id": evidence_id.replacen("evidence", "bundle", 1),
+                        "document_version": 1,
+                        "artifact_kind": "conformance-bundle",
+                        "artifact_locator": format!("test:{}", evidence_id.replacen("evidence", "bundle", 1)),
                         "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     }]
                 },

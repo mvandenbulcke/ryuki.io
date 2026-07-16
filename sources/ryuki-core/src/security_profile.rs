@@ -43,6 +43,8 @@ pub struct DeploymentSecurityProfile {
     pub policy_version: u64,
     pub tenancy_mode: TenancyMode,
     pub trust_topology: TrustTopology,
+    pub conformance_trust_root_registry_ref: VersionedContentReference,
+    pub control_trace_ref: VersionedContentReference,
     pub provider_registry_ref: VersionedContentReference,
     pub provider_lifecycle_snapshot_ref: ProviderLifecycleReference,
     pub action_resource_registry_ref: VersionedContentReference,
@@ -163,6 +165,9 @@ pub struct VersionedContentReference {
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
     DeploymentSecurityProfile,
+    ConformanceTrustRootRegistry,
+    ControlTrace,
+    ConformanceBundle,
     ProviderRegistry,
     ActionResourceRegistry,
     SecurityLimitProfile,
@@ -410,13 +415,6 @@ impl DeploymentSecurityProfile {
         if self.lifecycle.state != DocumentLifecycleState::Active {
             errors.push("startup requires an active deployment profile document".into());
         }
-        if expected.security_profile.is_production() {
-            errors.push(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified"
-                    .into(),
-            );
-        }
-
         errors.sort();
         errors.dedup();
         errors
@@ -473,6 +471,18 @@ impl DeploymentSecurityProfile {
         }
 
         for (label, reference, expected_kind, expected_prefix) in [
+            (
+                "conformance_trust_root_registry_ref",
+                &self.conformance_trust_root_registry_ref,
+                ArtifactKind::ConformanceTrustRootRegistry,
+                "conformance-trust-root-registry:",
+            ),
+            (
+                "control_trace_ref",
+                &self.control_trace_ref,
+                ArtifactKind::ControlTrace,
+                "control-trace:",
+            ),
             (
                 "provider_registry_ref",
                 &self.provider_registry_ref,
@@ -930,15 +940,10 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("pinned security_profile"))
         );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("production startup is blocked"))
-        );
     }
 
     #[test]
-    fn receipt_shaped_metadata_never_authorizes_production_startup() {
+    fn structurally_complete_production_profile_reaches_external_closure_gate() {
         let profile = structurally_complete_production_profile();
         assert!(profile.validate_structure_at(fixed_now()).is_empty());
 
@@ -951,11 +956,7 @@ mod tests {
             TEST_PROFILE_DIGEST,
             fixed_now(),
         );
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("production startup is blocked"))
-        );
+        assert!(errors.is_empty());
     }
 
     #[test]

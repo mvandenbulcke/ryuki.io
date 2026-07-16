@@ -437,10 +437,12 @@ fn find_deployment<'a>(docs: &'a [serde_yaml::Value], name: &str) -> &'a serde_y
 }
 
 const SECURITY_ADMISSION_CONFIG_MAP: &str = "platform-security-admission-config";
-const SECURITY_ADMISSION_KEYS: [&str; 5] = [
+const SECURITY_ADMISSION_KEYS: [&str; 7] = [
     "RYUKI_SECURITY_CONTRACT_ROOT",
     "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
     "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH",
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST",
     "RYUKI_EXPECTED_DEPLOYMENT_ID",
     "RYUKI_SECURITY_PROFILE",
 ];
@@ -474,7 +476,7 @@ fn assert_ordered_security_admission_env(env: &[serde_yaml::Value]) {
     assert_eq!(
         env.len(),
         SECURITY_ADMISSION_KEYS.len() + 1,
-        "the exact database secret key must be followed by five admission keys"
+        "the exact database secret key must be followed by seven admission keys"
     );
 
     let names: Vec<&str> = env

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod conformance_trust;
 pub mod secret_scan;
 pub mod security_profile;
 pub mod types;

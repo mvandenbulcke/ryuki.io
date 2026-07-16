@@ -117,7 +117,11 @@ def inline(text: str) -> str:
                     url += "#" + fragment
                 break
         else:
-            url = re.sub(r"^(?:docs/)?([\w-]+)\.md$", r"\1.html", url)
+            rewritten = re.sub(r"^(?:docs/)?([\w-]+)\.md$", r"\1.html", base)
+            if rewritten != base:
+                url = rewritten
+                if separator:
+                    url += "#" + fragment
         return f'<a href="{url}">{label}</a>'
 
     return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, out)

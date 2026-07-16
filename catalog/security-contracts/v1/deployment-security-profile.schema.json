@@ -10,7 +10,8 @@
     "document_version", "lifecycle", "applicability",
     "deployment_profile_version", "deployment_id", "security_profile",
     "platform_configuration_version", "policy_version", "tenancy_mode",
-    "trust_topology", "provider_registry_ref",
+    "trust_topology", "conformance_trust_root_registry_ref",
+    "control_trace_ref", "provider_registry_ref",
     "provider_lifecycle_snapshot_ref", "action_resource_registry_ref",
     "security_limit_profile_ref", "control_plane_topology_ref",
     "egress_policy_ref", "retention_policy_ref", "enabled_features",
@@ -31,6 +32,18 @@
     "policy_version": { "$ref": "#/$defs/positiveVersion" },
     "tenancy_mode": { "enum": ["single_tenant", "multi_tenant"] },
     "trust_topology": { "$ref": "#/$defs/trustTopology" },
+    "conformance_trust_root_registry_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "conformance-trust-root-registry" } } }
+      ]
+    },
+    "control_trace_ref": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedContentReference" },
+        { "properties": { "artifact_kind": { "const": "control-trace" } } }
+      ]
+    },
     "provider_registry_ref": {
       "allOf": [
         { "$ref": "#/$defs/versionedContentReference" },
@@ -190,7 +203,8 @@
         "artifact_kind": {
           "enum": [
             "deployment-security-profile", "provider-registry", "action-resource-registry",
-            "security-limit-profile", "control-plane-topology",
+            "security-limit-profile", "conformance-trust-root-registry", "control-trace",
+            "control-plane-topology",
             "egress-policy", "retention-policy", "federation-policy",
             "package-exit-receipt"
           ]
@@ -205,6 +219,8 @@
         { "if": { "properties": { "artifact_kind": { "const": "provider-registry" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^provider-registry:" } } } },
         { "if": { "properties": { "artifact_kind": { "const": "action-resource-registry" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^action-resource-registry:" } } } },
         { "if": { "properties": { "artifact_kind": { "const": "security-limit-profile" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^security-limit-profile:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "conformance-trust-root-registry" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^conformance-trust-root-registry:" } } } },
+        { "if": { "properties": { "artifact_kind": { "const": "control-trace" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^control-trace:" } } } },
         { "if": { "properties": { "artifact_kind": { "const": "package-exit-receipt" } }, "required": ["artifact_kind"] }, "then": { "properties": { "document_id": { "pattern": "^package-exit-receipt:" } } } }
       ]
     },

@@ -76,13 +76,14 @@ implementation work packages
 work that does and does not require trusted access
 acceptance criteria
 standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link active" aria-current="page" data-sections="load order
+deployment-security startup admission
 core environment variables
 infrastructure providers
 nested configuration groups
 validation
 entra id app registration
 postgresql
-admin portal" href="/configuration.html">Configuration</a><ul class="sb-sections"><li><a href="#load-order">Load Order</a></li><li><a href="#core-environment-variables">Core Environment Variables</a></li><li><a href="#infrastructure-providers">Infrastructure Providers</a></li><li><a href="#nested-configuration-groups">Nested Configuration Groups</a></li><li><a href="#validation">Validation</a></li><li><a href="#entra-id-app-registration">Entra ID App Registration</a></li><li><a href="#postgresql">PostgreSQL</a></li><li><a href="#admin-portal">Admin Portal</a></li></ul></li><li><a class="sb-link" data-sections="overview
+admin portal" href="/configuration.html">Configuration</a><ul class="sb-sections"><li><a href="#load-order">Load Order</a></li><li><a href="#deployment-security-startup-admission">Deployment-security startup admission</a></li><li><a href="#core-environment-variables">Core Environment Variables</a></li><li><a href="#infrastructure-providers">Infrastructure Providers</a></li><li><a href="#nested-configuration-groups">Nested Configuration Groups</a></li><li><a href="#validation">Validation</a></li><li><a href="#entra-id-app-registration">Entra ID App Registration</a></li><li><a href="#postgresql">PostgreSQL</a></li><li><a href="#admin-portal">Admin Portal</a></li></ul></li><li><a class="sb-link" data-sections="overview
 browser redirect registration
 app roles definition
 how it works
@@ -138,6 +139,20 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 </ol>
 <p>Nested fields use <code>__</code> in environment variables. For example, <code>server.bind_address</code> becomes <code>RYUKI_SERVER__BIND_ADDRESS</code>.</p>
 <p><code>RyukiConfig::load()</code> does not parse <code>.env</code> files by itself. Use <code>.env</code> with Docker Compose, export variables into the host process environment, or use one of the supported config files for direct <code>cargo run</code> workflows.</p>
+<h2 id="deployment-security-startup-admission">Deployment-security startup admission</h2>
+<p>Every API and migration process requires these seven values; none has a runtime default and empty values fail closed:</p>
+<table><thead><tr><th>Variable</th><th>Required value</th></tr></thead><tbody>
+<tr><td><code>RYUKI_SECURITY_CONTRACT_ROOT</code></td><td>Absolute path to the immutable directory containing the profile and all referenced artifacts</td></tr>
+<tr><td><code>RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH</code></td><td>Normalized relative path beneath that absolute root; absolute paths and traversal are rejected</td></tr>
+<tr><td><code>RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST</code></td><td>Nonzero <code>sha256:&lt;64 lowercase hex&gt;</code> digest computed over the profile's exact raw bytes</td></tr>
+<tr><td><code>RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH</code></td><td>Normalized relative <code>.json</code> path beneath the same immutable root; absolute paths, traversal, and non-JSON paths are rejected</td></tr>
+<tr><td><code>RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST</code></td><td>Independently supplied, nonzero <code>sha256:&lt;64 lowercase hex&gt;</code> digest computed over the trust-root registry's exact raw bytes</td></tr>
+<tr><td><code>RYUKI_EXPECTED_DEPLOYMENT_ID</code></td><td>Independent canonical <code>deployment:</code> pin that must equal the document's deployment identity</td></tr>
+<tr><td><code>RYUKI_SECURITY_PROFILE</code></td><td>Independent profile-class pin, exactly <code>development</code>, <code>test</code>, or <code>production</code>, that must equal the document</td></tr>
+</tbody></table>
+<p>The deployment, profile, and trust-root-registry pins come from process configuration, not from the documents being admitted. Preflight verifies the root-owned, immutable, content-addressed root before migration-mode or database configuration, application configuration, signing keys, workers, router construction, or listener binding. The sole configuration-free exception is the read-only <code>--dump-route-meta</code> maintenance mode, which exits without starting runtime services.</p>
+<p>Files checked into <code>catalog/security-contracts/v1</code> with lifecycle <code>implementation_only</code> are schema/conformance fixtures, not active deployment authority, and cannot start the API or migration runner. Production remains blocked until trusted conformance receipts and live runtime facts can be verified. The proving ground likewise requires a separately reviewed active operator bundle and evidence; the repository does not publish or infer a runnable profile digest.</p>
+<p>This admission slice binds authentication to exactly one active provider configuration. Only a matching mock/static development fixture can currently pass, and it must use a literal loopback listener and public URL. The provider schema does not yet project every security-relevant legacy <code>local</code> or <code>entra-id</code> runtime value, so those live modes fail closed even under a migration overlay. Their configuration sections below document implemented runtime features, not a bypass around startup admission.</p>
 <h2 id="core-environment-variables">Core Environment Variables</h2>
 <p>Copy <code>.env.example</code> to <code>.env</code> for Compose workflows, or export the same variables before running the API directly:</p>
 <h3 id="postgresql-connection">PostgreSQL connection</h3>

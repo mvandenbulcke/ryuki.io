@@ -123,6 +123,16 @@ spec:
                 configMapKeyRef:
                   name: platform-security-admission-config
                   key: RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST
+            - name: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH
+            - name: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-security-admission-config
+                  key: RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST
             - name: RYUKI_EXPECTED_DEPLOYMENT_ID
               valueFrom:
                 configMapKeyRef:

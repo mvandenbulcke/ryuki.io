@@ -6,7 +6,11 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "$schema",
     "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
     "ledger_id",
     "ledger_version",
     "acceptance_status",
@@ -16,8 +20,21 @@
     "traces"
   ],
   "properties": {
+    "$schema": {
+      "const": "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json"
+    },
     "schema_version": {
       "$ref": "#/$defs/version"
+    },
+    "contract_kind": {
+      "const": "control-trace"
+    },
+    "document_id": {
+      "const": "control-trace:ryuki-security-boundary-v1"
+    },
+    "document_version": {
+      "type": "integer",
+      "minimum": 1
     },
     "ledger_id": {
       "$ref": "#/$defs/identifier"

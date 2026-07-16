@@ -22,8 +22,13 @@ length.
 
 The API image fixes `RYUKI_SECURITY_CONTRACT_ROOT=/app/security-contract` and
 Compose requires the profile path, exact raw-byte profile digest, expected
-deployment id, and `development|test|production` profile pin from the
-gitignored environment. The checked-in bundle is `implementation_only`, so it
+deployment id, `development|test|production` profile pin, and the normalized
+`.json` path plus exact nonzero raw-byte digest of an independently approved
+conformance trust-root registry from the gitignored environment through
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` and
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. The registry and profile must
+both reside beneath the root-owned immutable contract root.
+The checked-in bundle is `implementation_only`, so it
 is not selected automatically and cannot start this stack. Until an active
 typed provider profile can bind every runtime authentication value, the full
 Compose startup is intentionally blocked. A migration overlay cannot grant

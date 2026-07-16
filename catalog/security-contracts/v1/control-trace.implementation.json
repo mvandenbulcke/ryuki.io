@@ -1,5 +1,9 @@
 {
+  "$schema": "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json",
   "schema_version": "1.0.0",
+  "contract_kind": "control-trace",
+  "document_id": "control-trace:ryuki-security-boundary-v1",
+  "document_version": 1,
   "ledger_id": "ryuki-security-boundary",
   "ledger_version": "1.0.0",
   "acceptance_status": "implementation_only",

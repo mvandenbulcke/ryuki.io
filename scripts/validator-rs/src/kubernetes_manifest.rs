@@ -70,6 +70,8 @@ const SECURITY_ADMISSION_KEYS: &[&str] = &[
     "RYUKI_SECURITY_CONTRACT_ROOT",
     "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH",
     "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST",
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH",
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST",
     "RYUKI_EXPECTED_DEPLOYMENT_ID",
     "RYUKI_SECURITY_PROFILE",
 ];
@@ -634,7 +636,7 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
         );
         validate_container_image(name, container, errors);
         // Non-secret configuration is imported from one exact, key-allowlisted
-        // ConfigMap. The API adds one reviewed Secret key and five individually
+        // ConfigMap. The API adds one reviewed Secret key and seven individually
         // pinned admission ConfigMap keys; whole-Secret envFrom imports are
         // forbidden so new Secret fields can never override policy configuration.
         for (index, item) in containers.iter().enumerate() {
@@ -838,7 +840,7 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
     let env = array_at_path(container, &["env"]);
     let migration_url = env.first().copied().unwrap_or(&Value::Null);
     expect(
-        env.len() == 6
+        env.len() == SECURITY_ADMISSION_KEYS.len() + 1
             && object(migration_url).is_some_and(|entry| entry.len() == 2)
             && str_at(migration_url, &["name"]) == Some("RYUKI_MIGRATION_DATABASE_URL")
             && object_at(migration_url, &["valueFrom"])
@@ -853,13 +855,13 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
                 == Some("RYUKI_MIGRATION_DATABASE_URL")
             && value_at(migration_url, &["value"]).is_none(),
         errors,
-        "migration Job must import the digest-scoped migrator URL key plus five security-admission keys",
+        "migration Job must import the digest-scoped migrator URL key plus seven security-admission keys",
     );
     expect(
         env.get(1..)
             .is_some_and(exact_security_admission_env_entries),
         errors,
-        "migration Job must import the exact five security-admission ConfigMap keys",
+        "migration Job must import the exact seven security-admission ConfigMap keys",
     );
 
     validate_cnpg_ca_mount("migration Job", pod_spec, container, errors);
@@ -1225,7 +1227,7 @@ fn immutable_image_digest(image: &str) -> Option<&str> {
 }
 
 /// Require one exact allowlisted ConfigMap import per deployment, plus one exact
-/// database URL Secret key and five admission ConfigMap keys for the API.
+/// database URL Secret key and seven admission ConfigMap keys for the API.
 /// Literal values and whole-Secret imports are refused.
 fn validate_container_env(name: &str, index: usize, container: &Value, errors: &mut Vec<String>) {
     let Some(item) = object(container) else {
@@ -1255,7 +1257,7 @@ fn validate_container_env(name: &str, index: usize, container: &Value, errors: &
     if name == "platform-api" {
         let entry = env.first().copied().unwrap_or(&Value::Null);
         expect(
-            env.len() == 6
+            env.len() == SECURITY_ADMISSION_KEYS.len() + 1
                 && object(entry).is_some_and(|map| map.len() == 2)
                 && str_at(entry, &["name"]) == Some("RYUKI_DATABASE_URL")
                 && object_at(entry, &["valueFrom"]).is_some_and(|value_from| value_from.len() == 1)
@@ -1267,13 +1269,13 @@ fn validate_container_env(name: &str, index: usize, container: &Value, errors: &
                     == Some("RYUKI_DATABASE_URL")
                 && value_at(entry, &["value"]).is_none(),
             errors,
-            "Deployment platform-api must import the database URL plus five security-admission keys",
+            "Deployment platform-api must import the database URL plus seven security-admission keys",
         );
         expect(
             env.get(1..)
                 .is_some_and(exact_security_admission_env_entries),
             errors,
-            "Deployment platform-api must import the exact five security-admission ConfigMap keys",
+            "Deployment platform-api must import the exact seven security-admission ConfigMap keys",
         );
     } else {
         expect(
@@ -2875,6 +2877,58 @@ mod tests {
     }
 
     #[test]
+    fn security_admission_config_map_entries_are_exact_and_fail_closed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let raw = fs::read_to_string(root.join("deploy/kubernetes/base/deployments.yaml"))
+            .expect("checked-in Deployments must be readable");
+        let platform_api = serde_yaml::Deserializer::from_str(&raw)
+            .map(|document| Value::deserialize(document).expect("Deployment YAML must parse"))
+            .find(|deployment| str_at(deployment, &["metadata", "name"]) == Some("platform-api"))
+            .expect("platform-api Deployment must remain checked in");
+        let container = platform_api["spec"]["template"]["spec"]["containers"][0].clone();
+
+        let mut baseline_errors = Vec::new();
+        validate_container_env("platform-api", 0, &container, &mut baseline_errors);
+        assert!(
+            baseline_errors.is_empty(),
+            "checked-in admission entries must pass: {baseline_errors:?}"
+        );
+
+        for key in SECURITY_ADMISSION_KEYS {
+            for mutation in ["missing", "wrong ConfigMap", "literal value"] {
+                let mut invalid = container.clone();
+                let env = invalid["env"]
+                    .as_array_mut()
+                    .expect("platform-api env must be an array");
+                let index = env
+                    .iter()
+                    .position(|entry| str_at(entry, &["name"]) == Some(*key))
+                    .unwrap_or_else(|| panic!("checked-in env must contain {key}"));
+                match mutation {
+                    "missing" => {
+                        env.remove(index);
+                    }
+                    "wrong ConfigMap" => {
+                        env[index]["valueFrom"]["configMapKeyRef"]["name"] =
+                            json!("unreviewed-admission-config");
+                    }
+                    "literal value" => {
+                        env[index] = json!({ "name": key, "value": "unreviewed" });
+                    }
+                    _ => unreachable!(),
+                }
+
+                let mut errors = Vec::new();
+                validate_container_env("platform-api", 0, &invalid, &mut errors);
+                assert!(
+                    !errors.is_empty(),
+                    "{key} must fail closed when mutated as {mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn checked_in_migration_job_retains_the_one_shot_contract() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let deployments_raw =
@@ -3296,6 +3350,20 @@ mod tests {
                                     "valueFrom": { "configMapKeyRef": {
                                         "name": SECURITY_ADMISSION_CONFIG_MAP,
                                         "key": "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH"
+                                    }}
+                                },
+                                {
+                                    "name": "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST",
+                                    "valueFrom": { "configMapKeyRef": {
+                                        "name": SECURITY_ADMISSION_CONFIG_MAP,
+                                        "key": "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST"
                                     }}
                                 },
                                 {

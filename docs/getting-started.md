@@ -46,13 +46,17 @@ bind address explicitly so the portal can use its default port `8080`. Pass
 additional authentication settings explicitly or through a supported Ryuki
 config file rather than sourcing `.env` as shell code:
 
-Before running, supply a reviewed active contract through all five mandatory
+Before running, supply a reviewed active contract and independently approved
+trust-root registry through all seven mandatory
 inputs: `RYUKI_SECURITY_CONTRACT_ROOT`,
 `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH`,
-`RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST`, `RYUKI_EXPECTED_DEPLOYMENT_ID`, and
-`RYUKI_SECURITY_PROFILE`. The profile path is relative to the absolute root;
-the digest is `sha256:<64 lowercase hex>` over its exact raw bytes; and the
-deployment identity and profile class are independent pins. See
+`RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST`,
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH`,
+`RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`, `RYUKI_EXPECTED_DEPLOYMENT_ID`,
+and `RYUKI_SECURITY_PROFILE`. Both paths are normalized `.json` paths relative
+to the absolute, immutable root; both digests are nonzero
+`sha256:<64 lowercase hex>` values over the respective exact raw bytes; and the
+deployment identity and profile class remain independent pins. See
 [Deployment-security startup admission](configuration.md#deployment-security-startup-admission).
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.

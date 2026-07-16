@@ -17,6 +17,10 @@ use std::path::{Component, Path, PathBuf};
 use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
 use ryuki_core::config::{AuthMode, RyukiConfig};
+use ryuki_core::conformance_trust::{
+    ConformanceTrustStore, ConformanceVerificationContext, EvidenceTier,
+    VerifiedConformanceDocument,
+};
 use ryuki_core::security_profile::{
     DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile, StartupAdmissionContext,
 };
@@ -28,6 +32,10 @@ use sha2::{Digest, Sha256};
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
 pub(crate) const SECURITY_PROFILE_DIGEST_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST";
+pub(crate) const CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH";
+pub(crate) const CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST";
 pub(crate) const EXPECTED_DEPLOYMENT_ID_ENV: &str = "RYUKI_EXPECTED_DEPLOYMENT_ID";
 pub(crate) const SECURITY_PROFILE_ENV: &str = "RYUKI_SECURITY_PROFILE";
 
@@ -44,6 +52,13 @@ const MAX_JSON_OBJECT_MEMBERS: usize = 4_096;
 
 const PROFILE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/deployment-security-profile.schema.json");
+const CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/conformance-trust-root-registry.schema.json"
+);
+const CONTROL_TRACE_SCHEMA: &str =
+    include_str!("../../../catalog/security-contracts/v1/control-trace.schema.json");
+const CONFORMANCE_BUNDLE_SCHEMA: &str =
+    include_str!("../../../catalog/security-contracts/v1/conformance-bundle.schema.json");
 const PROVIDER_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/provider-registry.schema.json");
 const ACTION_SCHEMA: &str =
@@ -58,6 +73,8 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) contract_root: PathBuf,
     pub(crate) profile_path: PathBuf,
     pub(crate) profile_digest: String,
+    pub(crate) conformance_trust_root_registry_path: PathBuf,
+    pub(crate) conformance_trust_root_registry_digest: String,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
 }
@@ -80,10 +97,26 @@ impl StartupSecurityPins {
 
         let profile_path_raw = required_unicode(&mut get, SECURITY_PROFILE_PATH_ENV)?;
         let profile_path = PathBuf::from(&profile_path_raw);
-        validate_relative_path(SECURITY_PROFILE_PATH_ENV, &profile_path)?;
+        validate_json_relative_path(SECURITY_PROFILE_PATH_ENV, &profile_path)?;
 
         let profile_digest = required_unicode(&mut get, SECURITY_PROFILE_DIGEST_ENV)?;
         validate_digest_pin(SECURITY_PROFILE_DIGEST_ENV, &profile_digest)?;
+
+        let conformance_trust_root_registry_path_raw =
+            required_unicode(&mut get, CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV)?;
+        let conformance_trust_root_registry_path =
+            PathBuf::from(&conformance_trust_root_registry_path_raw);
+        validate_json_relative_path(
+            CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV,
+            &conformance_trust_root_registry_path,
+        )?;
+
+        let conformance_trust_root_registry_digest =
+            required_unicode(&mut get, CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV)?;
+        validate_digest_pin(
+            CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV,
+            &conformance_trust_root_registry_digest,
+        )?;
 
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
         validate_namespaced_id(EXPECTED_DEPLOYMENT_ID_ENV, &deployment_id, "deployment:")?;
@@ -104,6 +137,8 @@ impl StartupSecurityPins {
             contract_root,
             profile_path,
             profile_digest,
+            conformance_trust_root_registry_path,
+            conformance_trust_root_registry_digest,
             deployment_id,
             security_profile,
         })
@@ -199,6 +234,7 @@ pub(crate) struct SecurityContractContext {
     pub(crate) profile_digest: String,
     pub(crate) contract_root: PathBuf,
     pub(crate) profile_path: PathBuf,
+    pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceDocument>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
 }
@@ -211,10 +247,10 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if self.profile.security_profile.is_production() {
-            return Err(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified"
-                    .into(),
-            );
+            return Err(format!(
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({} signed closure documents authenticated; semantic closure remains unavailable)",
+                self.verified_conformance_documents.len()
+            ));
         }
 
         if self.profile.migration_overlay.is_some()
@@ -455,6 +491,9 @@ pub(crate) fn load_startup_security_contract(
         ));
     }
 
+    let conformance_trust_store =
+        load_pinned_conformance_trust_root_registry(&mut store, pins, &profile, now)?;
+
     let allow_repository_fixture_evidence = profile.security_profile.admits_development_fixture()
         && profile
             .enabled_features
@@ -474,6 +513,12 @@ pub(crate) fn load_startup_security_contract(
         .ok_or_else(|| "provider registry reference did not resolve to JSON".to_string())?;
     let active_providers =
         validate_provider_registry(provider_registry, &profile, now, &verifier.documents)?;
+    let verified_conformance_documents = verify_loaded_conformance_documents(
+        &verifier.documents,
+        conformance_trust_store.as_ref(),
+        &profile,
+        now,
+    )?;
 
     for (label, reference, expected_schema) in [
         (
@@ -500,13 +545,330 @@ pub(crate) fn load_startup_security_contract(
         validate_active_deployment_document(label, document, &profile, now)?;
     }
 
+    reject_incomplete_production_startup(&profile, verified_conformance_documents.len())?;
+
     Ok(SecurityContractContext {
         profile,
         profile_digest: actual_profile_digest,
         contract_root: store.root,
         profile_path: pins.profile_path.clone(),
+        verified_conformance_documents,
         active_providers,
     })
+}
+
+fn reject_incomplete_production_startup(
+    profile: &DeploymentSecurityProfile,
+    verified_document_count: usize,
+) -> Result<(), String> {
+    if profile.security_profile.is_production() {
+        Err(format!(
+            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; semantic closure and live runtime facts remain unavailable)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn load_pinned_conformance_trust_root_registry(
+    store: &mut ArtifactStore,
+    pins: &StartupSecurityPins,
+    profile: &DeploymentSecurityProfile,
+    now: DateTime<Utc>,
+) -> Result<Option<ConformanceTrustStore>, String> {
+    let reference = &profile.conformance_trust_root_registry_ref;
+    let reference_path = Path::new(&reference.artifact_locator);
+    if reference_path != pins.conformance_trust_root_registry_path.as_path() {
+        return Err(
+            "deployment profile trust-root registry path does not match the independent startup pin"
+                .into(),
+        );
+    }
+    if reference.content_digest != pins.conformance_trust_root_registry_digest {
+        return Err(
+            "deployment profile trust-root registry digest does not match the independent startup pin"
+                .into(),
+        );
+    }
+
+    let bytes = store.read(
+        &pins.conformance_trust_root_registry_path,
+        MAX_ARTIFACT_BYTES,
+    )?;
+    let actual_digest = raw_digest(&bytes);
+    if actual_digest != pins.conformance_trust_root_registry_digest {
+        return Err(format!(
+            "conformance trust-root registry digest mismatch: expected {}, got {actual_digest}",
+            pins.conformance_trust_root_registry_digest
+        ));
+    }
+    let registry = parse_json_strict(&bytes)
+        .map_err(|error| format!("conformance trust-root registry JSON is invalid: {error}"))?;
+    validate_against_schema(
+        "conformance trust-root registry",
+        CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA,
+        &registry,
+    )?;
+
+    let binding = ReferenceBinding {
+        locator: reference.artifact_locator.clone(),
+        digest: reference.content_digest.clone(),
+        artifact_kind: Some("conformance-trust-root-registry".into()),
+        document_id: Some(reference.document_id.clone()),
+        document_version: Some(reference.document_version),
+    };
+    validate_reference_identity(&binding, &registry)?;
+    validate_typed_reference_document(&binding, &registry)?;
+    validate_conformance_trust_root_registry_lifecycle(&registry, profile, now)?;
+    let trust_store = if profile.security_profile.is_production() {
+        Some(
+            ConformanceTrustStore::from_bytes(
+                &bytes,
+                &reference.document_id,
+                reference.document_version,
+                &pins.conformance_trust_root_registry_digest,
+                now,
+            )
+            .map_err(|error| format!("conformance trust-root registry is not trusted: {error}"))?,
+        )
+    } else {
+        None
+    };
+    Ok(trust_store)
+}
+
+fn validate_conformance_trust_root_registry_lifecycle(
+    registry: &Value,
+    profile: &DeploymentSecurityProfile,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let lifecycle = registry
+        .get("lifecycle")
+        .ok_or_else(|| "conformance trust-root registry omits lifecycle".to_string())?;
+    let state = lifecycle
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "conformance trust-root registry omits lifecycle.state".to_string())?;
+    let effective_at = lifecycle
+        .get("effective_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "conformance trust-root registry omits lifecycle.effective_at".to_string()
+        })?;
+    let effective_at = DateTime::parse_from_rfc3339(effective_at)
+        .map_err(|_| {
+            "conformance trust-root registry lifecycle.effective_at is invalid".to_string()
+        })?
+        .with_timezone(&Utc);
+    if effective_at > now {
+        return Err("conformance trust-root registry lifecycle is future-dated".into());
+    }
+
+    let applicability = registry
+        .get("applicability")
+        .ok_or_else(|| "conformance trust-root registry omits applicability".to_string())?;
+    if applicability
+        .get("evaluation_scope")
+        .and_then(Value::as_str)
+        != Some("deployment")
+    {
+        return Err(
+            "conformance trust-root registry applicability must be deployment-scoped".into(),
+        );
+    }
+    for (field, expected) in [
+        (
+            "security_profiles",
+            profile
+                .applicability
+                .security_profiles
+                .iter()
+                .map(|profile| profile.as_str().to_owned())
+                .collect::<BTreeSet<_>>(),
+        ),
+        (
+            "deployment_ids",
+            profile
+                .applicability
+                .deployment_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+        (
+            "trust_domain_ids",
+            profile
+                .trust_topology
+                .trust_domain_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+    ] {
+        let actual = json_string_set(applicability, field)?;
+        if actual != expected {
+            return Err(format!(
+                "conformance trust-root registry applicability {field} does not exactly match the deployment profile"
+            ));
+        }
+    }
+
+    match state {
+        "active" => Ok(()),
+        "implementation_only"
+            if profile.security_profile.admits_development_fixture()
+                && profile
+                    .enabled_features
+                    .iter()
+                    .any(|feature| feature == "repository-conformance")
+                && profile
+                    .enabled_features
+                    .iter()
+                    .any(|feature| feature == "static-dry-run") =>
+        {
+            Ok(())
+        }
+        "implementation_only" => Err(
+            "implementation-only conformance trust-root registry requires the explicit test/development repository fixture"
+                .into(),
+        ),
+        _ => Err(format!(
+            "conformance trust-root registry lifecycle {state} cannot authenticate closure"
+        )),
+    }
+}
+
+fn verify_loaded_conformance_documents(
+    documents: &BTreeMap<String, Value>,
+    trust_store: Option<&ConformanceTrustStore>,
+    profile: &DeploymentSecurityProfile,
+    now: DateTime<Utc>,
+) -> Result<BTreeMap<String, VerifiedConformanceDocument>, String> {
+    let conformance_documents = documents
+        .iter()
+        .filter(|(_, document)| {
+            matches!(
+                document.get("contract_kind").and_then(Value::as_str),
+                Some("conformance-bundle" | "package-exit-receipt")
+            )
+        })
+        .collect::<Vec<_>>();
+    if conformance_documents.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let trust_store = trust_store.ok_or_else(|| {
+        "signed conformance documents require an active, production-accepted trust-root registry"
+            .to_string()
+    })?;
+    let [trust_domain_id] = profile.trust_topology.trust_domain_ids.as_slice() else {
+        return Err(
+            "signed conformance documents require exactly one trust domain until per-document trust-domain binding is implemented"
+                .into(),
+        );
+    };
+
+    let control_trace = documents
+        .get(&profile.control_trace_ref.artifact_locator)
+        .ok_or_else(|| {
+            "ControlTrace reference did not resolve before closure verification".to_string()
+        })?;
+    let mut trace_packages = BTreeMap::new();
+    for trace in control_trace
+        .get("traces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ControlTrace omits traces".to_string())?
+    {
+        let trace_id = trace
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "ControlTrace entry omits trace_id".to_string())?;
+        let package_id = trace
+            .get("owning_work_package")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("ControlTrace entry {trace_id} omits owning_work_package"))?;
+        if trace_packages
+            .insert(trace_id.to_owned(), package_id.to_owned())
+            .is_some()
+        {
+            return Err(format!(
+                "ControlTrace contains duplicate trace_id {trace_id}"
+            ));
+        }
+    }
+
+    let mut verified = BTreeMap::new();
+    for (locator, document) in conformance_documents {
+        let kind = document
+            .get("contract_kind")
+            .and_then(Value::as_str)
+            .expect("filtered conformance document has a kind");
+        let (package_id, tier_name) = match kind {
+            "conformance-bundle" => {
+                let trace_id = document
+                    .get("trace_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("conformance bundle {locator} omits trace_id"))?;
+                let package_id = trace_packages.get(trace_id).ok_or_else(|| {
+                    format!("conformance bundle {locator} cites unknown trace_id {trace_id}")
+                })?;
+                let tier = document
+                    .pointer("/provenance/evidence_tier/name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("conformance bundle {locator} omits evidence tier"))?;
+                (package_id.as_str(), tier)
+            }
+            "package-exit-receipt" => {
+                let package_id = document
+                    .get("package_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("package receipt {locator} omits package_id"))?;
+                let tier = document
+                    .pointer("/evidence_tier/name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("package receipt {locator} omits evidence tier"))?;
+                (package_id, tier)
+            }
+            _ => unreachable!("filtered conformance document kind"),
+        };
+        let evidence_tier = match tier_name {
+            "repository_local" => EvidenceTier::RepositoryLocal,
+            "operator_environment" => EvidenceTier::OperatorEnvironment,
+            "externally_attested" => EvidenceTier::ExternallyAttested,
+            _ => {
+                return Err(format!(
+                    "conformance document {locator} has unknown evidence tier"
+                ))
+            }
+        };
+        let proof = trust_store
+            .verify_document(
+                document,
+                ConformanceVerificationContext {
+                    deployment_id: &profile.deployment_id,
+                    trust_domain_id,
+                    package_id,
+                    evidence_tier,
+                },
+                now,
+            )
+            .map_err(|error| format!("conformance document {locator} is untrusted: {error}"))?;
+        verified.insert((*locator).clone(), proof);
+    }
+    Ok(verified)
+}
+
+fn json_string_set(value: &Value, field: &str) -> Result<BTreeSet<String>, String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{field} must be an array"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{field} must contain only strings"))
+        })
+        .collect()
 }
 
 fn required_unicode(
@@ -561,13 +923,30 @@ fn validate_digest_pin(name: &str, value: &str) -> Result<(), String> {
 }
 
 fn validate_relative_path(name: &str, path: &Path) -> Result<(), String> {
-    if path.as_os_str().is_empty()
+    let raw = path
+        .to_str()
+        .ok_or_else(|| format!("{name} must contain valid UTF-8"))?;
+    if raw.is_empty()
         || path.is_absolute()
+        || raw.contains('\\')
+        || raw
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(format!("{name} must be a normalized relative path"));
+    }
+    Ok(())
+}
+
+fn validate_json_relative_path(name: &str, path: &Path) -> Result<(), String> {
+    validate_relative_path(name, path)?;
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return Err(format!(
+            "{name} must select a normalized relative .json path"
+        ));
     }
     Ok(())
 }
@@ -928,7 +1307,10 @@ fn reference_binding_from_object(object: &Map<String, Value>) -> Option<Referenc
     let locator = object.get("artifact_locator")?.as_str()?;
     let digest = object
         .get("content_digest")
-        .or_else(|| object.get("reference_digest"))?
+        .or_else(|| object.get("reference_digest"))
+        .or_else(|| object.get("bundle_digest"))
+        .or_else(|| object.get("receipt_digest"))
+        .or_else(|| object.get("ledger_digest"))?
         .as_str()?;
     Some(ReferenceBinding {
         locator: locator.to_string(),
@@ -940,6 +1322,9 @@ fn reference_binding_from_object(object: &Map<String, Value>) -> Option<Referenc
         document_id: object
             .get("document_id")
             .or_else(|| object.get("reference_id"))
+            .or_else(|| object.get("receipt_id"))
+            .or_else(|| object.get("bundle_id"))
+            .or_else(|| object.get("ledger_id"))
             .and_then(Value::as_str)
             .map(str::to_string),
         document_version: object
@@ -957,6 +1342,8 @@ fn validate_reference_identity(
         let actual = document
             .get("document_id")
             .or_else(|| document.get("receipt_id"))
+            .or_else(|| document.get("bundle_id"))
+            .or_else(|| document.get("ledger_id"))
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 format!(
@@ -997,6 +1384,30 @@ fn validate_typed_reference_document(
 ) -> Result<(), String> {
     let schema_uri = document.get("$schema").and_then(Value::as_str);
     match reference.artifact_kind.as_deref() {
+        Some("conformance-trust-root-registry") => require_contract_document(
+            reference,
+            document,
+            schema_uri,
+            "conformance-trust-root-registry",
+            "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+            CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA,
+        ),
+        Some("control-trace") => require_contract_document(
+            reference,
+            document,
+            schema_uri,
+            "control-trace",
+            "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json",
+            CONTROL_TRACE_SCHEMA,
+        ),
+        Some("conformance-bundle") => require_contract_document(
+            reference,
+            document,
+            schema_uri,
+            "conformance-bundle",
+            "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+            CONFORMANCE_BUNDLE_SCHEMA,
+        ),
         Some("provider-registry") => require_contract_document(
             reference,
             document,
@@ -1029,10 +1440,13 @@ fn validate_typed_reference_document(
             "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json",
             PROFILE_SCHEMA,
         ),
-        Some("package-exit-receipt") => validate_against_schema(
-            "package exit receipt",
-            PACKAGE_EXIT_RECEIPT_SCHEMA,
+        Some("package-exit-receipt") => require_contract_document(
+            reference,
             document,
+            schema_uri,
+            "package-exit-receipt",
+            "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+            PACKAGE_EXIT_RECEIPT_SCHEMA,
         ),
         Some(
             "control-plane-topology" | "egress-policy" | "retention-policy" | "federation-policy",
@@ -1045,6 +1459,46 @@ fn validate_typed_reference_document(
             reference.locator
         )),
         None => match schema_uri {
+            Some(
+                "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+            ) => require_contract_document(
+                reference,
+                document,
+                schema_uri,
+                "conformance-trust-root-registry",
+                "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+                CONFORMANCE_TRUST_ROOT_REGISTRY_SCHEMA,
+            ),
+            Some("https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json") => {
+                require_contract_document(
+                    reference,
+                    document,
+                    schema_uri,
+                    "control-trace",
+                    "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json",
+                    CONTROL_TRACE_SCHEMA,
+                )
+            }
+            Some(
+                "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+            ) => require_contract_document(
+                reference,
+                document,
+                schema_uri,
+                "conformance-bundle",
+                "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+                CONFORMANCE_BUNDLE_SCHEMA,
+            ),
+            Some(
+                "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+            ) => require_contract_document(
+                reference,
+                document,
+                schema_uri,
+                "package-exit-receipt",
+                "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+                PACKAGE_EXIT_RECEIPT_SCHEMA,
+            ),
             Some(
                 "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
             ) => validate_against_schema("provider registry", PROVIDER_SCHEMA, document),
@@ -1858,7 +2312,14 @@ mod tests {
     use std::ffi::OsString;
     use std::io::Write;
 
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use chrono::TimeZone;
+    use ed25519_dalek::{Signer, SigningKey};
+    use ryuki_core::conformance_trust::{
+        conformance_signed_subject_digest, conformance_signing_bytes, CANONICALIZATION_PROFILE,
+        CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN, SIGNATURE_ALGORITHM,
+        SIGNATURE_VERSION,
+    };
     use ryuki_core::security_profile::{ArtifactKind, MigrationOverlay, VersionedContentReference};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1867,9 +2328,110 @@ mod tests {
 
     const DEPLOYMENT_ID: &str = "deployment:runtime-loader-test";
     const PROFILE_PATH: &str = "profiles/runtime-test.json";
+    const TRUST_ROOT_REGISTRY_PATH: &str =
+        "catalog/security-contracts/v1/conformance-trust-root-registry.runtime-test.json";
+    const CONTROL_TRACE_PATH: &str =
+        "catalog/security-contracts/v1/control-trace.runtime-test.json";
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
+    }
+
+    fn production_trust_registry(key: &SigningKey, profile: &DeploymentSecurityProfile) -> Value {
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "conformance-trust-root-registry",
+            "document_id": "conformance-trust-root-registry:runtime-test",
+            "document_version": 1,
+            "acceptance_status": "production_accepted",
+            "production_accepted": true,
+            "lifecycle": {"state": "active", "effective_at": "2026-07-15T00:00:00Z"},
+            "applicability": {
+                "evaluation_scope": "deployment",
+                "security_profiles": ["production"],
+                "deployment_ids": profile.applicability.deployment_ids,
+                "trust_domain_ids": profile.trust_topology.trust_domain_ids
+            },
+            "trust_policy_version": 1,
+            "canonicalization_profiles": [CANONICALIZATION_PROFILE],
+            "signature_algorithms": [SIGNATURE_ALGORITHM],
+            "keys": [{
+                "key_id": "conformance-key:runtime-test",
+                "signer_identity": "signer:runtime-test",
+                "algorithm": SIGNATURE_ALGORITHM,
+                "public_key_base64": BASE64_STANDARD.encode(key.verifying_key().to_bytes()),
+                "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
+                "allowed_evidence_tiers": ["externally_attested"],
+                "allowed_package_ids": ["SB-0"],
+                "deployment_ids": profile.applicability.deployment_ids,
+                "trust_domain_ids": profile.trust_topology.trust_domain_ids,
+                "valid_from": "2026-07-15T00:00:00Z",
+                "valid_until": "2026-07-17T00:00:00Z",
+                "lifecycle": "active",
+                "revoked_at": null,
+                "supersedes_key_id": null
+            }],
+            "key_tombstones": []
+        })
+    }
+
+    fn signed_closure_document(kind: &str, key: &SigningKey, registry_digest: &str) -> Value {
+        let (schema, id_field, id, purpose, domain) = match kind {
+            "conformance-bundle" => (
+                "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+                "bundle_id",
+                "bundle:runtime-test",
+                "conformance_bundle",
+                CONFORMANCE_BUNDLE_DOMAIN,
+            ),
+            "package-exit-receipt" => (
+                "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+                "receipt_id",
+                "package-exit-receipt:runtime-test",
+                "package_exit_receipt",
+                PACKAGE_EXIT_RECEIPT_DOMAIN,
+            ),
+            _ => panic!("unsupported signed closure kind"),
+        };
+        let mut document = json!({
+            "$schema": schema,
+            "schema_version": "1.0.0",
+            "contract_kind": kind,
+            "document_version": 1,
+            "signer": {
+                "signature_version": SIGNATURE_VERSION,
+                "identity": "signer:runtime-test",
+                "key_id": "conformance-key:runtime-test",
+                "algorithm": SIGNATURE_ALGORITHM,
+                "canonicalization": CANONICALIZATION_PROFILE,
+                "purpose": purpose,
+                "domain": domain,
+                "trust_registry_id": "conformance-trust-root-registry:runtime-test",
+                "trust_registry_version": 1,
+                "trust_registry_digest": registry_digest,
+                "signed_at": "2026-07-16T10:00:00Z",
+                "signed_subject_digest": format!("sha256:{}", "a".repeat(64)),
+                "signature_base64": BASE64_STANDARD.encode([0u8; 64])
+            }
+        });
+        document[id_field] = json!(id);
+        if kind == "conformance-bundle" {
+            document["trace_id"] = json!("TRACE-RUNTIME-TEST");
+            document["bindings"] = json!({"deployment_profile": {"deployment_id": DEPLOYMENT_ID}});
+            document["provenance"] = json!({"evidence_tier": {"name": "externally_attested"}});
+        } else {
+            document["package_id"] = json!("SB-0");
+            document["closure_context"] =
+                json!({"deployment_profile": {"deployment_id": DEPLOYMENT_ID}});
+            document["evidence_tier"] = json!({"name": "externally_attested"});
+        }
+        let subject_digest = conformance_signed_subject_digest(&document).unwrap();
+        document["signer"]["signed_subject_digest"] = json!(subject_digest);
+        let signature = key.sign(&conformance_signing_bytes(&document).unwrap());
+        document["signer"]["signature_base64"] =
+            json!(BASE64_STANDARD.encode(signature.to_bytes()));
+        document
     }
 
     fn repository_root() -> PathBuf {
@@ -1900,6 +2462,25 @@ mod tests {
             ] {
                 copy_relative(&repository, &root, relative);
             }
+
+            copy_relative_as(
+                &repository,
+                &root,
+                "catalog/security-contracts/v1/control-trace.implementation.json",
+                CONTROL_TRACE_PATH,
+            );
+            let mut trust_root_registry: Value = serde_json::from_slice(
+                &fs::read(repository.join(
+                    "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json",
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            trust_root_registry["applicability"]["deployment_ids"] = json!([DEPLOYMENT_ID]);
+            let trust_root_registry_digest =
+                write_json(&root, TRUST_ROOT_REGISTRY_PATH, &trust_root_registry);
+            let control_trace_digest =
+                raw_digest(&fs::read(root.join(CONTROL_TRACE_PATH)).unwrap());
 
             let transition_validated = write_json(
                 &root,
@@ -2028,6 +2609,20 @@ mod tests {
                 "session-lookup-admission"
             ]);
             profile["applicability"]["enabled_feature_ids"] = profile["enabled_features"].clone();
+            profile["conformance_trust_root_registry_ref"] = json!({
+                "artifact_kind": "conformance-trust-root-registry",
+                "document_id": "conformance-trust-root-registry:repository-implementation-v1",
+                "document_version": 1,
+                "content_digest": trust_root_registry_digest,
+                "artifact_locator": TRUST_ROOT_REGISTRY_PATH
+            });
+            profile["control_trace_ref"] = json!({
+                "artifact_kind": "control-trace",
+                "document_id": "control-trace:ryuki-security-boundary-v1",
+                "document_version": 1,
+                "content_digest": control_trace_digest,
+                "artifact_locator": CONTROL_TRACE_PATH
+            });
             set_root_reference(
                 &mut profile,
                 "provider_registry_ref",
@@ -2064,6 +2659,8 @@ mod tests {
                 contract_root: root.clone(),
                 profile_path: PathBuf::from(PROFILE_PATH),
                 profile_digest,
+                conformance_trust_root_registry_path: PathBuf::from(TRUST_ROOT_REGISTRY_PATH),
+                conformance_trust_root_registry_digest: trust_root_registry_digest,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
             };
@@ -2096,12 +2693,40 @@ mod tests {
                 profile["provider_lifecycle_snapshot_ref"]["content_digest"] = json!(digest);
             });
         }
+
+        fn rewrite_trust_root_registry_raw(&mut self, bytes: &[u8]) {
+            fs::write(self.root.join(TRUST_ROOT_REGISTRY_PATH), bytes).unwrap();
+            let digest = raw_digest(bytes);
+            self.pins.conformance_trust_root_registry_digest = digest.clone();
+            self.rewrite_profile(|profile| {
+                profile["conformance_trust_root_registry_ref"]["content_digest"] = json!(digest);
+            });
+        }
+
+        fn rewrite_trust_root_registry(&mut self, mutate: impl FnOnce(&mut Value)) {
+            let path = self.root.join(TRUST_ROOT_REGISTRY_PATH);
+            let mut registry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            mutate(&mut registry);
+            let bytes = serde_json::to_vec_pretty(&registry).unwrap();
+            self.rewrite_trust_root_registry_raw(&bytes);
+        }
     }
 
     fn copy_relative(source_root: &Path, destination_root: &Path, relative: &str) {
         let destination = destination_root.join(relative);
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::copy(source_root.join(relative), destination).unwrap();
+    }
+
+    fn copy_relative_as(
+        source_root: &Path,
+        destination_root: &Path,
+        source_relative: &str,
+        destination_relative: &str,
+    ) {
+        let destination = destination_root.join(destination_relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(source_root.join(source_relative), destination).unwrap();
     }
 
     fn write_json(root: &Path, relative: &str, value: &Value) -> String {
@@ -2171,6 +2796,14 @@ mod tests {
             ),
             (SECURITY_PROFILE_DIGEST_ENV.into(), OsString::from(&digest)),
             (
+                CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV.into(),
+                OsString::from(TRUST_ROOT_REGISTRY_PATH),
+            ),
+            (
+                CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV.into(),
+                OsString::from(&digest),
+            ),
+            (
                 EXPECTED_DEPLOYMENT_ID_ENV.into(),
                 OsString::from(DEPLOYMENT_ID),
             ),
@@ -2183,6 +2816,8 @@ mod tests {
             SECURITY_CONTRACT_ROOT_ENV,
             SECURITY_PROFILE_PATH_ENV,
             SECURITY_PROFILE_DIGEST_ENV,
+            CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV,
+            CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV,
             EXPECTED_DEPLOYMENT_ID_ENV,
             SECURITY_PROFILE_ENV,
         ] {
@@ -2200,12 +2835,62 @@ mod tests {
             OsString::from("test,production"),
         );
         assert!(StartupSecurityPins::from_source(|name| downgraded.get(name).cloned()).is_err());
-        let mut traversal = values;
+        let mut traversal = values.clone();
         traversal.insert(
             SECURITY_PROFILE_PATH_ENV.into(),
             OsString::from("../profile.json"),
         );
         assert!(StartupSecurityPins::from_source(|name| traversal.get(name).cloned()).is_err());
+
+        let mut trust_root_traversal = values.clone();
+        trust_root_traversal.insert(
+            CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV.into(),
+            OsString::from("../trust-root-registry.json"),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| trust_root_traversal.get(name).cloned())
+                .unwrap_err()
+                .contains("normalized relative path")
+        );
+
+        let mut non_json_trust_root = values.clone();
+        non_json_trust_root.insert(
+            CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV.into(),
+            OsString::from("catalog/security-contracts/v1/trust-root.txt"),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| non_json_trust_root.get(name).cloned())
+                .unwrap_err()
+                .contains("relative .json path")
+        );
+
+        for noncanonical in [
+            "catalog/./trust-root.json",
+            "catalog//trust-root.json",
+            "catalog\\trust-root.json",
+        ] {
+            let mut invalid = values.clone();
+            invalid.insert(
+                CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV.into(),
+                OsString::from(noncanonical),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("normalized relative path")
+            );
+        }
+
+        let mut malformed_trust_root_digest = values;
+        malformed_trust_root_digest.insert(
+            CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV.into(),
+            OsString::from(format!("sha256:{}", "0".repeat(64))),
+        );
+        assert!(StartupSecurityPins::from_source(|name| {
+            malformed_trust_root_digest.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("nonzero"));
     }
 
     #[test]
@@ -2213,6 +2898,7 @@ mod tests {
         let fixture = ActiveFixture::build();
         let context = fixture.load().expect("active test contract must load");
         assert_eq!(context.active_providers.len(), 1);
+        assert!(context.verified_conformance_documents.is_empty());
         let mut config = RyukiConfig {
             auth_mode: AuthMode::StaticDryRun,
             ..RyukiConfig::default()
@@ -2255,6 +2941,241 @@ mod tests {
             .unwrap();
         let error = fixture.load().unwrap_err();
         assert!(error.contains("artifact") && error.contains("digest mismatch"));
+    }
+
+    #[test]
+    fn independently_pinned_trust_root_registry_is_strict_and_content_addressed() {
+        let missing = ActiveFixture::build();
+        fs::remove_file(missing.root.join(TRUST_ROOT_REGISTRY_PATH)).unwrap();
+        assert!(missing
+            .load()
+            .unwrap_err()
+            .contains("artifact catalog/security-contracts/v1/conformance-trust-root-registry.runtime-test.json is unavailable"));
+
+        let mut malformed = ActiveFixture::build();
+        malformed.rewrite_trust_root_registry_raw(b"{\"not\":\"closed\"");
+        assert!(malformed
+            .load()
+            .unwrap_err()
+            .contains("trust-root registry JSON is invalid"));
+
+        let tampered = ActiveFixture::build();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(tampered.root.join(TRUST_ROOT_REGISTRY_PATH))
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(tampered
+            .load()
+            .unwrap_err()
+            .contains("trust-root registry digest mismatch"));
+    }
+
+    #[test]
+    fn profile_trust_root_reference_must_exactly_match_independent_pins() {
+        let mut path_mismatch = ActiveFixture::build();
+        path_mismatch.rewrite_profile(|profile| {
+            profile["conformance_trust_root_registry_ref"]["artifact_locator"] =
+                json!("catalog/security-contracts/v1/other-trust-root-registry.json");
+        });
+        assert!(path_mismatch
+            .load()
+            .unwrap_err()
+            .contains("path does not match the independent startup pin"));
+
+        let mut digest_mismatch = ActiveFixture::build();
+        digest_mismatch.rewrite_profile(|profile| {
+            profile["conformance_trust_root_registry_ref"]["content_digest"] =
+                json!(format!("sha256:{}", "b".repeat(64)));
+        });
+        assert!(digest_mismatch
+            .load()
+            .unwrap_err()
+            .contains("digest does not match the independent startup pin"));
+
+        let mut identity_mismatch = ActiveFixture::build();
+        identity_mismatch.rewrite_profile(|profile| {
+            profile["conformance_trust_root_registry_ref"]["document_id"] =
+                json!("conformance-trust-root-registry:wrong-registry");
+        });
+        assert!(identity_mismatch
+            .load()
+            .unwrap_err()
+            .contains("document identity mismatch"));
+    }
+
+    #[test]
+    fn implementation_trust_root_registry_is_fixture_only() {
+        let mut fixture = ActiveFixture::build();
+        fixture.rewrite_profile(|profile| {
+            profile["enabled_features"] = json!(["static-dry-run"]);
+            profile["applicability"]["enabled_feature_ids"] = profile["enabled_features"].clone();
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("implementation-only conformance trust-root registry requires"));
+    }
+
+    #[test]
+    fn trust_root_registry_applicability_must_exactly_match_profile() {
+        let mut fixture = ActiveFixture::build();
+        fixture.rewrite_trust_root_registry(|registry| {
+            registry["applicability"]["deployment_ids"] = json!(["deployment:other"]);
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("applicability deployment_ids does not exactly match"));
+
+        let mut fixture = ActiveFixture::build();
+        fixture.rewrite_trust_root_registry(|registry| {
+            registry["applicability"]["trust_domain_ids"] = json!(["trust-domain:other"]);
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("applicability trust_domain_ids does not exactly match"));
+    }
+
+    #[test]
+    fn production_signature_admission_precedes_the_final_production_block() {
+        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let mut fixture = ActiveFixture::build();
+        let mut profile_value: Value = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        profile_value["security_profile"] = json!("production");
+        profile_value["applicability"]["security_profiles"] = json!(["production"]);
+        profile_value["conformance_trust_root_registry_ref"]["document_id"] =
+            json!("conformance-trust-root-registry:runtime-test");
+        profile_value["conformance_trust_root_registry_ref"]["document_version"] = json!(1);
+        let provisional_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile_value.clone()).unwrap();
+        let registry = production_trust_registry(&key, &provisional_profile);
+        let registry_bytes = serde_json::to_vec_pretty(&registry).unwrap();
+        let registry_digest = raw_digest(&registry_bytes);
+        profile_value["conformance_trust_root_registry_ref"]["content_digest"] =
+            json!(registry_digest);
+        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        fixture.rewrite_trust_root_registry_raw(&registry_bytes);
+
+        let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
+        let trust_store = load_pinned_conformance_trust_root_registry(
+            &mut artifact_store,
+            &fixture.pins,
+            &profile,
+            fixed_now(),
+        )
+        .expect("production trust registry must load")
+        .expect("production registry must create a trust store");
+
+        let bundle = signed_closure_document(
+            "conformance-bundle",
+            &key,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let receipt = signed_closure_document(
+            "package-exit-receipt",
+            &key,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let documents = BTreeMap::from([
+            (
+                profile.control_trace_ref.artifact_locator.clone(),
+                json!({
+                    "traces": [{
+                        "trace_id": "TRACE-RUNTIME-TEST",
+                        "owning_work_package": "SB-0"
+                    }]
+                }),
+            ),
+            ("evidence/runtime-bundle.json".into(), bundle),
+            ("receipts/runtime-sb0.json".into(), receipt),
+        ]);
+        let verified = verify_loaded_conformance_documents(
+            &documents,
+            Some(&trust_store),
+            &profile,
+            fixed_now(),
+        )
+        .expect("valid signatures must authenticate");
+        assert_eq!(verified.len(), 2);
+        let expected_trust_domain = profile.trust_topology.trust_domain_ids[0].as_str();
+        assert!(verified.values().all(|proof| {
+            proof.deployment_id() == DEPLOYMENT_ID
+                && proof.trust_domain_id() == expected_trust_domain
+                && proof.package_id() == "SB-0"
+                && proof.evidence_tier() == EvidenceTier::ExternallyAttested
+        }));
+        let final_block = reject_incomplete_production_startup(&profile, verified.len())
+            .expect_err("cryptographic verification alone cannot authorize production");
+        assert!(final_block.contains("2 signed closure documents authenticated"));
+        assert!(final_block.contains("semantic closure and live runtime facts remain unavailable"));
+
+        let mut tampered = documents.clone();
+        tampered.get_mut("evidence/runtime-bundle.json").unwrap()["signer"]["signature_base64"] =
+            BASE64_STANDARD.encode([0u8; 64]).into();
+        let error = verify_loaded_conformance_documents(
+            &tampered,
+            Some(&trust_store),
+            &profile,
+            fixed_now(),
+        )
+        .expect_err("tampered signature must fail before the production block");
+        assert!(error.contains("untrusted"));
+        assert!(!error.contains("production startup is blocked"));
+
+        for (pointer, replacement) in [
+            (
+                "/signer/trust_registry_digest",
+                json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+            (
+                "/bindings/deployment_profile/deployment_id",
+                json!("deployment:other"),
+            ),
+            (
+                "/provenance/evidence_tier/name",
+                json!("operator_environment"),
+            ),
+        ] {
+            let mut scoped_tamper = documents.clone();
+            *scoped_tamper
+                .get_mut("evidence/runtime-bundle.json")
+                .unwrap()
+                .pointer_mut(pointer)
+                .unwrap() = replacement;
+            assert!(verify_loaded_conformance_documents(
+                &scoped_tamper,
+                Some(&trust_store),
+                &profile,
+                fixed_now(),
+            )
+            .is_err());
+        }
+
+        let mut package_tamper = documents.clone();
+        package_tamper.get_mut("receipts/runtime-sb0.json").unwrap()["package_id"] = json!("SB-1");
+        assert!(verify_loaded_conformance_documents(
+            &package_tamper,
+            Some(&trust_store),
+            &profile,
+            fixed_now(),
+        )
+        .is_err());
+
+        let mut wrong_domain_profile = profile.clone();
+        wrong_domain_profile.trust_topology.trust_domain_ids = vec!["trust-domain:other".into()];
+        assert!(verify_loaded_conformance_documents(
+            &documents,
+            Some(&trust_store),
+            &wrong_domain_profile,
+            fixed_now(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2512,6 +3433,49 @@ mod tests {
             .verify_value(&value, 0)
             .unwrap_err()
             .contains("total reference bindings"));
+    }
+
+    #[test]
+    fn closure_reference_aliases_enter_the_recursive_reference_graph() {
+        for (identity_field, identity, digest_field, kind) in [
+            (
+                "bundle_id",
+                "conformance-bundle:fixture",
+                "bundle_digest",
+                "conformance-bundle",
+            ),
+            (
+                "receipt_id",
+                "package-exit-receipt:fixture",
+                "receipt_digest",
+                "package-exit-receipt",
+            ),
+            (
+                "document_id",
+                "control-trace:fixture",
+                "ledger_digest",
+                "control-trace",
+            ),
+        ] {
+            let mut object = Map::new();
+            object.insert("artifact_kind".into(), json!(kind));
+            object.insert(identity_field.into(), json!(identity));
+            object.insert("document_version".into(), json!(1));
+            object.insert(
+                digest_field.into(),
+                json!(format!("sha256:{}", "a".repeat(64))),
+            );
+            object.insert(
+                "artifact_locator".into(),
+                json!(format!("closure/{kind}.json")),
+            );
+
+            let reference = reference_binding_from_object(&object)
+                .expect("closure locator and digest must form a recursive reference");
+            assert_eq!(reference.document_id.as_deref(), Some(identity));
+            assert_eq!(reference.artifact_kind.as_deref(), Some(kind));
+            assert_eq!(reference.document_version, Some(1));
+        }
     }
 
     #[test]

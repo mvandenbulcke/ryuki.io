@@ -3122,13 +3122,16 @@ dependencies = [
 name = "ryuki-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
+ "ed25519-dalek",
  "figment",
  "hmac",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

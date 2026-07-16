@@ -16,7 +16,7 @@ Nested fields use `__` in environment variables. For example, `server.bind_addre
 
 ## Deployment-security startup admission
 
-Every API and migration process requires these five values; none has a runtime
+Every API and migration process requires these seven values; none has a runtime
 default and empty values fail closed:
 
 | Variable | Required value |
@@ -24,11 +24,14 @@ default and empty values fail closed:
 | `RYUKI_SECURITY_CONTRACT_ROOT` | Absolute path to the immutable directory containing the profile and all referenced artifacts |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH` | Normalized relative path beneath that absolute root; absolute paths and traversal are rejected |
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Nonzero `sha256:<64 lowercase hex>` digest computed over the profile's exact raw bytes |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized relative `.json` path beneath the same immutable root; absolute paths, traversal, and non-JSON paths are rejected |
+| `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently supplied, nonzero `sha256:<64 lowercase hex>` digest computed over the trust-root registry's exact raw bytes |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independent canonical `deployment:` pin that must equal the document's deployment identity |
 | `RYUKI_SECURITY_PROFILE` | Independent profile-class pin, exactly `development`, `test`, or `production`, that must equal the document |
 
-The deployment and profile pins come from process configuration, not from the
-document being admitted. Preflight verifies the content-addressed root before
+The deployment, profile, and trust-root-registry pins come from process
+configuration, not from the documents being admitted. Preflight verifies the
+root-owned, immutable, content-addressed root before
 migration-mode or database configuration, application configuration, signing
 keys, workers, router construction, or listener binding. The sole
 configuration-free exception is the read-only `--dump-route-meta` maintenance

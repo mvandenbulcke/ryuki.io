@@ -1,0 +1,444 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json",
+  "title": "Ryuki Conformance Trust Root Registry",
+  "description": "Closed, deployment-applicable registry of Ed25519 verification keys authorized to sign conformance bundles and package-exit receipts. Schema validity alone never grants production acceptance; the closure verifier enforces key uniqueness, temporal validity, scope, tombstones, and signature verification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_kind",
+    "document_id",
+    "document_version",
+    "acceptance_status",
+    "production_accepted",
+    "lifecycle",
+    "applicability",
+    "trust_policy_version",
+    "canonicalization_profiles",
+    "signature_algorithms",
+    "keys",
+    "key_tombstones"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json"
+    },
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "contract_kind": {
+      "const": "conformance-trust-root-registry"
+    },
+    "document_id": {
+      "type": "string",
+      "pattern": "^conformance-trust-root-registry:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "document_version": {
+      "$ref": "#/$defs/positiveVersion"
+    },
+    "acceptance_status": {
+      "enum": [
+        "implementation_only",
+        "production_candidate",
+        "production_accepted"
+      ]
+    },
+    "production_accepted": {
+      "type": "boolean"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/documentLifecycle"
+    },
+    "applicability": {
+      "$ref": "#/$defs/deploymentApplicability"
+    },
+    "trust_policy_version": {
+      "$ref": "#/$defs/positiveVersion"
+    },
+    "canonicalization_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "const": "ryuki-canonical-json-v1"
+      }
+    },
+    "signature_algorithms": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "const": "ed25519"
+      }
+    },
+    "keys": {
+      "description": "Verification-key records. key_id uniqueness and non-reuse across keys and key_tombstones are semantic closure invariants.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/verificationKey"
+      }
+    },
+    "key_tombstones": {
+      "description": "Key identifiers revoked by this registry version. Production promotion additionally requires externally verified registry lineage that carries tombstones forward.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/keyTombstone"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "implementation_only"
+            },
+            "production_accepted": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "production_candidate"
+            },
+            "production_accepted": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "acceptance_status": {
+              "const": "production_accepted"
+            },
+            "production_accepted": {
+              "const": true
+            },
+            "lifecycle": {
+              "properties": {
+                "state": {
+                  "const": "active"
+                }
+              }
+            },
+            "keys": {
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "positiveVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "keyId": {
+      "type": "string",
+      "pattern": "^conformance-key:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "workPackageId": {
+      "enum": [
+        "SB-0",
+        "SB-1",
+        "SB-2",
+        "SB-3",
+        "SB-4",
+        "SB-5",
+        "SB-6",
+        "SB-7",
+        "SB-8",
+        "SB-9"
+      ]
+    },
+    "evidenceTierName": {
+      "enum": [
+        "repository_local",
+        "operator_environment",
+        "externally_attested"
+      ]
+    },
+    "documentLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "effective_at"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "implementation_only",
+            "candidate",
+            "active",
+            "deprecated",
+            "retired"
+          ]
+        },
+        "effective_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "deploymentApplicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_scope",
+        "security_profiles",
+        "deployment_ids",
+        "trust_domain_ids"
+      ],
+      "properties": {
+        "evaluation_scope": {
+          "const": "deployment"
+        },
+        "security_profiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "development",
+              "test",
+              "production"
+            ]
+          }
+        },
+        "deployment_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/deploymentId"
+          }
+        },
+        "trust_domain_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/trustDomainId"
+          }
+        }
+      }
+    },
+    "verificationKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_id",
+        "signer_identity",
+        "algorithm",
+        "public_key_base64",
+        "allowed_purposes",
+        "allowed_evidence_tiers",
+        "allowed_package_ids",
+        "deployment_ids",
+        "trust_domain_ids",
+        "valid_from",
+        "valid_until",
+        "lifecycle",
+        "revoked_at",
+        "supersedes_key_id"
+      ],
+      "properties": {
+        "key_id": {
+          "$ref": "#/$defs/keyId"
+        },
+        "signer_identity": {
+          "$ref": "#/$defs/identifier"
+        },
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "public_key_base64": {
+          "description": "Canonical RFC 4648 standard-base64 encoding, including padding, of exactly 32 Ed25519 public-key bytes.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
+        },
+        "allowed_purposes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "conformance_bundle",
+              "package_exit_receipt"
+            ]
+          }
+        },
+        "allowed_evidence_tiers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/evidenceTierName"
+          }
+        },
+        "allowed_package_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/workPackageId"
+          }
+        },
+        "deployment_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/deploymentId"
+          }
+        },
+        "trust_domain_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/trustDomainId"
+          }
+        },
+        "valid_from": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "valid_until": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "lifecycle": {
+          "enum": [
+            "active",
+            "overlap",
+            "revoked",
+            "retired"
+          ]
+        },
+        "revoked_at": {
+          "$ref": "#/$defs/nullableTimestamp"
+        },
+        "supersedes_key_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/keyId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "lifecycle": {
+                "const": "revoked"
+              }
+            },
+            "required": [
+              "lifecycle"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "revoked_at": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "keyTombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_id",
+        "signer_identity",
+        "algorithm",
+        "revoked_at",
+        "reason",
+        "superseded_by_key_id",
+        "trust_policy_version"
+      ],
+      "properties": {
+        "key_id": {
+          "$ref": "#/$defs/keyId"
+        },
+        "signer_identity": {
+          "$ref": "#/$defs/identifier"
+        },
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "revoked_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 1000
+        },
+        "superseded_by_key_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/keyId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trust_policy_version": {
+          "$ref": "#/$defs/positiveVersion"
+        }
+      }
+    }
+  }
+}

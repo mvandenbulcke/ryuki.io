@@ -63,6 +63,17 @@ work; the admin approves the agent and drives every post-create request action,
 including live apply. Successful single-job cleanup is currently out of band,
 not an admin-approved control-plane destroy step.
 
+Supply the active deployment profile and independently approved conformance
+trust-root registry through their two normalized relative `.json` paths and
+two exact nonzero lowercase `sha256:<64hex>` raw-byte digests. Both documents
+are supplied through `PG_DEPLOYMENT_SECURITY_PROFILE_PATH`,
+`PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST`,
+`PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH`, and
+`PG_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST`. They must be root-owned regular
+files beneath the immutable
+`/app/security-contract` image tree; the proving ground never selects or
+fabricates a registry, profile, or digest.
+
 Agent values are parsed as literal `KEY=value` text. HCL spaces, semicolons,
 `$()`, and other shell metacharacters are not evaluated. Do not add an inline
 comment to an agent value because it becomes part of that literal value.
@@ -139,9 +150,9 @@ Run the non-destructive smoke check before starting anything:
 
 It checks shell syntax (including the cleanup utility), literal env parsing,
 approved Terraform/Ansible path provenance, private-copy digest binding, and
-version identity, the
-two-account and `DEFRA` invariants, the session-verifier length, backend
-placeholder rendering, the `/ready` health gate, the loopback-only host ports,
+version identity, the two-account and `DEFRA` invariants, the session-verifier
+length, backend placeholder rendering, the exact profile/trust-registry pins,
+the `/ready` health gate, the loopback-only host ports,
 the private API/Vault loopback, the portal's separate network namespace, the
 non-root/capability-drop contract, the clean acceptance revision, each local
 image ID/revision label, each staged third-party digest, and the rendered

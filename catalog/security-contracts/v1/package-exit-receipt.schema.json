@@ -6,7 +6,9 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "$schema",
     "schema_version",
+    "contract_kind",
     "document_version",
     "receipt_id",
     "acceptance_status",
@@ -31,8 +33,14 @@
     "supersedes_receipt_id"
   ],
   "properties": {
+    "$schema": {
+      "const": "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json"
+    },
     "schema_version": {
-      "$ref": "#/$defs/version"
+      "const": "1.0.0"
+    },
+    "contract_kind": {
+      "const": "package-exit-receipt"
     },
     "document_version": {
       "type": "integer",
@@ -289,15 +297,42 @@
         "$ref": "#/$defs/digest"
       }
     },
+    "artifactLocator": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+      "not": {
+        "pattern": "(?:^|/)\\.\\.?(?:/|$)"
+      }
+    },
     "ledgerBinding": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "artifact_kind",
+        "document_id",
+        "document_version",
+        "artifact_locator",
         "ledger_id",
         "ledger_version",
         "ledger_digest"
       ],
       "properties": {
+        "artifact_kind": {
+          "const": "control-trace"
+        },
+        "document_id": {
+          "type": "string",
+          "pattern": "^control-trace:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "document_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/artifactLocator"
+        },
         "ledger_id": {
           "$ref": "#/$defs/identifier"
         },
@@ -357,10 +392,27 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "artifact_kind",
+        "bundle_id",
+        "document_version",
+        "artifact_locator",
         "evidence_instance_id",
         "bundle_digest"
       ],
       "properties": {
+        "artifact_kind": {
+          "const": "conformance-bundle"
+        },
+        "bundle_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "document_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/artifactLocator"
+        },
         "evidence_instance_id": {
           "$ref": "#/$defs/identifier"
         },
@@ -548,6 +600,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "artifact_kind",
+        "artifact_locator",
         "package_id",
         "document_version",
         "receipt_id",
@@ -560,6 +614,12 @@
         "expires_at"
       ],
       "properties": {
+        "artifact_kind": {
+          "const": "package-exit-receipt"
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/artifactLocator"
+        },
         "package_id": {
           "$ref": "#/$defs/workPackageId"
         },
@@ -743,36 +803,65 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "signature_version",
         "identity",
-        "mechanism",
         "key_id",
-        "signature_digest",
-        "trust_root_version"
+        "algorithm",
+        "canonicalization",
+        "purpose",
+        "domain",
+        "trust_registry_id",
+        "trust_registry_version",
+        "trust_registry_digest",
+        "signed_at",
+        "signed_subject_digest",
+        "signature_base64"
       ],
       "properties": {
+        "signature_version": {
+          "const": "1.0.0"
+        },
         "identity": {
           "$ref": "#/$defs/identifier"
         },
-        "mechanism": {
-          "type": "string",
-          "enum": [
-            "sigstore",
-            "x509",
-            "pgp",
-            "workload_identity",
-            "oidc"
-          ]
-        },
         "key_id": {
-          "$ref": "#/$defs/identifier"
+          "type": "string",
+          "pattern": "^conformance-key:[a-z0-9][a-z0-9._-]{2,126}$"
         },
-        "signature_digest": {
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "canonicalization": {
+          "const": "ryuki-canonical-json-v1"
+        },
+        "purpose": {
+          "const": "package_exit_receipt"
+        },
+        "domain": {
+          "const": "ryuki-v1/package-exit-receipt"
+        },
+        "trust_registry_id": {
+          "type": "string",
+          "pattern": "^conformance-trust-root-registry:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "trust_registry_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "trust_registry_digest": {
           "$ref": "#/$defs/digest"
         },
-        "trust_root_version": {
+        "signed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "signed_subject_digest": {
+          "description": "SHA-256 of the ryuki-canonical-json-v1 UTF-8 bytes of this complete document after removing only /signer/signature_base64 and /signer/signed_subject_digest. Every other signer field remains covered.",
+          "$ref": "#/$defs/digest"
+        },
+        "signature_base64": {
+          "description": "Canonical RFC 4648 standard-base64 encoding, including padding, of exactly 64 Ed25519 signature bytes. The Ed25519 message is u64_le(domain UTF-8 byte length) || domain UTF-8 bytes || u64_le(canonical subject UTF-8 byte length) || canonical subject UTF-8 bytes.",
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128
+          "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
         }
       }
     },

@@ -24,6 +24,20 @@
     "topology_kind": "single_trust_domain",
     "trust_domain_ids": ["trust-domain:repository-fixture"]
   },
+  "conformance_trust_root_registry_ref": {
+    "artifact_kind": "conformance-trust-root-registry",
+    "document_id": "conformance-trust-root-registry:repository-implementation-v1",
+    "document_version": 1,
+    "content_digest": "sha256:352ba7deb2ac801404351520d05422f15adc7a7610ee6fed32f62a5ab9766447",
+    "artifact_locator": "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json"
+  },
+  "control_trace_ref": {
+    "artifact_kind": "control-trace",
+    "document_id": "control-trace:ryuki-security-boundary-v1",
+    "document_version": 1,
+    "content_digest": "sha256:5eaa90b3e46457df4fcb9623da345c9e683a1e0c6f9235319e3a7cbf986b45b0",
+    "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json"
+  },
   "provider_registry_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
