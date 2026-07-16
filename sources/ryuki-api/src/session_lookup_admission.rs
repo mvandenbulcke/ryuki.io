@@ -2,7 +2,7 @@
 //!
 //! A syntactically valid `rys_` bearer is intentionally opaque, so a random
 //! value cannot be rejected without consulting PostgreSQL. This module keeps
-//! that unavoidable miss path outside the application's queueing concurrency
+//! that unavoidable miss path outside the application's whole-request concurrency
 //! layer and bounds it with three process-local controls:
 //! - a short, bounded cache of database-confirmed misses;
 //! - a bounded cache of recently confirmed live verifiers so real sessions do
@@ -15,7 +15,8 @@
 //! check before it is authenticated.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,14 +35,161 @@ use crate::session_credentials::SESSION_VERIFIER_LEN;
 
 pub(crate) type SessionVerifier = [u8; SESSION_VERIFIER_LEN];
 
-const POSITIVE_CAPACITY: usize = 65_536;
-const NEGATIVE_CAPACITY: usize = 4_096;
-// Positive entries are only admission hints and every request still performs
-// the SQL authority/version join. Keep this short as a second bound for an
-// out-of-process assignment change that cannot synchronously evict this replica.
-const POSITIVE_MAX_TTL: Duration = Duration::from_secs(30);
-const NEGATIVE_TTL: Duration = Duration::from_secs(30);
-const MISS_WINDOW: Duration = Duration::from_secs(1);
+/// Repository-local, immutable projection of the active security-limit profile
+/// for persisted-session lookup admission. Keeping every selected value and
+/// derivation input here prevents runtime code, prewarm, readback, and metrics
+/// from quietly acquiring different limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionLookupSecurityLimitProfile {
+    version: &'static str,
+    positive_cache_capacity: usize,
+    negative_cache_capacity: usize,
+    positive_cache_max_ttl_secs: u64,
+    negative_cache_ttl_secs: u64,
+    miss_window_secs: u64,
+    reserved_pool_connections: u32,
+    unknown_slots_min: usize,
+    unknown_slots_max: usize,
+    miss_budget_per_slot: usize,
+    miss_budget_floor: usize,
+    miss_budget_ceiling: usize,
+    prewarm_lookahead_rows: usize,
+    uninitialized_pool_max_connections: u32,
+    failure_status: StatusCode,
+    failure_code: &'static str,
+    failure_message: &'static str,
+    failure_queueing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedSessionLookupLimits {
+    positive_cache_capacity: usize,
+    negative_cache_capacity: usize,
+    positive_cache_max_ttl: Duration,
+    negative_cache_ttl: Duration,
+    miss_window: Duration,
+    unknown_slots: usize,
+    miss_budget: usize,
+    prewarm_lookahead_rows: usize,
+}
+
+impl SessionLookupSecurityLimitProfile {
+    fn resolve(self, max_connections: u32) -> ResolvedSessionLookupLimits {
+        // Preserve at least one connection for authenticated/control-plane work
+        // whenever the configured pool has more than one connection.
+        let unknown_slots = max_connections
+            .saturating_sub(self.reserved_pool_connections)
+            .clamp(self.unknown_slots_min as u32, self.unknown_slots_max as u32)
+            as usize;
+        let miss_budget = unknown_slots
+            .saturating_mul(self.miss_budget_per_slot)
+            .max(self.miss_budget_floor)
+            .min(self.miss_budget_ceiling);
+        ResolvedSessionLookupLimits {
+            positive_cache_capacity: self.positive_cache_capacity,
+            negative_cache_capacity: self.negative_cache_capacity,
+            positive_cache_max_ttl: Duration::from_secs(self.positive_cache_max_ttl_secs),
+            negative_cache_ttl: Duration::from_secs(self.negative_cache_ttl_secs),
+            miss_window: Duration::from_secs(self.miss_window_secs),
+            unknown_slots,
+            miss_budget,
+            prewarm_lookahead_rows: self.prewarm_lookahead_rows,
+        }
+    }
+}
+
+const ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE: SessionLookupSecurityLimitProfile =
+    SessionLookupSecurityLimitProfile {
+        version: "session-lookup-v1",
+        positive_cache_capacity: 65_536,
+        negative_cache_capacity: 4_096,
+        // Positive entries are only admission hints and every request still
+        // performs the SQL authority/version join. Keep this short as a second
+        // bound for an out-of-process assignment change that cannot
+        // synchronously evict this replica.
+        positive_cache_max_ttl_secs: 30,
+        negative_cache_ttl_secs: 30,
+        miss_window_secs: 1,
+        reserved_pool_connections: 1,
+        unknown_slots_min: 1,
+        unknown_slots_max: 8,
+        miss_budget_per_slot: 8,
+        miss_budget_floor: 16,
+        miss_budget_ceiling: 64,
+        prewarm_lookahead_rows: 1,
+        // Production initializes the singleton explicitly. This value owns the
+        // deterministic fallback used only by direct resolver tests or an early
+        // in-process caller.
+        uninitialized_pool_max_connections: 8,
+        failure_status: StatusCode::TOO_MANY_REQUESTS,
+        failure_code: "SESSION_LOOKUP_ADMISSION_EXCEEDED",
+        failure_message: "Too many session verification requests",
+        failure_queueing: false,
+    };
+
+const _: () = {
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.positive_cache_capacity > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.negative_cache_capacity > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.positive_cache_max_ttl_secs > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.negative_cache_ttl_secs > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.miss_window_secs > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.reserved_pool_connections > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.unknown_slots_min > 0);
+    assert!(
+        ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.unknown_slots_min
+            <= ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.unknown_slots_max
+    );
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.unknown_slots_max <= u32::MAX as usize);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.miss_budget_per_slot > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.miss_budget_floor > 0);
+    assert!(
+        ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.miss_budget_floor
+            <= ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.miss_budget_ceiling
+    );
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.prewarm_lookahead_rows > 0);
+    assert!(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.uninitialized_pool_max_connections > 0);
+    assert!(!ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.failure_queueing);
+};
+
+/// Authenticated, value-only readback of the selected per-replica limits. It
+/// intentionally excludes cache occupancy, loaded prewarm row counts, verifier
+/// cardinality, and every credential-derived value.
+pub(crate) fn security_limit_readback(max_connections: u32) -> serde_json::Value {
+    let profile = ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE;
+    let resolved = profile.resolve(max_connections);
+    serde_json::json!({
+        "profile_version": profile.version,
+        "scope": "replica",
+        "source": "repository-immutable",
+        "positive_cache": {
+            "capacity": resolved.positive_cache_capacity,
+            "max_ttl_secs": resolved.positive_cache_max_ttl.as_secs(),
+            "prewarm_truncation_lookahead_rows": resolved.prewarm_lookahead_rows,
+        },
+        "negative_cache": {
+            "capacity": resolved.negative_cache_capacity,
+            "ttl_secs": resolved.negative_cache_ttl.as_secs(),
+        },
+        "unknown_lookup": {
+            "reserved_pool_connections_when_possible": profile.reserved_pool_connections,
+            "slots_min": profile.unknown_slots_min,
+            "slots_max": profile.unknown_slots_max,
+            "selected_slots": resolved.unknown_slots,
+            "miss_budget_per_slot": profile.miss_budget_per_slot,
+            "miss_budget_floor": profile.miss_budget_floor,
+            "miss_budget_ceiling": profile.miss_budget_ceiling,
+            "selected_miss_budget": resolved.miss_budget,
+            "miss_window_secs": resolved.miss_window.as_secs(),
+        },
+        "failure": {
+            "status": profile.failure_status.as_u16(),
+            "code": profile.failure_code,
+            "message": profile.failure_message,
+            "queueing": profile.failure_queueing,
+            "retry_after_secs": profile.miss_window_secs,
+        },
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionLookupAdmissionProof {
@@ -165,18 +313,122 @@ impl AdmissionInner {
     }
 }
 
+fn saturating_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    saturating_add(counter, 1);
+}
+
+#[derive(Default)]
+struct SessionLookupTelemetry {
+    known_positive: AtomicU64,
+    cached_miss: AtomicU64,
+    admitted_unknown: AtomicU64,
+    rejected_duplicate_in_flight: AtomicU64,
+    rejected_capacity: AtomicU64,
+    rejected_budget: AtomicU64,
+    database_row: AtomicU64,
+    database_miss: AtomicU64,
+    database_error: AtomicU64,
+    database_cancelled: AtomicU64,
+    database_duration_micros: AtomicU64,
+    prewarm_truncated: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionLookupTelemetrySnapshot {
+    known_positive: u64,
+    cached_miss: u64,
+    admitted_unknown: u64,
+    rejected_duplicate_in_flight: u64,
+    rejected_capacity: u64,
+    rejected_budget: u64,
+    database_row: u64,
+    database_miss: u64,
+    database_error: u64,
+    database_cancelled: u64,
+    database_duration_micros: u64,
+    prewarm_truncated: bool,
+}
+
+impl SessionLookupTelemetry {
+    fn snapshot(&self) -> SessionLookupTelemetrySnapshot {
+        SessionLookupTelemetrySnapshot {
+            known_positive: self.known_positive.load(Ordering::Relaxed),
+            cached_miss: self.cached_miss.load(Ordering::Relaxed),
+            admitted_unknown: self.admitted_unknown.load(Ordering::Relaxed),
+            rejected_duplicate_in_flight: self.rejected_duplicate_in_flight.load(Ordering::Relaxed),
+            rejected_capacity: self.rejected_capacity.load(Ordering::Relaxed),
+            rejected_budget: self.rejected_budget.load(Ordering::Relaxed),
+            database_row: self.database_row.load(Ordering::Relaxed),
+            database_miss: self.database_miss.load(Ordering::Relaxed),
+            database_error: self.database_error.load(Ordering::Relaxed),
+            database_cancelled: self.database_cancelled.load(Ordering::Relaxed),
+            database_duration_micros: self.database_duration_micros.load(Ordering::Relaxed),
+            prewarm_truncated: self.prewarm_truncated.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionDatabaseLookupOutcome {
+    Row,
+    Miss,
+    Error,
+    Cancelled,
+}
+
+/// Cancellation-safe database observation. The outer request-timeout layer may
+/// drop an in-flight resolver future before SQLx returns, so `Drop` records a
+/// fixed-cardinality `cancelled` outcome unless the caller explicitly finishes
+/// it with the database result.
+pub(crate) struct SessionDatabaseLookupObservation {
+    admission: Arc<SessionLookupAdmission>,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl SessionDatabaseLookupObservation {
+    pub(crate) fn finish(mut self, outcome: SessionDatabaseLookupOutcome) {
+        debug_assert_ne!(outcome, SessionDatabaseLookupOutcome::Cancelled);
+        self.admission
+            .record_database_lookup(outcome, self.started_at.elapsed());
+        self.finished = true;
+    }
+}
+
+impl Drop for SessionDatabaseLookupObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.admission.record_database_lookup(
+                SessionDatabaseLookupOutcome::Cancelled,
+                self.started_at.elapsed(),
+            );
+            self.finished = true;
+        }
+    }
+}
+
 /// Process-local session lookup admission. All collections have explicit hard
 /// bounds; lock poisoning is recovered so one panic cannot permanently disable
 /// authentication.
 pub(crate) struct SessionLookupAdmission {
     inner: Mutex<AdmissionInner>,
     unknown_slots: Arc<Semaphore>,
+    unknown_slots_capacity: usize,
     positive_capacity: usize,
     negative_capacity: usize,
+    positive_max_ttl: Duration,
     miss_budget: usize,
     miss_window: Duration,
     negative_ttl: Duration,
+    prewarm_lookahead_rows: usize,
     db_lookup_count: AtomicU64,
+    telemetry: SessionLookupTelemetry,
 }
 
 pub(crate) enum SessionLookupDecision {
@@ -215,14 +467,11 @@ impl Drop for SessionLookupGuard {
 }
 
 impl SessionLookupAdmission {
-    fn new(
-        positive_capacity: usize,
-        negative_capacity: usize,
-        unknown_slots: usize,
-        miss_budget: usize,
-        miss_window: Duration,
-        negative_ttl: Duration,
-    ) -> Arc<Self> {
+    fn new(limits: ResolvedSessionLookupLimits) -> Arc<Self> {
+        let positive_capacity = limits.positive_cache_capacity;
+        let negative_capacity = limits.negative_cache_capacity;
+        let unknown_slots = limits.unknown_slots;
+        let miss_budget = limits.miss_budget;
         Arc::new(Self {
             inner: Mutex::new(AdmissionInner {
                 positive: HashMap::with_capacity(positive_capacity),
@@ -234,29 +483,22 @@ impl SessionLookupAdmission {
                 window_used: 0,
                 generation: 0,
             }),
-            unknown_slots: Arc::new(Semaphore::new(unknown_slots.max(1))),
-            positive_capacity: positive_capacity.max(1),
-            negative_capacity: negative_capacity.max(1),
-            miss_budget: miss_budget.max(1),
-            miss_window,
-            negative_ttl,
+            unknown_slots: Arc::new(Semaphore::new(unknown_slots)),
+            unknown_slots_capacity: unknown_slots,
+            positive_capacity,
+            negative_capacity,
+            positive_max_ttl: limits.positive_cache_max_ttl,
+            miss_budget,
+            miss_window: limits.miss_window,
+            negative_ttl: limits.negative_cache_ttl,
+            prewarm_lookahead_rows: limits.prewarm_lookahead_rows,
             db_lookup_count: AtomicU64::new(0),
+            telemetry: SessionLookupTelemetry::default(),
         })
     }
 
     pub(crate) fn for_pool(max_connections: u32) -> Arc<Self> {
-        // Preserve at least one connection for authenticated/control-plane
-        // work whenever the configured pool has more than one connection.
-        let unknown_slots = max_connections.saturating_sub(1).clamp(1, 8) as usize;
-        let miss_budget = unknown_slots.saturating_mul(8).max(16);
-        Self::new(
-            POSITIVE_CAPACITY,
-            NEGATIVE_CAPACITY,
-            unknown_slots,
-            miss_budget,
-            MISS_WINDOW,
-            NEGATIVE_TTL,
-        )
+        Self::new(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.resolve(max_connections))
     }
 
     #[cfg(test)]
@@ -266,14 +508,18 @@ impl SessionLookupAdmission {
         unknown_slots: usize,
         miss_budget: usize,
     ) -> Arc<Self> {
-        Self::new(
-            positive_capacity,
-            negative_capacity,
+        let production = ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE
+            .resolve(ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.uninitialized_pool_max_connections);
+        Self::new(ResolvedSessionLookupLimits {
+            positive_cache_capacity: positive_capacity,
+            negative_cache_capacity: negative_capacity,
+            positive_cache_max_ttl: production.positive_cache_max_ttl,
+            negative_cache_ttl: production.negative_cache_ttl,
+            miss_window: production.miss_window,
             unknown_slots,
             miss_budget,
-            MISS_WINDOW,
-            NEGATIVE_TTL,
-        )
+            prewarm_lookahead_rows: production.prewarm_lookahead_rows,
+        })
     }
 
     pub(crate) fn try_admit(self: &Arc<Self>, verifier: SessionVerifier) -> SessionLookupDecision {
@@ -304,12 +550,14 @@ impl SessionLookupAdmission {
             .get(&verifier)
             .is_some_and(|entry| entry.expires_at > now)
         {
+            saturating_increment(&self.telemetry.known_positive);
             return SessionLookupDecision::KnownPositive(Some(inner.positive[&verifier].authority));
         }
         inner.positive.remove(&verifier);
         let negative = inner.negative.get(&verifier).copied();
         if let Some(entry) = negative.filter(|entry| entry.expires_at > now) {
             if !require_confirmed_absence || entry.confirmed_absent {
+                saturating_increment(&self.telemetry.cached_miss);
                 return SessionLookupDecision::CachedMiss;
             }
         }
@@ -317,6 +565,7 @@ impl SessionLookupAdmission {
             inner.negative.remove(&verifier);
         }
         if inner.in_flight.contains(&verifier) {
+            saturating_increment(&self.telemetry.rejected_duplicate_in_flight);
             return SessionLookupDecision::Rejected(SessionLookupRejection::DuplicateInFlight);
         }
         if now.saturating_duration_since(inner.window_started_at) >= self.miss_window {
@@ -324,15 +573,20 @@ impl SessionLookupAdmission {
             inner.window_used = 0;
         }
         if inner.window_used >= self.miss_budget {
+            saturating_increment(&self.telemetry.rejected_budget);
             return SessionLookupDecision::Rejected(SessionLookupRejection::Budget);
         }
         let permit = match Arc::clone(&self.unknown_slots).try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return SessionLookupDecision::Rejected(SessionLookupRejection::Capacity),
+            Err(_) => {
+                saturating_increment(&self.telemetry.rejected_capacity);
+                return SessionLookupDecision::Rejected(SessionLookupRejection::Capacity);
+            }
         };
         inner.window_used += 1;
         inner.in_flight.insert(verifier);
         drop(inner);
+        saturating_increment(&self.telemetry.admitted_unknown);
 
         SessionLookupDecision::Unknown(SessionLookupGuard {
             admission: Arc::clone(self),
@@ -360,7 +614,7 @@ impl SessionLookupAdmission {
         authority: SessionAuthorityCacheBinding,
     ) {
         let now = Instant::now();
-        let valid_for = valid_for.min(POSITIVE_MAX_TTL);
+        let valid_for = valid_for.min(self.positive_max_ttl);
         if valid_for.is_zero() {
             self.record_miss(verifier);
             return;
@@ -426,8 +680,161 @@ impl SessionLookupAdmission {
         inner.trim_negative(self.negative_capacity);
     }
 
-    pub(crate) fn note_database_lookup(&self) {
-        self.db_lookup_count.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn start_database_lookup(self: &Arc<Self>) -> SessionDatabaseLookupObservation {
+        SessionDatabaseLookupObservation {
+            admission: Arc::clone(self),
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn record_database_lookup(&self, outcome: SessionDatabaseLookupOutcome, duration: Duration) {
+        saturating_increment(&self.db_lookup_count);
+        let outcome_counter = match outcome {
+            SessionDatabaseLookupOutcome::Row => &self.telemetry.database_row,
+            SessionDatabaseLookupOutcome::Miss => &self.telemetry.database_miss,
+            SessionDatabaseLookupOutcome::Error => &self.telemetry.database_error,
+            SessionDatabaseLookupOutcome::Cancelled => &self.telemetry.database_cancelled,
+        };
+        saturating_increment(outcome_counter);
+        let elapsed_micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        saturating_add(&self.telemetry.database_duration_micros, elapsed_micros);
+    }
+
+    #[cfg(test)]
+    fn observe_database_lookup_for_test(
+        &self,
+        outcome: SessionDatabaseLookupOutcome,
+        duration: Duration,
+    ) {
+        self.record_database_lookup(outcome, duration);
+    }
+
+    fn append_metrics(&self, body: &mut String) {
+        let telemetry = self.telemetry.snapshot();
+        let database_duration_seconds = telemetry.database_duration_micros as f64 / 1_000_000.0;
+
+        body.push_str(
+            "# HELP ryuki_session_lookup_limit_profile Active persisted-session lookup limit profile\n\
+             # TYPE ryuki_session_lookup_limit_profile gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_limit_profile{{version=\"{}\",scope=\"replica\"}} 1",
+            ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.version
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_cache_capacity_entries Configured verifier-cache capacity, not current credential cardinality\n\
+             # TYPE ryuki_session_lookup_cache_capacity_entries gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_cache_capacity_entries{{cache=\"positive\"}} {}",
+            self.positive_capacity
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_cache_capacity_entries{{cache=\"negative\"}} {}",
+            self.negative_capacity
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_cache_ttl_seconds Configured verifier-cache lifetime\n\
+             # TYPE ryuki_session_lookup_cache_ttl_seconds gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_cache_ttl_seconds{{cache=\"positive_max\"}} {}",
+            self.positive_max_ttl.as_secs()
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_cache_ttl_seconds{{cache=\"negative\"}} {}",
+            self.negative_ttl.as_secs()
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_unknown_slots Configured non-queueing database lookup slots\n\
+             # TYPE ryuki_session_lookup_unknown_slots gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_unknown_slots {}",
+            self.unknown_slots_capacity
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_miss_budget Configured new-verifier budget per window\n\
+             # TYPE ryuki_session_lookup_miss_budget gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_miss_budget {}",
+            self.miss_budget
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_miss_window_seconds Configured new-verifier budget window\n\
+             # TYPE ryuki_session_lookup_miss_window_seconds gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_miss_window_seconds {}",
+            self.miss_window.as_secs()
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_admission_decisions_total Persisted-session lookup admission decision invocations\n\
+             # TYPE ryuki_session_lookup_admission_decisions_total counter\n",
+        );
+        for (decision, count) in [
+            ("known_positive", telemetry.known_positive),
+            ("cached_miss", telemetry.cached_miss),
+            ("admitted_unknown", telemetry.admitted_unknown),
+            (
+                "rejected_duplicate_in_flight",
+                telemetry.rejected_duplicate_in_flight,
+            ),
+            ("rejected_capacity", telemetry.rejected_capacity),
+            ("rejected_budget", telemetry.rejected_budget),
+        ] {
+            let _ = writeln!(
+                body,
+                "ryuki_session_lookup_admission_decisions_total{{decision=\"{decision}\"}} {count}"
+            );
+        }
+        body.push_str(
+            "# HELP ryuki_session_lookup_database_lookups_total Persisted-session authority database lookup outcomes\n\
+             # TYPE ryuki_session_lookup_database_lookups_total counter\n",
+        );
+        for (outcome, count) in [
+            ("row", telemetry.database_row),
+            ("miss", telemetry.database_miss),
+            ("error", telemetry.database_error),
+            ("cancelled", telemetry.database_cancelled),
+        ] {
+            let _ = writeln!(
+                body,
+                "ryuki_session_lookup_database_lookups_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+        body.push_str(
+            "# HELP ryuki_session_lookup_database_duration_seconds Persisted-session authority database lookup duration\n\
+             # TYPE ryuki_session_lookup_database_duration_seconds summary\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_database_duration_seconds_count {}",
+            self.db_lookup_count.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_database_duration_seconds_sum {database_duration_seconds:.6}"
+        );
+        body.push_str(
+            "# HELP ryuki_session_lookup_prewarm_truncated Whether startup prewarm reached its configured capacity without exposing loaded-session count\n\
+             # TYPE ryuki_session_lookup_prewarm_truncated gauge\n",
+        );
+        let _ = writeln!(
+            body,
+            "ryuki_session_lookup_prewarm_truncated {}",
+            u8::from(telemetry.prewarm_truncated)
+        );
     }
 
     #[cfg(test)]
@@ -449,6 +856,7 @@ impl SessionLookupAdmission {
 }
 
 static GLOBAL_ADMISSION: OnceLock<Arc<SessionLookupAdmission>> = OnceLock::new();
+static RETRY_AFTER_HEADER: OnceLock<HeaderValue> = OnceLock::new();
 
 pub(crate) fn initialize_global(max_connections: u32) -> Arc<SessionLookupAdmission> {
     let admission = SessionLookupAdmission::for_pool(max_connections);
@@ -459,7 +867,17 @@ pub(crate) fn initialize_global(max_connections: u32) -> Arc<SessionLookupAdmiss
 }
 
 pub(crate) fn global_admission() -> Arc<SessionLookupAdmission> {
-    Arc::clone(GLOBAL_ADMISSION.get_or_init(|| SessionLookupAdmission::for_pool(8)))
+    Arc::clone(GLOBAL_ADMISSION.get_or_init(|| {
+        SessionLookupAdmission::for_pool(
+            ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE.uninitialized_pool_max_connections,
+        )
+    }))
+}
+
+pub(crate) fn append_global_metrics(body: &mut String) {
+    if let Some(admission) = GLOBAL_ADMISSION.get() {
+        admission.append_metrics(body);
+    }
 }
 
 fn verifier_from_slice(verifier: &[u8]) -> Option<SessionVerifier> {
@@ -493,7 +911,6 @@ pub(crate) fn mark_negative_global(verifier: &[u8]) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrewarmReport {
-    pub loaded: usize,
     pub truncated: bool,
 }
 
@@ -504,6 +921,10 @@ pub(crate) async fn prewarm(
     pool: &PgPool,
     config: &RyukiConfig,
 ) -> Result<PrewarmReport, sqlx::Error> {
+    let admission = global_admission();
+    let prewarm_limit = admission
+        .positive_capacity
+        .saturating_add(admission.prewarm_lookahead_rows);
     let entra_issuer = crate::identity_authority::configured_entra_issuer(config);
     let rows = sqlx::query_as::<
         _,
@@ -551,13 +972,15 @@ pub(crate) async fn prewarm(
     .bind(entra_issuer)
     .bind(config.oidc.enabled)
     .bind(&config.oidc.issuer)
-    .bind((POSITIVE_CAPACITY + 1) as i64)
+    .bind(i64::try_from(prewarm_limit).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
-    let truncated = rows.len() > POSITIVE_CAPACITY;
-    let admission = global_admission();
+    let truncated = rows.len() > admission.positive_capacity;
+    admission
+        .telemetry
+        .prewarm_truncated
+        .store(truncated, Ordering::Relaxed);
     let now = Utc::now();
-    let mut loaded = 0;
     for (
         verifier,
         expires_at,
@@ -567,7 +990,7 @@ pub(crate) async fn prewarm(
         assignment_version,
         site_mode,
         environment_mode,
-    ) in rows.into_iter().take(POSITIVE_CAPACITY)
+    ) in rows.into_iter().take(admission.positive_capacity)
     {
         let Some(verifier) = verifier_from_slice(&verifier) else {
             continue;
@@ -588,9 +1011,8 @@ pub(crate) async fn prewarm(
                 environment_global: environment_mode == "global",
             },
         );
-        loaded += 1;
     }
-    Ok(PrewarmReport { loaded, truncated })
+    Ok(PrewarmReport { truncated })
 }
 
 fn is_logout_path(path: &str) -> bool {
@@ -613,17 +1035,24 @@ fn uses_human_session_middleware(request: &Request) -> bool {
 }
 
 fn lookup_capacity_response() -> Response {
+    let profile = ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE;
     let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(ApiError::new(
-            "SESSION_LOOKUP_ADMISSION_EXCEEDED",
-            "Too many session verification requests",
-        )),
+        profile.failure_status,
+        Json(ApiError::new(profile.failure_code, profile.failure_message)),
     )
         .into_response();
+    let retry_after = RETRY_AFTER_HEADER
+        .get_or_init(|| {
+            ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE
+                .miss_window_secs
+                .to_string()
+                .parse::<HeaderValue>()
+                .expect("validated session lookup miss window is an HTTP header value")
+        })
+        .clone();
     response
         .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        .insert(header::RETRY_AFTER, retry_after);
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -631,8 +1060,8 @@ fn lookup_capacity_response() -> Response {
 }
 
 /// Path-aware outer admission. `main` mounts this after (therefore outside)
-/// the whole-app `ConcurrencyLimitLayer`. `try_acquire_owned` never waits, so
-/// random well-formed verifiers cannot queue behind or occupy that pool.
+/// the whole-app concurrency admission. `try_acquire_owned` never waits, so
+/// random well-formed verifiers cannot occupy that budget.
 pub(crate) async fn session_lookup_admission_middleware(
     State(admission): State<Arc<SessionLookupAdmission>>,
     mut request: Request,
@@ -738,6 +1167,252 @@ mod tests {
             site_global: true,
             environment_global: true,
         }
+    }
+
+    #[test]
+    fn active_profile_resolves_pool_dependent_limits_without_new_literals() {
+        let profile = ACTIVE_SESSION_LOOKUP_LIMIT_PROFILE;
+        for (pool_connections, expected_slots, expected_budget) in [
+            (1, 1, 16),
+            (2, 1, 16),
+            (5, 4, 32),
+            (9, 8, 64),
+            (u32::MAX, 8, 64),
+        ] {
+            let resolved = profile.resolve(pool_connections);
+            assert_eq!(resolved.unknown_slots, expected_slots);
+            assert_eq!(resolved.miss_budget, expected_budget);
+            assert_eq!(resolved.positive_cache_capacity, 65_536);
+            assert_eq!(resolved.negative_cache_capacity, 4_096);
+            assert_eq!(resolved.positive_cache_max_ttl, Duration::from_secs(30));
+            assert_eq!(resolved.negative_cache_ttl, Duration::from_secs(30));
+            assert_eq!(resolved.miss_window, Duration::from_secs(1));
+            assert_eq!(resolved.prewarm_lookahead_rows, 1);
+        }
+
+        let admission = SessionLookupAdmission::for_pool(5);
+        assert_eq!(admission.positive_capacity, 65_536);
+        assert_eq!(admission.negative_capacity, 4_096);
+        assert_eq!(admission.positive_max_ttl, Duration::from_secs(30));
+        assert_eq!(admission.negative_ttl, Duration::from_secs(30));
+        assert_eq!(admission.miss_window, Duration::from_secs(1));
+        assert_eq!(admission.unknown_slots_capacity, 4);
+        assert_eq!(admission.miss_budget, 32);
+        assert_eq!(admission.prewarm_lookahead_rows, 1);
+    }
+
+    #[test]
+    fn authenticated_limit_readback_exposes_selected_values_not_credential_cardinality() {
+        let readback = security_limit_readback(5);
+        assert_eq!(
+            readback["profile_version"].as_str(),
+            Some("session-lookup-v1")
+        );
+        assert_eq!(readback["scope"].as_str(), Some("replica"));
+        assert_eq!(
+            readback["positive_cache"]["capacity"].as_u64(),
+            Some(65_536)
+        );
+        assert_eq!(
+            readback["positive_cache"]["max_ttl_secs"].as_u64(),
+            Some(30)
+        );
+        assert_eq!(
+            readback["positive_cache"]["prewarm_truncation_lookahead_rows"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(readback["negative_cache"]["capacity"].as_u64(), Some(4_096));
+        assert_eq!(readback["negative_cache"]["ttl_secs"].as_u64(), Some(30));
+        assert_eq!(
+            readback["unknown_lookup"]["selected_slots"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(
+            readback["unknown_lookup"]["selected_miss_budget"].as_u64(),
+            Some(32)
+        );
+        assert_eq!(
+            readback["unknown_lookup"]["miss_budget_ceiling"].as_u64(),
+            Some(64)
+        );
+        assert_eq!(readback["failure"]["retry_after_secs"].as_u64(), Some(1));
+
+        let projection = readback.to_string();
+        for prohibited in [
+            "verifier",
+            "bearer",
+            "positive_entries",
+            "negative_entries",
+            "cache_occupancy",
+            "prewarm_loaded",
+        ] {
+            assert!(
+                !projection.contains(prohibited),
+                "readback leaked prohibited field {prohibited}: {projection}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_response_exactly_matches_profile_readback() {
+        let readback = security_limit_readback(5);
+        let response = lookup_capacity_response();
+        assert_eq!(
+            u64::from(response.status().as_u16()),
+            readback["failure"]["status"].as_u64().unwrap()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok()),
+            readback["failure"]["retry_after_secs"].as_u64()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4_096)
+            .await
+            .expect("bounded rejection body");
+        let body: ApiError = serde_json::from_slice(&body).expect("structured rejection body");
+        assert_eq!(body.error, readback["failure"]["code"].as_str().unwrap());
+        assert_eq!(
+            body.message,
+            readback["failure"]["message"].as_str().unwrap()
+        );
+        assert_eq!(readback["failure"]["queueing"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn cancelled_lookup_future_records_one_bounded_outcome() {
+        let admission = SessionLookupAdmission::for_tests(4, 4, 1, 4);
+        let task_admission = Arc::clone(&admission);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _observation = task_admission.start_database_lookup();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx
+            .await
+            .expect("lookup observation must be live before cancellation");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let telemetry = admission.telemetry.snapshot();
+        assert_eq!(admission.database_lookup_count(), 1);
+        assert_eq!(telemetry.database_cancelled, 1);
+        assert_eq!(telemetry.database_row, 0);
+        assert_eq!(telemetry.database_miss, 0);
+        assert_eq!(telemetry.database_error, 0);
+        let mut metrics = String::new();
+        admission.append_metrics(&mut metrics);
+        assert!(metrics
+            .contains("ryuki_session_lookup_database_lookups_total{outcome=\"cancelled\"} 1"));
+        assert!(metrics.contains("ryuki_session_lookup_database_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn operational_metrics_are_fixed_cardinality_and_value_free() {
+        let admission = SessionLookupAdmission::for_tests(8, 8, 1, 3);
+        admission.record_hit(verifier(1), Duration::from_secs(60), authority(1));
+        assert!(matches!(
+            admission.try_admit(verifier(1)),
+            SessionLookupDecision::KnownPositive(_)
+        ));
+        admission.record_miss(verifier(2));
+        assert!(matches!(
+            admission.try_admit(verifier(2)),
+            SessionLookupDecision::CachedMiss
+        ));
+
+        let held = admission.try_admit(verifier(3));
+        assert!(matches!(held, SessionLookupDecision::Unknown(_)));
+        assert!(matches!(
+            admission.try_admit(verifier(3)),
+            SessionLookupDecision::Rejected(SessionLookupRejection::DuplicateInFlight)
+        ));
+        assert!(matches!(
+            admission.try_admit(verifier(4)),
+            SessionLookupDecision::Rejected(SessionLookupRejection::Capacity)
+        ));
+        drop(held);
+        let second = admission.try_admit(verifier(5));
+        assert!(matches!(second, SessionLookupDecision::Unknown(_)));
+        drop(second);
+        let third = admission.try_admit(verifier(6));
+        assert!(matches!(third, SessionLookupDecision::Unknown(_)));
+        drop(third);
+        assert!(matches!(
+            admission.try_admit(verifier(7)),
+            SessionLookupDecision::Rejected(SessionLookupRejection::Budget)
+        ));
+
+        admission.observe_database_lookup_for_test(
+            SessionDatabaseLookupOutcome::Row,
+            Duration::from_millis(2),
+        );
+        admission.observe_database_lookup_for_test(
+            SessionDatabaseLookupOutcome::Miss,
+            Duration::from_millis(3),
+        );
+        admission.observe_database_lookup_for_test(
+            SessionDatabaseLookupOutcome::Error,
+            Duration::from_millis(5),
+        );
+        let credential_marker = [0xab; SESSION_VERIFIER_LEN];
+        admission.record_miss(credential_marker);
+
+        let mut before = String::new();
+        admission.append_metrics(&mut before);
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"known_positive\"} 1"
+        ));
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"cached_miss\"} 1"
+        ));
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"admitted_unknown\"} 3"
+        ));
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"rejected_duplicate_in_flight\"} 1"
+        ));
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"rejected_capacity\"} 1"
+        ));
+        assert!(before.contains(
+            "ryuki_session_lookup_admission_decisions_total{decision=\"rejected_budget\"} 1"
+        ));
+        assert!(before.contains("ryuki_session_lookup_database_lookups_total{outcome=\"row\"} 1"));
+        assert!(before.contains("ryuki_session_lookup_database_lookups_total{outcome=\"miss\"} 1"));
+        assert!(before.contains("ryuki_session_lookup_database_lookups_total{outcome=\"error\"} 1"));
+        assert!(
+            before.contains("ryuki_session_lookup_database_lookups_total{outcome=\"cancelled\"} 0")
+        );
+        assert!(before.contains("ryuki_session_lookup_database_duration_seconds_count 3"));
+        assert!(before.contains("ryuki_session_lookup_database_duration_seconds_sum 0.010000"));
+        assert!(!before.contains(&format!("{credential_marker:?}")));
+        for prohibited in [
+            "positive_entries",
+            "negative_entries",
+            "cache_occupancy",
+            "prewarm_loaded",
+        ] {
+            assert!(!before.contains(prohibited));
+        }
+
+        let data_series = |metrics: &str| {
+            metrics
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .count()
+        };
+        let series_before = data_series(&before);
+        for value in 1_000..2_000 {
+            let decision = admission.try_admit(verifier(value));
+            drop(decision);
+        }
+        let mut after = String::new();
+        admission.append_metrics(&mut after);
+        assert_eq!(data_series(&after), series_before);
     }
 
     #[test]
@@ -854,10 +1529,10 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_layer_remains_outside_queueing_global_concurrency() {
+    fn production_admission_layer_remains_outside_global_concurrency_budget() {
         let main = include_str!("main.rs");
         let concurrency = main
-            .rfind(".layer(ConcurrencyLimitLayer::new")
+            .rfind("GlobalConcurrencyAdmission::new(app_config.server.max_concurrent_connections)")
             .expect("whole-app concurrency layer");
         let admission = main
             .rfind("session_lookup_admission::session_lookup_admission_middleware")

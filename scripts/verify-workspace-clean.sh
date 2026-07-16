@@ -199,6 +199,7 @@ run_gate "format" cargo fmt --check --all
 run_gate "workspace build" cargo build --workspace
 run_gate "workspace tests" cargo test --workspace
 run_gate "workspace clippy" cargo clippy --workspace --all-targets -- -D warnings
+run_gate "Vault chart release" ./deploy/kubernetes/vault/test-release-approved-chart.sh
 run_gate "validator" cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 run_gate "dependency audit" ./scripts/dependency-audit.sh
 run_gate "secret scan" ./scripts/no-secret-scan.sh

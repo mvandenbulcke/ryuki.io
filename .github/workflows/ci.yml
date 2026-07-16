@@ -119,6 +119,8 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run validator
         run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
+      - name: Exercise release-source trust gate
+        run: ./scripts/release/test-validate-source-v1.sh
 
   images:
     name: Build Images

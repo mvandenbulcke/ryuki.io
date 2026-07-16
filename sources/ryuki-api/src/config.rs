@@ -365,6 +365,12 @@ pub fn get_platform_status() -> serde_json::Value {
             "hsts_enabled": config.security.hsts_enabled,
             "hsts_max_age_secs": config.security.hsts_max_age_secs,
         },
+        "security_limits": {
+            "session_lookup_admission":
+                crate::session_lookup_admission::security_limit_readback(
+                    config.server.pool_max_connections,
+                ),
+        },
         "smtp": {
             "enabled": config.smtp.enabled,
             "host": config.smtp.host,
@@ -403,6 +409,32 @@ pub fn get_platform_status() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_status_includes_value_free_session_lookup_limit_readback() {
+        let mut config = RyukiConfig::default();
+        config.server.pool_max_connections = 5;
+        crate::config_store::init_with_config(
+            "/tmp/ryuki-unused-session-limit-readback-test.json",
+            &config,
+        );
+
+        let status = get_platform_status();
+        let limits = &status["security_limits"]["session_lookup_admission"];
+        assert_eq!(
+            limits["profile_version"].as_str(),
+            Some("session-lookup-v1")
+        );
+        assert_eq!(limits["unknown_lookup"]["selected_slots"].as_u64(), Some(4));
+        assert_eq!(
+            limits["unknown_lookup"]["selected_miss_budget"].as_u64(),
+            Some(32)
+        );
+        let projection = limits.to_string();
+        for prohibited in ["verifier", "bearer", "cache_occupancy", "prewarm_loaded"] {
+            assert!(!projection.contains(prohibited));
+        }
+    }
 
     #[test]
     fn test_entra_configured_requires_tenant_and_client() {

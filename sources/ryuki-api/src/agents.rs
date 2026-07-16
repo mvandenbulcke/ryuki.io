@@ -2351,8 +2351,11 @@ pub struct ResultBody {
     /// without a plan artifact), but the digest must still match.
     #[serde(default)]
     pub evidence: Vec<u8>,
-    /// Optional structured evidence parsed from the evidence bytes.
-    /// Stored as JSONB for query convenience; never trusted for authz.
+    /// Optional structured evidence convenience field. It is independently
+    /// untrusted, even when the raw evidence bytes are signed. Successful
+    /// LivePlan ingestion ignores it; a `Planned` result instead retains its
+    /// validated signed safe-projection bytes for review. Other outcomes/modes
+    /// may store the convenience field for query purposes.
     #[serde(default)]
     pub evidence_json: Option<serde_json::Value>,
 }
@@ -2415,8 +2418,12 @@ fn map_result_status_to_job_status(mode: &JobMode, s: &JobResultStatus) -> &'sta
 // ALREADY-VERIFIED `evidence_digest` — step 6 above guarantees
 // `sha256_hex(&body.evidence) == env.evidence_digest` before this is ever
 // called), and only a small reference is stored inline in place of the full
-// `evidence_json`. Small evidence is unaffected — it keeps flowing through as
-// the agent-submitted `evidence_json` exactly as before.
+// `evidence_json`. Small evidence in modes other than a successful LivePlan is
+// unaffected — it keeps flowing through as the agent-submitted `evidence_json`
+// exactly as before. Successful LivePlan evidence is handled separately below:
+// the parallel untrusted `evidence_json` convenience field is ignored, and a
+// `Planned` result's validated safe-projection bytes are retained in
+// `evidence_blobs` for server-side review.
 // ---------------------------------------------------------------------------
 
 /// Reference stored inline in `agent_jobs.evidence_json` when the raw evidence
@@ -2430,11 +2437,12 @@ fn evidence_blob_reference(digest: &str, size_bytes: usize) -> Value {
     })
 }
 
-/// Decide what to persist in `agent_jobs.evidence_json` for this result: the
-/// original agent-submitted `evidence_json` when evidence is small enough to
-/// stay inline, or a small digest reference when it is large enough to
-/// offload. Pure and side-effect-free so the offload threshold decision is
-/// unit-testable without a DB. `offload` is the caller's already-computed
+/// Decide what to persist in `agent_jobs.evidence_json` for a result mode that
+/// permits the convenience field: the original agent-submitted JSON when the
+/// evidence is small enough to stay inline, or a small digest reference when
+/// it is large enough to offload. Successful LivePlan bypasses this helper.
+/// Pure and side-effect-free so the offload threshold decision is unit-testable
+/// without a DB. `offload` is the caller's already-computed
 /// [`ryuki_engine::evidence_store::EvidenceStorage::is_offloaded`] result —
 /// passed in rather than recomputed so the handler and the persisted
 /// `evidence_blobs` INSERT can never disagree on the decision.
@@ -2448,6 +2456,26 @@ fn compute_evidence_json_for_storage(
         Some(evidence_blob_reference(evidence_digest, evidence_len))
     } else {
         evidence_json.clone()
+    }
+}
+
+/// Successful LivePlan results never persist the independently untrusted
+/// structured convenience field. `Planned` and `CheckOk` are the two
+/// protocol-valid LivePlan statuses that map to a successful terminal job.
+fn compute_result_evidence_json_for_storage(
+    mode: &JobMode,
+    status: &JobResultStatus,
+    offload: bool,
+    evidence_len: usize,
+    evidence_digest: &str,
+    evidence_json: &Option<Value>,
+) -> Option<Value> {
+    if *mode == JobMode::LivePlan
+        && matches!(status, JobResultStatus::Planned | JobResultStatus::CheckOk)
+    {
+        None
+    } else {
+        compute_evidence_json_for_storage(offload, evidence_len, evidence_digest, evidence_json)
     }
 }
 
@@ -4524,13 +4552,17 @@ async fn post_job_result_with_pool(
         ryuki_engine::evidence_store::DEFAULT_EVIDENCE_INLINE_THRESHOLD_BYTES,
     )
     .is_offloaded();
-    // A successful LivePlan is also retained in the content-addressed blob
-    // store even when small. The admin review endpoint reparses these exact
-    // digest-covered bytes into a safe projection; it never trusts the
-    // agent-submitted evidence_json convenience field.
+    // A successful Planned LivePlan is also retained in the content-addressed
+    // blob store even when small. The admin review endpoint reparses these exact
+    // digest-covered bytes into a safe projection. Both successful LivePlan
+    // outcomes (`Planned` and `CheckOk`) ignore the parallel evidence_json field:
+    // it is independently attacker-controlled and can contain raw provider
+    // material even when the signed plan bytes passed validation above.
     let retain_verified_plan_bytes =
         stored_mode == JobMode::LivePlan && env.status == JobResultStatus::Planned;
-    let evidence_json_for_storage = compute_evidence_json_for_storage(
+    let evidence_json_for_storage = compute_result_evidence_json_for_storage(
+        &stored_mode,
+        &env.status,
         offload_evidence,
         body.evidence.len(),
         &env.evidence_digest,
@@ -9201,6 +9233,59 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn successful_live_plan_never_stores_untrusted_structured_evidence() {
+        let submitted = Some(json!({"provider_private": "RAW-SENTINEL"}));
+        for status in [JobResultStatus::CheckOk, JobResultStatus::Planned] {
+            for offload in [false, true] {
+                assert_eq!(
+                    compute_result_evidence_json_for_storage(
+                        &JobMode::LivePlan,
+                        &status,
+                        offload,
+                        70_000,
+                        "deadbeef",
+                        &submitted,
+                    ),
+                    None,
+                    "every successful LivePlan outcome must suppress evidence_json"
+                );
+            }
+        }
+        assert_eq!(
+            compute_result_evidence_json_for_storage(
+                &JobMode::LivePlan,
+                &JobResultStatus::Failed,
+                false,
+                10,
+                "deadbeef",
+                &submitted,
+            ),
+            submitted,
+            "non-successful LivePlan evidence keeps its existing inline semantics"
+        );
+    }
+
+    #[test]
+    fn live_plan_evidence_migration_quarantines_unverifiable_legacy_storage() {
+        let migration = include_str!("../../../migrations/190_live_plan_evidence_quarantine.sql");
+        assert!(
+            migration.contains("SET evidence_json = NULL")
+                && migration.contains("result_status IS DISTINCT FROM 'planned'"),
+            "migration must erase and fence every successful LivePlan inline JSON outcome"
+        );
+        assert!(
+            migration.contains("SET evidence_digest = NULL")
+                && migration.contains("raw_plan_digest = NULL"),
+            "unverifiable legacy rows must be detached from both evidence commitments"
+        );
+        assert!(
+            migration.contains("retained-shared-digest-trusted-review")
+                && migration.contains("agent_jobs_live_plan_evidence_storage_check"),
+            "shared residuals must be explicit and older writers must be fenced"
+        );
+    }
+
     fn reviewable_live_plan_spec() -> JobSpec {
         JobSpec {
             request_id: Uuid::new_v4(),
@@ -13818,7 +13903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_live_plan_ingest_rejects_raw_bytes_before_terminal_or_blob_write() {
+    async fn db_live_plan_ingest_rejects_raw_bytes_and_ignores_untrusted_inline_json() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -13895,8 +13980,10 @@ mod tests {
             "rejected raw provider bytes must never reach durable blob storage"
         );
 
-        let safe_evidence = serde_json::to_vec(&reviewable_live_plan(&["create"])).unwrap();
+        let safe_projection = reviewable_live_plan(&["create"]);
+        let safe_evidence = serde_json::to_vec(&safe_projection).unwrap();
         let safe_digest = proto_sha256(&safe_evidence);
+        let structured_sentinel = format!("RAW-STRUCTURED-PROVIDER-{}", Uuid::new_v4());
         let (safe_result, safe_bytes) = make_job_result(
             &agent_id,
             _agent_enrollment_id,
@@ -13917,7 +14004,10 @@ mod tests {
             ResultBody {
                 job_result: safe_result,
                 evidence: safe_bytes,
-                evidence_json: None,
+                evidence_json: Some(json!({
+                    "provider_private": &structured_sentinel,
+                    "resource_changes": [],
+                })),
             },
             &pool,
         )
@@ -13930,10 +14020,30 @@ mod tests {
         let after_acceptance = read_job_result_row(&pool, job_id).await;
         assert_eq!(after_acceptance.status, "Succeeded");
         assert_eq!(after_acceptance.result_status.as_deref(), Some("planned"));
+        let stored_inline = read_evidence_json(&pool, job_id).await;
+        assert_eq!(
+            stored_inline, None,
+            "successful LivePlan must ignore the independently untrusted evidence_json field"
+        );
+        assert!(
+            !format!("{stored_inline:?}").contains(&structured_sentinel),
+            "raw structured provider evidence must not reach the terminal job row"
+        );
         assert_eq!(
             count_evidence_blobs(&pool, &safe_digest).await,
             1,
             "accepted safe projection remains available for digest-bound review"
+        );
+        let stored_safe_projection = read_evidence_blob(&pool, &safe_digest)
+            .await
+            .expect("accepted LivePlan safe projection blob");
+        assert_eq!(
+            stored_safe_projection, safe_evidence,
+            "the exact validated safe-projection bytes must remain available for review"
+        );
+        assert!(
+            !String::from_utf8_lossy(&stored_safe_projection).contains(&structured_sentinel),
+            "the retained safe projection must not contain the raw structured sentinel"
         );
 
         cleanup_jobs_for_platform(&pool, &platform).await;
@@ -13961,6 +14071,14 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("count evidence_blobs")
+    }
+
+    async fn read_evidence_blob(pool: &PgPool, digest: &str) -> Option<Vec<u8>> {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT bytes FROM evidence_blobs WHERE digest = $1")
+            .bind(digest)
+            .fetch_optional(pool)
+            .await
+            .expect("read evidence blob")
     }
 
     async fn cleanup_evidence_blob(pool: &PgPool, digest: &str) {

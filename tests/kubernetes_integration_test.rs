@@ -756,22 +756,41 @@ fn cnpg_client_tls_contract_binds_ca_secret_and_server_dns_name() {
 #[test]
 fn vault_bootstrap_requires_exact_preverified_chart_archive() {
     let runbook = std::fs::read_to_string("deploy/kubernetes/vault/bootstrap-runbook.md").unwrap();
+    let release_wrapper =
+        std::fs::read_to_string("deploy/kubernetes/vault/release-approved-chart.sh").unwrap();
+    for required in [
+        "VAULT_HELM_CHART_ARCHIVE",
+        "VAULT_HELM_CHART_VERSION",
+        "VAULT_HELM_CHART_SHA256",
+        "release-approved-chart.sh verify",
+        "release-approved-chart.sh install",
+    ] {
+        assert!(
+            runbook.contains(required),
+            "runbook must delegate to the immutable chart wrapper: {required}"
+        );
+    }
     for required in [
         "VAULT_HELM_CHART_ARCHIVE",
         "VAULT_HELM_CHART_VERSION",
         "VAULT_HELM_CHART_SHA256",
         "chart version must be exact MAJOR.MINOR.PATCH",
         "chart SHA-256 mismatch",
-        "helm show chart \"$VAULT_HELM_CHART_ARCHIVE\"",
-        "helm upgrade --install vault \"$VAULT_HELM_CHART_ARCHIVE\"",
+        "chart_snapshot",
+        "helm show chart \"$chart_snapshot\"",
+        "helm template vault \"$chart_snapshot\"",
+        "helm lint \"$chart_snapshot\"",
+        "helm upgrade --install vault \"$chart_snapshot\"",
+        "assert_snapshot",
     ] {
         assert!(
-            runbook.contains(required),
-            "missing chart guard: {required}"
+            release_wrapper.contains(required),
+            "immutable chart wrapper is missing guard: {required}"
         );
     }
     assert!(
-        !runbook.contains("helm upgrade --install vault hashicorp/vault"),
+        !runbook.contains("helm upgrade --install vault hashicorp/vault")
+            && !release_wrapper.contains("hashicorp/vault"),
         "installation must not resolve a repository-latest chart"
     );
 }

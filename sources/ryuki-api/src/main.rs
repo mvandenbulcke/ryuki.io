@@ -46,7 +46,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
-use tower::limit::ConcurrencyLimitLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -704,8 +703,8 @@ async fn auth_session_from_persisted_session_with_authority_admission(
                OR ($6 AND s.provider = 'oidc' AND s.identity_issuer = $7) \
              )) \
            )";
-    admission.note_database_lookup();
-    match sqlx::query_as::<_, DbAuthSessionRow>(query)
+    let lookup_observation = admission.start_database_lookup();
+    let lookup_result = sqlx::query_as::<_, DbAuthSessionRow>(query)
         .bind(verifier.as_slice())
         .bind(session.federated_authority_max_staleness_secs as f64)
         .bind(auth_mode.as_str())
@@ -714,8 +713,14 @@ async fn auth_session_from_persisted_session_with_authority_admission(
         .bind(config.oidc.enabled)
         .bind(&config.oidc.issuer)
         .fetch_optional(pool)
-        .await
-    {
+        .await;
+    let lookup_outcome = match &lookup_result {
+        Ok(Some(_)) => crate::session_lookup_admission::SessionDatabaseLookupOutcome::Row,
+        Ok(None) => crate::session_lookup_admission::SessionDatabaseLookupOutcome::Miss,
+        Err(_) => crate::session_lookup_admission::SessionDatabaseLookupOutcome::Error,
+    };
+    lookup_observation.finish(lookup_outcome);
+    match lookup_result {
         Ok(Some(row)) => {
             use subtle::ConstantTimeEq;
             if bool::from(verifier.as_slice().ct_eq(row.bearer_verifier.as_slice())) {
@@ -2627,6 +2632,59 @@ async fn request_timeout_middleware(
     }
 }
 
+/// Shared whole-application concurrency budget. Anonymous local-login attempts
+/// are deliberately excluded because their outer, non-queueing admission gate
+/// already owns a small fixed budget that covers the complete handler lifetime:
+/// verification, uniform failure delay, or successful session persistence and
+/// response construction. Letting those requests also hold this semaphore
+/// would allow the eight login slots to starve every unrelated route when the
+/// global limit is eight or lower.
+#[derive(Clone)]
+struct GlobalConcurrencyAdmission {
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl GlobalConcurrencyAdmission {
+    fn new(max_concurrent_requests: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
+        }
+    }
+}
+
+fn bypasses_global_concurrency_budget(request: &HttpRequest<Body>) -> bool {
+    contracts::is_local_login_attempt(request.method(), request.uri().path())
+        && request
+            .extensions()
+            .get::<contracts::LocalLoginAdmissionPermit>()
+            .is_some()
+}
+
+async fn global_concurrency_middleware(
+    State(admission): State<GlobalConcurrencyAdmission>,
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    if bypasses_global_concurrency_budget(&request) {
+        return next.run(request).await;
+    }
+
+    // Do not turn a burst into an unbounded set of in-process semaphore
+    // waiters. The request timeout would eventually cancel them, but retaining
+    // every queued future until then is itself an availability risk.
+    let Ok(_permit) = admission.permits.clone().try_acquire_owned() else {
+        return problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_UNAVAILABLE",
+            "Service temporarily unavailable",
+            None::<String>,
+        )
+        .into_response();
+    };
+
+    next.run(request).await
+}
+
 async fn security_headers_middleware(
     request: HttpRequest<Body>,
     next: middleware::Next,
@@ -3127,7 +3185,6 @@ async fn main() {
         }
         match crate::session_lookup_admission::prewarm(pool, &app_config).await {
             Ok(report) => tracing::info!(
-                loaded = report.loaded,
                 truncated = report.truncated,
                 "persisted-session lookup admission prewarmed"
             ),
@@ -3419,7 +3476,7 @@ async fn main() {
         .merge(agents::agent_routes())
         // The inbound receiver is public and bypasses human auth, but requires a
         // fresh, connection-bound signed delivery envelope. A path-aware layer
-        // outside the shared concurrency queue owns its always-on
+        // outside the shared concurrency budget owns its always-on
         // per-client/global/in-flight gate; the optional general limiter remains
         // defense in depth.
         .merge(inbound_webhooks::routes())
@@ -3472,8 +3529,9 @@ async fn main() {
         .layer(Extension(entra_sso::EntraSsoDeps::from_app_config(
             &app_config,
         )))
-        .layer(ConcurrencyLimitLayer::new(
-            app_config.server.max_concurrent_connections,
+        .layer(middleware::from_fn_with_state(
+            GlobalConcurrencyAdmission::new(app_config.server.max_concurrent_connections),
+            global_concurrency_middleware,
         ))
         .layer(middleware::from_fn(request_counter_middleware))
         .layer(middleware::from_fn(
@@ -3492,7 +3550,7 @@ async fn main() {
         .layer(middleware::from_fn(cache_control_middleware))
         .layer(middleware::from_fn(timing_middleware))
         // Feature-local anonymous admission runs before telemetry, body polling,
-        // the optional general limiter, and the queueing whole-app concurrency
+        // the optional general limiter, and the fail-fast whole-app concurrency
         // layer. Non-matching paths pass through without consuming its budgets.
         .layer(middleware::from_fn_with_state(
             webhook_admission,
@@ -3509,7 +3567,7 @@ async fn main() {
         .layer(middleware::from_fn(
             contracts::login_initiation_prequeue_middleware,
         ))
-        // Persisted-session miss admission is outside the queueing whole-app
+        // Persisted-session miss admission is outside the fail-fast whole-app
         // concurrency layer. Unknown verifiers use try-only capacity; recently
         // confirmed live sessions bypass the miss budget but are still checked
         // against PostgreSQL and the current authority epoch on every request.
@@ -3877,6 +3935,7 @@ async fn metrics() -> Response {
         "ryuki_db_pool_connected {}\n",
         if pool.connected { 1 } else { 0 }
     ));
+    crate::session_lookup_admission::append_global_metrics(&mut body);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -4086,6 +4145,47 @@ mod tests {
     use axum::http::StatusCode;
     use tower::ServiceExt;
 
+    #[derive(Clone)]
+    struct GlobalConcurrencyTestGates {
+        login_started: Arc<tokio::sync::Semaphore>,
+        login_release: Arc<tokio::sync::Semaphore>,
+        ordinary_started: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Default for GlobalConcurrencyTestGates {
+        fn default() -> Self {
+            Self {
+                login_started: Arc::new(tokio::sync::Semaphore::new(0)),
+                login_release: Arc::new(tokio::sync::Semaphore::new(0)),
+                ordinary_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+    }
+
+    async fn blocked_successful_local_login_probe(
+        State(gates): State<GlobalConcurrencyTestGates>,
+        Extension(admission_permit): Extension<contracts::LocalLoginAdmissionPermit>,
+    ) -> StatusCode {
+        // Model the successful handler tail after credential verification:
+        // database/session work remains in flight while this feature-local
+        // permit is retained, even though the global budget is bypassed.
+        gates.login_started.add_permits(1);
+        gates
+            .login_release
+            .acquire()
+            .await
+            .expect("login test gate remains open")
+            .forget();
+        drop(admission_permit);
+        StatusCode::OK
+    }
+
+    async fn blocked_ordinary_probe(State(gates): State<GlobalConcurrencyTestGates>) -> StatusCode {
+        gates.ordinary_started.add_permits(1);
+        std::future::pending::<()>().await;
+        StatusCode::NO_CONTENT
+    }
+
     fn init_transport_middleware_test_config() {
         crate::config_store::init_with_config(
             "/tmp/ryuki-unused-transport-middleware-test.json",
@@ -4112,6 +4212,206 @@ mod tests {
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(response.headers()["x-frame-options"], "DENY");
         assert_eq!(response.headers()["x-api-version"], "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn successful_local_login_tail_is_bounded_without_consuming_global_budget() {
+        const LOCAL_LOGIN_PATH: &str = "/api/auth/local/login";
+        const LOCAL_LOGIN_SLOTS: usize = 8;
+        const ORDINARY_BLOCKED_PATH: &str = "/ordinary/blocked";
+        const ORDINARY_PROBE_PATH: &str = "/ordinary/probe";
+
+        let request = |method: Method, path: &'static str| {
+            HttpRequest::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .expect("concurrency test request")
+        };
+        // A raw exact-path request cannot self-select the bypass. The outer
+        // local gate must first attach its unforgeable in-process permit.
+        assert!(!bypasses_global_concurrency_budget(&request(
+            Method::POST,
+            LOCAL_LOGIN_PATH,
+        )));
+        assert!(!bypasses_global_concurrency_budget(&request(
+            Method::GET,
+            LOCAL_LOGIN_PATH,
+        )));
+        assert!(!bypasses_global_concurrency_budget(&request(
+            Method::POST,
+            "/api/auth/local/login/",
+        )));
+
+        let gates = GlobalConcurrencyTestGates::default();
+        let app = Router::new()
+            .route(
+                LOCAL_LOGIN_PATH,
+                axum::routing::post(blocked_successful_local_login_probe),
+            )
+            .route(ORDINARY_BLOCKED_PATH, get(blocked_ordinary_probe))
+            .route(
+                ORDINARY_PROBE_PATH,
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .with_state(gates.clone())
+            .layer(middleware::from_fn_with_state(
+                GlobalConcurrencyAdmission::new(1),
+                global_concurrency_middleware,
+            ))
+            // This is the production ordering: the feature-local, fail-fast
+            // login gate runs before the shared budget and remains the sole
+            // capacity owner for the exempt route.
+            .layer(middleware::from_fn_with_state(
+                Arc::new(contracts::LocalLoginThrottle::default()),
+                contracts::local_login_admission_middleware,
+            ));
+
+        let mut login_tasks = Vec::with_capacity(LOCAL_LOGIN_SLOTS);
+        for _ in 0..LOCAL_LOGIN_SLOTS {
+            let app = app.clone();
+            login_tasks.push(tokio::spawn(async move {
+                app.oneshot(request(Method::POST, LOCAL_LOGIN_PATH))
+                    .await
+                    .expect("admitted login response")
+            }));
+        }
+        for _ in 0..LOCAL_LOGIN_SLOTS {
+            tokio::time::timeout(Duration::from_secs(1), gates.login_started.acquire())
+                .await
+                .expect("all admitted login probes must enter")
+                .expect("login start gate remains open")
+                .forget();
+        }
+
+        // The local gate remains fail-fast and bounded even though login no
+        // longer consumes a permit from the global budget.
+        let saturated_login = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.clone().oneshot(request(Method::POST, LOCAL_LOGIN_PATH)),
+        )
+        .await
+        .expect("saturated login gate must reject without queueing")
+        .expect("saturated login response");
+        assert_eq!(saturated_login.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Eight blocked successful-login tails cannot consume the sole shared
+        // permit, so an unrelated route still completes immediately while the
+        // feature-local budget prevents a ninth session-persistence future.
+        let ordinary_during_login = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.clone()
+                .oneshot(request(Method::GET, ORDINARY_PROBE_PATH)),
+        )
+        .await
+        .expect("login delay must not block an unrelated route")
+        .expect("unrelated response while logins are delayed");
+        assert_eq!(ordinary_during_login.status(), StatusCode::NO_CONTENT);
+
+        gates.login_release.add_permits(LOCAL_LOGIN_SLOTS);
+        for login_task in login_tasks {
+            let response = tokio::time::timeout(Duration::from_secs(1), login_task)
+                .await
+                .expect("admitted login probe must finish")
+                .expect("admitted login task must not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Non-exempt routes still share exactly one permit and saturation is
+        // fail-fast, rather than retaining an unbounded semaphore waiter set.
+        let blocking_app = app.clone();
+        let blocking_task = tokio::spawn(async move {
+            blocking_app
+                .oneshot(request(Method::GET, ORDINARY_BLOCKED_PATH))
+                .await
+                .expect("blocking ordinary response")
+        });
+        tokio::time::timeout(Duration::from_secs(1), gates.ordinary_started.acquire())
+            .await
+            .expect("blocking ordinary probe must enter")
+            .expect("ordinary start gate remains open")
+            .forget();
+
+        let saturated_ordinary = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.clone()
+                .oneshot(request(Method::GET, ORDINARY_PROBE_PATH)),
+        )
+        .await
+        .expect("saturated global budget must reject without queueing")
+        .expect("saturated ordinary response");
+        assert_eq!(saturated_ordinary.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let saturated_body = axum::body::to_bytes(saturated_ordinary.into_body(), 4096)
+            .await
+            .expect("structured concurrency rejection body");
+        let saturated_body: serde_json::Value =
+            serde_json::from_slice(&saturated_body).expect("concurrency rejection JSON");
+        assert_eq!(saturated_body["error"], "SERVICE_UNAVAILABLE");
+        assert_eq!(saturated_body["message"], "Service temporarily unavailable");
+
+        // Cancellation of the admitted handler must release its owned permit.
+        blocking_task.abort();
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), blocking_task)
+            .await
+            .expect("cancelled ordinary task must terminate")
+            .expect_err("aborted ordinary task must report cancellation");
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                app.clone()
+                    .oneshot(request(Method::GET, ORDINARY_PROBE_PATH)),
+            )
+            .await
+            .expect("permit cancellation must restore capacity")
+            .expect("ordinary response after cancellation")
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let closed_admission = GlobalConcurrencyAdmission::new(1);
+        closed_admission.permits.close();
+        let closed_app = Router::new()
+            .route(
+                ORDINARY_PROBE_PATH,
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                LOCAL_LOGIN_PATH,
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .layer(middleware::from_fn_with_state(
+                closed_admission,
+                global_concurrency_middleware,
+            ));
+        assert_eq!(
+            closed_app
+                .clone()
+                .oneshot(request(Method::GET, ORDINARY_PROBE_PATH))
+                .await
+                .expect("closed global budget response")
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let raw_local_login = closed_app
+            .oneshot(request(Method::POST, LOCAL_LOGIN_PATH))
+            .await
+            .expect("raw local-login request without permit");
+        assert_eq!(
+            raw_local_login.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exact-path request without the outer admission permit must not bypass"
+        );
+        let raw_local_login = axum::body::to_bytes(raw_local_login.into_body(), 4096)
+            .await
+            .expect("raw local-login concurrency rejection body");
+        let raw_local_login: serde_json::Value =
+            serde_json::from_slice(&raw_local_login).expect("raw local-login rejection JSON");
+        assert_eq!(raw_local_login["error"], "SERVICE_UNAVAILABLE");
+        assert_eq!(
+            raw_local_login["message"],
+            "Service temporarily unavailable"
+        );
     }
 
     #[test]

@@ -18,51 +18,35 @@ This runbook is provider-safe. It records the bootstrap sequence and evidence bo
 
 ## Verify, Render, And Lint
 
-Validate the exact operator-approved archive before Helm parses or installs it.
-Version ranges, prerelease selectors, repository-latest resolution, missing
-digests, and uppercase/short digests fail closed.
+Use the repository wrapper to validate the exact operator-approved archive
+before Helm parses or installs it. Version ranges, prerelease selectors,
+repository-latest resolution, missing digests, uppercase/short digests,
+symlink archives, and version mismatches fail closed.
+
+The wrapper copies the source archive into a mode-`0700` temporary directory,
+checks the approved digest and version on that private chart snapshot, and
+passes only that one snapshot path to `helm show chart`, `helm template`, and
+`helm lint`. It verifies the digest again after every Helm call. A concurrent
+change to the operator-supplied source path therefore cannot swap the bytes
+between validation and use.
 
 ```bash
 set -eu
-: "${VAULT_HELM_CHART_ARCHIVE:?set to the approved local chart archive}"
-: "${VAULT_HELM_CHART_VERSION:?set the exact approved MAJOR.MINOR.PATCH version}"
-: "${VAULT_HELM_CHART_SHA256:?set the approved lowercase SHA-256 digest}"
-
-case "$VAULT_HELM_CHART_VERSION" in
-  *[!0-9.]*|.*|*.|*..*) echo "chart version must be exact MAJOR.MINOR.PATCH" >&2; exit 1 ;;
-esac
-old_ifs=$IFS
-IFS=.
-set -- ${VAULT_HELM_CHART_VERSION}
-IFS=$old_ifs
-[ "$#" -eq 3 ] || { echo "chart version must be exact MAJOR.MINOR.PATCH" >&2; exit 1; }
-for component in "$@"; do
-  case "$component" in
-    ""|*[!0-9]*) echo "chart version must be exact MAJOR.MINOR.PATCH" >&2; exit 1 ;;
-  esac
-done
-[ "${#VAULT_HELM_CHART_SHA256}" -eq 64 ] || { echo "chart SHA-256 must contain 64 lowercase hex characters" >&2; exit 1; }
-case "$VAULT_HELM_CHART_SHA256" in
-  *[!0-9a-f]*) echo "chart SHA-256 must contain 64 lowercase hex characters" >&2; exit 1 ;;
-esac
-[ -f "$VAULT_HELM_CHART_ARCHIVE" ] || { echo "approved chart archive is missing" >&2; exit 1; }
-
-if command -v sha256sum >/dev/null 2>&1; then
-  actual_chart_sha256=$(sha256sum "$VAULT_HELM_CHART_ARCHIVE" | awk '{print $1}')
-else
-  actual_chart_sha256=$(shasum -a 256 "$VAULT_HELM_CHART_ARCHIVE" | awk '{print $1}')
-fi
-[ "$actual_chart_sha256" = "$VAULT_HELM_CHART_SHA256" ] || { echo "chart SHA-256 mismatch" >&2; exit 1; }
-helm show chart "$VAULT_HELM_CHART_ARCHIVE" | grep -Fx "version: $VAULT_HELM_CHART_VERSION" >/dev/null
-
-helm template vault "$VAULT_HELM_CHART_ARCHIVE" --namespace vault -f deploy/kubernetes/vault/values-ha-raft.yaml
-helm lint "$VAULT_HELM_CHART_ARCHIVE" -f deploy/kubernetes/vault/values-ha-raft.yaml
+export VAULT_HELM_CHART_ARCHIVE="${APPROVED_VAULT_CHART_ARCHIVE:?set approved archive path}"
+export VAULT_HELM_CHART_VERSION="${APPROVED_VAULT_CHART_VERSION:?set approved exact version}"
+export VAULT_HELM_CHART_SHA256="${APPROVED_VAULT_CHART_SHA256:?set approved digest}"
+./deploy/kubernetes/vault/release-approved-chart.sh verify
 ```
 
 ## Install Shape
 
+Install mode repeats the digest/version checks, render, and lint in one process,
+then passes that same private chart snapshot to `helm upgrade --install`. Do not
+copy the Helm commands out of the wrapper or install directly from the source
+archive or a repository tag.
+
 ```bash
-helm upgrade --install vault "$VAULT_HELM_CHART_ARCHIVE" --namespace vault --create-namespace -f deploy/kubernetes/vault/values-ha-raft.yaml
+./deploy/kubernetes/vault/release-approved-chart.sh install
 ```
 
 ## Initialize And Unseal
@@ -95,7 +79,8 @@ Audit logs are sensitive operational records. Export only redacted audit evidenc
 
 - Exact Helm chart version, independently approved expected digest,
   verified archive digest, and values file hash. A matching digest proves only that the
-  reviewed bytes were used; external provenance remains an operator-owned gate.
+  reviewed bytes were used consistently by render, lint, and install; external
+  publisher provenance remains an operator-owned gate.
 - Render and lint status.
 - Pod readiness state and Raft peer count.
 - Audit device enabled state.

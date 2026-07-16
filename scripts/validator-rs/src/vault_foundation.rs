@@ -420,12 +420,12 @@ fn validate_docs_text(readme: &str, runbook: &str, errors: &mut Vec<String>) {
         "Vault runbook must define exact-version, digest, and values evidence",
     );
     expect(
-        runbook.contains("chart version must be exact MAJOR.MINOR.PATCH")
-            && runbook.contains("chart SHA-256 mismatch")
-            && runbook.contains("helm show chart \"$VAULT_HELM_CHART_ARCHIVE\"")
+        runbook.contains("release-approved-chart.sh verify")
+            && runbook.contains("release-approved-chart.sh install")
+            && runbook.contains("private chart snapshot")
             && !runbook.contains("helm upgrade --install vault hashicorp/vault"),
         errors,
-        "Vault runbook must verify a pre-approved exact chart archive",
+        "Vault runbook must use the immutable approved-chart release wrapper",
     );
 }
 

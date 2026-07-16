@@ -22,6 +22,7 @@ const SERVICE_ACCOUNTS_PATH: &str = "deploy/kubernetes/base/serviceaccounts.yaml
 const API_DEPLOYMENT_PATH: &str = "deploy/kubernetes/base/deployments.yaml";
 const CNPG_CLUSTER_PATH: &str = "deploy/kubernetes/cloudnativepg/cnpg-cluster.yaml";
 const VAULT_BOOTSTRAP_PATH: &str = "deploy/kubernetes/vault/bootstrap-runbook.md";
+const VAULT_CHART_RELEASE_PATH: &str = "deploy/kubernetes/vault/release-approved-chart.sh";
 const ENDPOINT: &str = "/api/platform/vault-secret-delivery-contract";
 const CNPG_SERVER_DNS_NAME: &str = "ryuki-platform-db-rw.ryuki-platform.svc";
 const CNPG_POSTGRES_ENDPOINT: &str = "ryuki-platform-db-rw.ryuki-platform.svc:5432";
@@ -310,6 +311,8 @@ fn validate_reference_guardrails(root: &Path, errors: &mut Vec<String>) -> Resul
         .map_err(|error| format!("failed to read {CNPG_CLUSTER_PATH}: {error}"))?;
     let bootstrap = fs::read_to_string(root.join(VAULT_BOOTSTRAP_PATH))
         .map_err(|error| format!("failed to read {VAULT_BOOTSTRAP_PATH}: {error}"))?;
+    let chart_release = fs::read_to_string(root.join(VAULT_CHART_RELEASE_PATH))
+        .map_err(|error| format!("failed to read {VAULT_CHART_RELEASE_PATH}: {error}"))?;
 
     validate_yaml_duplicate_keys_text(&vso, VSO_MANIFEST_PATH, errors);
     validate_yaml_duplicate_keys_text(&migration_vso, MIGRATION_VSO_MANIFEST_PATH, errors);
@@ -373,10 +376,9 @@ fn validate_reference_guardrails(root: &Path, errors: &mut Vec<String>) -> Resul
         "VAULT_HELM_CHART_ARCHIVE",
         "VAULT_HELM_CHART_VERSION",
         "VAULT_HELM_CHART_SHA256",
-        "chart version must be exact MAJOR.MINOR.PATCH",
-        "chart SHA-256 mismatch",
-        "helm show chart \"$VAULT_HELM_CHART_ARCHIVE\"",
-        "helm upgrade --install vault \"$VAULT_HELM_CHART_ARCHIVE\"",
+        "private chart snapshot",
+        "release-approved-chart.sh verify",
+        "release-approved-chart.sh install",
     ] {
         if !bootstrap.contains(required) {
             errors.push(format!(
@@ -384,10 +386,30 @@ fn validate_reference_guardrails(root: &Path, errors: &mut Vec<String>) -> Resul
             ));
         }
     }
-    if bootstrap.contains("helm upgrade --install vault hashicorp/vault") {
-        errors.push(format!(
-            "{VAULT_BOOTSTRAP_PATH} must not install a repository-latest chart"
-        ));
+    for required in [
+        "VAULT_HELM_CHART_ARCHIVE",
+        "VAULT_HELM_CHART_VERSION",
+        "VAULT_HELM_CHART_SHA256",
+        "chart version must be exact MAJOR.MINOR.PATCH",
+        "chart SHA-256 mismatch",
+        "chart_snapshot",
+        "helm show chart \"$chart_snapshot\"",
+        "helm template vault \"$chart_snapshot\"",
+        "helm lint \"$chart_snapshot\"",
+        "helm upgrade --install vault \"$chart_snapshot\"",
+        "assert_snapshot",
+    ] {
+        if !chart_release.contains(required) {
+            errors.push(format!(
+                "{VAULT_CHART_RELEASE_PATH} is missing immutable-chart control `{required}`"
+            ));
+        }
+    }
+    if bootstrap.contains("helm upgrade --install vault hashicorp/vault")
+        || chart_release.contains("hashicorp/vault")
+    {
+        errors
+            .push("Vault release guidance must not install a repository-latest chart".to_string());
     }
 
     Ok(())

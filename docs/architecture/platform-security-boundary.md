@@ -1583,6 +1583,21 @@ The words **must**, **must not**, **should**, and **may** are normative.
   `Draft|ReviewRequested|ExpiryApproved -> StaleFlagged`; remediation permits
   only `StaleFlagged -> RemediationPlanned`. A re-review is not an alias for the
   ordinary review endpoint and requires a separately authorized, audited action.
+- **SB-AZ-09A — Shift assignment and resolution are an explicit temporary
+  fleet-global exception.** `POST /api/ops/shift/assign/{id}` and
+  `POST /api/ops/shift/resolve/{id}` require a fresh server-verified human
+  administrator with explicit Global authority on both the site and environment
+  axes. Bare `execute`, machine or simulated actors, and an administrator with
+  either scope axis are denied before item lookup, input validation, or
+  database/no-database access. An admitted assignment target or resolution is a
+  canonical, bounded, nonblank, control-character-free value; the selected row
+  still passes through the typed immutable authority lock, compare-and-set, and
+  transactional hash-chained audit path. This is a fail-closed temporary policy,
+  not operator delegation: delegated assignment and resolution remain disabled
+  until the platform has typed destination-principal/team eligibility and an
+  authoritative support-group plus queue-state transition policy. At that point
+  a narrower action may replace this exception only with positive and negative
+  scope, destination, transition, race, and audit proofs.
 - **SB-AZ-10 — Monitoring configuration and alerts retain resource authority.**
   Every alert route created by the API is an immutable dual-axis
   site/environment resource whose canonical site must have a current active

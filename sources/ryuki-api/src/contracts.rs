@@ -7174,6 +7174,61 @@ struct ShiftHandoverQuery {
 const SHIFT_QUEUE_DEFAULT_LIMIT: i64 = 50;
 const SHIFT_QUEUE_MAX_LIMIT: i64 = 200;
 const SHIFT_QUEUE_MAX_TYPE_BUCKETS: i64 = 200;
+// Handover is an operational summary, not a raw queue export. Each projected
+// text value is sliced by PostgreSQL to at most one character beyond its
+// response budget; Rust removes that look-ahead character and emits an
+// explicit truncation flag. This keeps both sections bounded even when a
+// legacy or compromised writer stores very wide TEXT/JSONB values.
+const SHIFT_HANDOVER_ITEM_TYPE_MAX_CHARS: i32 = 128;
+const SHIFT_HANDOVER_TITLE_MAX_CHARS: i32 = 256;
+const SHIFT_HANDOVER_DESCRIPTION_MAX_CHARS: i32 = 1_024;
+const SHIFT_HANDOVER_PRIORITY_MAX_CHARS: i32 = 16;
+const SHIFT_HANDOVER_ASSIGNEE_MAX_CHARS: i32 = 512;
+const SHIFT_HANDOVER_ESCALATION_REASON_MAX_CHARS: i32 = 1_024;
+const SHIFT_HANDOVER_RESOLUTION_MAX_CHARS: i32 = 2_048;
+// Reuse the established principal/justification byte budgets for the two
+// temporary fleet-global shift mutations. These inputs remain bounded until a
+// typed destination-principal and transition-policy model replaces the
+// explicit Global verified-human admin exception.
+const SHIFT_ASSIGNMENT_TARGET_MAX_BYTES: usize = MAX_LOCAL_REQUEST_PRINCIPAL_BYTES;
+const SHIFT_RESOLUTION_MAX_BYTES: usize = MAX_LOCAL_REQUEST_JUSTIFICATION_BYTES;
+
+/// Assignment and resolution cannot be delegated safely while the queue has no
+/// authoritative assignee directory or support-group/state transition policy.
+/// Admit only the existing strongest platform-global human-admin authority;
+/// callers with bare execute, machine/simulated authority, or either scope axis
+/// are denied before input validation, item lookup, or persistence behavior.
+fn require_shift_global_verified_human_admin(
+    session: &AuthSession,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    require_global_verified_human_admin_permission(session).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "shift assignment and resolution require a verified human administrator with Global authority"
+            })),
+        )
+    })
+}
+
+fn validate_canonical_shift_text(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if value.len() > max_bytes {
+        return Err(status_400(&format!(
+            "{field} must be at most {max_bytes} bytes"
+        )));
+    }
+    reject_control_chars(field, value)?;
+    if value.trim().is_empty() || value != value.trim() {
+        return Err(status_400(&format!(
+            "{field} must be nonblank and have no surrounding whitespace"
+        )));
+    }
+    Ok(())
+}
 
 /// Server-derived shift-queue resource policy. Empty scope axes retain the
 /// platform's established "unrestricted on this axis" meaning; a global row is
@@ -7305,6 +7360,104 @@ const SHIFT_QUEUE_COLUMNS: &str =
      created_at, acknowledged, acknowledged_by, acknowledged_at, resolved, resolution, \
      resolved_at, escalated, escalation_reason, escalated_at, metadata::text AS metadata, \
      updated_at";
+
+/// Narrow, bounded projection for the open half of a handover. Deliberately
+/// absent are `metadata` and lifecycle columns that the response never uses.
+/// The SQL query returns at most `MAX + 1` characters for each text field so
+/// truncation can be detected without asking PostgreSQL to scan the complete
+/// value with `char_length`.
+#[derive(sqlx::FromRow)]
+struct ShiftHandoverOpenRow {
+    id: String,
+    item_type: String,
+    title: String,
+    description: String,
+    priority: String,
+    assigned_to: Option<String>,
+    acknowledged: bool,
+    escalated: bool,
+    escalation_reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Narrow, bounded projection for the recently-resolved half of a handover.
+#[derive(sqlx::FromRow)]
+struct ShiftHandoverResolvedRow {
+    id: String,
+    title: String,
+    resolution: Option<String>,
+    resolved_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn finalize_shift_handover_text(mut value: String, max_chars: i32) -> (String, bool) {
+    let max_chars = usize::try_from(max_chars).expect("handover text limit must be positive");
+    let Some((truncate_at, _)) = value.char_indices().nth(max_chars) else {
+        return (value, false);
+    };
+    value.truncate(truncate_at);
+    (value, true)
+}
+
+fn finalize_optional_shift_handover_text(
+    value: Option<String>,
+    max_chars: i32,
+) -> (Option<String>, bool) {
+    match value {
+        Some(value) => {
+            let (value, truncated) = finalize_shift_handover_text(value, max_chars);
+            (Some(value), truncated)
+        }
+        None => (None, false),
+    }
+}
+
+fn shift_handover_open_page_sql() -> String {
+    format!(
+        "WITH cursor AS ( \
+             SELECT LEFT(priority, $13) AS priority, created_at, id FROM shift_queue \
+             WHERE resolved = false AND {SHIFT_QUEUE_SCOPE_SQL} AND id = $8 \
+         ) \
+         SELECT id::text AS id, \
+                LEFT(item_type, $10) AS item_type, \
+                LEFT(title, $11) AS title, \
+                LEFT(description, $12) AS description, \
+                LEFT(priority, $13) AS priority, \
+                LEFT(assigned_to, $14) AS assigned_to, \
+                acknowledged, escalated, \
+                LEFT(escalation_reason, $15) AS escalation_reason, \
+                created_at \
+         FROM shift_queue \
+         WHERE resolved = false AND {SHIFT_QUEUE_SCOPE_SQL} \
+           AND ($8::uuid IS NULL OR (LEFT(priority, $13), created_at, id) > \
+                (SELECT priority, created_at, id FROM cursor)) \
+         ORDER BY LEFT(shift_queue.priority, $13) ASC, shift_queue.created_at ASC, \
+                  shift_queue.id ASC LIMIT $9"
+    )
+}
+
+fn shift_handover_resolved_page_sql() -> String {
+    format!(
+        "WITH cursor AS ( \
+             SELECT resolved_at, id FROM shift_queue \
+             WHERE resolved = true \
+               AND resolved_at IS NOT NULL \
+               AND resolved_at >= NOW() - INTERVAL '12 hours' \
+               AND {SHIFT_QUEUE_SCOPE_SQL} AND id = $8 \
+         ) \
+         SELECT id::text AS id, \
+                LEFT(title, $10) AS title, \
+                LEFT(resolution, $11) AS resolution, \
+                resolved_at \
+         FROM shift_queue \
+         WHERE resolved = true \
+           AND resolved_at IS NOT NULL \
+           AND resolved_at >= NOW() - INTERVAL '12 hours' \
+           AND {SHIFT_QUEUE_SCOPE_SQL} \
+           AND ($8::uuid IS NULL OR (resolved_at, id) < \
+                (SELECT resolved_at, id FROM cursor)) \
+         ORDER BY shift_queue.resolved_at DESC, shift_queue.id DESC LIMIT $9"
+    )
+}
 
 async fn shift_queue_lock_authorized_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -7575,6 +7728,12 @@ async fn shift_assign(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<ShiftActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_shift_global_verified_human_admin(&session)?;
+    validate_canonical_shift_text(
+        "shift assignment target",
+        &body.user,
+        SHIFT_ASSIGNMENT_TARGET_MAX_BYTES,
+    )?;
     let policy = shift_queue_admit(&session)?;
     // assigned_to (body.user) is the ASSIGNEE; assigned_by is the actor that
     // performed the assignment — taken from the authenticated session, never a
@@ -7739,6 +7898,12 @@ async fn shift_resolve(
     Path(id): Path<String>,
     Json(body): Json<ShiftResolveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_shift_global_verified_human_admin(&session)?;
+    validate_canonical_shift_text(
+        "shift resolution",
+        &body.resolution,
+        SHIFT_RESOLUTION_MAX_BYTES,
+    )?;
     let policy = shift_queue_admit(&session)?;
     if let Some(pool) = get_db() {
         // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
@@ -7833,8 +7998,8 @@ async fn shift_handover(
         i64,
     ) = sqlx::query_as(&format!(
         "SELECT COUNT(*)::bigint, \
-                COUNT(*) FILTER (WHERE priority = 'P1')::bigint, \
-                COUNT(*) FILTER (WHERE priority = 'P2')::bigint, \
+                COUNT(*) FILTER (WHERE LEFT(priority, 3) = 'P1')::bigint, \
+                COUNT(*) FILTER (WHERE LEFT(priority, 3) = 'P2')::bigint, \
                 COUNT(*) FILTER (WHERE acknowledged = false)::bigint, \
                 COUNT(*) FILTER (WHERE escalated = true)::bigint \
          FROM shift_queue WHERE resolved = false AND {SHIFT_QUEUE_SCOPE_SQL}"
@@ -7850,29 +8015,26 @@ async fn shift_handover(
     .await
     .map_err(db_error)?;
 
-    let mut open_rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
-        "WITH authorized AS ( \
-             SELECT * FROM shift_queue WHERE resolved = false AND {SHIFT_QUEUE_SCOPE_SQL} \
-         ), cursor AS ( \
-             SELECT priority, created_at, id FROM authorized WHERE id = $8 \
-         ) \
-         SELECT {SHIFT_QUEUE_COLUMNS} FROM authorized \
-         WHERE ($8::uuid IS NULL OR (priority, created_at, id) > \
-                (SELECT priority, created_at, id FROM cursor)) \
-         ORDER BY priority ASC, created_at ASC, id ASC LIMIT $9"
-    ))
-    .bind(policy.all_sites)
-    .bind(&policy.sites)
-    .bind(policy.all_environments)
-    .bind(&policy.environments)
-    .bind(policy.bypass_owner)
-    .bind(&policy.principal)
-    .bind(policy.allow_global)
-    .bind(open_after)
-    .bind(limit + 1)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
+    let open_page_sql = shift_handover_open_page_sql();
+    let mut open_rows: Vec<ShiftHandoverOpenRow> = sqlx::query_as(&open_page_sql)
+        .bind(policy.all_sites)
+        .bind(&policy.sites)
+        .bind(policy.all_environments)
+        .bind(&policy.environments)
+        .bind(policy.bypass_owner)
+        .bind(&policy.principal)
+        .bind(policy.allow_global)
+        .bind(open_after)
+        .bind(limit + 1)
+        .bind(SHIFT_HANDOVER_ITEM_TYPE_MAX_CHARS + 1)
+        .bind(SHIFT_HANDOVER_TITLE_MAX_CHARS + 1)
+        .bind(SHIFT_HANDOVER_DESCRIPTION_MAX_CHARS + 1)
+        .bind(SHIFT_HANDOVER_PRIORITY_MAX_CHARS + 1)
+        .bind(SHIFT_HANDOVER_ASSIGNEE_MAX_CHARS + 1)
+        .bind(SHIFT_HANDOVER_ESCALATION_REASON_MAX_CHARS + 1)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
     let open_has_more = open_rows.len() as i64 > limit;
     open_rows.truncate(limit as usize);
     let next_open_cursor = if open_has_more {
@@ -7881,33 +8043,23 @@ async fn shift_handover(
         None
     };
 
-    let mut recently_resolved_rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
-        "WITH authorized AS ( \
-             SELECT * FROM shift_queue \
-             WHERE resolved = true \
-               AND resolved_at IS NOT NULL \
-               AND resolved_at >= NOW() - INTERVAL '12 hours' \
-               AND {SHIFT_QUEUE_SCOPE_SQL} \
-         ), cursor AS ( \
-             SELECT resolved_at, id FROM authorized WHERE id = $8 \
-         ) \
-         SELECT {SHIFT_QUEUE_COLUMNS} FROM authorized \
-         WHERE ($8::uuid IS NULL OR (resolved_at, id) < \
-                (SELECT resolved_at, id FROM cursor)) \
-         ORDER BY resolved_at DESC, id DESC LIMIT $9"
-    ))
-    .bind(policy.all_sites)
-    .bind(&policy.sites)
-    .bind(policy.all_environments)
-    .bind(&policy.environments)
-    .bind(policy.bypass_owner)
-    .bind(&policy.principal)
-    .bind(policy.allow_global)
-    .bind(resolved_after)
-    .bind(limit + 1)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
+    let resolved_page_sql = shift_handover_resolved_page_sql();
+    let mut recently_resolved_rows: Vec<ShiftHandoverResolvedRow> =
+        sqlx::query_as(&resolved_page_sql)
+            .bind(policy.all_sites)
+            .bind(&policy.sites)
+            .bind(policy.all_environments)
+            .bind(&policy.environments)
+            .bind(policy.bypass_owner)
+            .bind(&policy.principal)
+            .bind(policy.allow_global)
+            .bind(resolved_after)
+            .bind(limit + 1)
+            .bind(SHIFT_HANDOVER_TITLE_MAX_CHARS + 1)
+            .bind(SHIFT_HANDOVER_RESOLUTION_MAX_CHARS + 1)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?;
     let resolved_has_more = recently_resolved_rows.len() as i64 > limit;
     recently_resolved_rows.truncate(limit as usize);
     let next_resolved_cursor = if resolved_has_more {
@@ -7917,30 +8069,61 @@ async fn shift_handover(
     };
 
     let open_items: Vec<Value> = open_rows
-        .iter()
+        .into_iter()
         .map(|row| {
+            let (item_type, item_type_truncated) =
+                finalize_shift_handover_text(row.item_type, SHIFT_HANDOVER_ITEM_TYPE_MAX_CHARS);
+            let (title, title_truncated) =
+                finalize_shift_handover_text(row.title, SHIFT_HANDOVER_TITLE_MAX_CHARS);
+            let (description, description_truncated) =
+                finalize_shift_handover_text(row.description, SHIFT_HANDOVER_DESCRIPTION_MAX_CHARS);
+            let (priority, priority_truncated) =
+                finalize_shift_handover_text(row.priority, SHIFT_HANDOVER_PRIORITY_MAX_CHARS);
+            let (assigned_to, assigned_to_truncated) = finalize_optional_shift_handover_text(
+                row.assigned_to,
+                SHIFT_HANDOVER_ASSIGNEE_MAX_CHARS,
+            );
+            let (escalation_reason, escalation_reason_truncated) =
+                finalize_optional_shift_handover_text(
+                    row.escalation_reason,
+                    SHIFT_HANDOVER_ESCALATION_REASON_MAX_CHARS,
+                );
             json!({
                 "id": row.id,
-                "item_type": row.item_type,
-                "title": row.title,
-                "description": row.description,
-                "priority": row.priority,
-                "assigned_to": row.assigned_to,
+                "item_type": item_type,
+                "item_type_truncated": item_type_truncated,
+                "title": title,
+                "title_truncated": title_truncated,
+                "description": description,
+                "description_truncated": description_truncated,
+                "priority": priority,
+                "priority_truncated": priority_truncated,
+                "assigned_to": assigned_to,
+                "assigned_to_truncated": assigned_to_truncated,
                 "acknowledged": row.acknowledged,
                 "escalated": row.escalated,
-                "escalation_reason": row.escalation_reason,
+                "escalation_reason": escalation_reason,
+                "escalation_reason_truncated": escalation_reason_truncated,
                 "created_at": row.created_at.to_rfc3339(),
             })
         })
         .collect();
     let recently_resolved: Vec<Value> = recently_resolved_rows
-        .iter()
+        .into_iter()
         .map(|row| {
+            let (title, title_truncated) =
+                finalize_shift_handover_text(row.title, SHIFT_HANDOVER_TITLE_MAX_CHARS);
+            let (resolution, resolution_truncated) = finalize_optional_shift_handover_text(
+                row.resolution,
+                SHIFT_HANDOVER_RESOLUTION_MAX_CHARS,
+            );
             json!({
                 "id": row.id,
-                "title": row.title,
-                "resolution": row.resolution,
-                "resolved_at": row.resolved_at.as_ref().map(|date| date.to_rfc3339()),
+                "title": title,
+                "title_truncated": title_truncated,
+                "resolution": resolution,
+                "resolution_truncated": resolution_truncated,
+                "resolved_at": row.resolved_at.to_rfc3339(),
             })
         })
         .collect();
@@ -15630,8 +15813,9 @@ const LOCAL_LOGIN_FAILURE_WINDOW: std::time::Duration = std::time::Duration::fro
 /// user's account locked indefinitely.
 const LOCAL_LOGIN_LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// At most this many local-login failures may perform verification/dummy work
-/// and hold the uniform delay concurrently. Admission is non-queueing.
+/// At most this many local-login requests may run concurrently, from
+/// verification/dummy work through failure delay or successful session
+/// persistence and response construction. Admission is non-queueing.
 const LOCAL_LOGIN_MAX_CONCURRENT_ATTEMPTS: usize = 8;
 
 /// Configuration rejects NUL in local-auth usernames, so this username can
@@ -15720,7 +15904,8 @@ impl Drop for LocalLoginAttempt<'_> {
 /// user count; attacker-selected unknown names allocate no retained state and
 /// cannot evict a real account's lock. Per-account reservations make lock
 /// admission, verification, and completion one serialized protocol. A small
-/// non-queueing semaphore bounds dummy/verification work plus failure delay.
+/// non-queueing semaphore bounds the full handler lifetime, including failure
+/// delay or successful database/session work and response construction.
 pub struct LocalLoginThrottle {
     // Lock acquisitions below recover from poisoning via
     // `unwrap_or_else(|e| e.into_inner())`: a panic in another thread's
@@ -15731,10 +15916,12 @@ pub struct LocalLoginThrottle {
     attempt_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-/// Owned pre-auth capacity reservation inserted by
-/// [`local_login_admission_middleware`]. The handler retains a clone through
-/// credential/dummy work and the uniform failure delay, then releases it
-/// before any authenticated database or session work.
+/// Owned end-to-end capacity reservation inserted by
+/// [`local_login_admission_middleware`]. The middleware retains one clone
+/// around the entire inner handler future, while the login handler requires a
+/// clone explicitly and keeps it through database/session work and response
+/// construction. A handler refactor therefore cannot accidentally create an
+/// unbounded successful-login tail outside both admission budgets.
 #[derive(Clone)]
 pub(crate) struct LocalLoginAdmissionPermit {
     _permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
@@ -15871,13 +16058,13 @@ impl LocalLoginThrottle {
     }
 }
 
-fn is_local_login_attempt(method: &axum::http::Method, path: &str) -> bool {
+pub(crate) fn is_local_login_attempt(method: &axum::http::Method, path: &str) -> bool {
     *method == axum::http::Method::POST && path == "/api/auth/local/login"
 }
 
 /// Fail-fast admission for the anonymous local-login route. This layer is
 /// mounted outside the shared application concurrency limit in `main`, so a
-/// random-username flood cannot queue for or occupy the much larger global
+/// random-username flood cannot queue for or occupy the shared global
 /// permit pool. It does not inspect credentials or create keyed state; the
 /// handler's configured-account-only tracker remains the credential boundary.
 pub(crate) async fn local_login_admission_middleware(
@@ -15885,16 +16072,25 @@ pub(crate) async fn local_login_admission_middleware(
     mut request: Request,
     next: middleware::Next,
 ) -> Response {
-    if is_local_login_attempt(request.method(), request.uri().path()) {
+    let admission_permit = if is_local_login_attempt(request.method(), request.uri().path()) {
         let Some(permit) = throttle.try_acquire_attempt_slot() else {
             return local_login_capacity_problem().into_response();
         };
-        request.extensions_mut().insert(LocalLoginAdmissionPermit {
+        let admission_permit = LocalLoginAdmissionPermit {
             _permit: std::sync::Arc::new(permit),
-        });
-    }
+        };
+        request.extensions_mut().insert(admission_permit.clone());
+        Some(admission_permit)
+    } else {
+        None
+    };
 
-    next.run(request).await
+    let response = next.run(request).await;
+    // Keep the feature-local budget charged until the complete inner handler
+    // future has produced its response, even if the handler stops extracting
+    // or accidentally drops its own extension clone early.
+    drop(admission_permit);
+    response
 }
 
 /// Local usernames are configured as exact-case ASCII identifiers. There is
@@ -15969,10 +16165,6 @@ async fn auth_local_login(
         }
     };
 
-    // A successful credential check no longer consumes pre-auth capacity
-    // while the database creates the persisted session.
-    drop(admission_permit);
-
     // Local sessions are never minted in-memory: a database is required.
     let Some(pool) = get_db() else {
         tracing::error!("local login requires a database for session persistence");
@@ -16024,6 +16216,10 @@ async fn auth_local_login(
         tracing::error!(error = %error, "local session cookie header encoding failed");
         session_cookie_encoding_problem()
     })?;
+    // The exact-route admission permit intentionally spans every successful
+    // database/session await and response-construction step. Error paths also
+    // retain it until their handler future returns through normal drop scope.
+    drop(admission_permit);
     Ok(response)
 }
 
@@ -50623,7 +50819,7 @@ mod unit_tests {
         let throttle = std::sync::Arc::new(LocalLoginThrottle::with_attempt_slots(1));
         let held = throttle
             .try_acquire_attempt_slot()
-            .expect("test should occupy the only pre-auth permit");
+            .expect("test should occupy the only end-to-end login permit");
         let app = Router::new()
             .route("/api/auth/local/login", post(admitted))
             .layer(axum::middleware::from_fn_with_state(
@@ -72473,24 +72669,45 @@ mod approved_packages_db_tests {
 mod shift_queue_db_tests {
     use super::*;
 
-    /// Authenticated acknowledger session — shift_acknowledge records the
-    /// actor from `session.user_id`, so `acknowledged_by` is this id.
+    fn verified_human_session(
+        user_id: &str,
+        roles: &[&str],
+        sites: &[&str],
+        environments: &[&str],
+    ) -> AuthSession {
+        AuthSession {
+            user_id: user_id.into(),
+            display_name: format!("{user_id} (verified test human)"),
+            roles: roles.iter().map(|role| (*role).to_string()).collect(),
+            token_valid: true,
+            provider_mode: "test-interactive".into(),
+            actor_class: ryuki_engine::auth::ActorClass::VerifiedHuman,
+            site_scope: sites.iter().map(|site| (*site).to_string()).collect(),
+            environment_scope: environments
+                .iter()
+                .map(|environment| (*environment).to_string())
+                .collect(),
+        }
+    }
+
+    /// Global verified-human administrator used by positive assignment and
+    /// resolution controls. The actor id remains server-derived test evidence.
     fn approver_session(user_id: &str) -> AuthSession {
-        let mut s = AuthSession::static_dry_run();
-        s.user_id = user_id.into();
-        s.display_name = format!("{user_id} (test)");
-        s
+        verified_human_session(
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[],
+            &[],
+        )
     }
 
     fn scoped_operator_session(user_id: &str, site: &str, environment: &str) -> AuthSession {
-        let mut session = AuthSession::static_dry_run();
-        session.user_id = user_id.into();
-        session.display_name = format!("{user_id} (scoped test)");
-        session.provider_mode = "api-token".into();
-        session.roles = vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.into()];
-        session.site_scope = vec![site.into()];
-        session.environment_scope = vec![environment.into()];
-        session
+        verified_human_session(
+            user_id,
+            &[ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR],
+            &[site],
+            &[environment],
+        )
     }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
@@ -72573,6 +72790,408 @@ mod shift_queue_db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    async fn shift_state(pool: &PgPool, id: &str) -> (Option<String>, bool) {
+        sqlx::query_as("SELECT assigned_to, resolved FROM shift_queue WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read shift mutation state")
+    }
+
+    async fn shift_audit_count(pool: &PgPool, id: &str, action: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = $1 AND detail->>'shift_item_id' = $2",
+        )
+        .bind(action)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count shift mutation audit rows")
+    }
+
+    async fn cleanup_handover_environment(pool: &PgPool, environment: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE environment = $1")
+            .bind(environment)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// C219: a 201-row authorized relation returns one bounded 200-row page,
+    /// exposes a cursor, and returns the final row on the next page. Requesting
+    /// 201 explicitly is clamped to the same contract maximum.
+    #[tokio::test]
+    async fn shift_handover_caps_a_201_row_relation_at_200() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let environment = format!("handover-page-{}", Uuid::new_v4());
+        let item_type = format!("handover-page-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "WITH generated AS ( \
+                 SELECT gen_random_uuid() AS id, sequence \
+                 FROM generate_series(1, 201) AS generated_sequence(sequence) \
+             ) \
+             INSERT INTO shift_queue \
+                 (id, item_type, title, description, priority, assigned_to, \
+                  visibility_kind, site, environment, owner_principal, \
+                  source_ci_key, scope_provenance, created_at) \
+             SELECT id, $1, 'Handover page item ' || sequence::text, \
+                    'Bounded handover page regression', 'P2', 'alice', \
+                    'resource', 'DEFRA', $2, 'alice', id::text, \
+                    'scheduler-resource-v1', \
+                    '2026-01-01T00:00:00Z'::timestamptz \
+                        + sequence * INTERVAL '1 second' \
+             FROM generated",
+        )
+        .bind(&item_type)
+        .bind(&environment)
+        .execute(pool)
+        .await
+        .expect("seed 201 handover rows");
+        let session = scoped_operator_session("alice", "DEFRA", &environment);
+
+        let Json(first) = shift_handover(
+            AuthExtractor(session.clone()),
+            Query(ShiftHandoverQuery {
+                limit: Some(200),
+                open_after: None,
+                resolved_after: None,
+            }),
+        )
+        .await
+        .expect("first maximum-size handover page");
+        assert_eq!(first["shift_summary"]["total_open"], 201);
+        assert_eq!(
+            first["open_items"].as_array().expect("open items").len(),
+            200
+        );
+        let ordinary = &first["open_items"][0];
+        assert_eq!(ordinary["item_type"], item_type.as_str());
+        assert_eq!(ordinary["description"], "Bounded handover page regression");
+        for flag in [
+            "item_type_truncated",
+            "title_truncated",
+            "description_truncated",
+            "priority_truncated",
+            "assigned_to_truncated",
+            "escalation_reason_truncated",
+        ] {
+            assert_eq!(ordinary[flag], false, "ordinary {flag} must remain false");
+        }
+        assert_eq!(first["page"]["limit"], 200);
+        assert_eq!(first["page"]["open_has_more"], true);
+        let cursor = first["page"]["next_open_cursor"]
+            .as_str()
+            .expect("open cursor")
+            .to_string();
+
+        let Json(second) = shift_handover(
+            AuthExtractor(session.clone()),
+            Query(ShiftHandoverQuery {
+                limit: Some(200),
+                open_after: Some(cursor),
+                resolved_after: None,
+            }),
+        )
+        .await
+        .expect("final handover page");
+        assert_eq!(
+            second["open_items"].as_array().expect("open items").len(),
+            1
+        );
+        assert_eq!(second["page"]["open_has_more"], false);
+
+        let Json(clamped) = shift_handover(
+            AuthExtractor(session),
+            Query(ShiftHandoverQuery {
+                limit: Some(201),
+                open_after: None,
+                resolved_after: None,
+            }),
+        )
+        .await
+        .expect("over-maximum handover page");
+        assert_eq!(clamped["page"]["limit"], 200);
+        assert_eq!(
+            clamped["open_items"].as_array().expect("open items").len(),
+            200
+        );
+        assert_eq!(clamped["page"]["open_has_more"], true);
+
+        cleanup_handover_environment(pool, &environment).await;
+    }
+
+    /// C219: resolved keyset pagination advances over the narrow resolved
+    /// projection and does not repeat the cursor row.
+    #[tokio::test]
+    async fn shift_handover_resolved_cursor_advances_without_repeating() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let environment = format!("handover-resolved-{}", Uuid::new_v4());
+        let item_type = format!("handover-resolved-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "WITH generated AS ( \
+                 SELECT gen_random_uuid() AS id, sequence \
+                 FROM generate_series(1, 3) AS generated_sequence(sequence) \
+             ) \
+             INSERT INTO shift_queue \
+                 (id, item_type, title, description, priority, assigned_to, \
+                  visibility_kind, site, environment, owner_principal, \
+                  source_ci_key, scope_provenance, resolved, resolution, resolved_at) \
+             SELECT id, $1, 'Resolved item ' || sequence::text, \
+                    'Resolved handover cursor regression', 'P2', 'alice', \
+                    'resource', 'DEFRA', $2, 'alice', id::text, \
+                    'scheduler-resource-v1', true, \
+                    'Resolution ' || sequence::text, \
+                    clock_timestamp() - sequence * INTERVAL '1 minute' \
+             FROM generated",
+        )
+        .bind(&item_type)
+        .bind(&environment)
+        .execute(pool)
+        .await
+        .expect("seed resolved handover rows");
+        let session = scoped_operator_session("alice", "DEFRA", &environment);
+
+        let mut resolved_after = None;
+        let mut seen = std::collections::HashSet::new();
+        for expected_has_more in [true, true, false] {
+            let Json(page) = shift_handover(
+                AuthExtractor(session.clone()),
+                Query(ShiftHandoverQuery {
+                    limit: Some(1),
+                    open_after: None,
+                    resolved_after,
+                }),
+            )
+            .await
+            .expect("resolved handover page");
+            let rows = page["recently_resolved"]
+                .as_array()
+                .expect("recently resolved rows");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["title_truncated"], false);
+            assert_eq!(rows[0]["resolution_truncated"], false);
+            let id = rows[0]["id"].as_str().expect("resolved id").to_string();
+            assert!(seen.insert(id), "resolved cursor row must not repeat");
+            assert_eq!(page["page"]["resolved_has_more"], expected_has_more);
+            resolved_after = page["page"]["next_resolved_cursor"]
+                .as_str()
+                .map(str::to_string);
+        }
+        assert_eq!(seen.len(), 3);
+
+        cleanup_handover_environment(pool, &environment).await;
+    }
+
+    /// C219: very wide JSONB and TEXT values remain in storage while the
+    /// handler decodes only the explicit projection. Every response text field
+    /// is capped, reports truncation, and excludes storage-only sentinels.
+    #[tokio::test]
+    async fn shift_handover_uses_narrow_bounded_projections_for_wide_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for page_sql in [
+            shift_handover_open_page_sql(),
+            shift_handover_resolved_page_sql(),
+        ] {
+            let normalized = page_sql.to_ascii_lowercase();
+            assert!(
+                !normalized.contains("metadata"),
+                "handover page SQL must not select or decode metadata"
+            );
+            assert!(
+                !normalized.contains("select *"),
+                "handover page SQL must remain an explicit projection"
+            );
+        }
+        let environment = format!("handover-wide-{}", Uuid::new_v4());
+        let open_id = Uuid::new_v4();
+        let resolved_id = Uuid::new_v4();
+        let wide = |prefix: &str, max_chars: i32, tail: &str| {
+            format!(
+                "{}{}{}",
+                prefix,
+                "x".repeat(usize::try_from(max_chars).expect("positive limit") + 32),
+                tail
+            )
+        };
+        let item_type = wide("type-", SHIFT_HANDOVER_ITEM_TYPE_MAX_CHARS, "TYPE_TAIL");
+        let title = wide("title-", SHIFT_HANDOVER_TITLE_MAX_CHARS, "TITLE_TAIL");
+        let description = wide(
+            "description-",
+            SHIFT_HANDOVER_DESCRIPTION_MAX_CHARS,
+            "DESCRIPTION_TAIL",
+        );
+        let priority = wide(
+            "priority-",
+            SHIFT_HANDOVER_PRIORITY_MAX_CHARS,
+            "PRIORITY_TAIL",
+        );
+        let assigned_to = wide(
+            "assignee-",
+            SHIFT_HANDOVER_ASSIGNEE_MAX_CHARS,
+            "ASSIGNEE_TAIL",
+        );
+        let escalation_reason = wide(
+            "escalation-",
+            SHIFT_HANDOVER_ESCALATION_REASON_MAX_CHARS,
+            "ESCALATION_TAIL",
+        );
+        let resolution = wide(
+            "resolution-",
+            SHIFT_HANDOVER_RESOLUTION_MAX_CHARS,
+            "RESOLUTION_TAIL",
+        );
+        sqlx::query(
+            "INSERT INTO shift_queue \
+                 (id, item_type, title, description, priority, assigned_to, \
+                  visibility_kind, site, environment, owner_principal, \
+                  source_ci_key, scope_provenance, escalated, escalation_reason, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'resource', 'DEFRA', $7, 'alice', \
+                     $1::text, 'scheduler-resource-v1', true, $8, \
+                     jsonb_build_object('storage_only', \
+                         repeat('m', 1000000) || 'METADATA_SENTINEL'))",
+        )
+        .bind(open_id)
+        .bind(&item_type)
+        .bind(&title)
+        .bind(&description)
+        .bind(&priority)
+        .bind(&assigned_to)
+        .bind(&environment)
+        .bind(&escalation_reason)
+        .execute(pool)
+        .await
+        .expect("seed wide open handover row");
+        sqlx::query(
+            "INSERT INTO shift_queue \
+                 (id, item_type, title, description, priority, assigned_to, \
+                  visibility_kind, site, environment, owner_principal, \
+                  source_ci_key, scope_provenance, resolved, resolution, resolved_at, metadata) \
+             VALUES ($1, 'resolved-wide', $2, 'resolved description', 'P2', 'alice', \
+                     'resource', 'DEFRA', $3, 'alice', $1::text, \
+                     'scheduler-resource-v1', true, $4, clock_timestamp(), \
+                     jsonb_build_object('storage_only', \
+                         repeat('n', 1000000) || 'RESOLVED_METADATA_SENTINEL'))",
+        )
+        .bind(resolved_id)
+        .bind(&title)
+        .bind(&environment)
+        .bind(&resolution)
+        .execute(pool)
+        .await
+        .expect("seed wide resolved handover row");
+        let stored_metadata_bytes: i64 = sqlx::query_scalar(
+            "SELECT SUM(octet_length(metadata::text))::bigint \
+             FROM shift_queue WHERE environment = $1",
+        )
+        .bind(&environment)
+        .fetch_one(pool)
+        .await
+        .expect("measure stored wide metadata");
+        assert!(stored_metadata_bytes > 2_000_000);
+
+        let Json(body) = shift_handover(
+            AuthExtractor(scoped_operator_session("alice", "DEFRA", &environment)),
+            Query(ShiftHandoverQuery {
+                limit: Some(1),
+                open_after: None,
+                resolved_after: None,
+            }),
+        )
+        .await
+        .expect("bounded wide-row handover");
+        let open = &body["open_items"][0];
+        for (field, limit, flag) in [
+            (
+                "item_type",
+                SHIFT_HANDOVER_ITEM_TYPE_MAX_CHARS,
+                "item_type_truncated",
+            ),
+            ("title", SHIFT_HANDOVER_TITLE_MAX_CHARS, "title_truncated"),
+            (
+                "description",
+                SHIFT_HANDOVER_DESCRIPTION_MAX_CHARS,
+                "description_truncated",
+            ),
+            (
+                "priority",
+                SHIFT_HANDOVER_PRIORITY_MAX_CHARS,
+                "priority_truncated",
+            ),
+            (
+                "assigned_to",
+                SHIFT_HANDOVER_ASSIGNEE_MAX_CHARS,
+                "assigned_to_truncated",
+            ),
+            (
+                "escalation_reason",
+                SHIFT_HANDOVER_ESCALATION_REASON_MAX_CHARS,
+                "escalation_reason_truncated",
+            ),
+        ] {
+            assert_eq!(
+                open[field]
+                    .as_str()
+                    .expect("bounded open field")
+                    .chars()
+                    .count(),
+                usize::try_from(limit).expect("positive limit"),
+                "{field} must be capped"
+            );
+            assert_eq!(open[flag], true, "{field} must report truncation");
+        }
+        let resolved = &body["recently_resolved"][0];
+        assert_eq!(
+            resolved["title"]
+                .as_str()
+                .expect("bounded title")
+                .chars()
+                .count(),
+            usize::try_from(SHIFT_HANDOVER_TITLE_MAX_CHARS).expect("positive limit")
+        );
+        assert_eq!(resolved["title_truncated"], true);
+        assert_eq!(
+            resolved["resolution"]
+                .as_str()
+                .expect("bounded resolution")
+                .chars()
+                .count(),
+            usize::try_from(SHIFT_HANDOVER_RESOLUTION_MAX_CHARS).expect("positive limit")
+        );
+        assert_eq!(resolved["resolution_truncated"], true);
+        let serialized = body.to_string();
+        for forbidden in [
+            "TYPE_TAIL",
+            "TITLE_TAIL",
+            "DESCRIPTION_TAIL",
+            "PRIORITY_TAIL",
+            "ASSIGNEE_TAIL",
+            "ESCALATION_TAIL",
+            "RESOLUTION_TAIL",
+            "METADATA_SENTINEL",
+            "RESOLVED_METADATA_SENTINEL",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "handover response must not contain storage-only value {forbidden}"
+            );
+        }
+
+        cleanup_handover_environment(pool, &environment).await;
     }
 
     // ── DB-gated: acknowledge persists to the DB and is visible on re-read ──
@@ -73638,9 +74257,243 @@ mod shift_queue_db_tests {
         }
     }
 
-    /// C125-C128: by-id transitions lock only an authorized row. A foreign row
-    /// and an absent row return the same 404 class, cause no lifecycle change,
-    /// and an in-scope control still succeeds.
+    /// C126/C128 root-control regression: assignment and resolution are a
+    /// temporary explicit fleet-global exception. A fresh execute-only human
+    /// and a scoped verified-human admin are both denied before object access,
+    /// and neither denial writes state or success audit evidence.
+    #[tokio::test]
+    async fn shift_assign_and_resolve_deny_delegated_callers_without_side_effects() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let site = "DEFRA";
+        let environment = format!("shift-admin-denial-{}", Uuid::new_v4());
+        let ids: Vec<String> = (0..4).map(|_| Uuid::new_v4().to_string()).collect();
+        for id in &ids {
+            seed_scoped_item(
+                pool,
+                id,
+                "mutation-admin-gate-test",
+                "P2",
+                None,
+                site,
+                Some(environment.as_str()),
+                None,
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+        }
+
+        let execute_only = scoped_operator_session("shift-execute-only", site, &environment);
+        let scoped_admin = verified_human_session(
+            "shift-scoped-admin",
+            &[ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN],
+            &[site],
+            &[environment.as_str()],
+        );
+        let denied = vec![
+            shift_assign(
+                Path(ids[0].clone()),
+                AuthExtractor(execute_only.clone()),
+                Json(ShiftActionRequest {
+                    user: "operations-team".into(),
+                }),
+            )
+            .await
+            .map(|_| ()),
+            shift_resolve(
+                AuthExtractor(execute_only),
+                Path(ids[1].clone()),
+                Json(ShiftResolveRequest {
+                    resolution: "Reviewed by the delegated operator".into(),
+                }),
+            )
+            .await
+            .map(|_| ()),
+            shift_assign(
+                Path(ids[2].clone()),
+                AuthExtractor(scoped_admin.clone()),
+                Json(ShiftActionRequest {
+                    user: "operations-team".into(),
+                }),
+            )
+            .await
+            .map(|_| ()),
+            shift_resolve(
+                AuthExtractor(scoped_admin),
+                Path(ids[3].clone()),
+                Json(ShiftResolveRequest {
+                    resolution: "Reviewed by the scoped administrator".into(),
+                }),
+            )
+            .await
+            .map(|_| ()),
+        ];
+        for result in denied {
+            let Err((status, _)) = result else {
+                panic!("delegated shift mutation must be denied");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        for id in &ids {
+            assert_eq!(shift_state(pool, id).await, (None, false));
+            assert_eq!(shift_audit_count(pool, id, "shift-assign").await, 0);
+            assert_eq!(shift_audit_count(pool, id, "shift-resolve").await, 0);
+            cleanup_item(pool, id).await;
+        }
+    }
+
+    /// The legitimate temporary control remains functional: one unscoped,
+    /// verified-human PlatformAdmin may assign and resolve through the existing
+    /// authorized-row lock, CAS, and hash-chained audit transaction.
+    #[tokio::test]
+    async fn shift_assign_and_resolve_allow_global_verified_human_admin() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let assign_id = Uuid::new_v4().to_string();
+        let resolve_id = Uuid::new_v4().to_string();
+        let environment = format!("shift-global-admin-{}", Uuid::new_v4());
+        for id in [&assign_id, &resolve_id] {
+            seed_scoped_item(
+                pool,
+                id,
+                "mutation-global-admin-test",
+                "P2",
+                None,
+                "DEFRA",
+                Some(environment.as_str()),
+                None,
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+        }
+        let admin = approver_session("shift-global-admin");
+
+        let Json(assigned) = shift_assign(
+            Path(assign_id.clone()),
+            AuthExtractor(admin.clone()),
+            Json(ShiftActionRequest {
+                user: "operations-team".into(),
+            }),
+        )
+        .await
+        .expect("global verified-human admin assignment");
+        assert_eq!(assigned["assigned_by"], "shift-global-admin");
+        assert_eq!(assigned["assigned_to"], "operations-team");
+
+        let Json(resolved) = shift_resolve(
+            AuthExtractor(admin),
+            Path(resolve_id.clone()),
+            Json(ShiftResolveRequest {
+                resolution: "Explicit global-admin resolution".into(),
+            }),
+        )
+        .await
+        .expect("global verified-human admin resolution");
+        assert_eq!(resolved["status"], "resolved");
+
+        assert_eq!(
+            shift_state(pool, &assign_id).await,
+            (Some("operations-team".into()), false)
+        );
+        assert_eq!(shift_state(pool, &resolve_id).await, (None, true));
+        assert_eq!(shift_audit_count(pool, &assign_id, "shift-assign").await, 1);
+        assert_eq!(
+            shift_audit_count(pool, &resolve_id, "shift-resolve").await,
+            1
+        );
+
+        cleanup_item(pool, &assign_id).await;
+        cleanup_item(pool, &resolve_id).await;
+    }
+
+    /// Canonical input validation runs after the global-human-admin gate but
+    /// before either persistence backend. Every invalid class leaves both rows
+    /// and success audit evidence untouched.
+    #[tokio::test]
+    async fn shift_assign_and_resolve_reject_invalid_input_without_side_effects() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let assign_id = Uuid::new_v4().to_string();
+        let resolve_id = Uuid::new_v4().to_string();
+        let environment = format!("shift-invalid-input-{}", Uuid::new_v4());
+        for id in [&assign_id, &resolve_id] {
+            seed_scoped_item(
+                pool,
+                id,
+                "mutation-invalid-input-test",
+                "P2",
+                None,
+                "DEFRA",
+                Some(environment.as_str()),
+                None,
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+        }
+        let admin = approver_session("shift-input-admin");
+
+        for invalid in [
+            String::new(),
+            " operations-team".into(),
+            "operations-team\n".into(),
+            "x".repeat(SHIFT_ASSIGNMENT_TARGET_MAX_BYTES + 1),
+        ] {
+            let Err((status, _)) = shift_assign(
+                Path(assign_id.clone()),
+                AuthExtractor(admin.clone()),
+                Json(ShiftActionRequest { user: invalid }),
+            )
+            .await
+            else {
+                panic!("invalid assignment target must be rejected");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        for invalid in [
+            String::new(),
+            " resolved".into(),
+            "resolved\n".into(),
+            "x".repeat(SHIFT_RESOLUTION_MAX_BYTES + 1),
+        ] {
+            let Err((status, _)) = shift_resolve(
+                AuthExtractor(admin.clone()),
+                Path(resolve_id.clone()),
+                Json(ShiftResolveRequest {
+                    resolution: invalid,
+                }),
+            )
+            .await
+            else {
+                panic!("invalid resolution must be rejected");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        assert_eq!(shift_state(pool, &assign_id).await, (None, false));
+        assert_eq!(shift_state(pool, &resolve_id).await, (None, false));
+        assert_eq!(shift_audit_count(pool, &assign_id, "shift-assign").await, 0);
+        assert_eq!(
+            shift_audit_count(pool, &resolve_id, "shift-resolve").await,
+            0
+        );
+
+        cleanup_item(pool, &assign_id).await;
+        cleanup_item(pool, &resolve_id).await;
+    }
+
+    /// C125/C127: the remaining delegated by-id transitions lock only an
+    /// authorized row. Assignment and resolution now fail earlier at their
+    /// explicit global-human-admin gate.
     #[tokio::test]
     async fn shift_mutations_are_non_enumerating_and_scope_bound() {
         let _serial = DB_TEST_SERIAL.lock().await;
@@ -73704,13 +74557,11 @@ mod shift_queue_db_tests {
             }),
         )
         .await;
-        for result in [
-            acknowledge.map(|_| ()),
-            assign.map(|_| ()),
-            escalate.map(|_| ()),
-            resolve.map(|_| ()),
-        ] {
+        for result in [acknowledge.map(|_| ()), escalate.map(|_| ())] {
             assert_eq!(result.unwrap_err().0, StatusCode::NOT_FOUND);
+        }
+        for result in [assign.map(|_| ()), resolve.map(|_| ())] {
+            assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
         }
         let missing = shift_acknowledge(
             Path(Uuid::new_v4().to_string()),

@@ -20,6 +20,8 @@ values, external role policies, or an organization-approved chart archive.
 |---|---|
 | `values-ha-raft.yaml` | Static Helm values baseline for HA Raft Vault. |
 | `bootstrap-runbook.md` | Exact-version/digest chart verification plus safe render, install, initialize, unseal, and audit bootstrap sequence. |
+| `release-approved-chart.sh` | Snapshot-bound release wrapper that gives chart metadata inspection, render, lint, and install the same digest-checked local archive. |
+| `test-release-approved-chart.sh` | Executable regression for version/digest rejection, source-path mutation isolation, single-snapshot use, and tamper detection. |
 | `vso-secrets.yaml` | Non-live Vault Secrets Operator skeleton with per-secret-family workload identities and a bounded API database rotation restart target. |
 
 ## Boundaries
@@ -49,3 +51,5 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- validate vault-foun
 When Helm is available, follow `bootstrap-runbook.md`; it refuses repository-
 latest resolution and requires an operator-approved local chart archive, exact
 stable version, and independently approved SHA-256 before render or install.
+The release wrapper does not establish publisher provenance; the organization-
+approved archive and digest remain deployment-owned evidence.
