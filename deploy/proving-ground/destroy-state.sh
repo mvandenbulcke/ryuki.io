@@ -313,7 +313,6 @@ for numeric_name in CPU MEMORY_GB DISK_SIZE_GB; do
 done
 
 [[ -r "$ENV_FILE" ]] || die "cannot read environment file: $ENV_FILE"
-TERRAFORM_BIN="$(command -v terraform)" || die "terraform is required"
 command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v shasum >/dev/null 2>&1 || die "shasum is required"
 
@@ -322,6 +321,11 @@ source "$HERE/agent-env.sh"
 validate_private_agent_env_file "$ENV_FILE"
 load_agent_env "$ENV_FILE"
 validate_agent_env
+validate_private_agent_state_dir "$STATE_DIR"
+stage_approved_executable terraform "$PG_TERRAFORM_EXECUTABLE" \
+  "$PG_TERRAFORM_EXPECTED_VERSION" "$PG_TERRAFORM_EXECUTABLE_SHA256" \
+  "$STATE_DIR"
+TERRAFORM_BIN="$APPROVED_EXECUTABLE_PATH"
 [[ "$PG_AGENT_PLATFORM" == "DEFRA" ]] || die "PG_AGENT_PLATFORM must be DEFRA"
 EXPECTED_BACKEND_HCL='terraform { backend "local" { path = "{STATE_DIR}/terraform-{STATE_KEY}.tfstate" } }'
 [[ "$PG_AGENT_BACKEND_HCL" == "$EXPECTED_BACKEND_HCL" ]] || \
@@ -331,13 +335,16 @@ EXPECTED_BACKEND_HCL='terraform { backend "local" { path = "{STATE_DIR}/terrafor
 [[ -n "$PG_VSPHERE_USER" ]] || die "PG_VSPHERE_USER is missing"
 [[ -n "$PG_VSPHERE_PASSWORD" ]] || die "PG_VSPHERE_PASSWORD is missing"
 [[ -n "$PG_VSPHERE_SERVER" ]] || die "PG_VSPHERE_SERVER is missing"
-PROVIDER_CONTEXT_FILE="$STATE_DIR/provider-context.sha256"
-[[ -r "$PROVIDER_CONTEXT_FILE" ]] || \
-  die "pinned provider context is missing; refusing cleanup against an unbound endpoint"
-IFS= read -r PINNED_PROVIDER_CONTEXT < "$PROVIDER_CONTEXT_FILE"
-CURRENT_PROVIDER_CONTEXT="$(provider_context_fingerprint "$PG_VSPHERE_USER" "$PG_VSPHERE_SERVER")"
-[[ "$PINNED_PROVIDER_CONTEXT" == "$CURRENT_PROVIDER_CONTEXT" ]] || \
-  die "vSphere endpoint/account differs from the context pinned before live execution"
+[[ -n "$PG_PROVIDER_AUTHORITY_ID" ]] || die "PG_PROVIDER_AUTHORITY_ID is missing"
+[[ -n "$PG_PROVIDER_AUTHORITY_VERSION" ]] || die "PG_PROVIDER_AUTHORITY_VERSION is missing"
+PROVIDER_AUTHORITY_FILE="$STATE_DIR/provider-authority.ref"
+[[ -r "$PROVIDER_AUTHORITY_FILE" ]] || \
+  die "pinned provider authority is missing; refusing cleanup against an unbound authority"
+PINNED_PROVIDER_AUTHORITY="$(cat "$PROVIDER_AUTHORITY_FILE")"
+CURRENT_PROVIDER_AUTHORITY="$(provider_authority_record \
+  "$PG_PROVIDER_AUTHORITY_ID" "$PG_PROVIDER_AUTHORITY_VERSION")"
+[[ "$PINNED_PROVIDER_AUTHORITY" == "$CURRENT_PROVIDER_AUTHORITY" ]] || \
+  die "provider authority reference/version differs from the authority pinned before live execution"
 
 BACKEND_HCL="$(render_agent_backend_hcl "$PG_AGENT_BACKEND_HCL" "$STATE_DIR")"
 BACKEND_HCL="${BACKEND_HCL//\{STATE_KEY\}/$STATE_KEY}"
@@ -350,7 +357,6 @@ BUNDLE_DIR="$REPO/sources/ryuki-runner/src/iac/$OFFERING"
   die "offering Terraform dependency lock is missing"
 
 umask 077
-mkdir -p "$STATE_DIR"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryuki-destroy.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 cp "$BUNDLE_DIR/main.tf" "$WORK_DIR/main.tf"
@@ -391,7 +397,12 @@ export TF_VAR_vsphere_password="$PG_VSPHERE_PASSWORD" # secret-scan-allow: revie
 export TF_VAR_vsphere_server="$PG_VSPHERE_SERVER"
 unset RYUKI_PG_ENV_ISOLATED
 unset PG_AGENT_PLATFORM PG_AGENT_ALLOW_LIVE PG_AGENT_BACKEND_HCL
+unset PG_TERRAFORM_EXECUTABLE PG_TERRAFORM_EXPECTED_VERSION \
+  PG_TERRAFORM_EXECUTABLE_SHA256
+unset PG_ANSIBLE_PLAYBOOK_EXECUTABLE PG_ANSIBLE_PLAYBOOK_EXPECTED_VERSION \
+  PG_ANSIBLE_PLAYBOOK_EXECUTABLE_SHA256
 unset PG_VSPHERE_USER PG_VSPHERE_PASSWORD PG_VSPHERE_SERVER
+unset PG_PROVIDER_AUTHORITY_ID PG_PROVIDER_AUTHORITY_VERSION
 unset PG_DB_PASSWORD PG_VAULT_TOKEN PG_LOCAL_USERS
 
 printf 'Initializing isolated state %s for out-of-band cleanup.\n' "$STATE_KEY"

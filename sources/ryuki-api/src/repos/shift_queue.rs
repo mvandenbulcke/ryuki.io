@@ -5,18 +5,14 @@
 //! reusable writer, kept minimal and scoped to the restore-test producers
 //! (`restore-test-overdue`, `restore-test-failed`).
 //!
-//! # Dedup (no natural key)
-//! `shift_queue` has only a PK on `id`. To enqueue at-most-one OPEN item per
-//! system+type, [`enqueue_if_absent`] is an atomic single-statement
-//! `INSERT … SELECT … WHERE NOT EXISTS … ON CONFLICT DO NOTHING`. The `WHERE NOT
-//! EXISTS` skips the insert in the common already-queued case; the untargeted
-//! `ON CONFLICT DO NOTHING` is the belt-and-suspenders that makes a racing
-//! insert hit the matching partial unique index
-//! (`uq_shift_queue_open_restore_overdue` in migration 122,
-//! `uq_shift_queue_open_restore_failed` in migration 123) and be silently
-//! dropped instead of aborting the caller's transaction. Under the
-//! single-leader scheduler tick the race is already impossible; the ON CONFLICT
-//! just makes it structurally safe.
+//! # Authority-scoped dedup
+//! Migration 170 replaces the legacy metadata-expression indexes with typed
+//! partial unique indexes. Resource work is unique by
+//! `(item_type, source_ci_key, site, environment)` and explicit fleet-global
+//! work by `(item_type, source_ci_key)`. Quarantined legacy rows participate in
+//! neither contract and therefore cannot suppress verified work. The common
+//! `NOT EXISTS` predicate and the concurrency-safe unique index use the exact
+//! same tuple.
 
 use sqlx::{PgExecutor, PgPool};
 
@@ -27,6 +23,12 @@ pub const RESTORE_OVERDUE_ITEM_TYPE: &str = "restore-test-overdue";
 /// The FAILED-latest restore signal (#52 slice 2). Fixed so the dedup key and the
 /// partial unique index always agree.
 pub const RESTORE_FAILED_ITEM_TYPE: &str = "restore-test-failed";
+
+/// A restore history tuple containing one or more rows whose durable authority
+/// or maker/checker provenance is quarantined. The scheduler uses a digest-only
+/// global key so malformed or oversized legacy values are never copied into a
+/// queue btree key or operator payload.
+pub const RESTORE_AUTHORITY_QUARANTINED_ITEM_TYPE: &str = "restore-authority-quarantined";
 
 /// The OVERDUE secret-rotation signal (#7). A secret whose `next_rotation_due` has
 /// passed. Fixed so the dedup key and the partial unique index always agree.
@@ -92,58 +94,133 @@ pub const GOLDEN_IMAGE_STALE_ITEM_TYPE: &str = "golden-image-stale";
 /// still overdue on the next daily scan (migration 145).
 pub const DRIFT_RECHECK_OVERDUE_ITEM_TYPE: &str = "drift-recheck-overdue";
 
-/// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
-/// (`resolved = false`) item already exists for that system+type. Returns
-/// `rows_affected()` — `1` when a new item was inserted, `0` when one already
-/// existed (or a concurrent writer raced and the ON CONFLICT dropped this one).
+/// Server-derived authorization classification for a scheduler work item.
+/// Callers must construct `Resource` only from typed source columns selected by
+/// the scheduler repository; descriptive queue metadata is never consulted.
+#[derive(Debug, Clone, Copy)]
+pub enum ShiftQueueAuthority<'a> {
+    Resource {
+        site: &'a str,
+        environment: Option<&'a str>,
+    },
+    /// The producer's source object is intentionally fleet-wide rather than
+    /// missing scope. This is distinct from unresolved legacy work.
+    Global,
+}
+
+/// Enqueue ONE open `item_type` work item for the exact typed authority tuple.
+/// Returns `rows_affected()` — `1` when a new item was inserted, `0` when that
+/// same authority tuple already exists, a concurrent writer won, or a resource
+/// site is not currently an ACTIVE canonical registry entry.
 ///
 /// `item_type` is a code-controlled constant (`RESTORE_OVERDUE_ITEM_TYPE` /
 /// `RESTORE_FAILED_ITEM_TYPE`), never user input; it is bound into BOTH the
 /// INSERT and the NOT EXISTS dedup predicate so the produced row and the dedup
 /// key can never drift.
 ///
-/// `metadata` is bound as a JSON string and cast to `jsonb`. Rejects an empty/
-/// whitespace `source_ci_key`: it is not a meaningful asset identity, and a blank
-/// key would group unrelated systems together under the dedup. (A partial unique
-/// index permits multiple NULL keys — but `metadata->>'source_ci_key'` is never
-/// NULL here since we always write the key — so the guard is about blankness, not
-/// NULL multiplicity.)
+/// `metadata` is descriptive only. It must be valid JSON and its diagnostic
+/// `source_ci_key` must exactly agree with the typed argument, preventing audit
+/// payloads from naming a different source than the persisted dedup authority.
+/// The source/site/environment tuple must already be canonical (trimmed,
+/// nonblank); this function never repairs or infers authority from JSON.
 ///
 /// Executor-generic (`impl PgExecutor`) so the scheduler tick can run it on
 /// `&mut *tx` and any future caller can run it on a pool.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_if_absent(
     executor: impl PgExecutor<'_>,
     item_type: &str,
     source_ci_key: &str,
+    authority: ShiftQueueAuthority<'_>,
     title: &str,
     description: &str,
     priority: &str,
     metadata: &str,
 ) -> Result<u64, sqlx::Error> {
-    if source_ci_key.trim().is_empty() {
+    if source_ci_key.trim().is_empty() || source_ci_key != source_ci_key.trim() {
         return Err(sqlx::Error::Protocol(
-            "enqueue_if_absent: source_ci_key must not be empty".into(),
+            "enqueue_if_absent: source_ci_key must be canonical and nonempty".into(),
         ));
     }
-    let result = sqlx::query(
-        "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
-         SELECT $1, $2, $3, $4, $5::jsonb \
-         WHERE NOT EXISTS ( \
-             SELECT 1 FROM shift_queue \
-             WHERE item_type = $1 \
-               AND resolved = false \
-               AND metadata->>'source_ci_key' = $6 \
-         ) \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(item_type)
-    .bind(title)
-    .bind(description)
-    .bind(priority)
-    .bind(metadata)
-    .bind(source_ci_key)
-    .execute(executor)
-    .await?;
+    let metadata_value: serde_json::Value = serde_json::from_str(metadata).map_err(|error| {
+        sqlx::Error::Protocol(format!(
+            "enqueue_if_absent: metadata is not valid JSON: {error}"
+        ))
+    })?;
+    if metadata_value
+        .get("source_ci_key")
+        .and_then(serde_json::Value::as_str)
+        != Some(source_ci_key)
+    {
+        return Err(sqlx::Error::Protocol(
+            "enqueue_if_absent: metadata source_ci_key must match typed authority".into(),
+        ));
+    }
+
+    let result = match authority {
+        ShiftQueueAuthority::Resource { site, environment } => {
+            if site.trim().is_empty()
+                || site != site.trim()
+                || environment.is_some_and(|value| value.trim().is_empty() || value != value.trim())
+            {
+                return Err(sqlx::Error::Protocol(
+                    "enqueue_if_absent: resource scope must be canonical and nonempty".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO shift_queue (item_type, title, description, priority, metadata, \
+                                          source_ci_key, visibility_kind, site, environment, \
+                                          scope_provenance) \
+                 SELECT $1, $2, $3, $4, $5::jsonb, $6, 'resource', $7, $8, \
+                        'scheduler-resource-v1' \
+                 FROM site_registry AS registry \
+                 WHERE registry.unlocode = $7 AND registry.active = true \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM shift_queue AS queued \
+                       WHERE queued.item_type = $1 \
+                         AND queued.source_ci_key = $6 \
+                         AND queued.visibility_kind = 'resource' \
+                         AND queued.site = $7 \
+                         AND queued.environment IS NOT DISTINCT FROM $8 \
+                         AND queued.resolved = false \
+                   ) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(item_type)
+            .bind(title)
+            .bind(description)
+            .bind(priority)
+            .bind(metadata)
+            .bind(source_ci_key)
+            .bind(site)
+            .bind(environment)
+            .execute(executor)
+            .await?
+        }
+        ShiftQueueAuthority::Global => {
+            sqlx::query(
+                "INSERT INTO shift_queue (item_type, title, description, priority, metadata, \
+                                      source_ci_key, visibility_kind, scope_provenance) \
+             SELECT $1, $2, $3, $4, $5::jsonb, $6, 'global', 'scheduler-global-v1' \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM shift_queue AS queued \
+                 WHERE queued.item_type = $1 \
+                   AND queued.source_ci_key = $6 \
+                   AND queued.visibility_kind = 'global' \
+                   AND queued.resolved = false \
+             ) \
+             ON CONFLICT DO NOTHING",
+            )
+            .bind(item_type)
+            .bind(title)
+            .bind(description)
+            .bind(priority)
+            .bind(metadata)
+            .bind(source_ci_key)
+            .execute(executor)
+            .await?
+        }
+    };
     Ok(result.rows_affected())
 }
 
@@ -178,17 +255,31 @@ pub struct ShiftQueueFilter<'a> {
     pub unassigned: Option<bool>,
 }
 
+/// Server-derived row authorization for shift work. Caller-controlled filters
+/// are deliberately separate: this policy is always applied before ordering,
+/// pagination, counting, or projection.
+#[derive(Debug)]
+pub struct ShiftQueueAccess<'a> {
+    pub sites: &'a [String],
+    pub environments: &'a [String],
+    pub principal: &'a str,
+    pub all_sites: bool,
+    pub all_environments: bool,
+    pub allow_global: bool,
+    pub bypass_owner: bool,
+}
+
 /// Filtered + paginated operator triage list.
 ///
-/// EVERY filter is a BOUND parameter applied via the `($N::type IS NULL OR
-/// col = $N)` pattern — an unset filter matches every row, and NO user input is ever
-/// concatenated into SQL (injection-safe). Ordered `priority ASC` (P1<P2<P3) then
-/// `created_at ASC` (oldest-waiting first — the triage backlog order) then `id ASC`
-/// as an IMMUTABLE tiebreaker, so offset pagination is deterministic even when
-/// priority + created_at tie. The caller passes `limit + 1` to derive `has_more`
-/// without a COUNT.
+/// The server-derived resource policy is evaluated first. EVERY caller filter
+/// is then a BOUND parameter applied via the `($N::type IS NULL OR col = $N)`
+/// pattern — an unset filter matches every authorized row, and no user input is
+/// concatenated into SQL. Ordered `priority ASC` (P1<P2<P3), `created_at ASC`,
+/// then immutable `id ASC`, so offset pagination is deterministic for a stable
+/// relation. The caller passes `limit + 1` to derive `has_more` without a COUNT.
 pub async fn list_filtered(
     pool: &PgPool,
+    access: &ShiftQueueAccess<'_>,
     filter: &ShiftQueueFilter<'_>,
     limit: i64,
     offset: i64,
@@ -197,16 +288,33 @@ pub async fn list_filtered(
         "SELECT id::text AS id, item_type, title, description, priority, assigned_to, \
                 created_at, acknowledged, escalated, resolved \
          FROM shift_queue \
-         WHERE ($1::text IS NULL OR item_type = $1) \
-           AND ($2::text IS NULL OR priority = $2) \
-           AND ($3::text IS NULL OR assigned_to = $3) \
-           AND ($4::bool IS NULL OR resolved = $4) \
-           AND ($5::bool IS NULL OR acknowledged = $5) \
-           AND ($6::bool IS NULL OR escalated = $6) \
-           AND ($7::bool IS NULL OR (assigned_to IS NULL) = $7) \
+         WHERE ( \
+             (visibility_kind = 'resource' \
+              AND EXISTS (SELECT 1 FROM site_registry AS authorized_site \
+                          WHERE authorized_site.unlocode = shift_queue.site \
+                            AND authorized_site.active = true) \
+              AND ($1::bool OR site = ANY($2::text[])) \
+              AND ($3::bool OR environment = ANY($4::text[])) \
+              AND ($5::bool OR owner_principal IS NULL OR owner_principal = $6)) \
+             OR (visibility_kind = 'global' AND $7::bool) \
+         ) \
+           AND ($8::text IS NULL OR item_type = $8) \
+           AND ($9::text IS NULL OR priority = $9) \
+           AND ($10::text IS NULL OR assigned_to = $10) \
+           AND ($11::bool IS NULL OR resolved = $11) \
+           AND ($12::bool IS NULL OR acknowledged = $12) \
+           AND ($13::bool IS NULL OR escalated = $13) \
+           AND ($14::bool IS NULL OR (assigned_to IS NULL) = $14) \
          ORDER BY priority ASC, created_at ASC, id ASC \
-         LIMIT $8 OFFSET $9",
+         LIMIT $15 OFFSET $16",
     )
+    .bind(access.all_sites)
+    .bind(access.sites)
+    .bind(access.all_environments)
+    .bind(access.environments)
+    .bind(access.bypass_owner)
+    .bind(access.principal)
+    .bind(access.allow_global)
     .bind(filter.item_type)
     .bind(filter.priority)
     .bind(filter.assigned_to)

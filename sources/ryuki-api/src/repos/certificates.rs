@@ -10,8 +10,13 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::certificate_lifecycle::{CertificateRecord, CertificateStatus};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
+
+/// Canonical site codes are at most 32 ASCII octets. Migration 172 uses the
+/// same bound for its new-write constraint and partial read indexes, so legacy
+/// outliers never enter a bounded certificate page or an index tuple.
+pub const MAX_CERTIFICATE_SITE_QUERY_BYTES: usize = 32;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
 
@@ -111,12 +116,17 @@ pub fn status_str(s: &CertificateStatus) -> &'static str {
 /// carries the DB-authoritative `created_at` (the response then matches a
 /// subsequent `get`).
 ///
-/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
-/// `&mut *tx` to share a transaction with an audit write.
+/// The `INSERT ... SELECT` repeats the exact active `site_registry` relation at
+/// the write boundary. The handler also holds that site `FOR SHARE`, preventing
+/// concurrent deactivation until the audited transaction commits. `None`
+/// means the site is not currently canonical and active.
+///
+/// Accepts any `sqlx::PgExecutor` — callers should pass `&mut *tx` so the
+/// authority lock, insert, and audit remain atomic.
 pub async fn insert(
     executor: impl sqlx::PgExecutor<'_>,
     r: &CertificateRecord,
-) -> Result<CertificateRecord, sqlx::Error> {
+) -> Result<Option<CertificateRecord>, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let valid_from: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&r.valid_from)
@@ -127,11 +137,16 @@ pub async fn insert(
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
-    let row: CertificateRow = sqlx::query_as(&format!(
-        "INSERT INTO certificates \
-         (id, common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-         RETURNING {COLUMNS}"
+    let row: Option<CertificateRow> = sqlx::query_as(&format!(
+        "WITH inserted AS ( \
+             INSERT INTO certificates \
+             (id, common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, sr.unlocode, $9 \
+             FROM site_registry AS sr \
+             WHERE sr.unlocode = $8 AND sr.active = true \
+             RETURNING * \
+         ) \
+         SELECT {COLUMNS} FROM inserted"
     ))
     .bind(id)
     .bind(&r.common_name)
@@ -146,10 +161,10 @@ pub async fn insert(
     .bind(&r.hostname)
     .bind(&r.site)
     .bind(status_str(&r.status))
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await?;
 
-    row.into_model()
+    row.map(|row| row.into_model()).transpose()
 }
 
 /// Fetch one certificate by string id. A malformed (non-UUID) id is treated as
@@ -170,15 +185,129 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<CertificateRecord>, s
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Return all certificates ordered by creation time descending.
-pub async fn list(pool: &PgPool) -> Result<Vec<CertificateRecord>, sqlx::Error> {
-    let rows: Vec<CertificateRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM certificates ORDER BY created_at DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Fully normalized, authorization-aware inventory keyset query. `sites = None`
+/// means an unrestricted principal.  `Some` is bounded by the handler and is
+/// evaluated as a fixed per-site top-N merge, so sparse multi-site scopes do not
+/// scan a global index past an attacker-independent page budget.
+pub struct CertificateListQuery {
+    pub sites: Option<Vec<String>>,
+    pub after: Option<(DateTime<Utc>, Uuid)>,
+    pub limit: i64,
+}
 
-    rows.into_iter().map(|r| r.into_model()).collect()
+const RAW_COLUMNS: &str = "candidate.id, candidate.common_name, candidate.subject, \
+    candidate.valid_from, candidate.valid_to, candidate.service_type, \
+    candidate.hostname, candidate.site, candidate.status, candidate.created_at";
+
+fn push_created_before<'args>(
+    builder: &mut QueryBuilder<'args, Postgres>,
+    prefix: &str,
+    after: &'args Option<(DateTime<Utc>, Uuid)>,
+) {
+    if let Some((created_at, id)) = after.as_ref() {
+        builder
+            .push(" AND (")
+            .push(prefix)
+            .push("created_at, ")
+            .push(prefix)
+            .push("id) < (")
+            .push_bind(created_at)
+            .push(", ")
+            .push_bind(id)
+            .push(")");
+    }
+}
+
+/// Fetch one bounded newest-first keyset page.  Unrestricted callers use the
+/// global `(created_at,id)` index.  Scoped callers take at most `limit` rows
+/// from each of at most 64 authorized sites through the matching site index,
+/// then merge only that bounded candidate set into the global order.
+pub async fn list_page(
+    pool: &PgPool,
+    query: &CertificateListQuery,
+) -> Result<Vec<CertificateRecord>, sqlx::Error> {
+    let mut builder = if let Some(sites) = query.sites.as_ref() {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "WITH site_candidates AS ( \
+             SELECT candidate.* FROM ( \
+                 SELECT DISTINCT site FROM unnest(",
+        );
+        builder
+            .push_bind(sites.as_slice())
+            .push(
+                "::text[]) AS scoped(site) \
+             ) AS authorized \
+             CROSS JOIN LATERAL ( \
+                 SELECT ",
+            )
+            .push(RAW_COLUMNS)
+            .push(
+                " FROM certificates AS candidate \
+                 WHERE octet_length(candidate.site) BETWEEN 1 AND 32 \
+                   AND candidate.site = authorized.site",
+            );
+        push_created_before(&mut builder, "candidate.", &query.after);
+        builder
+            .push(" ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT ")
+            .push_bind(query.limit)
+            .push(
+                ") AS candidate \
+             ) SELECT id::text AS id, common_name, subject, valid_from, valid_to, \
+                      service_type, hostname, site, status, created_at \
+               FROM site_candidates \
+               ORDER BY site_candidates.created_at DESC, \
+                        site_candidates.id DESC LIMIT ",
+            )
+            .push_bind(query.limit);
+        builder
+    } else {
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {COLUMNS} FROM certificates \
+             WHERE octet_length(site) BETWEEN 1 AND 32"
+        ));
+        push_created_before(&mut builder, "certificates.", &query.after);
+        builder
+            .push(" ORDER BY certificates.created_at DESC, certificates.id DESC LIMIT ")
+            .push_bind(query.limit);
+        builder
+    };
+
+    let rows: Vec<CertificateRow> = builder.build_query_as().fetch_all(pool).await?;
+    rows.into_iter().map(CertificateRow::into_model).collect()
+}
+
+/// Fetch a bounded, index-ordered expiry page. The optional tuple is the last
+/// `(valid_to,id)` from the preceding page, so later pages remain keyset-bound
+/// rather than paying attacker-selected OFFSET discard work.
+pub async fn list_expiring_page(
+    pool: &PgPool,
+    site: Option<&str>,
+    expires_before: &DateTime<Utc>,
+    after: Option<(&DateTime<Utc>, &Uuid)>,
+    limit: i64,
+) -> Result<Vec<CertificateRecord>, sqlx::Error> {
+    let mut builder = QueryBuilder::<Postgres>::new(format!(
+        "SELECT {COLUMNS} FROM certificates \
+         WHERE octet_length(site) BETWEEN 1 AND 32 AND "
+    ));
+    if let Some(site) = site {
+        builder.push("site = ").push_bind(site).push(" AND ");
+    }
+    builder.push("valid_to <= ").push_bind(expires_before);
+    if let Some((valid_to, id)) = after {
+        builder
+            .push(" AND (valid_to, id) > (")
+            .push_bind(valid_to)
+            .push(", ")
+            .push_bind(id)
+            .push(")");
+    }
+    builder
+        .push(" ORDER BY valid_to ASC, certificates.id ASC LIMIT ")
+        .push_bind(limit);
+
+    let rows: Vec<CertificateRow> = builder.build_query_as().fetch_all(pool).await?;
+    rows.into_iter().map(CertificateRow::into_model).collect()
 }
 
 /// Only a TERMINAL certificate (`Expired`|`Revoked`) may be DELETED — operational

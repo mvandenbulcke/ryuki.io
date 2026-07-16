@@ -22,7 +22,7 @@ impl std::fmt::Display for NamespaceStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Environment {
     Dev,
     Test,
@@ -63,8 +63,13 @@ pub struct ResourceQuota {
 pub struct K8sNamespace {
     pub id: String,
     pub name: String,
+    /// Internal immutable provenance for the authoritative cluster/environment
+    /// relation. It is intentionally omitted from API serialization.
+    #[serde(default, skip_serializing)]
+    pub cluster_scope_id: String,
     pub cluster: String,
     pub site: String,
+    pub environment: Environment,
     pub resource_quota: ResourceQuota,
     pub network_policy: String,
     pub service_accounts: Vec<String>,
@@ -76,6 +81,10 @@ pub struct ContainerRequest {
     pub id: String,
     pub requester: String,
     pub namespace_name: String,
+    /// Internal immutable provenance for the authoritative cluster/environment
+    /// relation. It is intentionally omitted from API serialization.
+    #[serde(default, skip_serializing)]
+    pub cluster_scope_id: String,
     pub cluster: String,
     pub site: String,
     pub cpu_request: u32,
@@ -157,9 +166,13 @@ pub fn validate_capacity_bounds(cpu: u32, memory: u32, storage: u32) -> Result<(
 }
 
 /// Build a new K8sNamespace (Creating status) and its paired ContainerRequest (Provisioned).
-/// IDs use full Uuid::new_v4().
+/// `requester` is the verified caller identity supplied by the authenticated
+/// boundary. IDs use full Uuid::new_v4().
+#[allow(clippy::too_many_arguments)]
 pub fn build_namespace_and_request(
     name: &str,
+    requester: &str,
+    cluster_scope_id: &str,
     cluster: &str,
     site: &str,
     cpu: u32,
@@ -172,8 +185,10 @@ pub fn build_namespace_and_request(
     let namespace = K8sNamespace {
         id: ns_id.clone(),
         name: name.to_string(),
+        cluster_scope_id: cluster_scope_id.to_string(),
         cluster: cluster.to_string(),
         site: site.to_string(),
+        environment,
         resource_quota: build_quota(cpu, memory, storage),
         network_policy: format!(
             "{}-{}-default",
@@ -185,8 +200,9 @@ pub fn build_namespace_and_request(
     };
     let request = ContainerRequest {
         id: req_id,
-        requester: "platform-engineering".into(),
+        requester: requester.to_string(),
         namespace_name: name.to_string(),
+        cluster_scope_id: cluster_scope_id.to_string(),
         cluster: cluster.to_string(),
         site: site.to_string(),
         cpu_request: cpu,
@@ -315,8 +331,10 @@ mod tests {
         K8sNamespace {
             id: id.into(),
             name: name.into(),
+            cluster_scope_id: format!("scope-{cluster}-prod"),
             cluster: cluster.into(),
             site: site.into(),
+            environment: Environment::Prod,
             resource_quota: build_quota(4, 8, 100),
             network_policy: "deny-by-default".into(),
             service_accounts: vec!["test-deployer".into()],
@@ -370,6 +388,8 @@ mod tests {
         let env = Environment::Staging;
         let (ns, req) = build_namespace_and_request(
             "frpar-api-staging",
+            "verified-platform-engineer",
+            "cluster-scope-frpar-k8s-01-staging",
             "frpar-k8s-01",
             "FRPAR",
             10,
@@ -378,14 +398,18 @@ mod tests {
             env,
         );
         assert_eq!(ns.name, "frpar-api-staging");
+        assert_eq!(ns.cluster_scope_id, "cluster-scope-frpar-k8s-01-staging");
         assert_eq!(ns.cluster, "frpar-k8s-01");
         assert_eq!(ns.site, "FRPAR");
+        assert_eq!(ns.environment, Environment::Staging);
         assert_eq!(ns.status, NamespaceStatus::Creating);
         assert_eq!(ns.network_policy, "frpar-staging-default");
         assert_eq!(ns.service_accounts, vec!["frpar-api-staging-deployer"]);
         assert!(!ns.id.is_empty());
 
         assert_eq!(req.namespace_name, "frpar-api-staging");
+        assert_eq!(req.requester, "verified-platform-engineer");
+        assert_eq!(req.cluster_scope_id, "cluster-scope-frpar-k8s-01-staging");
         assert_eq!(req.cluster, "frpar-k8s-01");
         assert_eq!(req.status, RequestStatus::Provisioned);
         assert_eq!(req.cpu_request, 10);

@@ -414,7 +414,7 @@ pub async fn summary(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
 
 /// CAS: status='Pending' → 'InProgress'. Returns Ok(None) → 409 on miss.
 pub async fn start(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     reviewer: &str,
     expected_updated_at: DateTime<Utc>,
@@ -434,16 +434,17 @@ pub async fn start(
     .bind(uid)
     .bind(reviewer)
     .bind(expected_updated_at)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Dual-CAS: (status, updated_at, next_review_due) → 'Approved'.
+/// Designated-reviewer CAS: (`InProgress`, reviewer, updated_at,
+/// next_review_due) → `Approved`.
 /// Sets last_reviewed=NOW(), next_review_due=NOW()+90days, appends justification.
 pub async fn approve(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     reviewer: &str,
     justification: &str,
@@ -463,7 +464,12 @@ pub async fn approve(
          next_review_due = NOW() + INTERVAL '90 days', \
          review_history = review_history || to_jsonb($3::text), \
          updated_at = NOW() \
-         WHERE id = $1 AND status = $4 AND updated_at = $5 AND next_review_due = $6 \
+         WHERE id = $1 \
+           AND status = 'InProgress' \
+           AND status = $4 \
+           AND reviewer = $2 \
+           AND updated_at = $5 \
+           AND next_review_due = $6 \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
@@ -472,15 +478,16 @@ pub async fn approve(
     .bind(expected_status)
     .bind(expected_updated_at)
     .bind(expected_next_review_due)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
 
-/// CAS: (status, updated_at) → 'Revoked'. Sets last_reviewed=NOW(), appends reason.
+/// Designated-reviewer CAS: (`InProgress`, reviewer, updated_at) → `Revoked`.
+/// Sets last_reviewed=NOW() and appends the reason.
 pub async fn revoke(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     reviewer: &str,
     reason: &str,
@@ -498,7 +505,11 @@ pub async fn revoke(
          last_reviewed = NOW(), \
          review_history = review_history || to_jsonb($3::text), \
          updated_at = NOW() \
-         WHERE id = $1 AND status = $4 AND updated_at = $5 \
+         WHERE id = $1 \
+           AND status = 'InProgress' \
+           AND status = $4 \
+           AND reviewer = $2 \
+           AND updated_at = $5 \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
@@ -506,17 +517,18 @@ pub async fn revoke(
     .bind(reason)
     .bind(expected_status)
     .bind(expected_updated_at)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
 
-/// Dual-CAS: (status, updated_at, next_review_due) → 'Exempted'.
+/// Designated-reviewer CAS: (`InProgress`, reviewer, updated_at,
+/// next_review_due) → `Exempted`.
 /// Sets last_reviewed=NOW(), next_review_due=$exemption_expiry, appends justification.
 #[allow(clippy::too_many_arguments)]
 pub async fn exempt(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     reviewer: &str,
     justification: &str,
@@ -537,7 +549,12 @@ pub async fn exempt(
          next_review_due = $3, \
          review_history = review_history || to_jsonb($4::text), \
          updated_at = NOW() \
-         WHERE id = $1 AND status = $5 AND updated_at = $6 AND next_review_due = $7 \
+         WHERE id = $1 \
+           AND status = 'InProgress' \
+           AND status = $5 \
+           AND reviewer = $2 \
+           AND updated_at = $6 \
+           AND next_review_due = $7 \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
@@ -547,7 +564,7 @@ pub async fn exempt(
     .bind(expected_status)
     .bind(expected_updated_at)
     .bind(expected_next_review_due)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     row.map(|r| r.into_model()).transpose()
@@ -699,8 +716,12 @@ mod access_recertification_db_tests {
             format!("NOW() - INTERVAL '{} days'", -next_review_due_offset_days)
         };
         sqlx::query(&format!(
-            "INSERT INTO access_reviews (id, review_type, target_name, owner, next_review_due, status, site, review_history) \
-             VALUES ($1, $2, 'test-target', 'test-owner', {next_due}, $3, $4, '[]'::jsonb)"
+            "INSERT INTO access_reviews \
+             (id, review_type, target_name, owner, next_review_due, status, reviewer, site, review_history) \
+             VALUES \
+             ($1, $2, 'test-target', 'test-owner', {next_due}, $3, \
+              CASE WHEN $3 = 'InProgress' THEN 'designated.reviewer' ELSE NULL END, \
+              $4, '[]'::jsonb)"
         ))
         .bind(id)
         .bind(review_type)
@@ -873,18 +894,22 @@ mod access_recertification_db_tests {
             .expect("row exists");
 
         // Success
-        let result = start(&pool, &id.to_string(), "test.reviewer", updated_at)
+        let mut tx = pool.begin().await.expect("begin start transaction");
+        let result = start(&mut tx, &id.to_string(), "test.reviewer", updated_at)
             .await
             .expect("start");
+        tx.commit().await.expect("commit start transaction");
         assert!(result.is_some(), "start should succeed");
         let (review, _) = result.unwrap();
         assert_eq!(review.status, ReviewStatus::InProgress);
         assert_eq!(review.reviewer, Some("test.reviewer".into()));
 
         // Miss: try again with same (now stale) updated_at
-        let miss = start(&pool, &id.to_string(), "other.reviewer", updated_at)
+        let mut tx = pool.begin().await.expect("begin stale start transaction");
+        let miss = start(&mut tx, &id.to_string(), "other.reviewer", updated_at)
             .await
             .expect("start miss");
+        tx.commit().await.expect("commit stale start transaction");
         assert!(miss.is_none(), "stale updated_at → Ok(None)");
 
         cleanup_review(&pool, id).await;
@@ -910,11 +935,37 @@ mod access_recertification_db_tests {
                 .unwrap()
                 .with_timezone(&Utc);
 
-        // Success
-        let result = approve(
-            &pool,
+        // A different approve-tier principal cannot claim the assigned review,
+        // even with fresh CAS fields.
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin denied approve transaction");
+        let denied = approve(
+            &mut tx,
             &id.to_string(),
-            "approver",
+            "other.reviewer",
+            "access confirmed",
+            "InProgress",
+            updated_at,
+            expected_nrd,
+        )
+        .await
+        .expect("non-designated approve is evaluated");
+        tx.commit()
+            .await
+            .expect("commit denied approve transaction");
+        assert!(
+            denied.is_none(),
+            "non-designated reviewer must miss the CAS"
+        );
+
+        // Designated-reviewer success.
+        let mut tx = pool.begin().await.expect("begin approve transaction");
+        let result = approve(
+            &mut tx,
+            &id.to_string(),
+            "designated.reviewer",
             "access confirmed",
             "InProgress",
             updated_at,
@@ -922,6 +973,7 @@ mod access_recertification_db_tests {
         )
         .await
         .expect("approve");
+        tx.commit().await.expect("commit approve transaction");
         assert!(result.is_some(), "approve should succeed");
         let (review, _) = result.unwrap();
         assert_eq!(review.status, ReviewStatus::Approved);
@@ -935,10 +987,11 @@ mod access_recertification_db_tests {
             .await
             .expect("get")
             .expect("row");
+        let mut tx = pool.begin().await.expect("begin stale approve transaction");
         let miss = approve(
-            &pool,
+            &mut tx,
             &id.to_string(),
-            "approver2",
+            "designated.reviewer",
             "justification",
             "Approved",
             new_updated_at,
@@ -946,6 +999,7 @@ mod access_recertification_db_tests {
         )
         .await
         .expect("approve miss");
+        tx.commit().await.expect("commit stale approve transaction");
         assert!(miss.is_none(), "stale next_review_due → Ok(None)");
 
         cleanup_review(&pool, id).await;
@@ -967,16 +1021,37 @@ mod access_recertification_db_tests {
             .expect("get")
             .expect("row");
 
-        let result = revoke(
-            &pool,
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin non-designated revoke transaction");
+        let denied = revoke(
+            &mut tx,
             &id.to_string(),
-            "revoker",
+            "other.reviewer",
+            "attempted reassignment",
+            "InProgress",
+            updated_at,
+        )
+        .await
+        .expect("non-designated revoke is evaluated");
+        tx.commit()
+            .await
+            .expect("commit non-designated revoke transaction");
+        assert!(denied.is_none(), "non-designated revoker must miss the CAS");
+
+        let mut tx = pool.begin().await.expect("begin revoke transaction");
+        let result = revoke(
+            &mut tx,
+            &id.to_string(),
+            "designated.reviewer",
             "access no longer needed",
             "InProgress",
             updated_at,
         )
         .await
         .expect("revoke");
+        tx.commit().await.expect("commit revoke transaction");
         assert!(result.is_some());
         let (review, _) = result.unwrap();
         assert_eq!(review.status, ReviewStatus::Revoked);
@@ -997,7 +1072,7 @@ mod access_recertification_db_tests {
         };
 
         let id = uuid::Uuid::new_v4();
-        insert_test_review(&pool, id, "LocalAdmin", "Pending", "TEST", 30).await;
+        insert_test_review(&pool, id, "LocalAdmin", "InProgress", "TEST", 30).await;
 
         let (loaded, updated_at) = get(&pool, &id.to_string())
             .await
@@ -1010,18 +1085,44 @@ mod access_recertification_db_tests {
 
         let expiry = chrono::Utc::now() + chrono::Duration::days(180);
 
-        let result = exempt(
-            &pool,
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin non-designated exemption transaction");
+        let denied = exempt(
+            &mut tx,
             &id.to_string(),
-            "exemption.reviewer",
+            "other.reviewer",
+            "attempted reassignment",
+            expiry,
+            "InProgress",
+            updated_at,
+            expected_nrd,
+        )
+        .await
+        .expect("non-designated exemption is evaluated");
+        tx.commit()
+            .await
+            .expect("commit non-designated exemption transaction");
+        assert!(
+            denied.is_none(),
+            "non-designated exemption reviewer must miss the CAS"
+        );
+
+        let mut tx = pool.begin().await.expect("begin exempt transaction");
+        let result = exempt(
+            &mut tx,
+            &id.to_string(),
+            "designated.reviewer",
             "agent migration in progress",
             expiry,
-            "Pending",
+            "InProgress",
             updated_at,
             expected_nrd,
         )
         .await
         .expect("exempt");
+        tx.commit().await.expect("commit exempt transaction");
         assert!(result.is_some());
         let (review, _) = result.unwrap();
         assert_eq!(review.status, ReviewStatus::Exempted);
@@ -1057,9 +1158,16 @@ mod access_recertification_db_tests {
             .expect("row");
 
         // start → appends nothing; approve appends justification
-        let _ = start(&pool, &id.to_string(), "rev", updated_at)
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin round-trip start transaction");
+        let _ = start(&mut tx, &id.to_string(), "rev", updated_at)
             .await
             .expect("start");
+        tx.commit()
+            .await
+            .expect("commit round-trip start transaction");
 
         let (after_start, updated_at2) = get(&pool, &id.to_string())
             .await
@@ -1069,8 +1177,12 @@ mod access_recertification_db_tests {
             .unwrap()
             .with_timezone(&Utc);
 
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin round-trip approve transaction");
         let _ = approve(
-            &pool,
+            &mut tx,
             &id.to_string(),
             "rev",
             "round-trip test justification",
@@ -1080,6 +1192,9 @@ mod access_recertification_db_tests {
         )
         .await
         .expect("approve");
+        tx.commit()
+            .await
+            .expect("commit round-trip approve transaction");
 
         let (final_review, _) = get(&pool, &id.to_string())
             .await

@@ -9,9 +9,11 @@ edition = "2021"
 
 [dependencies]
 ryuki-engine = { workspace = true }
+ryuki-protocol = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"
 tempfile = "3"
-wait-timeout = "0.2"
 libc = "0.2"
 sha2 = "0.10"
+url = "2"
+zeroize = { version = "1", features = ["derive"] }

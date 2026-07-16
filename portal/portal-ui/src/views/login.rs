@@ -55,8 +55,9 @@ pub fn LoginView() -> impl IntoView {
     // Entra ID browser SSO: the server function returns the tenant authorize
     // URL (and sets the HttpOnly CSRF-binding cookie on its response); the
     // client then performs a full-page navigation to Microsoft. The IdP
-    // redirects back to the API callback, which mints the shared
-    // `ryuki_session` cookie the session gate consumes.
+    // redirects back to the API callback, which mints the mode-selected
+    // session cookie the gate consumes (`__Host-ryuki_session` on HTTPS,
+    // unprefixed only for explicitly enabled loopback HTTP).
     let entra_action = Action::new(move |_: &()| async move {
         match get_entra_authorize_url().await {
             Ok(url) => {

@@ -20,8 +20,8 @@
 //! ordering is:
 //!
 //! 1. `!allow_live` → refuse WITHOUT planning (fail-closed, no platform contact).
-//! 2. `live_exec.plan(spec)` → `LivePlanOutcome { evidence, plan_digest }`.
-//! 3. `evaluate_live_execution(job, cp_key, allow_live, Some(&plan_digest))` —
+//! 2. `live_exec.plan(spec)` → `LivePlanOutcome { evidence, raw_plan_digest }`.
+//! 3. `evaluate_live_execution(job, cp_key, allow_live, Some(&raw_plan_digest))` —
 //!    checks allow_live, grant signature, request_id, expiry, digest match.
 //! 4. `Refused` → `build_refused_result` (apply is NEVER called).
 //! 5. `Proceed` → `live_exec.apply(spec)` → `Evidence { Applied/Failed }`.
@@ -76,18 +76,42 @@ use crate::{
     client::{ClientError, CpClient},
     executor::{Evidence, ExecError, JobExecutor},
     identity::AgentIdentity,
-    live::evaluate_live_execution,
+    live::{evaluate_execution_trust_binding, evaluate_live_execution},
     live_exec::{LiveExecError, LiveExecutor},
     outbox::{Outbox, OutboxError},
-    result::{build_refused_result, build_signed_result, ResultError},
+    result::{
+        build_refused_result, build_signed_result, build_signed_result_with_trust_profile,
+        ResultError,
+    },
 };
 use ryuki_engine::runners::RunStatus;
-use ryuki_protocol::{Job, JobLease, JobMode};
+use ryuki_protocol::{AgentHeartbeatResponse, Job, JobLease, JobMode};
 
 /// Renew well inside the control plane's lease window. A single failed fenced
 /// renewal marks the local attempt lost; it is never treated as a best-effort
 /// liveness signal.
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(60);
+/// A renewal that never returns is indistinguishable from lost lease
+/// authority. Bound every initial, periodic, and pre-mutation renewal well
+/// inside the renewal interval so the shared cancellation flag can fence the
+/// active runner before the control-plane lease window elapses.
+const LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn renew_lease_with_timeout(
+    client: &CpClient,
+    job_id: Uuid,
+    lease: &JobLease,
+    timeout_budget: Duration,
+) -> Result<AgentHeartbeatResponse, String> {
+    match tokio::time::timeout(timeout_budget, client.renew_lease(job_id, lease)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "lease renewal timed out after {} seconds",
+            timeout_budget.as_secs()
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // AgentError
@@ -126,13 +150,14 @@ struct LeaseRenewalGuard {
 
 impl LeaseRenewalGuard {
     async fn start(client: &CpClient, job_id: Uuid, lease: &JobLease) -> Result<Self, AgentError> {
-        let response = match client.renew_lease(job_id, lease).await {
-            Ok(response) => response,
-            Err(error) => {
-                warn!(job_id = %job_id, error = %error, "initial fenced lease renewal failed");
-                return Err(AgentError::LeaseLost);
-            }
-        };
+        let response =
+            match renew_lease_with_timeout(client, job_id, lease, LEASE_RENEW_TIMEOUT).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "initial fenced lease renewal failed");
+                    return Err(AgentError::LeaseLost);
+                }
+            };
         info!(
             job_id = %job_id,
             attempt_id = %lease.attempt_id,
@@ -153,7 +178,14 @@ impl LeaseRenewalGuard {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                match renewal_client.renew_lease(job_id, &renewal_lease).await {
+                match renew_lease_with_timeout(
+                    &renewal_client,
+                    job_id,
+                    &renewal_lease,
+                    LEASE_RENEW_TIMEOUT,
+                )
+                .await
+                {
                     Ok(response) => info!(
                         job_id = %job_id,
                         attempt_id = %renewal_lease.attempt_id,
@@ -192,11 +224,22 @@ impl LeaseRenewalGuard {
         }
     }
 
+    fn cancellation(&self) -> ryuki_runner::CommandCancellation {
+        cancellation_from_lease_loss(&self.lost)
+    }
+
     /// Mandatory point-in-time fence used immediately before a mutation and
     /// once more before terminal result submission.
     async fn renew_now(&self) -> Result<(), AgentError> {
         self.ensure_active()?;
-        let response = match self.client.renew_lease(self.job_id, &self.lease).await {
+        let response = match renew_lease_with_timeout(
+            &self.client,
+            self.job_id,
+            &self.lease,
+            LEASE_RENEW_TIMEOUT,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 self.lost.store(true, Ordering::SeqCst);
@@ -224,6 +267,10 @@ impl LeaseRenewalGuard {
         }
         self.ensure_active()
     }
+}
+
+fn cancellation_from_lease_loss(lost: &Arc<AtomicBool>) -> ryuki_runner::CommandCancellation {
+    ryuki_runner::CommandCancellation::from_shared_flag(Arc::clone(lost))
 }
 
 impl Drop for LeaseRenewalGuard {
@@ -278,9 +325,12 @@ pub async fn process_job(
     // background task keeps the database-clock deadline alive while the
     // synchronous runner is busy.
     let renewal = LeaseRenewalGuard::start(client, job.id, lease).await?;
+    let cancellation = renewal.cancellation();
 
     // Step 2: execute (deterministic spec rejections become Failed evidence).
-    let evidence = run_executor_blocking(|| evidence_or_deterministic_failure(executor, job))?;
+    let evidence = run_executor_blocking(|| {
+        evidence_or_deterministic_failure_with_cancellation(executor, job, &cancellation)
+    })?;
 
     // Step 3: build once. result_id is the idempotency key for the outbox.
     // OfflineDryRun is the only mode supported by the current executor.
@@ -305,11 +355,24 @@ pub async fn process_job(
 ///
 /// The rejection strings carry only spec-level data (mode, offering slug,
 /// digest hex) — no credentials exist on this pre-execution path.
+#[cfg(test)]
 fn evidence_or_deterministic_failure(
     executor: &dyn JobExecutor,
     job: &Job,
 ) -> Result<Evidence, AgentError> {
-    match executor.execute(&job.spec) {
+    evidence_or_deterministic_failure_with_cancellation(
+        executor,
+        job,
+        &ryuki_runner::CommandCancellation::new(),
+    )
+}
+
+fn evidence_or_deterministic_failure_with_cancellation(
+    executor: &dyn JobExecutor,
+    job: &Job,
+    cancellation: &ryuki_runner::CommandCancellation,
+) -> Result<Evidence, AgentError> {
+    match executor.execute_with_cancellation(&job.spec, cancellation) {
         Ok(evidence) => Ok(evidence),
         Err(err @ (ExecError::UnsupportedMode(_) | ExecError::PlanBuild(_))) => {
             warn!(
@@ -404,6 +467,7 @@ pub async fn process_job_live(
         .ack(job.id, lease.attempt_id, &lease.fencing_token)
         .await?;
     let renewal = LeaseRenewalGuard::start(client, job.id, lease).await?;
+    let cancellation = renewal.cancellation();
 
     // Build the signed result body (exactly once) and enqueue + post it.
     let body = match job.spec.mode {
@@ -471,36 +535,108 @@ pub async fn process_job_live(
                     build_refused_result(identity, agent_id, job, &reason)?
                 }
                 crate::live::LiveDecision::Proceed => {
-                    // Destroy mutates immediately. Re-prove the exact fence at
-                    // this boundary, then re-check the time-bound grant after
-                    // the awaited renewal. The renewal request itself can cross
-                    // the grant expiry boundary, so the earlier decision is not
-                    // sufficient authority for the mutation that follows.
-                    renewal.renew_now().await?;
-                    if let crate::live::LiveDecision::Refused(reason) =
-                        evaluate_live_execution(job, vk, allow_live, None)
+                    // Only a verified CP grant may trigger local executable
+                    // admission. This still precedes every backend/provider
+                    // contact and validates the actual current configuration.
+                    let trust_profile = match live_exec
+                        .execution_trust_profile(&job.spec, &job.platform)
                     {
-                        warn!(
-                            job_id = %job.id,
-                            reason = %reason,
-                            "LiveDestroy refused after lease renewal -- destroy() will NOT be called"
-                        );
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            let reason =
+                                format!("LiveDestroy execution trust profile unavailable: {error}");
+                            return renew_finish_and_post(
+                                client,
+                                outbox,
+                                job,
+                                renewal,
+                                build_refused_result(identity, agent_id, job, &reason)?,
+                            )
+                            .await;
+                        }
+                    };
+                    if let crate::live::LiveDecision::Refused(reason) =
+                        evaluate_execution_trust_binding(
+                            job,
+                            agent_id,
+                            &identity.public_key_b64(),
+                            &trust_profile,
+                        )
+                    {
                         build_refused_result(identity, agent_id, job, &reason)?
                     } else {
-                        // Gate passed — destroy the step's applied resources.
-                        // Executor errors propagate (mirroring apply's stance): a
-                        // destroy that MAY have partially mutated (e.g. timeout)
-                        // must never be reported as LiveRefused ("declined, no
-                        // mutation"); the job stays Running and the CP's teardown
-                        // lease-expiry sweep halts the rollback.
-                        let destroy_evidence =
-                            run_executor_blocking(|| live_exec.destroy(&job.spec))?;
+                        // Destroy mutates immediately. Re-prove the exact fence at
+                        // this boundary, then re-check the time-bound grant after
+                        // the awaited renewal. The renewal request itself can cross
+                        // the grant expiry boundary, so the earlier decision is not
+                        // sufficient authority for the mutation that follows.
+                        renewal.renew_now().await?;
+                        let current_profile = match live_exec
+                            .execution_trust_profile(&job.spec, &job.platform)
+                        {
+                            Ok(profile) => profile,
+                            Err(error) => {
+                                let reason = format!(
+                                    "LiveDestroy execution trust profile unavailable at mutation boundary: {error}"
+                                );
+                                return renew_finish_and_post(
+                                    client,
+                                    outbox,
+                                    job,
+                                    renewal,
+                                    build_refused_result(identity, agent_id, job, &reason)?,
+                                )
+                                .await;
+                            }
+                        };
+                        if let crate::live::LiveDecision::Refused(reason) =
+                            evaluate_live_execution(job, vk, allow_live, None)
+                        {
+                            warn!(
+                                job_id = %job.id,
+                                reason = %reason,
+                                "LiveDestroy refused after lease renewal -- destroy() will NOT be called"
+                            );
+                            build_refused_result(identity, agent_id, job, &reason)?
+                        } else if let crate::live::LiveDecision::Refused(reason) =
+                            evaluate_execution_trust_binding(
+                                job,
+                                agent_id,
+                                &identity.public_key_b64(),
+                                &current_profile,
+                            )
+                        {
+                            warn!(
+                                job_id = %job.id,
+                                reason = %reason,
+                                "LiveDestroy refused on execution-profile drift -- destroy() will NOT be called"
+                            );
+                            build_refused_result(identity, agent_id, job, &reason)?
+                        } else {
+                            // Gate passed — destroy the step's applied resources.
+                            // Executor errors propagate (mirroring apply's stance): a
+                            // destroy that MAY have partially mutated (e.g. timeout)
+                            // must never be reported as LiveRefused ("declined, no
+                            // mutation"); the job stays Running and the CP's teardown
+                            // lease-expiry sweep halts the rollback.
+                            let destroy_evidence = run_executor_blocking(|| {
+                                live_exec.destroy_with_cancellation(&job.spec, &cancellation)
+                            })?;
 
-                        // A LiveDestroy result NEVER carries approved_plan_digest
-                        // (build_signed_result and the CP verifier both reject it).
-                        // Success maps to Applied → the CP marks the step ToreDown;
-                        // Failed → the CP halts the teardown cascade.
-                        build_signed_result(identity, agent_id, job, &destroy_evidence, None)?
+                            // A LiveDestroy result NEVER carries approved_plan_digest
+                            // (build_signed_result and the CP verifier both reject it).
+                            // Success maps to Applied → the CP marks the step ToreDown;
+                            // Failed → the CP halts the teardown cascade.
+                            build_signed_result_with_trust_profile(
+                                identity,
+                                agent_id,
+                                job,
+                                &destroy_evidence,
+                                None,
+                                None,
+                                Some(current_profile),
+                            )?
+                        }
                     }
                 }
             }
@@ -526,19 +662,43 @@ pub async fn process_job_live(
                     build_refused_result(identity, agent_id, job, &reason)?
                 }
                 crate::live::LiveDecision::Proceed => {
+                    // Only an admitted live job may probe the executable or
+                    // resolve local provider credentials while minting the
+                    // complete non-secret execution identity.
+                    let trust_profile = match live_exec
+                        .execution_trust_profile(&job.spec, &job.platform)
+                    {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            let reason =
+                                format!("LivePlan execution trust profile unavailable: {error}");
+                            return renew_finish_and_post(
+                                client,
+                                outbox,
+                                job,
+                                renewal,
+                                build_refused_result(identity, agent_id, job, &reason)?,
+                            )
+                            .await;
+                        }
+                    };
                     // Gate passed — execute the plan.
                     // FAIL CLOSED: if plan() returns Err (non-clean plan), build a
                     // refusal rather than propagating a bare AgentError that would
                     // leave the job silently Running on the CP.
-                    match run_executor_blocking(|| live_exec.plan(&job.spec)) {
+                    match run_executor_blocking(|| {
+                        live_exec.plan_with_cancellation(&job.spec, &cancellation)
+                    }) {
                         Ok(plan_outcome) => {
                             // LivePlan → approved_plan_digest MUST be None.
-                            build_signed_result(
+                            build_signed_result_with_trust_profile(
                                 identity,
                                 agent_id,
                                 job,
                                 &plan_outcome.evidence,
                                 None,
+                                Some(plan_outcome.raw_plan_digest.clone()),
+                                Some(trust_profile),
                             )?
                         }
                         Err(e) => {
@@ -610,12 +770,48 @@ pub async fn process_job_live(
                 )
                 .await;
             }
+            let trust_profile = match live_exec.execution_trust_profile(&job.spec, &job.platform) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    let reason = format!("LiveApply execution trust profile unavailable: {error}");
+                    return renew_finish_and_post(
+                        client,
+                        outbox,
+                        job,
+                        renewal,
+                        build_refused_result(identity, agent_id, job, &reason)?,
+                    )
+                    .await;
+                }
+            };
+            if let crate::live::LiveDecision::Refused(reason) = evaluate_execution_trust_binding(
+                job,
+                agent_id,
+                &identity.public_key_b64(),
+                &trust_profile,
+            ) {
+                warn!(
+                    job_id = %job.id,
+                    reason = %reason,
+                    "LiveApply refused before plan on owner/profile mismatch — no provider contact"
+                );
+                return renew_finish_and_post(
+                    client,
+                    outbox,
+                    job,
+                    renewal,
+                    build_refused_result(identity, agent_id, job, &reason)?,
+                )
+                .await;
+            }
 
-            // Plan first — plan_digest will be checked by the gate.
+            // Plan first — raw_plan_digest will be checked by the gate.
             // FAIL CLOSED: if plan() returns Err (non-clean plan), build a refusal
             // rather than propagating as a bare AgentError that would leave the job
             // silently Running on the CP.  apply() is NEVER called on Err.
-            let plan_outcome = match run_executor_blocking(|| live_exec.plan(&job.spec)) {
+            let plan_outcome = match run_executor_blocking(|| {
+                live_exec.plan_with_cancellation(&job.spec, &cancellation)
+            }) {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     let reason = format!("terraform plan failed: {e}");
@@ -634,10 +830,10 @@ pub async fn process_job_live(
                     .await;
                 }
             };
-            let plan_digest = &plan_outcome.plan_digest;
+            let raw_plan_digest = &plan_outcome.raw_plan_digest;
 
             // Gate: all six checks (allow_live, grant sig, request_id, expiry, digest).
-            match evaluate_live_execution(job, vk, allow_live, Some(plan_digest.as_str())) {
+            match evaluate_live_execution(job, vk, allow_live, Some(raw_plan_digest.as_str())) {
                 crate::live::LiveDecision::Refused(reason) => {
                     warn!(
                         job_id = %job.id,
@@ -653,7 +849,30 @@ pub async fn process_job_live(
                     // after that awaited renewal because it can itself cross the
                     // signed expiry boundary.
                     renewal.renew_now().await?;
-                    match evaluate_live_execution(job, vk, allow_live, Some(plan_digest.as_str())) {
+                    let current_profile = match live_exec
+                        .execution_trust_profile(&job.spec, &job.platform)
+                    {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            let reason = format!(
+                                "LiveApply execution trust profile unavailable at mutation boundary: {error}"
+                            );
+                            return renew_finish_and_post(
+                                client,
+                                outbox,
+                                job,
+                                renewal,
+                                build_refused_result(identity, agent_id, job, &reason)?,
+                            )
+                            .await;
+                        }
+                    };
+                    match evaluate_live_execution(
+                        job,
+                        vk,
+                        allow_live,
+                        Some(raw_plan_digest.as_str()),
+                    ) {
                         crate::live::LiveDecision::Refused(reason) => {
                             warn!(
                                 job_id = %job.id,
@@ -663,11 +882,37 @@ pub async fn process_job_live(
                             build_refused_result(identity, agent_id, job, &reason)?
                         }
                         crate::live::LiveDecision::Proceed => {
+                            if let crate::live::LiveDecision::Refused(reason) =
+                                evaluate_execution_trust_binding(
+                                    job,
+                                    agent_id,
+                                    &identity.public_key_b64(),
+                                    &current_profile,
+                                )
+                            {
+                                warn!(
+                                    job_id = %job.id,
+                                    reason = %reason,
+                                    "LiveApply refused on execution-profile drift -- apply() will NOT be called"
+                                );
+                                return renew_finish_and_post(
+                                    client,
+                                    outbox,
+                                    job,
+                                    renewal,
+                                    build_refused_result(identity, agent_id, job, &reason)?,
+                                )
+                                .await;
+                            }
                             // Gate passed: apply the SAVED plan (close the TOCTOU hole).
                             // Pass the exact tfplan bytes produced by plan() so terraform
                             // applies that plan and not a fresh re-plan.
                             let apply_evidence = run_executor_blocking(|| {
-                                live_exec.apply(&job.spec, &plan_outcome.tfplan)
+                                live_exec.apply_with_cancellation(
+                                    &job.spec,
+                                    &plan_outcome.tfplan,
+                                    &cancellation,
+                                )
                             })?;
 
                             // The approved_plan_digest for the result comes from the grant
@@ -677,12 +922,14 @@ pub async fn process_job_live(
                                 .as_ref()
                                 .map(|g| g.approved_plan_digest.clone());
 
-                            build_signed_result(
+                            build_signed_result_with_trust_profile(
                                 identity,
                                 agent_id,
                                 job,
                                 &apply_evidence,
                                 approved_digest,
+                                None,
+                                Some(current_profile),
                             )?
                         }
                     }
@@ -1124,7 +1371,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        executor::StubExecutor, identity::AgentIdentity, live_exec::StubLiveExecutor,
+        executor::StubExecutor,
+        identity::AgentIdentity,
+        live_exec::{LivePlanOutcome, StubLiveExecutor},
         outbox::Outbox,
     };
     use ryuki_engine::runners::RunStatus;
@@ -1144,6 +1393,89 @@ mod tests {
             "Tokio must schedule renewal work while the synchronous executor runs"
         );
         lease_task.await.expect("lease task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unresponsive_lease_renewal_is_bounded_and_fails_closed() {
+        let job = make_leased_job();
+        let lease = job.lease.as_ref().expect("leased job");
+        let (base_url, server, _heartbeat_count) =
+            cp_stub_delaying_boundary_renewal(std::time::Duration::from_secs(2)).await;
+        let client = CpClient::new(&base_url, "test-platform", "rya_test-token");
+
+        renew_lease_with_timeout(&client, job.id, lease, std::time::Duration::from_secs(1))
+            .await
+            .expect("first renewal is immediate");
+
+        let started = std::time::Instant::now();
+        let error =
+            renew_lease_with_timeout(&client, job.id, lease, std::time::Duration::from_millis(50))
+                .await
+                .expect_err("an unresponsive renewal must lose authority");
+        server.abort();
+
+        assert!(error.contains("timed out"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "renewal timeout must be observed promptly"
+        );
+    }
+
+    struct LeaseAwareBlockingExecutor {
+        started: Arc<std::sync::Barrier>,
+    }
+
+    impl JobExecutor for LeaseAwareBlockingExecutor {
+        fn execute(&self, _spec: &JobSpec) -> Result<Evidence, ExecError> {
+            panic!("lease-aware path must call execute_with_cancellation")
+        }
+
+        fn execute_with_cancellation(
+            &self,
+            _spec: &JobSpec,
+            cancellation: &ryuki_runner::CommandCancellation,
+        ) -> Result<Evidence, ExecError> {
+            self.started.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !cancellation.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !cancellation.is_cancelled() {
+                return Err(ExecError::PlanBuild(
+                    "lease-loss cancellation was not observed".to_string(),
+                ));
+            }
+            Err(ExecError::Runner(
+                ryuki_engine::runners::RunnerError::Cancelled,
+            ))
+        }
+    }
+
+    #[test]
+    fn authoritative_lease_loss_cancels_an_active_job_executor() {
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = cancellation_from_lease_loss(&lost);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let executor = LeaseAwareBlockingExecutor {
+            started: Arc::clone(&started),
+        };
+        let job = make_leased_job();
+        let worker = std::thread::spawn(move || {
+            evidence_or_deterministic_failure_with_cancellation(&executor, &job, &cancellation)
+        });
+
+        started.wait();
+        let cancelled_at = std::time::Instant::now();
+        lost.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = worker
+            .join()
+            .expect("executor thread must not panic")
+            .expect_err("lease loss must cancel active execution");
+        assert!(matches!(error, AgentError::Exec(ExecError::Runner(_))));
+        assert!(
+            cancelled_at.elapsed() < std::time::Duration::from_secs(1),
+            "lease-loss cancellation must return promptly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1230,6 +1562,7 @@ mod tests {
 
         let unsigned = SignedEnvelope {
             agent_id: "test-agent".to_string(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "test".to_string(),
             job_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
@@ -1240,6 +1573,8 @@ mod tests {
             status: JobResultStatus::CheckOk,
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
+            raw_plan_digest: None,
+            execution_trust_profile: None,
             evidence_digest: evidence_digest.clone(),
             redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
@@ -1253,6 +1588,7 @@ mod tests {
             attempt_id: signed.attempt_id,
             result_id: signed.result_id,
             status: signed.status.clone(),
+            raw_plan_digest: signed.raw_plan_digest.clone(),
             evidence_digest: signed.evidence_digest.clone(),
             signed_envelope: signed,
         };
@@ -1450,18 +1786,50 @@ mod tests {
         (sk, vk)
     }
 
+    fn exact_test_execution_authority(
+        live_exec: &dyn LiveExecutor,
+        identity: &AgentIdentity,
+        agent_id: &str,
+        job: &Job,
+    ) -> ryuki_protocol::LiveExecutionAuthority {
+        let profile = live_exec
+            .execution_trust_profile(&job.spec, &job.platform)
+            .expect("stub execution trust profile");
+        ryuki_protocol::LiveExecutionAuthority {
+            assigned_agent_id: agent_id.to_string(),
+            assigned_agent_enrollment_id: job.agent_enrollment_id,
+            assigned_agent_key_fingerprint: ryuki_protocol::public_key_fingerprint(
+                &identity.public_key_b64(),
+            ),
+            execution_trust_profile_digest: ryuki_protocol::execution_trust_profile_digest(
+                &profile,
+            ),
+        }
+    }
+
+    fn unrelated_test_execution_authority() -> ryuki_protocol::LiveExecutionAuthority {
+        ryuki_protocol::LiveExecutionAuthority {
+            assigned_agent_id: "unrelated-test-agent".to_string(),
+            assigned_agent_enrollment_id: Uuid::nil(),
+            assigned_agent_key_fingerprint: "sha256:test-only-unrelated".to_string(),
+            execution_trust_profile_digest: sha256_hex(b"unrelated-test-profile"),
+        }
+    }
+
     /// Build a valid signed grant for `request_id` using `cp_sk`.
     fn make_grant(
         cp_sk: &ed25519_dalek::SigningKey,
         request_id: Uuid,
         approved_plan_digest: &str,
         spec: &JobSpec,
+        execution_authority: ryuki_protocol::LiveExecutionAuthority,
     ) -> VerifiedLiveContext {
         make_grant_expiring_at(
             cp_sk,
             request_id,
             approved_plan_digest,
             spec,
+            execution_authority,
             Utc::now() + Duration::hours(1),
         )
     }
@@ -1471,15 +1839,20 @@ mod tests {
         request_id: Uuid,
         approved_plan_digest: &str,
         spec: &JobSpec,
+        execution_authority: ryuki_protocol::LiveExecutionAuthority,
         expiry: chrono::DateTime<Utc>,
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-test".to_owned(),
             expiry,
             step_job_id: None,
+            execution_authority,
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -1489,7 +1862,11 @@ mod tests {
     /// renewal and is deliberately delayed past the supplied grant expiry.
     async fn cp_stub_delaying_boundary_renewal(
         delay: std::time::Duration,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1498,12 +1875,13 @@ mod tests {
             .expect("bind CP stub");
         let address = listener.local_addr().expect("CP stub address");
         let heartbeat_count = Arc::new(AtomicUsize::new(0));
+        let server_heartbeat_count = Arc::clone(&heartbeat_count);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let heartbeat_count = Arc::clone(&heartbeat_count);
+                let heartbeat_count = Arc::clone(&server_heartbeat_count);
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1563,7 +1941,7 @@ mod tests {
                 });
             }
         });
-        (format!("http://{address}"), task)
+        (format!("http://{address}"), task, heartbeat_count)
     }
 
     fn make_leased_job_mode(mode: JobMode) -> Job {
@@ -1585,6 +1963,7 @@ mod tests {
         };
         Job {
             id: Uuid::new_v4(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "test-platform".to_string(),
             spec,
             status: JobStatus::Running,
@@ -1606,6 +1985,71 @@ mod tests {
         StubLiveExecutor::with_plan(plan_bytes, apply_status)
     }
 
+    #[derive(Clone, Copy)]
+    enum ProfileDrift {
+        BackendLocation,
+        CredentialRevision,
+        ProviderDestinationSet,
+    }
+
+    /// Returns the approved profile on the first execution check and a
+    /// same-agent authority drift on the mutation-boundary recomputation.
+    struct BoundaryDriftExecutor {
+        inner: StubLiveExecutor,
+        drift: ProfileDrift,
+        profile_calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl BoundaryDriftExecutor {
+        fn new(plan_bytes: &'static [u8], drift: ProfileDrift) -> Self {
+            Self {
+                inner: stub_live(plan_bytes, RunStatus::Applied),
+                drift,
+                profile_calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl LiveExecutor for BoundaryDriftExecutor {
+        fn execution_trust_profile(
+            &self,
+            spec: &JobSpec,
+            platform: &str,
+        ) -> Result<ryuki_protocol::ExecutionTrustProfile, LiveExecError> {
+            let mut profile = self.inner.execution_trust_profile(spec, platform)?;
+            let call = self
+                .profile_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call > 0 {
+                match self.drift {
+                    ProfileDrift::BackendLocation => {
+                        profile.backend_authority_digest =
+                            sha256_hex(b"same-kind-different-backend-authority");
+                    }
+                    ProfileDrift::CredentialRevision => {
+                        profile.backend_credential_authority_revision = "v2".to_string();
+                    }
+                    ProfileDrift::ProviderDestinationSet => {
+                        profile.provider_authority_version = "v2".to_string();
+                    }
+                }
+            }
+            Ok(profile)
+        }
+
+        fn plan(&self, spec: &JobSpec) -> Result<LivePlanOutcome, LiveExecError> {
+            self.inner.plan(spec)
+        }
+
+        fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError> {
+            self.inner.apply(spec, tfplan)
+        }
+
+        fn destroy(&self, spec: &JobSpec) -> Result<Evidence, LiveExecError> {
+            self.inner.destroy(spec)
+        }
+    }
+
     // Helper: build a LiveApply job with a valid grant signed by cp_sk, where
     // the grant's approved_plan_digest matches the stub's plan_digest.
     fn make_live_apply_job_with_grant(cp_sk: &ed25519_dalek::SigningKey, plan_bytes: &[u8]) -> Job {
@@ -1621,7 +2065,13 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
-        let grant = make_grant(cp_sk, request_id, &plan_digest, &spec);
+        let grant = make_grant(
+            cp_sk,
+            request_id,
+            &plan_digest,
+            &spec,
+            unrelated_test_execution_authority(),
+        );
         let lease = JobLease {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
@@ -1631,6 +2081,7 @@ mod tests {
         };
         Job {
             id: Uuid::new_v4(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "test-platform".to_string(),
             spec,
             status: JobStatus::Running,
@@ -1644,19 +2095,24 @@ mod tests {
         let (cp_sk, vk) = cp_keypair();
         const PLAN_BYTES: &[u8] = b"plan-for-expiry-boundary";
         let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+        let identity = AgentIdentity::generate();
+        let agent_id = "test-platform";
         let mut job = make_live_apply_job_with_grant(&cp_sk, PLAN_BYTES);
+        job.agent_enrollment_id = Uuid::new_v4();
+        let execution_authority =
+            exact_test_execution_authority(&live_exec, &identity, agent_id, &job);
         job.live_context = Some(make_grant_expiring_at(
             &cp_sk,
             job.spec.request_id,
             &sha256_hex(PLAN_BYTES),
             &job.spec,
+            execution_authority,
             Utc::now() + Duration::seconds(2),
         ));
 
-        let (base_url, server) =
+        let (base_url, server, heartbeat_count) =
             cp_stub_delaying_boundary_renewal(std::time::Duration::from_millis(2200)).await;
-        let client = CpClient::new(&base_url, "test-platform", "rya_test-token");
-        let identity = AgentIdentity::generate();
+        let client = CpClient::new(&base_url, agent_id, "rya_test-token");
         let dir = tempfile::TempDir::new().expect("tempdir");
         let outbox = Outbox::new(dir.path());
 
@@ -1664,7 +2120,7 @@ mod tests {
             &client,
             &live_exec,
             &identity,
-            "test-platform",
+            agent_id,
             &outbox,
             &job,
             Some(&vk),
@@ -1679,11 +2135,81 @@ mod tests {
             1,
             "the approved plan is rebuilt"
         );
+        assert!(
+            heartbeat_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the initial and post-plan boundary renewals must both reach the CP"
+        );
         assert_eq!(
             live_exec.apply_call_count(),
             0,
             "apply must not start after the grant expires during renewal"
         );
+    }
+
+    async fn assert_live_apply_boundary_profile_drift(drift: ProfileDrift) {
+        let (cp_sk, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"plan-for-authority-drift-boundary";
+        let live_exec = BoundaryDriftExecutor::new(PLAN_BYTES, drift);
+        let identity = AgentIdentity::generate();
+        let agent_id = "test-platform";
+        let mut job = make_live_apply_job_with_grant(&cp_sk, PLAN_BYTES);
+        job.agent_enrollment_id = Uuid::new_v4();
+        let authority = exact_test_execution_authority(&live_exec.inner, &identity, agent_id, &job);
+        job.live_context = Some(make_grant(
+            &cp_sk,
+            job.spec.request_id,
+            &sha256_hex(PLAN_BYTES),
+            &job.spec,
+            authority,
+        ));
+
+        let (base_url, server, heartbeat_count) =
+            cp_stub_delaying_boundary_renewal(std::time::Duration::ZERO).await;
+        let client = CpClient::new(&base_url, agent_id, "rya_test-token");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        process_job_live(
+            &client,
+            &live_exec,
+            &identity,
+            agent_id,
+            &outbox,
+            &job,
+            Some(&vk),
+            true,
+        )
+        .await
+        .expect("authority drift must be reported as a refusal");
+        server.abort();
+
+        assert_eq!(
+            live_exec
+                .profile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "profile must be recomputed before contact and at the apply boundary"
+        );
+        assert_eq!(live_exec.inner.plan_call_count(), 1);
+        assert_eq!(live_exec.inner.apply_call_count(), 0);
+        assert!(
+            heartbeat_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the boundary renewal must complete before drift is refused"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_apply_refuses_same_kind_backend_authority_drift_at_boundary() {
+        assert_live_apply_boundary_profile_drift(ProfileDrift::BackendLocation).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_apply_refuses_backend_credential_authority_revision_drift_at_boundary() {
+        assert_live_apply_boundary_profile_drift(ProfileDrift::CredentialRevision).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_apply_refuses_provider_destination_set_drift_at_boundary() {
+        assert_live_apply_boundary_profile_drift(ProfileDrift::ProviderDestinationSet).await;
     }
 
     // -----------------------------------------------------------------------
@@ -1707,7 +2233,7 @@ mod tests {
         let body = {
             // Simulate just the gate + build step without async HTTP.
             let plan_outcome = live_exec.plan(&job.spec).expect("plan");
-            let plan_digest = &plan_outcome.plan_digest;
+            let plan_digest = &plan_outcome.raw_plan_digest;
 
             // Gate check — must Proceed.
             let decision = evaluate_live_execution(&job, &vk, true, Some(plan_digest.as_str()));
@@ -1781,7 +2307,13 @@ mod tests {
         let wrong_request_id = Uuid::new_v4();
         let plan_digest = sha256_hex(PLAN_BYTES);
         let mut job = make_leased_job_mode(JobMode::LiveApply);
-        let bad_grant = make_grant(&cp_sk, wrong_request_id, &plan_digest, &job.spec);
+        let bad_grant = make_grant(
+            &cp_sk,
+            wrong_request_id,
+            &plan_digest,
+            &job.spec,
+            unrelated_test_execution_authority(),
+        );
         job.live_context = Some(bad_grant);
         // job.spec.request_id is a different Uuid → grant.request_id mismatch.
 
@@ -1829,7 +2361,13 @@ mod tests {
             state_key: Some(format!("request-{request_id}")),
             mode: JobMode::LiveApply,
         };
-        let grant = make_grant(&cp_sk, request_id, &wrong_digest, &spec);
+        let grant = make_grant(
+            &cp_sk,
+            request_id,
+            &wrong_digest,
+            &spec,
+            unrelated_test_execution_authority(),
+        );
         let lease = JobLease {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
@@ -1839,6 +2377,7 @@ mod tests {
         };
         let job = Job {
             id: Uuid::new_v4(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "test-platform".to_string(),
             spec,
             status: JobStatus::Running,
@@ -1849,7 +2388,7 @@ mod tests {
 
         // Plan → digest is sha256(PLAN_BYTES), NOT wrong_digest.
         let plan_outcome = live_exec.plan(&job.spec).expect("plan");
-        let replanned_digest = &plan_outcome.plan_digest;
+        let replanned_digest = &plan_outcome.raw_plan_digest;
 
         let decision = evaluate_live_execution(&job, &vk, true, Some(replanned_digest.as_str()));
         assert_eq!(
@@ -1897,11 +2436,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // LivePlan allow_live=true → plan IS called, Planned result, no digest
+    // LivePlan allow_live=true → plan IS called and its raw digest is signed
     // -----------------------------------------------------------------------
 
     #[test]
-    fn live_plan_allow_live_true_plan_called_no_digest() {
+    fn live_plan_allow_live_true_plan_called_with_raw_digest() {
         let (_, vk) = cp_keypair();
         const PLAN_BYTES: &[u8] = b"live-plan-canonical-output";
         let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
@@ -1925,13 +2464,19 @@ mod tests {
             "apply NOT called for LivePlan"
         );
 
-        // Build result — approved_plan_digest MUST be None.
-        let body = crate::result::build_signed_result(
+        // Build result — approved_plan_digest is absent, while the raw-plan
+        // commitment and exact execution profile are signed for review.
+        let trust_profile = live_exec
+            .execution_trust_profile(&job.spec, &job.platform)
+            .expect("stub execution trust profile");
+        let body = crate::result::build_signed_result_with_trust_profile(
             &identity,
             "test-agent",
             &job,
             &plan_outcome.evidence,
             None,
+            Some(plan_outcome.raw_plan_digest.clone()),
+            Some(trust_profile),
         )
         .expect("build");
 
@@ -1946,6 +2491,11 @@ mod tests {
                 .approved_plan_digest
                 .is_none(),
             "LivePlan must NOT carry approved_plan_digest"
+        );
+        assert_eq!(
+            body.job_result.signed_envelope.raw_plan_digest,
+            Some(plan_outcome.raw_plan_digest),
+            "LivePlan must carry the canonical raw-plan commitment"
         );
     }
 
@@ -2036,7 +2586,7 @@ mod tests {
 
         // Gate must Proceed.
         let decision =
-            evaluate_live_execution(&job, &vk, true, Some(plan_outcome.plan_digest.as_str()));
+            evaluate_live_execution(&job, &vk, true, Some(plan_outcome.raw_plan_digest.as_str()));
         assert_eq!(decision, crate::live::LiveDecision::Proceed);
 
         // apply() receives exactly the tfplan bytes from plan_outcome.
@@ -2130,12 +2680,14 @@ mod tests {
         request_id: Uuid,
         step_job_id: Uuid,
         spec: &JobSpec,
+        execution_authority: ryuki_protocol::LiveExecutionAuthority,
     ) -> VerifiedLiveContext {
         make_step_grant_expiring_at(
             cp_sk,
             request_id,
             step_job_id,
             spec,
+            execution_authority,
             Utc::now() + Duration::hours(1),
         )
     }
@@ -2145,17 +2697,22 @@ mod tests {
         request_id: Uuid,
         step_job_id: Uuid,
         spec: &JobSpec,
+        execution_authority: ryuki_protocol::LiveExecutionAuthority,
         expiry: chrono::DateTime<Utc>,
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "test-platform".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             // The digest of the plan the step APPLIED — present in the grant but
             // deliberately unchecked by the destroy gate (no plan-then-apply).
             approved_plan_digest: sha256_hex(b"the-applied-plan"),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-test".to_owned(),
             expiry,
             step_job_id: Some(step_job_id),
+            execution_authority,
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -2174,7 +2731,13 @@ mod tests {
             state_key: Some(format!("step-{request_id}")),
             mode: JobMode::LiveDestroy,
         };
-        let grant = make_step_grant(cp_sk, request_id, job_id, &spec);
+        let grant = make_step_grant(
+            cp_sk,
+            request_id,
+            job_id,
+            &spec,
+            unrelated_test_execution_authority(),
+        );
         let lease = JobLease {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
@@ -2184,6 +2747,7 @@ mod tests {
         };
         Job {
             id: job_id,
+            agent_enrollment_id: Uuid::nil(),
             platform: "test-platform".to_string(),
             spec,
             status: JobStatus::Running,
@@ -2196,19 +2760,24 @@ mod tests {
     async fn live_destroy_rechecks_grant_after_boundary_renewal() {
         let (cp_sk, vk) = cp_keypair();
         let live_exec = stub_live(b"unused-plan", RunStatus::Applied);
+        let identity = AgentIdentity::generate();
+        let agent_id = "test-platform";
         let mut job = make_live_destroy_job_with_step_grant(&cp_sk);
+        job.agent_enrollment_id = Uuid::new_v4();
+        let execution_authority =
+            exact_test_execution_authority(&live_exec, &identity, agent_id, &job);
         job.live_context = Some(make_step_grant_expiring_at(
             &cp_sk,
             job.spec.request_id,
             job.id,
             &job.spec,
+            execution_authority,
             Utc::now() + Duration::seconds(2),
         ));
 
-        let (base_url, server) =
+        let (base_url, server, heartbeat_count) =
             cp_stub_delaying_boundary_renewal(std::time::Duration::from_millis(2200)).await;
-        let client = CpClient::new(&base_url, "test-platform", "rya_test-token");
-        let identity = AgentIdentity::generate();
+        let client = CpClient::new(&base_url, agent_id, "rya_test-token");
         let dir = tempfile::TempDir::new().expect("tempdir");
         let outbox = Outbox::new(dir.path());
 
@@ -2216,7 +2785,7 @@ mod tests {
             &client,
             &live_exec,
             &identity,
-            "test-platform",
+            agent_id,
             &outbox,
             &job,
             Some(&vk),
@@ -2226,11 +2795,79 @@ mod tests {
         .expect("expired-at-boundary destroy must be reported as a refusal");
 
         server.abort();
+        assert!(
+            heartbeat_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the initial and pre-destroy boundary renewals must both reach the CP"
+        );
         assert_eq!(
             live_exec.destroy_call_count(),
             0,
             "destroy must not start after the grant expires during renewal"
         );
+    }
+
+    async fn assert_live_destroy_boundary_profile_drift(drift: ProfileDrift) {
+        let (cp_sk, vk) = cp_keypair();
+        let live_exec = BoundaryDriftExecutor::new(b"unused-destroy-plan", drift);
+        let identity = AgentIdentity::generate();
+        let agent_id = "test-platform";
+        let mut job = make_live_destroy_job_with_step_grant(&cp_sk);
+        job.agent_enrollment_id = Uuid::new_v4();
+        let authority = exact_test_execution_authority(&live_exec.inner, &identity, agent_id, &job);
+        job.live_context = Some(make_step_grant(
+            &cp_sk,
+            job.spec.request_id,
+            job.id,
+            &job.spec,
+            authority,
+        ));
+
+        let (base_url, server, heartbeat_count) =
+            cp_stub_delaying_boundary_renewal(std::time::Duration::ZERO).await;
+        let client = CpClient::new(&base_url, agent_id, "rya_test-token");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        process_job_live(
+            &client,
+            &live_exec,
+            &identity,
+            agent_id,
+            &outbox,
+            &job,
+            Some(&vk),
+            true,
+        )
+        .await
+        .expect("destroy authority drift must be reported as a refusal");
+        server.abort();
+
+        assert_eq!(
+            live_exec
+                .profile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "profile must be recomputed before contact and at the destroy boundary"
+        );
+        assert_eq!(live_exec.inner.destroy_call_count(), 0);
+        assert!(
+            heartbeat_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the pre-destroy boundary renewal must complete before drift is refused"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_destroy_refuses_same_kind_backend_authority_drift_at_boundary() {
+        assert_live_destroy_boundary_profile_drift(ProfileDrift::BackendLocation).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_destroy_refuses_backend_credential_authority_revision_drift_at_boundary() {
+        assert_live_destroy_boundary_profile_drift(ProfileDrift::CredentialRevision).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_destroy_refuses_provider_destination_set_drift_at_boundary() {
+        assert_live_destroy_boundary_profile_drift(ProfileDrift::ProviderDestinationSet).await;
     }
 
     // -----------------------------------------------------------------------
@@ -2303,6 +2940,7 @@ mod tests {
             job.spec.request_id,
             &sha256_hex(b"the-applied-plan"),
             &job.spec,
+            unrelated_test_execution_authority(),
         ));
 
         let decision = evaluate_live_execution(&job, &vk, true, None);

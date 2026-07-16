@@ -11,6 +11,8 @@ const DOC_README_PATH: &str = "docs/workflows/README.md";
 const DOC_PATH: &str = "docs/workflows/platform-database-readiness.md";
 const CNPG_CLUSTER_PATH: &str = "deploy/kubernetes/cloudnativepg/cnpg-cluster.yaml";
 const ENDPOINT: &str = "/api/platform/database-readiness-contract";
+const CNPG_SERVER_DNS_NAME: &str = "ryuki-platform-db-rw.ryuki-platform.svc";
+const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
 const REQUIRED_CNPG_CLUSTER_KEYS: &[&str] = &["apiVersion", "kind", "metadata", "spec"];
 const REQUIRED_CNPG_SPEC_KEYS: &[&str] = &[
     "instances",
@@ -33,14 +35,16 @@ const CNPG_SAFE_VALUES: &[&str] = &[
     "vsphere-csi",
     "10Gi",
     "5Gi",
-    "ryuki-platform-app",
-    "managed",
-    "ryuki-platform-db-app-user",
+    "ryuki_app_runtime",
+    "ryuki_schema_migrator",
+    "present",
     "unsupervised",
     "switchover",
     "s3://placeholder-bucket/",
     "https://placeholder-s3-endpoint.invalid",
     "ryuki-platform-db-backup-s3",
+    "ryuki-platform-db-rw.ryuki-platform.svc",
+    "ryuki-platform-db-ca",
     "access_key_id",
     "secret_access_key",
     "256MB",
@@ -63,11 +67,76 @@ const CNPG_SAFE_FIELDS: &[&str] = &[
     "accessKeyId",
     "secretAccessKey",
     "passwordSecret",
+    "postInitApplicationSQL",
+    "roles",
+    "ensure",
+    "login",
+    "superuser",
+    "createdb",
+    "createrole",
+    "inherit",
+    "replication",
+    "bypassrls",
+    "disablePassword",
     "secret",
     "name",
     "key",
+    "annotations",
+    "ryuki.io/required-server-dns-san",
+    "ryuki.io/client-ca-secret",
 ];
 const CNPG_SAFE_VALUE_TERMS: &[&str] = &["placeholder-s3-endpoint", "placeholder-bucket"];
+const EXPECTED_CNPG_POST_INIT_SQL: &[&str] = &[
+    r#"DO $roles$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'ryuki_app_runtime'
+  ) THEN
+    CREATE ROLE ryuki_app_runtime NOLOGIN NOSUPERUSER NOCREATEDB
+      NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'ryuki_schema_migrator'
+  ) THEN
+    CREATE ROLE ryuki_schema_migrator NOLOGIN NOSUPERUSER NOCREATEDB
+      NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END
+$roles$;"#,
+    "ALTER ROLE ryuki_app_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL",
+    "ALTER ROLE ryuki_schema_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL",
+    "ALTER SCHEMA public OWNER TO ryuki_schema_migrator",
+    "ALTER ROLE ryuki_platform NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL",
+    r#"DO $databases$
+DECLARE
+  target_database name;
+BEGIN
+  FOR target_database IN
+    SELECT datname
+    FROM pg_database
+    WHERE datallowconn
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE %I FROM PUBLIC, ryuki_app_runtime, ryuki_schema_migrator',
+      target_database
+    );
+  END LOOP;
+END
+$databases$;"#,
+    "GRANT CONNECT ON DATABASE ryuki_platform TO ryuki_app_runtime, ryuki_schema_migrator",
+    "REVOKE ALL ON SCHEMA public FROM PUBLIC",
+    "GRANT USAGE ON SCHEMA public TO ryuki_app_runtime, ryuki_schema_migrator",
+    "GRANT CREATE ON SCHEMA public TO ryuki_schema_migrator",
+    r#"ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES
+FROM PUBLIC, ryuki_app_runtime"#,
+    r#"ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+IN SCHEMA public REVOKE ALL PRIVILEGES ON SEQUENCES
+FROM PUBLIC, ryuki_app_runtime"#,
+    r#"ALTER DEFAULT PRIVILEGES FOR ROLE ryuki_schema_migrator
+IN SCHEMA public REVOKE ALL PRIVILEGES ON FUNCTIONS
+FROM PUBLIC, ryuki_app_runtime"#,
+];
 const REQUIRED_SURFACES: &[&str] = &[
     "cnpg-operator-readiness",
     "postgres-cluster-topology",
@@ -292,36 +361,31 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-database-or-kubernetes-actions",
         decision: "block",
-        requirement:
-            "Platform database readiness reports static readiness only and never applies Kubernetes manifests, creates CloudNativePG clusters, mutates databases, runs schema migrations, executes backups, executes restores, accesses object storage, or changes provider state.",
+        requirement: "Platform database readiness reports static readiness only and never applies Kubernetes manifests, creates CloudNativePG clusters, mutates databases, runs schema migrations, executes backups, executes restores, accesses object storage, or changes provider state.",
         evidence: "Database readiness summary",
     },
     RuleDetail {
         id: "ha-topology-and-storage-required",
         decision: "block",
-        requirement:
-            "Three-instance topology, storage class, anti-affinity posture, and maintenance behavior must be reviewed before production database readiness can be accepted.",
+        requirement: "Three-instance topology, storage class, anti-affinity posture, and maintenance behavior must be reviewed before production database readiness can be accepted.",
         evidence: "Cluster topology review",
     },
     RuleDetail {
         id: "backup-restore-monitoring-required",
         decision: "block",
-        requirement:
-            "WAL archive, object backup, restore test, monitoring, and evidence readiness must be reviewed before database readiness can be accepted.",
+        requirement: "WAL archive, object backup, restore test, monitoring, and evidence readiness must be reviewed before database readiness can be accepted.",
         evidence: "Restore test review",
     },
     RuleDetail {
         id: "secret-and-network-boundary-required",
         decision: "block",
-        requirement:
-            "Vault secret references and network policy posture must be reviewed before workloads can use the database.",
+        requirement: "Vault secret references and network policy posture must be reviewed before workloads can use the database.",
         evidence: "Secret reference review",
     },
     RuleDetail {
         id: "raw-database-data-not-exposed",
         decision: "block",
-        requirement:
-            "Database readiness evidence must use safe summaries only and must not expose database names, usernames, credential values, connection strings, endpoints, private IPs, raw database rows, raw Kubernetes payloads, raw backup payloads, object-storage payloads, tokens, or provider payloads.",
+        requirement: "Database readiness evidence must use safe summaries only and must not expose database names, usernames, credential values, connection strings, endpoints, private IPs, raw database rows, raw Kubernetes payloads, raw backup payloads, object-storage payloads, tokens, or provider payloads.",
         evidence: "Evidence references",
     },
 ];
@@ -2274,6 +2338,19 @@ fn validate_cnpg_cluster_text(text: &str, errors: &mut Vec<String>) {
             "{CNPG_CLUSTER_PATH} apiVersion must be postgresql.cnpg.io/v1, got {api}"
         ));
     }
+    let required_server_dns_san = value
+        .pointer("/metadata/annotations/ryuki.io~1required-server-dns-san")
+        .and_then(Value::as_str);
+    let client_ca_secret = value
+        .pointer("/metadata/annotations/ryuki.io~1client-ca-secret")
+        .and_then(Value::as_str);
+    if required_server_dns_san != Some(CNPG_SERVER_DNS_NAME)
+        || client_ca_secret != Some(CNPG_CA_SECRET_NAME)
+    {
+        errors.push(format!(
+            "{CNPG_CLUSTER_PATH} must require server DNS SAN {CNPG_SERVER_DNS_NAME} and client CA Secret {CNPG_CA_SECRET_NAME}"
+        ));
+    }
     if let Some(instances) = spec.get("instances").and_then(Value::as_u64) {
         if instances < 3 {
             errors.push(format!(
@@ -2316,12 +2393,94 @@ fn validate_cnpg_cluster_text(text: &str, errors: &mut Vec<String>) {
             "{CNPG_CLUSTER_PATH} missing required field spec.managed"
         ));
     }
+    let post_init_sql = spec
+        .pointer("/bootstrap/initdb/postInitApplicationSQL")
+        .and_then(Value::as_array);
+    validate_cnpg_bootstrap_sql(post_init_sql.map(Vec::as_slice), errors);
+
+    let roles = spec
+        .pointer("/managed/roles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for role_name in ["ryuki_app_runtime", "ryuki_schema_migrator"] {
+        let role = roles
+            .iter()
+            .find(|role| role.get("name").and_then(Value::as_str) == Some(role_name));
+        let valid = role.is_some_and(|role| managed_role_is_exact(role, role_name));
+        if !valid {
+            errors.push(format!(
+                "{CNPG_CLUSTER_PATH} managed role {role_name} must be a present NOLOGIN, passwordless, non-privileged group role"
+            ));
+        }
+    }
+    if roles.len() != 2 {
+        errors.push(format!(
+            "{CNPG_CLUSTER_PATH} must manage exactly the application and migration group roles"
+        ));
+    }
     if spec.get("backup").is_none() {
         errors.push(format!(
             "{CNPG_CLUSTER_PATH} missing required field spec.backup"
         ));
     }
     scan_cnpg_value(&value, CNPG_CLUSTER_PATH, errors);
+}
+
+fn managed_role_is_exact(role: &Value, role_name: &str) -> bool {
+    role.as_object().is_some_and(|fields| fields.len() == 10)
+        && role.get("name").and_then(Value::as_str) == Some(role_name)
+        && role.get("ensure").and_then(Value::as_str) == Some("present")
+        && role.get("login").and_then(Value::as_bool) == Some(false)
+        && role.get("superuser").and_then(Value::as_bool) == Some(false)
+        && role.get("createdb").and_then(Value::as_bool) == Some(false)
+        && role.get("createrole").and_then(Value::as_bool) == Some(false)
+        && role.get("inherit").and_then(Value::as_bool) == Some(true)
+        && role.get("replication").and_then(Value::as_bool) == Some(false)
+        && role.get("bypassrls").and_then(Value::as_bool) == Some(false)
+        && role.get("disablePassword").and_then(Value::as_bool) == Some(true)
+}
+
+fn normalize_sql_statement(statement: &str) -> String {
+    statement.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn validate_cnpg_bootstrap_sql(statements: Option<&[Value]>, errors: &mut Vec<String>) {
+    let Some(statements) = statements else {
+        errors.push(format!(
+            "{CNPG_CLUSTER_PATH} postInitApplicationSQL must contain the exact closed bootstrap role/grant program"
+        ));
+        return;
+    };
+
+    if statements.len() != EXPECTED_CNPG_POST_INIT_SQL.len() {
+        errors.push(format!(
+            "{CNPG_CLUSTER_PATH} postInitApplicationSQL must contain exactly {} ordered statements; found {}",
+            EXPECTED_CNPG_POST_INIT_SQL.len(),
+            statements.len()
+        ));
+        return;
+    }
+
+    for (index, (actual, expected)) in statements
+        .iter()
+        .zip(EXPECTED_CNPG_POST_INIT_SQL)
+        .enumerate()
+    {
+        let Some(actual) = actual.as_str() else {
+            errors.push(format!(
+                "{CNPG_CLUSTER_PATH} postInitApplicationSQL statement {} must be a literal SQL string",
+                index + 1
+            ));
+            continue;
+        };
+        if normalize_sql_statement(actual) != normalize_sql_statement(expected) {
+            errors.push(format!(
+                "{CNPG_CLUSTER_PATH} postInitApplicationSQL statement {} differs from the exact least-privilege bootstrap model",
+                index + 1
+            ));
+        }
+    }
 }
 
 fn scan_cnpg_value(value: &Value, path: &str, errors: &mut Vec<String>) {
@@ -2346,6 +2505,19 @@ fn scan_cnpg_value(value: &Value, path: &str, errors: &mut Vec<String>) {
             }
         }
         Value::String(text) => {
+            // The exact ordered bootstrap program is validated separately.
+            // Those known SQL literals intentionally contain PostgreSQL role
+            // attributes such as `PASSWORD NULL`; do not misclassify the
+            // password-removal syntax as embedded credential material.
+            let exact_bootstrap_statement = path
+                .contains(".spec.bootstrap.initdb.postInitApplicationSQL[")
+                && EXPECTED_CNPG_POST_INIT_SQL.iter().any(|expected| {
+                    normalize_sql_statement(text) == normalize_sql_statement(expected)
+                });
+            if exact_bootstrap_statement {
+                return;
+            }
+
             // Placeholder Barman object-store URLs (s3://placeholder-bucket/,
             // https://placeholder-s3-endpoint.invalid) are part of the static
             // CNPG skeleton allow-list; everything else still runs the value scan.
@@ -2383,6 +2555,13 @@ fn scan_cnpg_value(value: &Value, path: &str, errors: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    fn exact_bootstrap_sql() -> Vec<Value> {
+        EXPECTED_CNPG_POST_INIT_SQL
+            .iter()
+            .map(|statement| Value::String((*statement).to_string()))
+            .collect()
+    }
+
     #[test]
     fn platform_database_readiness_endpoint_registration_detects_route_alias() {
         let program = format!(
@@ -2390,5 +2569,92 @@ mod tests {
         );
 
         assert_eq!(endpoint_start_indexes(&program).len(), 1);
+    }
+
+    #[test]
+    fn cnpg_bootstrap_sql_accepts_only_the_closed_normalized_program() {
+        let statements = exact_bootstrap_sql();
+        let mut errors = Vec::new();
+        validate_cnpg_bootstrap_sql(Some(statements.as_slice()), &mut errors);
+        assert!(
+            errors.is_empty(),
+            "exact bootstrap was rejected: {errors:?}"
+        );
+
+        let mut extra = exact_bootstrap_sql();
+        extra.push(Value::String(
+            "GRANT CONNECT ON DATABASE ryuki_platform TO attacker".to_string(),
+        ));
+        errors.clear();
+        validate_cnpg_bootstrap_sql(Some(extra.as_slice()), &mut errors);
+        assert!(!errors.is_empty(), "extra grantee was accepted");
+
+        let mut reordered = exact_bootstrap_sql();
+        reordered.swap(5, 6);
+        errors.clear();
+        validate_cnpg_bootstrap_sql(Some(reordered.as_slice()), &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "reordered bootstrap override was accepted"
+        );
+
+        let mut dynamic = exact_bootstrap_sql();
+        dynamic[0] = Value::String(
+            "DO $roles$ BEGIN EXECUTE current_setting('ryuki.bootstrap_sql'); END $roles$;"
+                .to_string(),
+        );
+        errors.clear();
+        validate_cnpg_bootstrap_sql(Some(dynamic.as_slice()), &mut errors);
+        assert!(!errors.is_empty(), "dynamic bootstrap SQL was accepted");
+    }
+
+    #[test]
+    fn cnpg_managed_role_model_rejects_extra_or_privileged_fields() {
+        let exact = serde_json::json!({
+            "name": "ryuki_app_runtime",
+            "ensure": "present",
+            "login": false,
+            "superuser": false,
+            "createdb": false,
+            "createrole": false,
+            "inherit": true,
+            "replication": false,
+            "bypassrls": false,
+            "disablePassword": true
+        });
+        assert!(managed_role_is_exact(&exact, "ryuki_app_runtime"));
+
+        let mut extra = exact.clone();
+        extra["passwordSecret"] = serde_json::json!({"name": "dynamic-secret"});
+        assert!(!managed_role_is_exact(&extra, "ryuki_app_runtime"));
+
+        let mut privileged = exact;
+        privileged["createrole"] = Value::Bool(true);
+        assert!(!managed_role_is_exact(&privileged, "ryuki_app_runtime"));
+    }
+
+    #[test]
+    fn cnpg_tls_contract_requires_exact_dns_san_and_ca_secret() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            fs::read_to_string(root.join(CNPG_CLUSTER_PATH)).expect("checked-in CNPG manifest");
+        let mut errors = Vec::new();
+        validate_cnpg_cluster_text(&manifest, &mut errors);
+        assert!(
+            !errors.iter().any(|error| error.contains("server DNS SAN")),
+            "checked-in TLS identity should pass: {errors:?}"
+        );
+
+        for invalid in [
+            manifest.replace(CNPG_SERVER_DNS_NAME, "wrong.example.invalid"),
+            manifest.replace(CNPG_CA_SECRET_NAME, "wrong-ca-secret"),
+        ] {
+            let mut errors = Vec::new();
+            validate_cnpg_cluster_text(&invalid, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains("server DNS SAN")),
+                "wrong server identity or CA must fail closed: {errors:?}"
+            );
+        }
     }
 }

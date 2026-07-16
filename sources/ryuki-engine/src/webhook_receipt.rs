@@ -1,25 +1,23 @@
 //! Inbound webhook signature verification (#18 slice 1) — the PURE security core.
 //!
 //! External systems (ServiceNow, monitoring, CI) authenticate an inbound webhook
-//! by signing the RAW request body with a shared secret (HMAC-SHA256) and sending
-//! the hex digest in a header (the `X-Hub-Signature-256: sha256=<hex>` convention).
-//! This module is the pure, no-IO verifier: given the shared secret, the EXACT raw
-//! body bytes, and the provided signature, it returns whether the signature is
-//! valid — using a CONSTANT-TIME comparison so a bad signature leaks no timing
-//! information about how much of the digest matched.
+//! by signing Ryuki's versioned canonical delivery message with a shared secret
+//! (HMAC-SHA256) and sending the hex digest in `X-Hub-Signature-256`. This module
+//! is the pure, no-IO primitive: given the shared secret, exact authenticated
+//! message bytes, and provided signature, it returns whether the signature is
+//! valid using a CONSTANT-TIME comparison.
 //!
 //! Keeping this pure means the security-critical primitive is fully unit-testable
 //! (against published HMAC test vectors + tamper cases) with no DB, no axum, and no
-//! network. The CP handler that looks up the integration connection, resolves its
-//! secret, verifies the raw body here, and records a domain event on success (401
-//! on mismatch, mutate nothing) is a thin follow-up slice built on this core.
+//! network. The API handler constructs the canonical method/path, connection,
+//! timestamp, delivery-id, and body-digest message before calling this primitive.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Verify an HMAC-SHA256 signature over `raw_body` using the shared `secret`.
+/// Verify an HMAC-SHA256 signature over `authenticated_message` using `secret`.
 ///
 /// `provided_signature` is the hex-encoded digest the caller sent, optionally
 /// prefixed `sha256=` (the `X-Hub-Signature-256` convention). Returns `true` only
@@ -33,7 +31,11 @@ type HmacSha256 = Hmac<Sha256>;
 ///   caller could authenticate with the HMAC of an empty key).
 /// - A signature that is not valid lowercase/uppercase hex, or decodes to a length
 ///   other than 32 bytes, returns `false` (it can never equal a SHA-256 MAC).
-pub fn verify_hmac_sha256(secret: &[u8], raw_body: &[u8], provided_signature: &str) -> bool {
+pub fn verify_hmac_sha256(
+    secret: &[u8],
+    authenticated_message: &[u8],
+    provided_signature: &str,
+) -> bool {
     if secret.is_empty() {
         return false;
     }
@@ -49,7 +51,7 @@ pub fn verify_hmac_sha256(secret: &[u8], raw_body: &[u8], provided_signature: &s
     let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
         return false;
     };
-    mac.update(raw_body);
+    mac.update(authenticated_message);
     // verify_slice recomputes the MAC and compares in constant time; it also
     // rejects a wrong-length `sig_bytes` (not 32 bytes) without leaking length via
     // an early byte-by-byte compare.

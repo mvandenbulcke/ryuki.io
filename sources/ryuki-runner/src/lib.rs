@@ -6,18 +6,24 @@
 //! - Writing non-secret input files into the workspace.
 //! - Injecting resolved credentials via the child process environment and/or
 //!   0600 files — NEVER on the command-line argv.
-//! - Spawning the binary, capturing stdout/stderr.
+//! - Spawning the binary under one timeout/cancellation supervisor with hard
+//!   per-stream and combined stdout/stderr limits.
 //! - Scrubbing credential values from captured output before constructing
 //!   `RunOutcome`.
 //! - Mapping binary exit codes to `RunStatus`.
 //!
 //! # Security invariants (MUST hold at all times)
+//! - Top-level Terraform and Ansible CLIs are selected by configured absolute,
+//!   canonical paths and admitted through filesystem plus identity/version
+//!   validation before any credential-bearing command is constructed.
 //! - Secret material is NEVER passed as a command-line argument.
 //! - Secret material is injected into the child process environment only
 //!   (not the parent process env) and/or written to 0600 files in the
 //!   workspace, which is removed on drop.
 //! - Output is scrubbed for known secret values before being placed into
 //!   `RunOutcome.log` or `RunOutcome.summary`.
+//! - Subprocess output overflow fails closed and kills/reaps the process group;
+//!   truncation is never used as a substitute for bounded capture.
 //! - The workspace TempDir is removed on drop, including on panic.
 //! - `ResolvedCredentials` is zeroized on drop immediately after the child
 //!   process is configured — no long-lived reference is kept.
@@ -26,6 +32,7 @@
 
 pub mod ansible;
 pub mod exec;
+mod executable;
 pub mod iac;
 pub mod live;
 pub mod live_ansible;
@@ -35,25 +42,34 @@ pub mod workspace;
 
 use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunnerError, RunnerKind};
 
-pub use live::{
-    run_live_apply, run_live_destroy, run_live_plan, IsolatedBackendConfig, LivePlanArtifacts,
-    STATE_KEY_PLACEHOLDER,
+pub use exec::{
+    external_subprocess_containment_available, CommandCancellation,
+    RUNNER_CONTAINMENT_POLICY_VERSION,
 };
-pub use live_ansible::{run_ansible_live_apply, run_ansible_live_plan};
+pub use executable::{approved_terraform_executable_provenance, ApprovedExecutableProvenance};
+pub use live::{
+    run_live_apply, run_live_apply_with_cancellation, run_live_destroy,
+    run_live_destroy_with_cancellation, run_live_plan, run_live_plan_with_cancellation,
+    IsolatedBackendConfig, LivePlanArtifacts, STATE_KEY_PLACEHOLDER,
+};
+pub use live_ansible::{
+    run_ansible_live_apply, run_ansible_live_apply_with_cancellation, run_ansible_live_plan,
+    run_ansible_live_plan_with_cancellation,
+};
 pub use ryuki_engine::runners::ResolvedCredentials;
 
 /// The `Runner` trait defines the interface that both `TerraformRunner` and
 /// `AnsibleRunner` implement.
 ///
-/// # Binary injection
-/// The `binary_path` is injectable so that tests can point it at a fake shim
-/// instead of requiring a real terraform/ansible installation.
+/// Test builds can point concrete runners at deterministic shims. Production
+/// builds expose no raw binary-path injection and require approved executable
+/// configuration.
 pub trait Runner {
-    /// Returns `true` if the runner binary is present and executable.
+    /// Returns `true` if the configured runner binary is locally approved and
+    /// its bounded availability probe succeeds.
     ///
-    /// This is a lightweight probe — it does not verify version or
-    /// compatibility, only presence. Returns `false` gracefully (never panics)
-    /// when the binary is absent.
+    /// Returns `false` gracefully (never panics) when configuration,
+    /// provenance, identity/version, or availability validation fails.
     fn available(&self) -> bool;
 
     /// Execute a dry-run (plan or check). No changes are made.
@@ -103,6 +119,24 @@ pub fn run_offline_dry_run(
     plan: &RunPlan,
     creds: &ResolvedCredentials,
 ) -> Result<RunOutcome, RunnerError> {
+    run_offline_dry_run_inner(plan, creds, None)
+}
+
+/// Cancellation-aware offline entry point. One signal is propagated through
+/// the version probe and every subprocess phase in the selected runner.
+pub fn run_offline_dry_run_with_cancellation(
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: &exec::CommandCancellation,
+) -> Result<RunOutcome, RunnerError> {
+    run_offline_dry_run_inner(plan, creds, Some(cancellation))
+}
+
+fn run_offline_dry_run_inner(
+    plan: &RunPlan,
+    creds: &ResolvedCredentials,
+    cancellation: Option<&exec::CommandCancellation>,
+) -> Result<RunOutcome, RunnerError> {
     if plan.mode != RunMode::DryRun {
         return Err(RunnerError::Spawn(format!(
             "run_offline_dry_run only accepts RunMode::DryRun; got {:?} — live execution is S5",
@@ -131,7 +165,10 @@ pub fn run_offline_dry_run(
                     plan.offering_id
                 ))
             })?;
-            let runner = terraform::TerraformRunner::new().with_iac(iac_files);
+            let mut runner = terraform::TerraformRunner::new().with_iac(iac_files);
+            if let Some(cancellation) = cancellation {
+                runner = runner.with_cancellation(cancellation);
+            }
             runner.run_dry(plan, creds)
         }
         RunnerKind::Ansible => {
@@ -142,7 +179,10 @@ pub fn run_offline_dry_run(
                     plan.offering_id
                 ))
             })?;
-            let runner = ansible::AnsibleRunner::new().with_iac(iac_files);
+            let mut runner = ansible::AnsibleRunner::new().with_iac(iac_files);
+            if let Some(cancellation) = cancellation {
+                runner = runner.with_cancellation(cancellation);
+            }
             runner.run_dry(plan, creds)
         }
     }

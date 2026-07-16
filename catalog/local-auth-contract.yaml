@@ -1,3 +1,33 @@
-# local-auth contract — static stub for COVERAGE_TSV registration
+# Local-auth static catalog contract. This publishes development/migration
+# metadata only; `status: active` is catalog publication state, not an active
+# production authenticator or permission to enable live execution.
+version: 2
 slice: local-auth
 status: active
+statusMeaning: catalog-publication-only
+source: static-seed
+authenticationMode: local-mock
+configuredForProduction: false
+liveAuthenticationAllowed: false
+liveExecutionAllowed: false
+allowedProfiles:
+  - development
+  - test
+currentCredentialKind: password-session-migration
+targetProviderKinds:
+  - local-passkey
+  - break-glass-passkey
+targetBoundary: platform-security-boundary
+requirements:
+  - id: explicit-non-production-state
+    decision: block
+    requirement: Catalog publication status must never be interpreted as production authenticator lifecycle state.
+  - id: local-profile-isolation
+    decision: block
+    requirement: Current local mock or password-backed authentication is limited to explicit development or test profiles. A governed migration overlay must bind one explicit profile, use provider-registry configuration, and cannot infer authority from this catalog.
+  - id: purpose-separated-passkeys
+    decision: block
+    requirement: Ordinary and dormant break-glass passkeys use separate purposes and cannot be accepted across profiles.
+  - id: no-password-production-fallback
+    decision: block
+    requirement: Password-only local authentication cannot satisfy production or emergency activation.

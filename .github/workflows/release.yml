@@ -1,10 +1,10 @@
 name: Release
 
 # Cuts a release on a semver tag. Re-runs the CI gate (build, test, lint,
-# secret scan, validator) so a tag can never ship code that would not pass main's CI
-# (.github/workflows/ci.yml), then builds both app images, pushes them to GHCR
-# pinned by digest, and publishes a GitHub release whose notes are the
-# changelog section for this tag.
+# dependency/secret scans, validator) so a tag can never ship code that would
+# not pass main's CI (.github/workflows/ci.yml), then builds both app images,
+# pushes them to GHCR pinned by digest, and publishes a GitHub release whose
+# notes are the changelog section for this tag.
 #
 # Trigger: push a tag shaped like v1.2.3 (see cliff.toml `tag_pattern`).
 #   git tag v0.1.0 && git push origin v0.1.0
@@ -29,15 +29,46 @@ env:
   PORTAL_IMAGE: ryuki-portal-ui
 
 jobs:
+  # A tag push can name any reachable commit. Keep the release workflow bound
+  # to an exact SemVer annotated tag, signed by the configured release key, whose
+  # commit is already in trusted main history. Repository rulesets must still
+  # restrict who may create/update v* tags.
+  release-source:
+    name: Validate Trusted Release Source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit-sha: ${{ steps.provenance.outputs.commit-sha }}
+      tag-object-sha: ${{ steps.provenance.outputs.tag-object-sha }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact SemVer, signed annotated tag, and main ancestry
+        id: provenance
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          # Repository variables are public trust policy, not secrets. The
+          # base64 value must contain exactly one reviewed OpenPGP public key.
+          RELEASE_SIGNING_PUBLIC_KEY_B64: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY_B64 }}
+          RELEASE_SIGNING_FINGERPRINT: ${{ vars.RELEASE_SIGNING_FINGERPRINT }}
+        run: bash scripts/release/validate-source-v1.sh
+
   # ── CI gate ───────────────────────────────────────────────────────────────
   # Mirrors .github/workflows/ci.yml so a release tag is held to the same bar
   # as main. Image build/push only runs once these pass (see `needs:` below).
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    needs: release-source
     services:
       postgres:
-        image: postgres:18
+        # postgres:18.4, pinned to the reviewed multi-platform index.
+        image: postgres:18.4@sha256:b913fd5699b8bd23fa4b06d72ecdd939fad43b80fb8651bac06caa0e6d135cac
         env:
           POSTGRES_DB: ryuki_ci
           POSTGRES_USER: postgres
@@ -51,12 +82,15 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          persist-credentials: false
       # rust-toolchain.toml pins the stable channel with rustfmt + clippy.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build workspace
         run: cargo build --workspace
       - name: Test workspace
@@ -85,26 +119,40 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: release-source
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
         with:
           components: rustfmt, clippy
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check formatting
         run: cargo fmt --check --all
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   security:
-    name: Secret Scan
+    name: Dependency & Secret Scan
     runs-on: ubuntu-latest
+    needs: release-source
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Run dependency audit
+        run: ./scripts/dependency-audit.sh
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Run secret scan
@@ -113,13 +161,17 @@ jobs:
   validate:
     name: Validator
     runs-on: ubuntu-latest
+    needs: release-source
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # reviewed stable pin
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run validator
         run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 
@@ -127,7 +179,12 @@ jobs:
   images:
     name: Build & Push Images
     runs-on: ubuntu-latest
-    needs: [build-test, lint, security, validate]
+    needs: [release-source, build-test, lint, security, validate]
+    # Configure this Environment with required reviewers and deployment branch
+    # rules. Checked-in validation proves the declaration; hosted policy is an
+    # independently audited release control.
+    environment:
+      name: release
     permissions:
       contents: read
       # Required to push images to GitHub Container Registry (GHCR).
@@ -136,16 +193,36 @@ jobs:
       api-digest: ${{ steps.api.outputs.digest }}
       portal-digest: ${{ steps.portal.outputs.digest }}
     steps:
+      - name: Require the remote tag to retain the validated object
+        id: revalidate-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          EXPECTED_TAG_OBJECT: ${{ needs.release-source.outputs.tag-object-sha }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_TAG_OBJECT}" =~ ^[0-9a-f]{40}$ ]]
+          remote_tag_object="$(
+            gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.sha'
+          )"
+          [[ "${remote_tag_object}" == "${EXPECTED_TAG_OBJECT}" ]] || {
+            echo "::error::Release tag moved after provenance validation"
+            exit 1
+          }
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       # Logs in with the workflow's GITHUB_TOKEN (no extra secret needed for
       # GHCR pushes from this repo). To push to a different registry, replace
       # `password` with a registry PAT stored as a repo secret and add a clear
       # comment marking it required.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -153,7 +230,11 @@ jobs:
       # The leading `v` is part of the git tag but not of the image version.
       - name: Derive version tags
         id: version
+        env:
+          EXPECTED_COMMIT: ${{ needs.release-source.outputs.commit-sha }}
         run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_COMMIT}" ]]
           version="${GITHUB_REF_NAME#v}"
           {
             echo "version=${version}"
@@ -161,11 +242,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - name: Build & push platform-api (digest-pinned)
         id: api
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: sources/ryuki-api/Dockerfile
           push: true
+          provenance: mode=max
+          sbom: true
           # Both Dockerfiles build from the repository root context (see the
           # Dockerfile headers); release_image_builds enforces this.
           tags: |
@@ -173,11 +256,13 @@ jobs:
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}:sha-${{ steps.version.outputs.sha_short }}
       - name: Build & push portal-ui (digest-pinned)
         id: portal
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: portal/portal-ui/Dockerfile
           push: true
+          provenance: mode=max
+          sbom: true
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}:sha-${{ steps.version.outputs.sha_short }}
@@ -200,41 +285,87 @@ jobs:
           API_DIGEST: ${{ steps.api.outputs.digest }}
           PORTAL_DIGEST: ${{ steps.portal.outputs.digest }}
 
+  # Generate release-note data without repository write authority. The
+  # contents:write job below consumes this output as data and runs no external
+  # action code.
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    needs: [release-source, build-test, lint, security, validate]
+    permissions:
+      contents: read
+    outputs:
+      content-b64: ${{ steps.validate-notes.outputs.content-b64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.release-source.outputs.commit-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Generate release notes from changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        id: changelog
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --latest --strip all
+      - name: Bound and encode generated release notes
+        id: validate-notes
+        env:
+          RAW_NOTES: ${{ steps.changelog.outputs.content }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/release/validate-notes-v1.sh
+
   # ── GitHub release with changelog notes ───────────────────────────────────
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: images
+    needs: [release-source, images, release-notes]
+    environment:
+      name: release
     permissions:
       # Required to create the GitHub release.
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          # git-cliff needs the full history to build the changelog section.
-          fetch-depth: 0
-      # Renders the changelog section for THIS tag only, used as release notes.
-      - name: Generate release notes from changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          config: cliff.toml
-          args: --latest --strip all
-        env:
-          OUTPUT: RELEASE_NOTES.md
       - name: Create GitHub release
+        id: publish
         env:
           # GITHUB_TOKEN is provided automatically; no extra secret required.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          EXPECTED_TAG_OBJECT: ${{ needs.release-source.outputs.tag-object-sha }}
+          RELEASE_NOTES_B64: ${{ needs.release-notes.outputs.content-b64 }}
           API_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}
           PORTAL_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}
           API_DIGEST: ${{ needs.images.outputs.api-digest }}
           PORTAL_DIGEST: ${{ needs.images.outputs.portal-digest }}
         run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          [[ "${EXPECTED_TAG_OBJECT}" =~ ^[0-9a-f]{40}$ ]] || \
+            fail "Validated release tag object is malformed"
+          remote_tag_object="$(
+            gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.sha'
+          )" || fail "Cannot read the remote release tag"
+          [[ "${remote_tag_object}" == "${EXPECTED_TAG_OBJECT}" ]] || \
+            fail "Release tag moved after provenance validation"
+          [[ -n "${RELEASE_NOTES_B64}" ]] || fail "Validated release notes are missing"
+          printf '%s' "${RELEASE_NOTES_B64}" | base64 --decode > release-notes.md || \
+            fail "Validated release notes are not canonical base64"
+          note_bytes="$(LC_ALL=C wc -c < release-notes.md | tr -d '[:space:]')"
+          [[ "${note_bytes}" =~ ^[0-9]+$ && "${note_bytes}" -le 131072 ]] || \
+            fail "Validated release notes exceed the 128 KiB handoff limit"
+          version="${TAG#v}"
+          first_heading="$(awk 'NF { print; exit }' release-notes.md)"
+          [[ "${first_heading}" == "## [${version}]"* ]] || \
+            fail "Validated release notes do not match the release tag"
           {
-            cat "${{ steps.changelog.outputs.changelog || 'RELEASE_NOTES.md' }}" 2>/dev/null || true
+            cat release-notes.md
             echo ""
             echo "### Images (digest-pinned)"
             echo ""

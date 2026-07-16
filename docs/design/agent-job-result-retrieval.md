@@ -18,7 +18,7 @@ verifiable result. Additive: NO migration, NO engine change.
 
 ## Secret hygiene — expose the ATTESTATION, NOT the raw evidence (the crux)
 `SignedEnvelope` (ryuki-protocol types.rs:280) is a pure CRYPTOGRAPHIC ATTESTATION:
-agent_id/platform/job_id/attempt_id/lease_generation/request_id/result_id, mode, status,
+agent_id/agent_enrollment_id/platform/job_id/attempt_id/lease_generation/request_id/result_id, mode, status,
 `job_spec_digest`, `approved_plan_digest`, `evidence_digest` (SHA-256 of the POST-REDACTION
 evidence pack), `redaction_policy_version`, timestamp, `key_id`, `cp_nonce`, and the Ed25519
 `signature`. It contains ONLY digests + signature + metadata — NO raw evidence, NO secrets,
@@ -46,15 +46,16 @@ counterpart — a buggy/compromised agent could sign a secret into it and it wou
 to this view. So the POST verifier now gates it (Step 5b, fail-closed like every other check)
 against the CLOSED allowlist of policy versions the CP recognises —
 `ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS` (currently
-`["ryuki-redaction-v1"]`, the value the real agent emits via
+`["ryuki-redaction-v2"]`, the value the real agent emits via
 `ryuki_protocol::REDACTION_POLICY_VERSION`). A charset/length heuristic was NOT enough (codex
 2nd pass): a bare token like `SUPERSECRET` is alphanumeric and short, so it would have passed —
 only an exact-match allowlist actually closes the channel. The value is an opaque SLUG, not a
 semver number (the prior type doc said "semver, e.g. 1.0.0", which was wrong — corrected). A
 validly-signed envelope whose policy version is not on the allowlist is rejected with 400 and
 nothing is recorded; this both closes the free-form channel and refuses evidence redacted under
-a policy the CP cannot interpret. Bumping the policy (e.g. `ryuki-redaction-v2`) means adding it
-to the one protocol constant, which both the agent and the CP reference (no drift).
+a policy the CP cannot interpret. Bumping the policy means replacing the one protocol constant
+and its closed allowlist; policies with known redaction gaps are intentionally not retained for
+compatibility. Both the agent and the CP reference that shared contract (no drift).
 
 ## Endpoint — GET /api/admin/agents/jobs/{job_id}/result
 `admin_agent_job_result(Extension<AuthSession>, Path(job_id))`, mirroring
@@ -91,8 +92,8 @@ to the one protocol constant, which both the agent and the CP reference (no drif
 3. **unknown** (DB/no-DB): unknown job_id → 404.
 4. **403** (no-DB): a non-admin session → 403.
 5. **allowlist guard** (no-DB, pure): `redaction_policy_version_is_supported` accepts only
-   `ryuki-redaction-v1` and rejects bare tokens (`SUPERSECRET`, `tokenabc123def456`), an
-   unknown-but-valid semver (`1.0.0`/`2.0.0`), an unknown slug (`ryuki-redaction-v2`), and empty.
+   `ryuki-redaction-v2` and rejects the superseded v1 policy, bare tokens (`SUPERSECRET`,
+   `tokenabc123def456`), unknown semvers/slugs, and empty values.
 6. **ingestion rejection** (DB): a VALIDLY-SIGNED envelope smuggling `SUPERSECRET` into
    `redaction_policy_version` is POSTed → 400 (Step 5b), the error names the field, the rejection
    body does not echo the secret, and NO result column is written (fail-closed).

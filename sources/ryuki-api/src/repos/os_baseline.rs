@@ -1,7 +1,9 @@
 //! Repository functions for `baseline_checks` and `baseline_results`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Reads take `&PgPool`. Remediation helpers take the caller-owned
+//! `&mut PgConnection` so the authenticated handler can keep object-scope
+//! authorization, the result update, and its audit append in one transaction.
+//! Callers map `sqlx::Error` → 500 and absent/unauthorized targets → 404.
 //!
 //! # ID type
 //! Both `baseline_checks.id` (TEXT PK) and `baseline_results` composite PK
@@ -24,7 +26,7 @@ use chrono::{DateTime, Utc};
 use ryuki_engine::os_baseline::{
     BaselineCategory, BaselineCheck, BaselineResult, BaselineSeverity,
 };
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 // ─── Column lists ─────────────────────────────────────────────────────────────
 
@@ -130,15 +132,46 @@ pub async fn list_checks(pool: &PgPool) -> Result<Vec<BaselineCheck>, sqlx::Erro
 
 // ─── Repository functions — baseline_results ──────────────────────────────────
 
-/// Return all compliance results for a single server, ordered by check_id.
+/// Resolve a server to its one persisted site without materialising any of its
+/// compliance details. `None` means the server is absent OR its rows disagree
+/// about site ownership; callers intentionally map both cases to the same 404.
+///
+/// The persisted `baseline_results.site` value is the authorization source.
+/// Server-name parsing is never used to infer scope.
+pub async fn canonical_site_for_server(
+    pool: &PgPool,
+    server_name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT MIN(site) \
+         FROM baseline_results \
+         WHERE server_name = $1 \
+         HAVING COUNT(DISTINCT site) = 1",
+    )
+    .bind(server_name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Return compliance results for one server only when every returned row also
+/// belongs to the already-authorized persisted site. The site predicate is
+/// applied in SQL, before rows are decoded or serialised.
 pub async fn list_results_for_server(
     pool: &PgPool,
     server_name: &str,
+    site: &str,
 ) -> Result<Vec<BaselineResult>, sqlx::Error> {
     let rows: Vec<BaselineResultRow> = sqlx::query_as(&format!(
-        "SELECT {RESULT_COLUMNS} FROM baseline_results WHERE server_name = $1 ORDER BY check_id"
+        "SELECT {RESULT_COLUMNS} FROM baseline_results \
+         WHERE server_name = $1 AND site = $2 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM baseline_results sibling \
+               WHERE sibling.server_name = $1 AND sibling.site <> $2 \
+           ) \
+         ORDER BY check_id"
     ))
     .bind(server_name)
+    .bind(site)
     .fetch_all(pool)
     .await?;
 
@@ -161,66 +194,140 @@ pub async fn list_results_for_site(
     Ok(rows.into_iter().map(|r| r.into_model()).collect())
 }
 
-/// Return all compliance results across all sites, ordered by server_name, check_id.
-pub async fn list_all_results(pool: &PgPool) -> Result<Vec<BaselineResult>, sqlx::Error> {
-    let rows: Vec<BaselineResultRow> = sqlx::query_as(&format!(
-        "SELECT {RESULT_COLUMNS} FROM baseline_results ORDER BY server_name, check_id"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Return compliance results under an already-resolved site set, ordered by
+/// server_name/check_id. `None` is the explicit unrestricted-principal case;
+/// `Some(sites)` applies `site = ANY($1)` in SQL before any row is decoded.
+pub async fn list_results_for_sites(
+    pool: &PgPool,
+    sites: Option<&[String]>,
+) -> Result<Vec<BaselineResult>, sqlx::Error> {
+    let rows: Vec<BaselineResultRow> = match sites {
+        None => {
+            sqlx::query_as(&format!(
+                "SELECT {RESULT_COLUMNS} FROM baseline_results ORDER BY server_name, check_id"
+            ))
+            .fetch_all(pool)
+            .await?
+        }
+        Some(sites) => {
+            sqlx::query_as(&format!(
+                "SELECT {RESULT_COLUMNS} FROM baseline_results \
+                 WHERE site = ANY($1) ORDER BY server_name, check_id"
+            ))
+            .bind(sites)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     Ok(rows.into_iter().map(|r| r.into_model()).collect())
 }
 
-/// Atomically set a compliance result to compliant, using `FOR UPDATE` on the
-/// composite PK row so concurrent remediations of the same (server, check) pair
-/// are serialized.
-///
-/// Returns `Ok(None)` when the (server_name, check_id) pair is absent (caller →
-/// 404). Returns `Ok(Some(result))` on success with the DB-authoritative row.
-/// `Err` is reserved for genuine DB failures (caller → 500).
-pub async fn remediate(
-    pool: &PgPool,
+/// A remediation target loaded from the database while its result row is
+/// locked. The fields are private so the update helper can only consume the
+/// exact server/check/site/expected-value tuple loaded under that lock.
+pub struct LockedRemediationTarget {
+    server_name: String,
+    check_id: String,
+    site: String,
+    expected_value: String,
+    was_compliant: bool,
+}
+
+impl LockedRemediationTarget {
+    pub fn site(&self) -> &str {
+        &self.site
+    }
+
+    pub fn was_compliant(&self) -> bool {
+        self.was_compliant
+    }
+}
+
+/// Lock and load the exact remediation row plus the check's authoritative
+/// expected value inside the CALLER-owned transaction. Returning the persisted
+/// site lets the authenticated handler authorize the object before any update.
+/// `None` is the non-enumerating absent-target case.
+pub async fn lock_remediation_target(
+    conn: &mut PgConnection,
     server_name: &str,
     check_id: &str,
-) -> Result<Option<BaselineResult>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+) -> Result<Option<LockedRemediationTarget>, sqlx::Error> {
+    // Lock every currently persisted check row for the server first. This
+    // makes the server->site consistency decision and the selected-row update
+    // share one lock window: a concurrent sibling-row site reassignment cannot
+    // turn an authorized server into a mixed/foreign server between check and
+    // update.
+    let sites: Vec<String> = sqlx::query_scalar(
+        "SELECT site FROM baseline_results \
+         WHERE server_name = $1 ORDER BY check_id FOR UPDATE",
+    )
+    .bind(server_name)
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some(canonical_site) = sites.first() else {
+        return Ok(None);
+    };
+    if sites.iter().any(|site| site != canonical_site) {
+        return Ok(None);
+    }
 
-    // Lock the result row AND fetch its check's authoritative expected_value in
-    // one query, inside the tx, so the value written can't go stale between a
-    // separate lookup and the UPDATE. If the result row (or its check) is absent
-    // there is nothing valid to remediate → Ok(None) → 404. No fallback value.
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT c.expected_value \
+    let row: Option<(String, String, String, String, bool)> = sqlx::query_as(
+        "SELECT r.server_name, r.check_id, r.site, c.expected_value, r.compliant \
          FROM baseline_results r \
          JOIN baseline_checks c ON c.id = r.check_id \
-         WHERE r.server_name = $1 AND r.check_id = $2 \
+         WHERE r.server_name = $1 AND r.check_id = $2 AND r.site = $3 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM baseline_results sibling \
+               WHERE sibling.server_name = r.server_name AND sibling.site <> r.site \
+           ) \
          FOR UPDATE OF r",
     )
     .bind(server_name)
     .bind(check_id)
-    .fetch_optional(&mut *tx)
+    .bind(canonical_site)
+    .fetch_optional(&mut *conn)
     .await?;
 
-    let Some((expected_value,)) = row else {
-        tx.rollback().await?;
-        return Ok(None);
-    };
+    Ok(row.map(
+        |(server_name, check_id, site, expected_value, was_compliant)| LockedRemediationTarget {
+            server_name,
+            check_id,
+            site,
+            expected_value,
+            was_compliant,
+        },
+    ))
+}
 
-    let updated: BaselineResultRow = sqlx::query_as(&format!(
+/// Apply a previously locked remediation target inside the same caller-owned
+/// transaction. The authoritative site is repeated in the UPDATE predicate as
+/// defense in depth, and mixed-site ownership is rechecked in the mutation
+/// statement's own snapshot. The expected value comes only from
+/// `baseline_checks`. `None` means ownership changed after the locked load;
+/// callers roll back and map it to the same opaque 404.
+pub async fn apply_locked_remediation(
+    conn: &mut PgConnection,
+    target: &LockedRemediationTarget,
+) -> Result<Option<BaselineResult>, sqlx::Error> {
+    let updated: Option<BaselineResultRow> = sqlx::query_as(&format!(
         "UPDATE baseline_results \
          SET compliant = true, actual_value = $3, last_checked = NOW() \
-         WHERE server_name = $1 AND check_id = $2 \
+         WHERE server_name = $1 AND check_id = $2 AND site = $4 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM baseline_results sibling \
+               WHERE sibling.server_name = $1 AND sibling.site <> $4 \
+           ) \
          RETURNING {RESULT_COLUMNS}"
     ))
-    .bind(server_name)
-    .bind(check_id)
-    .bind(&expected_value)
-    .fetch_one(&mut *tx)
+    .bind(&target.server_name)
+    .bind(&target.check_id)
+    .bind(&target.expected_value)
+    .bind(&target.site)
+    .fetch_optional(conn)
     .await?;
 
-    tx.commit().await?;
-    Ok(Some(updated.into_model()))
+    Ok(updated.map(BaselineResultRow::into_model))
 }
 
 /// Return per-month compliance percentages for a site, sorted chronologically.
@@ -363,9 +470,9 @@ mod os_baseline_db_tests {
 
         // Strengthen: verify the migration-068 CASE backfill across ALL sites and
         // that no seed row fell through to 'UNKNOWN' (a typo in any CASE branch).
-        let all = list_all_results(pool)
+        let all = list_results_for_sites(pool, None)
             .await
-            .expect("list_all_results failed");
+            .expect("unrestricted list_results_for_sites failed");
         assert_eq!(
             all.len(),
             20,
@@ -393,7 +500,12 @@ mod os_baseline_db_tests {
         };
         let pool = &pool;
 
-        let results = list_results_for_server(pool, "srv-gblon-db01")
+        let site = canonical_site_for_server(pool, "srv-gblon-db01")
+            .await
+            .expect("canonical_site_for_server failed");
+        assert_eq!(site.as_deref(), Some("GBLON"));
+
+        let results = list_results_for_server(pool, "srv-gblon-db01", "GBLON")
             .await
             .expect("list_results_for_server failed");
 
@@ -417,12 +529,101 @@ mod os_baseline_db_tests {
             !fw.unwrap().compliant,
             "bc-004 must be non-compliant for srv-gblon-db01"
         );
+
+        let foreign = list_results_for_server(pool, "srv-gblon-db01", "DEFRA")
+            .await
+            .expect("foreign-site predicate must remain a valid empty query");
+        assert!(
+            foreign.is_empty(),
+            "the SQL site predicate must exclude a foreign server before decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_results_for_sites_filters_in_sql() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pool = &pool;
+
+        let sites = vec!["GBLON".to_string(), "FRPAR".to_string()];
+        let results = list_results_for_sites(pool, Some(&sites))
+            .await
+            .expect("scoped result query failed");
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|row| row.site == "GBLON" || row.site == "FRPAR"),
+            "no row outside the bound site array may be materialised"
+        );
+        assert!(results.iter().all(|row| row.site != "DEFRA"));
+
+        let none = list_results_for_sites(pool, Some(&[]))
+            .await
+            .expect("empty authorized-site set must be a valid empty query");
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mixed_site_server_has_no_canonical_site_or_locked_target() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pool = &pool;
+        let server = format!("mixed-site-{}", uuid::Uuid::new_v4());
+
+        for (check, site) in [("bc-001", "DEFRA"), ("bc-002", "GBLON")] {
+            sqlx::query(
+                "INSERT INTO baseline_results \
+                 (server_name, check_id, compliant, actual_value, site) \
+                 VALUES ($1, $2, false, 'test', $3)",
+            )
+            .bind(&server)
+            .bind(check)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("insert mixed-site fixture");
+        }
+
+        let site = canonical_site_for_server(pool, &server)
+            .await
+            .expect("canonical-site query failed");
+        assert!(site.is_none(), "mixed-site ownership must fail closed");
+        let details = list_results_for_server(pool, &server, "DEFRA")
+            .await
+            .expect("mixed-site detail predicate failed");
+        assert!(
+            details.is_empty(),
+            "mixed-site rows must never produce a partial authorized projection"
+        );
+
+        let mut tx = pool.begin().await.expect("begin remediation transaction");
+        let target = lock_remediation_target(&mut tx, &server, "bc-001")
+            .await
+            .expect("lock query failed");
+        assert!(
+            target.is_none(),
+            "a mixed-site server must not produce a remediable target"
+        );
+        tx.rollback().await.expect("rollback fixture transaction");
+
+        sqlx::query("DELETE FROM baseline_results WHERE server_name = $1")
+            .bind(&server)
+            .execute(pool)
+            .await
+            .expect("clean up mixed-site fixture");
     }
 
     // ─── remediate — happy path ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_remediate_sets_compliant() {
+    async fn test_locked_remediation_update_stays_in_caller_transaction() {
         let _guard = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -436,18 +637,23 @@ mod os_baseline_db_tests {
         let expected = "enabled, domain profile";
 
         // Capture original state so we can restore it.
-        let original = list_results_for_server(pool, server)
+        let original = list_results_for_server(pool, server, "GBLON")
             .await
             .expect("pre-read failed")
             .into_iter()
             .find(|r| r.check_id == check)
             .expect("seeded row must exist");
 
-        let result = remediate(pool, server, check)
+        let mut tx = pool.begin().await.expect("begin remediation transaction");
+        let target = lock_remediation_target(&mut tx, server, check)
             .await
-            .expect("remediate failed");
-
-        let result = result.expect("remediate must return Some for a known row");
+            .expect("lock remediation target failed")
+            .expect("known target must exist");
+        assert_eq!(target.site(), "GBLON");
+        let result = apply_locked_remediation(&mut tx, &target)
+            .await
+            .expect("remediate failed")
+            .expect("locked target must remain consistently owned");
         assert!(result.compliant, "remediated row must be compliant");
         assert_eq!(
             result.actual_value, expected,
@@ -456,23 +662,18 @@ mod os_baseline_db_tests {
         assert_eq!(result.server_name, server, "server_name must be preserved");
         assert_eq!(result.check_id, check, "check_id must be preserved");
 
-        // Restore original state.
-        sqlx::query(
-            "UPDATE baseline_results SET compliant = $3, actual_value = $4, last_checked = $5 \
-             WHERE server_name = $1 AND check_id = $2",
-        )
-        .bind(server)
-        .bind(check)
-        .bind(original.compliant)
-        .bind(&original.actual_value)
-        .bind(
-            chrono::DateTime::parse_from_rfc3339(&original.last_checked)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-        )
-        .execute(pool)
-        .await
-        .expect("cleanup restore failed");
+        // This repository-level test proves the locked update without landing
+        // an unaudited mutation; the HTTP handler owns the real commit+audit.
+        tx.rollback()
+            .await
+            .expect("roll back repository-only update");
+        let restored = list_results_for_server(pool, server, "GBLON")
+            .await
+            .expect("post-rollback read failed")
+            .into_iter()
+            .find(|row| row.check_id == check)
+            .expect("seeded row must remain");
+        assert_eq!(restored, original);
     }
 
     // ─── remediate — unknown pair → Ok(None) ─────────────────────────────────
@@ -486,11 +687,13 @@ mod os_baseline_db_tests {
         };
         let pool = &pool;
 
-        let result = remediate(pool, "nonexistent-server", "bc-001")
+        let mut tx = pool.begin().await.expect("begin remediation transaction");
+        let result = lock_remediation_target(&mut tx, "nonexistent-server", "bc-001")
             .await
-            .expect("remediate must not error for unknown pair");
+            .expect("lock lookup must not error for unknown pair");
 
         assert!(result.is_none(), "unknown (server, check) must return None");
+        tx.rollback().await.expect("rollback empty transaction");
     }
 
     // ─── compliance_trend_for_site ────────────────────────────────────────────

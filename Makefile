@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-db lint validate clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
+.PHONY: build test test-unit test-db lint validate verify-clean cache-status clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
 
 build:
 	cargo build --workspace
@@ -49,12 +49,21 @@ validate:
 	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 	./scripts/no-secret-scan.sh
 
+# Full one-shot verification for CI and coding agents. Uses one temporary,
+# non-incremental target and deletes it on success, failure, or interruption.
+verify-clean:
+	./scripts/verify-workspace-clean.sh
+
+cache-status:
+	@du -sh target 2>/dev/null || echo "target: absent"
+	@df -h . | tail -1
+
 clean:
 	cargo clean
 	rm -rf output/
 
 run-api:
-	cargo run --manifest-path sources/ryuki-api/Cargo.toml
+	RYUKI_MIGRATION_MODE=local-auto cargo run --manifest-path sources/ryuki-api/Cargo.toml
 
 run-portal:
 	cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml

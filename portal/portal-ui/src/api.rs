@@ -802,11 +802,10 @@ fn safe_step_key(step_key: &str) -> Result<&str, ApiPathError> {
     Ok(step_key)
 }
 
-/// Builds `/api/requests/{id}/steps/{step_key}/approve-live-apply` — the
-/// admin-gated per-step approval endpoint for multi-step orchestration
-/// (#42 live-apply slice B1b). Approves ONE `AwaitingApproval` step by minting
-/// a step-scoped CP-signed LiveApply grant. Both dynamic segments are
-/// validated as single safe URL path segments.
+/// Builds the reserved per-step live-apply approval path. The API currently
+/// rejects this route fail-closed until an exact step-scoped safe review is
+/// available; retaining the guarded builder lets that refusal stay same-origin.
+/// Both dynamic segments are validated as single safe URL path segments.
 pub fn request_step_approve_live_apply_path(
     request_id: &str,
     step_key: &str,

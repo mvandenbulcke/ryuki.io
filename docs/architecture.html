@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link active" aria-current="page" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a><ul class="sb-sections"><li><a href="#stack">Stack</a></li><li><a href="#component-diagram">Component Diagram</a></li><li><a href="#key-decisions">Key Decisions</a></li><li><a href="#network-policy">Network Policy</a></li><li><a href="#execution-model">Execution Model</a></li></ul></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a><ul class="sb-sections"><li><a href="#stack">Stack</a></li><li><a href="#component-diagram">Component Diagram</a></li><li><a href="#key-decisions">Key Decisions</a></li><li><a href="#platform-security-boundary">Platform security boundary</a></li><li><a href="#network-policy">Network Policy</a></li><li><a href="#execution-model">Execution Model</a></li></ul></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -114,8 +130,8 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <tr><td>Engine</td><td>Rust</td></tr>
 <tr><td>Core</td><td>Rust</td></tr>
 <tr><td>Database</td><td>PostgreSQL / sqlx</td></tr>
-<tr><td>Secrets</td><td>HashiCorp Vault</td></tr>
-<tr><td>Auth</td><td>Entra ID (OIDC / OAuth2)</td></tr>
+<tr><td>Secrets</td><td>Provider-neutral resolver capability with current Vault adapter; target versioned provider registry</td></tr>
+<tr><td>Auth</td><td>Current Entra implementation; target versioned multi-provider registry</td></tr>
 </tbody></table>
 <h2 id="component-diagram">Component Diagram</h2>
 <pre><code> Browser (WASM)
@@ -153,60 +169,53 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 └──────────────┘</code></pre>
 <h2 id="key-decisions">Key Decisions</h2>
 <ul>
-<li><strong>Same-origin</strong>: Portal and API served from the same origin. CORS allows the Portal origin only.</li>
-<li><strong>Dry-run default</strong>: Provider operations default to mock/dry-run (<code>provider_calls_enabled = false</code>). Live infrastructure execution is a separate, operator-gated path — see <a href="#execution-model">Execution Model</a>. <code>RYUKI_AUTH_MODE</code> selects authentication (<code>entra-id</code> for real SSO, otherwise a static dev session); it does <strong>not</strong> enable live provider calls.</li>
-<li><strong>Vault secrets</strong>: Platform secrets (DB credentials, provider tokens) stored in HashiCorp Vault, never in environment or config files.</li>
-<li><strong>Entra app roles</strong>: RBAC via Entra ID app roles with <code>roles</code> claim in the access token. No group-name-to-role mapping.</li>
+<li><strong>Same-origin</strong>: Portal and API are normally served from one validated origin. CORS is not a CSRF control: every unsafe browser operation also requires exact origin validation and a session-bound CSRF proof at the shared portal/API admission boundary.</li>
+<li><strong>Dry-run default</strong>: Provider operations default to mock/dry-run (<code>provider_calls_enabled = false</code>). Live infrastructure execution is a separate, operator-gated path — see <a href="#execution-model">Execution Model</a>. <code>RYUKI_AUTH_MODE</code> is a transitional switch; static identity is accepted only by an explicit loopback/isolated development profile and never as a production fallback.</li>
+<li><strong>Pluggable secret managers</strong>: Domain code stores typed secret references, not provider-specific credentials. The current live-shaped resolver is HashiCorp Vault and is not the final production contract. The target registry admits Vault, OpenBao, cloud-native managers, and enterprise adapters by narrow, independently tested resolution, issuance, lease, key, certificate, publication, and materialization capabilities. CSI/ESO/VSO delivery is a custody boundary, not a generic <code>SecretStore</code> equivalent.</li>
+<li><strong>Provider-neutral identity and authority</strong>: Authentication carriers are namespaced by <code>(provider, issuer, subject)</code> and cannot grant platform authority directly. Interactive local, OIDC, and Entra identities are intersected with a versioned server-owned role/site/environment assignment; Unknown and Revoked fail closed, and Global is explicit rather than inferred from an empty list. The same contract is ready for brokered SAML/LDAP and passkeys, while production acceptance remains blocked on the shared registry, lifecycle, and live-provider evidence gates.</li>
 </ul>
+<h2 id="platform-security-boundary">Platform security boundary</h2>
+<p>Authentication protocols remain pluggable, but they feed one platform-wide principal, policy, transition, and audit boundary. The production target covers browser sessions, OIDC, local emergency access, API tokens, agents, webhooks, system workers, approvals, provider credentials, and evidence. See the <a href="platform-security-boundary.html">Platform Security Boundary Specification</a> for its normative invariants, migration work packages, acceptance tests, and the split between repository work and operator-owned Entra/Vault/PKI changes.</p>
+<p>The boundary specification is the required target state. Development modes and the current implementation may not yet conform, and must not be presented as production-ready merely because their individual authentication or signature checks pass.</p>
 <h2 id="network-policy">Network Policy</h2>
 <pre><code>Browser ──► Portal (same-origin) ──► API ──► Database
-                                        ├───► Vault
-                                        └───► Adapters</code></pre>
-<p>Only the API server has access to the database, Vault, and provider adapters. The Portal communicates exclusively with the API.</p>
+                                        └───► control-plane secret/key services
+
+API ──► Agent control channel ──► Agent ──► workload secret/key service
+                                      └───► infrastructure provider endpoint</code></pre>
+<p>The Portal communicates exclusively with the API, and only the API accesses the control-plane database. The intended live execution plane is agent-local: once sealed per-command descendant containment exists, the agent will resolve workload credentials and call provider endpoints under a signed, scoped grant. The current production runner refuses every external Terraform and Ansible spawn before that point. Network policy must still isolate control-plane egress from future agent workload egress; neither plane receives ambient access to the other's secret services or provider destinations.</p>
 <h2 id="execution-model">Execution Model</h2>
 <p>Ryuki is <strong>dry-run-first</strong>. Almost every operation plans, validates, and records evidence without touching live infrastructure: the provider catalogue entries are credential/endpoint registries whose connection test is a shape-check stub (no live vendor call), and most domains report <code>provider_calls_enabled = false</code>.</p>
-<p>There is exactly <strong>one</strong> live execution path, and it is operator-gated end to end: an operator-deployed agent runs Terraform/Ansible against real infrastructure under a control-plane-signed grant.</p>
+<p>There is exactly <strong>one</strong> governed live-execution protocol path, and it is operator-gated end to end. Production external execution is not enabled in this snapshot: no mode may spawn Terraform or Ansible until the runner can attach every descendant before execution, terminate the whole set, and wait until the set is empty.</p>
 <h3 id="modes">Modes</h3>
-<table><thead><tr><th>Mode</th><th>Who can dispatch</th><th>What runs</th></tr></thead><tbody>
-<tr><td><code>OfflineDryRun</code> (default)</td><td><code>execute</code> tier</td><td>Terraform <code>init</code>, <code>validate</code>, and a best-effort credential-free plan, or <code>ansible-playbook --check</code>, in an isolated workspace. Registry downloads may occur; no provider credentials or mutation authority are supplied.</td></tr>
+<table><thead><tr><th>Mode</th><th>Who can dispatch</th><th>Protocol / acceptance behavior (external spawn currently unavailable)</th></tr></thead><tbody>
+<tr><td><code>OfflineDryRun</code> (default)</td><td><code>execute</code> tier</td><td>Models Terraform <code>init</code>, <code>validate</code>, and a best-effort credential-free plan, or <code>ansible-playbook --check</code>, without provider authority. Pure/stub tests exercise it; production refuses before either CLI starts.</td></tr>
 <tr><td><code>LivePlan</code></td><td><code>admin</code> tier</td><td>Real <code>terraform init</code> → <code>plan</code> → <code>show -json</code> against the backend. Produces a plan + a <code>plan_digest</code> without applying provider resources; backend initialization, locking, and state metadata can still change.</td></tr>
 <tr><td><code>LiveApply</code></td><td>minted by an <code>admin</code> via <code>approve-live-apply</code>, never dispatched directly</td><td>Creates a fresh plan, requires its canonical digest to match the reviewed plan, then applies that matching binary plan.</td></tr>
 <tr><td><code>LiveDestroy</code></td><td>system compensation after a failed multi-step live run</td><td><code>terraform destroy</code> against the exact step state, authorized by a step-scoped signed grant.</td></tr>
 </tbody></table>
-<p>The vSphere bundles pin <code>vmware/vsphere</code> at <code>2.16.1</code> and carry generated multi-platform checksum locks. Every Terraform execution mode initializes with <code>-lockfile=readonly</code>, so dependency selection is part of the digest-bound IaC rather than mutable job-local state.</p>
+<p>The vSphere bundles pin <code>vmware/vsphere</code> at <code>2.16.1</code> and carry generated multi-platform checksum locks. The runner is designed to initialize every Terraform mode with <code>-lockfile=readonly</code>, so dependency selection remains part of the digest-bound IaC once external execution is admitted.</p>
 <h3 id="live-apply-trust-chain">Live-apply trust chain</h3>
 <ol>
-<li>An operator dispatches a <code>LivePlan</code> (admin-only). The agent runs the plan and</li>
+<li>An operator dispatches a <code>LivePlan</code> (admin-only). In protocol and pure/stub acceptance tests, the agent returns scrubbed evidence plus the plan digest; production currently refuses before Terraform starts.</li>
+<li>The control plane derives a digest-verified, allowlisted Plan Review from the stored plan bytes. It exposes managed actions and request placement, never raw Terraform JSON or provider object identifiers. Server apply approval is refused if this projection cannot be derived.</li>
+<li>An <code>admin</code> approves via <code>POST /api/requests/{id}/approve-live-apply</code>, sending the exact reviewed plan job UUID, attempt UUID, and lowercase digest. The control plane locks and re-verifies that exact signed result before minting a <code>LiveApply</code> grant <strong>signed with its Ed25519 key</strong>. The grant binds the request and platform, exact plan row/attempt, approved plan and complete JobSpec digests, planning-agent enrollment/key/profile authority, approver, and a short expiry (&lt;= 24 h). A later same-digest row cannot replace the reviewed row, and a unique constraint prevents a second request-level apply. Human per-step approval is disabled: its portal control is absent and the route returns <code>409 Conflict</code> without minting.</li>
+<li>The protocol-v6 agent only acts if <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, it has pinned the control-plane public key, and external containment is available. It verifies the embedded IaC digest and refuses unless <strong>all</strong> hold: the grant signature verifies; its full JobSpec digest and exact plan row/attempt match; request, platform, step, mode, state owner, planning-agent enrollment/key/profile, and expiry match; and the freshly computed plan digest matches the approved one. Protocol v1 through v5 is rejected. Plan, apply, and destroy for a state key remain pinned to the same agent.</li>
+<li>Once containment is implemented, the LiveApply path will apply only the fresh binary plan whose canonical JSON digest matched the reviewed plan. Binary <code>tfplan</code> bytes are not carried between jobs; digest equality is the approval invariant that closes the plan-then-apply TOCTOU gap. A post-apply plan must confirm convergence before the vSphere request can be verified as completed.</li>
 </ol>
-<p>   returns scrubbed evidence plus the plan digest.</p>
-<ol>
-<li>The control plane derives a digest-verified, allowlisted Plan Review from the</li>
-</ol>
-<p>   stored plan bytes. It exposes managed actions and request placement, never    raw Terraform JSON or provider object identifiers. Server apply approval is    refused if this projection cannot be derived.</p>
-<ol>
-<li>An <code>admin</code> approves via <code>POST /api/requests/{id}/approve-live-apply</code>. The</li>
-</ol>
-<p>   control plane mints a <code>LiveApply</code> grant <strong>signed with its Ed25519 key</strong>,    binding the request id, approved plan digest, full JobSpec digest (including    mode and state key), approver, and a short expiry (&lt;= 24 h). A unique constraint prevents a second request-level    live apply; in orchestrated multi-step runs each step gets exactly one    step-scoped <code>LiveApply</code>, gated by the step's <code>FOR UPDATE</code> approval lock    (migration 153).</p>
-<ol>
-<li>The protocol-v2 agent only acts if <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and it has</li>
-</ol>
-<p>   pinned the control-plane public key. It verifies the embedded IaC digest and    refuses unless <strong>all</strong> hold: the grant signature verifies; its full JobSpec    digest matches this exact job; request, step, mode, and state ownership match;    it has not expired; and the freshly computed plan digest <strong>matches</strong> the    approved one. Any mismatch produces a signed refusal and mutation is never    called. Plan, apply, and destroy for a state key are pinned to the same agent.</p>
-<ol>
-<li>On success the LiveApply job applies the fresh binary plan whose canonical</li>
-</ol>
-<p>   JSON digest matched the reviewed plan. Binary <code>tfplan</code> bytes are not carried    between jobs; digest equality is the approval invariant that closes the    plan-then-apply TOCTOU gap. A post-apply plan must confirm convergence before    the vSphere request can be verified as completed.</p>
-<p>Credentials never reach the control plane; the agent resolves them locally and all command output is scrubbed before it becomes signed evidence.</p>
+<p>Credentials never reach the control plane; the current agent environment seam resolves them locally and scrubs output before signing. Its free-form credential values and provider authority id/version are separate, non-atomic environment reads, however. A typed secret-manager connector and deployment readback must prove their exact version binding before provider-connected activation.</p>
 <h3 id="operator-flags">Operator flags</h3>
 <table><thead><tr><th>Flag</th><th>Side</th><th>Effect</th></tr></thead><tbody>
-<tr><td><code>RYUKI_AGENT_ALLOW_LIVE</code></td><td>Agent</td><td><code>true</code>/<code>1</code> unlocks <code>LivePlan</code>/<code>LiveApply</code>/<code>LiveDestroy</code>; anything else = dry-run only. Cleartext non-loopback URLs are rejected at startup.</td></tr>
+<tr><td><code>RYUKI_AGENT_ALLOW_LIVE</code></td><td>Agent</td><td><code>true</code>/<code>1</code> passes the live-mode configuration gate; it does not bypass the missing descendant-containment capability, so external spawn still fails closed. Anything else is dry-run-only. Cleartext non-loopback URLs are rejected at startup.</td></tr>
 <tr><td><code>RYUKI_AGENT_CP_URL</code> / <code>RYUKI_AGENT_TOKEN</code> / <code>RYUKI_AGENT_KEY_PATH</code></td><td>Agent</td><td>CP endpoint (HTTPS for live), enrolment token, and the agent signing key.</td></tr>
-<tr><td><code>RYUKI_AGENT_BACKEND_HCL</code></td><td>Agent</td><td>Durable Terraform backend template. The active path/key attribute must contain <code>{STATE_KEY}</code> for per-request/per-step isolation; comments and unrelated attributes do not satisfy the gate. Remote authentication must work within the agent's minimal environment because arbitrary backend credential variables are not passed through.</td></tr>
-<tr><td><code>RYUKI_CP_SIGNING_KEY_PATH</code></td><td>Control plane</td><td>CP Ed25519 grant-signing key (created at <code>0600</code> on first boot).</td></tr>
+<tr><td><code>RYUKI_AGENT_BACKEND_HCL</code></td><td>Agent</td><td>Terraform backend template. The active path/key attribute must contain <code>{STATE_KEY}</code> for per-request/per-step isolation; comments and unrelated attributes do not satisfy the gate. Remote-execution backend type <code>remote</code> is rejected. A privacy-safe semantic authority digest is bound from plan through mutation.</td></tr>
+<tr><td><code>RYUKI_LIVE_PROVIDER_AUTHORITY_ID</code> / <code>RYUKI_LIVE_PROVIDER_AUTHORITY_VERSION</code></td><td>Agent</td><td>Non-secret opaque provisioning-record reference and immutable version for the exact vSphere destination/account credential set. Missing/malformed metadata fails live profile minting; changing the set requires version rotation and reapproval.</td></tr>
+<tr><td><code>RYUKI_CP_SIGNING_KEY_PATH</code></td><td>Control plane</td><td>CP Ed25519 grant-signing key path. First-boot local creation is disposable development behavior only; production requires externally governed key custody, rotation, and recovery evidence.</td></tr>
 </tbody></table>
 <h3 id="maturity">Maturity</h3>
-<p>The dry-run pipeline, the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply), agent-side <code>LiveApply</code> and <code>LiveDestroy</code> execution, the provider credential-injection path, and a Vault KV v2 resolver are covered by repository and CI tests. A provider-connected vSphere run is not accepted until the operator-owned gates in <a href="first-test.html">First Test Acceptance</a> pass against an approved disposable target. It requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials via <code>RYUKI_LIVE_CRED_&lt;NAME&gt;</code>, and a durable isolated state backend. The vendor-API adapters for a given provider are enabled per integration as you go live.</p>
+<p>The no-provider-authority/no-spawn dry-run protocol path, the live trust gate (exact plan-row/spec/authority grant signing and verification, digest integrity, refusal reporting, and no-double-apply), credential-resolution comparisons, and a Vault KV v2 control-plane resolver are covered by repository tests. These are protocol and pure/stub acceptance paths, not production external execution. Terraform and Ansible <code>OfflineDryRun</code>, <code>LivePlan</code>, <code>LiveApply</code>, and <code>LiveDestroy</code> all remain unavailable until a sealed per-command descendant-containment adapter exists. Provider-connected activation additionally requires the operator-owned gates in <a href="first-test.html">First Test Acceptance</a>, a typed versioned credential/authority connector with deployment readback, a durable isolated state backend, and an approved disposable target.</p>
 <p>Automatic <code>LiveDestroy</code> is compensation for a failed multi-step run. There is not yet an operator-triggered destroy endpoint for a successful single-job request, so the first live test must approve and rehearse a state-keyed cleanup procedure before apply. See <a href="first-test.html">First Test Acceptance</a>.</p>
-<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/first-test.html">&larr; First Test Acceptance</a><a href="/configuration.html">Configuration &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-11 · <a href="https://github.com/mvandenbulcke/ryuki.io/edit/main/docs/architecture.md" target="_blank" rel="noopener">Edit this page on GitHub</a></div><nav class="foot-nav"><a href="/first-test.html">&larr; First Test Acceptance</a><a href="/platform-security-boundary.html">Platform Security Boundary &rarr;</a></nav>
 </main>
 </div>
 <script>

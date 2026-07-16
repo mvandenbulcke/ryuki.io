@@ -14,12 +14,28 @@
 //! | `RYUKI_AGENT_TOKEN`                    | `token`                    | (unset) — see token precedence |
 //! | `RYUKI_AGENT_TOKEN_PATH`               | `token_path`               | `agent.token` next to the key file |
 //! | `RYUKI_AGENT_SELF_REGISTER`            | `self_register`            | `false` |
+//! | `RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID`  | `enrollment_challenge_id`  | (required with self-registration) |
+//! | `RYUKI_AGENT_ENROLLMENT_CHALLENGE`     | `enrollment_challenge`     | (required with self-registration) |
+//! | `RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK`  | loopback HTTP development policy | `false` |
 //! | `RYUKI_AGENT_KEY_PATH`                 | `key_path`                 | `agent.key` (cwd) |
 //! | `RYUKI_AGENT_POLL_INTERVAL_SECS`       | `poll_interval_secs`       | 10      |
 //! | `RYUKI_AGENT_LEASE_SECS`               | `lease_secs`               | 300     |
 //! | `RYUKI_AGENT_ALLOW_LIVE`               | `allow_live`               | `false` |
 //! | `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`      | `max_outbox_attempts`      | 10      |
 //! | `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS` | `outbox_drain_interval_secs` | 60  |
+//!
+//! ## Runner executable approval
+//!
+//! The runner crate reads `RYUKI_TERRAFORM_EXECUTABLE` plus
+//! `RYUKI_TERRAFORM_EXPECTED_VERSION`, and
+//! `RYUKI_ANSIBLE_PLAYBOOK_EXECUTABLE` plus
+//! `RYUKI_ANSIBLE_PLAYBOOK_EXPECTED_VERSION`, only when the corresponding tool
+//! is needed. Paths must be absolute and canonical. Optional
+//! `RYUKI_TERRAFORM_EXECUTABLE_SHA256` and
+//! `RYUKI_ANSIBLE_PLAYBOOK_EXECUTABLE_SHA256` values add content pins. These
+//! values are intentionally not fields on `AgentConfig`: the executable is
+//! admitted at the command boundary immediately before use, so credentials
+//! cannot be attached to a merely startup-checked path.
 //!
 //! ### Token resolution precedence (S5 self-registration)
 //!
@@ -32,9 +48,25 @@
 //!    A file that exists but is malformed is FATAL, never a fall-through.
 //! 3. First-boot self-registration, only when `RYUKI_AGENT_SELF_REGISTER` is
 //!    `"true"` / `"1"` (same strict opt-in parse as `RYUKI_AGENT_ALLOW_LIVE`):
-//!    the agent registers with the CP, persists the returned token to the
+//!    trusted provisioning must also supply the paired challenge id and
+//!    one-time challenge. The agent signs that exact claim with its existing
+//!    Ed25519 key, registers with the CP, persists the returned token to the
 //!    token file, and exits 0 pending admin approval.
 //! 4. Otherwise startup fails with an error naming all three options.
+//!
+//! Existing token paths are resolved through pinned handles without following
+//! symlinks in any component and validated from the final opened handle. On Unix
+//! they must be regular, owned by the effective service UID, and grant no
+//! permissions to group/other users. Platforms without an equivalent
+//! owner/DACL/reparse-point adapter fail closed.
+//!
+//! ### `RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK`
+//!
+//! Plain HTTP is denied by default for every execution mode and token source.
+//! Local development/test harnesses may opt in with the exact value `true` or
+//! `1`, but the parsed destination must still be `localhost` or a standard-
+//! library-confirmed IPv4/IPv6 loopback literal. Redirects remain disabled and
+//! ambient proxies are bypassed for this local-only exception.
 //!
 //! ### `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`
 //!
@@ -66,7 +98,12 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use ryuki_protocol::Capabilities;
+use ryuki_protocol::{
+    Capabilities, AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES, AGENT_ENROLLMENT_CHALLENGE_PREFIX,
+};
+use uuid::Uuid;
+
+use crate::client::ControlPlaneEndpoint;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -94,10 +131,16 @@ pub enum ConfigError {
 /// would leak the token into any `tracing` call that formats the config.
 #[derive(Clone)]
 pub struct AgentConfig {
-    /// Base URL of the Ryuki control plane (e.g. `https://ryuki.example.com`).
-    /// Trailing slash is stripped on construction so callers can always append
-    /// a path directly.
-    pub cp_base_url: String,
+    /// Parsed, transport-validated URL of the Ryuki control plane.
+    ///
+    /// HTTPS is mandatory. Plain HTTP is admitted only for an exact loopback
+    /// endpoint when `RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK=true` (or `1`) is
+    /// explicitly set for a local development/test harness.
+    pub cp_base_url: ControlPlaneEndpoint,
+
+    /// Whether the explicit loopback-only HTTP development policy was enabled.
+    /// Remote HTTP remains invalid even when this is true.
+    pub allow_insecure_loopback: bool,
 
     /// Platform / site identifier this agent serves (e.g. `defra`).
     pub platform: String,
@@ -112,7 +155,9 @@ pub struct AgentConfig {
     /// self-registration disabled, startup fails.
     pub token: Option<String>,
 
-    /// Path to the on-disk bearer-token file (plaintext `rya_…` + newline, 0600).
+    /// Path to the on-disk bearer-token file (plaintext `rya_…` + newline).
+    /// Existing Unix files must be effective-UID-owned regular files with no
+    /// group/other permission bits (0400 and 0600 are both accepted).
     ///
     /// Set via `RYUKI_AGENT_TOKEN_PATH`; defaults to `agent.token` in the SAME
     /// directory as `key_path` — token and key share one operational blast
@@ -126,6 +171,14 @@ pub struct AgentConfig {
     /// never an error. Only consulted when neither `RYUKI_AGENT_TOKEN` nor the
     /// token file provides a token.
     pub self_register: bool,
+
+    /// Trusted provisioning challenge identifier consumed on first-boot
+    /// registration. It is not a durable identity credential.
+    pub enrollment_challenge_id: Option<Uuid>,
+
+    /// One-time challenge secret delivered through the deployment's existing
+    /// provider-neutral secret/bootstrap channel. `Debug` always redacts it.
+    pub enrollment_challenge: Option<String>,
 
     /// Path to the on-disk Ed25519 secret key file (binary, 32 bytes, 0600).
     pub key_path: PathBuf,
@@ -172,11 +225,17 @@ impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
             .field("cp_base_url", &self.cp_base_url)
+            .field("allow_insecure_loopback", &self.allow_insecure_loopback)
             .field("platform", &self.platform)
             // Presence only — Some("<redacted>") / None — never the value.
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("token_path", &self.token_path)
             .field("self_register", &self.self_register)
+            .field("enrollment_challenge_id", &self.enrollment_challenge_id)
+            .field(
+                "enrollment_challenge",
+                &self.enrollment_challenge.as_ref().map(|_| "<redacted>"),
+            )
             .field("key_path", &self.key_path)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("lease_secs", &self.lease_secs)
@@ -215,19 +274,23 @@ impl AgentConfig {
     /// Returns `Err` if any *required* variable is absent or if an optional
     /// variable has an invalid value (e.g. non-numeric interval).
     pub fn from_source(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let cp_base_url = require(&get, "RYUKI_AGENT_CP_URL")?;
-        // Strip trailing slash for consistent path construction.
-        let cp_base_url = cp_base_url.trim_end_matches('/').to_owned();
-        // The bearer token is sent on every request, so the transport must be
-        // a URL we recognise. (HTTPS is not hard-required because the e2e tests
-        // and local runs use http://127.0.0.1; main.rs warns on cleartext.)
-        if !(cp_base_url.starts_with("http://") || cp_base_url.starts_with("https://")) {
-            return Err(ConfigError::InvalidEnv {
+        let raw_cp_base_url = require(&get, "RYUKI_AGENT_CP_URL")?;
+        // Plain HTTP is never inferred from execution mode or hostname. It is
+        // a separate, strict development/test opt-in, and the endpoint parser
+        // still limits it to exact loopback destinations.
+        let allow_insecure_loopback = matches!(
+            get("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK").as_deref(),
+            Some("true") | Some("1")
+        );
+        // This admission gate runs before platform/token/file parsing. A bad
+        // transport therefore fails startup before any credential is resolved.
+        let cp_base_url = ControlPlaneEndpoint::parse(&raw_cp_base_url, allow_insecure_loopback)
+            .map_err(|e| ConfigError::InvalidEnv {
                 var: "RYUKI_AGENT_CP_URL",
-                value: cp_base_url,
-                reason: "must start with http:// or https://".to_owned(),
-            });
-        }
+                // A rejected URL may contain userinfo; never copy it into logs.
+                value: "<redacted>".to_owned(),
+                reason: e.to_string(),
+            })?;
 
         let platform = require(&get, "RYUKI_AGENT_PLATFORM")?;
         // platform is interpolated into URL path segments, so constrain it to a
@@ -283,6 +346,53 @@ impl AgentConfig {
             Some("true") | Some("1")
         );
 
+        let enrollment_challenge_id =
+            match get("RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID")
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(value) => Some(Uuid::parse_str(value.trim()).map_err(|error| {
+                    ConfigError::InvalidEnv {
+                        var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+                        value,
+                        reason: error.to_string(),
+                    }
+                })?),
+                None => None,
+            };
+        let enrollment_challenge =
+            get("RYUKI_AGENT_ENROLLMENT_CHALLENGE").filter(|value| !value.trim().is_empty());
+        if let Some(challenge) = enrollment_challenge.as_deref() {
+            let expected_len =
+                AGENT_ENROLLMENT_CHALLENGE_PREFIX.len() + AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES;
+            let valid = challenge.len() == expected_len
+                && challenge.starts_with(AGENT_ENROLLMENT_CHALLENGE_PREFIX)
+                && challenge[AGENT_ENROLLMENT_CHALLENGE_PREFIX.len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+            if !valid {
+                return Err(ConfigError::InvalidEnv {
+                    var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE",
+                    value: "<redacted>".to_owned(),
+                    reason: format!(
+                        "must be {AGENT_ENROLLMENT_CHALLENGE_PREFIX} followed by exactly {AGENT_ENROLLMENT_CHALLENGE_HEX_BYTES} lowercase hexadecimal characters"
+                    ),
+                });
+            }
+        }
+        if enrollment_challenge_id.is_some() != enrollment_challenge.is_some() {
+            return Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+                value: "<redacted>".to_owned(),
+                reason: "the challenge id and one-time challenge must be configured together"
+                    .to_owned(),
+            });
+        }
+        if self_register && enrollment_challenge_id.is_none() {
+            return Err(ConfigError::MissingEnv {
+                var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+            });
+        }
+
         let poll_interval_secs = optional_u64(&get, "RYUKI_AGENT_POLL_INTERVAL_SECS", 10)?;
         // A zero poll interval would busy-loop the pull-loop (heartbeat + poll
         // with no sleep), hammering the control plane. Reject it explicitly.
@@ -305,23 +415,6 @@ impl AgentConfig {
             Some("true") | Some("1")
         );
 
-        // SECURITY: a live-capable agent bootstraps trust by fetching the CP
-        // public key over `cp_base_url` (then verifying every grant against it).
-        // Over cleartext http:// a network MITM could substitute its own key and
-        // forge approval grants — so live execution requires https://, except a
-        // loopback URL (local dev / the e2e harness). Fail closed at startup.
-        if allow_live && cp_base_url.starts_with("http://") && !is_loopback_url(&cp_base_url) {
-            return Err(ConfigError::InvalidEnv {
-                var: "RYUKI_AGENT_ALLOW_LIVE",
-                value: "true".to_owned(),
-                reason: format!(
-                    "live execution requires an https:// control-plane URL (got cleartext \
-                     {cp_base_url}); a MITM over http:// could substitute the CP signing key and \
-                     forge grants. Use https://, or a loopback URL for local testing"
-                ),
-            });
-        }
-
         let max_outbox_attempts = optional_u32(&get, "RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS", 10)?;
         if max_outbox_attempts == 0 {
             return Err(ConfigError::InvalidEnv {
@@ -343,10 +436,13 @@ impl AgentConfig {
 
         Ok(Self {
             cp_base_url,
+            allow_insecure_loopback,
             platform,
             token,
             token_path,
             self_register,
+            enrollment_challenge_id,
+            enrollment_challenge,
             key_path,
             poll_interval_secs,
             lease_secs,
@@ -371,23 +467,6 @@ fn require(
     get(var)
         .filter(|v| !v.trim().is_empty())
         .ok_or(ConfigError::MissingEnv { var })
-}
-
-/// True if `url` (http:// or https://) targets a loopback authority. Used to
-/// allow cleartext only for local dev/test. The authority is matched exactly (or
-/// with a `:port`) so a hostname like `127.0.0.1.evil.com` is NOT treated as
-/// loopback.
-fn is_loopback_url(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    // Authority is everything up to the first '/'.
-    let authority = rest.split('/').next().unwrap_or(rest);
-    const LOOPBACKS: &[&str] = &["localhost", "127.0.0.1", "[::1]", "0.0.0.0"];
-    LOOPBACKS
-        .iter()
-        .any(|h| authority == *h || authority.starts_with(&format!("{h}:")))
 }
 
 /// True if `s` is a non-empty ASCII slug (alphanumeric, '.', '-' or '_').
@@ -458,8 +537,9 @@ mod tests {
             ("RYUKI_AGENT_LEASE_SECS", "600"),
         ]))
         .expect("must parse");
-        // Trailing slash must be stripped.
-        assert_eq!(cfg.cp_base_url, "https://cp.example.com");
+        // Operator-facing form remains normalized without a trailing slash.
+        assert_eq!(cfg.cp_base_url.to_string(), "https://cp.example.com");
+        assert!(!cfg.allow_insecure_loopback);
         assert_eq!(cfg.platform, "defra");
         assert_eq!(cfg.token, Some("rya_abc123".to_owned()));
         assert_eq!(cfg.key_path, PathBuf::from("/etc/ryuki/agent.key"));
@@ -482,6 +562,10 @@ mod tests {
         // Default key is in cwd → default token file is `agent.token` in cwd.
         assert_eq!(cfg.token_path, PathBuf::from("agent.token"));
         assert!(!cfg.self_register, "self_register must default to false");
+        assert!(
+            !cfg.allow_insecure_loopback,
+            "insecure loopback transport must default to false"
+        );
         assert_eq!(cfg.poll_interval_secs, 10);
         assert_eq!(cfg.lease_secs, 300);
     }
@@ -669,6 +753,14 @@ mod tests {
         let base = [
             ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
             ("RYUKI_AGENT_PLATFORM", "defra"),
+            (
+                "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "RYUKI_AGENT_ENROLLMENT_CHALLENGE",
+                "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
         ];
         let with = |val: Option<&str>| {
             let mut pairs: Vec<(&str, &str)> = base.to_vec();
@@ -686,6 +778,40 @@ mod tests {
                 "RYUKI_AGENT_SELF_REGISTER={garbage:?} must be treated as false"
             );
         }
+    }
+
+    #[test]
+    fn self_registration_requires_a_complete_canonical_challenge() {
+        let missing = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_SELF_REGISTER", "true"),
+        ]));
+        assert!(matches!(
+            missing,
+            Err(ConfigError::MissingEnv {
+                var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID"
+            })
+        ));
+
+        let malformed = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_SELF_REGISTER", "true"),
+            (
+                "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            ("RYUKI_AGENT_ENROLLMENT_CHALLENGE", "ryc_NOT-SECRET"),
+        ]));
+        assert!(matches!(
+            malformed,
+            Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_ENROLLMENT_CHALLENGE",
+                value,
+                ..
+            }) if value == "<redacted>"
+        ));
     }
 
     #[test]
@@ -709,23 +835,65 @@ mod tests {
     }
 
     #[test]
-    fn allow_live_over_cleartext_remote_is_rejected() {
+    fn remote_cleartext_is_rejected_for_every_execution_mode() {
+        for allow_live in ["false", "true"] {
+            let result = AgentConfig::from_source(src(&[
+                ("RYUKI_AGENT_CP_URL", "http://cp.example.com"),
+                ("RYUKI_AGENT_PLATFORM", "defra"),
+                ("RYUKI_AGENT_TOKEN", "rya_tok"),
+                ("RYUKI_AGENT_ALLOW_LIVE", allow_live),
+            ]));
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidEnv {
+                        var: "RYUKI_AGENT_CP_URL",
+                        ..
+                    })
+                ),
+                "remote HTTP must be rejected when allow_live={allow_live}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_switch_does_not_admit_remote_cleartext() {
         let result = AgentConfig::from_source(src(&[
             ("RYUKI_AGENT_CP_URL", "http://cp.example.com"),
             ("RYUKI_AGENT_PLATFORM", "defra"),
             ("RYUKI_AGENT_TOKEN", "rya_tok"),
-            ("RYUKI_AGENT_ALLOW_LIVE", "true"),
+            ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", "true"),
         ]));
         assert!(
             matches!(
                 result,
                 Err(ConfigError::InvalidEnv {
-                    var: "RYUKI_AGENT_ALLOW_LIVE",
+                    var: "RYUKI_AGENT_CP_URL",
                     ..
                 })
             ),
-            "allow_live over cleartext http:// to a remote host must be rejected"
+            "the development switch must never admit a remote HTTP host"
         );
+    }
+
+    #[test]
+    fn invalid_transport_fails_before_credential_configuration_is_read() {
+        let result = AgentConfig::from_source(|var| {
+            match var {
+            "RYUKI_AGENT_CP_URL" => Some("http://cp.example.com".to_owned()),
+            "RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK" => None,
+            other => panic!(
+                "transport rejection must dominate platform/token/file/self-registration reads; accessed {other}"
+            ),
+        }
+        });
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_CP_URL",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -741,10 +909,29 @@ mod tests {
     }
 
     #[test]
-    fn allow_live_over_loopback_http_is_allowed() {
-        // Local dev / e2e harness uses http://127.0.0.1.
+    fn loopback_http_requires_explicit_switch() {
+        let result = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "http://127.0.0.1:8081"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+        ]));
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidEnv {
+                    var: "RYUKI_AGENT_CP_URL",
+                    ..
+                })
+            ),
+            "loopback HTTP must be rejected without the dedicated opt-in"
+        );
+    }
+
+    #[test]
+    fn explicit_switch_admits_only_loopback_http() {
         for url in [
             "http://127.0.0.1:8081",
+            "http://127.42.7.9:8081",
             "http://localhost:8080",
             "http://[::1]:8081",
         ] {
@@ -752,40 +939,72 @@ mod tests {
                 ("RYUKI_AGENT_CP_URL", url),
                 ("RYUKI_AGENT_PLATFORM", "defra"),
                 ("RYUKI_AGENT_TOKEN", "rya_tok"),
+                ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", "true"),
                 ("RYUKI_AGENT_ALLOW_LIVE", "true"),
             ]))
-            .unwrap_or_else(|e| panic!("allow_live over loopback {url} must be accepted: {e}"));
+            .unwrap_or_else(|e| panic!("explicit loopback endpoint {url} must be accepted: {e}"));
             assert!(cfg.allow_live);
+            assert!(cfg.allow_insecure_loopback);
+            assert!(cfg.cp_base_url.is_insecure_loopback());
         }
     }
 
     #[test]
-    fn cleartext_remote_allowed_when_live_disabled() {
-        // Without allow_live the agent only does OfflineDryRun; cleartext is
-        // permitted (a warning is logged) since no CP-key trust is bootstrapped.
-        let cfg = AgentConfig::from_source(src(&[
-            ("RYUKI_AGENT_CP_URL", "http://cp.example.com"),
-            ("RYUKI_AGENT_PLATFORM", "defra"),
-            ("RYUKI_AGENT_TOKEN", "rya_tok"),
-        ]))
-        .expect("cleartext is allowed when live is disabled");
-        assert!(!cfg.allow_live);
+    fn insecure_loopback_switch_uses_strict_opt_in_values() {
+        for enabled in ["true", "1"] {
+            let cfg = AgentConfig::from_source(src(&[
+                ("RYUKI_AGENT_CP_URL", "http://127.0.0.1:8081"),
+                ("RYUKI_AGENT_PLATFORM", "defra"),
+                ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", enabled),
+            ]))
+            .expect("true/1 must enable loopback HTTP");
+            assert!(cfg.allow_insecure_loopback);
+        }
+        for disabled in ["yes", "TRUE", "on", "0", "false", ""] {
+            let result = AgentConfig::from_source(src(&[
+                ("RYUKI_AGENT_CP_URL", "http://127.0.0.1:8081"),
+                ("RYUKI_AGENT_PLATFORM", "defra"),
+                ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", disabled),
+            ]));
+            assert!(
+                result.is_err(),
+                "{disabled:?} must not enable the loopback HTTP exception"
+            );
+        }
     }
 
     #[test]
-    fn loopback_lookalike_host_is_not_loopback() {
-        // A hostname that merely STARTS WITH a loopback literal must not be
-        // treated as loopback.
-        let result = AgentConfig::from_source(src(&[
-            ("RYUKI_AGENT_CP_URL", "http://127.0.0.1.evil.com"),
-            ("RYUKI_AGENT_PLATFORM", "defra"),
-            ("RYUKI_AGENT_TOKEN", "rya_tok"),
-            ("RYUKI_AGENT_ALLOW_LIVE", "true"),
-        ]));
-        assert!(
-            result.is_err(),
-            "a loopback-lookalike host must not bypass the https requirement"
-        );
+    fn malformed_or_unsafe_control_plane_urls_are_rejected_and_redacted() {
+        for url in [
+            "http://127.0.0.1.evil.com",
+            "http://localhost.evil.example",
+            "http://0.0.0.0:8081",
+            "https://0.0.0.0:8443",
+            "https://[::]:8443",
+            "http://localhost:8081@evil.example",
+            "http://@localhost:8081",
+            "https://user@cp.example.com",
+            "https://cp.example.com?next=http://evil.example",
+            "https://cp.example.com#fragment",
+            "https://",
+        ] {
+            let result = AgentConfig::from_source(src(&[
+                ("RYUKI_AGENT_CP_URL", url),
+                ("RYUKI_AGENT_PLATFORM", "defra"),
+                ("RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK", "true"),
+            ]));
+            match result {
+                Err(ConfigError::InvalidEnv {
+                    var,
+                    value,
+                    reason: _,
+                }) => {
+                    assert_eq!(var, "RYUKI_AGENT_CP_URL", "unexpected error for {url}");
+                    assert_eq!(value, "<redacted>", "rejected URL must not enter logs");
+                }
+                other => panic!("unsafe URL {url:?} must be rejected, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -794,6 +1013,14 @@ mod tests {
             ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
             ("RYUKI_AGENT_PLATFORM", "defra"),
             ("RYUKI_AGENT_TOKEN", "rya_supersecret"),
+            (
+                "RYUKI_AGENT_ENROLLMENT_CHALLENGE_ID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "RYUKI_AGENT_ENROLLMENT_CHALLENGE",
+                "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
         ]))
         .expect("must parse");
         let dbg = format!("{cfg:?}");
@@ -802,6 +1029,10 @@ mod tests {
             "Debug output must not contain the token"
         );
         assert!(dbg.contains("<redacted>"), "Debug must show <redacted>");
+        assert!(
+            !dbg.contains("0123456789abcdef0123456789abcdef"),
+            "Debug output must not contain the one-time enrollment challenge"
+        );
     }
 
     // -----------------------------------------------------------------------

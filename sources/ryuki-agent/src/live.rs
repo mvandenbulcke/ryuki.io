@@ -50,8 +50,11 @@ use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
 use ryuki_protocol::{
-    crypto::{decode_verifying_key, job_spec_digest, verify_vlc, VerifyError},
-    Job, JobMode,
+    crypto::{
+        decode_verifying_key, execution_trust_profile_digest, job_spec_digest,
+        public_key_fingerprint, verify_vlc, VerifyError,
+    },
+    ExecutionTrustProfile, Job, JobMode,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +83,43 @@ pub enum LiveDecision {
     /// The agent refuses to execute — the contained string is a human-readable
     /// reason suitable for inclusion in the signed result's evidence.
     Refused(String),
+}
+
+/// Compare the locally authenticated agent key and the execution profile
+/// recomputed from current local configuration with the CP-signed successful-
+/// plan authority. Callers run this only after the VLC signature gate, and
+/// before any Terraform init/plan/backend/provider contact.
+pub fn evaluate_execution_trust_binding(
+    job: &Job,
+    agent_id: &str,
+    agent_public_key: &str,
+    current_profile: &ExecutionTrustProfile,
+) -> LiveDecision {
+    let Some(grant) = job.live_context.as_ref() else {
+        return LiveDecision::Refused("live execution requires a control-plane grant".to_string());
+    };
+    let authority = &grant.execution_authority;
+    if authority.assigned_agent_id != agent_id {
+        return LiveDecision::Refused(
+            "grant is assigned to a different planning agent".to_string(),
+        );
+    }
+    if authority.assigned_agent_enrollment_id != job.agent_enrollment_id {
+        return LiveDecision::Refused(
+            "grant is assigned to a different immutable enrollment".to_string(),
+        );
+    }
+    if authority.assigned_agent_key_fingerprint != public_key_fingerprint(agent_public_key) {
+        return LiveDecision::Refused(
+            "grant is assigned to a different enrollment key".to_string(),
+        );
+    }
+    if authority.execution_trust_profile_digest != execution_trust_profile_digest(current_profile) {
+        return LiveDecision::Refused(
+            "current execution trust profile differs from the approved plan".to_string(),
+        );
+    }
+    LiveDecision::Proceed
 }
 
 // ---------------------------------------------------------------------------
@@ -114,16 +154,17 @@ pub enum LiveDecision {
 ///   1. `allow_live` is `true`
 ///   2. `job.live_context` is `Some(grant)`
 ///   3. `verify_vlc(grant, cp_verifying_key)` succeeds
-///   4. `grant.job_spec_digest == job_spec_digest(job.spec)`
-///   5. `grant.request_id == job.spec.request_id`
-///   6. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
+///   4. `grant.platform == job.platform`
+///   5. `grant.job_spec_digest == job_spec_digest(job.spec)`
+///   6. `grant.request_id == job.spec.request_id`
+///   7. (#42 slice A) if `grant.step_job_id` is `Some(bound_id)`, then
 ///      `bound_id == job.id` — a step-scoped grant only authorises the ONE
 ///      dispatched step job it was minted for, preventing replay across
 ///      steps and across re-dispatches (a re-dispatch mints a fresh job id).
-///      `None` is the legacy/whole-request grant and is UNCHANGED: this check
-///      is skipped entirely.
-///   7. `grant.expiry > Utc::now()`
-///   8. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
+///      `None` is the whole-request grant shape, so the step-id comparison is
+///      skipped.
+///   8. `grant.expiry > Utc::now()`
+///   9. `replanned_plan_digest == Some(&grant.approved_plan_digest)`
 ///
 /// Any failure → `Refused` with a specific reason string.
 pub fn evaluate_live_execution(
@@ -155,8 +196,8 @@ pub fn evaluate_live_execution(
 
         // LiveDestroy also mutates (it DESTROYS the step's applied resources for
         // #42's auto compensating teardown). It requires the SAME step-bound,
-        // CP-signed grant as LiveApply (checks 1-6), but has NO plan-then-apply
-        // digest match (check 7): a destroy removes the step's own isolated
+        // CP-signed grant as LiveApply (checks 1-8), but has NO plan-then-apply
+        // digest match (check 9): a destroy removes the step's own isolated
         // workspace state, not a pre-approved plan. `replanned_plan_digest` is
         // therefore irrelevant here.
         JobMode::LiveDestroy => evaluate_live_destroy(job, cp_verifying_key, allow_live),
@@ -190,11 +231,11 @@ pub fn evaluate_live_authority(
 }
 
 /// Shared grant checks for the mutating live modes (`LiveApply` /
-/// `LiveDestroy`) — checks 1-6, in strict order; the first failure returns a
+/// `LiveDestroy`) — checks 1-8, in strict order; the first failure returns a
 /// `Refused` decision. Returns the verified grant so the caller can apply its
 /// mode-specific final check (LiveApply's plan-then-apply digest match, check
-/// 7). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
-/// signature, request binding, step binding, and expiry.
+/// 9). Extracted so LiveApply and LiveDestroy share IDENTICAL grant rigor:
+/// signature, platform/request binding, step binding, and expiry.
 fn verify_live_grant<'g>(
     job: &'g Job,
     cp_verifying_key: &VerifyingKey,
@@ -228,7 +269,16 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 4: the signed grant must authorize this EXACT canonical JobSpec.
+    // Check 4: the signed grant must authorize this EXACT destination. A grant
+    // for another platform remains invalid even when it has a genuine CP
+    // signature and an otherwise identical JobSpec.
+    if grant.platform != job.platform {
+        return Err(LiveDecision::Refused(
+            "grant is for a different platform".to_owned(),
+        ));
+    }
+
+    // Check 5: the signed grant must authorize this EXACT canonical JobSpec.
     // This binds mode, IaC, variables, and state_key before apply/destroy can
     // run. The CP's later result-digest verification is too late to prevent a
     // mutation, so the agent must enforce this independently up front.
@@ -238,14 +288,14 @@ fn verify_live_grant<'g>(
         ));
     }
 
-    // Check 5: the grant must be for THIS job's request.
+    // Check 6: the grant must be for THIS job's request.
     if grant.request_id != job.spec.request_id {
         return Err(LiveDecision::Refused(
             "grant is for a different request".to_owned(),
         ));
     }
 
-    // Check 6 (#42 slice A / B2): the grant's step binding.
+    // Check 7 (#42 slice A / B2): the grant's step binding.
     //
     // A step-scoped grant (`step_job_id: Some`) may only be used against the ONE
     // dispatched step job it was minted for — closing cross-step replay (a grant
@@ -273,7 +323,7 @@ fn verify_live_grant<'g>(
         }
     }
 
-    // Check 7: the grant must not be expired.
+    // Check 8: the grant must not be expired.
     if grant.expiry <= Utc::now() {
         return Err(LiveDecision::Refused("grant has expired".to_owned()));
     }
@@ -365,7 +415,7 @@ mod tests {
     use rand::rngs::OsRng;
     use ryuki_protocol::{
         crypto::{encode_verifying_key, generate_keypair, sha256_hex, sign_vlc},
-        Job, JobLease, JobMode, JobSpec, JobStatus, VerifiedLiveContext,
+        Job, JobLease, JobMode, JobSpec, JobStatus, LiveExecutionAuthority, VerifiedLiveContext,
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -382,10 +432,19 @@ mod tests {
         (sk, vk)
     }
 
+    fn test_execution_authority() -> LiveExecutionAuthority {
+        LiveExecutionAuthority {
+            assigned_agent_id: "agent-test".to_string(),
+            assigned_agent_enrollment_id: Uuid::nil(),
+            assigned_agent_key_fingerprint: "sha256:test".to_string(),
+            execution_trust_profile_digest: sha256_hex(b"profile"),
+        }
+    }
+
     /// Build a valid, signed [`VerifiedLiveContext`] grant for `request_id`
-    /// using `cp_sk`.  The grant is valid for 1 hour from now.  `step_job_id`
-    /// is `None` — a legacy/whole-request grant (unchanged single-job trust
-    /// model). Use [`make_valid_step_grant`] for a step-scoped grant.
+    /// using `cp_sk`. The grant is valid for 1 hour from now and is bound to
+    /// the fixture's `defra` destination. `step_job_id` is `None`; use
+    /// [`make_valid_step_grant`] for a step-scoped grant.
     fn make_valid_grant(
         cp_sk: &ed25519_dalek::SigningKey,
         request_id: Uuid,
@@ -394,11 +453,15 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: None,
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -416,11 +479,15 @@ mod tests {
     ) -> VerifiedLiveContext {
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(spec),
             approved_plan_digest: approved_plan_digest.to_owned(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: Some(step_job_id),
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         sign_vlc(unsigned, cp_sk)
@@ -454,6 +521,7 @@ mod tests {
         };
         Job {
             id,
+            agent_enrollment_id: Uuid::nil(),
             platform: "defra".to_owned(),
             spec,
             status: JobStatus::Running,
@@ -466,6 +534,67 @@ mod tests {
             }),
             live_context,
         }
+    }
+
+    #[test]
+    fn execution_trust_binding_rejects_owner_enrollment_key_and_profile_drift() {
+        use crate::live_exec::{LiveExecutor, StubLiveExecutor};
+
+        let (cp_sk, _) = cp_keypair();
+        let agent_key = generate_keypair(&mut OsRng);
+        let agent_public_key = encode_verifying_key(&agent_key.verifying_key());
+        let agent_id = "agent-test";
+        let request_id = Uuid::new_v4();
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let profile =
+            StubLiveExecutor::with_plan(b"plan", ryuki_engine::runners::RunStatus::Applied)
+                .execution_trust_profile(&job.spec, &job.platform)
+                .expect("stub profile");
+        let mut grant = make_valid_grant(&cp_sk, request_id, &sha256_hex(b"plan"), &job.spec);
+        grant.execution_authority = LiveExecutionAuthority {
+            assigned_agent_id: agent_id.to_string(),
+            assigned_agent_enrollment_id: job.agent_enrollment_id,
+            assigned_agent_key_fingerprint: public_key_fingerprint(&agent_public_key),
+            execution_trust_profile_digest: execution_trust_profile_digest(&profile),
+        };
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            evaluate_execution_trust_binding(&job, agent_id, &agent_public_key, &profile),
+            LiveDecision::Proceed
+        );
+        assert!(matches!(
+            evaluate_execution_trust_binding(&job, "other-agent", &agent_public_key, &profile),
+            LiveDecision::Refused(_)
+        ));
+        let mut wrong_enrollment = job.clone();
+        wrong_enrollment.agent_enrollment_id = Uuid::new_v4();
+        assert!(matches!(
+            evaluate_execution_trust_binding(
+                &wrong_enrollment,
+                agent_id,
+                &agent_public_key,
+                &profile
+            ),
+            LiveDecision::Refused(_)
+        ));
+        let other_key = generate_keypair(&mut OsRng);
+        assert!(matches!(
+            evaluate_execution_trust_binding(
+                &job,
+                agent_id,
+                &encode_verifying_key(&other_key.verifying_key()),
+                &profile
+            ),
+            LiveDecision::Refused(_)
+        ));
+        let mut changed_profile = profile.clone();
+        changed_profile.containment_policy_version = "changed".to_string();
+        assert!(matches!(
+            evaluate_execution_trust_binding(&job, agent_id, &agent_public_key, &changed_profile),
+            LiveDecision::Refused(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -565,6 +694,23 @@ mod tests {
     }
 
     #[test]
+    fn live_grant_refuses_validly_signed_cross_platform_replay() {
+        let (cp_sk, vk) = cp_keypair();
+        let request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(b"the-plan");
+        let mut job = make_job(JobMode::LiveApply, request_id, None);
+        let mut grant = make_valid_grant(&cp_sk, request_id, &plan_digest, &job.spec);
+        grant.platform = "another-platform".to_owned();
+        grant.signature.clear();
+        job.live_context = Some(sign_vlc(grant, &cp_sk));
+
+        assert_eq!(
+            evaluate_live_execution(&job, &vk, true, Some(&plan_digest)),
+            LiveDecision::Refused("grant is for a different platform".to_owned())
+        );
+    }
+
+    #[test]
     fn live_grant_refuses_mode_tamper_before_destroy() {
         let (cp_sk, vk) = cp_keypair();
         let request_id = Uuid::new_v4();
@@ -631,11 +777,15 @@ mod tests {
         let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "attacker".to_owned(),
             expiry: Utc::now() + Duration::hours(1),
             step_job_id: None,
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         let forged_grant = sign_vlc(unsigned, &attacker_sk);
@@ -680,11 +830,15 @@ mod tests {
         let mut job = make_job(JobMode::LiveApply, request_id, None);
         let unsigned = VerifiedLiveContext {
             request_id,
+            platform: "defra".to_owned(),
             job_spec_digest: job_spec_digest(&job.spec),
             approved_plan_digest: plan_digest.clone(),
+            approved_plan_job_id: Uuid::new_v4(),
+            approved_plan_attempt_id: Uuid::new_v4(),
             approver: "ops-alice".to_owned(),
             expiry: Utc::now() - Duration::seconds(1), // in the past
             step_job_id: None,
+            execution_authority: test_execution_authority(),
             signature: String::new(),
         };
         let expired_grant = sign_vlc(unsigned, &cp_sk);

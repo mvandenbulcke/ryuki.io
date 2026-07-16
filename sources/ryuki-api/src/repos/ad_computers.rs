@@ -1,7 +1,9 @@
 //! Repository functions for `ad_computers`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Ordinary reads use `&PgPool`; mutations and reviewed recovery also accept a
+//! caller-owned transaction connection where atomic locking and audit are
+//! required. Operational paths expose only Verified rows whose exact persisted
+//! owner site is currently active.
 //!
 //! # CAS design
 //! `transition` uses a compare-and-set conditioned on BOTH `expected_status`
@@ -15,7 +17,8 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::ad_computer_lifecycle::{ADComputer, ComputerStatus};
-use sqlx::PgPool;
+use ryuki_engine::site_registry::DIRECTORY_NAMESPACE_POLICY_VERSION;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
@@ -33,6 +36,9 @@ pub const COLUMNS: &str = "id::text AS id, \
      os, \
      created_at, \
      updated_at, \
+     namespace_owner_site, \
+     namespace_policy_version, \
+     namespace_state, \
      metadata::text AS metadata";
 
 // ─── Row struct ──────────────────────────────────────────────────────────────
@@ -49,6 +55,9 @@ pub struct AdComputerRow {
     pub created_at: DateTime<Utc>,
     /// Optimistic-version CAS token — carried by callers into `transition`.
     pub updated_at: DateTime<Utc>,
+    pub namespace_owner_site: Option<String>,
+    pub namespace_policy_version: Option<String>,
+    pub namespace_state: String,
     /// Raw JSON text from `metadata::text` cast.
     pub metadata: String,
 }
@@ -74,6 +83,18 @@ impl AdComputerRow {
         }
 
         let status = decode_status(&self.status)?;
+        if self.namespace_state != "Verified" {
+            return Err(sqlx::Error::Decode(
+                "ad_computers: unverified namespace rows are not operational models".into(),
+            ));
+        }
+        if self.namespace_owner_site.as_deref() != Some(self.site.as_str())
+            || self.namespace_policy_version.as_deref() != Some(DIRECTORY_NAMESPACE_POLICY_VERSION)
+        {
+            return Err(sqlx::Error::Decode(
+                "ad_computers: verified namespace provenance is internally inconsistent".into(),
+            ));
+        }
 
         let metadata: std::collections::HashMap<String, String> =
             serde_json::from_str(&self.metadata).map_err(|e| {
@@ -129,11 +150,19 @@ pub async fn get(
         return Ok(None);
     };
 
-    let row: Option<AdComputerRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM ad_computers WHERE id = $1"))
-            .bind(uid)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<AdComputerRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM ad_computers \
+         WHERE id = $1 AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           )"
+    ))
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?;
 
     row.map(|r| r.into_model()).transpose()
 }
@@ -148,7 +177,14 @@ pub async fn get_by_name(
     name: &str,
 ) -> Result<Option<(ADComputer, DateTime<Utc>)>, sqlx::Error> {
     let row: Option<AdComputerRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM ad_computers WHERE name = $1"
+        "SELECT {COLUMNS} FROM ad_computers \
+         WHERE name = $1 AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           )"
     ))
     .bind(name)
     .fetch_optional(pool)
@@ -163,13 +199,27 @@ pub async fn get_by_name(
 pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<ADComputer>, sqlx::Error> {
     let rows: Vec<AdComputerRow> = if site.is_empty() {
         sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM ad_computers ORDER BY site, name"
+            "SELECT {COLUMNS} FROM ad_computers \
+             WHERE namespace_state = 'Verified' \
+               AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+             ) ORDER BY site, name"
         ))
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM ad_computers WHERE site = $1 ORDER BY name"
+            "SELECT {COLUMNS} FROM ad_computers \
+             WHERE site = $1 AND namespace_state = 'Verified' \
+               AND EXISTS ( \
+                    SELECT 1 FROM site_registry AS registry \
+                    WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                      AND registry.active \
+                      AND ad_computers.namespace_owner_site = ad_computers.site \
+               ) ORDER BY name"
         ))
         .bind(site)
         .fetch_all(pool)
@@ -209,8 +259,9 @@ pub async fn insert(
 
     let row: AdComputerRow = sqlx::query_as(&format!(
         "INSERT INTO ad_computers \
-         (id, name, site, ou_path, status, last_logon, os, created_at, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) \
+         (id, name, site, ou_path, status, last_logon, os, created_at, metadata, \
+          namespace_owner_site, namespace_policy_version, namespace_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, 'Verified') \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -222,6 +273,8 @@ pub async fn insert(
     .bind(&r.os)
     .bind(created_at)
     .bind(&metadata_json)
+    .bind(&r.site)
+    .bind(DIRECTORY_NAMESPACE_POLICY_VERSION)
     .fetch_one(executor)
     .await?;
 
@@ -263,6 +316,13 @@ pub async fn transition(
          metadata = $7::jsonb, \
          updated_at = NOW() \
          WHERE id = $1 AND status = $8 AND updated_at = $9 \
+           AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           ) \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
@@ -280,6 +340,205 @@ pub async fn transition(
     row.map(|r| r.into_model()).transpose()
 }
 
+// ─── Reviewed quarantine recovery ───────────────────────────────────────────
+
+const RECOVERY_REVIEW_COLUMNS: &str = "id, computer_id, expected_updated_at, reason, \
+     requested_by, approved_by, state, expires_at, approved_at";
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct QuarantineRecoveryReviewRow {
+    pub id: Uuid,
+    pub computer_id: Uuid,
+    pub expected_updated_at: DateTime<Utc>,
+    pub reason: String,
+    pub requested_by: String,
+    pub approved_by: Option<String>,
+    pub state: String,
+    pub expires_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+}
+
+/// Resolve the immutable computer id before acquiring locks. Recovery
+/// workflows then lock review rows before the computer row in every path.
+pub async fn id_by_name(conn: &mut PgConnection, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM ad_computers \
+         WHERE name = $1 AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           )",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+pub async fn get_by_name_for_update(
+    conn: &mut PgConnection,
+    name: &str,
+) -> Result<Option<(ADComputer, DateTime<Utc>, String)>, sqlx::Error> {
+    let row: Option<AdComputerRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM ad_computers \
+         WHERE name = $1 AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           ) FOR UPDATE"
+    ))
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    row.map(|row| {
+        let namespace_state = row.namespace_state.clone();
+        row.into_model()
+            .map(|(computer, updated_at)| (computer, updated_at, namespace_state))
+    })
+    .transpose()
+}
+
+pub async fn get_by_id_for_update(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Result<Option<(ADComputer, DateTime<Utc>, String)>, sqlx::Error> {
+    let row: Option<AdComputerRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM ad_computers \
+         WHERE id = $1 AND namespace_state = 'Verified' \
+           AND EXISTS ( \
+                SELECT 1 FROM site_registry AS registry \
+                WHERE registry.unlocode = ad_computers.namespace_owner_site \
+                  AND registry.active \
+                  AND ad_computers.namespace_owner_site = ad_computers.site \
+           ) FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    row.map(|row| {
+        let namespace_state = row.namespace_state.clone();
+        row.into_model()
+            .map(|(computer, updated_at)| (computer, updated_at, namespace_state))
+    })
+    .transpose()
+}
+
+pub async fn expire_recovery_reviews(
+    conn: &mut PgConnection,
+    computer_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "WITH writer_contract AS ( \
+             SELECT set_config('ryuki.ad_recovery_writer_contract', 'ad-recovery-v2', TRUE) \
+         ) \
+         UPDATE ad_quarantine_recovery_reviews \
+         SET state = 'Expired' \
+         FROM writer_contract \
+         WHERE computer_id = $1 \
+           AND state IN ('Pending', 'Approved') \
+           AND expires_at <= NOW()",
+    )
+    .bind(computer_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn create_recovery_review(
+    conn: &mut PgConnection,
+    computer_id: Uuid,
+    expected_updated_at: DateTime<Utc>,
+    reason: &str,
+    requested_by: &str,
+) -> Result<QuarantineRecoveryReviewRow, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "WITH writer_contract AS ( \
+             SELECT set_config('ryuki.ad_recovery_writer_contract', 'ad-recovery-v2', TRUE) \
+         ) \
+         INSERT INTO ad_quarantine_recovery_reviews \
+         (computer_id, expected_updated_at, reason, requested_by, expires_at) \
+         SELECT $1, $2, $3, $4, statement_timestamp() + INTERVAL '24 hours' \
+         FROM writer_contract \
+         RETURNING {RECOVERY_REVIEW_COLUMNS}"
+    ))
+    .bind(computer_id)
+    .bind(expected_updated_at)
+    .bind(reason)
+    .bind(requested_by)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+pub async fn get_recovery_review_for_update(
+    conn: &mut PgConnection,
+    review_id: Uuid,
+) -> Result<Option<QuarantineRecoveryReviewRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {RECOVERY_REVIEW_COLUMNS} \
+         FROM ad_quarantine_recovery_reviews AS review \
+         WHERE id = $1 \
+           AND EXISTS ( \
+                SELECT 1 \
+                FROM ad_computers AS computer \
+                JOIN site_registry AS registry \
+                  ON registry.unlocode = computer.namespace_owner_site \
+                WHERE computer.id = review.computer_id \
+                  AND computer.namespace_state = 'Verified' \
+                  AND computer.namespace_owner_site = computer.site \
+                  AND registry.active \
+           ) FOR UPDATE"
+    ))
+    .bind(review_id)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+pub async fn approve_recovery_review(
+    conn: &mut PgConnection,
+    review_id: Uuid,
+    approved_by: &str,
+) -> Result<Option<QuarantineRecoveryReviewRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "WITH writer_contract AS ( \
+             SELECT set_config('ryuki.ad_recovery_writer_contract', 'ad-recovery-v2', TRUE) \
+         ) \
+         UPDATE ad_quarantine_recovery_reviews \
+         SET state = 'Approved', approved_by = $2 \
+         FROM writer_contract \
+         WHERE id = $1 AND state = 'Pending' AND expires_at > NOW() \
+           AND requested_by <> $2 \
+         RETURNING {RECOVERY_REVIEW_COLUMNS}"
+    ))
+    .bind(review_id)
+    .bind(approved_by)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+pub async fn mark_recovery_review_applied(
+    conn: &mut PgConnection,
+    review_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "WITH writer_contract AS ( \
+             SELECT set_config('ryuki.ad_recovery_writer_contract', 'ad-recovery-v2', TRUE) \
+         ) \
+         UPDATE ad_quarantine_recovery_reviews \
+         SET state = 'Applied' \
+         FROM writer_contract \
+         WHERE id = $1 AND state = 'Approved' AND expires_at > NOW()",
+    )
+    .bind(review_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 // ─── DB integration tests ────────────────────────────────────────────────────
 //
 // Run with:
@@ -293,7 +552,7 @@ mod ad_computers_db_tests {
     use super::*;
     use ryuki_engine::ad_computer_lifecycle::{
         delete_computer_model, disable_computer_model, enable_computer_model, move_computer_model,
-        prestage_computer,
+        prestage_computer, release_quarantine_model, QuarantineRecoveryDecision,
     };
 
     // Serializes DB tests so they don't contend on shared rows.
@@ -320,6 +579,11 @@ mod ad_computers_db_tests {
 
     async fn cleanup(pool: &PgPool, id: &str) {
         if let Ok(uid) = Uuid::parse_str(id) {
+            sqlx::query("SELECT purge_ad_recovery_reviews_for_maintenance($1)")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
             sqlx::query("DELETE FROM ad_computers WHERE id = $1")
                 .bind(uid)
                 .execute(pool)
@@ -340,14 +604,14 @@ mod ad_computers_db_tests {
 
         let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
         let name = format!("DEFRA-SRV-{sequence:04}");
-        let computer =
-            prestage_computer(&name, "DEFRA", "OU=Servers,DC=corp,DC=local").expect("prestage");
+        let computer = prestage_computer(&name, "DEFRA", "OU=Servers,OU=DEFRA,DC=corp,DC=local")
+            .expect("prestage");
 
         let persisted = insert(&pool, &computer).await.expect("insert");
         assert_eq!(persisted.name, name);
         assert_eq!(persisted.site, "DEFRA");
         assert_eq!(persisted.status, ComputerStatus::Active);
-        assert_eq!(persisted.ou_path, "OU=Servers,DC=corp,DC=local");
+        assert_eq!(persisted.ou_path, "OU=Servers,OU=DEFRA,DC=corp,DC=local");
 
         let (fetched, _) = get_by_name(&pool, &name)
             .await
@@ -369,8 +633,12 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-92", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-92",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let _inserted = insert(&pool, &computer).await.expect("insert");
         let (persisted, updated_at) = get_by_name(&pool, "DEFRA-SRV-92")
             .await
@@ -404,8 +672,12 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-93", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-93",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let _inserted = insert(&pool, &computer).await.expect("insert");
         let (persisted, updated_at_0) = get_by_name(&pool, "DEFRA-SRV-93")
             .await
@@ -445,8 +717,12 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-94", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-94",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let _inserted = insert(&pool, &computer).await.expect("insert");
         let (persisted, updated_at) = get_by_name(&pool, "DEFRA-SRV-94")
             .await
@@ -481,8 +757,12 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-95", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-95",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let _inserted = insert(&pool, &computer).await.expect("insert");
         let (persisted, updated_at) = get_by_name(&pool, "DEFRA-SRV-95")
             .await
@@ -510,15 +790,20 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-96", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-96",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let _inserted = insert(&pool, &computer).await.expect("insert");
         let (persisted, updated_at) = get_by_name(&pool, "DEFRA-SRV-96")
             .await
             .expect("get_by_name")
             .expect("row exists");
 
-        let moved = move_computer_model(&persisted, "OU=DMZ,DC=corp,DC=local").expect("move_model");
+        let moved = move_computer_model(&persisted, "OU=DMZ,OU=DEFRA,DC=corp,DC=local")
+            .expect("move_model");
 
         // CAS: status + updated_at must match.
         let before_status = status_str(&persisted.status);
@@ -527,11 +812,11 @@ mod ad_computers_db_tests {
             .expect("transition")
             .expect("row updated");
 
-        assert_eq!(after.ou_path, "OU=DMZ,DC=corp,DC=local");
+        assert_eq!(after.ou_path, "OU=DMZ,OU=DEFRA,DC=corp,DC=local");
         assert_eq!(after.status, ComputerStatus::Active);
 
         // A second concurrent move with the OLD updated_at should now fail.
-        let stale = move_computer_model(&persisted, "OU=Management,DC=corp,DC=local")
+        let stale = move_computer_model(&persisted, "OU=Management,OU=DEFRA,DC=corp,DC=local")
             .expect("move_model stale");
         let result = transition(&pool, before_status, updated_at, &stale)
             .await
@@ -555,8 +840,12 @@ mod ad_computers_db_tests {
             return;
         };
 
-        let computer = prestage_computer("DEFRA-SRV-97", "DEFRA", "OU=Servers,DC=corp,DC=local")
-            .expect("prestage");
+        let computer = prestage_computer(
+            "DEFRA-SRV-97",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("prestage");
         let persisted = insert(&pool, &computer).await.expect("insert");
         let (loaded, old_updated_at) = get_by_name(&pool, "DEFRA-SRV-97")
             .await
@@ -588,6 +877,374 @@ mod ad_computers_db_tests {
             "transition with stale updated_at must return None"
         );
 
+        cleanup(&pool, &persisted.id).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_trigger_rejects_cross_site_and_caller_chosen_ou_provenance() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
+        let name = format!("DEFRA-DEV-{sequence:04}");
+        let valid = prestage_computer(&name, "DEFRA", "OU=Development,OU=DEFRA,DC=corp,DC=local")
+            .expect("valid server-derived namespace");
+
+        let mut cross_site = valid.clone();
+        cross_site.site = "GBLON".into();
+        let error = insert(&pool, &cross_site)
+            .await
+            .expect_err("DB trigger must repeat name/site ownership validation");
+        assert!(error.as_database_error().is_some());
+
+        let mut caller_ou = valid.clone();
+        caller_ou.id = Uuid::new_v4().to_string();
+        caller_ou.ou_path = "OU=Development,OU=GBLON,DC=corp,DC=local".into();
+        let error = insert(&pool, &caller_ou)
+            .await
+            .expect_err("DB trigger must reject a foreign caller-chosen OU");
+        assert!(error.as_database_error().is_some());
+
+        let persisted = insert(&pool, &valid)
+            .await
+            .expect("insert canonical namespace owner");
+        let reassigned_name = format!("GBLON-DEV-{sequence:04}");
+        let reassignment = sqlx::query(
+            "UPDATE ad_computers \
+             SET name = $2, site = 'GBLON', namespace_owner_site = 'GBLON', \
+                 ou_path = 'OU=Development,OU=GBLON,DC=corp,DC=local' \
+             WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(&persisted.id).expect("persisted id"))
+        .bind(&reassigned_name)
+        .execute(&pool)
+        .await;
+        let reassignment_error = reassignment
+            .expect_err("verified global computer ownership must not be transferred by update");
+        assert!(
+            reassignment_error
+                .as_database_error()
+                .is_some_and(|database| database.message().contains("immutable")),
+            "the namespace immutability trigger must be the rejecting control"
+        );
+        cleanup(&pool, &persisted.id).await;
+
+        let inconsistent_verified: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ad_computers \
+             WHERE namespace_state = 'Verified' \
+               AND (namespace_owner_site IS DISTINCT FROM site \
+                    OR namespace_policy_version IS DISTINCT FROM 'directory-namespace-v1')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect migrated namespace provenance");
+        assert_eq!(
+            inconsistent_verified, 0,
+            "legacy rows may be verified only when owner provenance is consistent"
+        );
+
+        let unsafe_quarantine: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ad_computers \
+             WHERE namespace_state = 'Quarantined' \
+               AND status NOT IN ('Quarantined', 'Deleted')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect legacy quarantine state");
+        assert_eq!(
+            unsafe_quarantine, 0,
+            "legacy namespace mismatches must be sticky-quarantined"
+        );
+    }
+
+    #[test]
+    fn inactive_legacy_backfill_requires_active_owners_and_asserts_the_result() {
+        let migration =
+            include_str!("../../../../migrations/177_directory_namespace_quarantine_recovery.sql");
+        assert!(
+            migration.contains("COALESCE(registry.active, false)"),
+            "AD legacy classification must require an active canonical owner"
+        );
+        assert!(
+            migration.contains("COALESCE(owner.active, false)"),
+            "gMSA legacy classification must require the longest owner to be active"
+        );
+        assert!(
+            migration.contains("legacy directory namespace backfill admitted an inactive owner"),
+            "migration must fail rather than commit an inactive Verified backfill"
+        );
+        assert!(
+            migration.contains("OLD.namespace_state = 'Quarantined'")
+                && migration
+                    .contains("quarantined AD namespace provenance requires trusted repair"),
+            "a legacy quarantined AD row must not self-promote into operational provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivation_gates_ad_without_state_change_and_reactivation_restores_verified() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let token = Uuid::new_v4().simple().to_string();
+        let site = format!("ADACT{}", &token[..8]).to_ascii_uppercase();
+        let site_model = ryuki_engine::site_registry::SiteEntry {
+            unlocode: site.clone(),
+            name: "AD active-owner gate test".into(),
+            country: "Test".into(),
+            country_code: "ZZ".into(),
+            timezone: "UTC".into(),
+            active: true,
+        };
+        ryuki_engine::site_registry::upsert_site(
+            site_model.clone(),
+            ryuki_engine::site_registry::SiteCodeSystem::Custom,
+        )
+        .expect("register active test site in engine cache");
+        let site_row = crate::repos::site_registry::SiteEntryRow {
+            unlocode: site.clone(),
+            code_system: "custom".into(),
+            name: site_model.name,
+            country: site_model.country,
+            country_code: site_model.country_code,
+            timezone: site_model.timezone,
+            active: true,
+        };
+        assert!(crate::repos::site_registry::insert(&pool, &site_row)
+            .await
+            .expect("insert active test site"));
+
+        let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
+        let name = format!("{site}-DEV-{sequence:04}");
+        let computer = prestage_computer(
+            &name,
+            &site,
+            &format!("OU=Development,OU={site},DC=corp,DC=local"),
+        )
+        .expect("create canonical active-site computer");
+        let persisted = insert(&pool, &computer).await.expect("insert computer");
+        let computer_id = Uuid::parse_str(&persisted.id).expect("computer id");
+        let (loaded, version) = get_by_name(&pool, &name)
+            .await
+            .expect("load active computer")
+            .expect("active owner exposes verified computer");
+        let disabled = disable_computer_model(&loaded, "active-owner gate")
+            .expect("prepare ordinary transition");
+        let before: (String, String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT status, namespace_state, updated_at FROM ad_computers WHERE id = $1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read state before deactivation");
+
+        assert!(crate::repos::site_registry::set_active(&pool, &site, false)
+            .await
+            .expect("deactivate owner site"));
+        assert!(
+            ryuki_engine::site_registry::is_valid_site(&site),
+            "stale engine cache remains active to prove DB authority is fail-closed"
+        );
+        assert!(
+            get_by_name(&pool, &name)
+                .await
+                .expect("inactive lookup")
+                .is_none(),
+            "ordinary read must hide a Verified resource under an inactive owner"
+        );
+        assert!(
+            list(&pool, &site).await.expect("inactive list").is_empty(),
+            "ordinary inventory must hide inactive-owner resources"
+        );
+        assert!(
+            transition(&pool, "Active", version, &disabled)
+                .await
+                .expect("inactive transition is a clean miss")
+                .is_none(),
+            "repository mutation must fail closed before touching inactive-owner state"
+        );
+        let no_op = sqlx::query("UPDATE ad_computers SET status = status WHERE id = $1")
+            .bind(computer_id)
+            .execute(&pool)
+            .await
+            .expect_err("DB trigger must fence stale-replica mutation attempts");
+        assert!(no_op
+            .as_database_error()
+            .is_some_and(|database| database.message().contains("active owner site")));
+        let mut recovery_tx = pool.begin().await.expect("begin inactive recovery probe");
+        let recovery = create_recovery_review(
+            &mut recovery_tx,
+            computer_id,
+            version,
+            "inactive owner must block recovery",
+            "inactive-owner-maker",
+        )
+        .await;
+        assert!(
+            recovery.is_err(),
+            "recovery-row trigger must reject an inactive directory owner"
+        );
+        recovery_tx
+            .rollback()
+            .await
+            .expect("rollback inactive recovery probe");
+
+        let after_block: (String, String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT status, namespace_state, updated_at FROM ad_computers WHERE id = $1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read state after blocked operations");
+        assert_eq!(
+            after_block, before,
+            "deactivation and denials change no resource state"
+        );
+
+        assert!(crate::repos::site_registry::set_active(&pool, &site, true)
+            .await
+            .expect("reactivate owner site"));
+        let (reactivated, reactivated_version) = get_by_name(&pool, &name)
+            .await
+            .expect("reactivated lookup")
+            .expect("reactivation restores an unchanged Verified resource");
+        assert_eq!(reactivated.status, ComputerStatus::Active);
+        assert_eq!(reactivated_version, version);
+
+        cleanup(&pool, &persisted.id).await;
+        sqlx::query("DELETE FROM site_registry WHERE unlocode = $1")
+            .bind(&site)
+            .execute(&pool)
+            .await
+            .expect("cleanup test site");
+        ryuki_engine::site_registry::deactivate_site(&site)
+            .expect("deactivate test site in engine cache");
+    }
+
+    #[tokio::test]
+    async fn concurrent_authorized_claims_keep_one_global_name_winner() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
+        let name = format!("NLAMS-TEST-{sequence:04}");
+        let first = prestage_computer(&name, "NLAMS", "OU=Testing,OU=NLAMS,DC=corp,DC=local")
+            .expect("first authorized claim");
+        let second = prestage_computer(&name, "NLAMS", "OU=Testing,OU=NLAMS,DC=corp,DC=local")
+            .expect("second authorized claim");
+
+        let (left, right) = tokio::join!(insert(&pool, &first), insert(&pool, &second));
+        assert_eq!(
+            usize::from(left.is_ok()) + usize::from(right.is_ok()),
+            1,
+            "global uniqueness must serialize two valid first claims"
+        );
+        let winner = left.as_ref().ok().or_else(|| right.as_ref().ok()).unwrap();
+        cleanup(&pool, &winner.id).await;
+    }
+
+    #[tokio::test]
+    async fn database_quarantine_requires_fresh_maker_checker_review() {
+        let _guard = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let sequence = 1000 + (Uuid::new_v4().as_u128() % 9000) as u16;
+        let name = format!("DEFRA-MGMT-{sequence:04}");
+        let computer = prestage_computer(&name, "DEFRA", "OU=Management,OU=DEFRA,DC=corp,DC=local")
+            .expect("valid computer");
+        let persisted = insert(&pool, &computer).await.expect("insert");
+        let computer_id = Uuid::parse_str(&persisted.id).unwrap();
+
+        sqlx::query(
+            "UPDATE ad_computers \
+             SET status = 'Quarantined', \
+                 metadata = metadata || '{\"quarantine_reason\":\"synthetic investigation\"}'::jsonb, \
+                 updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("seed quarantine state");
+
+        let unreviewed = sqlx::query(
+            "UPDATE ad_computers SET status = 'Disabled', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await;
+        assert!(
+            unreviewed.is_err(),
+            "DB trigger must reject ordinary Quarantined -> Disabled"
+        );
+
+        let (_, quarantined_at) = get_by_name(&pool, &name)
+            .await
+            .expect("read quarantine")
+            .expect("computer exists");
+        let mut create_tx = pool.begin().await.expect("begin review request");
+        let review = create_recovery_review(
+            &mut create_tx,
+            computer_id,
+            quarantined_at,
+            "reviewed synthetic recovery",
+            "recovery-maker",
+        )
+        .await
+        .expect("create recovery review");
+        create_tx.commit().await.expect("commit review request");
+
+        let mut approve_tx = pool.begin().await.expect("begin approval");
+        let approved = approve_recovery_review(&mut approve_tx, review.id, "recovery-checker")
+            .await
+            .expect("approve query")
+            .expect("distinct checker approves");
+        approve_tx.commit().await.expect("commit approval");
+
+        let mut apply_tx = pool.begin().await.expect("begin apply");
+        let locked_review = get_recovery_review_for_update(&mut apply_tx, approved.id)
+            .await
+            .expect("lock review")
+            .expect("review exists");
+        let (locked, version, namespace_state) = get_by_id_for_update(&mut apply_tx, computer_id)
+            .await
+            .expect("lock computer")
+            .expect("computer exists");
+        assert_eq!(namespace_state, "Verified");
+        let decision = QuarantineRecoveryDecision {
+            review_id: locked_review.id.to_string(),
+            reason: locked_review.reason.clone(),
+            approved_at: locked_review.approved_at.unwrap().to_rfc3339(),
+        };
+        let recovered = release_quarantine_model(&locked, &decision).expect("typed release");
+        let (after, _) = transition(&mut *apply_tx, "Quarantined", version, &recovered)
+            .await
+            .expect("release transition")
+            .expect("CAS succeeds");
+        assert!(
+            mark_recovery_review_applied(&mut apply_tx, locked_review.id)
+                .await
+                .expect("mark applied")
+        );
+        apply_tx.commit().await.expect("commit recovery");
+
+        assert_eq!(after.status, ComputerStatus::Disabled);
+        assert_eq!(
+            after.metadata.get("quarantine_reason").map(String::as_str),
+            Some("synthetic investigation")
+        );
         cleanup(&pool, &persisted.id).await;
     }
 }

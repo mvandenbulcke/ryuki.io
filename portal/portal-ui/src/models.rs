@@ -34,10 +34,12 @@ pub struct OperationRunSummary {
 #[serde(rename_all = "camelCase")]
 pub struct SecretReferenceCatalogStatus {
     pub source: String,
-    pub primary_provider: String,
-    pub management_cli: String,
-    pub future_providers: Vec<String>,
-    pub reference_kinds: Vec<String>,
+    pub provider_model: String,
+    pub management_interface: String,
+    pub fallback_policy: String,
+    pub admitted_provider_classes: Vec<String>,
+    pub capability_interfaces: Vec<String>,
+    pub secret_reference_kinds: Vec<String>,
     pub readiness_states: Vec<String>,
     pub rotation_policies: Vec<String>,
     pub configured_for_production: bool,
@@ -45,12 +47,12 @@ pub struct SecretReferenceCatalogStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SecretReferenceSummary {
-    pub provider: String,
-    pub management_cli: String,
+    pub capability: String,
+    pub interface: String,
     pub readiness_state: String,
     pub rotation_state: String,
     pub consumer_scope: String,
-    pub live_cli_execution_allowed: bool,
+    pub live_provider_actions_allowed: bool,
     pub value_exposure_allowed: bool,
     pub provider_path_exposure_allowed: bool,
     pub safe_summary: String,
@@ -1174,27 +1176,45 @@ pub fn activity_queue_fallbacks() -> Vec<ActivityQueueSummary> {
 pub fn secret_reference_catalog_fallback() -> SecretReferenceCatalogStatus {
     SecretReferenceCatalogStatus {
         source: "static-seed".to_string(),
-        primary_provider: "vaultwarden".to_string(),
-        management_cli: "vaultwarden-cli".to_string(),
-        future_providers: Vec::new(),
-        reference_kinds: vec![
+        provider_model: "capability-registry".to_string(),
+        management_interface: "provider-adapter".to_string(),
+        fallback_policy: "disabled".to_string(),
+        admitted_provider_classes: vec![
+            "lease-capable-secret-service".to_string(),
+            "cloud-secret-manager".to_string(),
+            "deployment-injection".to_string(),
+            "enterprise-plugin-adapter".to_string(),
+            "development-adapter".to_string(),
+        ],
+        capability_interfaces: vec![
+            "resolve-read".to_string(),
+            "publish-version".to_string(),
+            "materialize-reload".to_string(),
+        ],
+        secret_reference_kinds: vec![
             "adapter-credential".to_string(),
             "worker-credential".to_string(),
             "database-credential".to_string(),
             "object-storage-credential".to_string(),
             "pki-material".to_string(),
+            "recovery-material".to_string(),
+            "signing-material".to_string(),
         ],
         readiness_states: vec![
             "missing".to_string(),
             "pending-approval".to_string(),
             "configured".to_string(),
+            "admitted".to_string(),
             "rotation-due".to_string(),
             "blocked".to_string(),
+            "quarantined".to_string(),
+            "retired".to_string(),
         ],
         rotation_policies: vec![
             "deployment-managed".to_string(),
             "scheduled-rotation".to_string(),
             "emergency-rotation".to_string(),
+            "certificate-renewal".to_string(),
             "manual-break-glass-review".to_string(),
         ],
         configured_for_production: false,
@@ -1204,29 +1224,42 @@ pub fn secret_reference_catalog_fallback() -> SecretReferenceCatalogStatus {
 pub fn secret_reference_fallbacks() -> Vec<SecretReferenceSummary> {
     vec![
         SecretReferenceSummary {
-            provider: "vaultwarden".to_string(),
-            management_cli: "vaultwarden-cli".to_string(),
+            capability: "resolve-read".to_string(),
+            interface: "SecretResolver".to_string(),
             readiness_state: "pending-approval".to_string(),
             rotation_state: "rotation review required".to_string(),
             consumer_scope: "adapter and worker references".to_string(),
-            live_cli_execution_allowed: false,
+            live_provider_actions_allowed: false,
             value_exposure_allowed: false,
             provider_path_exposure_allowed: false,
             safe_summary:
-                "Reference readiness is shown as catalog metadata only; automation remains disabled."
+                "Resolution and read readiness are shown as metadata only; no provider is selected or contacted."
                     .to_string(),
         },
         SecretReferenceSummary {
-            provider: "vaultwarden".to_string(),
-            management_cli: "vaultwarden-cli".to_string(),
+            capability: "publish-version".to_string(),
+            interface: "SecretVersionPublisher".to_string(),
             readiness_state: "blocked".to_string(),
-            rotation_state: "break-glass review required".to_string(),
-            consumer_scope: "recovery and signing references".to_string(),
-            live_cli_execution_allowed: false,
+            rotation_state: "purpose-bound permit required".to_string(),
+            consumer_scope: "version publication and rotation".to_string(),
+            live_provider_actions_allowed: false,
             value_exposure_allowed: false,
             provider_path_exposure_allowed: false,
             safe_summary:
-                "Sensitive material stays runtime-resolved and never appears in the portal."
+                "Publication is independently admitted; resolver support never implies write or rotation authority."
+                    .to_string(),
+        },
+        SecretReferenceSummary {
+            capability: "materialize-reload".to_string(),
+            interface: "MaterializationController".to_string(),
+            readiness_state: "blocked".to_string(),
+            rotation_state: "consumer acknowledgement required".to_string(),
+            consumer_scope: "workload file and volume delivery".to_string(),
+            live_provider_actions_allowed: false,
+            value_exposure_allowed: false,
+            provider_path_exposure_allowed: false,
+            safe_summary:
+                "Materialization is a separate custody boundary and does not claim lease or publication support."
                     .to_string(),
         },
     ]
@@ -1440,11 +1473,11 @@ pub struct AuthSession {
     pub provider_mode: String,
 }
 
-/// Canonical POST /api/auth/local/login response. The `session_id` stays on
-/// the SSR side (portal cookie) and never reaches WASM.
+/// Canonical POST /api/auth/local/login response. The one-time
+/// session_token stays on the SSR side (portal cookie) and never reaches WASM.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApiLoginSession {
-    pub session_id: String,
+    pub session_token: String,
     pub user_id: String,
     pub display_name: String,
     pub roles: Vec<String>,
@@ -1892,11 +1925,26 @@ pub struct NotificationSummary {
 // mislead operators about what is actually enrolled.
 
 /// Portal-facing summary of one registered execution agent.
+///
+/// `enrollment_id` and `public_key_fingerprint` are the immutable, non-secret
+/// review binding required by the approval endpoint. The raw public key is
+/// intentionally not represented by this portal model and must never cross the
+/// portal server-function boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentSummary {
+    pub enrollment_id: String,
+    /// True only when the roster row is linked to a consumed trusted
+    /// provisioning challenge. Pending rows without this marker must never be
+    /// offered for approval.
+    pub cryptographically_admitted: bool,
     pub agent_id: String,
     pub platform: String,
     pub status: String,
+    pub public_key_fingerprint: String,
+    /// SHA-256 review handle for the stored capability document. For pending
+    /// rows the document is self-declared; for approved rows it is the exact
+    /// administrator-authorized grant used by lease admission.
+    pub capabilities_digest: String,
     pub last_seen_at: Option<String>,
     pub created_at: String,
     pub jobs: Vec<AgentJobSummary>,
@@ -2592,17 +2640,104 @@ impl LivePlanReview {
     }
 }
 
+/// Exact immutable LivePlan snapshot the administrator reviewed. These three
+/// non-secret values are the complete mutation-authorizing selection sent back
+/// to the API; the portal never reconstructs a spec or accepts provider data.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct ReviewedLivePlanSelection {
+    pub approved_plan_job_id: String,
+    pub approved_plan_attempt_id: String,
+    /// Signed SHA-256 of the complete canonical raw plan. This is distinct
+    /// from the redacted review evidence digest.
+    pub approved_plan_digest: String,
+}
+
+impl ReviewedLivePlanSelection {
+    pub fn is_canonical(&self) -> bool {
+        fn is_canonical_uuid(value: &str) -> bool {
+            let mut groups = value.split('-');
+            [8usize, 4, 4, 4, 12].into_iter().all(|expected_len| {
+                groups.next().is_some_and(|group| {
+                    group.len() == expected_len
+                        && group
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            }) && groups.next().is_none()
+        }
+
+        is_canonical_uuid(&self.approved_plan_job_id)
+            && is_canonical_uuid(&self.approved_plan_attempt_id)
+            && self.approved_plan_digest.len() == 64
+            && self
+                .approved_plan_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Minimal signed-envelope subset required to bind the safe review to the
+/// exact leased plan attempt. Every other attestation field is ignored.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ApiLivePlanReviewBinding {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub evidence_digest: String,
+    #[serde(default)]
+    pub raw_plan_digest: Option<String>,
+}
+
 /// Minimal projection of `GET /api/admin/agents/jobs/{job_id}/result` used by
-/// the portal. All attestation internals and raw evidence are ignored.
+/// the portal. Raw evidence and provider data are ignored. The signed envelope
+/// is reduced to the exact identifiers needed for reviewed selection.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct ApiAdminAgentJobResult {
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub evidence_digest: Option<String>,
+    #[serde(default)]
+    pub raw_plan_digest: Option<String>,
+    #[serde(default)]
+    pub signed_envelope: Option<ApiLivePlanReviewBinding>,
     #[serde(default)]
     pub plan_review: Option<LivePlanReview>,
 }
 
-/// Portal-facing projection of an execution-agent job — display-ready fields
-/// only. The server boundary uses `agent_job_id` to fetch the admin-only review
-/// projection, then discards that internal handle before this reaches the UI.
+impl ApiAdminAgentJobResult {
+    /// Consume an admin result only when its safe review, evidence binding,
+    /// and distinct raw-plan commitment agree with the exact job path read.
+    /// Any legacy, malformed, or mixed-row response suppresses approval.
+    pub fn into_reviewed_live_plan(
+        self,
+        expected_job_id: &str,
+    ) -> Option<(LivePlanReview, ReviewedLivePlanSelection)> {
+        let review = self.plan_review?;
+        let envelope = self.signed_envelope?;
+        let evidence_digest = self.evidence_digest?;
+        let raw_plan_digest = self.raw_plan_digest?;
+        let selection = ReviewedLivePlanSelection {
+            approved_plan_job_id: self.job_id.clone(),
+            approved_plan_attempt_id: envelope.attempt_id,
+            approved_plan_digest: raw_plan_digest.clone(),
+        };
+        if !review.digest_verified
+            || self.job_id != expected_job_id
+            || envelope.job_id != expected_job_id
+            || envelope.evidence_digest != evidence_digest
+            || envelope.raw_plan_digest.as_deref() != Some(raw_plan_digest.as_str())
+            || !selection.is_canonical()
+        {
+            return None;
+        }
+        Some((review, selection))
+    }
+}
+
+/// Portal-facing projection of an execution-agent job. The server boundary
+/// uses `agent_job_id` to fetch the admin-only safe review, then retains only
+/// the exact non-secret reviewed selection needed for approval; raw job specs,
+/// provider data, and attestation internals never reach this model.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExecutionJob {
     pub request_id: String,
@@ -2630,6 +2765,9 @@ pub struct ExecutionJob {
     /// Safe, digest-bound review data for a successful LivePlan.
     #[serde(default)]
     pub live_plan_review: Option<LivePlanReview>,
+    /// Exact plan row/attempt/digest paired with `live_plan_review`.
+    #[serde(default)]
+    pub reviewed_plan_selection: Option<ReviewedLivePlanSelection>,
 }
 
 impl From<ApiExecutionJob> for ExecutionJob {
@@ -2653,13 +2791,20 @@ impl From<ApiExecutionJob> for ExecutionJob {
                 .unwrap_or_default(),
             verification_ready: api.verification_ready,
             live_plan_review: None,
+            reviewed_plan_selection: None,
         }
     }
 }
 
 impl ExecutionJob {
-    pub fn with_live_plan_review(mut self, review: Option<LivePlanReview>) -> Self {
-        self.live_plan_review = review;
+    pub fn with_reviewed_live_plan(
+        mut self,
+        reviewed: Option<(LivePlanReview, ReviewedLivePlanSelection)>,
+    ) -> Self {
+        if let Some((review, selection)) = reviewed {
+            self.live_plan_review = Some(review);
+            self.reviewed_plan_selection = Some(selection);
+        }
         self
     }
 
@@ -2677,6 +2822,10 @@ impl ExecutionJob {
     /// non-mutation previews until a typed review projection is implemented.
     pub fn can_approve_live_apply(&self) -> bool {
         self.is_successful_live_plan()
+            && self
+                .reviewed_plan_selection
+                .as_ref()
+                .is_some_and(ReviewedLivePlanSelection::is_canonical)
             && self
                 .live_plan_review
                 .as_ref()
@@ -4499,10 +4648,13 @@ mod tests {
     fn api_login_session_decodes_canonical_local_login_response() {
         // Canonical POST /api/auth/local/login 200 body — the seam both the
         // API and the portal test against.
-        let body = r#"{"session_id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"2026-06-13T12:00:00+00:00"}"#;
+        let body = r#"{"session_token":"rys_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"2026-06-13T12:00:00+00:00"}"#;
         let login: ApiLoginSession = serde_json::from_str(body).expect("login body must decode");
 
-        assert_eq!(login.session_id, "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b");
+        assert_eq!(
+            login.session_token,
+            "rys_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
         assert_eq!(login.user_id, "admin");
         assert_eq!(login.display_name, "admin");
         assert_eq!(login.roles, vec!["PlatformAdmin".to_string()]);
@@ -4513,10 +4665,10 @@ mod tests {
         assert_eq!(session.user_id, "admin");
         assert!(session.token_valid);
         assert_eq!(session.provider_mode, "local");
-        // The session id must never cross into the AuthSession that reaches
-        // WASM: AuthSession has no session_id field by construction.
+        // The session token must never cross into the AuthSession that reaches
+        // WASM: AuthSession has no credential field by construction.
         let serialized = serde_json::to_value(&session).expect("session must serialize");
-        assert!(serialized.get("session_id").is_none());
+        assert!(serialized.get("session_token").is_none());
     }
 
     #[test]
@@ -4968,7 +5120,7 @@ mod tests {
     #[test]
     fn platform_summary_context_decodes_nested_camel_case_payload() {
         // GET /api/platform/summary shape (nested localAuthorization block).
-        let body = r#"{"productName":"Ryuki Infrastructure Platform","lifecycleStages":["intake"],"components":["portal-ui"],"browserIsolation":true,"localAuthorization":{"authenticationMode":"local","configuredForProduction":false,"entraGroupsConfigured":false,"roleHeader":"X-Ryuki-Local-Role","requiredProductionProvider":"Microsoft Entra ID"}}"#;
+        let body = r#"{"productName":"Ryuki Infrastructure Platform","lifecycleStages":["intake"],"components":["portal-ui"],"browserIsolation":true,"localAuthorization":{"authenticationMode":"local","configuredForProduction":false,"entraGroupsConfigured":false,"roleHeader":"X-Ryuki-Local-Role","requiredProductionProvider":"Versioned authenticator registry (generic OIDC; Entra is one provider)"}}"#;
         let summary: ApiPlatformSummary =
             serde_json::from_str(body).expect("platform summary must decode");
         let context = PlatformSummaryContext::from(summary);
@@ -4983,6 +5135,65 @@ mod tests {
         let fallback = platform_summary_context_fallback();
         assert_eq!(fallback.authentication_mode, "static-dry-run");
         assert!(!fallback.entra_groups_configured);
+    }
+
+    #[test]
+    fn secret_reference_catalog_decodes_capability_registry_payload() {
+        let body = r#"{"source":"static-seed","providerModel":"capability-registry","managementInterface":"provider-adapter","fallbackPolicy":"disabled","admittedProviderClasses":["lease-capable-secret-service","cloud-secret-manager","deployment-injection","enterprise-plugin-adapter","development-adapter"],"capabilityInterfaces":["resolve-read","publish-version","materialize-reload"],"secretReferenceKinds":["adapter-credential","worker-credential","database-credential","object-storage-credential","pki-material","recovery-material","signing-material"],"readinessStates":["pending-approval"],"rotationPolicies":["deployment-managed"],"configuredForProduction":false}"#;
+        let catalog: SecretReferenceCatalogStatus =
+            serde_json::from_str(body).expect("capability-registry catalog must decode");
+
+        assert_eq!(catalog.provider_model, "capability-registry");
+        assert_eq!(catalog.management_interface, "provider-adapter");
+        assert_eq!(catalog.fallback_policy, "disabled");
+        assert_eq!(catalog.admitted_provider_classes.len(), 5);
+        assert_eq!(
+            catalog.capability_interfaces,
+            vec!["resolve-read", "publish-version", "materialize-reload"]
+        );
+        assert_eq!(
+            catalog.secret_reference_kinds,
+            vec![
+                "adapter-credential",
+                "worker-credential",
+                "database-credential",
+                "object-storage-credential",
+                "pki-material",
+                "recovery-material",
+                "signing-material"
+            ]
+        );
+        assert!(!catalog.configured_for_production);
+    }
+
+    #[test]
+    fn secret_reference_catalog_fallback_has_exact_rotation_policies() {
+        let catalog = secret_reference_catalog_fallback();
+
+        assert_eq!(
+            catalog.rotation_policies,
+            vec![
+                "deployment-managed",
+                "scheduled-rotation",
+                "emergency-rotation",
+                "certificate-renewal",
+                "manual-break-glass-review"
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_reference_fallbacks_keep_capabilities_separate() {
+        let references = secret_reference_fallbacks();
+        assert_eq!(references.len(), 3);
+        assert_eq!(references[0].capability, "resolve-read");
+        assert_eq!(references[1].capability, "publish-version");
+        assert_eq!(references[2].capability, "materialize-reload");
+        assert!(references.iter().all(|reference| {
+            !reference.live_provider_actions_allowed
+                && !reference.value_exposure_allowed
+                && !reference.provider_path_exposure_allowed
+        }));
     }
 
     #[test]
@@ -5195,43 +5406,59 @@ mod tests {
     // ── evidence-pack audit CSV export (#50) ─────────────────────────────────
 
     #[test]
-    fn live_plan_review_is_safe_typed_and_gates_apply() {
-        let response: ApiAdminAgentJobResult = serde_json::from_str(
-            r#"{
-                "plan_review": {
-                    "digest_verified": true,
-                    "state_key": "request-7c9e6679-7425-40de-944b-e07fc1f90ae7",
-                    "placement": {
-                        "name": "first-test-vm",
-                        "cpu": 2,
-                        "memory_gb": 4,
-                        "disk_size_gb": 80,
-                        "datacenter": "DC-TEST",
-                        "cluster": "Compute-Test",
-                        "datastore": "Datastore-Test",
-                        "network": "Test-Network",
-                        "template": "rhel-9-test"
-                    },
-                    "managed_changes": [{
-                        "resource_type": "virtual_machine",
-                        "logical_name": "linux_server",
-                        "action": "create"
-                    }],
-                    "counts": {"create": 1, "update": 0, "delete": 0, "replace": 0}
+    fn exact_live_plan_review_selection_is_safe_typed_and_gates_apply() {
+        let job_id = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let attempt_id = "8d0f778a-8536-41ef-a55c-f18fd20a1bf8";
+        let evidence_digest = "a".repeat(64);
+        let raw_plan_digest = "b".repeat(64);
+        let response: ApiAdminAgentJobResult = serde_json::from_value(serde_json::json!({
+            "job_id": job_id,
+            "evidence_digest": evidence_digest.clone(),
+            "raw_plan_digest": raw_plan_digest.clone(),
+            "plan_review": {
+                "digest_verified": true,
+                "state_key": "request-7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                "placement": {
+                    "name": "first-test-vm",
+                    "cpu": 2,
+                    "memory_gb": 4,
+                    "disk_size_gb": 80,
+                    "datacenter": "DC-TEST",
+                    "cluster": "Compute-Test",
+                    "datastore": "Datastore-Test",
+                    "network": "Test-Network",
+                    "template": "rhel-9-test"
                 },
-                "signed_envelope": {"must_not_be_mapped": true},
-                "raw_plan": {"must_not_be_mapped": true}
-            }"#,
-        )
+                "managed_changes": [{
+                    "resource_type": "virtual_machine",
+                    "logical_name": "linux_server",
+                    "action": "create"
+                }],
+                "counts": {"create": 1, "update": 0, "delete": 0, "replace": 0}
+            },
+            "signed_envelope": {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "evidence_digest": evidence_digest.clone(),
+                "raw_plan_digest": raw_plan_digest.clone(),
+                "must_not_be_mapped": true
+            },
+            "raw_plan": {"must_not_be_mapped": true}
+        }))
         .expect("safe review response must decode");
-        let review = response.plan_review.expect("review");
+        let (review, selection) = response
+            .into_reviewed_live_plan(job_id)
+            .expect("exact safe review binding");
         assert!(review.digest_verified);
         assert_eq!(review.counts.create, 1);
         assert_eq!(review.managed_changes[0].logical_name, "linux_server");
+        assert_eq!(selection.approved_plan_job_id, job_id);
+        assert_eq!(selection.approved_plan_attempt_id, attempt_id);
+        assert_eq!(selection.approved_plan_digest, raw_plan_digest);
 
         let api = ApiExecutionJob {
             request_id: "REQ-PLAN".to_string(),
-            agent_job_id: "job-plan".to_string(),
+            agent_job_id: job_id.to_string(),
             mode: "LivePlan".to_string(),
             status: "Succeeded".to_string(),
             result_status: Some("planned".to_string()),
@@ -5256,11 +5483,85 @@ mod tests {
         unsafe_review.managed_changes[0].action = "delete".to_string();
         assert!(!job
             .clone()
-            .with_live_plan_review(Some(unsafe_review))
+            .with_reviewed_live_plan(Some((unsafe_review, selection.clone())))
             .can_approve_live_apply());
         assert!(job
-            .with_live_plan_review(Some(review))
+            .with_reviewed_live_plan(Some((review, selection)))
             .can_approve_live_apply());
+    }
+
+    #[test]
+    fn mixed_or_noncanonical_plan_review_bindings_fail_closed() {
+        let digest = "b".repeat(64);
+        let exact = ApiAdminAgentJobResult {
+            job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            evidence_digest: Some(digest.clone()),
+            raw_plan_digest: Some("c".repeat(64)),
+            signed_envelope: Some(ApiLivePlanReviewBinding {
+                job_id: "aaaaaaaa-7425-40de-944b-e07fc1f90ae7".to_string(),
+                attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+                evidence_digest: digest,
+                raw_plan_digest: Some("c".repeat(64)),
+            }),
+            plan_review: Some(LivePlanReview {
+                digest_verified: true,
+                ..LivePlanReview::default()
+            }),
+        };
+        assert!(exact
+            .into_reviewed_live_plan("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+            .is_none());
+
+        let raw_digest_mismatch = ApiAdminAgentJobResult {
+            job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            evidence_digest: Some("d".repeat(64)),
+            raw_plan_digest: Some("e".repeat(64)),
+            signed_envelope: Some(ApiLivePlanReviewBinding {
+                job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+                attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+                evidence_digest: "d".repeat(64),
+                raw_plan_digest: Some("f".repeat(64)),
+            }),
+            plan_review: Some(LivePlanReview {
+                digest_verified: true,
+                ..LivePlanReview::default()
+            }),
+        };
+        assert!(
+            raw_digest_mismatch
+                .into_reviewed_live_plan("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+                .is_none(),
+            "outer and signed raw-plan commitments must match exactly"
+        );
+
+        let legacy = ApiAdminAgentJobResult {
+            job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            evidence_digest: Some("d".repeat(64)),
+            raw_plan_digest: None,
+            signed_envelope: Some(ApiLivePlanReviewBinding {
+                job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+                attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+                evidence_digest: "d".repeat(64),
+                raw_plan_digest: None,
+            }),
+            plan_review: Some(LivePlanReview {
+                digest_verified: true,
+                ..LivePlanReview::default()
+            }),
+        };
+        assert!(
+            legacy
+                .into_reviewed_live_plan("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+                .is_none(),
+            "legacy evidence-only plan results must not be approvable"
+        );
+
+        let uppercase = ReviewedLivePlanSelection {
+            approved_plan_job_id: "7C9E6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+            approved_plan_digest: "c".repeat(64),
+        };
+        assert!(!uppercase.is_canonical());
     }
 
     #[test]
@@ -5280,6 +5581,7 @@ mod tests {
                 },
                 verification_ready: ready,
                 live_plan_review: None,
+                reviewed_plan_selection: None,
             };
 
         assert!(make("OfflineDryRun", "Succeeded", "check_ok", true, true)

@@ -11,6 +11,7 @@ const PROHIBITED_SERVICE_KEYS: &[&str] = &[
     "additional_hosts",
     "container_name",
     "dns",
+    "env_file",
     "external_links",
     "extra_hosts",
     "hostname",
@@ -59,12 +60,13 @@ const SAFE_TEXT_VALUES: &[&str] = &[
     "sources/ryuki-api/Dockerfile",
     "portal/portal-ui/Dockerfile",
     "../..",
-    "18080:8080",
-    "18000:8080",
-    "5432:5432",
+    "127.0.0.1:18080:8080",
+    "127.0.0.1:18000:8080",
+    "127.0.0.1:5432:5432",
     "0.0.0.0:8080",
     "postgres://ryuki:ryuki_dev@platform-db:5432/ryuki_platform",
     "http://localhost:18080",
+    "http://127.0.0.1:18000",
     "http://localhost:8080/health",
     "http://localhost:8080/healthz",
 ];
@@ -80,8 +82,67 @@ const HOST_ASSIGNMENT_KEYS: &[&str] = &["host", "hostname", "fqdn", "serial"];
 const PLATFORM_DB_ENV_WHITELIST: &[&str] = &["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"];
 const PLATFORM_API_ENV_WHITELIST: &[&str] = &[
     "RYUKI_DATABASE_URL",
+    "RYUKI_DATABASE__REQUIRED",
     "RYUKI_SERVER__BIND_ADDRESS",
     "RYUKI_PLATFORM_URL",
+    "RYUKI_AUTH_MODE",
+    "RYUKI_LOCAL_AUTH__USERS",
+    "RYUKI_LOCAL_AUTH__SITE_AUTHORITY",
+    "RYUKI_LOCAL_AUTH__SITE_SCOPE",
+    "RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY",
+    "RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE",
+    "RYUKI_SESSION__CREDENTIAL_HMAC_KEY",
+    "RYUKI_SESSION__COOKIE_SECURE",
+];
+const PORTAL_UI_ENV_WHITELIST: &[&str] = &[
+    "RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK",
+    "RYUKI_PORTAL_PUBLIC_ORIGIN",
+];
+
+const PLATFORM_DB_ENVIRONMENT: &[(&str, &str)] = &[
+    ("POSTGRES_USER", "ryuki"),
+    ("POSTGRES_PASSWORD", "ryuki_dev"),
+    ("POSTGRES_DB", "ryuki_platform"),
+];
+const PLATFORM_API_ENVIRONMENT: &[(&str, &str)] = &[
+    (
+        "RYUKI_DATABASE_URL",
+        "postgres://ryuki:ryuki_dev@platform-db:5432/ryuki_platform",
+    ),
+    ("RYUKI_DATABASE__REQUIRED", "true"),
+    ("RYUKI_MIGRATION_MODE", "local-auto"),
+    ("RYUKI_SERVER__BIND_ADDRESS", "0.0.0.0:8080"),
+    ("RYUKI_PLATFORM_URL", "http://localhost:18080"),
+    ("RYUKI_AUTH_MODE", "local"),
+    (
+        "RYUKI_LOCAL_AUTH__USERS",
+        "${RYUKI_LOCAL_AUTH__USERS:?required}",
+    ),
+    (
+        "RYUKI_LOCAL_AUTH__SITE_AUTHORITY",
+        "${RYUKI_LOCAL_AUTH__SITE_AUTHORITY:?required}",
+    ),
+    (
+        "RYUKI_LOCAL_AUTH__SITE_SCOPE",
+        "${RYUKI_LOCAL_AUTH__SITE_SCOPE:-}",
+    ),
+    (
+        "RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY",
+        "${RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY:?required}",
+    ),
+    (
+        "RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE",
+        "${RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE:-}",
+    ),
+    (
+        "RYUKI_SESSION__CREDENTIAL_HMAC_KEY",
+        "${RYUKI_SESSION__CREDENTIAL_HMAC_KEY:?required}",
+    ),
+    ("RYUKI_SESSION__COOKIE_SECURE", "false"),
+];
+const PORTAL_UI_ENVIRONMENT: &[(&str, &str)] = &[
+    ("RYUKI_PORTAL_PUBLIC_ORIGIN", "http://127.0.0.1:18000"),
+    ("RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK", "true"),
 ];
 
 #[derive(Debug, Deserialize)]
@@ -131,7 +192,7 @@ fn validate_compose_value(compose: &Value, errors: &mut Vec<String>) {
     expect(
         object_keys(compose) == key_set(ALLOWED_TOP_LEVEL_KEYS),
         errors,
-        "compose top-level keys must be exactly name, services, networks",
+        "compose top-level keys must be exactly name, services, volumes, networks",
     );
     expect(
         str_at(compose, &["name"]) == Some("ryuki-infrastructure-platform"),
@@ -200,6 +261,24 @@ fn validate_compose_value(compose: &Value, errors: &mut Vec<String>) {
         errors,
         "ryuki-net network must define only bridge driver",
     );
+    expect(
+        object_at(compose, &["volumes"])
+            .map(|value| object_keys(value) == key_set(&["pgdata"]))
+            .unwrap_or(false)
+            && compose
+                .get("volumes")
+                .and_then(|value| value.get("pgdata"))
+                .map(|value| {
+                    value.is_null()
+                        || value
+                            .as_object()
+                            .map(|mapping| mapping.is_empty())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false),
+        errors,
+        "compose volumes must define only an empty pgdata volume",
+    );
 }
 
 fn validate_service(service_name: &str, service: Option<&Value>, errors: &mut Vec<String>) {
@@ -254,6 +333,23 @@ fn validate_service(service_name: &str, service: Option<&Value>, errors: &mut Ve
         errors,
         format!("{service_name} must use ryuki-net network only"),
     );
+    validate_environment(service_name, service, errors);
+}
+
+fn validate_environment(service_name: &str, service: Option<&Value>, errors: &mut Vec<String>) {
+    let expected = match service_name {
+        "platform-db" => PLATFORM_DB_ENVIRONMENT,
+        "platform-api" => PLATFORM_API_ENVIRONMENT,
+        "portal-ui" => PORTAL_UI_ENVIRONMENT,
+        _ => &[],
+    };
+    expect(
+        exact_string_map_at(service, &["environment"], expected),
+        errors,
+        format!(
+            "{service_name} environment must match the reviewed local-safe profile of checked-in values"
+        ),
+    );
 }
 
 fn validate_no_prohibited_service_keys(
@@ -295,7 +391,15 @@ fn scan_prohibited_value(value: &Value, path: &str, errors: &mut Vec<String>) {
                     || path.ends_with("services.platform-api.environment");
                 let is_api_env_whitelisted =
                     in_platform_api_env && PLATFORM_API_ENV_WHITELIST.contains(&key.as_str());
-                if !is_db_env_whitelisted && !is_api_env_whitelisted && prohibited_key(key) {
+                let in_portal_ui_env = path.ends_with("portal-ui.environment")
+                    || path.ends_with("services.portal-ui.environment");
+                let is_portal_env_whitelisted =
+                    in_portal_ui_env && PORTAL_UI_ENV_WHITELIST.contains(&key.as_str());
+                if !is_db_env_whitelisted
+                    && !is_api_env_whitelisted
+                    && !is_portal_env_whitelisted
+                    && prohibited_key(key)
+                {
                     errors.push(format!("{path}.{key} contains prohibited key"));
                 }
                 scan_prohibited_value(child, &format!("{path}.{key}"), errors);
@@ -323,7 +427,6 @@ fn allowed_service_keys(service_name: &str) -> &'static [&'static str] {
         "platform-api" => &[
             "build",
             "depends_on",
-            "env_file",
             "environment",
             "healthcheck",
             "image",
@@ -333,6 +436,7 @@ fn allowed_service_keys(service_name: &str) -> &'static [&'static str] {
         "portal-ui" => &[
             "build",
             "depends_on",
+            "environment",
             "healthcheck",
             "image",
             "networks",
@@ -376,9 +480,9 @@ fn allowed_image(service_name: &str) -> &'static str {
 
 fn allowed_ports(service_name: &str) -> Vec<String> {
     match service_name {
-        "platform-api" => vec!["18080:8080".to_string()],
-        "portal-ui" => vec!["18000:8080".to_string()],
-        "platform-db" => vec!["5432:5432".to_string()],
+        "platform-api" => vec!["127.0.0.1:18080:8080".to_string()],
+        "portal-ui" => vec!["127.0.0.1:18000:8080".to_string()],
+        "platform-db" => vec!["127.0.0.1:5432:5432".to_string()],
         _ => Vec::new(),
     }
 }
@@ -417,6 +521,26 @@ fn string_array_at_required(value: Option<&Value>, path: &[&str]) -> Option<Vec<
         Value::String(text) => Some(vec![text.to_string()]),
         _ => None,
     }
+}
+
+fn exact_string_map_at(value: Option<&Value>, path: &[&str], expected: &[(&str, &str)]) -> bool {
+    let mut current = match value {
+        Some(value) => value,
+        None => return false,
+    };
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return false;
+        };
+        current = next;
+    }
+    let Some(map) = current.as_object() else {
+        return false;
+    };
+    map.len() == expected.len()
+        && expected.iter().all(|(key, expected_value)| {
+            map.get(*key).and_then(Value::as_str) == Some(*expected_value)
+        })
 }
 
 fn object_keys(value: &Value) -> BTreeSet<String> {
@@ -628,6 +752,130 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reviewed_compose() -> Value {
+        serde_yaml::from_str(include_str!("../../../deploy/compose/compose.yaml"))
+            .expect("reviewed compose fixture must parse")
+    }
+
+    fn value_errors(compose: &Value) -> Vec<String> {
+        validate_values_json(&json!({ "compose": compose }).to_string())
+            .expect("compose value validation must complete")
+    }
+
+    fn prohibited_errors(compose: &Value) -> Vec<String> {
+        scan_prohibited_json(
+            &json!({
+                "value": compose,
+                "path": "compose",
+            })
+            .to_string(),
+        )
+        .expect("compose prohibited scan must complete")
+    }
+
+    #[test]
+    fn reviewed_loopback_launch_profile_is_accepted() {
+        let compose = reviewed_compose();
+
+        assert!(
+            value_errors(&compose).is_empty(),
+            "reviewed profile must satisfy the exact compose contract: {:?}",
+            value_errors(&compose)
+        );
+        assert!(
+            prohibited_errors(&compose).is_empty(),
+            "reviewed profile must contain no prohibited material: {:?}",
+            prohibited_errors(&compose)
+        );
+    }
+
+    #[test]
+    fn nonloopback_published_port_is_rejected() {
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["ports"][0] = Value::String("18080:8080".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "platform-api ports are invalid"),
+            "nonloopback port must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn credential_free_api_auth_mode_is_rejected() {
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["environment"]["RYUKI_AUTH_MODE"] =
+            Value::String("mock-dry-run".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("platform-api environment must match the reviewed local-safe profile")),
+            "credential-free bridge auth must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn nonloopback_portal_origin_is_rejected() {
+        let mut compose = reviewed_compose();
+        compose["services"]["portal-ui"]["environment"]["RYUKI_PORTAL_PUBLIC_ORIGIN"] =
+            Value::String("https://portal.example".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("portal-ui environment must match the reviewed local-safe profile")),
+            "unreviewed portal origin must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn arbitrary_api_environment_value_is_rejected() {
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["environment"]["RYUKI_UNREVIEWED_SETTING"] =
+            Value::String("true".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("platform-api environment must match the reviewed local-safe profile")),
+            "arbitrary API environment must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn service_env_file_cannot_be_reintroduced() {
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["env_file"] = json!([{
+            "path": "../../.env",
+            "required": false
+        }]);
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "platform-api must not define env_file in skeleton"),
+            "service env_file must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn required_secret_interpolation_cannot_gain_a_fallback() {
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["environment"]["RYUKI_SESSION__CREDENTIAL_HMAC_KEY"] =
+            Value::String("${RYUKI_SESSION__CREDENTIAL_HMAC_KEY:-fallback}".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("platform-api environment must match the reviewed local-safe profile")),
+            "secret interpolation fallback must fail closed: {errors:?}"
+        );
+    }
 
     // ── allowed_context tests (RED before reconciliation) ─────────────
 

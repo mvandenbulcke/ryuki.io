@@ -4,6 +4,8 @@
 //! plan -input=false -no-color` in an isolated workspace.
 //!
 //! # Security invariants
+//! - The top-level Terraform CLI is an approved absolute canonical executable;
+//!   inherited `PATH` is never used to select it.
 //! - All child `Command`s call `.env_clear()` and then re-inject only a minimal
 //!   allowlist: PATH, HOME, TMPDIR, LANG, LC_ALL (if present in the parent).
 //!   This prevents platform secrets (RYUKI_*, RYUKI_DATABASE_*, vault tokens,
@@ -25,14 +27,30 @@ use ryuki_engine::runners::{
     ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
 };
 
-use super::{exec::run_command_with_timeout, scrub::scrub_output, workspace::Workspace, Runner};
+use super::{
+    exec::{run_command_with_optional_cancellation, run_version_probe, CommandCancellation},
+    executable::{ApprovedExecutable, ApprovedTool},
+    scrub::scrub_output,
+    workspace::Workspace,
+    Runner,
+};
 
 /// Per-subprocess timeout for terraform init and terraform plan.
 /// A hung terraform (e.g. waiting for a remote backend) is killed after this.
 const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Default binary name; overridable for tests via `TerraformRunner::with_binary`.
-const DEFAULT_BINARY: &str = "terraform";
+/// Add phase context only to ordinary setup failures. Authoritative lifecycle
+/// and capture-budget outcomes must retain their exact typed variants so the
+/// job owner cannot mistake cancellation or overflow for a generic spawn
+/// failure during an early Terraform phase.
+fn terraform_phase_error(phase: &str, error: RunnerError) -> RunnerError {
+    match error {
+        terminal @ (RunnerError::Timeout
+        | RunnerError::Cancelled
+        | RunnerError::OutputLimitExceeded { .. }) => terminal,
+        other => RunnerError::Spawn(format!("terraform {phase}: {other}")),
+    }
+}
 
 /// Dependency selection is part of the embedded IaC contract. Every runner
 /// path uses this exact init argv so Terraform cannot silently rewrite it.
@@ -61,28 +79,22 @@ static OFFERING_SLUG_RE: std::sync::LazyLock<regex::Regex> =
 
 /// Runner for Terraform. Dry-run only in Slice 1.
 ///
-/// # Binary injection
-/// Use `TerraformRunner::with_binary("/path/to/fake-terraform")` in tests
-/// to avoid requiring a real Terraform installation.
+/// # Executable approval
+/// Production runs require `RYUKI_TERRAFORM_EXECUTABLE` and
+/// `RYUKI_TERRAFORM_EXPECTED_VERSION`. The configured CLI is admitted through
+/// the shared approved-executable boundary before command construction.
 ///
 /// # IaC content injection
 /// Use `TerraformRunner::with_iac` to embed static IaC file content that is
 /// written into the workspace before `terraform init`. Each entry is a
 /// `(filename, content)` pair; content must be valid Terraform HCL.
+#[derive(Default)]
 pub struct TerraformRunner {
-    binary: String,
+    executable: Option<ApprovedExecutable>,
     /// Static IaC files written into the workspace before `terraform init`.
     /// Each entry is `(filename, utf8_content)`.
     iac_files: Vec<(&'static str, &'static str)>,
-}
-
-impl Default for TerraformRunner {
-    fn default() -> Self {
-        Self {
-            binary: DEFAULT_BINARY.to_string(),
-            iac_files: Vec::new(),
-        }
-    }
+    cancellation: Option<CommandCancellation>,
 }
 
 impl TerraformRunner {
@@ -90,11 +102,15 @@ impl TerraformRunner {
         Self::default()
     }
 
-    /// Create a runner pointing at a custom binary path (for tests / injection).
+    /// Create a runner pointing at a test shim without requiring a real
+    /// Terraform installation. This bypass is absent from production builds.
+    #[cfg(test)]
     pub fn with_binary(binary: impl Into<String>) -> Self {
+        let binary: String = binary.into();
         Self {
-            binary: binary.into(),
+            executable: Some(ApprovedExecutable::for_test(binary)),
             iac_files: Vec::new(),
+            cancellation: None,
         }
     }
 
@@ -107,6 +123,29 @@ impl TerraformRunner {
     pub fn with_iac(mut self, files: Vec<(&'static str, &'static str)>) -> Self {
         self.iac_files = files;
         self
+    }
+
+    /// Attach one cancellation signal to the entire logical run, including
+    /// its version probe and init/validate/plan phases.
+    pub fn with_cancellation(mut self, cancellation: &CommandCancellation) -> Self {
+        self.cancellation = Some(cancellation.clone());
+        self
+    }
+
+    fn approved_executable(&self) -> Result<ApprovedExecutable, RunnerError> {
+        match &self.executable {
+            Some(executable) => Ok(executable.clone()),
+            None => {
+                ApprovedExecutable::configured(ApprovedTool::Terraform, self.cancellation.as_ref())
+            }
+        }
+    }
+
+    fn probe_available(&self, executable: &ApprovedExecutable) -> Result<bool, RunnerError> {
+        let mut cmd = Command::new(executable.path());
+        apply_env_allowlist(&mut cmd);
+        cmd.arg("version");
+        run_version_probe(cmd, self.cancellation.as_ref())
     }
 }
 
@@ -216,18 +255,8 @@ pub(crate) fn credential_components(material: &[u8]) -> Vec<Vec<u8>> {
 
 impl Runner for TerraformRunner {
     fn available(&self) -> bool {
-        // A simple version check — if the binary is missing, the command fails
-        // and we return false (never panic).
-        // env_clear() + allowlist: prevent parent secrets from reaching the probe.
-        let mut cmd = Command::new(&self.binary);
-        apply_env_allowlist(&mut cmd);
-        cmd.arg("version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Retry on transient ETXTBSY: a test probe may exec a just-written shim
-        // that a concurrent fork() briefly holds a write fd to (see exec.rs).
-        crate::exec::retry_on_etxtbsy(|| cmd.status())
-            .map(|s| s.success())
+        self.approved_executable()
+            .and_then(|executable| self.probe_available(&executable))
             .unwrap_or(false)
     }
 
@@ -251,6 +280,28 @@ impl Runner for TerraformRunner {
             validate_var_name(name)?;
         }
 
+        // Establish executable provenance before credential material is even
+        // split or converted, and before any credential-bearing Command can
+        // be constructed.
+        let executable = match self.approved_executable() {
+            Ok(executable) => executable,
+            Err(error) => {
+                if matches!(&error, RunnerError::Cancelled) {
+                    return Err(error);
+                }
+                return Ok(RunOutcome {
+                    runner_kind: RunnerKind::Terraform,
+                    mode: plan.mode,
+                    status: RunStatus::RunnerUnavailable,
+                    summary: "runner unavailable: configured Terraform executable was not approved"
+                        .to_string(),
+                    log: String::new(),
+                    exit_code: None,
+                    post_apply: None,
+                });
+            }
+        };
+
         // Build the per-component secret values for scrubbing.
         // Splitting into components ensures each comma-separated value is
         // redacted individually — prevents partial leakage.
@@ -258,14 +309,14 @@ impl Runner for TerraformRunner {
         let secret_refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
 
         // --- Binary availability check ---
-        if !self.available() {
+        if !self.probe_available(&executable)? {
             return Ok(RunOutcome {
                 runner_kind: RunnerKind::Terraform,
                 mode: plan.mode,
                 status: RunStatus::RunnerUnavailable,
                 summary: format!(
-                    "runner unavailable: terraform binary not found at '{}'",
-                    self.binary
+                    "runner unavailable: terraform binary not found at {:?}",
+                    executable.path()
                 ),
                 log: String::new(),
                 exit_code: None,
@@ -298,7 +349,7 @@ impl Runner for TerraformRunner {
         // --- Step 1: terraform init ---
         // env_clear() + allowlist applied; CHECKPOINT_DISABLE and TF_LOG
         // control added explicitly after the allowlist.
-        let mut init_cmd = Command::new(&self.binary);
+        let mut init_cmd = Command::new(executable.path());
         apply_env_allowlist(&mut init_cmd);
         // Pin HOME and TMPDIR to the workspace so terraform cannot write to
         // the real $HOME (e.g. ~/.terraform.d plugin cache). Any cache writes
@@ -319,11 +370,12 @@ impl Runner for TerraformRunner {
             init_cmd.env(&env_key, &cred_str);
         }
 
-        let init_output =
-            run_command_with_timeout(init_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
-                RunnerError::Timeout => RunnerError::Timeout,
-                other => RunnerError::Spawn(format!("terraform init: {other}")),
-            })?;
+        let init_output = run_command_with_optional_cancellation(
+            init_cmd,
+            RUNNER_TIMEOUT,
+            self.cancellation.as_ref(),
+        )
+        .map_err(|error| terraform_phase_error("init", error))?;
 
         if !init_output.status.success() {
             let raw = combine_output(&init_output.stdout, &init_output.stderr);
@@ -346,7 +398,7 @@ impl Runner for TerraformRunner {
         // Always runs — offline correctness oracle against the real provider
         // schema. Requires no live vCenter or credentials; validate only checks
         // that the configuration is structurally valid per the downloaded schema.
-        let mut validate_cmd = Command::new(&self.binary);
+        let mut validate_cmd = Command::new(executable.path());
         apply_env_allowlist(&mut validate_cmd);
         pin_home_tmpdir_to_workspace(&mut validate_cmd, ws.path());
         validate_cmd
@@ -355,11 +407,12 @@ impl Runner for TerraformRunner {
             .env("CHECKPOINT_DISABLE", "1")
             .env_remove("TF_LOG");
 
-        let validate_output =
-            run_command_with_timeout(validate_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
-                RunnerError::Timeout => RunnerError::Timeout,
-                other => RunnerError::Spawn(format!("terraform validate: {other}")),
-            })?;
+        let validate_output = run_command_with_optional_cancellation(
+            validate_cmd,
+            RUNNER_TIMEOUT,
+            self.cancellation.as_ref(),
+        )
+        .map_err(|error| terraform_phase_error("validate", error))?;
 
         let validate_raw = combine_output(&validate_output.stdout, &validate_output.stderr);
         let validate_log = scrub_output(&validate_raw, &secret_refs);
@@ -388,7 +441,7 @@ impl Runner for TerraformRunner {
         // For built-in terraform_data offerings this succeeds fully offline.
         // For vsphere/external-provider offerings it will fail without a
         // reachable vCenter — that failure is captured gracefully.
-        let mut plan_cmd = Command::new(&self.binary);
+        let mut plan_cmd = Command::new(executable.path());
         apply_env_allowlist(&mut plan_cmd);
         pin_home_tmpdir_to_workspace(&mut plan_cmd, ws.path());
         plan_cmd
@@ -402,9 +455,26 @@ impl Runner for TerraformRunner {
             plan_cmd.env(&env_key, &cred_str);
         }
 
-        let plan_result = run_command_with_timeout(plan_cmd, RUNNER_TIMEOUT);
+        let plan_result = run_command_with_optional_cancellation(
+            plan_cmd,
+            RUNNER_TIMEOUT,
+            self.cancellation.as_ref(),
+        );
 
         match plan_result {
+            Err(error) if matches!(&error, RunnerError::Cancelled) => {
+                // Cancellation is an authoritative lifecycle decision, not a
+                // best-effort plan failure. Propagate it so request/lease
+                // owners cannot publish partial validation evidence after
+                // terminating the active process tree.
+                Err(error)
+            }
+            Err(error @ RunnerError::OutputLimitExceeded { .. }) => {
+                // Output overflow is also terminal. Treating it as a merely
+                // unavailable best-effort plan would publish `Validated` after
+                // an adversarial/provider-controlled capture breach.
+                Err(error)
+            }
             Err(RunnerError::Timeout) => {
                 // Plan timed out — degraded but validate evidence is preserved.
                 Ok(RunOutcome {
@@ -616,6 +686,244 @@ mod tests {
             !runner.available(),
             "missing binary must return false, not panic"
         );
+    }
+
+    #[test]
+    fn logical_run_propagates_cancellation_to_the_version_probe() {
+        let ws = Workspace::new().expect("workspace");
+        let marker = ws.path().join("version-probe-ran");
+        let shim = ws.path().join("cancelled-terraform");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let cancellation = CommandCancellation::new();
+        cancellation.cancel();
+        let runner =
+            TerraformRunner::with_binary(shim.to_string_lossy()).with_cancellation(&cancellation);
+        let error = runner
+            .run_dry(&make_plan_dryrun(), &fake_creds(""))
+            .expect_err("pre-cancelled logical run must fail before probing");
+        assert_eq!(error, RunnerError::Cancelled);
+        assert!(
+            !marker.exists(),
+            "cancelled logical run must not spawn a probe"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_version_probe_is_not_reported_as_unavailable() {
+        let ws = Workspace::new().expect("workspace");
+        let probe_started = ws.path().join("version-probe-started");
+        let shim = ws.path().join("slow-version-terraform");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = version ]; then\n\
+               touch '{}'; sleep 30\n\
+             fi\n\
+             exit 0\n",
+            probe_started.display()
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let cancellation = CommandCancellation::new();
+        let runner =
+            TerraformRunner::with_binary(shim.to_string_lossy()).with_cancellation(&cancellation);
+        let worker =
+            std::thread::spawn(move || runner.run_dry(&make_plan_dryrun(), &fake_creds("")));
+        let started = (0..500).any(|_| {
+            if probe_started.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(started, "fake version probe must start");
+
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("runner thread must not panic")
+            .expect_err("cancelled active probe must return an error");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "authoritative cancellation must not become RunnerUnavailable: {error}"
+        );
+    }
+
+    fn assert_active_phase_cancellation_is_terminal(active_phase: &str) {
+        let ws = Workspace::new().expect("workspace");
+        let init_started = ws.path().join("init-started");
+        let validate_started = ws.path().join("validate-started");
+        let plan_started = ws.path().join("plan-started");
+        let active_phase_completed = ws.path().join("active-phase-completed");
+        let shim = ws.path().join("cancellable-terraform");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               version) exit 0 ;;\n\
+               init) touch '{}'; if [ '{}' = init ]; then sleep 30; touch '{}'; fi; exit 0 ;;\n\
+               validate) touch '{}'; if [ '{}' = validate ]; then sleep 30; touch '{}'; fi; exit 0 ;;\n\
+               plan) touch '{}'; if [ '{}' = plan ]; then sleep 30; touch '{}'; fi; exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            init_started.display(),
+            active_phase,
+            active_phase_completed.display(),
+            validate_started.display(),
+            active_phase,
+            active_phase_completed.display(),
+            plan_started.display(),
+            active_phase,
+            active_phase_completed.display()
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let cancellation = CommandCancellation::new();
+        let runner =
+            TerraformRunner::with_binary(shim.to_string_lossy()).with_cancellation(&cancellation);
+        let worker =
+            std::thread::spawn(move || runner.run_dry(&make_plan_dryrun(), &fake_creds("")));
+
+        let active_marker = match active_phase {
+            "init" => &init_started,
+            "validate" => &validate_started,
+            "plan" => &plan_started,
+            other => panic!("unexpected Terraform test phase: {other}"),
+        };
+        let started = (0..500).any(|_| {
+            if active_marker.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(started, "fake {active_phase} phase must start");
+        let cancelled_at = std::time::Instant::now();
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("runner thread must not panic")
+            .expect_err("active logical phase must observe cancellation");
+        assert_eq!(error, RunnerError::Cancelled);
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(2),
+            "active {active_phase} cancellation must return promptly"
+        );
+        assert!(
+            !active_phase_completed.exists(),
+            "cancelled {active_phase} process must not run to completion"
+        );
+        if active_phase == "init" {
+            assert!(
+                !validate_started.exists() && !plan_started.exists(),
+                "init cancellation must prevent validate and plan"
+            );
+        } else if active_phase == "validate" {
+            assert!(
+                !plan_started.exists(),
+                "validate cancellation must prevent plan"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_during_init_is_terminal_and_bounded() {
+        assert_active_phase_cancellation_is_terminal("init");
+    }
+
+    #[test]
+    fn cancellation_during_validate_is_terminal_and_bounded() {
+        assert_active_phase_cancellation_is_terminal("validate");
+    }
+
+    #[test]
+    fn cancellation_during_plan_is_terminal_and_bounded() {
+        assert_active_phase_cancellation_is_terminal("plan");
+    }
+
+    fn assert_early_phase_overflow_is_terminal(active_phase: &str) {
+        let ws = Workspace::new().expect("workspace");
+        let shim = ws
+            .path()
+            .join(format!("overflowing-terraform-{active_phase}"));
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  version) exit 0 ;;\n  {active_phase}) yes x | head -c {}; exit 0 ;;\n  init|validate|plan) exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            crate::exec::MAX_CAPTURE_BYTES_PER_STREAM + 1
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let error = TerraformRunner::with_binary(shim.to_string_lossy())
+            .run_dry(&make_plan_dryrun(), &fake_creds(""))
+            .expect_err("early-phase output overflow must remain terminal");
+        assert!(matches!(
+            error,
+            RunnerError::OutputLimitExceeded { ref scope, limit }
+                if scope == "stdout" && limit == crate::exec::MAX_CAPTURE_BYTES_PER_STREAM
+        ));
+    }
+
+    #[test]
+    fn init_capture_overflow_preserves_exact_terminal_variant() {
+        assert_early_phase_overflow_is_terminal("init");
+    }
+
+    #[test]
+    fn validate_capture_overflow_preserves_exact_terminal_variant() {
+        assert_early_phase_overflow_is_terminal("validate");
+    }
+
+    #[test]
+    fn plan_capture_overflow_is_terminal_not_validated() {
+        let ws = Workspace::new().expect("workspace");
+        let shim = ws.path().join("overflowing-terraform-plan");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  version|init|validate) exit 0 ;;\n  plan) yes x | head -c {}; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            crate::exec::MAX_CAPTURE_BYTES_PER_STREAM + 1
+        );
+        std::fs::write(&shim, script).expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let runner = TerraformRunner::with_binary(shim.to_string_lossy());
+        let error = runner
+            .run_dry(&make_plan_dryrun(), &fake_creds(""))
+            .expect_err("an oversized plan must not degrade to Validated");
+        assert!(matches!(
+            error,
+            RunnerError::OutputLimitExceeded { ref scope, limit }
+                if scope == "stdout" && limit == crate::exec::MAX_CAPTURE_BYTES_PER_STREAM
+        ));
     }
 
     // --- env_clear: parent secrets must NOT reach the child ---

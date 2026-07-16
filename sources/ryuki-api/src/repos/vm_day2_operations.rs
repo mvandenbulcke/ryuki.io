@@ -152,7 +152,8 @@ pub async fn list(pool: &PgPool) -> Result<Vec<VmDay2ChangeRequest>, sqlx::Error
 }
 
 /// Atomically transition a vm day-2 operation to its new state IFF its current
-/// DB status still equals `expected_status` (optimistic lock). Returns
+/// DB status still equals `expected_status` (optimistic lock) and its durable
+/// governance binding is unchanged. Returns
 /// `Ok(false)` when the row is absent or its status had already changed
 /// (caller → 409). `Ok(true)` on success.
 ///
@@ -166,6 +167,11 @@ pub async fn transition(
     let Ok(uid) = Uuid::parse_str(&op.id) else {
         return Ok(false);
     };
+    if op.governance.is_none() {
+        // Legacy/makerless rows fail closed. They must be replanned so the
+        // immutable plan has a server-derived maker and digest binding.
+        return Ok(false);
+    }
 
     let plan_json = serde_json::to_string(op).unwrap_or_else(|_| "{}".into());
 
@@ -176,7 +182,10 @@ pub async fn transition(
          status = $2, \
          plan_json = $3::jsonb, \
          updated_at = NOW() \
-         WHERE id = $1 AND status = $4",
+         WHERE id = $1 AND status = $4 \
+           AND plan_json #> '{governance}' = $3::jsonb #> '{governance}' \
+           AND (plan_json - 'status' - 'updated_at' - 'metadata' - 'governance') = \
+               ($3::jsonb - 'status' - 'updated_at' - 'metadata' - 'governance')",
     )
     .bind(uid)
     .bind(status_str(&op.status))
@@ -192,4 +201,206 @@ pub async fn transition(
 
     tx.commit().await?;
     Ok(true)
+}
+
+/// Store the maker/checker decision for the exact validated plan. The database
+/// repeats the engine checks so a stale read, forged repository caller, or
+/// concurrent transition cannot approve a different plan or let its maker act
+/// as checker.
+pub async fn approve_transition(
+    pool: &PgPool,
+    op: &VmDay2ChangeRequest,
+) -> Result<bool, sqlx::Error> {
+    let Ok(uid) = Uuid::parse_str(&op.id) else {
+        return Ok(false);
+    };
+    let Some(governance) = op.governance.as_ref() else {
+        return Ok(false);
+    };
+    let Some(approval) = governance.approval.as_ref() else {
+        return Ok(false);
+    };
+    if op.status != VmChangeStatus::Approved
+        || governance.planned_by.trim().is_empty()
+        || approval.approved_by.trim().is_empty()
+        || governance.planned_by == approval.approved_by
+        || governance.plan_digest != approval.plan_digest
+        || governance.operation_lock.is_some()
+    {
+        return Ok(false);
+    }
+
+    let plan_json = serde_json::to_string(op).unwrap_or_else(|_| "{}".into());
+    let res = sqlx::query(
+        "UPDATE vm_day2_operations SET \
+         status = 'Approved', plan_json = $2::jsonb, updated_at = NOW() \
+         WHERE id = $1 AND status = 'Validated' \
+           AND plan_json #>> '{governance,plan_digest}' = $3 \
+           AND plan_json #>> '{governance,planned_by}' = $4 \
+           AND NULLIF(plan_json #>> '{governance,planned_by}', '') IS NOT NULL \
+           AND plan_json #> '{governance,approval}' IS NULL \
+           AND plan_json #> '{governance,operation_lock}' IS NULL \
+           AND (plan_json - 'status' - 'updated_at' - 'metadata' - 'governance') = \
+               ($2::jsonb - 'status' - 'updated_at' - 'metadata' - 'governance') \
+           AND $2::jsonb #>> '{governance,approval,plan_digest}' = $3 \
+           AND NULLIF($2::jsonb #>> '{governance,approval,approved_by}', '') IS NOT NULL \
+           AND $2::jsonb #>> '{governance,approval,approved_by}' <> $4 \
+           AND NULLIF($2::jsonb #>> '{governance,approval,approved_at}', '')::timestamptz \
+               <= clock_timestamp() + INTERVAL '5 minutes'",
+    )
+    .bind(uid)
+    .bind(&plan_json)
+    .bind(&governance.plan_digest)
+    .bind(&governance.planned_by)
+    .execute(pool)
+    .await?;
+
+    Ok(res.rows_affected() == 1)
+}
+
+/// Acquire a durable, short-lived lock for the exact approved plan. A
+/// transaction-scoped advisory lock serializes contenders for the same VM
+/// scope; the guarded UPDATE then refuses any still-active overlapping lock.
+pub async fn acquire_lock_transition(
+    pool: &PgPool,
+    op: &VmDay2ChangeRequest,
+) -> Result<bool, sqlx::Error> {
+    let Ok(uid) = Uuid::parse_str(&op.id) else {
+        return Ok(false);
+    };
+    let Some(governance) = op.governance.as_ref() else {
+        return Ok(false);
+    };
+    let (Some(approval), Some(operation_lock)) = (
+        governance.approval.as_ref(),
+        governance.operation_lock.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if op.status != VmChangeStatus::Locked
+        || governance.planned_by.trim().is_empty()
+        || approval.approved_by.trim().is_empty()
+        || governance.planned_by == approval.approved_by
+        || governance.plan_digest != approval.plan_digest
+        || governance.plan_digest != operation_lock.plan_digest
+        || Uuid::parse_str(&operation_lock.lock_id).is_err()
+        || operation_lock.locked_by.trim().is_empty()
+    {
+        return Ok(false);
+    }
+
+    let plan_json = serde_json::to_string(op).unwrap_or_else(|_| "{}".into());
+    let lock_scope = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        op.target_ci_key, op.site, op.environment
+    );
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(&lock_scope)
+        .execute(&mut *tx)
+        .await?;
+
+    let res = sqlx::query(
+        "UPDATE vm_day2_operations AS current_op SET \
+         status = 'Locked', plan_json = $2::jsonb, updated_at = NOW() \
+         WHERE current_op.id = $1 AND current_op.status = 'Approved' \
+           AND current_op.plan_json #>> '{governance,plan_digest}' = $3 \
+           AND current_op.plan_json #>> '{governance,planned_by}' = $4 \
+           AND current_op.plan_json #> '{governance,approval}' = \
+               $2::jsonb #> '{governance,approval}' \
+           AND current_op.plan_json #> '{governance,operation_lock}' IS NULL \
+           AND (current_op.plan_json - 'status' - 'updated_at' - 'metadata' - 'governance') = \
+               ($2::jsonb - 'status' - 'updated_at' - 'metadata' - 'governance') \
+           AND $2::jsonb #>> '{governance,operation_lock,plan_digest}' = $3 \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,lock_id}', '') IS NOT NULL \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,locked_by}', '') IS NOT NULL \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,acquired_at}', '')::timestamptz \
+               <= clock_timestamp() + INTERVAL '5 minutes' \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,expires_at}', '')::timestamptz \
+               > clock_timestamp() \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,expires_at}', '')::timestamptz \
+               > NULLIF($2::jsonb #>> '{governance,operation_lock,acquired_at}', '')::timestamptz \
+           AND NULLIF($2::jsonb #>> '{governance,operation_lock,expires_at}', '')::timestamptz \
+               <= NULLIF($2::jsonb #>> '{governance,operation_lock,acquired_at}', '')::timestamptz \
+                  + INTERVAL '20 minutes' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM vm_day2_operations AS other \
+               WHERE other.id <> current_op.id \
+                 AND other.target_ci_key = current_op.target_ci_key \
+                 AND other.site = current_op.site \
+                 AND other.environment = current_op.environment \
+                 AND other.status = 'Locked' \
+                 AND NULLIF(other.plan_json #>> '{governance,operation_lock,expires_at}', '')::timestamptz \
+                     > clock_timestamp() \
+           )",
+    )
+    .bind(uid)
+    .bind(&plan_json)
+    .bind(&governance.plan_digest)
+    .bind(&governance.planned_by)
+    .execute(&mut *tx)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Execute only while the exact stored lock remains active according to the
+/// database clock. This closes the application-check/DB-write race: expiry,
+/// digest, approval, lock id, and scalar status are one atomic predicate.
+pub async fn execute_transition(
+    pool: &PgPool,
+    op: &VmDay2ChangeRequest,
+) -> Result<bool, sqlx::Error> {
+    let Ok(uid) = Uuid::parse_str(&op.id) else {
+        return Ok(false);
+    };
+    let Some(governance) = op.governance.as_ref() else {
+        return Ok(false);
+    };
+    let (Some(approval), Some(operation_lock)) = (
+        governance.approval.as_ref(),
+        governance.operation_lock.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if op.status != VmChangeStatus::Executed
+        || governance.planned_by.trim().is_empty()
+        || approval.approved_by.trim().is_empty()
+        || governance.planned_by == approval.approved_by
+        || governance.plan_digest != approval.plan_digest
+        || governance.plan_digest != operation_lock.plan_digest
+        || Uuid::parse_str(&operation_lock.lock_id).is_err()
+        || operation_lock.locked_by.trim().is_empty()
+    {
+        return Ok(false);
+    }
+
+    let plan_json = serde_json::to_string(op).unwrap_or_else(|_| "{}".into());
+    let res = sqlx::query(
+        "UPDATE vm_day2_operations SET \
+         status = 'Executed', plan_json = $2::jsonb, updated_at = NOW() \
+         WHERE id = $1 AND status = 'Locked' \
+           AND plan_json #>> '{governance,plan_digest}' = $3 \
+           AND plan_json #>> '{governance,planned_by}' = $4 \
+           AND plan_json #> '{governance,approval}' = $2::jsonb #> '{governance,approval}' \
+           AND plan_json #> '{governance,operation_lock}' = \
+               $2::jsonb #> '{governance,operation_lock}' \
+           AND (plan_json - 'status' - 'updated_at' - 'metadata' - 'governance') = \
+               ($2::jsonb - 'status' - 'updated_at' - 'metadata' - 'governance') \
+           AND NULLIF(plan_json #>> '{governance,operation_lock,expires_at}', '')::timestamptz \
+               > clock_timestamp()",
+    )
+    .bind(uid)
+    .bind(&plan_json)
+    .bind(&governance.plan_digest)
+    .bind(&governance.planned_by)
+    .execute(pool)
+    .await?;
+
+    Ok(res.rows_affected() == 1)
 }

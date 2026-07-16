@@ -221,6 +221,24 @@ pub async fn list_ports_by_switch(
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// List ports for a switch while applying the caller's persisted site scope in
+/// SQL, before raw topology rows cross the repository boundary.
+pub async fn list_ports_by_switch_in_sites(
+    pool: &PgPool,
+    switch_name: &str,
+    sites: &[String],
+) -> Result<Vec<SwitchPort>, sqlx::Error> {
+    let rows: Vec<SwitchPortRow> = sqlx::query_as(&format!(
+        "SELECT {PORT_COLUMNS} FROM switch_ports \
+         WHERE switch_name = $1 AND site = ANY($2::text[]) ORDER BY port_number"
+    ))
+    .bind(switch_name)
+    .bind(sites)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
 /// List all VLANs, optionally filtered by site.
 pub async fn list_vlans(pool: &PgPool, site: &str) -> Result<Vec<VLAN>, sqlx::Error> {
     let rows: Vec<VlanRow> = if site.is_empty() {

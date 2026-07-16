@@ -1508,9 +1508,9 @@ fn RbacRoleCatalogPanel() -> impl IntoView {
     }
 }
 
-/// One enrolled-agent row for the Admin roster: agent id, platform, enrollment
-/// status, last-seen heartbeat, and recent-job count. Read-only — approve and
-/// revoke live in the Agents workspace.
+/// One enrolled-agent row for the Admin roster: agent id, immutable enrollment
+/// id, non-secret key fingerprint, platform, status, last-seen heartbeat, and
+/// recent-job count. Read-only — approve and revoke live in the Agents workspace.
 fn admin_agent_row(agent: AgentSummary) -> impl IntoView {
     let status_class = status_badge_class(&agent.status);
     let status_text = agent.status.clone();
@@ -1533,6 +1533,8 @@ fn admin_agent_row(agent: AgentSummary) -> impl IntoView {
                 <strong>{agent.agent_id.clone()}</strong>
                 <p class="table-note">"Enrolled " {enrolled}</p>
             </td>
+            <td><span class="table-note">{agent.enrollment_id.clone()}</span></td>
+            <td><code class="table-note">{agent.public_key_fingerprint.clone()}</code></td>
             <td><span class="badge neutral">{agent.platform.clone()}</span></td>
             <td><span class=status_class>{status_text}</span></td>
             <td class="cell-date">{last_seen}</td>
@@ -1595,6 +1597,8 @@ fn AdminAgentsPanel() -> impl IntoView {
                                             <thead>
                                                 <tr>
                                                     <th scope="col">"Agent"</th>
+                                                    <th scope="col">"Enrollment ID"</th>
+                                                    <th scope="col">"Key fingerprint"</th>
                                                     <th scope="col">"Platform"</th>
                                                     <th scope="col">"Status"</th>
                                                     <th scope="col">"Last seen"</th>
@@ -2221,11 +2225,14 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
         .expect("secret reference status must be allowlisted");
     let _secret_reference_resource_guard = resource_api_path(secret_references_resource());
     let secret_reference_api_path = snapshot.secret_references_path.clone();
-    let provider = snapshot.provider.clone();
-    let management_cli = snapshot.management_cli.clone();
+    let provider_model = snapshot.provider_model.clone();
+    let management_interface = snapshot.management_interface.clone();
+    let fallback_policy = snapshot.fallback_policy.clone();
+    let admitted_provider_classes = snapshot.admitted_provider_classes.join(",");
+    let capability_interfaces = snapshot.capability_interfaces.join(",");
     let readiness_state = snapshot.readiness_state.clone();
     let configured_for_production = snapshot.configured_for_production.to_string();
-    let live_cli_execution_allowed = snapshot.live_cli_execution_allowed.to_string();
+    let live_provider_actions_allowed = snapshot.live_provider_actions_allowed.to_string();
     let provider_calls_allowed = snapshot.provider_calls_allowed.to_string();
     let secret_values_allowed = snapshot.secret_values_allowed.to_string();
     let provider_paths_allowed = snapshot.provider_paths_allowed.to_string();
@@ -2237,11 +2244,14 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
             aria-labelledby="secret-reference-workspace-detail-title"
             data-secret-reference-workspace-detail="true"
             data-api-path=secret_reference_api_path
-            data-provider=provider
-            data-management-cli=management_cli
+            data-provider-model=provider_model
+            data-management-interface=management_interface
+            data-fallback-policy=fallback_policy
+            data-admitted-provider-classes=admitted_provider_classes
+            data-capability-interfaces=capability_interfaces
             data-readiness-state=readiness_state
             data-configured-for-production=configured_for_production
-            data-live-cli-execution-allowed=live_cli_execution_allowed
+            data-live-provider-actions-allowed=live_provider_actions_allowed
             data-provider-calls-allowed=provider_calls_allowed
             data-secret-values-allowed=secret_values_allowed
             data-provider-paths-allowed=provider_paths_allowed
@@ -2251,17 +2261,17 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
                     <span class="eyebrow">"Secrets"</span>
                     <h2 id="secret-reference-workspace-detail-title">"Secret-reference workspace detail"</h2>
                 </div>
-                <span class="badge bad">"CLI execution blocked"</span>
+                <span class="badge bad">"Provider actions blocked"</span>
             </div>
             <div class="workspace-detail-columns">
                 <div class="workspace-detail-list" aria-label="Secret-reference readiness">
                     {references
                         .into_iter()
                         .map(|reference| {
-                            let cli_state = if reference.live_cli_execution_allowed {
-                                "CLI execution allowed"
+                            let action_state = if reference.live_provider_actions_allowed {
+                                "Provider actions allowed"
                             } else {
-                                "CLI execution blocked"
+                                "Provider actions blocked"
                             };
                             let value_state = if reference.value_exposure_allowed {
                                 "Values visible"
@@ -2275,10 +2285,10 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
                             };
                             view! {
                                 <div class="workspace-detail-item">
-                                    <span class="badge bad">{cli_state}</span>
+                                    <span class="badge bad">{action_state}</span>
                                     <strong>{reference.consumer_scope}</strong>
                                     <p>{reference.safe_summary}</p>
-                                    <span class="table-note">{reference.provider} " / " {reference.management_cli} " / " {reference.rotation_state} " / " {value_state} " / " {path_state}</span>
+                                    <span class="table-note">{reference.capability} " / " {reference.interface} " / " {reference.rotation_state} " / " {value_state} " / " {path_state}</span>
                                 </div>
                             }
                         })

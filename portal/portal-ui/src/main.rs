@@ -10,7 +10,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use leptos::prelude::*;
     use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
     use ryuki_portal_ui::app::{shell, App};
+    use ryuki_portal_ui::security::{
+        protect_server_function_routes, PortalPublicOrigin, PortalServerFunctionLimits,
+    };
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    use ryuki_portal_ui::startup::validate_live_provider_auth_posture;
     use ryuki_portal_ui::upstream::UpstreamClient;
 
     // Read Leptos config from the environment: cargo-leptos injects LEPTOS_*
@@ -27,14 +31,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // One upstream HTTP client for the whole process, handed to server
     // functions through Leptos context on both the SSR-render path and the
     // explicit server-function route below.
-    let upstream = UpstreamClient::from_env();
+    let public_origin = PortalPublicOrigin::from_env()?;
+    let server_function_limits = PortalServerFunctionLimits::from_env()?;
+    let upstream = UpstreamClient::from_env(&public_origin)?;
+    validate_live_provider_auth_posture(&upstream, &public_origin).await?;
     let upstream_for_server_fns = upstream.clone();
     let upstream_for_routes = upstream.clone();
 
-    let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ready" }))
-        .route(
+    let server_function_routes = protect_server_function_routes(
+        Router::new().route(
             "/portal/api/{*fn_name}",
             any(move |request: axum::extract::Request| {
                 let upstream = upstream_for_server_fns.clone();
@@ -46,7 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .await
                 }
             }),
-        )
+        ),
+        public_origin,
+        server_function_limits,
+    );
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ready" }))
+        .merge(server_function_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,

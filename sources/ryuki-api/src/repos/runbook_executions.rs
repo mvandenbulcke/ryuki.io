@@ -92,14 +92,18 @@ pub async fn insert(
     executor: impl sqlx::PgExecutor<'_>,
     exec: &RunbookExecution,
 ) -> Result<(), sqlx::Error> {
+    ryuki_engine::runbook_execution::validate_execution_invariants(exec).map_err(|error| {
+        sqlx::Error::Protocol(format!("runbook execution invariant violation: {error}"))
+    })?;
     let execution_json = serde_json::to_value(exec).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
 
     sqlx::query(
         "INSERT INTO runbook_executions \
-         (id, runbook_id, status, site, started_by, execution_json) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (id, runbook_id, status, site, started_by, execution_json, \
+          invariant_state, invariant_reason) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'Verified', NULL)",
     )
     .bind(&exec.id)
     .bind(&exec.runbook_id)
@@ -177,6 +181,9 @@ pub async fn transition(
     expected_version: &str,
     updated: &RunbookExecution,
 ) -> Result<bool, sqlx::Error> {
+    ryuki_engine::runbook_execution::validate_execution_invariants(updated).map_err(|error| {
+        sqlx::Error::Protocol(format!("runbook execution invariant violation: {error}"))
+    })?;
     let execution_json = serde_json::to_value(updated).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
@@ -186,7 +193,7 @@ pub async fn transition(
          status = $2, \
          execution_json = $3, \
          updated_at = NOW() \
-         WHERE id = $1 AND xmin = $4::xid",
+         WHERE id = $1 AND xmin = $4::xid AND invariant_state = 'Verified'",
     )
     .bind(id)
     .bind(status_str(&updated.status))

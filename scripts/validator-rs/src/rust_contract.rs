@@ -110,6 +110,33 @@ fn handler_after_endpoint(rest: &str) -> Option<String> {
 /// or parsed. Callers translate `None` into the slice's "endpoint missing"
 /// error so an unmounted/renamed endpoint still fails the slice.
 pub fn handler_payload(contracts_rs: &str, endpoint: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(handler_json_object_text(contracts_rs, endpoint)?).ok()
+}
+
+/// Parses a handler payload that contains exactly one intentionally dynamic
+/// array field. The selected handler object must contain the exact expression
+/// once; it is projected to an empty array before strict JSON parsing. Any
+/// other Rust expression remains unparsable, so safety fields and contract
+/// arrays continue to fail closed instead of being silently ignored.
+pub fn handler_payload_with_dynamic_array_field(
+    contracts_rs: &str,
+    endpoint: &str,
+    field: &str,
+    exact_expression: &str,
+) -> Option<Value> {
+    let object_text = handler_json_object_text(contracts_rs, endpoint)?;
+    let needle = format!("\"{field}\": {exact_expression}");
+    let mut matches = object_text.match_indices(&needle);
+    let (start, matched) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let mut projected = object_text.to_string();
+    projected.replace_range(start..start + matched.len(), &format!("\"{field}\": []"));
+    serde_json::from_str::<Value>(&projected).ok()
+}
+
+fn handler_json_object_text<'a>(contracts_rs: &'a str, endpoint: &str) -> Option<&'a str> {
     let handler = route_handler_name(contracts_rs, endpoint)?;
     let signature = format!("fn {handler}(");
     let fn_start = contracts_rs.find(&signature)?;
@@ -121,8 +148,7 @@ pub fn handler_payload(contracts_rs: &str, endpoint: &str) -> Option<Value> {
     let object_rel = object_search.find('{')?;
     let object_start = fn_start + json_macro_rel + "json!(".len() + object_rel;
     let object_end = matching_brace(contracts_rs, object_start)?;
-    let object_text = &contracts_rs[object_start..=object_end];
-    serde_json::from_str::<Value>(object_text).ok()
+    Some(&contracts_rs[object_start..=object_end])
 }
 
 /// Finds the index of the `}` that matches the `{` at `open_index`, honouring
@@ -255,6 +281,42 @@ pub fn validate_static_seed_contract(
         missing_endpoint,
         errors,
     )?;
+    if payload.get("source").and_then(Value::as_str) != Some("static-seed") {
+        errors.push("API must keep static-seed source".to_string());
+    }
+    check_safety_flags_disabled(&payload, errors);
+    Some(payload)
+}
+
+/// Variant of [`validate_static_seed_contract`] for a handler whose one
+/// explicitly named array is derived from an authoritative runtime registry.
+/// Route cardinality, the exact dynamic expression, every remaining JSON
+/// field, static source, and safety flags are still validated.
+pub fn validate_static_seed_contract_with_dynamic_array_field(
+    contracts_rs: &str,
+    endpoint: &str,
+    missing_endpoint: &str,
+    field: &str,
+    exact_expression: &str,
+    errors: &mut Vec<String>,
+) -> Option<Value> {
+    match route_registration_count(contracts_rs, endpoint) {
+        0 => {
+            errors.push(missing_endpoint.to_string());
+            return None;
+        }
+        1 => {}
+        _ => {
+            errors.push(format!("API must register exactly one {endpoint} endpoint"));
+            return None;
+        }
+    }
+    let Some(payload) =
+        handler_payload_with_dynamic_array_field(contracts_rs, endpoint, field, exact_expression)
+    else {
+        errors.push(missing_endpoint.to_string());
+        return None;
+    };
     if payload.get("source").and_then(Value::as_str) != Some("static-seed") {
         errors.push("API must keep static-seed source".to_string());
     }
@@ -430,5 +492,48 @@ async fn protect_demo() -> Json<Value> {
             payload_string_array(&payload, "scopes"),
             Some(vec!["a", "b"])
         );
+    }
+
+    #[test]
+    fn projects_one_exact_dynamic_array_field_and_keeps_other_fields_strict() {
+        let source = r#"
+            .route("/api/catalog/access-control", get(access_control))
+
+async fn access_control() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "roles": access_control_roles_json(),
+        "executionGuards": [{"id": "validation-passed"}]
+    }))
+}
+"#;
+        let payload = handler_payload_with_dynamic_array_field(
+            source,
+            "/api/catalog/access-control",
+            "roles",
+            "access_control_roles_json()",
+        )
+        .expect("the exact runtime-derived roles field is projected");
+        assert_eq!(payload["roles"], serde_json::json!([]));
+        assert_eq!(payload["executionGuards"][0]["id"], "validation-passed");
+
+        assert!(handler_payload_with_dynamic_array_field(
+            &source.replace("access_control_roles_json()", "other_roles()"),
+            "/api/catalog/access-control",
+            "roles",
+            "access_control_roles_json()",
+        )
+        .is_none());
+        assert!(handler_payload_with_dynamic_array_field(
+            &source.replace(
+                "\"providerCallsEnabled\": false",
+                "\"providerCallsEnabled\": dynamic_flag()"
+            ),
+            "/api/catalog/access-control",
+            "roles",
+            "access_control_roles_json()",
+        )
+        .is_none());
     }
 }

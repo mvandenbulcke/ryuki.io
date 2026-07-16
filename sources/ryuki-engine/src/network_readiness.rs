@@ -4,7 +4,6 @@
 //! inputs alone.  Persistence is owned by `ryuki-api/src/repos/network_readiness.rs`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use uuid::Uuid;
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
@@ -48,151 +47,214 @@ pub struct PortReservation {
 
 // ─── Read helpers (pure, no DB) ───────────────────────────────────────────────
 
+/// A minimized readiness decision. It intentionally carries no site, switch,
+/// port, VLAN, subnet, gateway, device, or exact-capacity fields.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessProjection {
+    pub satisfied: bool,
+    pub capacity_band: String,
+    pub review_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// Combined minimized response for the readiness endpoint.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkReadinessProjection {
+    pub port_readiness: ReadinessProjection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vlan_readiness: Option<ReadinessProjection>,
+}
+
+/// Coarse site-capacity response. Exact counts and topology are deliberately
+/// unavailable through this DTO.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteCapacityProjection {
+    pub port_capacity_band: String,
+    pub vlan_capacity_band: String,
+    pub review_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// Redacted response shared by the former raw inventory endpoints.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryProjection {
+    pub inventory_present: bool,
+    pub availability_band: String,
+    pub review_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+fn requested_capacity_band(available: u32, requested: u32) -> &'static str {
+    if requested == 0 || available >= requested {
+        "sufficient"
+    } else if available == 0 {
+        "none"
+    } else {
+        "limited"
+    }
+}
+
+fn inventory_availability_band(total: usize, available: usize) -> &'static str {
+    if total == 0 {
+        "unknown"
+    } else if available == 0 {
+        "exhausted"
+    } else {
+        "available"
+    }
+}
+
+fn readiness_projection(available: u32, requested: u32) -> ReadinessProjection {
+    let satisfied = available >= requested;
+    ReadinessProjection {
+        satisfied,
+        capacity_band: requested_capacity_band(available, requested).to_string(),
+        review_required: !satisfied,
+        blocked_reason: (!satisfied).then(|| "insufficient-capacity".to_string()),
+    }
+}
+
 /// Check whether `port_count_needed` Available ports exist at `site`.
-/// Returns a readiness summary JSON value.
-pub fn check_port_readiness(site: &str, port_count_needed: u32, ports: &[SwitchPort]) -> Value {
+/// Returns only a coarse decision projection, never the exact count.
+pub fn check_port_readiness(
+    site: &str,
+    port_count_needed: u32,
+    ports: &[SwitchPort],
+) -> ReadinessProjection {
     let available = ports
         .iter()
         .filter(|p| p.site == site && p.status == "Available")
-        .count();
+        .count() as u32;
 
-    json!({
-        "site": site,
-        "port_count_needed": port_count_needed,
-        "available_ports": available,
-        "satisfied": available as u32 >= port_count_needed,
-    })
+    readiness_projection(available, port_count_needed)
 }
 
 /// Check whether a VLAN has enough available IPs.
-/// Returns `Err` if the VLAN is not found.
+/// Returns a generic error if the resource is not found, without echoing a
+/// network identifier or site value.
 pub fn check_vlan_readiness(
     site: &str,
     vlan_id_: u32,
     ip_count_needed: u32,
     vlans: &[VLAN],
-) -> Result<Value, String> {
+) -> Result<ReadinessProjection, String> {
     let vlan = vlans
         .iter()
         .find(|v| v.site == site && v.vlan_id == vlan_id_)
-        .ok_or_else(|| format!("VLAN {} not found at site {}", vlan_id_, site))?;
+        .ok_or_else(|| "network inventory unavailable".to_string())?;
 
-    Ok(json!({
-        "site": site,
-        "vlan_id": vlan_id_,
-        "vlan_name": vlan.vlan_name,
-        "available_ips": vlan.available_ips,
-        "ip_count_needed": ip_count_needed,
-        "satisfied": vlan.available_ips >= ip_count_needed,
-    }))
+    Ok(readiness_projection(vlan.available_ips, ip_count_needed))
 }
 
-/// Build the site-capacity summary from the provided slices (no DB access).
-pub fn build_site_capacity(site: &str, ports: &[SwitchPort], vlans: &[VLAN]) -> Value {
+/// Build the complete minimized readiness response.
+pub fn build_network_readiness(
+    site: &str,
+    port_count_needed: u32,
+    vlan_id: Option<u32>,
+    ip_count_needed: u32,
+    ports: &[SwitchPort],
+    vlans: &[VLAN],
+) -> NetworkReadinessProjection {
+    let port_readiness = check_port_readiness(site, port_count_needed, ports);
+    let vlan_readiness = vlan_id.map(|id| {
+        check_vlan_readiness(site, id, ip_count_needed, vlans).unwrap_or_else(|_| {
+            ReadinessProjection {
+                satisfied: false,
+                capacity_band: "unknown".to_string(),
+                review_required: true,
+                blocked_reason: Some("inventory-unavailable".to_string()),
+            }
+        })
+    });
+    NetworkReadinessProjection {
+        port_readiness,
+        vlan_readiness,
+    }
+}
+
+/// Build a coarse site-capacity policy projection (no DB access).
+pub fn build_site_capacity(
+    site: &str,
+    ports: &[SwitchPort],
+    vlans: &[VLAN],
+) -> SiteCapacityProjection {
     let total_ports = ports.iter().filter(|p| p.site == site).count();
     let available_ports = ports
         .iter()
         .filter(|p| p.site == site && p.status == "Available")
         .count();
-    let reserved_ports = ports
+
+    let total_vlans = vlans.iter().filter(|v| v.site == site).count();
+    let available_vlans = vlans
         .iter()
-        .filter(|p| p.site == site && p.status == "Reserved")
+        .filter(|v| v.site == site && v.available_ips > 0)
         .count();
-    let in_use_ports = ports
+    let review_required =
+        total_ports == 0 || available_ports == 0 || total_vlans == 0 || available_vlans == 0;
+
+    SiteCapacityProjection {
+        port_capacity_band: inventory_availability_band(total_ports, available_ports).to_string(),
+        vlan_capacity_band: inventory_availability_band(total_vlans, available_vlans).to_string(),
+        review_required,
+        blocked_reason: review_required.then(|| "capacity-review-required".to_string()),
+    }
+}
+
+/// Build a redacted port-inventory projection (no DB access).
+/// Returns a generic error if no scoped rows exist for the requested switch.
+pub fn build_port_inventory(
+    switch_name: &str,
+    ports: &[SwitchPort],
+) -> Result<InventoryProjection, String> {
+    let total = ports
         .iter()
-        .filter(|p| p.site == site && p.status == "InUse")
-        .count();
-    let disabled_ports = ports
-        .iter()
-        .filter(|p| p.site == site && p.status == "Disabled")
+        .filter(|p| p.switch_name == switch_name)
         .count();
 
-    let vlan_summaries: Vec<Value> = vlans
+    if total == 0 {
+        return Err("network inventory unavailable".to_string());
+    }
+    let available = ports
         .iter()
-        .filter(|v| v.site == site)
-        .map(|v| {
-            json!({
-                "vlan_id": v.vlan_id,
-                "vlan_name": v.vlan_name,
-                "subnet": v.subnet,
-                "gateway": v.gateway,
-                "purpose": v.purpose,
-                "available_ips": v.available_ips,
-            })
-        })
-        .collect();
+        .filter(|p| p.switch_name == switch_name && p.status == "Available")
+        .count();
+    let review_required = available == 0;
 
-    let switches: Vec<&str> = ports
-        .iter()
-        .filter(|p| p.site == site)
-        .map(|p| p.switch_name.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    json!({
-        "site": site,
-        "switches": switches,
-        "ports": {
-            "total": total_ports,
-            "available": available_ports,
-            "reserved": reserved_ports,
-            "in_use": in_use_ports,
-            "disabled": disabled_ports
-        },
-        "vlans": vlan_summaries,
+    Ok(InventoryProjection {
+        inventory_present: true,
+        availability_band: inventory_availability_band(total, available).to_string(),
+        review_required,
+        blocked_reason: review_required.then(|| "capacity-review-required".to_string()),
     })
 }
 
-/// Build the port-inventory JSON for a switch (no DB access).
-/// Returns `Err` if no ports found for that switch.
-pub fn build_port_inventory(switch_name: &str, ports: &[SwitchPort]) -> Result<Value, String> {
-    let matching: Vec<&SwitchPort> = ports
+/// Build a redacted VLAN-inventory projection (no DB access).
+/// Returns a generic error if no scoped rows exist for the requested site.
+pub fn build_vlan_inventory(site: &str, vlans: &[VLAN]) -> Result<InventoryProjection, String> {
+    let total = vlans.iter().filter(|v| v.site == site).count();
+
+    if total == 0 {
+        return Err("network inventory unavailable".to_string());
+    }
+    let available = vlans
         .iter()
-        .filter(|p| p.switch_name == switch_name)
-        .collect();
+        .filter(|v| v.site == site && v.available_ips > 0)
+        .count();
+    let review_required = available == 0;
 
-    if matching.is_empty() {
-        return Err(format!("Switch not found: {}", switch_name));
-    }
-
-    Ok(json!({
-        "switch_name": switch_name,
-        "total_ports": matching.len(),
-        "ports": matching.iter().map(|p| json!({
-            "id": p.id,
-            "port_number": p.port_number,
-            "vlan_id": p.vlan_id,
-            "vlan_name": p.vlan_name,
-            "status": p.status,
-            "connected_device": p.connected_device,
-            "site": p.site,
-        })).collect::<Vec<_>>(),
-    }))
-}
-
-/// Build the VLAN-inventory JSON for a site (no DB access).
-/// Returns `Err` if no VLANs found.
-pub fn build_vlan_inventory(site: &str, vlans: &[VLAN]) -> Result<Value, String> {
-    let matching: Vec<&VLAN> = vlans.iter().filter(|v| v.site == site).collect();
-
-    if matching.is_empty() {
-        return Err(format!("No VLANs found for site: {}", site));
-    }
-
-    Ok(json!({
-        "site": site,
-        "total_vlans": matching.len(),
-        "vlans": matching.iter().map(|v| json!({
-            "id": v.id,
-            "vlan_id": v.vlan_id,
-            "vlan_name": v.vlan_name,
-            "subnet": v.subnet,
-            "gateway": v.gateway,
-            "purpose": v.purpose,
-            "available_ips": v.available_ips,
-        })).collect::<Vec<_>>(),
-    }))
+    Ok(InventoryProjection {
+        inventory_present: true,
+        availability_band: inventory_availability_band(total, available).to_string(),
+        review_required,
+        blocked_reason: review_required.then(|| "capacity-review-required".to_string()),
+    })
 }
 
 // ─── Mutation helpers (pure logic, used by repo to build request inputs) ──────
@@ -320,23 +382,26 @@ mod tests {
     fn port_readiness_satisfied() {
         let ports = make_ports();
         let result = check_port_readiness("DEFRA", 2, &ports);
-        assert_eq!(result["satisfied"], true);
-        assert_eq!(result["available_ports"], 2u64);
+        assert!(result.satisfied);
+        assert_eq!(result.capacity_band, "sufficient");
+        assert!(!result.review_required);
     }
 
     #[test]
     fn port_readiness_not_satisfied() {
         let ports = make_ports();
         let result = check_port_readiness("DEFRA", 10, &ports);
-        assert_eq!(result["satisfied"], false);
+        assert!(!result.satisfied);
+        assert_eq!(result.capacity_band, "limited");
+        assert!(result.review_required);
     }
 
     #[test]
     fn port_readiness_empty_site() {
         let ports = make_ports();
         let result = check_port_readiness("NOWHERE", 1, &ports);
-        assert_eq!(result["satisfied"], false);
-        assert_eq!(result["available_ports"], 0u64);
+        assert!(!result.satisfied);
+        assert_eq!(result.capacity_band, "none");
     }
 
     // ── check_vlan_readiness ──
@@ -345,37 +410,37 @@ mod tests {
     fn vlan_readiness_satisfied() {
         let vlans = make_vlans();
         let r = check_vlan_readiness("DEFRA", 100, 5, &vlans).unwrap();
-        assert_eq!(r["satisfied"], true);
-        assert_eq!(r["available_ips"], 200u64);
+        assert!(r.satisfied);
+        assert_eq!(r.capacity_band, "sufficient");
     }
 
     #[test]
     fn vlan_readiness_insufficient() {
         let vlans = make_vlans();
         let r = check_vlan_readiness("DEFRA", 200, 100, &vlans).unwrap();
-        assert_eq!(r["satisfied"], false);
+        assert!(!r.satisfied);
+        assert_eq!(r.capacity_band, "limited");
     }
 
     #[test]
     fn vlan_readiness_not_found() {
         let vlans = make_vlans();
-        assert!(check_vlan_readiness("DEFRA", 999, 1, &vlans).is_err());
+        let error = check_vlan_readiness("DEFRA", 999, 1, &vlans).unwrap_err();
+        assert_eq!(error, "network inventory unavailable");
+        assert!(!error.contains("DEFRA"));
+        assert!(!error.contains("999"));
     }
 
     // ── build_site_capacity ──
 
     #[test]
-    fn site_capacity_counts() {
+    fn site_capacity_is_coarse() {
         let ports = make_ports();
         let vlans = make_vlans();
         let r = build_site_capacity("DEFRA", &ports, &vlans);
-        assert_eq!(r["ports"]["available"], 2u64);
-        assert_eq!(r["ports"]["in_use"], 1u64);
-        assert_eq!(r["ports"]["reserved"], 1u64);
-        assert_eq!(r["ports"]["disabled"], 1u64);
-        assert_eq!(r["ports"]["total"], 5u64);
-        let vlan_arr = r["vlans"].as_array().unwrap();
-        assert_eq!(vlan_arr.len(), 2); // DEFRA has 2 vlans
+        assert_eq!(r.port_capacity_band, "available");
+        assert_eq!(r.vlan_capacity_band, "available");
+        assert!(!r.review_required);
     }
 
     #[test]
@@ -383,8 +448,8 @@ mod tests {
         let ports = make_ports();
         let vlans = make_vlans();
         let r = build_site_capacity("GBLON", &ports, &vlans);
-        assert_eq!(r["ports"]["total"], 1u64);
-        assert_eq!(r["ports"]["available"], 1u64);
+        assert_eq!(r.port_capacity_band, "available");
+        assert_eq!(r.vlan_capacity_band, "available");
     }
 
     // ── build_port_inventory ──
@@ -393,8 +458,8 @@ mod tests {
     fn port_inventory_found() {
         let ports = make_ports();
         let r = build_port_inventory("sw-01", &ports).unwrap();
-        assert_eq!(r["total_ports"], 3u64);
-        assert_eq!(r["switch_name"], "sw-01");
+        assert!(r.inventory_present);
+        assert_eq!(r.availability_band, "available");
     }
 
     #[test]
@@ -409,14 +474,100 @@ mod tests {
     fn vlan_inventory_found() {
         let vlans = make_vlans();
         let r = build_vlan_inventory("DEFRA", &vlans).unwrap();
-        assert_eq!(r["total_vlans"], 2u64);
-        assert_eq!(r["site"], "DEFRA");
+        assert!(r.inventory_present);
+        assert_eq!(r.availability_band, "available");
     }
 
     #[test]
     fn vlan_inventory_not_found() {
         let vlans = make_vlans();
         assert!(build_vlan_inventory("NOWHERE", &vlans).is_err());
+    }
+
+    fn assert_no_forbidden_topology(value: &serde_json::Value) {
+        const FORBIDDEN_KEYS: &[&str] = &[
+            "id",
+            "site",
+            "switch_name",
+            "switchName",
+            "switches",
+            "port_number",
+            "portNumber",
+            "ports",
+            "total_ports",
+            "totalPorts",
+            "available_ports",
+            "availablePorts",
+            "vlan_id",
+            "vlanId",
+            "vlan_name",
+            "vlanName",
+            "vlans",
+            "total_vlans",
+            "totalVlans",
+            "available_ips",
+            "availableIps",
+            "connected_device",
+            "connectedDevice",
+            "subnet",
+            "gateway",
+            "purpose",
+        ];
+        const FORBIDDEN_VALUES: &[&str] = &[
+            "DEFRA",
+            "sw-01",
+            "mgmt",
+            "srv-01",
+            "10.1.1.0/24",
+            "10.1.1.1",
+            "Management",
+        ];
+
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, nested) in map {
+                    assert!(
+                        !FORBIDDEN_KEYS.contains(&key.as_str()),
+                        "forbidden topology key serialized: {key} in {value}"
+                    );
+                    assert_no_forbidden_topology(nested);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_forbidden_topology(item);
+                }
+            }
+            serde_json::Value::String(text) => assert!(
+                !FORBIDDEN_VALUES.contains(&text.as_str()),
+                "forbidden topology value serialized: {text} in {value}"
+            ),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_network_read_projection_rejects_raw_topology_keys_and_values() {
+        let ports = make_ports();
+        let vlans = make_vlans();
+        let projections = [
+            serde_json::to_value(build_network_readiness(
+                "DEFRA",
+                2,
+                Some(100),
+                5,
+                &ports,
+                &vlans,
+            ))
+            .unwrap(),
+            serde_json::to_value(build_site_capacity("DEFRA", &ports, &vlans)).unwrap(),
+            serde_json::to_value(build_port_inventory("sw-01", &ports).unwrap()).unwrap(),
+            serde_json::to_value(build_vlan_inventory("DEFRA", &vlans).unwrap()).unwrap(),
+        ];
+
+        for projection in projections {
+            assert_no_forbidden_topology(&projection);
+        }
     }
 
     // ── capacity math / reservation logic ──

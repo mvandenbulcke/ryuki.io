@@ -33,7 +33,12 @@ pub fn plan_snapshot(
 
     Ok(SnapshotRecord {
         id,
+        configuration_item_id: None,
         platform_ci_key: platform_ci_key.to_string(),
+        site: None,
+        environment: None,
+        created_by: None,
+        scope_provenance: None,
         snapshot_purpose: snapshot_purpose.to_string(),
         requested_expiry: requested_expiry.to_string(),
         owner: owner.to_string(),
@@ -97,15 +102,13 @@ pub fn validate_snapshot(record: &SnapshotRecord) -> Result<ValidationResult, St
 pub fn review_snapshot_policy(record: &SnapshotRecord) -> Result<SnapshotRecord, String> {
     let mut reviewed = record.clone();
 
-    // Failed is terminal too (see the flag/remediate guards below) — without it
-    // a Failed snapshot could be re-opened to ReviewRequested. Block all three
-    // terminal states.
-    if matches!(
-        record.status,
-        SnapshotStatus::Expired | SnapshotStatus::Completed | SnapshotStatus::Failed
-    ) {
+    // Ordinary policy review is a single forward transition. Re-reviewing an
+    // already reviewed, approved, stale, remediating, or terminal record would
+    // silently regress lifecycle state to ReviewRequested. Any future re-review
+    // requires a separately authorized transition with its own audit contract.
+    if record.status != SnapshotStatus::Draft {
         return Err(format!(
-            "Cannot review snapshot in status: {:?}",
+            "Cannot review snapshot in status {:?}; review requires Draft",
             record.status
         ));
     }
@@ -233,9 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn test_review_snapshot_policy_rejects_terminal_states() {
-        // All three terminal states must refuse review — none may be re-opened.
+    fn test_review_snapshot_policy_rejects_every_non_draft_state() {
+        // The explicit transition table contains only Draft -> ReviewRequested.
+        // No reviewed, stale, remediating, or terminal record may be re-opened.
         for status in [
+            SnapshotStatus::ReviewRequested,
+            SnapshotStatus::ExpiryApproved,
+            SnapshotStatus::StaleFlagged,
+            SnapshotStatus::RemediationPlanned,
             SnapshotStatus::Expired,
             SnapshotStatus::Completed,
             SnapshotStatus::Failed,
@@ -244,7 +252,7 @@ mod tests {
             record.status = status;
             assert!(
                 review_snapshot_policy(&record).is_err(),
-                "review must be refused from terminal status {:?}",
+                "review must be refused from non-Draft status {:?}",
                 record.status
             );
         }

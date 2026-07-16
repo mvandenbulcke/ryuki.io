@@ -25,8 +25,9 @@
 //!   `optional` = `Option<...>` or `#[serde(default)]`). Unfindable or
 //!   non-struct types degrade to `null` fields, never guesses.
 //! * `response_notes` uses only unambiguous body/signature evidence:
-//!   `total_count_headers(` (bare array + X-Total-Count), `add_page_meta(` or
-//!   inline `"total"/"limit"/"offset"` keys (paginated object), and a
+//!   `total_count_headers(` (bare array + required X-Total-Count),
+//!   `request_list_headers(` (conditional count/cursor headers),
+//!   `add_page_meta(` or inline `"total"/"limit"/"offset"` keys (paginated object), and a
 //!   `ProblemDetails`/`Json<ApiError>` error arm (the platform ApiError shape:
 //!   error, message, and optional detail).
 //! * Area keys reuse `endpoints_doc_section` verbatim; per-area descriptions
@@ -147,6 +148,7 @@ pub(crate) struct HandlerInfo {
 #[derive(Clone, Copy, Default)]
 struct BodyFlags {
     total_count_headers: bool,
+    request_list_headers: bool,
     paginated_object: bool,
 }
 
@@ -535,6 +537,7 @@ fn record_fn(
             let body = crate::strip_source_comments(&body);
             info.body_flags = BodyFlags {
                 total_count_headers: body.contains("total_count_headers("),
+                request_list_headers: body.contains("request_list_headers("),
                 paginated_object: body.contains("add_page_meta(")
                     || (body.contains("\"total\":")
                         && body.contains("\"limit\":")
@@ -1694,12 +1697,26 @@ fn request_headers_for(
             true,
             "Required agent credential: `Bearer rya_...`; this route bypasses human-session authentication and validates the agent token in the handler.",
         )),
-        Some("webhook") => headers.push(api_header(
-            "X-Hub-Signature-256",
-            "string",
-            true,
-            "Required HMAC-SHA256 signature (64 hexadecimal characters, optionally prefixed with `sha256=`) over the exact raw request-body bytes; no human or agent credential is accepted.",
-        )),
+        Some("webhook") => headers.extend([
+            api_header(
+                "X-Hub-Signature-256",
+                "string",
+                true,
+                "Required HMAC-SHA256 signature (64 hexadecimal characters, optionally prefixed with `sha256=`) over the Ryuki v1 canonical message: fixed POST path, connection id, timestamp, delivery id, and exact-body SHA-256 digest; no human or agent credential is accepted.",
+            ),
+            api_header(
+                "X-Ryuki-Webhook-Timestamp",
+                "integer",
+                true,
+                "Canonical Unix timestamp in seconds. It is covered by the v1 signature and must be within the receiver's five-minute clock-skew window.",
+            ),
+            api_header(
+                "X-Ryuki-Webhook-Delivery-Id",
+                "string",
+                true,
+                "Unique 1-128 byte `[A-Za-z0-9._-]` delivery identifier covered by the v1 signature and atomically deduplicated per connection.",
+            ),
+        ]),
         Some("public") => {}
         _ if !auth_exempt => {
             headers.push(api_header(
@@ -1707,9 +1724,9 @@ fn request_headers_for(
                 "string",
                 false,
                 if interactive_token_mint {
-                    "Interactive administrator credential alternative. Service API tokens (`ryk_...`, whose provider mode is `api-token`) are explicitly rejected for token minting; use an interactive user bearer credential or `X-Ryuki-Session-Id`."
+                    "Interactive administrator credential alternative. Service API tokens (`ryk_...`, whose provider mode is `api-token`) are explicitly rejected for token minting; use an interactive `rys_...` session token or `X-Ryuki-Session-Id`."
                 } else {
-                    "Human credential alternative: supply a bearer session/API token here or use `X-Ryuki-Session-Id`. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations."
+                    "Human credential alternative: supply one `Bearer rys_...` session token, `ryk_...` API token, or validated identity-provider JWT here. Do not combine it with `X-Ryuki-Session-Id` or the session cookie; conflicting carriers fail closed."
                 },
             ));
             headers.push(api_header(
@@ -1717,9 +1734,9 @@ fn request_headers_for(
                 "string",
                 false,
                 if interactive_token_mint {
-                    "Interactive administrator session identifier. This mutation-safe session carrier is the preferred example for token minting; service API tokens cannot call this operation."
+                    "Interactive administrator session token. Despite this compatibility header name, the value is an opaque `rys_...` bearer, never the administrative session UUID. Service API tokens cannot call this operation."
                 } else {
-                    "Human credential alternative: supply the verified session identifier here or use `Authorization: Bearer ...`. This header is the portal's mutation-safe session carrier."
+                    "Opaque `rys_...` session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request."
                 },
             ));
         }
@@ -1736,16 +1753,21 @@ fn request_headers_for(
     }
     let callback_cookie = match path {
         "/api/auth/oidc/callback" => Some("oidc_login_csrf"),
-        "/api/auth/entra/callback" => Some("entra_login_csrf"),
+        "/api/auth/entra/callback" => Some("__Host-entra_login_csrf"),
         _ => None,
     };
     if let Some(cookie) = callback_cookie {
+        let loopback_note = if path == "/api/auth/entra/callback" {
+            " Explicit loopback HTTP uses the compatibility name `entra_login_csrf`."
+        } else {
+            ""
+        };
         headers.push(api_header(
             "Cookie",
             "string",
             false,
             &format!(
-                "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `{cookie}` binding cookie set by login initiation. The provider-error redirect path does not require it."
+                "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `{cookie}` binding cookie set by login initiation. The provider-error redirect path does not require it.{loopback_note}"
             ),
         ));
     }
@@ -2642,13 +2664,44 @@ fn handler_marks_no_store(info: &HandlerInfo) -> bool {
 fn success_response_headers(info: &HandlerInfo) -> Vec<ApiHeader> {
     let mut headers = Vec::new();
     let body = info.body.as_deref().unwrap_or_default();
-    if info.body_flags.total_count_headers {
+    // The request-list helper is the more specific contract. If a future
+    // handler happens to call both helpers, do not emit contradictory required
+    // and optional definitions for the same X-Total-Count header.
+    if info.body_flags.total_count_headers && !info.body_flags.request_list_headers {
         headers.push(api_header(
             "X-Total-Count",
             "integer",
             true,
             "Filtered total before limit/offset pagination, returned alongside the successful bare JSON array.",
         ));
+    }
+    if info.body_flags.request_list_headers {
+        headers.extend([
+            api_header(
+                "X-Total-Count",
+                "integer",
+                false,
+                "Filtered, capped total; present only when include_total=true and the aggregate finishes within its statement budget.",
+            ),
+            api_header(
+                "X-Total-Count-Capped",
+                "boolean",
+                false,
+                "True when X-Total-Count reached the supported request-list navigation ceiling.",
+            ),
+            api_header(
+                "X-Total-Count-Unavailable",
+                "boolean",
+                false,
+                "True when include_total=true but the optional aggregate exceeded its statement budget; the bounded page is still returned.",
+            ),
+            api_header(
+                "X-Next-Cursor",
+                "string",
+                false,
+                "Opaque continuation emitted only when another deterministic request-list page exists.",
+            ),
+        ]);
     }
     if handler_marks_no_store(info) {
         headers.push(api_header(
@@ -2744,8 +2797,9 @@ fn success_response_override(handler: Option<&str>) -> Vec<ApiResponse> {
     match handler.and_then(|name| name.rsplit("::").next()) {
         Some("webhook_receive") => vec![ApiResponse {
             status: 202,
-            description: "Accepted after signature verification and durable event recording."
-                .to_string(),
+            description:
+                "Accepted after freshness/signature verification and atomic receipt/event recording."
+                    .to_string(),
             body_state: ResponseBodyState::Json,
             body: Some(ApiResponseBody {
                 type_: "Value".to_string(),
@@ -2758,7 +2812,7 @@ fn success_response_override(handler: Option<&str>) -> Vec<ApiResponse> {
                     },
                     ApiField {
                         name: "event_id".to_string(),
-                        type_: "String".to_string(),
+                        type_: "i64".to_string(),
                         optional: false,
                         doc: Some("Identifier of the recorded domain event.".to_string()),
                     },
@@ -2874,10 +2928,17 @@ fn request_body_for(info: &HandlerInfo, scan: &SourceScan) -> Option<ApiRequestB
 
 fn response_notes_for(info: &HandlerInfo) -> Option<String> {
     let mut notes: Vec<&str> = Vec::new();
-    if info.body_flags.total_count_headers {
+    if info.body_flags.total_count_headers && !info.body_flags.request_list_headers {
         notes.push(
             "Returns a bare JSON array; the filtered total is exposed via the \
              X-Total-Count response header.",
+        );
+    }
+    if info.body_flags.request_list_headers {
+        notes.push(
+            "Returns a bare JSON array; include_total defaults to false, so total-count \
+             headers are conditional, and X-Next-Cursor is emitted only when another \
+             deterministic page exists.",
         );
     }
     if info.body_flags.paginated_object {
@@ -2955,6 +3016,12 @@ async fn widgets_create(Json(body): Json<CreateWidget>) -> ApiResult {
     Ok(Json(json!({})))
 }
 
+/// GET /api/requests — lists requests with optional totals and cursors.
+async fn requests_list(Query(page): Query<RequestListParams>) -> ApiResult {
+    let headers = request_list_headers(None, None, false);
+    Ok(Json(json!([])))
+}
+
 fn helper_with_raw_string() -> &'static str {
     r#"{"not": "a } trap"}"#
 }
@@ -2982,8 +3049,47 @@ fn helper_with_raw_string() -> &'static str {
             Some("CreateWidget")
         );
         assert!(!create.body_flags.total_count_headers);
+        assert!(!create.body_flags.request_list_headers);
         // the comment-only add_page_meta mention is stripped before flag scans
         assert!(!create.body_flags.paginated_object);
+
+        let requests = &scan.handlers["requests_list"][0];
+        assert!(requests.body_flags.request_list_headers);
+        assert!(!requests.body_flags.total_count_headers);
+        let response_headers = success_response_headers(requests);
+        assert_eq!(response_headers.len(), 4);
+        assert_eq!(
+            response_headers
+                .iter()
+                .map(|header| header.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "X-Total-Count",
+                "X-Total-Count-Capped",
+                "X-Total-Count-Unavailable",
+                "X-Next-Cursor",
+            ]
+        );
+        assert!(response_headers.iter().all(|header| !header.required));
+        assert!(response_headers.iter().any(|header| {
+            header.name == "X-Total-Count-Unavailable"
+                && header.description.contains("statement budget")
+        }));
+        assert!(response_notes_for(requests)
+            .is_some_and(|notes| notes.contains("include_total defaults to false")));
+
+        let total_headers = success_response_headers(list);
+        assert_eq!(total_headers.len(), 1);
+        assert_eq!(total_headers[0].name, "X-Total-Count");
+        assert!(total_headers[0].required);
+
+        let mut both_flags = requests.clone();
+        both_flags.body_flags.total_count_headers = true;
+        let both_headers = success_response_headers(&both_flags);
+        assert_eq!(both_headers.len(), 4);
+        assert!(both_headers.iter().all(|header| !header.required));
+        assert!(response_notes_for(&both_flags)
+            .is_some_and(|notes| !notes.contains("filtered total is exposed")));
 
         // the raw string's unbalanced-looking brace did not desync the scanner
         assert!(scan.handlers.contains_key("helper_with_raw_string"));
@@ -3227,7 +3333,7 @@ async fn webhook_handler(body: Bytes) {}
             .contains("explicitly rejected"));
         assert!(token_mint_by_name["X-Ryuki-Session-Id"]
             .description
-            .contains("preferred example"));
+            .contains("never the administrative session UUID"));
 
         let webhook_info = &scan.handlers["webhook_handler"][0];
         let webhook = request_headers_for(
@@ -3238,12 +3344,17 @@ async fn webhook_handler(body: Bytes) {}
             Some(webhook_info),
             RequestBodyState::Raw,
         );
-        assert_eq!(webhook.len(), 1);
-        assert_eq!(webhook[0].name, "X-Hub-Signature-256");
-        assert!(webhook[0].required);
-        assert!(webhook[0]
+        assert_eq!(webhook.len(), 3);
+        let webhook_by_name: BTreeMap<&str, &ApiHeader> = webhook
+            .iter()
+            .map(|header| (header.name.as_str(), header))
+            .collect();
+        assert!(webhook_by_name["X-Hub-Signature-256"].required);
+        assert!(webhook_by_name["X-Hub-Signature-256"]
             .description
-            .contains("exact raw request-body bytes"));
+            .contains("v1 canonical message"));
+        assert!(webhook_by_name["X-Ryuki-Webhook-Timestamp"].required);
+        assert!(webhook_by_name["X-Ryuki-Webhook-Delivery-Id"].required);
     }
 
     #[test]
@@ -3797,7 +3908,7 @@ async fn widget_create(
         let (_, endpoints_count) =
             crate::generate_endpoints_doc(&root).expect("endpoints doc must build");
         assert_eq!(api_doc_count, endpoints_count);
-        assert_eq!(api_doc_count, 788, "production API route inventory drifted");
+        assert_eq!(api_doc_count, 796, "production API route inventory drifted");
         assert!(
             crate::RUST_API_ROUTE_SOURCES.contains(&crate::RUST_API_INTEGRATION_PATH),
             "integration.rs must remain a production route source"
@@ -3821,5 +3932,31 @@ async fn widget_create(
                 "AREA_DESCRIPTIONS entry '{key}' does not match any extracted area"
             );
         }
+    }
+
+    #[test]
+    fn api_doc_preserves_canonical_secret_reference_projection_field() {
+        let scan = scan_repository(&repo_root()).expect("API sources must be scannable");
+        let handler = scan
+            .handlers
+            .get("catalog_secret_references")
+            .and_then(|handlers| {
+                handlers
+                    .iter()
+                    .find(|handler| handler.file == "sources/ryuki-api/src/contracts.rs")
+            })
+            .expect("secret-reference catalog handler must be indexed");
+        let fields = literal_success_response_fields(handler)
+            .expect("secret-reference response must have a literal object schema");
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"secretReferenceKinds"),
+            "the API projection must retain its canonical field name"
+        );
+        assert!(
+            !names.contains(&"referenceKinds"),
+            "the catalog-source field must not leak into the API projection"
+        );
     }
 }

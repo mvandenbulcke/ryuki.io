@@ -1,3 +1,4 @@
+use crate::site_registry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,6 +40,68 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn active_site_code(site: &str) -> Result<String, String> {
+    let code = site_registry::normalize_site_code_for_lookup(site)
+        .map_err(|_| format!("Unknown or empty site: {site}"))?;
+    if site_registry::is_valid_site(&code) {
+        Ok(code)
+    } else {
+        Err(format!("Unknown or empty site: {site}"))
+    }
+}
+
+fn canonical_purpose(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// Resolve the owner of a global gMSA name from the complete governed site
+/// namespace. Longest-suffix selection prevents a short code from claiming a
+/// name owned by a hyphenated longer code; inactive codes remain reserved.
+fn gmsa_name_owner_site(name: &str) -> Result<String, String> {
+    if !name.is_ascii() || name != name.to_ascii_lowercase() || name.trim() != name {
+        return Err("gMSA name must be canonical lowercase ASCII".into());
+    }
+    if !name.starts_with("svc-") {
+        return Err("gMSA name must start with 'svc-'".into());
+    }
+
+    let mut candidates: Vec<(usize, String)> = site_registry::get_known_site_codes()
+        .map_err(|_| "Site namespace registry is unavailable".to_string())?
+        .into_iter()
+        .filter_map(|site| {
+            let token = site.to_ascii_lowercase();
+            let suffix = format!("-{token}");
+            let purpose = name.strip_suffix(&suffix)?.strip_prefix("svc-")?;
+            canonical_purpose(purpose).then_some((token.len(), site))
+        })
+        .collect();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let owner = candidates
+        .first()
+        .map(|(_, site)| site.clone())
+        .ok_or_else(|| "gMSA name does not end in a governed site namespace".to_string())?;
+    if !site_registry::is_valid_site(&owner) {
+        return Err(format!("gMSA name owner site '{owner}' is not active"));
+    }
+    Ok(owner)
+}
+
+fn require_site_bound_name(name: &str, canonical_site: &str) -> Result<(), String> {
+    let owner_site = gmsa_name_owner_site(name)?;
+    if owner_site != canonical_site {
+        return Err(format!(
+            "gMSA name namespace belongs to site '{owner_site}', not declared site '{canonical_site}'"
+        ));
+    }
+    Ok(())
+}
+
 /// Create a new gMSA account in memory (pure — no store). The caller is
 /// responsible for persisting the returned record. A fresh UUID is minted
 /// on each call.
@@ -51,15 +114,14 @@ pub fn create_gmsa(
     if name.is_empty() {
         return Err("gMSA name cannot be empty".into());
     }
-    if !name.starts_with("svc-") {
-        return Err("gMSA name must start with 'svc-'".into());
-    }
     if hosts.is_empty() {
         return Err("At least one authorized host is required".into());
     }
-    if site.is_empty() {
+    if site.trim().is_empty() {
         return Err("Site cannot be empty".into());
     }
+    let canonical_site = active_site_code(site)?;
+    require_site_bound_name(name, &canonical_site)?;
     if spns.is_empty() {
         return Err("At least one SPN is required".into());
     }
@@ -71,7 +133,7 @@ pub fn create_gmsa(
         dns_host_name: format!("{name}.corp.local"),
         service_principal_names: spns,
         authorized_hosts: hosts,
-        site: site.to_string(),
+        site: canonical_site,
         status: GMSAStatus::Active,
         managed_password_interval_days: 30,
         created_at: now_iso(),
@@ -93,19 +155,13 @@ pub fn validate_gmsa(name: &str) -> Result<crate::models::ValidationResult, Stri
     let mut failed_rules: Vec<String> = Vec::new();
     let mut remediation: Vec<String> = Vec::new();
 
-    if !name.starts_with("svc-") {
-        errors.push("gMSA name must start with 'svc-'".into());
-        failed_rules.push("gmsa-naming-convention".into());
-        remediation.push("Rename the gMSA to start with 'svc-' (e.g. svc-webappool-gblon)".into());
-    }
-
-    let parts: Vec<&str> = name.split('-').collect();
-    if parts.len() < 2 {
-        errors.push(
-            "gMSA name must have at least service and site parts (e.g. svc-webappool-gblon)".into(),
+    if let Err(error) = gmsa_name_owner_site(name) {
+        errors.push(error);
+        failed_rules.push("gmsa-canonical-site-namespace".into());
+        remediation.push(
+            "Use canonical lowercase format svc-PURPOSE-SITE with a governed active site suffix"
+                .into(),
         );
-        failed_rules.push("gmsa-name-structure".into());
-        remediation.push("Use format svc-PURPOSE-SITE".into());
     }
 
     warnings.push("DRY-RUN: No live AD gMSA validation performed".into());
@@ -358,6 +414,100 @@ mod tests {
             "GBLON",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_gmsa_rejects_foreign_site_suffix() {
+        let error = create_gmsa(
+            "svc-testapp-defra",
+            vec!["test01.corp.local".into()],
+            vec!["HTTP/test01.corp.local".into()],
+            "GBLON",
+        )
+        .expect_err("a declared site must not claim another site's global gMSA name");
+
+        assert!(error.contains("belongs to site 'DEFRA'"));
+    }
+
+    #[test]
+    fn test_create_gmsa_canonicalizes_declared_site_and_requires_canonical_suffix() {
+        let account = create_gmsa(
+            "svc-testapp-gblon",
+            vec!["test01.corp.local".into()],
+            vec!["HTTP/test01.corp.local".into()],
+            "gb lon",
+        )
+        .expect("a supported display-form alias should resolve to the registered active site");
+        assert_eq!(account.site, "GBLON");
+
+        let error = create_gmsa(
+            "svc-testapp-GBLON",
+            vec!["test01.corp.local".into()],
+            vec!["HTTP/test01.corp.local".into()],
+            "GBLON",
+        )
+        .expect_err("the globally unique name must use the canonical lowercase suffix");
+        assert!(error.contains("canonical lowercase ASCII"));
+    }
+
+    #[test]
+    fn test_create_gmsa_uses_longest_governed_namespace_suffix() {
+        for site in ["ZZ", "LAB-ZZ"] {
+            site_registry::upsert_site(
+                site_registry::SiteEntry {
+                    unlocode: site.into(),
+                    name: format!("{site} synthetic namespace site"),
+                    country: "Test country".into(),
+                    country_code: "ZZ".into(),
+                    timezone: "UTC".into(),
+                    active: true,
+                },
+                site_registry::SiteCodeSystem::Custom,
+            )
+            .unwrap();
+        }
+
+        let error = create_gmsa(
+            "svc-purpose-lab-zz",
+            vec!["test01.corp.local".into()],
+            vec!["HTTP/test01.corp.local".into()],
+            "ZZ",
+        )
+        .expect_err("the shorter suffix must not claim a longer site's namespace");
+        assert!(error.contains("belongs to site 'LAB-ZZ'"));
+
+        let account = create_gmsa(
+            "svc-purpose-lab-zz",
+            vec!["test01.corp.local".into()],
+            vec!["HTTP/test01.corp.local".into()],
+            "LAB-ZZ",
+        )
+        .expect("the longest authoritative site suffix owns the name");
+        assert_eq!(account.site, "LAB-ZZ");
+    }
+
+    #[test]
+    fn test_create_gmsa_rejects_ambiguous_or_noncanonical_name_forms() {
+        for name in [
+            "svc--gblon",
+            "svc-purpose--gblon",
+            "svc-purpose_gblon",
+            "svc-purpose-gblon ",
+            "svc-purpøse-gblon",
+            "svc-purpose-GBLON",
+            "svc-purpose-demuc",
+        ] {
+            assert!(
+                create_gmsa(
+                    name,
+                    vec!["test01.corp.local".into()],
+                    vec!["HTTP/test01.corp.local".into()],
+                    "GBLON",
+                )
+                .is_err(),
+                "noncanonical name must fail closed: {name}"
+            );
+        }
     }
 
     // ─── validate_gmsa ──────────────────────────────────────────────────────────

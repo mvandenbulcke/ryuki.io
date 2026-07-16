@@ -230,6 +230,29 @@ pub fn start_review_guard(review: &AccessReview, reviewer: &str) -> Result<(), S
     Ok(())
 }
 
+/// Enforce the object-level reviewer designation established by
+/// `Pending -> InProgress`. Approve-tier capability and site scope decide who
+/// may participate in this workflow; they do not let another approver claim a
+/// review that is already assigned to a stable principal.
+pub fn designated_reviewer_guard(review: &AccessReview, reviewer: &str) -> Result<(), String> {
+    if reviewer.trim().is_empty() {
+        return Err("reviewer cannot be empty".into());
+    }
+    if review.status != ReviewStatus::InProgress {
+        return Err(format!(
+            "access review '{}' must be started before a reviewer verdict (current: '{}')",
+            review.id, review.status
+        ));
+    }
+    if review.reviewer.as_deref() != Some(reviewer) {
+        return Err(format!(
+            "access review '{}' is assigned to a different reviewer",
+            review.id
+        ));
+    }
+    Ok(())
+}
+
 /// Pure guard for approve_review.
 pub fn approve_review_guard(
     review: &AccessReview,
@@ -242,15 +265,7 @@ pub fn approve_review_guard(
     if justification.trim().is_empty() {
         return Err("justification cannot be empty".into());
     }
-    if !matches!(
-        review.status,
-        ReviewStatus::InProgress | ReviewStatus::Pending
-    ) {
-        return Err(format!(
-            "access review '{}' cannot be approved from status '{}'",
-            review.id, review.status
-        ));
-    }
+    designated_reviewer_guard(review, reviewer)?;
     Ok(())
 }
 
@@ -266,15 +281,7 @@ pub fn revoke_review_guard(
     if reason.trim().is_empty() {
         return Err("reason cannot be empty".into());
     }
-    if !matches!(
-        review.status,
-        ReviewStatus::InProgress | ReviewStatus::Pending
-    ) {
-        return Err(format!(
-            "access review '{}' cannot be revoked from status '{}'",
-            review.id, review.status
-        ));
-    }
+    designated_reviewer_guard(review, reviewer)?;
     Ok(())
 }
 
@@ -294,17 +301,10 @@ pub fn exempt_review_guard(
     if parse_date(exemption_expiry).is_none() {
         return Err(format!("Invalid exemption_expiry: {exemption_expiry}"));
     }
-    // An exemption grants an exception while a review is still open; a review
-    // already Approved/Revoked/Exempted is terminal and must not be rewritten.
-    if !matches!(
-        review.status,
-        ReviewStatus::InProgress | ReviewStatus::Pending
-    ) {
-        return Err(format!(
-            "access review '{}' cannot be exempted from status '{}'",
-            review.id, review.status
-        ));
-    }
+    // An exception is a reviewer verdict over a review they explicitly
+    // started. It cannot be used to claim an unassigned Pending review or to
+    // rewrite another reviewer's in-progress work.
+    designated_reviewer_guard(review, reviewer)?;
     Ok(())
 }
 
@@ -640,29 +640,52 @@ mod tests {
     fn test_approve_review_guard_ok_on_in_progress() {
         let reviews = seed_reviews();
         let review = reviews.iter().find(|r| r.id == "ar-defra-svc-001").unwrap();
-        assert!(approve_review_guard(review, "test.approver", "Access still required").is_ok());
+        assert!(approve_review_guard(review, "alice.reviewer", "Access still required").is_ok());
     }
 
     #[test]
     fn test_revoke_review_guard_ok_on_in_progress() {
         let reviews = seed_reviews();
-        let review = reviews
-            .iter()
-            .find(|r| r.id == "ar-gblon-admin-001")
-            .unwrap();
-        assert!(revoke_review_guard(review, "test.reviewer", "Access no longer needed").is_ok());
+        let review = reviews.iter().find(|r| r.id == "ar-deber-ad-001").unwrap();
+        assert!(revoke_review_guard(review, "diego.reviewer", "Access no longer needed").is_ok());
     }
 
     #[test]
-    fn test_exempt_review_guard_rejects_terminal_states() {
+    fn reviewer_verdicts_require_started_assignment_and_reject_terminal_states() {
         let reviews = seed_reviews();
         let open = reviews
             .iter()
-            .find(|r| matches!(r.status, ReviewStatus::Pending | ReviewStatus::InProgress))
-            .expect("a seed review should be Pending/InProgress");
+            .find(|r| r.id == "ar-defra-svc-001")
+            .expect("an assigned in-progress seed review");
         let expiry = "2027-01-01T00:00:00Z";
-        // OK while the review is still open.
-        assert!(exempt_review_guard(open, "test.reviewer", "temporary exception", expiry).is_ok());
+        assert!(exempt_review_guard(open, "alice.reviewer", "temporary exception", expiry).is_ok());
+
+        for verdict in [
+            approve_review_guard(open, "other.reviewer", "still needed"),
+            revoke_review_guard(open, "other.reviewer", "remove access"),
+            exempt_review_guard(open, "other.reviewer", "temporary exception", expiry),
+        ] {
+            assert!(
+                verdict.is_err(),
+                "a non-designated approve-tier principal must not decide the review"
+            );
+        }
+
+        let pending = reviews
+            .iter()
+            .find(|r| r.id == "ar-gblon-admin-001")
+            .expect("an unassigned Pending seed review");
+        for verdict in [
+            approve_review_guard(pending, "new.reviewer", "still needed"),
+            revoke_review_guard(pending, "new.reviewer", "remove access"),
+            exempt_review_guard(pending, "new.reviewer", "temporary exception", expiry),
+        ] {
+            assert!(
+                verdict.is_err(),
+                "Pending reviews must cross the designation/start transition"
+            );
+        }
+
         // Rejected once the review is terminal — exempt must not rewrite it.
         let mut terminal = open.clone();
         for st in [
@@ -672,7 +695,7 @@ mod tests {
         ] {
             terminal.status = st;
             assert!(
-                exempt_review_guard(&terminal, "test.reviewer", "temporary exception", expiry)
+                exempt_review_guard(&terminal, "alice.reviewer", "temporary exception", expiry)
                     .is_err(),
                 "exempt must reject a terminal-status review"
             );

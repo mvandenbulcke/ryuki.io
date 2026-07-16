@@ -913,14 +913,21 @@ pub fn DashboardView() -> impl IntoView {
         .expect("secret reference status must be allowlisted");
     let _secret_reference_resource_guard = resource_api_path(secret_references_resource());
     let secret_reference_api_path = secret_reference_snapshot.secret_references_path.clone();
-    let secret_reference_provider = secret_reference_snapshot.provider.clone();
-    let secret_reference_management_cli = secret_reference_snapshot.management_cli.clone();
+    let secret_reference_provider_model = secret_reference_snapshot.provider_model.clone();
+    let secret_reference_management_interface =
+        secret_reference_snapshot.management_interface.clone();
+    let secret_reference_fallback_policy = secret_reference_snapshot.fallback_policy.clone();
+    let secret_reference_provider_classes = secret_reference_snapshot
+        .admitted_provider_classes
+        .join(",");
+    let secret_reference_capability_interfaces =
+        secret_reference_snapshot.capability_interfaces.join(",");
     let secret_reference_readiness_state = secret_reference_snapshot.readiness_state.clone();
     let secret_reference_configured_for_production = secret_reference_snapshot
         .configured_for_production
         .to_string();
-    let secret_live_cli_execution_allowed = secret_reference_snapshot
-        .live_cli_execution_allowed
+    let secret_live_provider_actions_allowed = secret_reference_snapshot
+        .live_provider_actions_allowed
         .to_string();
     let secret_provider_calls_allowed =
         secret_reference_snapshot.provider_calls_allowed.to_string();
@@ -1089,10 +1096,13 @@ pub fn DashboardView() -> impl IntoView {
                 class="panel contract-panel"
                 data-secret-reference-readiness="true"
                 data-api-path=secret_reference_api_path
-                data-provider=secret_reference_provider
-                data-management-cli=secret_reference_management_cli
+                data-provider-model=secret_reference_provider_model
+                data-management-interface=secret_reference_management_interface
+                data-fallback-policy=secret_reference_fallback_policy
+                data-admitted-provider-classes=secret_reference_provider_classes
+                data-capability-interfaces=secret_reference_capability_interfaces
                 data-configured-for-production=secret_reference_configured_for_production
-                data-live-cli-execution-allowed=secret_live_cli_execution_allowed
+                data-live-provider-actions-allowed=secret_live_provider_actions_allowed
                 data-provider-calls-allowed=secret_provider_calls_allowed
                 data-secret-values-allowed=secret_values_allowed
                 data-provider-paths-allowed=secret_provider_paths_allowed
@@ -1108,10 +1118,10 @@ pub fn DashboardView() -> impl IntoView {
                     {secret_references
                         .into_iter()
                         .map(|reference| {
-                            let cli_state = if reference.live_cli_execution_allowed {
-                                "CLI execution allowed"
+                            let action_state = if reference.live_provider_actions_allowed {
+                                "Provider actions allowed"
                             } else {
-                                "CLI execution blocked"
+                                "Provider actions blocked"
                             };
                             let value_state = if reference.value_exposure_allowed {
                                 "Values visible"
@@ -1125,10 +1135,10 @@ pub fn DashboardView() -> impl IntoView {
                             };
                             view! {
                                 <div class="contract-item">
-                                    <span class="badge bad">{cli_state}</span>
+                                    <span class="badge bad">{action_state}</span>
                                     <strong>{reference.consumer_scope}</strong>
                                     <p>{reference.safe_summary}</p>
-                                    <span class="table-note">{reference.provider} " / " {reference.management_cli} " / " {reference.rotation_state} " / " {value_state} " / " {path_state}</span>
+                                    <span class="table-note">{reference.capability} " / " {reference.interface} " / " {reference.rotation_state} " / " {value_state} " / " {path_state}</span>
                                 </div>
                             }
                         })

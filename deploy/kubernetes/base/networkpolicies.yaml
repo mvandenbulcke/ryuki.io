@@ -47,6 +47,7 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: ingress-nginx
+              app.kubernetes.io/instance: ryuki-platform
       ports:
         - protocol: TCP
           port: 8080
@@ -74,10 +75,7 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: ingress-nginx
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/part-of: ryuki-infrastructure-platform
-              app.kubernetes.io/name: portal-ui
+              app.kubernetes.io/instance: ryuki-platform
       ports:
         - protocol: TCP
           port: 8080
@@ -85,7 +83,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-portal-ui-egress-to-platform-api
+  name: allow-portal-ui-egress-to-dedicated-ingress-https
   namespace: ryuki-platform
   labels:
     app.kubernetes.io/part-of: ryuki-infrastructure-platform
@@ -99,13 +97,19 @@ spec:
     - Egress
   egress:
     - to:
-        - podSelector:
+        - namespaceSelector:
             matchLabels:
-              app.kubernetes.io/part-of: ryuki-infrastructure-platform
-              app.kubernetes.io/name: platform-api
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+              # This selector is a required deployment contract, not a label
+              # to add to a shared controller. The matching instance must own
+              # only the dedicated `ryuki-platform` IngressClass.
+              app.kubernetes.io/instance: ryuki-platform
       ports:
         - protocol: TCP
-          port: 8080
+          port: 443
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -177,6 +181,54 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: ryuki-infrastructure-platform
               app.kubernetes.io/name: platform-api
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-api-migrations-egress-to-db
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api-migrations
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ryuki-infrastructure-platform
+      app.kubernetes.io/name: platform-api-migrations
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: ryuki-platform-db
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-db-from-platform-api-migrations
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-db
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: ryuki-platform-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: ryuki-infrastructure-platform
+              app.kubernetes.io/name: platform-api-migrations
       ports:
         - protocol: TCP
           port: 5432

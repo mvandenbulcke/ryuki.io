@@ -4,8 +4,10 @@
 //! deployments. It complements (never replaces) the existing bearer-token path:
 //! `entra_auth::EntraTokenValidator` keeps validating `Authorization: Bearer`
 //! JWTs for API callers, while this flow lets a BROWSER sign in and ride the
-//! same persisted-session + `ryuki_session` cookie machinery the local login
-//! uses. In EntraId mode the session resolver honors ONLY the validated SSO
+//! same persisted-session + mode-selected cookie machinery the local login
+//! uses (`__Host-ryuki_session` for HTTPS, unprefixed only for explicit
+//! non-Secure loopback development/test configuration). In EntraId mode the
+//! session resolver honors ONLY the validated SSO
 //! providers (`entra-id` and the generic `oidc` flow), never a stale
 //! local/dry-run session — mirroring the symmetric restriction Local mode
 //! already applies.
@@ -43,10 +45,10 @@
 //!   validation; the PKCE verifier never leaves the server except to the token
 //!   endpoint over the exchange itself.
 //! - Per-browser CSRF binding: the authorize-url response carries a `binding`
-//!   value (also set as the HttpOnly `entra_login_csrf` cookie) that must match
-//!   the cookie presented to the callback, so a state minted in an attacker's
-//!   own flow cannot be redeemed in a victim's browser (login-CSRF defense —
-//!   same design as the generic OIDC flow's `oidc_login_csrf`).
+//!   value (also set as a mode-selected HttpOnly binding cookie) that must
+//!   match the cookie presented to the callback, so a state minted in an
+//!   attacker's own flow cannot be redeemed in a victim's browser
+//!   (login-CSRF defense — same design as the generic OIDC flow).
 //! - Public client: the token exchange sends NO `client_secret` field.
 //!   Confidential-client deployments are served by the generic `oidc.*` flow.
 //! - Session cookie flags come from `session_cookie_set_header` — identical to
@@ -54,9 +56,10 @@
 //! - No token material, code, verifier, or session id is ever logged; id_token
 //!   failures log only the validator's safe reason string.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::Query;
+use axum::extract::{ConnectInfo, Query, Request};
 use axum::http::header::{LOCATION, SET_COOKIE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -77,10 +80,21 @@ const ENTRA_ROLES_CLAIM: &str = "roles";
 /// id_token; profile/email populate display identity claims.
 const ENTRA_SCOPES: &str = "openid profile email";
 
-/// Name of the per-browser CSRF-binding cookie for the Entra flow. Distinct
-/// from the generic flow's `oidc_login_csrf` so the two flows can never
-/// clobber each other's binding.
-pub(crate) const ENTRA_BINDING_COOKIE: &str = "entra_login_csrf";
+/// Host-prefixed browser binding used for every HTTPS Entra callback. Browsers
+/// enforce `Secure`, `Path=/`, and no `Domain` for this name, so a sibling host
+/// cannot plant a parent-domain competitor.
+pub(crate) const SECURE_ENTRA_BINDING_COOKIE: &str = "__Host-entra_login_csrf";
+/// Compatibility name used only by validated plain-HTTP loopback development
+/// and tests, where a `__Host-` cookie cannot be set.
+pub(crate) const LOOPBACK_ENTRA_BINDING_COOKIE: &str = "entra_login_csrf";
+
+fn entra_binding_cookie_name(cookie_secure: bool) -> &'static str {
+    if cookie_secure {
+        SECURE_ENTRA_BINDING_COOKIE
+    } else {
+        LOOPBACK_ENTRA_BINDING_COOKIE
+    }
+}
 
 /// Derived per-tenant endpoints (see module docs for the fixed URL patterns).
 struct EntraEndpoints {
@@ -119,15 +133,17 @@ pub struct EntraSsoDeps {
     client_id: String,
     redirect_uri: String,
     authorize_endpoint: String,
+    issuer: String,
     session: ryuki_core::config::SessionConfig,
+    trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
     exchanger: Arc<dyn TokenExchanger + Send + Sync>,
     validator: Arc<OidcIdTokenValidator>,
 }
 
 impl EntraSsoDeps {
-    /// Shared constructor for production (`from_app_config`) and tests: wires
-    /// the real `ReqwestTokenExchanger` and network-JWKS `OidcIdTokenValidator`
-    /// against the derived tenant endpoints.
+    /// Test convenience constructor that wires the real `ReqwestTokenExchanger`
+    /// and network-JWKS `OidcIdTokenValidator` against derived tenant endpoints.
+    #[cfg(test)]
     pub fn build(
         mode_is_entra: bool,
         tenant_id: &str,
@@ -137,6 +153,29 @@ impl EntraSsoDeps {
         leeway_secs: u64,
         session: ryuki_core::config::SessionConfig,
     ) -> Arc<Self> {
+        Self::build_with_trusted_proxies(
+            mode_is_entra,
+            tenant_id,
+            client_id,
+            authority,
+            redirect_uri,
+            leeway_secs,
+            session,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_trusted_proxies(
+        mode_is_entra: bool,
+        tenant_id: &str,
+        client_id: &str,
+        authority: &str,
+        redirect_uri: &str,
+        leeway_secs: u64,
+        session: ryuki_core::config::SessionConfig,
+        trusted_proxies: Vec<ryuki_core::config::TrustedProxyNetwork>,
+    ) -> Arc<Self> {
         let endpoints = derive_entra_endpoints(authority, tenant_id);
         let exchanger: Arc<dyn TokenExchanger + Send + Sync> =
             Arc::new(ReqwestTokenExchanger::new(endpoints.token));
@@ -144,7 +183,7 @@ impl EntraSsoDeps {
         // Entra never issues id_tokens with the api:// audience form).
         let validator = Arc::new(OidcIdTokenValidator::new(
             endpoints.jwks,
-            endpoints.issuer,
+            endpoints.issuer.clone(),
             client_id.to_string(),
             leeway_secs,
         ));
@@ -154,7 +193,9 @@ impl EntraSsoDeps {
             client_id: client_id.to_string(),
             redirect_uri: redirect_uri.to_string(),
             authorize_endpoint: endpoints.authorize,
+            issuer: endpoints.issuer,
             session,
+            trusted_proxies,
             exchanger,
             validator,
         })
@@ -165,7 +206,17 @@ impl EntraSsoDeps {
     /// the placeholder endpoints derived from a possibly-empty tenant are
     /// never dereferenced.
     pub fn from_app_config(cfg: &ryuki_core::config::RyukiConfig) -> Arc<Self> {
-        Self::build(
+        let trusted_proxies = cfg
+            .rate_limit
+            .parsed_trusted_proxies()
+            .unwrap_or_else(|error| {
+                // Startup config validation rejects this condition. Retaining
+                // an empty trust set here is fail-safe if a test or future
+                // embedder bypasses validation: forwarded identity is ignored.
+                tracing::error!(error = %error, "invalid Entra login trusted-proxy configuration");
+                Vec::new()
+            });
+        Self::build_with_trusted_proxies(
             cfg.auth_mode == ryuki_core::config::AuthMode::EntraId,
             &cfg.entra_tenant_id,
             &cfg.entra_client_id,
@@ -173,6 +224,7 @@ impl EntraSsoDeps {
             &cfg.entra_redirect_uri,
             cfg.entra_leeway_secs,
             cfg.session.clone(),
+            trusted_proxies,
         )
     }
 
@@ -217,22 +269,11 @@ fn entra_sso_gate(deps: &EntraSsoDeps) -> Result<(), (StatusCode, Json<Value>)> 
 /// always; Secure follows the session cookie policy; Max-Age matches the
 /// 10-minute state TTL.
 fn entra_binding_cookie_header(binding: &str, cookie_secure: bool) -> String {
+    let name = entra_binding_cookie_name(cookie_secure);
     format!(
-        "{ENTRA_BINDING_COOKIE}={binding}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
+        "{name}={binding}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
         if cookie_secure { "; Secure" } else { "" }
     )
-}
-
-/// 32 CSPRNG bytes (OsRng / getrandom) as base64url — ≥256-bit entropy, the
-/// same recipe as the generic OIDC flow's state/nonce/verifier values.
-fn random_b64url_256() -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
-    use rand::RngCore;
-
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// GET /api/auth/entra/authorize-url — begins a browser sign-in.
@@ -240,12 +281,16 @@ fn random_b64url_256() -> String {
 /// Persists `(state, nonce, pkce_verifier, binding)` via the single-use
 /// `oidc_login_states` store, then returns the tenant authorize URL plus the
 /// per-browser binding as JSON. The binding is ALSO set as the HttpOnly
-/// `entra_login_csrf` cookie for direct same-origin browser callers; the
+/// mode-selected binding cookie for direct same-origin browser callers; the
 /// portal server function (which cannot forward upstream Set-Cookie headers)
 /// reads the JSON field and sets an identical cookie on its own response. The
-/// binding value never reaches page JavaScript either way.
+/// binding value never reaches page JavaScript either way. Mandatory shared
+/// source/global admission precedes PostgreSQL; serialized DB-time cleanup and
+/// provider/global quotas precede entropy generation. A 429 carries a bounded
+/// `Retry-After` response header.
 pub(crate) async fn entra_authorize_url(
     Extension(deps): Extension<Arc<EntraSsoDeps>>,
+    request: Request,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
@@ -253,25 +298,47 @@ pub(crate) async fn entra_authorize_url(
 
     entra_sso_gate(&deps)?;
 
+    // Mandatory shared login admission precedes database acquisition. The
+    // server-inserted TCP peer is required; forwarded identity is honored only
+    // through the immutable trusted-proxy configuration carried in these deps.
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0);
+    let _admission_permit = if request
+        .extensions()
+        .get::<crate::repos::oidc_login_states::LoginInitiationPreAdmitted>()
+        .is_some()
+    {
+        None
+    } else {
+        Some(
+            crate::repos::oidc_login_states::admit_public_login_initiation(
+                peer_addr,
+                request.headers(),
+                &deps.trusted_proxies,
+            )
+            .map_err(crate::contracts::login_initiation_admission_error)?,
+        )
+    };
+
     // A DB is required to persist the single-use state.
     let pool = crate::database::get_db().ok_or_else(crate::contracts::status_503_no_db)?;
 
-    let state = random_b64url_256();
-    let nonce = random_b64url_256();
-    let pkce_verifier = random_b64url_256();
+    // Shared DB admission runs before protocol material is generated and keeps
+    // generation + insertion inside the same serialized transaction.
+    let material = crate::repos::oidc_login_states::create(
+        pool,
+        crate::repos::oidc_login_states::LoginFlow::Entra,
+    )
+    .await
+    .map_err(crate::contracts::login_state_insert_error)?;
+    let state = material.state.as_str();
+    let nonce = material.nonce.as_str();
+    let pkce_verifier = material.pkce_verifier.as_str();
+    let binding = material.binding.as_str();
     // PKCE S256: code_challenge = BASE64URL(SHA-256(ASCII(code_verifier))).
     let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
-    let binding = random_b64url_256();
-
-    crate::repos::oidc_login_states::insert(pool, &state, &nonce, &pkce_verifier, &binding)
-        .await
-        .map_err(crate::contracts::db_error)?;
-
-    // Opportunistic, probabilistic sweep of expired rows (~1/64 of requests),
-    // same as the generic OIDC login initiation. Failure is non-fatal.
-    if rand::random::<u8>() < 4 {
-        let _ = crate::repos::oidc_login_states::cleanup_expired(pool).await;
-    }
 
     // All parameter values are percent-encoded by Url::parse_with_params, so
     // nothing can inject into the query string.
@@ -281,8 +348,8 @@ pub(crate) async fn entra_authorize_url(
         ("redirect_uri", &deps.redirect_uri),
         ("response_mode", "query"),
         ("scope", ENTRA_SCOPES),
-        ("state", &state),
-        ("nonce", &nonce),
+        ("state", state),
+        ("nonce", nonce),
         ("code_challenge", &code_challenge),
         ("code_challenge_method", "S256"),
     ];
@@ -294,7 +361,7 @@ pub(crate) async fn entra_authorize_url(
         )
     })?;
 
-    let cookie = entra_binding_cookie_header(&binding, deps.session.cookie_secure);
+    let cookie = entra_binding_cookie_header(binding, deps.session.cookie_secure);
     let cookie_hv = axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -315,16 +382,34 @@ pub(crate) async fn entra_authorize_url(
         .into_response())
 }
 
-/// Extract a single cookie value by exact name from the request `Cookie`
-/// header (same matcher as the generic OIDC callback).
-fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|pair| {
-        pair.trim()
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|val| val.to_string())
-    })
+/// Extract the only exact-name binding cookie across every `Cookie` header
+/// field. Duplicate matching pairs, malformed matching pairs, and opaque
+/// header bytes fail closed independently of browser/header ordering.
+fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let mut binding = None;
+    for raw in headers.get_all(axum::http::header::COOKIE).iter() {
+        let raw = raw.to_str().map_err(|_| ())?;
+        for pair in raw.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((cookie_name, value)) = pair.split_once('=') else {
+                if pair == name {
+                    return Err(());
+                }
+                continue;
+            };
+            if cookie_name.trim() != name {
+                continue;
+            }
+            if binding.is_some() {
+                return Err(());
+            }
+            binding = Some(value.trim().to_string());
+        }
+    }
+    Ok(binding)
 }
 
 fn invalid_state_problem() -> (StatusCode, Json<Value>) {
@@ -350,7 +435,7 @@ fn invalid_state_problem() -> (StatusCode, Json<Value>) {
 /// 6. Validate the id_token (RS256 sig + iss/aud/exp/nbf + nonce) and extract
 ///    identity + `roles`.
 /// 7. Mint the SAME persisted session shape local login mints (aligned
-///    row-expiry and cookie Max-Age), set the `ryuki_session` cookie, and
+///    row-expiry and cookie Max-Age), set the mode-selected session cookie, and
 ///    302-redirect to `/` (hardcoded — no open-redirect surface).
 pub(crate) async fn entra_callback(
     Extension(deps): Extension<Arc<EntraSsoDeps>>,
@@ -400,9 +485,14 @@ pub(crate) async fn entra_callback(
 
     // Login-CSRF / session-swapping defense: the state is redeemable only by
     // the browser that initiated the login (it holds the matching
-    // `entra_login_csrf` cookie). Both values are single-use, server-generated
-    // 256-bit strings, so a simple compare suffices.
-    let cookie_binding = cookie_value(&headers, ENTRA_BINDING_COOKIE).unwrap_or_default();
+    // mode-selected binding cookie). Both values are single-use,
+    // server-generated 256-bit strings, so a simple compare suffices.
+    let cookie_binding = cookie_value(
+        &headers,
+        entra_binding_cookie_name(deps.session.cookie_secure),
+    )
+    .map_err(|_| invalid_state_problem())?
+    .unwrap_or_default();
     if binding.is_empty() || cookie_binding.is_empty() || cookie_binding != binding {
         tracing::warn!("entra callback: login-state browser binding mismatch");
         return Err(invalid_state_problem());
@@ -431,7 +521,7 @@ pub(crate) async fn entra_callback(
     // Validate the id_token; log only the safe reason string.
     let claims = deps
         .validator
-        .validate_id_token(&token_resp.id_token, &nonce, ENTRA_ROLES_CLAIM)
+        .validate_entra_id_token(&token_resp.id_token, &nonce, ENTRA_ROLES_CLAIM)
         .await
         .map_err(|reason| {
             tracing::warn!(reason, "entra id_token validation failed");
@@ -441,22 +531,31 @@ pub(crate) async fn entra_callback(
             )
         })?;
 
-    // Mint the persisted session — same shape as local login: server-generated
-    // id (session-fixation defense) and a row expiry aligned with the cookie
-    // Max-Age, plus the identity fields the Entra id_token carries.
-    let session_id = Uuid::new_v4();
+    // Mint unrelated management and authentication values. Only the keyed
+    // verifier crosses into PostgreSQL; the bearer crosses only into Set-Cookie.
+    let session_record_id = Uuid::new_v4();
+    let credential =
+        crate::session_credentials::issue_session_credential(&deps.session).map_err(|error| {
+            tracing::error!(reason = %error, "entra session credential issuance failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "AUTH_SESSION_PERSISTENCE_FAILED"})),
+            )
+        })?;
     crate::contracts::map_auth_session_persistence_result(
-        sqlx::query(
-            "INSERT INTO sessions (id, user_id, display_name, email, roles, provider, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, 'entra-id', NOW() + make_interval(secs => $6))",
+        crate::identity_authority::create_federated_session(
+            pool,
+            "entra-id",
+            &deps.issuer,
+            &claims.user_id,
+            &claims.display_name,
+            claims.email.as_deref(),
+            &claims.roles,
+            session_record_id,
+            credential.verifier().as_slice(),
+            deps.session.cookie_max_age_secs,
+            &deps.session,
         )
-        .bind(session_id)
-        .bind(&claims.user_id)
-        .bind(&claims.display_name)
-        .bind(&claims.email)
-        .bind(&claims.roles as &[String])
-        .bind(deps.session.cookie_max_age_secs as f64)
-        .execute(pool)
         .await,
         "create",
     )
@@ -470,26 +569,32 @@ pub(crate) async fn entra_callback(
         )
     })?;
 
-    // Never log the session id — it IS the bearer cookie credential.
+    // Never log the bearer, verifier, or management UUID.
     tracing::info!("entra login session created");
 
-    // Session cookie flags are IDENTICAL to the local-login cookie
-    // (session_cookie_set_header); redirect target is hardcoded.
-    let cookie =
-        crate::contracts::session_cookie_set_header(&session_id.to_string(), &deps.session);
-    let cookie_hv = axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
+    // Session cookie flags and legacy-name retirement are identical to local
+    // login; the redirect target is hardcoded.
+    let cookies = crate::contracts::session_cookie_set_headers(credential.bearer(), &deps.session);
+    let location = axum::http::HeaderValue::from_static("/");
+
+    let mut response = (
+        StatusCode::FOUND,
+        [
+            (LOCATION, location),
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            ),
+        ],
+    )
+        .into_response();
+    crate::contracts::append_session_cookie_headers(&mut response, &cookies).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "ENTRA_COOKIE_ENCODING_FAILED"})),
         )
     })?;
-    let location = axum::http::HeaderValue::from_static("/");
-
-    Ok((
-        StatusCode::FOUND,
-        [(SET_COOKIE, cookie_hv), (LOCATION, location)],
-    )
-        .into_response())
+    Ok(response)
 }
 
 // ─── Unit tests (no DB, no network) ──────────────────────────────────────────
@@ -588,6 +693,21 @@ mod tests {
         assert!(entra_sso_gate(&configured).is_ok());
     }
 
+    #[tokio::test]
+    async fn authorize_url_fails_closed_without_tcp_peer_before_db() {
+        let configured = deps(true, "client-1", "http://localhost/api/auth/entra/callback");
+        let request = Request::builder()
+            .uri("/api/auth/entra/authorize-url")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let Err((status, Json(body))) = entra_authorize_url(Extension(configured), request).await
+        else {
+            panic!("missing TCP peer must fail closed before database acquisition");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "LOGIN_ADMISSION_CONTEXT_UNAVAILABLE");
+    }
+
     #[test]
     fn test_binding_cookie_header_flags() {
         let plain = entra_binding_cookie_header("abc", false);
@@ -596,19 +716,58 @@ mod tests {
             "entra_login_csrf=abc; Path=/; HttpOnly; Max-Age=600; SameSite=Lax"
         );
         let secure = entra_binding_cookie_header("abc", true);
+        assert!(secure.starts_with("__Host-entra_login_csrf=abc;"));
         assert!(secure.ends_with("; Secure"));
+        assert!(!secure.contains("Domain="));
     }
 
     #[test]
-    fn test_random_b64url_is_unique_and_url_safe() {
-        let a = random_b64url_256();
-        let b = random_b64url_256();
-        assert_ne!(a, b);
-        // 32 bytes -> 43 base64url chars, no padding.
-        assert_eq!(a.len(), 43);
-        assert!(a
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    fn binding_cookie_parser_rejects_duplicates_across_all_cookie_fields() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("__Host-entra_login_csrf=attacker"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("other=value; __Host-entra_login_csrf=victim"),
+        );
+        assert_eq!(
+            cookie_value(&headers, SECURE_ENTRA_BINDING_COOKIE),
+            Err(()),
+            "matching cookies split across fields must be ambiguous"
+        );
+
+        let mut same_field = axum::http::HeaderMap::new();
+        same_field.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "__Host-entra_login_csrf=victim; __Host-entra_login_csrf=attacker",
+            ),
+        );
+        assert_eq!(
+            cookie_value(&same_field, SECURE_ENTRA_BINDING_COOKIE),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn binding_cookie_parser_selects_only_the_validated_transport_name() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "entra_login_csrf=parent-domain-plant; __Host-entra_login_csrf=host-only",
+            ),
+        );
+        assert_eq!(
+            cookie_value(&headers, entra_binding_cookie_name(true)),
+            Ok(Some("host-only".to_string()))
+        );
+        assert_eq!(
+            cookie_value(&headers, entra_binding_cookie_name(false)),
+            Ok(Some("parent-domain-plant".to_string()))
+        );
     }
 }
 
@@ -629,15 +788,13 @@ mod tests {
 #[cfg(test)]
 mod entra_sso_db_tests {
     use super::*;
+    use crate::test_crypto;
     use axum::body::Body;
     use axum::extract::Form;
     use axum::http::Request;
     use axum::routing::{get, post};
     use axum::Router;
-    use jsonwebtoken::{Algorithm, EncodingKey, Header};
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::traits::PublicKeyParts;
-    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use jsonwebtoken::{Algorithm, Header};
     use sqlx::PgPool;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -647,6 +804,23 @@ mod entra_sso_db_tests {
     const TEST_CLIENT: &str = "entra-sso-client-test";
     const TEST_REDIRECT: &str = "http://127.0.0.1:9/api/auth/entra/callback";
     const TEST_KID: &str = "entra-sso-test-kid";
+
+    fn authorize_request() -> Request<Body> {
+        Request::builder()
+            .uri("/api/auth/entra/authorize-url")
+            .extension(ConnectInfo(
+                "127.0.0.1:40101".parse::<SocketAddr>().expect("test peer"),
+            ))
+            .body(Body::empty())
+            .expect("authorize request")
+    }
+
+    fn test_session_config() -> ryuki_core::config::SessionConfig {
+        ryuki_core::config::SessionConfig {
+            credential_hmac_key: "k".repeat(32),
+            ..Default::default()
+        }
+    }
 
     // ─── DB pool gate (mirrors the oidc_callback db-test pattern) ─────────
 
@@ -661,6 +835,14 @@ mod entra_sso_db_tests {
         crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
         let pool = crate::database::get_db()?;
         crate::database::run_migrations(pool).await.ok()?;
+        let cfg = ryuki_core::config::RyukiConfig {
+            auth_mode: ryuki_core::config::AuthMode::EntraId,
+            entra_tenant_id: TEST_TENANT.into(),
+            entra_client_id: TEST_CLIENT.into(),
+            session: test_session_config(),
+            ..Default::default()
+        };
+        crate::config_store::init_with_config("entra-sso-test-config.json", &cfg);
         Some(pool)
     }
 
@@ -721,13 +903,10 @@ mod entra_sso_db_tests {
     /// Starts the stub IdP on an ephemeral port with a fresh RSA-2048 keypair.
     /// Serves the derived Entra paths: discovery doc (realism), JWKS, token.
     async fn start_stub_idp() -> StubIdp {
-        let mut rng = rand::thread_rng();
-        let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-        let public = RsaPublicKey::from(&private);
-        let der = private.to_pkcs1_der().expect("pkcs1 der");
-        let encoding = Arc::new(EncodingKey::from_rsa_der(der.as_bytes()));
-        let jwk_n = b64url(public.n().to_bytes_be());
-        let jwk_e = b64url(public.e().to_bytes_be());
+        let keypair = test_crypto::make_rsa_keypair();
+        let encoding = Arc::new(keypair.encoding);
+        let jwk_n = keypair.modulus_b64;
+        let jwk_e = keypair.exponent_b64;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -846,7 +1025,7 @@ mod entra_sso_db_tests {
             &stub.base_url,
             TEST_REDIRECT,
             60,
-            ryuki_core::config::SessionConfig::default(),
+            test_session_config(),
         )
     }
 
@@ -855,6 +1034,24 @@ mod entra_sso_db_tests {
             .route("/api/auth/entra/authorize-url", get(entra_authorize_url))
             .route("/api/auth/entra/callback", get(entra_callback))
             .layer(Extension(deps))
+    }
+
+    async fn provision_global_assignment(
+        pool: &PgPool,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+        roles: &[String],
+    ) {
+        crate::human_authority::persist_governed_assignment(
+            pool,
+            provider,
+            issuer,
+            subject,
+            crate::human_authority::HumanAuthorityAssignmentSpec::test_global(roles),
+        )
+        .await
+        .expect("seed Entra human authority");
     }
 
     async fn body_json(resp: Response) -> Value {
@@ -870,12 +1067,7 @@ mod entra_sso_db_tests {
     async fn begin_login(app: &Router) -> (String, String, String, String) {
         let resp = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/auth/entra/authorize-url")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(authorize_request())
             .await
             .expect("authorize-url request");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -886,7 +1078,7 @@ mod entra_sso_db_tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            set_cookie.starts_with("entra_login_csrf="),
+            set_cookie.starts_with("__Host-entra_login_csrf="),
             "authorize-url must set the binding cookie, got: {set_cookie}"
         );
         assert!(set_cookie.contains("HttpOnly"));
@@ -915,7 +1107,7 @@ mod entra_sso_db_tests {
             ))
             .header(
                 axum::http::header::COOKIE,
-                format!("{ENTRA_BINDING_COOKIE}={binding}"),
+                format!("{}={binding}", entra_binding_cookie_name(true)),
             )
             .body(Body::empty())
             .unwrap()
@@ -935,12 +1127,7 @@ mod entra_sso_db_tests {
 
         let resp = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/auth/entra/authorize-url")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(authorize_request())
             .await
             .expect("request");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1007,7 +1194,16 @@ mod entra_sso_db_tests {
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let deps = stub_deps(&stub);
+        provision_global_assignment(
+            pool,
+            "entra-id",
+            &deps.issuer,
+            "entra-oid-1",
+            &["PlatformAdmin".to_string()],
+        )
+        .await;
+        let app = test_router(deps);
 
         let (state, nonce, code_challenge, binding) = begin_login(&app).await;
         // A real IdP echoes the request nonce into the id_token.
@@ -1027,33 +1223,51 @@ mod entra_sso_db_tests {
             "/",
             "must redirect to the portal root"
         );
-        let cookie = resp
+        let cookie_fields = resp
             .headers()
-            .get("set-cookie")
-            .and_then(|v| v.to_str().ok())
-            .expect("session cookie");
-        assert!(cookie.contains("ryuki_session="), "got: {cookie}");
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().expect("session cookie is text"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cookie_fields.len(),
+            2,
+            "Set-Cookie fields must stay separate"
+        );
+        let cookie = cookie_fields[0];
+        assert!(cookie.starts_with("__Host-ryuki_session="), "got: {cookie}");
         assert!(cookie.contains("HttpOnly"));
+        assert_eq!(
+            cookie_fields[1],
+            "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
+        );
 
         // The minted session row: provider entra-id, identity from the id_token.
-        let session_id = cookie
+        let session_bearer = cookie
             .split(';')
             .next()
-            .and_then(|kv| kv.strip_prefix("ryuki_session="))
-            .expect("session id in cookie");
-        let session_uuid = Uuid::parse_str(session_id).expect("session id is a uuid");
-        let row: (String, String, Vec<String>, String) = sqlx::query_as(
-            "SELECT user_id, display_name, roles, provider FROM sessions \
-             WHERE id = $1 AND expires_at > NOW()",
+            .and_then(|kv| kv.strip_prefix("__Host-ryuki_session="))
+            .expect("session bearer in cookie");
+        assert!(crate::session_credentials::is_well_formed_session_bearer(
+            session_bearer
+        ));
+        let verifier = crate::session_credentials::session_bearer_verifier(
+            session_bearer,
+            &test_session_config(),
         )
-        .bind(session_uuid)
+        .expect("test verifier");
+        let row: (Uuid, String, String, Vec<String>, String) = sqlx::query_as(
+            "SELECT session_record_id, user_id, display_name, roles, provider FROM sessions \
+             WHERE bearer_verifier = $1 AND expires_at > NOW()",
+        )
+        .bind(verifier.as_slice())
         .fetch_one(pool)
         .await
         .expect("session row");
-        assert_eq!(row.0, "entra-oid-1");
-        assert_eq!(row.1, "Entra Test User");
-        assert_eq!(row.2, vec!["PlatformAdmin".to_string()]);
-        assert_eq!(row.3, "entra-id");
+        assert_eq!(row.1, "entra-oid-1");
+        assert_eq!(row.2, "Entra Test User");
+        assert_eq!(row.3, vec!["PlatformAdmin".to_string()]);
+        assert_eq!(row.4, "entra-id");
 
         // The token exchange must have been a PKCE PUBLIC client exchange:
         // grant/code/redirect/client + a verifier that hashes to the
@@ -1074,8 +1288,8 @@ mod entra_sso_db_tests {
         );
 
         // Cleanup the minted session row.
-        let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(session_uuid)
+        let _ = sqlx::query("DELETE FROM sessions WHERE session_record_id = $1")
+            .bind(row.0)
             .execute(pool)
             .await;
     }
@@ -1102,12 +1316,21 @@ mod entra_sso_db_tests {
     #[tokio::test]
     async fn test_callback_replayed_state_returns_400_and_no_cookie() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        let Some(_pool) = global_pool().await else {
+        let Some(pool) = global_pool().await else {
             return;
         };
 
         let stub = start_stub_idp().await;
-        let app = test_router(stub_deps(&stub));
+        let deps = stub_deps(&stub);
+        provision_global_assignment(
+            pool,
+            "entra-id",
+            &deps.issuer,
+            "entra-oid-1",
+            &["PlatformAdmin".to_string()],
+        )
+        .await;
+        let app = test_router(deps);
 
         let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
@@ -1161,6 +1384,36 @@ mod entra_sso_db_tests {
             !resp.headers().contains_key("set-cookie"),
             "no session cookie may be set on a binding mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn test_callback_duplicate_binding_cookies_return_400() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            return;
+        };
+
+        let stub = start_stub_idp().await;
+        let app = test_router(stub_deps(&stub));
+
+        let (state, nonce, _challenge, binding) = begin_login(&app).await;
+        stub.set_nonce(&nonce);
+        let mut request = callback_req(&state, &binding);
+        request.headers_mut().append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "other=value; __Host-entra_login_csrf=attacker-binding",
+            ),
+        );
+
+        let resp = app.oneshot(request).await.expect("callback");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !resp.headers().contains_key("set-cookie"),
+            "ambiguous binding evidence must never mint a session cookie"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "ENTRA_INVALID_STATE");
     }
 
     #[tokio::test]
@@ -1348,34 +1601,145 @@ mod entra_sso_db_tests {
 
         // Seed one session per provider, all non-expired, all admin-privileged.
         let seed = |provider: &'static str| {
-            let id = Uuid::new_v4();
+            let record_id = Uuid::new_v4();
             async move {
-                sqlx::query(
-                    "INSERT INTO sessions (id, user_id, display_name, email, roles, provider, \
-                     expires_at) VALUES ($1, 'admin', 'Admin', NULL, $2, $3, NOW() + INTERVAL '1 hour')",
+                let credential =
+                    crate::session_credentials::issue_session_credential(&test_session_config())
+                        .expect("test session credential");
+                let issuer = if provider == "local" {
+                    crate::identity_authority::LOCAL_ISSUER
+                } else {
+                    "https://login.microsoftonline.example/test-tenant/v2.0"
+                };
+                let digest = Sha256::digest(format!("entra-mode-test\0{provider}\0{issuer}"));
+                let mut identity_tx = pool.begin().await.expect("begin Entra test identity seed");
+                crate::human_authority::prepare_writer_tx(
+                    &mut identity_tx,
+                    provider,
+                    issuer,
+                    "admin",
                 )
-                .bind(id)
+                .await
+                .expect("prepare Entra test identity writer");
+                crate::human_authority::mark_governed_identity_reactivation_tx(&mut identity_tx)
+                    .await
+                    .expect("mark Entra test identity reactivation");
+                let epoch = sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO identity_authorities \
+                     (provider, issuer, subject, authority_epoch, authority_digest, authority_status, \
+                      last_asserted_at) \
+                     VALUES ($1, $2, 'admin', 1, $3, 'active-scoped-v2', NOW()) \
+                     ON CONFLICT (provider, issuer, subject) DO UPDATE SET \
+                       authority_epoch = CASE \
+                         WHEN identity_authorities.authority_status <> 'active-scoped-v2' \
+                           OR identity_authorities.authority_digest <> EXCLUDED.authority_digest \
+                         THEN identity_authorities.authority_epoch + 1 \
+                         ELSE identity_authorities.authority_epoch \
+                       END, \
+                       authority_digest = EXCLUDED.authority_digest, \
+                       authority_status = 'active-scoped-v2', last_asserted_at = NOW() \
+                     RETURNING authority_epoch",
+                )
+                .bind(provider)
+                .bind(issuer)
+                .bind(digest.as_slice())
+                .fetch_one(&mut *identity_tx)
+                .await
+                .expect("seed identity authority");
+                identity_tx
+                    .commit()
+                    .await
+                    .expect("commit Entra test identity seed");
+                crate::human_authority::persist_governed_assignment(
+                    pool,
+                    provider,
+                    issuer,
+                    "admin",
+                    crate::human_authority::HumanAuthorityAssignmentSpec::test_global(&[
+                        "PlatformAdmin".to_string(),
+                    ]),
+                )
+                .await
+                .expect("seed human authority assignment");
+                let authority_version: i64 = sqlx::query_scalar(
+                    "SELECT assignment_version FROM human_authority_assignments \
+                     WHERE provider = $1 AND issuer = $2 AND subject = 'admin'",
+                )
+                .bind(provider)
+                .bind(issuer)
+                .fetch_one(pool)
+                .await
+                .expect("read human authority version");
+                let mut session_tx = pool.begin().await.expect("begin Entra test session seed");
+                crate::human_authority::prepare_writer_tx(
+                    &mut session_tx,
+                    provider,
+                    issuer,
+                    "admin",
+                )
+                .await
+                .expect("prepare Entra test session writer");
+                sqlx::query(
+                    "INSERT INTO sessions \
+                     (session_record_id, bearer_verifier, user_id, display_name, email, roles, provider, \
+                      identity_issuer, identity_subject, identity_authority_epoch, human_authority_version, \
+                      site_authority_mode, site_scope, environment_authority_mode, environment_scope, expires_at) \
+                     VALUES ($1, $2, 'admin', 'Admin', NULL, $3, $4, $5, 'admin', $6, $7, \
+                             'global', ARRAY[]::TEXT[], 'global', ARRAY[]::TEXT[], \
+                             NOW() + INTERVAL '1 hour')",
+                )
+                .bind(record_id)
+                .bind(credential.verifier().as_slice())
                 .bind(&["PlatformAdmin".to_string()] as &[String])
                 .bind(provider)
-                .execute(pool)
+                .bind(issuer)
+                .bind(epoch)
+                .bind(authority_version)
+                .execute(&mut *session_tx)
                 .await
                 .expect("seed session");
-                id
+                session_tx
+                    .commit()
+                    .await
+                    .expect("commit Entra test session seed");
+                (record_id, credential.bearer().to_string())
             }
         };
-        let local_id = seed("local").await;
-        let entra_id = seed("entra-id").await;
+        let (local_id, local_bearer) = seed("local").await;
+        let (entra_id, entra_bearer) = seed("entra-id").await;
+        let (oidc_id, oidc_bearer) = seed("oidc").await;
 
-        let resolve = |session_id: Uuid| async move {
+        let resolve = |session_bearer: String, tenant_id: &'static str, oidc_enabled: bool| async move {
+            let session_config = test_session_config();
+            let mut resolution_config = ryuki_core::config::RyukiConfig {
+                auth_mode: ryuki_core::config::AuthMode::EntraId,
+                entra_authority: "https://login.microsoftonline.example".to_string(),
+                entra_tenant_id: tenant_id.to_string(),
+                session: session_config,
+                ..Default::default()
+            };
+            resolution_config.oidc.enabled = oidc_enabled;
+            resolution_config.oidc.issuer =
+                "https://login.microsoftonline.example/test-tenant/v2.0".to_string();
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
                 axum::http::header::COOKIE,
-                format!("ryuki_session={session_id}").parse().unwrap(),
+                format!("__Host-ryuki_session={session_bearer}")
+                    .parse()
+                    .unwrap(),
             );
-            crate::auth_session_from_persisted_session(
+            // Each policy variant gets an isolated admission cache. A policy
+            // rejection is intentionally negative-cached by bearer, so sharing
+            // the process-global cache here would make the enabled assertion
+            // depend on which variant the test exercised first.
+            let admission =
+                crate::session_lookup_admission::SessionLookupAdmission::for_tests(8, 8, 1, 8);
+            crate::auth_session_from_persisted_session_with_admission(
                 &headers,
                 None,
-                &ryuki_core::config::AuthMode::EntraId,
+                &resolution_config,
+                &admission,
+                None,
             )
             .await
             .expect("resolver returns Some")
@@ -1383,19 +1747,32 @@ mod entra_sso_db_tests {
         };
 
         // The stale local session must NOT authenticate: no roles, not valid.
-        let local = resolve(local_id).await;
+        let local = resolve(local_bearer, "test-tenant", false).await;
         assert!(!local.token_valid, "stale local session must not be valid");
         assert!(
             local.roles.is_empty(),
             "stale local session grants no roles"
         );
         // The entra-id session resolves with its identity + roles.
-        let entra = resolve(entra_id).await;
+        let entra = resolve(entra_bearer.clone(), "test-tenant", false).await;
         assert_eq!(entra.user_id, "admin");
         assert_eq!(entra.roles, vec!["PlatformAdmin".to_string()]);
+        let rotated_tenant = resolve(entra_bearer, "rotated-tenant", false).await;
+        assert!(
+            !rotated_tenant.token_valid,
+            "an Entra authority/tenant change must reject sessions from the old issuer"
+        );
 
-        sqlx::query("DELETE FROM sessions WHERE id = ANY($1)")
-            .bind(&[local_id, entra_id] as &[Uuid])
+        let disabled_oidc = resolve(oidc_bearer.clone(), "test-tenant", false).await;
+        assert!(
+            !disabled_oidc.token_valid,
+            "disabling generic OIDC must reject its persisted sessions"
+        );
+        let enabled_oidc = resolve(oidc_bearer, "test-tenant", true).await;
+        assert!(enabled_oidc.token_valid);
+
+        sqlx::query("DELETE FROM sessions WHERE session_record_id = ANY($1)")
+            .bind(&[local_id, entra_id, oidc_id] as &[Uuid])
             .execute(pool)
             .await
             .ok();

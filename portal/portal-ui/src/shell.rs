@@ -82,12 +82,18 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
     let user_scope_label = format!("User: {}", auth_session.display_name);
     let session_resource = use_context::<SessionResource>();
     let logout_action = Action::new(move |_: &()| async move {
-        let _ = perform_logout().await;
-        if let Some(resource) = session_resource {
-            resource.refetch();
+        match perform_logout().await {
+            Ok(()) => {
+                if let Some(resource) = session_resource {
+                    resource.refetch();
+                }
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
         }
     });
     let logout_pending = logout_action.pending();
+    let logout_result = logout_action.value();
     let on_signout_click = move |_| {
         logout_action.dispatch(());
     };
@@ -265,6 +271,18 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                         >
                             "Sign out"
                         </button>
+                        <Show when=move || {
+                            matches!(logout_result.get(), Some(Err(_)))
+                        }>
+                            <span class="signout-error" role="alert">
+                                {move || {
+                                    logout_result
+                                        .get()
+                                        .and_then(|result| result.err())
+                                        .unwrap_or_else(|| "Sign-out could not be confirmed".to_string())
+                                }}
+                            </span>
+                        </Show>
                     </div>
                     <NotificationBell />
                     <button

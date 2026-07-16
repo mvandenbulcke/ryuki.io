@@ -49,10 +49,10 @@
 <p class="ep-note"><strong>Response metadata:</strong> <code>x-api-version</code>, <code>x-request-id</code>, and <code>traceresponse</code> apply to normal routed responses and are omitted from the per-operation header tables below.</p>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-images-factory-contract"><span class="method-chip m-get">GET</span><code>/api/images/factory-contract</code></h2>
-<p class="badges"><span class="badge">read access</span></p>
+<p class="badges"><span class="badge">request access</span></p>
 <p class="ep-summary">Images factory.</p>
 <h3 class="ep-sub">Permissions</h3>
-<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>read</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
+<table><thead><tr><th>Access class</th><th>Credential</th><th>Scoping</th></tr></thead><tbody><tr><td><code>request</code></td><td>An authenticated session or API bearer token is required.</td><td>The access class is enforced first; site and environment scopes narrow resources on scoped operations.</td></tr></tbody></table>
 <h3 class="ep-sub">HTTP request</h3>
 <pre><code>GET https://&lt;your-host&gt;/api/images/factory-contract</code></pre>
 <h3 class="ep-sub">Path parameters</h3>
@@ -60,7 +60,7 @@
 <h3 class="ep-sub">Query parameters</h3>
 <p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply a bearer session/API token here or use <code>X-Ryuki-Session-Id</code>. Same-origin reads may also use the session cookie; cookie-only authentication does not authorize mutations.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply the verified session identifier here or use <code>Authorization: Bearer ...</code>. This header is the portal's mutation-safe session carrier.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Authorization</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Human credential alternative: supply one <code>Bearer rys_...</code> session token, <code>ryk_...</code> API token, or validated identity-provider JWT here. Do not combine it with <code>X-Ryuki-Session-Id</code> or the session cookie; conflicting carriers fail closed.</td></tr><tr><td><code>X-Ryuki-Session-Id</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Opaque <code>rys_...</code> session-token carrier used by the portal for mutations. Administrative session UUIDs cannot authenticate. Supply exactly one credential carrier per request.</td></tr><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>

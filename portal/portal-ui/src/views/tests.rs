@@ -360,7 +360,10 @@ mod tests {
 
     // ── Agent view tests ──────────────────────────────────────────────────────
 
-    use super::super::agents::status_badge_class as agent_status_badge_class;
+    use super::super::agents::{
+        agent_is_approvable, agent_revoke_args, revoke_binding_is_armed,
+        status_badge_class as agent_status_badge_class,
+    };
     use crate::models::{AgentJobSummary, AgentSummary};
 
     /// `status_badge_class` must map all three canonical enrollment statuses and
@@ -395,15 +398,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_approval_requires_consumed_challenge_provenance() {
+        assert!(agent_is_approvable("pending", true));
+        for (status, admitted) in [
+            ("pending", false),
+            ("approved", true),
+            ("revoked", true),
+            ("unknown", true),
+        ] {
+            assert!(
+                !agent_is_approvable(status, admitted),
+                "status={status}, admitted={admitted} must not be approvable"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_revoke_arm_and_dispatch_are_bound_to_enrollment_snapshot() {
+        let reviewed = AgentSummary {
+            enrollment_id: "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601".to_string(),
+            cryptographically_admitted: true,
+            agent_id: "agent-reused-id".to_string(),
+            platform: "vmware".to_string(),
+            status: "approved".to_string(),
+            public_key_fingerprint:
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            capabilities_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            last_seen_at: None,
+            created_at: "2026-07-15T00:00:00Z".to_string(),
+            jobs: Vec::new(),
+        };
+        let mut replacement = reviewed.clone();
+        replacement.enrollment_id = "0190e17a-e9c3-7d8d-b7a9-933fc05cd53e".to_string();
+        replacement.public_key_fingerprint =
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string();
+
+        let reviewed_args = agent_revoke_args(&reviewed);
+        let replacement_args = agent_revoke_args(&replacement);
+        assert_eq!(reviewed_args.agent_id, replacement_args.agent_id);
+        assert_ne!(reviewed_args.enrollment_id, replacement_args.enrollment_id);
+        assert_ne!(
+            reviewed_args.public_key_fingerprint,
+            replacement_args.public_key_fingerprint
+        );
+
+        let armed = Some(reviewed_args.enrollment_id.as_str());
+        assert!(revoke_binding_is_armed(armed, &reviewed_args.enrollment_id));
+        assert!(
+            !revoke_binding_is_armed(armed, &replacement_args.enrollment_id),
+            "reusing an agent id with a new enrollment must clear the effective arm state"
+        );
+    }
+
     /// Round-trip deserialize a sample API JSON fragment (the {agents:[...]} envelope
     /// element) into `AgentSummary`, assert every field including nested jobs and
     /// nullable `last_seen_at` / `result_status` / `completed_at`.
     #[test]
     fn agent_summary_serde_round_trip() {
         let json = r#"{
+            "enrollment_id": "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601",
+            "cryptographically_admitted": true,
             "agent_id": "agt-abc123",
             "platform": "vmware",
             "status": "approved",
+            "public_key_fingerprint": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "capabilities_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "public_key": "raw-key-must-not-survive-the-portal-model",
             "last_seen_at": null,
             "created_at": "2026-06-01T00:00:00Z",
             "jobs": [
@@ -427,9 +491,24 @@ mod tests {
         let agent: AgentSummary =
             serde_json::from_str(json).expect("AgentSummary must deserialize from sample JSON");
 
+        assert_eq!(agent.enrollment_id, "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601");
+        assert!(agent.cryptographically_admitted);
         assert_eq!(agent.agent_id, "agt-abc123");
         assert_eq!(agent.platform, "vmware");
         assert_eq!(agent.status, "approved");
+        assert_eq!(
+            agent.public_key_fingerprint,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            agent.capabilities_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let portal_json = serde_json::to_value(&agent).expect("AgentSummary must serialize");
+        assert!(
+            portal_json.get("public_key").is_none(),
+            "the portal-facing model must never preserve raw public-key bytes"
+        );
         assert!(agent.last_seen_at.is_none(), "last_seen_at must be None");
         assert_eq!(agent.created_at, "2026-06-01T00:00:00Z");
         assert_eq!(agent.jobs.len(), 2, "must have exactly 2 jobs");

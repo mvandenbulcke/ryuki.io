@@ -30,6 +30,10 @@ securityControls:
   - identity-rbac-approval
   - dry-run-first
   - request-lifecycle-gates
+  # V1 compatibility alias required by the current validator and API projection
+  # for the current Vault resolver. ControlTrace maps it to the provider-neutral
+  # secret-provider capability boundary, and it cannot satisfy production by
+  # itself. Retire it only with the V2 validator/API zero-consumer receipt.
   - vault-secret-reference
   - browser-isolation
   - network-isolation

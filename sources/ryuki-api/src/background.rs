@@ -1049,10 +1049,25 @@ mod loop_monitor_db_tests {
         );
 
         // It is ackable through the SAME alert-worthy gate the feed uses.
-        let acked =
-            domain_events::ack_alert(pool, overdue.id, "operator:test", Some("ack"), &statuses)
-                .await
-                .expect("ack_alert");
+        let (alert_aggregate_types, exact_alert_statuses): (Vec<String>, Vec<String>) =
+            ryuki_engine::event_alerts::alert_worthy_pairs()
+                .iter()
+                .map(|(aggregate_type, to_status)| {
+                    (aggregate_type.to_string(), to_status.to_string())
+                })
+                .unzip();
+        let acked = domain_events::ack_alert(
+            pool,
+            overdue.id,
+            "operator:test",
+            Some("ack"),
+            &alert_aggregate_types,
+            &exact_alert_statuses,
+            &[],
+            &[],
+        )
+        .await
+        .expect("ack_alert");
         assert!(acked, "an alert-worthy overdue event is ackable");
 
         // Cleanup: `domain_events` is append-only — DELETE/TRUNCATE are blocked by

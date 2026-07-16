@@ -7,6 +7,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IncidentContext {
     pub incident_id: String,
+    /// Canonical site binding for the incident. The API persists this in a
+    /// dedicated relational column and overwrites this JSON field from that
+    /// column on read, so embedded affected-CI data is never the authority for
+    /// authorization decisions.
+    #[serde(default)]
+    pub site: String,
     pub title: String,
     pub severity: String,
     pub affected_ci: Vec<AffectedCI>,
@@ -68,6 +74,7 @@ fn seed_data() -> IncidentContextStore {
     vec![
         IncidentContext {
             incident_id: "inc-defra-001".into(),
+            site: "DEFRA".into(),
             title: "DEFRA database latency spike".into(),
             severity: "sev2".into(),
             affected_ci: vec![AffectedCI {
@@ -87,6 +94,7 @@ fn seed_data() -> IncidentContextStore {
         },
         IncidentContext {
             incident_id: "inc-gblon-001".into(),
+            site: "GBLON".into(),
             title: "GBLON storage fabric errors".into(),
             severity: "sev1".into(),
             affected_ci: vec![AffectedCI {
@@ -185,8 +193,9 @@ fn ci_type_for(ci_name: &str) -> String {
     }
 }
 
-/// Pure constructor — no I/O, no static store. Validates inputs and builds an
-/// `IncidentContext` with a uuid-based id. Suitable for DB-backed handlers.
+/// Pure dry-run/fixture constructor — no I/O, no static store. It cannot prove
+/// CI ownership, so DB-backed request handlers must use
+/// [`build_incident_context_from_bindings`] after authoritative CMDB resolution.
 pub fn build_incident_context(
     incident_title: &str,
     severity: &str,
@@ -228,6 +237,63 @@ pub fn build_incident_context(
 
     Ok(IncidentContext {
         incident_id,
+        site: normalized_site.clone(),
+        title: incident_title.to_string(),
+        severity: severity.to_string(),
+        affected_ci,
+        upstream_deps: mock_upstream_deps(&normalized_site),
+        downstream_deps: mock_downstream_deps(&normalized_site),
+        recent_changes: mock_recent_changes(&normalized_site),
+        on_call: mock_on_call(&normalized_site),
+        related_tickets: vec![format!("INC-{}-DRYRUN", normalized_site)],
+        assembled_at: now_iso(),
+        status: "active".into(),
+        resolution: None,
+    })
+}
+
+/// Build an incident from CI records already resolved through the authoritative
+/// CMDB/site-registry relationship. Unlike [`build_incident_context`], this
+/// constructor does not infer CI types or trust a caller-selected site.
+pub fn build_incident_context_from_bindings(
+    incident_title: &str,
+    severity: &str,
+    affected_ci: Vec<AffectedCI>,
+    site: &str,
+) -> Result<IncidentContext, String> {
+    if incident_title.trim().is_empty() {
+        return Err("incident_title cannot be empty".into());
+    }
+    if severity.trim().is_empty() {
+        return Err("severity cannot be empty".into());
+    }
+    if affected_ci.is_empty() {
+        return Err("affected CI bindings cannot be empty".into());
+    }
+    let normalized_site = crate::site_registry::normalize_site_code_for_lookup(site)
+        .map_err(|_| "incident site binding is not canonical".to_string())?;
+    if site != normalized_site
+        || affected_ci.iter().any(|ci| {
+            ci.ci_name.trim().is_empty()
+                || ci.ci_type.trim().is_empty()
+                || ci.site != normalized_site
+        })
+    {
+        return Err("affected CI bindings must share one canonical site".into());
+    }
+
+    let incident_id = format!(
+        "inc-{}-{}",
+        normalized_site.to_ascii_lowercase(),
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    );
+    Ok(IncidentContext {
+        incident_id,
+        site: normalized_site.clone(),
         title: incident_title.to_string(),
         severity: severity.to_string(),
         affected_ci,
@@ -272,12 +338,16 @@ pub fn add_affected_ci_pure(
     ctx: &IncidentContext,
     ci_name: &str,
     ci_type: &str,
+    authoritative_site: &str,
 ) -> Result<IncidentContext, String> {
     if ci_name.trim().is_empty() {
         return Err("ci_name cannot be empty".into());
     }
     if ci_type.trim().is_empty() {
         return Err("ci_type cannot be empty".into());
+    }
+    if authoritative_site != ctx.site || authoritative_site.trim().is_empty() {
+        return Err("affected CI is not bound to the incident site".into());
     }
     // Only an ACTIVE incident is mutable — a resolved (terminal) incident's record must
     // not be contaminated post-closure (it is compliance/review evidence).
@@ -287,16 +357,11 @@ pub fn add_affected_ci_pure(
             ctx.status
         ));
     }
-    let site = ctx
-        .affected_ci
-        .first()
-        .map(|ci| ci.site.clone())
-        .unwrap_or_else(|| "UNKNOWN".into());
     let mut updated = ctx.clone();
     updated.affected_ci.push(AffectedCI {
         ci_name: ci_name.to_string(),
         ci_type: ci_type.to_string(),
-        site,
+        site: authoritative_site.to_string(),
         status: "impacted".into(),
     });
     Ok(updated)
@@ -444,7 +509,8 @@ pub fn add_affected_ci(incident_id: &str, ci_name: &str, ci_type: &str) -> Resul
         .iter_mut()
         .find(|incident| incident.incident_id == incident_id)
         .ok_or_else(|| format!("Incident context '{}' not found", incident_id))?;
-    let updated = add_affected_ci_pure(entry, ci_name, ci_type)?;
+    let site = entry.site.clone();
+    let updated = add_affected_ci_pure(entry, ci_name, ci_type, &site)?;
     let new_ci = updated.affected_ci.last().cloned();
     let affected_count = updated.affected_ci.len();
     *entry = updated;
@@ -523,6 +589,44 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(result["context"]["site"], "DEFRA");
+    }
+
+    #[test]
+    fn test_authoritative_ci_bindings_require_one_incident_site() {
+        let defra = AffectedCI {
+            ci_name: "db-portal".into(),
+            ci_type: "Database".into(),
+            site: "DEFRA".into(),
+            status: "impacted".into(),
+        };
+        let ctx = build_incident_context_from_bindings(
+            "database latency",
+            "sev2",
+            vec![defra.clone()],
+            "DEFRA",
+        )
+        .expect("same-site authoritative binding must build");
+        assert_eq!(ctx.site, "DEFRA");
+        assert_eq!(ctx.affected_ci[0].ci_type, "Database");
+
+        let mut foreign = defra;
+        foreign.site = "GBLON".into();
+        assert!(
+            build_incident_context_from_bindings(
+                "mixed-site incident",
+                "sev1",
+                vec![foreign],
+                "DEFRA",
+            )
+            .is_err(),
+            "a foreign CMDB binding must fail closed"
+        );
+
+        assert!(
+            add_affected_ci_pure(&ctx, "san-gblon", "Storage", "GBLON").is_err(),
+            "a foreign-site CI must never be appended"
+        );
     }
 
     #[test]
@@ -570,7 +674,7 @@ mod tests {
         assert_eq!(active.status, "active");
         // Active: all three transitions are permitted.
         assert!(resolve_incident_pure(&active, "fixed").is_ok());
-        assert!(add_affected_ci_pure(&active, "ci-2", "server").is_ok());
+        assert!(add_affected_ci_pure(&active, "ci-2", "server", "DEFRA").is_ok());
         assert!(escalate_pure(&active, "paged on-call").is_ok());
 
         let resolved = resolve_incident_pure(&active, "service restored").unwrap();
@@ -582,7 +686,7 @@ mod tests {
             "a resolved incident must not be re-resolved (no silent overwrite)"
         );
         assert!(
-            add_affected_ci_pure(&resolved, "ci-3", "server").is_err(),
+            add_affected_ci_pure(&resolved, "ci-3", "server", "DEFRA").is_err(),
             "a resolved incident must not accept a new CI"
         );
         assert!(
@@ -595,7 +699,7 @@ mod tests {
         let mut weird = active.clone();
         weird.status = "paused".into();
         assert!(resolve_incident_pure(&weird, "x").is_err());
-        assert!(add_affected_ci_pure(&weird, "ci-x", "server").is_err());
+        assert!(add_affected_ci_pure(&weird, "ci-x", "server", "DEFRA").is_err());
         assert!(escalate_pure(&weird, "x").is_err());
     }
 

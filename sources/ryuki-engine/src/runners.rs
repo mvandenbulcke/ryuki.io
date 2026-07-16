@@ -263,6 +263,10 @@ pub enum RunnerError {
     },
     #[error("runner timed out")]
     Timeout,
+    #[error("runner command cancelled")]
+    Cancelled,
+    #[error("runner {scope} output exceeded safe capture limit ({limit} bytes)")]
+    OutputLimitExceeded { scope: String, limit: usize },
     #[error("credential injection failed: {0}")]
     CredInjection(String),
 }

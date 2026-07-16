@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_OU_PREFIXES: &[&str] = &[
-    "OU=Servers",
-    "OU=Workstations",
-    "OU=DMZ",
-    "OU=Management",
-    "OU=Testing",
-    "OU=Development",
+const DIRECTORY_DN_SUFFIX: &str = "DC=corp,DC=local";
+const SITE_SCOPED_OU_LEAVES: &[&str] = &[
+    "Servers",
+    "Workstations",
+    "DMZ",
+    "Management",
+    "Testing",
+    "Development",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +53,16 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn active_site_code(site: &str) -> Result<String, String> {
+    let code = site_registry::normalize_site_code_for_lookup(site)
+        .map_err(|_| format!("Unknown or empty site: {site}"))?;
+    if site_registry::is_valid_site(&code) {
+        Ok(code)
+    } else {
+        Err(format!("Unknown or empty site: {site}"))
+    }
+}
+
 fn computer_name_parts(name: &str) -> Option<(&str, &str, &str)> {
     let mut parts = name.rsplitn(3, '-');
     let number = parts.next()?;
@@ -92,36 +103,98 @@ fn validate_ou_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("OU path cannot be empty".into());
     }
-    if !VALID_OU_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-    {
-        return Err(format!(
-            "OU path must start with a valid OU prefix: {:?}",
-            VALID_OU_PREFIXES
-        ));
+    if !path.is_ascii() || path.trim() != path {
+        return Err("OU path must be canonical ASCII without surrounding whitespace".into());
     }
     Ok(())
+}
+
+fn site_scoped_ou(leaf: &str, site: &str) -> String {
+    format!("OU={leaf},OU={site},{DIRECTORY_DN_SUFFIX}")
+}
+
+fn canonical_prestage_ou_for_parts(role: &str, site: &str) -> Result<String, String> {
+    let ou_path = match role {
+        "SRV" => site_scoped_ou("Servers", site),
+        "WS" => site_scoped_ou("Workstations", site),
+        // Domain Controllers is the one directory-wide container in the
+        // metadata-only policy. The canonical computer name remains site-bound.
+        "DC" => format!("OU=Domain Controllers,{DIRECTORY_DN_SUFFIX}"),
+        "MGMT" => site_scoped_ou("Management", site),
+        "TEST" => site_scoped_ou("Testing", site),
+        "DEV" => site_scoped_ou("Development", site),
+        _ => return Err(format!("Unknown role code '{role}'")),
+    };
+    Ok(ou_path)
+}
+
+/// Return the one server-derived initial OU for a canonical computer name.
+pub fn canonical_prestage_ou(name: &str) -> Result<String, String> {
+    validate_naming_convention(name)?;
+    let (site, role, _) = computer_name_parts(name).expect("validated computer name");
+    canonical_prestage_ou_for_parts(role, site)
+}
+
+/// Validate a requested move against the closed, site-bound OU policy and
+/// return its canonical representation. Callers never persist an arbitrary DN.
+fn canonical_move_ou(name: &str, site: &str, requested: &str) -> Result<String, String> {
+    validate_ou_path(requested)?;
+    let (name_site, role, _) = computer_name_parts(name)
+        .ok_or_else(|| "computer name does not contain a canonical site and role".to_string())?;
+    if name_site != site {
+        return Err("computer name site does not match persisted owner site".into());
+    }
+
+    if role == "DC" {
+        let canonical = canonical_prestage_ou_for_parts(role, site)?;
+        return (requested == canonical)
+            .then_some(canonical)
+            .ok_or_else(|| {
+                "domain controllers must remain in the canonical directory container".into()
+            });
+    }
+
+    SITE_SCOPED_OU_LEAVES
+        .iter()
+        .map(|leaf| site_scoped_ou(leaf, site))
+        .find(|candidate| candidate == requested)
+        .ok_or_else(|| {
+            "target OU is not a canonical container for the computer's owner site".into()
+        })
 }
 
 pub fn prestage_computer(name: &str, site: &str, ou_path: &str) -> Result<ADComputer, String> {
     if name.is_empty() {
         return Err("Computer name cannot be empty".into());
     }
-    if site.is_empty() || !site_registry::is_valid_site(site) {
-        return Err(format!("Unknown or empty site: {}", site));
-    }
-    if ou_path.is_empty() {
-        return Err("OU path cannot be empty".into());
-    }
+    let canonical_site = active_site_code(site)?;
     validate_naming_convention(name)?;
-    validate_ou_path(ou_path)?;
+
+    let (embedded_site, role, _) = computer_name_parts(name).expect("validated computer name");
+    let canonical_embedded_site = site_registry::normalize_site_code_for_lookup(embedded_site)
+        .map_err(|_| format!("Unknown site code '{embedded_site}' in computer name"))?;
+    if embedded_site != canonical_embedded_site {
+        return Err(format!(
+            "Computer name must use canonical site code '{canonical_embedded_site}' (found '{embedded_site}')"
+        ));
+    }
+    if canonical_embedded_site != canonical_site {
+        return Err(format!(
+            "Computer name site '{canonical_embedded_site}' does not match declared site '{canonical_site}'"
+        ));
+    }
+    let canonical_ou = canonical_prestage_ou_for_parts(role, &canonical_site)?;
+    if ou_path != canonical_ou {
+        return Err(format!(
+            "OU path does not match the server-derived directory namespace; expected '{canonical_ou}'"
+        ));
+    }
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
-        site: site.to_string(),
-        ou_path: ou_path.to_string(),
+        site: canonical_site,
+        ou_path: canonical_ou,
         status: ComputerStatus::Active,
         last_logon: now_iso(),
         os: "Windows Server 2022".to_string(),
@@ -184,23 +257,23 @@ pub fn move_computer(name: &str, target_ou: &str) -> Result<ADComputer, String> 
     if target_ou.is_empty() {
         return Err("Target OU cannot be empty".into());
     }
-    validate_ou_path(target_ou)?;
     validate_naming_convention(name)?;
 
     let (site, _, _) = computer_name_parts(name).expect("validated computer name");
+    let target_ou = canonical_move_ou(name, site, target_ou)?;
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
         site: site.to_string(),
-        ou_path: target_ou.to_string(),
+        ou_path: target_ou.clone(),
         status: ComputerStatus::Active,
         last_logon: now_iso(),
         os: "Windows Server 2022".to_string(),
         created_at: now_iso(),
         metadata: HashMap::from([
             ("moved".into(), "true".into()),
-            ("previous_ou".into(), "OU=Servers,DC=corp,DC=local".into()),
+            ("previous_ou".into(), site_scoped_ou("Servers", site)),
             ("dry_run".into(), "true".into()),
             (
                 "note".into(),
@@ -223,12 +296,13 @@ pub fn disable_computer(name: &str, reason: &str) -> Result<ADComputer, String> 
     validate_naming_convention(name)?;
 
     let (site, _, _) = computer_name_parts(name).expect("validated computer name");
+    let ou_path = canonical_prestage_ou(name)?;
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
         site: site.to_string(),
-        ou_path: "OU=Disabled,DC=corp,DC=local".to_string(),
+        ou_path,
         status: ComputerStatus::Disabled,
         last_logon: now_iso(),
         os: "Windows Server 2022".to_string(),
@@ -255,12 +329,13 @@ pub fn enable_computer(name: &str) -> Result<ADComputer, String> {
     validate_naming_convention(name)?;
 
     let (site, _, _) = computer_name_parts(name).expect("validated computer name");
+    let ou_path = canonical_prestage_ou(name)?;
 
     Ok(ADComputer {
         id: computer_id(),
         name: name.to_string(),
         site: site.to_string(),
-        ou_path: "OU=Servers,DC=corp,DC=local".to_string(),
+        ou_path,
         status: ComputerStatus::Active,
         last_logon: now_iso(),
         os: "Windows Server 2022".to_string(),
@@ -300,9 +375,9 @@ pub fn move_computer_model(computer: &ADComputer, target_ou: &str) -> Result<ADC
             computer.status
         ));
     }
-    validate_ou_path(target_ou)?;
+    let target_ou = canonical_move_ou(&computer.name, &computer.site, target_ou)?;
     Ok(ADComputer {
-        ou_path: target_ou.to_string(),
+        ou_path: target_ou,
         ..computer.clone()
     })
 }
@@ -312,6 +387,9 @@ pub fn move_computer_model(computer: &ADComputer, target_ou: &str) -> Result<ADC
 /// Predecessor guards:
 /// - `reason` must not be empty (caller should pre-validate at the handler
 ///   boundary, but this is a second line of defence).
+/// - Must be `Active`. Quarantine is a distinct security state and can only be
+///   left through an explicit quarantine-release transition, not ordinary
+///   disable/enable authority.
 /// - Must not already be `Disabled` — idempotent disable would silently
 ///   overwrite the existing `disable_reason`.
 /// - Must not be `Deleted` — a deleted computer cannot be further modified.
@@ -326,7 +404,13 @@ pub fn disable_computer_model(computer: &ADComputer, reason: &str) -> Result<ADC
         ComputerStatus::Deleted => {
             return Err("Cannot disable a deleted computer".into());
         }
-        ComputerStatus::Active | ComputerStatus::Quarantined => {}
+        ComputerStatus::Quarantined => {
+            return Err(
+                "Cannot disable a quarantined computer; explicit quarantine release is required"
+                    .into(),
+            );
+        }
+        ComputerStatus::Active => {}
     }
     let mut metadata = computer.metadata.clone();
     metadata.insert("disable_reason".into(), reason.to_string());
@@ -356,11 +440,77 @@ pub fn enable_computer_model(computer: &ADComputer) -> Result<ADComputer, String
     })
 }
 
+/// Server-derived evidence for the only transition that may leave quarantine.
+/// Request/approval actors remain in the durable recovery-review row and audit
+/// chain rather than caller-controlled computer metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRecoveryDecision {
+    pub review_id: String,
+    pub reason: String,
+    pub approved_at: String,
+}
+
+/// Release a reviewed quarantine into `Disabled`, never directly into Active.
+/// The persistence layer separately proves that `review_id` names a fresh,
+/// maker-checker-approved row for this exact computer/version.
+pub fn release_quarantine_model(
+    computer: &ADComputer,
+    decision: &QuarantineRecoveryDecision,
+) -> Result<ADComputer, String> {
+    if computer.status != ComputerStatus::Quarantined {
+        return Err("Only a quarantined computer can complete reviewed recovery".into());
+    }
+    Uuid::parse_str(&decision.review_id)
+        .map_err(|_| "Quarantine recovery review id must be a UUID".to_string())?;
+    let reason = decision.reason.trim();
+    if reason.is_empty() || reason.len() > 1024 {
+        return Err("Quarantine recovery reason must contain 1-1024 bytes".into());
+    }
+    if decision.approved_at.trim().is_empty() {
+        return Err("Quarantine recovery approval timestamp is required".into());
+    }
+    if !computer
+        .metadata
+        .get("quarantine_reason")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err("Quarantine evidence is missing; recovery requires manual review".into());
+    }
+
+    let mut metadata = computer.metadata.clone();
+    metadata.insert(
+        "quarantine_release_review_id".into(),
+        decision.review_id.clone(),
+    );
+    metadata.insert("quarantine_release_reason".into(), reason.to_string());
+    metadata.insert(
+        "quarantine_release_approved_at".into(),
+        decision.approved_at.clone(),
+    );
+    metadata.insert(
+        "disable_reason".into(),
+        "reviewed quarantine recovery; explicit enable still required".into(),
+    );
+
+    Ok(ADComputer {
+        status: ComputerStatus::Disabled,
+        metadata,
+        ..computer.clone()
+    })
+}
+
 /// Soft-delete a computer that was loaded from the DB. Guards: must not already
 /// be `Deleted`.
 pub fn delete_computer_model(computer: &ADComputer) -> Result<ADComputer, String> {
-    if computer.status == ComputerStatus::Deleted {
-        return Err("Computer is already deleted".into());
+    match computer.status {
+        ComputerStatus::Deleted => return Err("Computer is already deleted".into()),
+        ComputerStatus::Quarantined => {
+            return Err(
+                "Cannot delete a quarantined computer; explicit quarantine recovery review is required"
+                    .into(),
+            );
+        }
+        ComputerStatus::Active | ComputerStatus::Disabled => {}
     }
     Ok(ADComputer {
         status: ComputerStatus::Deleted,
@@ -388,7 +538,7 @@ pub fn reconcile_computers(site: &str) -> Result<ReconciliationResult, String> {
             id: computer_id(),
             name: format!("{}-SRV-01", site),
             site: site.to_string(),
-            ou_path: "OU=Servers,DC=corp,DC=local".to_string(),
+            ou_path: site_scoped_ou("Servers", site),
             status: ComputerStatus::Active,
             last_logon: now_iso(),
             os: "Windows Server 2022".to_string(),
@@ -399,7 +549,7 @@ pub fn reconcile_computers(site: &str) -> Result<ReconciliationResult, String> {
             id: computer_id(),
             name: format!("{}-SRV-02", site),
             site: site.to_string(),
-            ou_path: "OU=Servers,DC=corp,DC=local".to_string(),
+            ou_path: site_scoped_ou("Servers", site),
             status: ComputerStatus::Active,
             last_logon: now_iso(),
             os: "Windows Server 2019".to_string(),
@@ -410,7 +560,7 @@ pub fn reconcile_computers(site: &str) -> Result<ReconciliationResult, String> {
             id: computer_id(),
             name: format!("{}-WS-01", site),
             site: site.to_string(),
-            ou_path: "OU=Workstations,DC=corp,DC=local".to_string(),
+            ou_path: site_scoped_ou("Workstations", site),
             status: ComputerStatus::Active,
             last_logon: now_iso(),
             os: "Windows 11".to_string(),
@@ -453,7 +603,7 @@ pub fn get_orphaned(site: &str) -> Result<Vec<ADComputer>, String> {
             id: computer_id(),
             name: format!("{}-SRV-03", site),
             site: site.to_string(),
-            ou_path: "OU=Servers,DC=corp,DC=local".to_string(),
+            ou_path: site_scoped_ou("Servers", site),
             status: ComputerStatus::Active,
             last_logon: ninety_days_ago.to_rfc3339(),
             os: "Windows Server 2016".to_string(),
@@ -468,7 +618,7 @@ pub fn get_orphaned(site: &str) -> Result<Vec<ADComputer>, String> {
             id: computer_id(),
             name: format!("{}-WS-99", site),
             site: site.to_string(),
-            ou_path: "OU=Workstations,DC=corp,DC=local".to_string(),
+            ou_path: site_scoped_ou("Workstations", site),
             status: ComputerStatus::Disabled,
             last_logon: (ninety_days_ago - chrono::Duration::days(60)).to_rfc3339(),
             os: "Windows 10".to_string(),
@@ -591,12 +741,73 @@ mod tests {
 
     #[test]
     fn test_prestage_computer_success() {
-        let computer =
-            prestage_computer("DEFRA-SRV-01", "DEFRA", "OU=Servers,DC=corp,DC=local").unwrap();
+        let computer = prestage_computer(
+            "DEFRA-SRV-01",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .unwrap();
         assert_eq!(computer.name, "DEFRA-SRV-01");
         assert_eq!(computer.site, "DEFRA");
+        assert_eq!(computer.ou_path, "OU=Servers,OU=DEFRA,DC=corp,DC=local");
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("prestaged"));
+    }
+
+    #[test]
+    fn test_prestage_rejects_foreign_site_prefix() {
+        let error = prestage_computer(
+            "GBLON-SRV-01",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect_err("an authorized declared site must not claim another site's namespace");
+
+        assert!(error.contains("does not match declared site"));
+    }
+
+    #[test]
+    fn test_prestage_canonicalizes_declared_site_but_requires_canonical_name_prefix() {
+        let computer = prestage_computer(
+            "DEFRA-SRV-01",
+            "de fra",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect("a supported display-form alias should resolve to the registered active site");
+        assert_eq!(computer.site, "DEFRA");
+
+        let error = prestage_computer(
+            "defra-SRV-01",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        )
+        .expect_err("the globally unique name must use the registry's canonical site code");
+        assert!(error.contains("must use canonical site code 'DEFRA'"));
+    }
+
+    #[test]
+    fn test_prestage_rejects_caller_chosen_foreign_or_noncanonical_ou() {
+        for unsafe_ou in [
+            "OU=Servers,OU=GBLON,DC=corp,DC=local",
+            "OU=Servers,DC=corp,DC=local",
+            "OU=DMZ,OU=DEFRA,DC=corp,DC=local",
+        ] {
+            let error = prestage_computer("DEFRA-SRV-01", "DEFRA", unsafe_ou)
+                .expect_err("prestage must persist the server-derived role/site OU only");
+            assert!(error.contains("server-derived directory namespace"));
+        }
+    }
+
+    #[test]
+    fn test_prestage_derives_role_specific_ou() {
+        assert_eq!(
+            canonical_prestage_ou("DEFRA-WS-01").unwrap(),
+            "OU=Workstations,OU=DEFRA,DC=corp,DC=local"
+        );
+        assert_eq!(
+            canonical_prestage_ou("DEFRA-DC-01").unwrap(),
+            "OU=Domain Controllers,DC=corp,DC=local"
+        );
     }
 
     #[test]
@@ -616,19 +827,28 @@ mod tests {
         .unwrap();
 
         let name = format!("{SITE}-SRV-01");
-        let computer = prestage_computer(&name, SITE, "OU=Servers,DC=corp,DC=local").unwrap();
+        let ou_path = format!("OU=Servers,OU={SITE},DC=corp,DC=local");
+        let computer = prestage_computer(&name, SITE, &ou_path).unwrap();
         assert_eq!(computer.site, SITE);
     }
 
     #[test]
     fn test_prestage_computer_invalid_site() {
-        let result = prestage_computer("DEFRA-SRV-01", "INVALID", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer(
+            "DEFRA-SRV-01",
+            "INVALID",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_prestage_computer_invalid_name() {
-        let result = prestage_computer("BAD-SRV-01", "DEFRA", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer(
+            "BAD-SRV-01",
+            "DEFRA",
+            "OU=Servers,OU=DEFRA,DC=corp,DC=local",
+        );
         assert!(result.is_err());
     }
 
@@ -653,8 +873,8 @@ mod tests {
 
     #[test]
     fn test_move_computer_success() {
-        let computer = move_computer("DEFRA-SRV-01", "OU=DMZ,DC=corp,DC=local").unwrap();
-        assert_eq!(computer.ou_path, "OU=DMZ,DC=corp,DC=local");
+        let computer = move_computer("DEFRA-SRV-01", "OU=DMZ,OU=DEFRA,DC=corp,DC=local").unwrap();
+        assert_eq!(computer.ou_path, "OU=DMZ,OU=DEFRA,DC=corp,DC=local");
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("moved"));
     }
@@ -663,6 +883,9 @@ mod tests {
     fn test_move_computer_invalid_target_ou() {
         let result = move_computer("DEFRA-SRV-01", "OU=Invalid,DC=corp,DC=local");
         assert!(result.is_err());
+
+        let foreign = move_computer("DEFRA-SRV-01", "OU=DMZ,OU=GBLON,DC=corp,DC=local");
+        assert!(foreign.is_err());
     }
 
     #[test]
@@ -756,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_prestage_empty_name() {
-        let result = prestage_computer("", "DEFRA", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer("", "DEFRA", "OU=Servers,OU=DEFRA,DC=corp,DC=local");
         assert!(result.is_err());
     }
 
@@ -773,7 +996,7 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             name: "DEFRA-SRV-01".into(),
             site: "DEFRA".into(),
-            ou_path: "OU=Servers,DC=corp,DC=local".into(),
+            ou_path: "OU=Servers,OU=DEFRA,DC=corp,DC=local".into(),
             status,
             last_logon: chrono::Utc::now().to_rfc3339(),
             os: "Windows Server 2022".into(),
@@ -785,7 +1008,7 @@ mod tests {
     #[test]
     fn move_deleted_computer_is_err() {
         let deleted = make_computer(ComputerStatus::Deleted);
-        let result = move_computer_model(&deleted, "OU=DMZ,DC=corp,DC=local");
+        let result = move_computer_model(&deleted, "OU=DMZ,OU=DEFRA,DC=corp,DC=local");
         assert!(result.is_err(), "moving a Deleted computer must fail");
         assert!(result.unwrap_err().contains("Deleted"));
     }
@@ -793,7 +1016,7 @@ mod tests {
     #[test]
     fn move_disabled_computer_is_err() {
         let disabled = make_computer(ComputerStatus::Disabled);
-        let result = move_computer_model(&disabled, "OU=DMZ,DC=corp,DC=local");
+        let result = move_computer_model(&disabled, "OU=DMZ,OU=DEFRA,DC=corp,DC=local");
         assert!(result.is_err(), "moving a Disabled computer must fail");
     }
 
@@ -816,6 +1039,127 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_computer_cannot_be_cycled_through_disabled_to_active() {
+        let mut quarantined = make_computer(ComputerStatus::Quarantined);
+        quarantined.metadata.insert(
+            "quarantine_reason".into(),
+            "Security incident investigation".into(),
+        );
+
+        let error = disable_computer_model(&quarantined, "ordinary maintenance")
+            .expect_err("ordinary disable authority must not release quarantine");
+
+        assert!(error.contains("explicit quarantine release"));
+        assert_eq!(quarantined.status, ComputerStatus::Quarantined);
+        assert_eq!(
+            quarantined
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("Security incident investigation")
+        );
+    }
+
+    #[test]
+    fn active_disable_then_enable_remains_supported() {
+        let active = make_computer(ComputerStatus::Active);
+        let disabled = disable_computer_model(&active, "Scheduled maintenance")
+            .expect("Active computer may be disabled");
+        assert_eq!(disabled.status, ComputerStatus::Disabled);
+
+        let enabled = enable_computer_model(&disabled).expect("Disabled computer may be enabled");
+        assert_eq!(enabled.status, ComputerStatus::Active);
+        assert!(!enabled.metadata.contains_key("disable_reason"));
+    }
+
+    fn reviewed_recovery() -> QuarantineRecoveryDecision {
+        QuarantineRecoveryDecision {
+            review_id: "10000000-0000-4000-8000-000000000001".into(),
+            reason: "Independent review confirmed the hold can be released".into(),
+            approved_at: "2026-07-15T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn reviewed_quarantine_recovery_leaves_computer_disabled_and_preserves_hold_evidence() {
+        let mut quarantined = make_computer(ComputerStatus::Quarantined);
+        quarantined.metadata.insert(
+            "quarantine_reason".into(),
+            "Security incident investigation".into(),
+        );
+
+        let recovered = release_quarantine_model(&quarantined, &reviewed_recovery())
+            .expect("a typed reviewed recovery may leave quarantine");
+
+        assert_eq!(recovered.status, ComputerStatus::Disabled);
+        assert_eq!(
+            recovered
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("Security incident investigation")
+        );
+        assert_eq!(
+            recovered
+                .metadata
+                .get("quarantine_release_review_id")
+                .map(String::as_str),
+            Some("10000000-0000-4000-8000-000000000001")
+        );
+        assert!(recovered.metadata.contains_key("disable_reason"));
+    }
+
+    #[test]
+    fn quarantine_is_terminal_without_complete_typed_review_evidence() {
+        let mut quarantined = make_computer(ComputerStatus::Quarantined);
+        quarantined
+            .metadata
+            .insert("quarantine_reason".into(), "investigation".into());
+
+        assert!(disable_computer_model(&quarantined, "maintenance").is_err());
+        assert!(enable_computer_model(&quarantined).is_err());
+        assert!(delete_computer_model(&quarantined).is_err());
+        assert!(move_computer_model(&quarantined, "OU=DMZ,OU=DEFRA,DC=corp,DC=local").is_err());
+
+        let mut malformed = reviewed_recovery();
+        malformed.review_id = "caller-chosen-label".into();
+        assert!(release_quarantine_model(&quarantined, &malformed).is_err());
+
+        let mut missing_reason = reviewed_recovery();
+        missing_reason.reason.clear();
+        assert!(release_quarantine_model(&quarantined, &missing_reason).is_err());
+    }
+
+    #[test]
+    fn ordinary_lifecycle_cannot_launder_quarantine_into_active() {
+        let mut frontier = vec![make_computer(ComputerStatus::Quarantined)];
+        frontier[0]
+            .metadata
+            .insert("quarantine_reason".into(), "investigation".into());
+
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for state in &frontier {
+                if let Ok(value) = disable_computer_model(state, "ordinary") {
+                    next.push(value);
+                }
+                if let Ok(value) = enable_computer_model(state) {
+                    next.push(value);
+                }
+                if let Ok(value) = delete_computer_model(state) {
+                    next.push(value);
+                }
+            }
+            assert!(
+                next.iter()
+                    .all(|state| state.status != ComputerStatus::Active),
+                "no bounded ordinary path from quarantine may reach Active"
+            );
+            frontier.extend(next);
+        }
+    }
+
+    #[test]
     fn enable_active_computer_is_err() {
         let active = make_computer(ComputerStatus::Active);
         let result = enable_computer_model(&active);
@@ -830,5 +1174,13 @@ mod tests {
             result.is_err(),
             "deleting an already-Deleted computer must fail"
         );
+    }
+
+    #[test]
+    fn delete_quarantined_computer_is_err() {
+        let quarantined = make_computer(ComputerStatus::Quarantined);
+        let error = delete_computer_model(&quarantined)
+            .expect_err("ordinary delete must not erase quarantine state");
+        assert!(error.contains("quarantine recovery review"));
     }
 }

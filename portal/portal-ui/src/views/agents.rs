@@ -18,6 +18,39 @@ pub(crate) fn status_badge_class(status: &str) -> &'static str {
     }
 }
 
+/// Only a Pending roster snapshot carrying consumed challenge provenance may
+/// reach the approval action. The API and database repeat this invariant.
+pub(crate) fn agent_is_approvable(status: &str, cryptographically_admitted: bool) -> bool {
+    status == "pending" && cryptographically_admitted
+}
+
+/// Exact reviewed enrollment snapshot dispatched by terminal revocation.
+/// Keeping all three values together prevents the view from accidentally
+/// falling back to the reusable human-readable agent id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentRevokeArgs {
+    pub(crate) agent_id: String,
+    pub(crate) enrollment_id: String,
+    pub(crate) public_key_fingerprint: String,
+}
+
+pub(crate) fn agent_revoke_args(agent: &AgentSummary) -> AgentRevokeArgs {
+    AgentRevokeArgs {
+        agent_id: agent.agent_id.clone(),
+        enrollment_id: agent.enrollment_id.clone(),
+        public_key_fingerprint: agent.public_key_fingerprint.clone(),
+    }
+}
+
+/// The two-click guard is keyed by immutable enrollment id. If a roster refresh
+/// replaces a row under the same agent id, the replacement is never left armed.
+pub(crate) fn revoke_binding_is_armed(
+    armed_enrollment_id: Option<&str>,
+    enrollment_id: &str,
+) -> bool {
+    armed_enrollment_id == Some(enrollment_id)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn api_path_guard() -> &'static str {
@@ -65,22 +98,22 @@ pub fn AgentListView() -> impl IntoView {
     let (action_feedback, set_action_feedback) = create_signal(String::new());
     #[allow(deprecated)]
     let (action_class, set_action_class) = create_signal("badge neutral");
-    // Two-click arm guard for per-agent "Revoke" (terminal, irreversible). Holds
-    // the agent_id awaiting a confirming second click, so a lone misclick can't
-    // revoke an approved execution agent. Keyed by id so only the armed row's
-    // button shows the confirm state.
+    // Two-click arm guard for per-enrollment "Revoke" (terminal, irreversible).
+    // Holds the immutable enrollment_id awaiting a confirming second click, so
+    // neither a lone misclick nor reuse of the human-readable agent id can revoke
+    // a replacement enrollment.
     #[allow(deprecated)]
     let (revoke_armed, set_revoke_armed) = create_signal::<Option<String>>(None);
 
-    // Approve a pending enrollment. The agent's currently displayed platform is
-    // re-affirmed as the authoritative value; on success the list is refetched
-    // so the row's status flips to "approved".
-    let approve_action = Action::new(move |args: &(String, String)| {
-        let (agent_id, platform) = args.clone();
+    // Approve a pending enrollment using the immutable row id and reviewed key
+    // fingerprint displayed in the same roster snapshot. The API rejects a stale
+    // snapshot; either success or rejection refetches the list.
+    let approve_action = Action::new(move |args: &(String, String, String, String)| {
+        let (agent_id, enrollment_id, public_key_fingerprint, platform) = args.clone();
         set_action_feedback.set("Approving...".to_string());
         set_action_class.set("badge neutral");
         async move {
-            match approve_agent(agent_id, platform).await {
+            match approve_agent(agent_id, enrollment_id, public_key_fingerprint, platform).await {
                 Ok(result) => {
                     set_action_feedback.set(format!("Agent {} approved.", result.id));
                     set_action_class.set("badge good");
@@ -89,19 +122,30 @@ pub fn AgentListView() -> impl IntoView {
                 Err(e) => {
                     set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
+                    // A 409 means the reviewed enrollment was replaced or
+                    // expired. Refetch on every rejection so the operator never
+                    // keeps acting on a stale approval binding.
+                    list_resource.refetch();
                 }
             }
         }
     });
 
-    // Revoke an enrolled agent (pending or approved). Revocation is terminal on the
-    // API side, so on success the list is refetched and the row flips to "revoked".
-    let revoke_action = Action::new(move |agent_id: &String| {
-        let agent_id = agent_id.clone();
+    // Revoke one exact reviewed enrollment (pending or approved). Revocation is
+    // terminal on the API side, so success or stale-binding rejection refetches
+    // the list.
+    let revoke_action = Action::new(move |args: &AgentRevokeArgs| {
+        let args = args.clone();
         set_action_feedback.set("Revoking...".to_string());
         set_action_class.set("badge neutral");
         async move {
-            match revoke_agent(agent_id).await {
+            match revoke_agent(
+                args.agent_id,
+                args.enrollment_id,
+                args.public_key_fingerprint,
+            )
+            .await
+            {
                 Ok(result) => {
                     set_action_feedback.set(format!("Agent {} revoked.", result.id));
                     set_action_class.set("badge good");
@@ -110,6 +154,7 @@ pub fn AgentListView() -> impl IntoView {
                 Err(e) => {
                     set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
+                    list_resource.refetch();
                 }
             }
         }
@@ -148,9 +193,9 @@ pub fn AgentListView() -> impl IntoView {
                                         role="alert"
                                         data-api-path=agents_api_path
                                     >
-                                        <p>"Platform API unreachable"</p>
+                                        <p>"Agent roster unavailable or incomplete"</p>
                                         <p class="table-note">
-                                            "Agent list could not be loaded. Check the platform API and reload this page."
+                                            "Do not approve agents or close the enrollment cutover until the platform API returns the complete roster and the legacy inventory has been reviewed."
                                         </p>
                                     </div>
                                 }
@@ -167,7 +212,7 @@ pub fn AgentListView() -> impl IntoView {
                                 >
                                     <p>"No execution agents enrolled."</p>
                                     <p class="table-note">
-                                        "Register an agent by running the ryuki-runner on a platform host and completing the approval workflow."
+                                        "Stage a key-bound enrollment through trusted provisioning, run the agent on its platform host, then complete the separate approval review."
                                     </p>
                                 </div>
                             }
@@ -183,7 +228,11 @@ pub fn AgentListView() -> impl IntoView {
                                         <thead>
                                             <tr>
                                                 <th scope="col">"Agent ID"</th>
+                                                <th scope="col">"Enrollment ID"</th>
+                                                <th scope="col">"Key fingerprint"</th>
+                                                <th scope="col">"Capability digest"</th>
                                                 <th scope="col">"Platform"</th>
+                                                <th scope="col">"Admission"</th>
                                                 <th scope="col">"Status"</th>
                                                 <th scope="col">"Last seen"</th>
                                                 <th scope="col">"Jobs"</th>
@@ -204,17 +253,28 @@ pub fn AgentListView() -> impl IntoView {
                                                         .as_deref()
                                                         .map(condense_timestamp)
                                                         .unwrap_or_default();
-                                                    // Approve is offered only to admins on a
-                                                    // pending enrollment; the values needed to
-                                                    // dispatch are captured before the row view.
-                                                    let is_pending = agent.status == "pending";
+                                                    // Approval is offered only for a Pending row
+                                                    // whose consumed provisioning challenge is
+                                                    // visible in the typed roster contract.
+                                                    let cryptographically_admitted = agent
+                                                        .cryptographically_admitted;
+                                                    let is_approvable = agent_is_approvable(
+                                                        &agent.status,
+                                                        cryptographically_admitted,
+                                                    );
                                                     // Revoke is offered for any non-revoked agent
                                                     // (pending = deny enrollment; approved = take
                                                     // offline). A revoked agent shows no action.
                                                     let is_revoked = agent.status == "revoked";
                                                     let approve_id = agent.agent_id.clone();
+                                                    let approve_enrollment_id = agent
+                                                        .enrollment_id
+                                                        .clone();
+                                                    let approve_public_key_fingerprint = agent
+                                                        .public_key_fingerprint
+                                                        .clone();
                                                     let approve_platform = agent.platform.clone();
-                                                    let revoke_id = agent.agent_id.clone();
+                                                    let revoke_args = agent_revoke_args(&agent);
 
                                                     view! {
                                                         <tr class="request-row">
@@ -223,7 +283,31 @@ pub fn AgentListView() -> impl IntoView {
                                                                     {agent.agent_id.clone()}
                                                                 </span>
                                                             </td>
+                                                            <td>
+                                                                <span class="table-note">
+                                                                    {agent.enrollment_id.clone()}
+                                                                </span>
+                                                            </td>
+                                                            <td>
+                                                                <code class="table-note">
+                                                                    {agent.public_key_fingerprint.clone()}
+                                                                </code>
+                                                            </td>
+                                                            <td>
+                                                                <code class="table-note">
+                                                                    {agent.capabilities_digest.clone()}
+                                                                </code>
+                                                            </td>
                                                             <td>{agent.platform.clone()}</td>
+                                                            <td>
+                                                                <span class="table-note">
+                                                                    {if cryptographically_admitted {
+                                                                        "Challenge-bound"
+                                                                    } else {
+                                                                        "Legacy/unverified"
+                                                                    }}
+                                                                </span>
+                                                            </td>
                                                             <td>
                                                                 <span class=status_badge>
                                                                     {agent.status.clone()}
@@ -308,16 +392,25 @@ pub fn AgentListView() -> impl IntoView {
                                                                             .into_any()
                                                                     } else {
                                                                         let approve_id = approve_id.clone();
+                                                                        let approve_enrollment_id = approve_enrollment_id
+                                                                            .clone();
+                                                                        let approve_public_key_fingerprint = approve_public_key_fingerprint
+                                                                            .clone();
                                                                         let approve_platform = approve_platform
                                                                             .clone();
-                                                                        let revoke_id = revoke_id.clone();
-                                                                        let revoke_id_for_label = revoke_id
+                                                                        let revoke_args = revoke_args.clone();
+                                                                        let revoke_enrollment_id_for_label = revoke_args
+                                                                            .enrollment_id
                                                                             .clone();
                                                                         view! {
                                                                             <div class="agent-actions">
-                                                                                {is_pending
+                                                                                {is_approvable
                                                                                     .then(|| {
                                                                                         let approve_id = approve_id.clone();
+                                                                                        let approve_enrollment_id = approve_enrollment_id
+                                                                                            .clone();
+                                                                                        let approve_public_key_fingerprint = approve_public_key_fingerprint
+                                                                                            .clone();
                                                                                         let approve_platform = approve_platform
                                                                                             .clone();
                                                                                         view! {
@@ -328,6 +421,8 @@ pub fn AgentListView() -> impl IntoView {
                                                                                                     approve_action
                                                                                                         .dispatch((
                                                                                                             approve_id.clone(),
+                                                                                                            approve_enrollment_id.clone(),
+                                                                                                            approve_public_key_fingerprint.clone(),
                                                                                                             approve_platform.clone(),
                                                                                                         ));
                                                                                                 }
@@ -342,23 +437,25 @@ pub fn AgentListView() -> impl IntoView {
                                                                                     on:click=move |_| {
                                                                                         // Terminal, irreversible — require a
                                                                                         // confirming second click on THIS row.
-                                                                                        if revoke_armed.get().as_deref()
-                                                                                            == Some(revoke_id.as_str())
+                                                                                        if revoke_binding_is_armed(
+                                                                                            revoke_armed.get().as_deref(),
+                                                                                            &revoke_args.enrollment_id,
+                                                                                        )
                                                                                         {
                                                                                             set_revoke_armed.set(None);
                                                                                             revoke_action
-                                                                                                .dispatch(revoke_id.clone());
+                                                                                                .dispatch(revoke_args.clone());
                                                                                         } else {
                                                                                             set_revoke_armed
-                                                                                                .set(Some(revoke_id.clone()));
+                                                                                                .set(Some(revoke_args.enrollment_id.clone()));
                                                                                         }
                                                                                     }
                                                                                 >
                                                                                     {move || {
-                                                                                        if revoke_armed.get().as_deref()
-                                                                                            == Some(
-                                                                                                revoke_id_for_label.as_str(),
-                                                                                            )
+                                                                                        if revoke_binding_is_armed(
+                                                                                            revoke_armed.get().as_deref(),
+                                                                                            &revoke_enrollment_id_for_label,
+                                                                                        )
                                                                                         {
                                                                                             "Confirm revoke"
                                                                                         } else {

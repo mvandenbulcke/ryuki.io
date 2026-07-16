@@ -46,7 +46,8 @@ live systems:
    The agent **verifies the grant's signature against the control plane's public
    key independently** — it does not trust a bare `mode` field.
 2. The agent was started `--allow-live` with real credentials in its environment.
-3. The grant's approved-plan digest **matches the plan the agent just produced**
+3. The grant's approved-plan digest **matches the raw canonical plan the agent
+   just produced**
    (plan-then-apply: the agent re-plans and refuses if the plan diverges from the
    approved one — no applying an unreviewed plan).
 
@@ -133,13 +134,14 @@ acknowledges — so a result is never lost to a timed-out POST.
 - **Every request** is signed by / mTLS-bound to that key — dispatch authority,
   not just evidence.
 - **Signed result envelope** binds the full context, not a bare digest:
-  `agent_id, platform, job_id, attempt_id, lease_generation, request_id, mode,
-  status, job_spec_digest, approved_plan_digest, evidence_digest,
+  `agent_id, agent_enrollment_id, platform, job_id, attempt_id, lease_generation, request_id, mode,
+  status, job_spec_digest, approved_plan_digest, raw_plan_digest, evidence_digest,
   redaction_policy_version, timestamp, key_id, cp_nonce`. The CP verifies the
   signature against the enrolled key, checks the nonce/attempt to **reject
   replays and stale attempts**, and recomputes `evidence_digest` over the exact
   canonical bytes it stores (extending the existing digest-seal model to a remote
-  origin).
+  origin). For a successful `LivePlan`, `raw_plan_digest` is separately required
+  and signature-bound; it is never inferred from `evidence_digest`.
 - **Scrub before sign.** The agent runs the engine's `redact_evidence` so no raw
   secret is in the signed/sent pack; the envelope records the redaction-policy
   version and the CP re-runs compliance checks (pattern redaction is not a

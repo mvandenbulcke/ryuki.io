@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -112,8 +128,9 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>Application routes live under <code>/api</code> on the control plane, normally on the same origin as the portal. Three operational routes live at the top level: <code>/health</code> and <code>/ready</code> are unauthenticated probes, while <code>/metrics</code> requires human API authentication. The API is not URI-versioned. Normal routed responses carry the server version in <code>x-api-version</code>.</p>
 <h2 id="authentication">Authentication</h2>
 <p><code>RYUKI_AUTH_MODE</code> selects one of four session-establishment modes (see <a href="configuration.html">Configuration</a>); service API tokens are a separate, mode-independent credential type.</p>
+<p>Those modes document the current API. The production target supports several configured OpenID Connect providers simultaneously, brokered SAML/LDAP/AD, local WebAuthn emergency access, OAuth service principals, scoped compatibility tokens, and workload identity, all normalized into one principal model. See the <a href="platform-security-boundary.html#pluggable-authentication-providers">Platform Security Boundary Specification</a>.</p>
 <p><strong>Development modes</strong> (<code>mock-dry-run</code>, the default, and <code>static-dry-run</code>): requests run as a static admin session with no credentials. Nothing to configure; never run these against anything real.</p>
-<p><strong>Local accounts</strong> (<code>local</code>): sign in and use the returned session ID. Browser safe reads may use the session cookie, but unsafe methods reject cookie-only authorization as a CSRF defense; scripts must send <code>X-Ryuki-Session-Id</code>.</p>
+<p><strong>Local accounts</strong> (<code>local</code>, current development/migration behavior): sign in with a username and password and use the returned <code>session_token</code>. It is a 256-bit opaque <code>rys_...</code> bearer disclosed only by the login response and cookie; the database stores only its keyed HMAC verifier. Browser safe reads may use the session cookie, but unsafe methods reject cookie-only authorization as a CSRF defense; scripts send the token in <code>X-Ryuki-Session-Id</code> (a compatibility header name). Never log, commit, or reuse the token between clients. UUIDs from the admin session inventory are non-secret management IDs and cannot authenticate.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">printf</span> <span class="hl-s">'Password: '</span> &gt;&amp;2
 <span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> PASSWORD &lt;/dev/tty
 <span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
@@ -122,12 +139,12 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
   <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">'https://&lt;host&gt;/api/auth/local/login'</span> \
     <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
 <span class="hl-cmd">unset</span> PASSWORD
-<span class="hl-cmd">SESSION_ID=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$LOGIN"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+<span class="hl-cmd">SESSION_TOKEN=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$LOGIN"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_token'</span>)
 <span class="hl-cmd">unset</span> LOGIN
 <span class="hl-cmd">umask</span> 077
 <span class="hl-cmd">SESSION_HEADER=</span>$(mktemp <span class="hl-s">"${TMPDIR:-/tmp}/ryuki-session.XXXXXX"</span>)
-<span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$SESSION_ID"</span> &gt; <span class="hl-s">"$SESSION_HEADER"</span>
-<span class="hl-cmd">unset</span> SESSION_ID
+<span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$SESSION_TOKEN"</span> &gt; <span class="hl-s">"$SESSION_HEADER"</span>
+<span class="hl-cmd">unset</span> SESSION_TOKEN
 
 <span class="hl-cmd">cleanup_session()</span> {
   <span class="hl-cmd">local</span> logout_status=0
@@ -145,7 +162,8 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
   <span class="hl-cmd">-H</span> <span class="hl-s">"@$SESSION_HEADER"</span></code></pre>
 <p><strong>Entra ID</strong> (<code>entra-id</code>): browsers use the sign-in flow behind the portal's "Sign in with Microsoft Entra ID" button; non-interactive callers present a bearer JWT from the tenant, validated against its JWKS.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> https://&lt;host&gt;/api/requests <span class="hl-f">-H</span> <span class="hl-s">"Authorization: Bearer &lt;entra-jwt&gt;"</span></code></pre>
-<p><strong>API tokens</strong> are the right choice for integrations once the platform is using database-backed interactive authentication. An interactive Local or Entra administrator mints one; another API token cannot mint tokens. The <code>ryk_...</code> value is returned exactly once. Tokens created while the platform is in <code>mock-dry-run</code> or <code>static-dry-run</code> are persisted with <code>token_valid: false</code> and cannot authenticate. Usable tokens can carry site and environment scopes, which narrow everything the token sees—the recommended blast-radius control.</p>
+<p><strong>Current API tokens</strong> are the available compatibility credential for integrations once the platform is using database-backed interactive authentication. An interactive Local or Entra administrator mints one; another API token cannot mint tokens. The <code>ryk_...</code> value is returned exactly once. Tokens created while the platform is in <code>mock-dry-run</code> or <code>static-dry-run</code> are persisted with <code>token_valid: false</code> and cannot authenticate. Usable tokens can carry site and environment scopes, which narrow everything the token sees—the recommended blast-radius control.</p>
+<p>Current token authority is derived from role names plus optional site and environment scope and expiry. It does not yet implement the production token contract. The target groups rotated versions into a credential family, binds each token to the Ryuki audience and an explicit closed action set, represents scope states unambiguously, enforces a short maximum TTL, and rotates by issuing a new credential id with a bounded observable overlap before revoking the old version. Target tokens never gain browser, interactive, step-up, or emergency authority. See <a href="platform-security-boundary.html#service-credentials-and-api-tokens">service credentials and API tokens</a>.</p>
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">-s</span> <span class="hl-f">-X</span> POST https://&lt;host&gt;/api/admin/tokens \
   <span class="hl-cmd">-H</span> <span class="hl-s">"@$SESSION_HEADER"</span> \
   <span class="hl-cmd">-H</span> <span class="hl-s">"Content-Type: application/json"</span> \
@@ -155,18 +173,32 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <h2 id="request-headers">Request headers</h2>
 <p>Header names are case-insensitive. Use only the credential type appropriate to the route's access class.</p>
 <table><thead><tr><th>Header</th><th>When to send it</th></tr></thead><tbody>
-<tr><td><code>Authorization: Bearer ...</code></td><td>Human API routes accept a <code>ryk_...</code> API token, a validated Entra JWT, or a persisted session UUID as applicable to the configured auth mode. Token minting is the exception: it rejects <code>ryk_...</code> credentials and requires an interactive administrator. Agent routes use their own <code>rya_...</code> bearer tokens.</td></tr>
-<tr><td><code>X-Ryuki-Session-Id</code></td><td>Explicit persisted-session carrier used by the portal and scripts. A <code>ryuki_session</code> cookie can authorize safe reads, but cookie-only <code>POST</code>, <code>PUT</code>, <code>PATCH</code>, and <code>DELETE</code> requests are rejected as a CSRF defense.</td></tr>
-<tr><td><code>Content-Type: application/json</code></td><td>Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: webhook HMAC verification covers the exact bytes sent.</td></tr>
+<tr><td><code>Authorization: Bearer ...</code></td><td>Human API routes accept exactly one applicable credential: a <code>ryk_...</code> API token, a validated Entra JWT, or an opaque <code>rys_...</code> persisted-session token. Token minting rejects <code>ryk_...</code> credentials and requires an interactive administrator. Agent routes use their own <code>rya_...</code> bearer tokens.</td></tr>
+<tr><td><code>X-Ryuki-Session-Id</code></td><td>Compatibility carrier for the opaque <code>rys_...</code> session token used by the portal and scripts. Despite the header name, an administrative session UUID is never valid here. HTTPS uses the <code>__Host-ryuki_session</code> cookie; explicitly configured non-Secure loopback development uses <code>ryuki_session</code>. Either cookie can authorize safe reads only in its matching mode; cookie-only <code>POST</code>, <code>PUT</code>, <code>PATCH</code>, and <code>DELETE</code> requests are rejected as a CSRF defense.</td></tr>
+<tr><td><code>Content-Type: application/json</code></td><td>Required when the route consumes a JSON body. Do not re-encode a webhook body after signing it: the v1 webhook message covers the exact-body SHA-256 digest.</td></tr>
 <tr><td><code>x-ryuki-protocol-version</code></td><td>Required on agent registration, poll, acknowledgement, heartbeat, and result requests. This build accepts version <code>2</code>; missing, duplicate, malformed, or unsupported values return <code>400</code>. The public-key and OpenAPI bootstrap reads do not require it.</td></tr>
-<tr><td><code>X-Hub-Signature-256</code></td><td>Required only by the inbound webhook receiver. Send the hex HMAC-SHA256 of the exact raw body, optionally prefixed with <code>sha256=</code>.</td></tr>
+<tr><td><code>X-Hub-Signature-256</code></td><td>Required by the inbound webhook receiver. Send the hex HMAC-SHA256 of the Ryuki v1 canonical message (fixed POST path, connection ID, timestamp, delivery ID, and exact-body SHA-256), optionally prefixed with <code>sha256=</code>.</td></tr>
+<tr><td><code>X-Ryuki-Webhook-Timestamp</code></td><td>Required by the inbound webhook receiver. Send canonical Unix time in seconds; it is signed and accepted only within five minutes of both receiver clocks.</td></tr>
+<tr><td><code>X-Ryuki-Webhook-Delivery-Id</code></td><td>Required by the inbound webhook receiver. Send a unique 1-128 byte identifier using <code>[A-Za-z0-9._-]</code>; it is signed and atomically deduplicated per connection.</td></tr>
 <tr><td><code>Idempotency-Key</code></td><td>Enables durable deduplication for authenticated, DB-backed human mutations. Use a unique, unguessable key for each logical operation; the emergency-initiate route requires one.</td></tr>
 </tbody></table>
+<p>During the secure-cookie migration, successful login/callback and logout responses send the <code>__Host-ryuki_session</code> field and a separate <code>ryuki_session</code> expiry field. Proxies must preserve these as independent <code>Set-Cookie</code> header fields; they must not comma-join them. The expired legacy name is never accepted as an HTTPS credential.</p>
+<p>For inbound webhooks, compute the HMAC over this exact UTF-8 v1 message with no trailing newline (replace the placeholders with the header/path values and the lowercase hex SHA-256 of the exact body bytes):</p>
+<pre><code class="lang-text">ryuki-webhook-v1
+method:POST
+path:/api/integrations/{connection_id}/webhook
+connection-id:{connection_id}
+timestamp:{unix_seconds}
+delivery-id:{delivery_id}
+body-sha256:{lowercase_hex_digest}</code></pre>
+<p>Webhook request bodies are capped at 256 KiB independently of the configurable whole-API body limit.</p>
+<p>Send only one credential carrier per request. Combining <code>X-Ryuki-Session-Id</code>, <code>Authorization</code>, or either session-cookie name; duplicating a session cookie; mixing its old/new names; or presenting a malformed/invalid prefixed credential fails closed without falling through to another identity.</p>
 <h2 id="authorization">Authorization</h2>
 <p>Human-session mutations are gated by one of five role permissions: <code>admin</code>, <code>approve</code>, <code>execute</code>, <code>request</code>, or <code>audit</code>. Safe reads and non-human entry points also use effective access classes such as composite <code>read</code>, <code>public</code>, <code>agent</code>, and <code>webhook</code>; those labels are not additional roles. Results are then narrowed by site and environment scope. <a href="rbac-and-scoping.html">RBAC &amp; Scoping</a> defines these labels and the <code>404</code>/<code>403</code>/filtered-list behavior. The effective access requirement for each route appears in the <a href="api-reference.html">API Reference</a>.</p>
 <h2 id="conventions">Conventions</h2>
 <h3 id="idempotent-mutations">Idempotent mutations</h3>
 <p>The idempotency layer applies to authenticated human <code>POST</code>, <code>PUT</code>, <code>PATCH</code>, and <code>DELETE</code> requests when PostgreSQL is available. It is opt-in unless the route says otherwise: without a usable key, or without a database, the request continues without deduplication. A usable key is 1..200 bytes; an unguessable UUID is a good default. Keys are isolated by authenticated principal.</p>
+<p>Continuing without PostgreSQL is current development/migration behavior, not a production failover guarantee. Production security mutations, sessions, replay/idempotency recording, approvals, and authoritative audit fail closed when their durable state is unavailable.</p>
 <p>The server fingerprints the method, full path and query string, and exact body. For the same key and fingerprint, a completed JSON response is replayed with its stored status and an <code>Idempotency-Replayed: true</code> header. A concurrent in-flight request returns <code>409</code>; reusing the key for a different fingerprint returns <code>422</code>. Records become eligible for the best-effort hourly expiry sweep after 24 hours; do not assume a key becomes claimable at an exact instant.</p>
 <p><code>5xx</code> responses and responses that cannot be replayed faithfully are not stored. This includes non-JSON responses, responses with replay-significant headers, and <code>Cache-Control: no-store</code> one-time-secret responses. The idempotency capture path has a 1 MiB request/response buffer limit. The high-blast-radius <code>POST /api/ops/emergency/initiate</code> route requires a usable key and returns <code>400 IDEMPOTENCY_KEY_REQUIRED</code> when it is absent or invalid.</p>
 <h3 id="pagination">Pagination</h3>
@@ -197,7 +229,7 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <span class="hl-cmd">login_local()</span> {
   <span class="hl-cmd">local</span> username=<span class="hl-v">$1</span>
   <span class="hl-cmd">local</span> header_file=<span class="hl-v">$2</span>
-  <span class="hl-cmd">local</span> password login session_id
+  <span class="hl-cmd">local</span> password login session_token
   <span class="hl-cmd">printf</span> <span class="hl-s">'%s password: '</span> <span class="hl-s">"$username"</span> &gt;&amp;2
   <span class="hl-cmd">IFS=</span> read <span class="hl-f">-r</span> <span class="hl-f">-s</span> password &lt;/dev/tty
   <span class="hl-cmd">printf</span> <span class="hl-s">'\n'</span> &gt;&amp;2
@@ -206,10 +238,10 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
     <span class="hl-cmd">curl</span> <span class="hl-f">--fail-with-body</span> <span class="hl-f">-sS</span> <span class="hl-f">-X</span> POST <span class="hl-s">"$BASE/api/auth/local/login"</span> \
       <span class="hl-cmd">-H</span> <span class="hl-s">'Content-Type: application/json'</span> <span class="hl-f">--data-binary</span> @-)
   <span class="hl-cmd">unset</span> password
-  <span class="hl-cmd">session_id=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_id'</span>)
+  <span class="hl-cmd">session_token=</span>$(printf <span class="hl-s">'%s'</span> <span class="hl-s">"$login"</span> | <span class="hl-cmd">jq</span> <span class="hl-f">-er</span> <span class="hl-s">'.session_token'</span>)
   <span class="hl-cmd">unset</span> login
-  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_id"</span> &gt; <span class="hl-s">"$header_file"</span>
-  <span class="hl-cmd">unset</span> session_id
+  <span class="hl-cmd">printf</span> <span class="hl-s">'X-Ryuki-Session-Id: %s\n'</span> <span class="hl-s">"$session_token"</span> &gt; <span class="hl-s">"$header_file"</span>
+  <span class="hl-cmd">unset</span> session_token
 <span class="hl-cmd">}</span>
 
 <span class="hl-cmd">logout_local()</span> {

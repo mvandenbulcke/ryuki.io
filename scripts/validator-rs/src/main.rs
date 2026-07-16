@@ -4123,6 +4123,12 @@ fn build_slice_context(
                 serde_json::Value::String(root.to_string_lossy().to_string()),
             );
         }
+        "vault-secret-delivery" => {
+            map.insert(
+                "root".to_string(),
+                serde_json::Value::String(root.to_string_lossy().to_string()),
+            );
+        }
         "catalog" => {
             for (key, path) in &[
                 ("site_catalog", "catalog/site-catalog.yaml"),
@@ -4148,15 +4154,19 @@ fn build_slice_context(
             // The deployment skeleton lives in deploy/kubernetes/base/*.yaml.
             // Load every base manifest file, split multi-document YAML on `---`,
             // and parse each document into a JSON value for the slice validator.
-            // The configmap file is intentionally excluded: ConfigMaps carry app
-            // configuration and are not part of the validated skeleton kinds.
+            // ConfigMaps are part of the validated cross-object mode/role/
+            // timeout contract. The migration Job lives outside the continuously
+            // reconciled base and is loaded explicitly as an operations-only
+            // create-once template.
             const BASE_MANIFEST_FILES: &[&str] = &[
                 "deploy/kubernetes/base/namespace.yaml",
                 "deploy/kubernetes/base/serviceaccounts.yaml",
+                "deploy/kubernetes/base/configmap.yaml",
                 "deploy/kubernetes/base/deployments.yaml",
                 "deploy/kubernetes/base/services.yaml",
                 "deploy/kubernetes/base/ingress.yaml",
                 "deploy/kubernetes/base/networkpolicies.yaml",
+                "deploy/kubernetes/operations/migration-job.yaml",
             ];
             let mut manifests = Vec::new();
             let mut source_texts = Vec::new();
@@ -4164,7 +4174,10 @@ fn build_slice_context(
                 let Ok(raw) = fs::read_to_string(root.join(rel)) else {
                     continue;
                 };
-                source_texts.push(serde_json::Value::String(raw.clone()));
+                source_texts.push(serde_json::json!({
+                    "path": *rel,
+                    "text": raw.clone(),
+                }));
                 for document in raw.split("\n---") {
                     let trimmed = document.trim();
                     if trimmed.is_empty() {
@@ -4177,9 +4190,20 @@ fn build_slice_context(
                     }
                 }
             }
+            let cutover_contract_path =
+                "deploy/kubernetes/operations/migration-cutover-contract.yaml";
+            if let Ok(raw) = fs::read_to_string(root.join(cutover_contract_path)) {
+                source_texts.push(serde_json::json!({
+                    "path": cutover_contract_path,
+                    "text": raw.clone(),
+                }));
+                if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(&raw) {
+                    map.insert("cutoverContract".to_string(), value);
+                }
+            }
             map.insert("manifests".to_string(), serde_json::Value::Array(manifests));
             map.insert(
-                "source_texts".to_string(),
+                "sourceTexts".to_string(),
                 serde_json::Value::Array(source_texts),
             );
         }
@@ -4567,6 +4591,62 @@ mod tests {
             "COVERAGE_TSV registry self-check failed:\n{}",
             problems.join("\n")
         );
+    }
+
+    #[test]
+    fn kubernetes_context_retains_config_cutover_and_operations_job() {
+        let root = root();
+        let entry = SliceEntry {
+            slice: "kubernetes-manifest".to_string(),
+            catalog_file: String::new(),
+            doc_file: String::new(),
+            endpoint: String::new(),
+        };
+        let context = build_slice_context(&root, &entry, &load_shared_context(&root));
+
+        assert!(
+            context.get("source_texts").is_none(),
+            "the context key must match Context's sourceTexts rename"
+        );
+        let source_texts = context
+            .get("sourceTexts")
+            .and_then(serde_json::Value::as_array)
+            .expect("Kubernetes sourceTexts must be an array");
+        assert!(source_texts.iter().all(|source| {
+            source
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && source
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+        }));
+        assert!(source_texts.iter().any(|source| {
+            source.get("path").and_then(serde_json::Value::as_str)
+                == Some("deploy/kubernetes/base/deployments.yaml")
+        }));
+        assert!(source_texts.iter().any(|source| {
+            source.get("path").and_then(serde_json::Value::as_str)
+                == Some("deploy/kubernetes/base/configmap.yaml")
+        }));
+        assert!(source_texts.iter().any(|source| {
+            source.get("path").and_then(serde_json::Value::as_str)
+                == Some("deploy/kubernetes/operations/migration-job.yaml")
+        }));
+        assert!(context.get("cutoverContract").is_some());
+
+        let manifests = context
+            .get("manifests")
+            .and_then(serde_json::Value::as_array)
+            .expect("Kubernetes manifests must be an array");
+        assert!(manifests.iter().any(|manifest| {
+            manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Job")
+                && manifest
+                    .pointer("/metadata/generateName")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("platform-api-migrations-111111111111-")
+        }));
     }
 
     #[test]

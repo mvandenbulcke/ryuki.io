@@ -16,23 +16,20 @@
 //! fields. We select only the columns the engine model has.
 //!
 //! # Multi-table transactions
-//! `request_exception`: UPDATE firmware_records + INSERT firmware_exceptions in
-//!   one transaction. Both writes commit atomically.
-//! `revoke_exception`: SELECT exception + DELETE firmware_exceptions + UPDATE
-//!   firmware_records in one transaction.
+//! Exception lifecycle writes accept a caller-owned transaction so the API can
+//! commit the state transition and its security audit record atomically.
 //!
-//! # list_exceptions active filter
-//! Filtered in SQL: `WHERE expiry_date >= $1`, where `$1` is the UTC date
-//! (`Utc::now().date_naive()`) bound from Rust — NOT SQL `CURRENT_DATE`, whose
-//! timezone could differ from the engine's UTC `active_exception` predicate.
-//! Since expiry_date is TEXT in 'YYYY-MM-DD' format, lexicographic comparison
-//! works correctly for ISO date strings.
+//! # Exception authority clock
+//! PostgreSQL `CURRENT_DATE` is the only authority for creation, approval, and
+//! expiry. Rust receives that same date for pure compliance evaluation; a
+//! stored `Exception` status is only a cache and never grants authority alone.
 
-use chrono::{Duration, Utc};
+use chrono::NaiveDate;
 use ryuki_engine::firmware_lifecycle::{
-    ComplianceStatus, DeviceType, FirmwareException, FirmwareRecord,
+    ComplianceStatus, DeviceType, FirmwareException, FirmwareExceptionStatus, FirmwareRecord,
 };
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 // ─── Column lists ─────────────────────────────────────────────────────────────
@@ -40,7 +37,8 @@ use uuid::Uuid;
 pub const RECORD_COLUMNS: &str =
     "id, device_type, vendor, model, current_version, minimum_version, latest_version, eol_date, site, compliance_status";
 
-pub const EXCEPTION_COLUMNS: &str = "id, device_id, reason, approved_by, expiry_date";
+pub const EXCEPTION_COLUMNS: &str =
+    "id, device_id, reason, requested_by, approved_by, expiry_date, status, version";
 
 // ─── Row structs ──────────────────────────────────────────────────────────────
 
@@ -103,20 +101,83 @@ pub struct FirmwareExceptionRow {
     pub id: String,
     pub device_id: String,
     pub reason: String,
-    pub approved_by: String,
-    pub expiry_date: String,
+    pub requested_by: String,
+    pub approved_by: Option<String>,
+    pub expiry_date: NaiveDate,
+    pub status: String,
+    pub version: i64,
 }
 
 impl FirmwareExceptionRow {
-    pub fn into_model(self) -> FirmwareException {
-        FirmwareException {
+    pub fn into_model(self) -> Result<FirmwareException, sqlx::Error> {
+        let status = FirmwareExceptionStatus::try_from(self.status.as_str()).map_err(|error| {
+            sqlx::Error::Decode(
+                format!(
+                    "firmware_exceptions.status: corrupt value '{}': {error}",
+                    self.status
+                )
+                .into(),
+            )
+        })?;
+        Ok(FirmwareException {
             id: self.id,
             device_id: self.device_id,
             reason: self.reason,
+            requested_by: self.requested_by,
             approved_by: self.approved_by,
-            expiry_date: self.expiry_date,
+            expiry_date: self.expiry_date.to_string(),
+            status,
+            version: self.version,
+        })
+    }
+}
+
+fn engine_error(error: String) -> sqlx::Error {
+    sqlx::Error::Decode(error.into())
+}
+
+async fn apply_effective_statuses(
+    pool: &PgPool,
+    records: &mut [FirmwareRecord],
+) -> Result<(), sqlx::Error> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    let today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        .fetch_one(&mut *tx)
+        .await?;
+    let device_ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
+    let rows: Vec<FirmwareExceptionRow> = sqlx::query_as(&format!(
+        "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions \
+         WHERE device_id = ANY($1) AND status = 'Approved' ORDER BY device_id, id"
+    ))
+    .bind(&device_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut authority = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let exception = row.into_model()?;
+        if authority
+            .insert(exception.device_id.clone(), exception)
+            .is_some()
+        {
+            return Err(engine_error(
+                "multiple Approved firmware exceptions exist for one device".into(),
+            ));
         }
     }
+    for record in records {
+        record.compliance_status =
+            ryuki_engine::firmware_lifecycle::calculated_status_with_exception_at(
+                record,
+                authority.get(&record.id),
+                today,
+            )
+            .map_err(engine_error)?;
+    }
+    Ok(())
 }
 
 // ─── Read functions ───────────────────────────────────────────────────────────
@@ -149,7 +210,12 @@ pub async fn list_devices(
         .fetch_all(pool)
         .await?
     };
-    rows.into_iter().map(|r| r.into_model()).collect()
+    let mut records: Vec<FirmwareRecord> = rows
+        .into_iter()
+        .map(|row| row.into_model())
+        .collect::<Result<_, _>>()?;
+    apply_effective_statuses(pool, &mut records).await?;
+    Ok(records)
 }
 
 /// Count firmware records (optionally site-filtered) — the pagination total for
@@ -175,34 +241,54 @@ pub async fn get_device(pool: &PgPool, id: &str) -> Result<Option<FirmwareRecord
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    row.map(|r| r.into_model()).transpose()
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut records = vec![row.into_model()?];
+    apply_effective_statuses(pool, &mut records).await?;
+    Ok(records.pop())
 }
 
-/// Return all non-compliant (NonCompliant or EOL) firmware records.
+/// Return all effectively non-compliant (NonCompliant or EOL) firmware records.
+/// Persisted Exception rows are included in the candidate set and re-evaluated
+/// against database-date exception authority before filtering, so an expired
+/// exception becomes visible immediately even before a cache recalculation.
 pub async fn list_noncompliant(pool: &PgPool) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
     let rows: Vec<FirmwareRecordRow> = sqlx::query_as(&format!(
         "SELECT {RECORD_COLUMNS} FROM firmware_records \
-         WHERE compliance_status IN ('NonCompliant', 'EOL') ORDER BY id"
+         WHERE compliance_status IN ('NonCompliant', 'EOL', 'Exception') ORDER BY id"
     ))
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(|r| r.into_model()).collect()
+    let mut records: Vec<FirmwareRecord> = rows
+        .into_iter()
+        .map(|row| row.into_model())
+        .collect::<Result<_, _>>()?;
+    apply_effective_statuses(pool, &mut records).await?;
+    records.retain(|record| {
+        matches!(
+            record.compliance_status,
+            ComplianceStatus::NonCompliant | ComplianceStatus::EOL
+        )
+    });
+    Ok(records)
 }
 
-/// Return all firmware records whose eol_date < today (lexicographic ISO date).
-/// The cutoff is the UTC date computed in Rust (NOT SQL CURRENT_DATE, whose
-/// timezone could differ), so this matches the engine's `is_eol` which uses
-/// `Utc::now().date_naive()`.
+/// Return all firmware records whose canonical ISO EOL date has passed under
+/// the same authoritative database date used by exception evaluation.
 pub async fn list_eol(pool: &PgPool) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
-    let today_utc = Utc::now().date_naive().to_string();
     let rows: Vec<FirmwareRecordRow> = sqlx::query_as(&format!(
         "SELECT {RECORD_COLUMNS} FROM firmware_records \
-         WHERE eol_date < $1 ORDER BY id"
+         WHERE eol_date::date < CURRENT_DATE ORDER BY id"
     ))
-    .bind(today_utc)
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(|r| r.into_model()).collect()
+    let mut records: Vec<FirmwareRecord> = rows
+        .into_iter()
+        .map(|row| row.into_model())
+        .collect::<Result<_, _>>()?;
+    apply_effective_statuses(pool, &mut records).await?;
+    Ok(records)
 }
 
 /// Return all firmware records for the compliance report.
@@ -212,174 +298,316 @@ pub async fn list_all_for_report(pool: &PgPool) -> Result<Vec<FirmwareRecord>, s
     ))
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(|r| r.into_model()).collect()
+    let mut records: Vec<FirmwareRecord> = rows
+        .into_iter()
+        .map(|row| row.into_model())
+        .collect::<Result<_, _>>()?;
+    apply_effective_statuses(pool, &mut records).await?;
+    Ok(records)
 }
 
-/// Return active exceptions (expiry_date >= today, ISO date TEXT lexicographic
-/// comparison). The cutoff is the UTC date from Rust (NOT SQL CURRENT_DATE), so
-/// it matches the engine's `active_exception` which uses `Utc::now().date_naive()`.
+/// Return only approved exceptions whose inclusive expiry has not passed under
+/// the authoritative PostgreSQL date. Pending, legacy, revoked, and expired
+/// rows are never surfaced as active authority.
 pub async fn list_active_exceptions(pool: &PgPool) -> Result<Vec<FirmwareException>, sqlx::Error> {
-    let today_utc = Utc::now().date_naive().to_string();
     let rows: Vec<FirmwareExceptionRow> = sqlx::query_as(&format!(
         "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions \
-         WHERE expiry_date >= $1 ORDER BY id"
+         WHERE status = 'Approved' AND expiry_date >= CURRENT_DATE ORDER BY id"
     ))
-    .bind(today_utc)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|r| r.into_model()).collect())
+    rows.into_iter().map(|row| row.into_model()).collect()
 }
 
 // ─── Write functions ──────────────────────────────────────────────────────────
 
-/// Recalculate and persist a device's compliance_status in ONE transaction.
-/// The device row is locked with `SELECT ... FOR UPDATE`, the new status is
-/// computed from the LOCKED row via the pure engine, and written back — so a
-/// concurrent `request_exception` (which sets the device to 'Exception') cannot
-/// be clobbered by a stale recompute. Returns the updated record, or `Ok(None)`
-/// when the id is absent. (calculated_status preserves an 'Exception' status, so
-/// a serialized recompute after an exception lands re-writes 'Exception'.)
-pub async fn recalculate_compliance(
-    pool: &PgPool,
+#[derive(Debug)]
+pub enum RequestExceptionOutcome {
+    Created(FirmwareException),
+    MissingDevice,
+    Conflict,
+}
+
+#[derive(Debug)]
+pub enum ApproveExceptionOutcome {
+    Approved(FirmwareException),
+    NotFound,
+    Conflict,
+    SelfApproval,
+}
+
+#[derive(Debug)]
+pub enum RevokeExceptionOutcome {
+    Revoked {
+        exception: FirmwareException,
+        device: Box<FirmwareRecord>,
+    },
+    NotFound,
+    Conflict,
+}
+
+/// Lock the resource authority row before any firmware exception row. Every
+/// lifecycle writer follows this lock order so concurrent request, approval,
+/// expiry reconciliation, recalc, and revocation cannot deadlock or race scope.
+pub async fn get_device_for_update(
+    conn: &mut PgConnection,
     id: &str,
 ) -> Result<Option<FirmwareRecord>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
     let row: Option<FirmwareRecordRow> = sqlx::query_as(&format!(
         "SELECT {RECORD_COLUMNS} FROM firmware_records WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
-    let Some(row) = row else {
-        tx.rollback().await?;
+    row.map(FirmwareRecordRow::into_model).transpose()
+}
+
+/// Resolve an exception's immutable parent before taking locks. Callers then
+/// lock the device first and the exception second.
+pub async fn exception_device_id(
+    pool: &PgPool,
+    exception_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT device_id FROM firmware_exceptions WHERE id = $1")
+        .bind(exception_id)
+        .fetch_optional(pool)
+        .await
+}
+
+async fn expire_open_exception(
+    conn: &mut PgConnection,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE firmware_exceptions \
+         SET status = 'Expired', version = version + 1 \
+         WHERE device_id = $1 AND status IN ('Pending', 'Approved') \
+           AND expiry_date < CURRENT_DATE",
+    )
+    .bind(device_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Recalculate inside the caller's transaction. Expiry is first reconciled
+/// under the device lock, then the approved exception fact and database date
+/// drive the pure engine calculation. Stored `Exception` is never trusted.
+pub async fn recalculate_compliance(
+    conn: &mut PgConnection,
+    id: &str,
+) -> Result<Option<FirmwareRecord>, sqlx::Error> {
+    let Some(mut record) = get_device_for_update(conn, id).await? else {
         return Ok(None);
     };
-    let mut record = row.into_model()?;
-    let new_status = ryuki_engine::firmware_lifecycle::calculated_status(&record);
+    expire_open_exception(conn, id).await?;
+    let row: Option<FirmwareExceptionRow> = sqlx::query_as(&format!(
+        "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions \
+         WHERE device_id = $1 AND status = 'Approved' FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let exception = row.map(FirmwareExceptionRow::into_model).transpose()?;
+    let today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        .fetch_one(&mut *conn)
+        .await?;
+    let new_status = ryuki_engine::firmware_lifecycle::calculated_status_with_exception_at(
+        &record,
+        exception.as_ref(),
+        today,
+    )
+    .map_err(engine_error)?;
     sqlx::query(
         "UPDATE firmware_records SET compliance_status = $2, updated_at = NOW() WHERE id = $1",
     )
     .bind(id)
     .bind(new_status.to_string())
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     record.compliance_status = new_status;
     Ok(Some(record))
 }
 
-/// Request an exception for a device: atomically set device status to 'Exception'
-/// and insert a new firmware_exceptions row.
-///
-/// Transaction:
-///   1. UPDATE firmware_records SET compliance_status='Exception' WHERE id=$device_id
-///      → returns None if device absent (caller → 404)
-///   2. INSERT INTO firmware_exceptions (id, device_id, reason, approved_by, expiry_date)
-///
-/// The exception id is generated as "fwex-{full-uuid}" — the FULL v4 UUID (122
-/// bits), not just the first 8-hex segment, so a growing exceptions table does
-/// not hit a birthday collision that would fail the PK insert with a 500.
-/// expiry_date is computed as (today + expiry_days) in YYYY-MM-DD format.
+/// Create a Pending request. The maker is a server-derived identity and creation
+/// does not grant authority or change the device status. The expiry is computed
+/// by PostgreSQL, never by a caller or process-local clock.
 pub async fn request_exception(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     device_id: &str,
     reason: &str,
-    approved_by: &str,
-    expiry_days: i64,
-) -> Result<Option<FirmwareException>, sqlx::Error> {
-    let exception_id = format!("fwex-{}", Uuid::new_v4());
-    let expiry_date = (Utc::now() + Duration::days(expiry_days))
-        .date_naive()
-        .to_string();
-
-    let mut tx = pool.begin().await?;
-
-    // Update device status; if device absent, UPDATE returns 0 rows.
-    let affected = sqlx::query(
-        "UPDATE firmware_records \
-         SET compliance_status = 'Exception', updated_at = NOW() \
-         WHERE id = $1",
+    requested_by: &str,
+    expiry_days: i32,
+) -> Result<RequestExceptionOutcome, sqlx::Error> {
+    if get_device_for_update(conn, device_id).await?.is_none() {
+        return Ok(RequestExceptionOutcome::MissingDevice);
+    }
+    expire_open_exception(conn, device_id).await?;
+    let open_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM firmware_exceptions \
+         WHERE device_id = $1 AND status IN ('Pending', 'Approved'))",
     )
     .bind(device_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if affected == 0 {
-        tx.rollback().await?;
-        return Ok(None);
+    .fetch_one(&mut *conn)
+    .await?;
+    if open_exists {
+        return Ok(RequestExceptionOutcome::Conflict);
     }
-
-    // Insert exception row.
-    sqlx::query(
-        "INSERT INTO firmware_exceptions (id, device_id, reason, approved_by, expiry_date) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
+    let exception_id = format!("fwex-{}", Uuid::new_v4());
+    let row: FirmwareExceptionRow = sqlx::query_as(&format!(
+        "INSERT INTO firmware_exceptions \
+            (id, device_id, reason, requested_by, approved_by, expiry_date, status, version) \
+         VALUES ($1, $2, $3, $4, NULL, CURRENT_DATE + $5::int, 'Pending', 1) \
+         RETURNING {EXCEPTION_COLUMNS}"
+    ))
     .bind(&exception_id)
     .bind(device_id)
     .bind(reason)
-    .bind(approved_by)
-    .bind(&expiry_date)
-    .execute(&mut *tx)
+    .bind(requested_by.trim())
+    .bind(expiry_days)
+    .fetch_one(&mut *conn)
     .await?;
-
-    tx.commit().await?;
-
-    Ok(Some(FirmwareException {
-        id: exception_id,
-        device_id: device_id.to_string(),
-        reason: reason.to_string(),
-        approved_by: approved_by.to_string(),
-        expiry_date,
-    }))
+    Ok(RequestExceptionOutcome::Created(row.into_model()?))
 }
 
-/// Revoke an exception: atomically delete the exception row and set device to NonCompliant.
-///
-/// Transaction:
-///   1. SELECT exception (→ None if absent, caller → 404)
-///   2. DELETE firmware_exceptions WHERE id=$exception_id
-///   3. UPDATE firmware_records SET compliance_status='NonCompliant' WHERE id=$device_id
-pub async fn revoke_exception(
-    pool: &PgPool,
+/// Transition one unexpired Pending request to Approved with a distinct checker.
+/// The expected version, state, expiry, and actor separation are repeated in the
+/// UPDATE predicate and database trigger; the device cache changes in the same
+/// caller-owned transaction.
+pub async fn approve_exception(
+    conn: &mut PgConnection,
     exception_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    // Fetch the exception to get device_id (None = absent).
+    expected_version: i64,
+    approved_by: &str,
+) -> Result<ApproveExceptionOutcome, sqlx::Error> {
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM firmware_exceptions WHERE id = $1")
+            .bind(exception_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(device_id) = device_id else {
+        return Ok(ApproveExceptionOutcome::NotFound);
+    };
+    if get_device_for_update(conn, &device_id).await?.is_none() {
+        return Err(engine_error(
+            "firmware exception parent device is missing".into(),
+        ));
+    }
     let row: Option<FirmwareExceptionRow> = sqlx::query_as(&format!(
         "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions WHERE id = $1 FOR UPDATE"
     ))
     .bind(exception_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
-
-    let Some(exc) = row else {
-        tx.rollback().await?;
-        return Ok(None);
+    let Some(row) = row else {
+        return Ok(ApproveExceptionOutcome::NotFound);
     };
-
-    let device_id = exc.device_id.clone();
-
-    // Delete the exception.
-    sqlx::query("DELETE FROM firmware_exceptions WHERE id = $1")
-        .bind(exception_id)
-        .execute(&mut *tx)
+    let today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        .fetch_one(&mut *conn)
         .await?;
-
-    // Set device to NonCompliant.
+    if row.status == "Pending" && row.expiry_date < today {
+        sqlx::query(
+            "UPDATE firmware_exceptions \
+             SET status = 'Expired', version = version + 1 \
+             WHERE id = $1 AND status = 'Pending' AND version = $2 \
+               AND expiry_date < CURRENT_DATE",
+        )
+        .bind(exception_id)
+        .bind(row.version)
+        .execute(&mut *conn)
+        .await?;
+        return Ok(ApproveExceptionOutcome::Conflict);
+    }
+    if row.requested_by.trim() == approved_by.trim() {
+        return Ok(ApproveExceptionOutcome::SelfApproval);
+    }
+    if row.status != "Pending" || row.version != expected_version {
+        return Ok(ApproveExceptionOutcome::Conflict);
+    }
+    let approved: Option<FirmwareExceptionRow> = sqlx::query_as(&format!(
+        "UPDATE firmware_exceptions \
+         SET status = 'Approved', approved_by = $3, version = version + 1 \
+         WHERE id = $1 AND status = 'Pending' AND version = $2 \
+           AND expiry_date >= CURRENT_DATE AND BTRIM(requested_by) <> BTRIM($3) \
+         RETURNING {EXCEPTION_COLUMNS}"
+    ))
+    .bind(exception_id)
+    .bind(expected_version)
+    .bind(approved_by.trim())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(approved) = approved else {
+        return Ok(ApproveExceptionOutcome::Conflict);
+    };
     sqlx::query(
-        "UPDATE firmware_records \
-         SET compliance_status = 'NonCompliant', updated_at = NOW() \
+        "UPDATE firmware_records SET compliance_status = 'Exception', updated_at = NOW() \
          WHERE id = $1",
     )
-    .bind(&device_id)
-    .execute(&mut *tx)
+    .bind(&approved.device_id)
+    .execute(&mut *conn)
     .await?;
+    Ok(ApproveExceptionOutcome::Approved(approved.into_model()?))
+}
 
-    tx.commit().await?;
-
-    Ok(Some(device_id))
+/// Revoke one currently Approved exception without deleting its evidence. The
+/// underlying device status is recomputed under the same DB date and transaction.
+pub async fn revoke_exception(
+    conn: &mut PgConnection,
+    exception_id: &str,
+) -> Result<RevokeExceptionOutcome, sqlx::Error> {
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM firmware_exceptions WHERE id = $1")
+            .bind(exception_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(device_id) = device_id else {
+        return Ok(RevokeExceptionOutcome::NotFound);
+    };
+    let Some(mut device) = get_device_for_update(conn, &device_id).await? else {
+        return Err(engine_error(
+            "firmware exception parent device is missing".into(),
+        ));
+    };
+    let row: Option<FirmwareExceptionRow> = sqlx::query_as(&format!(
+        "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(exception_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Ok(RevokeExceptionOutcome::NotFound);
+    };
+    if row.status != "Approved" {
+        return Ok(RevokeExceptionOutcome::Conflict);
+    }
+    let revoked: FirmwareExceptionRow = sqlx::query_as(&format!(
+        "UPDATE firmware_exceptions \
+         SET status = 'Revoked', version = version + 1 \
+         WHERE id = $1 AND status = 'Approved' AND version = $2 \
+         RETURNING {EXCEPTION_COLUMNS}"
+    ))
+    .bind(exception_id)
+    .bind(row.version)
+    .fetch_one(&mut *conn)
+    .await?;
+    let today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        .fetch_one(&mut *conn)
+        .await?;
+    device.compliance_status =
+        ryuki_engine::firmware_lifecycle::calculated_status_with_exception_at(&device, None, today)
+            .map_err(engine_error)?;
+    sqlx::query(
+        "UPDATE firmware_records \
+         SET compliance_status = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(&device.id)
+    .bind(device.compliance_status.to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(RevokeExceptionOutcome::Revoked {
+        exception: revoked.into_model()?,
+        device: Box::new(device),
+    })
 }
 
 // ─── DB integration tests ─────────────────────────────────────────────────────
@@ -392,7 +620,8 @@ pub async fn revoke_exception(
 #[cfg(test)]
 mod firmware_lifecycle_db_tests {
     use super::*;
-    use ryuki_engine::firmware_lifecycle::ComplianceStatus;
+    use crate::database::DB_TEST_SERIAL;
+    use ryuki_engine::firmware_lifecycle::{ComplianceStatus, FirmwareExceptionStatus};
 
     async fn test_pool() -> Option<PgPool> {
         let url = match std::env::var("RYUKI_DATABASE_URL") {
@@ -413,6 +642,7 @@ mod firmware_lifecycle_db_tests {
 
     #[tokio::test]
     async fn test_list_devices_returns_9_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -441,6 +671,7 @@ mod firmware_lifecycle_db_tests {
 
     #[tokio::test]
     async fn test_get_device_by_id_and_absent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -461,6 +692,7 @@ mod firmware_lifecycle_db_tests {
 
     #[tokio::test]
     async fn test_recalculate_compliance_corrects_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -476,10 +708,12 @@ mod firmware_lifecycle_db_tests {
         .await
         .expect("force wrong status");
 
-        let updated = recalculate_compliance(&pool, "fw-defra-srv-001")
+        let mut tx = pool.begin().await.expect("begin recalc transaction");
+        let updated = recalculate_compliance(&mut tx, "fw-defra-srv-001")
             .await
             .expect("recalculate_compliance failed")
             .expect("fw-defra-srv-001 must exist");
+        tx.commit().await.expect("commit recalc transaction");
         assert_eq!(
             updated.compliance_status,
             ComplianceStatus::Compliant,
@@ -496,101 +730,211 @@ mod firmware_lifecycle_db_tests {
         assert_eq!(stored, "Compliant");
 
         // Absent id returns None (not an error).
-        let absent = recalculate_compliance(&pool, "fw-nonexistent")
+        let mut tx = pool.begin().await.expect("begin absent transaction");
+        let absent = recalculate_compliance(&mut tx, "fw-nonexistent")
             .await
             .expect("recalculate for absent id must not error");
+        tx.rollback().await.expect("rollback absent transaction");
         assert!(absent.is_none(), "absent id must return None");
     }
 
     #[tokio::test]
-    async fn test_request_exception_sets_exception_and_inserts_row() {
+    async fn test_request_requires_distinct_checker_before_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
         // Use a NonCompliant device for a clean exception request.
+        let mut tx = pool.begin().await.expect("begin request transaction");
         let result = request_exception(
-            &pool,
+            &mut tx,
             "fw-gblon-srv-001",
             "Vendor image pending staged validation",
-            "netops.lead",
+            "firmware-maker",
             14,
         )
         .await
         .expect("request_exception failed");
-
-        assert!(
-            result.is_some(),
-            "request_exception must return Some for known device"
-        );
-        let exc = result.unwrap();
-        assert_eq!(exc.device_id, "fw-gblon-srv-001");
-        assert!(
-            exc.id.starts_with("fwex-"),
-            "exception id must start with fwex-"
-        );
-
-        // Device must now be Exception.
-        let device = get_device(&pool, "fw-gblon-srv-001")
-            .await
-            .expect("get_device failed")
-            .expect("device must exist");
-        assert_eq!(device.compliance_status, ComplianceStatus::Exception);
-
-        // Cleanup: revoke the exception to restore state.
-        let revoked = revoke_exception(&pool, &exc.id)
-            .await
-            .expect("revoke_exception failed");
-        assert!(revoked.is_some(), "revoke must succeed");
-
-        // Device restored to NonCompliant.
-        let restored = get_device(&pool, "fw-gblon-srv-001")
-            .await
-            .expect("get_device failed")
-            .expect("device must exist after revoke");
-        assert_eq!(restored.compliance_status, ComplianceStatus::NonCompliant);
-    }
-
-    #[tokio::test]
-    async fn test_revoke_exception_deletes_and_sets_noncompliant() {
-        let Some(pool) = test_pool().await else {
-            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
-            return;
+        let RequestExceptionOutcome::Created(exc) = result else {
+            panic!("known device must create a pending request: {result:?}");
         };
-        // First request an exception on a fresh device.
-        let exc = request_exception(
-            &pool,
-            "fw-deber-fw-001",
-            "Rollback validation required",
-            "platform.owner",
-            7,
-        )
-        .await
-        .expect("request_exception failed")
-        .expect("must return exception");
+        tx.commit().await.expect("commit pending request");
+        assert_eq!(exc.device_id, "fw-gblon-srv-001");
+        assert_eq!(exc.requested_by, "firmware-maker");
+        assert_eq!(exc.approved_by, None);
+        assert_eq!(exc.status, FirmwareExceptionStatus::Pending);
+        assert_eq!(exc.version, 1);
 
-        // Revoke it.
-        let device_id = revoke_exception(&pool, &exc.id)
-            .await
-            .expect("revoke_exception failed");
-        assert_eq!(device_id, Some("fw-deber-fw-001".to_string()));
-
-        // Device must be NonCompliant.
-        let device = get_device(&pool, "fw-deber-fw-001")
+        // A request alone never grants authority or changes the device cache.
+        let device = get_device(&pool, "fw-gblon-srv-001")
             .await
             .expect("get_device failed")
             .expect("device must exist");
         assert_eq!(device.compliance_status, ComplianceStatus::NonCompliant);
 
-        // Absent exception returns None.
-        let absent = revoke_exception(&pool, "fwex-nonexistent")
+        // The maker cannot approve their own request.
+        let mut tx = pool.begin().await.expect("begin self-approval transaction");
+        let self_approval = approve_exception(&mut tx, &exc.id, 1, "firmware-maker")
             .await
-            .expect("revoke for absent id must not error");
-        assert!(absent.is_none(), "absent exception id must return None");
+            .expect("self approval result");
+        assert!(matches!(
+            self_approval,
+            ApproveExceptionOutcome::SelfApproval
+        ));
+        tx.rollback().await.expect("roll back denied self approval");
+
+        // A distinct checker can approve at the current CAS version.
+        let mut tx = pool.begin().await.expect("begin approval transaction");
+        let approved = approve_exception(&mut tx, &exc.id, 1, "firmware-checker")
+            .await
+            .expect("cross-principal approval result");
+        let ApproveExceptionOutcome::Approved(approved) = approved else {
+            panic!("distinct checker must approve: {approved:?}");
+        };
+        tx.commit().await.expect("commit approval");
+        assert_eq!(approved.status, FirmwareExceptionStatus::Approved);
+        assert_eq!(approved.approved_by.as_deref(), Some("firmware-checker"));
+        assert_eq!(approved.version, 2);
+        let active = get_device(&pool, "fw-gblon-srv-001")
+            .await
+            .expect("read active device")
+            .expect("device exists");
+        assert_eq!(active.compliance_status, ComplianceStatus::Exception);
+
+        let mut tx = pool.begin().await.expect("begin cleanup revoke");
+        let revoked = revoke_exception(&mut tx, &exc.id)
+            .await
+            .expect("revoke approved exception");
+        assert!(matches!(revoked, RevokeExceptionOutcome::Revoked { .. }));
+        tx.commit().await.expect("commit cleanup revoke");
+        sqlx::query("SELECT purge_firmware_exceptions_for_maintenance($1)")
+            .bind(&exc.device_id)
+            .execute(&pool)
+            .await
+            .expect("purge test exception history as schema owner");
     }
 
     #[tokio::test]
-    async fn test_list_active_exceptions_returns_seeded() {
+    async fn test_approval_is_cas_safe_under_concurrency() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin concurrent fixture");
+        let outcome = request_exception(
+            &mut tx,
+            "fw-deber-fw-001",
+            "Concurrent decision validation",
+            "concurrent-maker",
+            7,
+        )
+        .await
+        .expect("request fixture");
+        let RequestExceptionOutcome::Created(exc) = outcome else {
+            panic!("fixture request must be created: {outcome:?}");
+        };
+        tx.commit().await.expect("commit concurrent fixture");
+
+        let approve_once = |pool: PgPool, id: String, checker: &'static str| async move {
+            let mut tx = pool.begin().await.expect("begin competing approval");
+            let outcome = approve_exception(&mut tx, &id, 1, checker)
+                .await
+                .expect("competing approval result");
+            tx.commit().await.expect("commit competing approval");
+            outcome
+        };
+        let (first, second) = tokio::join!(
+            approve_once(pool.clone(), exc.id.clone(), "checker-a"),
+            approve_once(pool.clone(), exc.id.clone(), "checker-b")
+        );
+        let approved_count = [&first, &second]
+            .into_iter()
+            .filter(|outcome| matches!(outcome, ApproveExceptionOutcome::Approved(_)))
+            .count();
+        let conflict_count = [&first, &second]
+            .into_iter()
+            .filter(|outcome| matches!(outcome, ApproveExceptionOutcome::Conflict))
+            .count();
+        assert_eq!(approved_count, 1, "exactly one checker wins the CAS");
+        assert_eq!(conflict_count, 1, "the stale checker is rejected");
+
+        let mut tx = pool.begin().await.expect("begin concurrent cleanup");
+        let _ = revoke_exception(&mut tx, &exc.id).await;
+        tx.commit().await.expect("commit concurrent cleanup");
+        sqlx::query("SELECT purge_firmware_exceptions_for_maintenance($1)")
+            .bind(&exc.device_id)
+            .execute(&pool)
+            .await
+            .expect("purge concurrent fixture as schema owner");
+    }
+
+    #[tokio::test]
+    async fn test_database_expiry_boundary_is_inclusive() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let device_id = format!("fw-expiry-boundary-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO firmware_records \
+                (id, device_type, vendor, model, current_version, minimum_version, \
+                 latest_version, eol_date, site, compliance_status) \
+             VALUES ($1, 'Server', 'TestVendor', 'TestModel', '1.0', '2.0', '2.0', \
+                     to_char(CURRENT_DATE + 365, 'YYYY-MM-DD'), 'TEST', 'NonCompliant')",
+        )
+        .bind(&device_id)
+        .execute(&pool)
+        .await
+        .expect("seed boundary device");
+
+        // The public validator requires at least one day. This repository-level
+        // fixture deliberately uses zero so expiry_date == CURRENT_DATE and
+        // proves the database predicate treats the final date as inclusive.
+        let mut tx = pool.begin().await.expect("begin boundary request");
+        let requested = request_exception(
+            &mut tx,
+            &device_id,
+            "Inclusive expiry boundary",
+            "boundary-maker",
+            0,
+        )
+        .await
+        .expect("create boundary request");
+        let RequestExceptionOutcome::Created(exception) = requested else {
+            panic!("boundary request must be created: {requested:?}");
+        };
+        let approved = approve_exception(&mut tx, &exception.id, 1, "boundary-checker")
+            .await
+            .expect("approve at inclusive boundary");
+        assert!(matches!(approved, ApproveExceptionOutcome::Approved(_)));
+        tx.commit().await.expect("commit boundary approval");
+
+        let active = list_active_exceptions(&pool)
+            .await
+            .expect("list boundary authority");
+        assert!(active.iter().any(|row| row.id == exception.id));
+
+        let mut tx = pool.begin().await.expect("begin boundary cleanup");
+        let _ = revoke_exception(&mut tx, &exception.id).await;
+        tx.commit().await.expect("commit boundary cleanup");
+        sqlx::query("SELECT purge_firmware_exceptions_for_maintenance($1)")
+            .bind(&device_id)
+            .execute(&pool)
+            .await
+            .expect("purge boundary exception history as schema owner");
+        sqlx::query("DELETE FROM firmware_records WHERE id = $1")
+            .bind(&device_id)
+            .execute(&pool)
+            .await
+            .expect("delete boundary fixture");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_rows_are_never_active_authority() {
+        let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -598,14 +942,27 @@ mod firmware_lifecycle_db_tests {
         let exceptions = list_active_exceptions(&pool)
             .await
             .expect("list_active_exceptions failed");
-        // Seeded exception fwex-gblon-crac-001 has expiry = today+21 days, so it's active.
         assert!(
-            !exceptions.is_empty(),
-            "must have at least the seeded active exception"
+            exceptions
+                .iter()
+                .all(|exception| exception.status == FirmwareExceptionStatus::Approved),
+            "only explicitly approved rows can be active"
         );
-        assert!(
-            exceptions.iter().any(|e| e.id == "fwex-gblon-crac-001"),
-            "seeded exception fwex-gblon-crac-001 must be active"
-        );
+        assert!(!exceptions
+            .iter()
+            .any(|exception| exception.id == "fwex-gblon-crac-001"));
+
+        let legacy_status: String = sqlx::query_scalar(
+            "SELECT status FROM firmware_exceptions WHERE id = 'fwex-gblon-crac-001'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read migrated legacy status");
+        assert_eq!(legacy_status, "Legacy");
+        let device = get_device(&pool, "fw-gblon-crac-001")
+            .await
+            .expect("read legacy device")
+            .expect("legacy device exists");
+        assert_ne!(device.compliance_status, ComplianceStatus::Exception);
     }
 }

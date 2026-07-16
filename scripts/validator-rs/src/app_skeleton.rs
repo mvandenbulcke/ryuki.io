@@ -288,7 +288,7 @@ const WORKSPACE_DETAIL_REQUIREMENTS: &[WorkspaceDetailRequirement] = &[
         fallbacks: &[
             "PortalSecretReferenceSnapshot::static_dry_run()",
             "snapshot.secret_references",
-            "data-live-cli-execution-allowed=live_cli_execution_allowed",
+            "data-live-provider-actions-allowed=live_provider_actions_allowed",
             "data-provider-calls-allowed=provider_calls_allowed",
             "data-secret-values-allowed=secret_values_allowed",
             "data-provider-paths-allowed=provider_paths_allowed",
@@ -296,7 +296,7 @@ const WORKSPACE_DETAIL_REQUIREMENTS: &[WorkspaceDetailRequirement] = &[
         ],
         safe_fields: &[
             "safe_summary",
-            "live_cli_execution_allowed",
+            "live_provider_actions_allowed",
             "value_exposure_allowed",
             "provider_path_exposure_allowed",
         ],
@@ -489,11 +489,44 @@ const DASHBOARD_CARDS: &[&str] = &[
     "Monitoring gaps",
     "Stale data",
 ];
-const ALLOWED_INTERNAL_URLS: &[&str] = &[
-    "http://platform-api:8080/api/",
-    "http://localhost:18080/api/",
-    "http://+:8080",
+#[derive(Clone, Copy)]
+struct AllowedUri {
+    scheme: &'static str,
+    host: &'static str,
+    port: u16,
+    path: &'static str,
+}
+
+const ALLOWED_INTERNAL_URLS: &[AllowedUri] = &[
+    AllowedUri {
+        scheme: "http",
+        host: "platform-api",
+        port: 8080,
+        path: "/api/",
+    },
+    AllowedUri {
+        scheme: "http",
+        host: "localhost",
+        port: 18080,
+        path: "/api/",
+    },
+    AllowedUri {
+        scheme: "http",
+        host: "+",
+        port: 8080,
+        path: "",
+    },
 ];
+// This is the one fail-closed development origin documented by the portal
+// image and README. It is accepted only as an exact, delimited value; paths,
+// queries, fragments, credentials, other ports, and non-loopback hosts remain
+// subject to the prohibited-value scan.
+const ALLOWED_LOOPBACK_ORIGINS: &[AllowedUri] = &[AllowedUri {
+    scheme: "http",
+    host: "127.0.0.1",
+    port: 8080,
+    path: "",
+}];
 
 #[derive(Debug, Deserialize)]
 struct Context {
@@ -1004,7 +1037,7 @@ fn validate_portal(
         "Static catalog source",
         "Request forms aligned",
         "Secret-reference readiness",
-        "CLI execution blocked",
+        "Provider actions blocked",
         "Audit-safe workflows",
         "Approval gates",
         "Activity queue",
@@ -1349,8 +1382,9 @@ fn validate_portal(
             && dashboard_view_code_block.contains("secret_reference_snapshot.secret_references")
             && dashboard_view_code_block.contains("secret_references_resource()")
             && dashboard_view_code_block.contains("data-secret-reference-readiness=")
-            && dashboard_view_code_block
-                .contains("data-live-cli-execution-allowed=secret_live_cli_execution_allowed")
+            && dashboard_view_code_block.contains(
+                "data-live-provider-actions-allowed=secret_live_provider_actions_allowed",
+            )
             && dashboard_view_code_block
                 .contains("data-provider-calls-allowed=secret_provider_calls_allowed")
             && dashboard_view_code_block
@@ -1778,7 +1812,7 @@ fn validate_portal(
             && !active_server_boundary_code.contains("raw_logs_allowed: true")
             && !active_server_boundary_code.contains("raw_route_state_allowed: true")
             && !active_server_boundary_code.contains("raw_evidence_payloads_allowed: true")
-            && !active_server_boundary_code.contains("live_cli_execution_allowed: true")
+            && !active_server_boundary_code.contains("live_provider_actions_allowed: true")
             && !active_server_boundary_code.contains("provider_paths_allowed: true")
             && !active_server_boundary_code.contains("file_import_execution_allowed: true")
             && !active_server_boundary_code.contains("file_export_execution_allowed: true")
@@ -1975,8 +2009,13 @@ fn validate_portal(
             && active_server_boundary_code.contains("secret_reference_catalog_fallback()")
             && active_server_boundary_code.contains("secret_reference_fallbacks()")
             && active_server_boundary_code.contains("secret_references_path: reference_plan.path")
+            && active_server_boundary_code.contains("provider_model:")
+            && active_server_boundary_code.contains("management_interface:")
+            && active_server_boundary_code.contains("fallback_policy:")
+            && active_server_boundary_code.contains("admitted_provider_classes:")
+            && active_server_boundary_code.contains("capability_interfaces:")
             && active_server_boundary_code.contains("configured_for_production:")
-            && active_server_boundary_code.contains("live_cli_execution_allowed: false")
+            && active_server_boundary_code.contains("live_provider_actions_allowed: false")
             && active_server_boundary_code.contains("provider_calls_allowed: false")
             && active_server_boundary_code.contains("secret_values_allowed: false")
             && active_server_boundary_code.contains("provider_paths_allowed: false"),
@@ -2134,13 +2173,17 @@ fn validate_portal(
         "handover_state",
         "decision",
         "safe_summary",
-        "primary_provider",
-        "management_cli",
-        "future_providers",
+        "provider_model",
+        "management_interface",
+        "fallback_policy",
+        "admitted_provider_classes",
+        "capability_interfaces",
         "configured_for_production",
+        "capability",
+        "interface",
         "rotation_state",
         "consumer_scope",
-        "live_cli_execution_allowed",
+        "live_provider_actions_allowed",
         "value_exposure_allowed",
         "provider_path_exposure_allowed",
         "redaction_required",
@@ -2214,11 +2257,11 @@ fn validate_portal(
     );
     expect(
         active_models.contains("configured_for_production: false")
-            && active_models.contains("live_cli_execution_allowed: false")
+            && active_models.contains("live_provider_actions_allowed: false")
             && active_models.contains("value_exposure_allowed: false")
             && active_models.contains("provider_path_exposure_allowed: false"),
         errors,
-        "portal secret-reference fallback must block live CLI execution and value/path exposure",
+        "portal secret-reference fallback must block live provider actions and value/path exposure",
     );
     expect(
         active_models.contains("redaction_required: true")
@@ -2259,7 +2302,8 @@ fn validate_portal(
         "portal Dockerfile must build the full-stack Leptos app",
     );
     expect(
-        dockerfile.contains("FROM debian:bookworm-slim AS runtime")
+        dockerfile.contains("FROM debian:bookworm-slim@sha256:")
+            && dockerfile.contains(" AS runtime")
             && dockerfile.contains("CMD [\"/app/ryuki-portal-ui\"]")
             && dockerfile.contains("LEPTOS_SITE_ROOT=/app/site")
             && dockerfile.contains("RYUKI_PORTAL_EXECUTION_MODE=static-dry-run"),
@@ -2294,12 +2338,7 @@ fn validate_text(path: &str, text: &str, errors: &mut Vec<String>) {
             continue;
         }
 
-        let mut scannable = line.to_string();
-        for allowed in ALLOWED_INTERNAL_URLS {
-            scannable = scannable.replace(allowed, "");
-        }
-
-        if contains_prohibited_value(&scannable) {
+        if contains_prohibited_value(line) {
             errors.push(format!("{path}:{} contains prohibited value", index + 1));
         }
     }
@@ -2706,7 +2745,7 @@ fn contains_uri_scheme(line: &str) -> bool {
                 .next_back()
                 .map(|value| !value.is_ascii_alphanumeric() && value != '_')
                 .unwrap_or(true);
-        if boundary_ok
+        let valid_scheme = boundary_ok
             && scheme
                 .chars()
                 .next()
@@ -2714,13 +2753,69 @@ fn contains_uri_scheme(line: &str) -> bool {
                 .unwrap_or(false)
             && scheme
                 .chars()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '.' | '-'))
-        {
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '.' | '-'));
+        if valid_scheme && !allowed_uri_at(line, scheme_start) {
             return true;
         }
         search_from = marker + 3;
     }
     false
+}
+
+fn allowed_uri_at(line: &str, start: usize) -> bool {
+    let Some((scheme, host, port, path)) = parse_uri_at(line, start) else {
+        return false;
+    };
+    ALLOWED_INTERNAL_URLS
+        .iter()
+        .chain(ALLOWED_LOOPBACK_ORIGINS)
+        .any(|allowed| {
+            scheme == allowed.scheme
+                && host == allowed.host
+                && port == allowed.port
+                && path == allowed.path
+        })
+}
+
+fn parse_uri_at(line: &str, start: usize) -> Option<(&str, &str, u16, &str)> {
+    let remainder = line.get(start..)?;
+    let end = remainder
+        .char_indices()
+        .find_map(|(index, value)| {
+            (value.is_whitespace()
+                || matches!(
+                    value,
+                    '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                ))
+            .then_some(index)
+        })
+        .unwrap_or(remainder.len());
+    let candidate = remainder.get(..end)?;
+    let (scheme, authority_and_path) = candidate.split_once("://")?;
+    if scheme.is_empty()
+        || authority_and_path.is_empty()
+        || authority_and_path.contains('@')
+        || authority_and_path.contains('?')
+        || authority_and_path.contains('#')
+        || authority_and_path.contains('\\')
+    {
+        return None;
+    }
+
+    let (authority, path) = authority_and_path
+        .find('/')
+        .map(|index| (&authority_and_path[..index], &authority_and_path[index..]))
+        .unwrap_or((authority_and_path, ""));
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty()
+        || host.contains(':')
+        || port.is_empty()
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    Some((scheme, host, port, path))
 }
 
 fn contains_private_ipv4(line: &str) -> bool {
@@ -2807,6 +2902,65 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prohibited_value_scan_allows_only_exact_documented_loopback_origin() {
+        let mut exact_errors = Vec::new();
+        validate_text(
+            "portal/portal-ui/Dockerfile",
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080 \\",
+            &mut exact_errors,
+        );
+        assert!(
+            exact_errors.is_empty(),
+            "exact loopback origin: {exact_errors:?}"
+        );
+
+        for unsafe_value in [
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080/admin",
+            r"ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080\admin",
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=http://192.168.1.5:8080",
+            "ENV RYUKI_PORTAL_PUBLIC_ORIGIN=https://portal.example.test",
+            concat!("password", "=http://127.0.0.1:8080"),
+        ] {
+            let mut errors = Vec::new();
+            validate_text("portal/portal-ui/Dockerfile", unsafe_value, &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("prohibited value")),
+                "unsafe origin must remain prohibited: {unsafe_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_url_allowlist_compares_structural_components_exactly() {
+        for safe in [
+            "API_BASE=http://platform-api:8080/api/",
+            "API_BASE=http://localhost:18080/api/",
+            "LISTENER=http://+:8080",
+        ] {
+            assert!(
+                !contains_uri_scheme(safe),
+                "exact internal URI was rejected: {safe}"
+            );
+        }
+
+        for unsafe_value in [
+            "LISTENER=http://+:8080@attacker.invalid/",
+            "LISTENER=http://+:8080/",
+            "API_BASE=http://platform-api:8080/api/admin",
+            "API_BASE=http://platform-api:8080/api/?token=attacker",
+            "API_BASE=http://localhost:18080/api/#fragment",
+            "API_BASE=http://localhost:18080.evil/api/",
+        ] {
+            assert!(
+                contains_uri_scheme(unsafe_value),
+                "structurally different URI was accepted: {unsafe_value}"
+            );
+        }
+    }
 
     #[test]
     fn root_context_portal_dockerfile_is_accepted() {

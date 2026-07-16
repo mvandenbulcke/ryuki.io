@@ -9,6 +9,8 @@ const REQUIRED_ENDPOINTS: &[&str] = &[
     "/api/catalog/evidence-manifest",
     "/api/catalog/secret-references",
 ];
+const ACCESS_CONTROL_ENDPOINT: &str = "/api/catalog/access-control";
+const ACCESS_CONTROL_DYNAMIC_ROLES_EXPRESSION: &str = "access_control_roles_json()";
 
 #[derive(Debug, Deserialize)]
 struct Context {
@@ -59,7 +61,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
     // `validate_program_text`).
     let mut scan_scope = serde_json::Map::new();
     for endpoint in REQUIRED_ENDPOINTS {
-        if let Some(payload) = crate::rust_contract::handler_payload(&context.program, endpoint) {
+        if let Some(payload) = governance_handler_payload(&context.program, endpoint) {
             scan_scope.insert((*endpoint).to_string(), payload);
         }
     }
@@ -125,12 +127,20 @@ fn validate_program_text(
 ) {
     let mut payloads = std::collections::BTreeMap::new();
     for endpoint in REQUIRED_ENDPOINTS {
-        if let Some(payload) = crate::rust_contract::validate_static_seed_contract(
-            program,
-            endpoint,
-            &format!("API missing governance catalog endpoint {endpoint}"),
-            errors,
-        ) {
+        let missing = format!("API missing governance catalog endpoint {endpoint}");
+        let payload = if *endpoint == ACCESS_CONTROL_ENDPOINT {
+            crate::rust_contract::validate_static_seed_contract_with_dynamic_array_field(
+                program,
+                endpoint,
+                &missing,
+                "roles",
+                ACCESS_CONTROL_DYNAMIC_ROLES_EXPRESSION,
+                errors,
+            )
+        } else {
+            crate::rust_contract::validate_static_seed_contract(program, endpoint, &missing, errors)
+        };
+        if let Some(payload) = payload {
             payloads.insert(*endpoint, payload);
         }
     }
@@ -150,10 +160,12 @@ fn validate_program_text(
             "API access-control endpoint must keep entraGroupsConfigured false",
         );
         expect(
-            access.get("requiredProductionProvider").and_then(Value::as_str)
-                == Some("Microsoft Entra ID"),
+            access
+                .get("requiredProductionProvider")
+                .and_then(Value::as_str)
+                == Some("Versioned authenticator registry (generic OIDC; Entra is one provider)"),
             errors,
-            "API access-control endpoint must name Microsoft Entra ID as required production provider",
+            "API access-control endpoint must name the provider-neutral authenticator registry",
         );
         expect(
             access.get("executionGuards").is_some_and(Value::is_array),
@@ -254,6 +266,19 @@ fn validate_program_text(
     }
 }
 
+fn governance_handler_payload(program: &str, endpoint: &str) -> Option<Value> {
+    if endpoint == ACCESS_CONTROL_ENDPOINT {
+        crate::rust_contract::handler_payload_with_dynamic_array_field(
+            program,
+            endpoint,
+            "roles",
+            ACCESS_CONTROL_DYNAMIC_ROLES_EXPRESSION,
+        )
+    } else {
+        crate::rust_contract::handler_payload(program, endpoint)
+    }
+}
+
 /// Collects the `id` string of each object in a handler payload's array field.
 fn payload_object_ids(
     payloads: &std::collections::BTreeMap<&str, Value>,
@@ -312,9 +337,13 @@ fn validate_access_control_endpoint(block: &str, errors: &mut Vec<String>) {
         "API access-control endpoint must keep entraGroupsConfigured false",
     );
     expect(
-        exact_string_assignment(block, "requiredProductionProvider", "Microsoft Entra ID"),
+        exact_string_assignment(
+            block,
+            "requiredProductionProvider",
+            "Versioned authenticator registry (generic OIDC; Entra is one provider)",
+        ),
         errors,
-        "API access-control endpoint must name Microsoft Entra ID as required production provider",
+        "API access-control endpoint must name the provider-neutral authenticator registry",
     );
     expect(
         shorthand_field(block, "executionGuards"),

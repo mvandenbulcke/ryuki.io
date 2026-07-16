@@ -29,7 +29,7 @@ Catalog files define safe seed data for requestable offerings, site facts, and f
 | [Evidence Redaction Contract](evidence-redaction-contract.yaml) | Draft static evidence redaction, export readiness, prohibited content, retention, and evidence reference contract. |
 | [Evidence Export Retention Contract](evidence-export-retention-contract.yaml) | Draft static evidence export package, retention, and metadata-only audit search contract. |
 | [Evidence Compliance Dashboard Contract](evidence-compliance-dashboard-contract.yaml) | Draft static aggregate evidence compliance dashboard, control status, trend, and redaction reference contract. |
-| [Secret Reference Catalog](secret-reference-catalog.yaml) | Draft Vaultwarden runtime reference kinds, management CLI, required fields, readiness states, rotation policies, and prohibited fields. |
+| [Secret Reference Catalog](secret-reference-catalog.yaml) | Draft provider-neutral capability-registry contract for typed references, admitted provider classes, independent resolution/publication/materialization capabilities, readiness, rotation, and prohibited fields. |
 | [Adapter Readiness Catalog](adapter-readiness-catalog.yaml) | Draft blocked-by-default adapter readiness contracts for VMware, Hyper-V, Proxmox, Veeam, Zabbix, and ServiceNow. |
 | [Adapter Readiness Matrix Contract](adapter-readiness-matrix-contract.yaml) | Draft static adapter readiness dimensions, states, guards, blockers, and evidence contract. |
 | [Adapter Contract Test Contract](adapter-contract-test-contract.yaml) | Draft mock-only adapter contract test targets, fixtures, guards, blockers, and evidence. |

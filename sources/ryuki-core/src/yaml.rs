@@ -3,6 +3,10 @@ use std::collections::BTreeSet;
 pub fn validate_yaml_duplicate_keys_text(text: &str, path: &str, errors: &mut Vec<String>) {
     let mut stack: Vec<(usize, BTreeSet<String>)> = Vec::new();
     for (line_index, line) in text.lines().enumerate() {
+        if is_yaml_document_marker(line) {
+            stack.clear();
+            continue;
+        }
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -43,6 +47,13 @@ pub fn validate_yaml_duplicate_keys_text(text: &str, path: &str, errors: &mut Ve
             ));
         }
     }
+}
+
+fn is_yaml_document_marker(line: &str) -> bool {
+    ["---", "..."].into_iter().any(|marker| {
+        line.strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })
 }
 
 fn yaml_key(trimmed_line: &str) -> Option<&str> {
@@ -159,5 +170,23 @@ mod tests {
             errors.is_empty(),
             "list entries are independent scopes: {errors:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_keys_are_scoped_to_one_yaml_document() {
+        let yaml = "spec:\n  name: first\n---\nspec:\n  name: second\n";
+        let errors = collect_errors(yaml);
+        assert!(
+            errors.is_empty(),
+            "all document-local scopes reset: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn indented_block_scalar_marker_does_not_reset_document_scope() {
+        let yaml = "kind: ConfigMap\ndata:\n  payload: |-\n    ---\nkind: Secret\n";
+        let errors = collect_errors(yaml);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("kind"));
     }
 }

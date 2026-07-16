@@ -48,9 +48,14 @@ window, not just to a backup boundary.
 3. The backup S3 credentials secret (`ryuki-platform-db-backup-s3`) is present
    in the namespace (synchronized by the Vault Secrets Operator).
 4. You have confirmed the object store is reachable and lists recent backups.
-5. **Stop application writers** before an in-place recovery: scale the platform
-   API down so it does not write during the recovery, and so it reconnects to
-   the recovered primary cleanly.
+5. **Stop every application generation** before recovery: withdraw traffic,
+   scale every API replica to zero, stop schedulers, workers, agents, migration
+   jobs, and operator-triggered execution, and wait for all database sessions
+   and transactions to drain. Record the exact database backup/WAL boundary and
+   the matching application image digest. Follow
+   `docs/runbooks/database-migration-cutover.md`; if interactive authority may
+   roll back, also follow
+   `docs/runbooks/interactive-human-authority-cutover.md`.
 
 ```bash
 # Confirm the operator and current cluster state.
@@ -120,13 +125,25 @@ cluster from the object store and replaying WAL up to the target time.
    ```
 
 4. Validate the recovered data (row counts, the specific records that were
-   damaged, latest sane timestamps).
+   damaged, latest sane timestamps). Read back the exact `_sqlx_migrations`
+   version/checksum/dirty inventory and select only the binary digest that
+   matches that restored schema. An unexpected, missing, dirty, or
+   checksum-mismatched ledger is a stop condition.
 
-5. Cut over: repoint the platform API at the recovered cluster's read/write
-   service, or promote the recovery cluster to replace the original. Then scale
-   the application writers back up.
+5. Before cutover, invalidate persisted sessions and API tokens, API-side
+   authority/verifier caches, and every applicable upstream credential/token
+   generation required by the interactive-authority rollback runbook. Obtain
+   upstream readback and wait the maximum issued-token lifetime when revocation
+   is unavailable.
 
-6. **Re-establish the backup posture on the recovered cluster.** The recovery
+6. Cut over the database endpoint or promote the recovery cluster. Start only
+   the exact matching binary in verify-only mode, prove its embedded migration
+   inventory/checksums match `_sqlx_migrations`, then complete authority and
+   readiness reconciliation before accepting traffic. Re-enable workers only
+   after the API is ready; never run an old binary against a newer restored
+   schema or restore only one half of the database/binary pair.
+
+7. **Re-establish the backup posture on the recovered cluster.** The recovery
    manifest above only declares how to recover FROM the object store
    (`externalClusters`); it does NOT give the new cluster its own
    `spec.backup.barmanObjectStore`, so the recovered cluster is **not backing
@@ -135,7 +152,7 @@ cluster from the object store and replaying WAL up to the target time.
    `ScheduledBackup` (pointed at the new cluster name) before treating recovery
    as complete — otherwise you are running unprotected.
 
-7. Once verified and stable, decommission the damaged original cluster.
+8. Once verified and stable, decommission the damaged original cluster.
 
 ---
 
@@ -200,7 +217,12 @@ so we rebuild from it.
    kubectl apply -f deploy/kubernetes/cloudnativepg/scheduled-backup.yaml
    ```
 
-6. Re-point and scale the platform API back up. Verify end-to-end login and a
+6. Before starting any reader or writer, read back the exact
+   `_sqlx_migrations` version/checksum/dirty inventory, select the matching
+   application image digest, and complete the session/token/cache/upstream
+   credential invalidation required by the two cutover runbooks above. Start
+   only that binary in verify-only mode; prove authority/readiness, then restore
+   traffic and workers in the documented order. Verify end-to-end login and a
    representative read/write path.
 
 ---

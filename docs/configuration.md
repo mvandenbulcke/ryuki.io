@@ -18,7 +18,7 @@ Nested fields use `__` in environment variables. For example, `server.bind_addre
 
 Copy `.env.example` to `.env` for Compose workflows, or export the same variables before running the API directly:
 
-### PostgreSQL
+### PostgreSQL connection
 
 | Variable | Description | Default |
 |---|---|---|
@@ -28,7 +28,7 @@ Copy `.env.example` to `.env` for Compose workflows, or export the same variable
 
 | Variable | Description | Default |
 |---|---|---|
-| `RYUKI_SERVER__BIND_ADDRESS` | API listen address | `0.0.0.0:8080` |
+| `RYUKI_SERVER__BIND_ADDRESS` | API listen address | `127.0.0.1:8080` |
 | `RYUKI_SERVER__REQUEST_TIMEOUT_SECS` | Per-request timeout | `30` |
 | `RYUKI_SERVER__MAX_BODY_SIZE_BYTES` | Maximum request body size | `10485760` |
 | `RYUKI_SERVER__MAX_CONCURRENT_CONNECTIONS` | Connection concurrency limit | `512` |
@@ -41,30 +41,99 @@ Copy `.env.example` to `.env` for Compose workflows, or export the same variable
 | `RYUKI_ENTRA_CLIENT_ID` | App registration client ID | Required for `entra-id` auth |
 | `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL | `https://login.microsoftonline.com` |
 | `RYUKI_ENTRA_REDIRECT_URI` | Browser SSO callback URL, e.g. `https://<host>/api/auth/entra/callback` | Required for the browser sign-in flow; empty leaves bearer-token auth only |
+| `RYUKI_ENTRA_JWKS_TTL_SECS` | Cached JWKS lifetime in seconds (`1..=86400`) | `86400` |
+| `RYUKI_ENTRA_LEEWAY_SECS` | Token `exp`/`nbf` clock leeway in seconds (`0..=300`) | `60` |
 
 Two Entra paths coexist. Bearer-token validation (API callers presenting
 `Authorization: Bearer <jwt>`) needs only tenant + client. The browser
 sign-in flow (OIDC authorization-code with PKCE, the "Sign in with
 Microsoft Entra ID" button) additionally needs `RYUKI_ENTRA_REDIRECT_URI`,
-registered as a redirect URI on the app registration. All three must be
-set for the button to appear; an empty redirect URI keeps bearer-only
-behavior unchanged.
+registered as a **Web** redirect to the server-side API/BFF callback. It is not
+an SPA redirect: the server exchanges the authorization code and establishes
+the browser session. Every Entra-mode launch also requires the runtime-only
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY`, even when it initially uses only bearer
+tokens, so browser sessions cannot later start with an unverifiable credential
+store. An empty redirect URI keeps the browser button disabled.
 
-### Vault (secrets resolver)
+Startup rejects a zero or greater-than-one-day Entra JWKS TTL so a successful
+generation has a meaningful but bounded retirement deadline. It also rejects
+token-clock leeway above five minutes; larger values would materially weaken
+`exp` and `nbf` enforcement. These bounds are validated even before Entra mode
+is enabled, preventing dormant unsafe configuration from becoming active later.
 
-The control plane resolves provider-credential handles through HashiCorp
-Vault when configured; otherwise a mock resolver runs (the development
-default).
+### Generic OIDC (current single-provider flow)
+
+The current release also implements one provider-agnostic confidential OIDC
+Authorization Code + PKCE flow. Set `RYUKI_OIDC__ENABLED=true` and configure all
+of the following; the login and callback routes remain hidden when it is false.
 
 | Variable | Description | Default |
 |---|---|---|
-| `VAULT_ADDR` | Vault server address, e.g. `https://vault.internal:8200` | Unset → mock resolver |
-| `VAULT_TOKEN` | Vault token with read access to the secret paths | Unset → mock resolver |
+| `RYUKI_OIDC__ISSUER` | Exact trusted issuer | Empty; required when enabled |
+| `RYUKI_OIDC__AUTHORIZE_ENDPOINT` | Authorization endpoint | Empty; required when enabled |
+| `RYUKI_OIDC__TOKEN_ENDPOINT` | Token endpoint | Empty; required when enabled |
+| `RYUKI_OIDC__JWKS_URI` | Signing-key endpoint | Empty; required when enabled |
+| `RYUKI_OIDC__CLIENT_ID` | Confidential client identifier | Empty; required when enabled |
+| `RYUKI_OIDC__CLIENT_SECRET` | Runtime-injected confidential client secret | Empty; required when enabled |
+| `RYUKI_OIDC__REDIRECT_URI` | Exact Web callback ending at `/api/auth/oidc/callback` | Empty; required when enabled |
+| `RYUKI_OIDC__SCOPES` | Requested scopes as a JSON string array | `["openid","profile","email"]` |
+| `RYUKI_OIDC__ROLES_CLAIM` | ID-token claim containing platform role values | `roles` |
+
+Issuer, authorization, token, JWKS, and redirect URLs require HTTPS outside
+explicit loopback unit tests. Token and signing-key clients never follow
+redirects, and identity-provider JSON bodies are bounded by the bytes actually
+received before parsing. Cached signing-key generations have a monotonic
+absolute expiry; a failed refresh never revives an expired key. Persisted OIDC
+and Entra browser sessions use `RYUKI_SESSION__COOKIE_MAX_AGE_SECS` as their
+server-side maximum as well as their cookie lifetime.
+
+Enabling this flow also requires PostgreSQL and the persisted-session verifier
+key. It is the implemented bridge toward the
+normative registry, but it is not yet the multi-issuer registry: simultaneous
+providers, discovery-driven configuration, lifecycle/SCIM, WebAuthn emergency
+access, service OAuth profiles, and workload identity remain specification
+work rather than current launch claims.
+
+### Vault (current secrets resolver)
+
+The control plane resolves provider-credential handles through HashiCorp
+Vault when both settings below are configured. Missing configuration fails the
+dependent credential-resolution operation unless **both** the platform auth
+mode (`mock-dry-run` or `static-dry-run`) and the individual connection
+execution mode (`static-dry-run`) explicitly admit the local mock resolver. A
+live connection never selects the mock resolver. Setting only one variable,
+setting either variable blank, using an invalid transport, or configuring Vault
+variables while another `secret_provider` is selected fails process startup.
+
+| Variable | Description | Default |
+|---|---|---|
+| `VAULT_ADDR` | Vault server address, e.g. `https://vault.internal:8200` | Unset → fail closed outside explicit local dry-run |
+| `VAULT_TOKEN` | Vault token with read access to the secret paths | Unset → fail closed outside explicit local dry-run |
+| `RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK` | Development exception for literal loopback HTTP only | `false` |
+| `RYUKI_INTEGRATION__ENCRYPTION_KEY` | 32-byte base64/hex envelope key for persisted integration credentials | Unset; dependent encrypted operations fail |
 
 Credential handles are `<mount>/<path>[#<field>]`, for example
 `secret/ryuki/vcenter#password`. A `#field` selector is required unless the
 secret has exactly one field. Values never appear in logs, errors, or
 evidence.
+
+`VAULT_ADDR` must be HTTPS and may not contain credentials, query text, or a
+fragment. The client disables redirects and ambient proxies. The insecure flag
+admits only a literal loopback IP such as `127.0.0.1` or `::1` for a deliberately
+local proving ground; it never admits `localhost`, a container service name, or
+a private network merely because that network is trusted. Production uses
+authenticated TLS and workload identity or another short-lived bootstrap
+instead of a process-wide static token.
+
+This is the current compatibility adapter. Domain credential dispatch depends
+on the provider-neutral `SecretResolver` capability, while `VAULT_TOKEN` is a
+reusable, process-wide bearer credential and the string handle remains a
+Vault-specific compatibility representation; neither is the production target.
+Production must use a typed provider-qualified secret reference and workload/
+managed identity or another explicitly approved short-lived bootstrap mechanism.
+A missing or unimplemented provider must fail readiness or the dependent
+operation instead of selecting a different adapter. See the
+[secret-management provider contract](architecture/platform-security-boundary.md#pluggable-secret-management-providers).
 
 ### Platform
 
@@ -73,6 +142,61 @@ evidence.
 | `RYUKI_PLATFORM_NAME` | Display name for the platform | `Ryuki Infrastructure Platform` |
 | `RYUKI_PLATFORM_URL` | Public base URL for the API | `http://localhost:18080` |
 | `RYUKI_AUTH_MODE`     | `mock-dry-run`, `static-dry-run`, `entra-id`, or `local` | `mock-dry-run` |
+
+The four primary modes above plus the separately enabled single generic-OIDC
+flow describe the current implementation. The production target
+is a provider registry with one or more generic OpenID Connect issuers, an
+optional OIDC identity broker for SAML/LDAP/AD, a WebAuthn-based emergency
+provider, scoped service credentials, and workload identity. Entra ID remains a
+supported OIDC configuration rather than the only production identity source.
+The current `local` mode uses password-backed sessions and is a development or
+migration facility, not the production emergency-authentication target.
+See the
+[Platform Security Boundary Specification](architecture/platform-security-boundary.md#pluggable-authentication-providers).
+
+### Interactive human authority assignments
+
+Authentication proves a provider-qualified identity; it does not grant Ryuki
+roles or resource reach. Every interactive local, generic OIDC, Entra, and
+future brokered SAML/LDAP or passkey principal requires a durable assignment
+keyed by the stable `(provider, canonical issuer, provider subject)` tuple.
+Assignments carry a monotonic version, an explicit `unknown`, `active`, or
+`revoked` state, a server-owned role allowlist, and independent site and
+environment modes. An active axis is either explicitly `global` with no values
+or `scoped` with a nonempty canonical list. Unknown, revoked, malformed, and
+empty scoped assignments fail closed.
+
+Provider claims are intersected with this assignment at browser-session
+creation and on every direct-bearer admission. Persisted sessions capture the
+exact assignment version and effective role/site/environment intersection;
+assignment changes or revocation synchronously delete matching sessions. The
+short process-local admission cache stores only a one-way authority-key
+fingerprint plus the active assignment version and is never authentication
+evidence without the database join.
+
+For `RYUKI_AUTH_MODE=local`, the startup-owned assignment applies to every
+configured local user and must be explicit:
+
+| Variable | Values | Requirement |
+|---|---|---|
+| `RYUKI_LOCAL_AUTH__SITE_AUTHORITY` | `global` or `scoped` | Required with populated local users; omitted/`unknown` fails startup. |
+| `RYUKI_LOCAL_AUTH__SITE_SCOPE` | Comma-separated canonical site ids | Empty only for explicit `global`; nonempty for `scoped`. |
+| `RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY` | `global` or `scoped` | Required with populated local users; omitted/`unknown` fails startup. |
+| `RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE` | Comma-separated canonical environment ids | Empty only for explicit `global`; nonempty for `scoped`. |
+
+Federated assignments are deliberately not bootstrapped from token roles,
+groups, email, or display name. Migration 182 quarantines existing identities
+as Unknown. A governed assignment source must provision and read back the
+provider-qualified row before sign-in can succeed. Live IdP claim/group
+assignment and readback remain operator-owned trusted-access verification.
+
+Current mock, static-admin, in-memory, and no-database branches exist so isolated
+development and migration tests remain operable. They are not production
+degraded modes. The target production profile requires durable PostgreSQL, an
+approved secret store, and a non-development authenticator; a missing dependency
+fails startup, readiness, or the dependent operation without activating a
+privileged fallback. See
+[configuration and deployment profiles](architecture/platform-security-boundary.md#configuration-and-deployment-profiles).
 
 ## Infrastructure Providers
 
@@ -107,9 +231,57 @@ Most operational settings are grouped under typed nested structs. Use double und
 | `log_extended` | `RYUKI_LOG_EXTENDED__FILE_PATH` | Optional file logging and retention. |
 | `security` | `RYUKI_SECURITY__CONTENT_SECURITY_POLICY` | CSP and optional HSTS settings. |
 | `smtp` | `RYUKI_SMTP__ENABLED` | Email notification transport. |
-| `session` | `RYUKI_SESSION__COOKIE_SECURE` | Session cookie security settings. |
+| `session` | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Dedicated persisted-session verifier key plus cookie security settings. |
 | `retention` | `RYUKI_RETENTION__DAILY_BACKUPS` | Backup retention windows. |
 | `maintenance_window` | `RYUKI_MAINTENANCE_WINDOW__ENABLED` | Scheduled maintenance window metadata. |
+
+### Persisted-session verifier key
+
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` is required before the listener binds
+whenever Local, Entra, or generic OIDC sessions can be minted. Supply at least
+32 random bytes through the selected secret manager or an equivalent
+runtime-only secret injection; do not put the value in a committed TOML, JSON,
+Compose, or Kubernetes manifest. The API stores only an HMAC-SHA256 verifier of
+each 256-bit `rys_...` session token. The administrative session UUID is
+unrelated metadata and cannot authenticate.
+
+`RYUKI_SESSION__FEDERATED_AUTHORITY_MAX_STALENESS_SECS` bounds how long a
+persisted non-local session may authorize without a fresh validated assertion
+or trusted lifecycle heartbeat. It defaults to 900 seconds and cannot exceed
+3600 seconds. Expiry at this bound fails closed and requires fresh identity
+evidence; it does not claim that an IdP lifecycle connector delivered an event.
+
+`RYUKI_SESSION__COOKIE_SECURE=false` is admitted only when
+`RYUKI_PLATFORM_URL` is plain HTTP on a literal loopback host (`localhost`, a
+`127.0.0.0/8` address, or `[::1]`). HTTPS and non-loopback public origins fail
+startup unless Secure cookies remain enabled. This rule is derived from the
+external platform URL rather than the API listener address, so TLS-terminating
+reverse proxies and loopback-published container bridges keep the intended
+policy. When generic OIDC or Entra browser callbacks are configured, their
+redirect URLs must also use loopback HTTP before non-Secure cookie mode is
+admitted.
+
+This release supports one active verifier key. Changing it deliberately
+invalidates all current bearers, so stale rows simply expire or are swept and
+users sign in again. Zero-downtime key rotation requires the planned
+versioned key-id/keyring extension; do not attempt overlap by retaining the old
+UUID-as-bearer behavior.
+
+### Secret-manager target architecture
+
+The current control-plane resolver supports Vault and a development mock; the
+provider enum lists additional intended platforms. The normative target is a
+capability-based adapter registry for HashiCorp Vault, OpenBao, Azure Key Vault,
+AWS Secrets Manager, Google Secret Manager, CyberArk, 1Password Connect,
+Bitwarden Secrets Manager, and future approved plugins. CSI, External Secrets
+Operator, and Vault Secrets Operator are modeled separately as materialization
+controllers rather than being credited with lease-aware resolution capabilities.
+Production adapters authenticate with managed/workload identity and report their
+real versioning, lease, renewal, revocation, wrapping, PKI, and rotation
+capabilities. Unsupported required capabilities fail closed.
+
+See the
+[secret-management provider contract](architecture/platform-security-boundary.md#pluggable-secret-management-providers).
 
 ## Validation
 
@@ -130,7 +302,7 @@ See `docs/entra-app-registration.md` for the full app roles manifest and setup i
 ### Required Entra Configuration
 
 - **App roles**: Defined in the manifest (see `docs/entra-app-registration.md`)
-- **Redirect URI**: SPA (single-page application) for the portal URL
+- **Redirect URI**: Web/server-side callback, for example `https://<host>/api/auth/entra/callback`; do not register the portal as an SPA token recipient
 - **Token configuration**: Access tokens must include the `roles` claim
 - **API permissions**: No delegated permissions required — app roles only
 
@@ -161,4 +333,8 @@ The platform name is configured via `RYUKI_PLATFORM_NAME`. Logo and branding ass
 
 ### Access Control
 
-Access is controlled by Entra ID app roles. The `PlatformAdmin` role grants full administrative access to the portal.
+In the current `entra-id` mode, access is controlled by Entra app-role values
+and `PlatformAdmin` grants full administrative access to the portal. This is a
+transitional provider-specific mapping. The production target accepts verified
+claims from any configured provider, normalizes them into one principal, and
+authorizes typed actions at the platform boundary.

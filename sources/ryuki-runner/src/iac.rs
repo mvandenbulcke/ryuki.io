@@ -314,6 +314,52 @@ pub fn live_secret_var_names(offering_id: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+/// Provider source and exact selected version parsed from the reviewed
+/// offering's embedded Terraform dependency lock. Returning `None` is
+/// fail-closed: unknown offerings, missing/ambiguous provider blocks, or a
+/// malformed lock cannot acquire reviewed-live execution authority.
+pub fn reviewed_live_provider_identity(offering_id: &str) -> Option<(String, String)> {
+    let lock = match offering_id {
+        "linux-server-deployment" => LINUX_SERVER_DEPLOYMENT_LOCK_HCL,
+        "windows-server-deployment" => WINDOWS_SERVER_DEPLOYMENT_LOCK_HCL,
+        _ => return None,
+    };
+
+    let mut provider_source: Option<String> = None;
+    let mut provider_version: Option<String> = None;
+    let mut in_provider = false;
+    for line in lock.lines() {
+        let line = line.trim();
+        if let Some(source) = line
+            .strip_prefix("provider \"")
+            .and_then(|value| value.strip_suffix("\" {"))
+        {
+            if provider_source.is_some() {
+                return None;
+            }
+            provider_source = Some(source.to_string());
+            in_provider = true;
+            continue;
+        }
+        if in_provider && line == "}" {
+            in_provider = false;
+            continue;
+        }
+        if in_provider && line.starts_with("version ") {
+            let version = line
+                .split_once('=')?
+                .1
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')?;
+            if provider_version.replace(version.to_string()).is_some() {
+                return None;
+            }
+        }
+    }
+    provider_source.zip(provider_version)
+}
+
 /// Resolve the IaC bundle for the given offering ID.
 ///
 /// Returns `Some(IacBundle)` when the offering has wired IaC, `None` otherwise.

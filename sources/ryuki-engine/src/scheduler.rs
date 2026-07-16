@@ -96,7 +96,8 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// call), and appends a `connection_health_checks` row plus refreshes each
 /// connection's `last_test_*` — writes only to our own tables.
 ///
-/// `restore_overdue_scan` (#52) also qualifies: it reads `restore_requests`
+/// `restore_overdue_scan_v2` (#52) also qualifies: it reads the bounded durable
+/// restore-system summary
 /// recency, classifies each system with the pure
 /// `backup_recency::classify_restore_recency`, and enqueues ONE deduped
 /// `shift_queue` work item per at-risk system — writes only to our own tables,
@@ -114,7 +115,8 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// item per missed wave — reads patch_waves, writes only shift_queue, NO
 /// provider/live/destructive call.
 ///
-/// `golden_image_stale_scan` (#60) also qualifies: it reads `golden_images` in
+/// `golden_image_stale_scan_v2` (#60) also qualifies: it reads bounded raw
+/// `golden_images` pages and then filters status/staleness
 /// status 'promoted', flags any whose `build_date` is older than the monthly
 /// refresh window (a STALE base image missing recent patches), and enqueues ONE
 /// deduped `shift_queue` item per stale image — reads golden_images, writes only
@@ -148,8 +150,8 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
             "synthetic_health_run"
                 | "maintain_review_scan"
                 | "connection_health_sweep"
-                | "restore_overdue_scan"
-                | "secret_rotation_due_scan"
+                | "restore_overdue_scan_v2"
+                | "secret_rotation_due_scan_v2"
                 | "legal_hold_expiry_scan"
                 | "recertification_overdue_scan"
                 | "certificate_expiry_scan"
@@ -161,7 +163,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "shift_queue_prune"
                 | "dr_test_overdue_scan"
                 | "patch_wave_overdue_scan"
-                | "golden_image_stale_scan"
+                | "golden_image_stale_scan_v2"
                 | "noise_suppression_expiry_scan"
                 // #31 slice 1: reads requests+agent_jobs, writes only our own
                 // shift_queue — no live/provider call (safe-internal write).
@@ -251,10 +253,10 @@ mod tests {
         assert!(!job_is_read_only("maintain_review_scan"));
         assert!(job_is_schedulable("connection_health_sweep"));
         assert!(!job_is_read_only("connection_health_sweep"));
-        assert!(job_is_schedulable("restore_overdue_scan"));
-        assert!(!job_is_read_only("restore_overdue_scan"));
-        assert!(job_is_schedulable("secret_rotation_due_scan"));
-        assert!(!job_is_read_only("secret_rotation_due_scan"));
+        assert!(job_is_schedulable("restore_overdue_scan_v2"));
+        assert!(!job_is_read_only("restore_overdue_scan_v2"));
+        assert!(job_is_schedulable("secret_rotation_due_scan_v2"));
+        assert!(!job_is_read_only("secret_rotation_due_scan_v2"));
         assert!(job_is_schedulable("legal_hold_expiry_scan"));
         assert!(!job_is_read_only("legal_hold_expiry_scan"));
         assert!(job_is_schedulable("recertification_overdue_scan"));
@@ -277,8 +279,8 @@ mod tests {
         assert!(!job_is_read_only("dr_test_overdue_scan"));
         assert!(job_is_schedulable("patch_wave_overdue_scan"));
         assert!(!job_is_read_only("patch_wave_overdue_scan"));
-        assert!(job_is_schedulable("golden_image_stale_scan"));
-        assert!(!job_is_read_only("golden_image_stale_scan"));
+        assert!(job_is_schedulable("golden_image_stale_scan_v2"));
+        assert!(!job_is_read_only("golden_image_stale_scan_v2"));
         assert!(job_is_schedulable("noise_suppression_expiry_scan"));
         assert!(!job_is_read_only("noise_suppression_expiry_scan"));
         assert!(job_is_schedulable("drift_recheck_overdue_scan"));
@@ -301,6 +303,11 @@ mod tests {
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));
         assert!(!job_is_schedulable("connection_health_sweep_live"));
+        // Migration 163 rejects these persisted v1 names. Keeping them out of
+        // this allowlist is the binary half of the rolling old-replica fence.
+        assert!(!job_is_schedulable("restore_overdue_scan"));
+        assert!(!job_is_schedulable("golden_image_stale_scan"));
+        assert!(!job_is_schedulable("secret_rotation_due_scan"));
         assert!(!job_is_schedulable("restore_overdue_scan_live"));
         assert!(!job_is_schedulable("golden_image_stale_scan_live"));
         assert!(!job_is_schedulable("noise_suppression_expiry_scan_live"));

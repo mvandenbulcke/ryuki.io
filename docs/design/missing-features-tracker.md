@@ -12,8 +12,8 @@ implementing **all 66**. This file tracks execution.
   migration numbers and on the hot shared files (`contracts.rs`, `main.rs`).
 - **Gate per slice:** `cargo fmt --all`; `cargo clippy --workspace --all-targets
   -- -D warnings`; `cargo test -p ryuki-api --bins`; the relevant `*_db_tests`
-  with `RYUKI_DATABASE_URL`; `bash scripts/no-secret-scan.sh`. Then a GPT-5 Codex
-  review before commit.
+  with `RYUKI_DATABASE_URL`; `bash scripts/dependency-audit.sh`;
+  `bash scripts/no-secret-scan.sh`. Then a GPT-5 Codex review before commit.
 - **Engines stay pure** (validator-enforced no-IO); credit Codex as co-author.
 
 ## Key dependencies (drive ordering)
@@ -25,6 +25,102 @@ implementing **all 66**. This file tracks execution.
 - **#14 API list/pagination** precedes #15 / #59 (portal faceting/scope).
 - **require-key rollout (idempotency 2b+)** precedes requiring keys on
   portal-called routes — needs `UpstreamClient` to send keys first.
+
+## Platform security-boundary convergence (P0)
+
+The repository-wide security review at revision
+`8212748308372e92d9cf794907d85fe103afd1da` found that several individually
+useful controls still have distributed ownership. The normative remediation is
+the [Platform Security Boundary Specification](../architecture/platform-security-boundary.md).
+It supersedes the assumption that completing isolated backlog rows such as #2,
+#20, #21, or #48 is sufficient for production identity and authorization.
+
+Track the convergence as one dependency-ordered P0 program:
+
+| Package | State | Outcome |
+| --- | --- | --- |
+| SB-0 Contract, bootstrap, and fail-closed profiles | `[ ]` | Missing/unknown profiles and invalid production configuration fail before bind; production cannot start with development auth, mock dependencies, insecure transport/cookies, or an open/reopened first-owner path; the executable deployment-security-profile root and provider/action/resource/conformance/limit schemas, route coverage, privileged-domain separation, and versioned no-downgrade contracts are complete. |
+| SB-1 Unified human identity and sessions | `[ ]` | A singular credential-admission classifier and versioned authenticator registry support multiple generic OIDC issuers, brokered SAML/LDAP/AD, separate ordinary and break-glass WebAuthn, native/device/service OAuth profiles, API/workload identities, one durable `SessionRepository`, CSRF, step-up, and lifecycle revocation. |
+| SB-2 Typed authorization and scoping | `[ ]` | One default-deny action/resource registry issues unforgeable permits only after typed obligations pass; protected collection queries require kernel-issued query permits across all actor kinds, routes, owner/site/environment/tenant scope, and DB/no-DB paths. |
+| SB-3 Approval, transition, and audit binding | `[ ]` | Principal lifecycle/authority versions, control-plane authority epoch, policy, actor/effective subject, scope, plan/provider identity, quorum, idempotency, transition, and outbox are bound atomically; audit is independently anchored and exported without silent gaps. |
+| SB-4 Machine identity and key lifecycle | `[ ]` | Invite/key-bound enrollment, proof of possession, rotatable workload identity, signing keyring, and replay protection replace ambient bearer trust. |
+| SB-5 Credential brokerage and bounded execution | `[ ]` | Capability-tested Vault/OpenBao/cloud/enterprise adapters issue job-scoped capabilities; governance records, runtime references, leases, material, resolution, dynamic issuance, lease control, key custody, certificate issuance, version publication, and CSI/ESO/VSO materialization remain separate; complete secret handling and bounded work obey the active security-limit profile. |
+| SB-6 Deployment and supply-chain integrity | `[ ]` | Immutable privileged inputs, complete scan scope, safe build contexts, signed digest-bound SBOM/provenance, deployment admission, and an owned vulnerability/exception lifecycle cover every deployable and rollback artifact. |
+| SB-7 Adapter, egress, and data boundary | `[ ]` | First-party adapters are provenance-bound; every plugin is out-of-process and capability-sandboxed; credential-bearing redirects fail closed; classification, executable retention, privacy/audit reconciliation, backups, and orthogonal deployment/tenancy/trust-topology gates are enforced. |
+| SB-8 Distributed security operations and recovery | `[ ]` | Governed policy/config changes, cryptographic inventory, authority epochs/fencing, trusted time, fair distributed budgets, degraded modes, explicit RTO/RPO, authenticated recovery media, compromise response, and restore-without-resurrection are implemented and rehearsed. |
+| SB-9 Security-state migration, bypass retirement, and production acceptance | `[ ]` | Expand/migrate/verify/contract and rollback fencing are proven, legacy fallbacks are removed, and local plus operator-owned identity-provider, secret-manager/PKI, and live acceptance evidence passes. |
+
+SB-1 now has an identity-epoch slice in migration 165 and an explicit
+interactive-human assignment slice in migration 182. Local, OIDC, and Entra
+carriers require a versioned provider/issuer/subject role and site/environment
+assignment; Unknown/Revoked deny, Global is explicit, asserted authority is
+intersected, and assignment updates delete older sessions. Direct Entra bearer
+traffic uses the same database boundary. Local credential/role changes,
+federated callback role changes, and delivered monotonic lifecycle events also
+invalidate older persisted sessions; non-local sessions fail closed after the
+bounded authority-freshness interval.
+SB-1 remains incomplete because no authenticated SCIM, back-channel logout,
+CAEP/RISC, or OIDC-broker lifecycle connector and no operator-owned IdP
+disable/role-revocation/assignment-readback acceptance evidence exists yet.
+Multi-replica Recreate/rollback rehearsal also remains trusted-access evidence.
+Those residuals are not a reason to remove the provider-neutral OIDC, brokered
+SAML/LDAP, passkey, or workload-identity boundary.
+
+Centralized validation is complete for the pinned revision. Attack-path
+analysis is complete for the 320 candidates that entered that phase: 232 remain
+reportable (3 High, 169 Medium, and 60 Low) and 88 were rejected after
+calibration; 48 candidates did not enter attack-path analysis. These interim
+counts come from the strict attack-path aggregate. Until the
+top-level manifest, finding/coverage records, and generated report are
+finalized, that checksummed aggregate is the per-instance policy source; the
+canonical report becomes authoritative only after finalization. Neither source
+claims that a rendered production deployment was tested.
+
+SB-0 gates every later package; SB-1 and SB-2 gate SB-3; SB-3 through SB-7 gate
+any live pilot; SB-8 gates production; and SB-9 requires a machine-readable
+zero-consumer/retired-bypass receipt. Every package emits a conformance-linked
+exit receipt and cannot self-declare completion from this tracker row.
+
+Cross-package acceptance also tracks these implementation artifacts rather than
+leaving their behavior implicit:
+
+- a machine-readable conformance ledger that separates evidence provenance tier
+  from lifecycle state, maps every permanent acceptance-case id to its static
+  control/applicability/package/owner/fixture/pass condition, and binds each
+  evaluated provider/deployment evidence instance through a separate
+  `ConformanceBundle`; it rejects missing, orphaned, duplicate, expired,
+  downgraded, wrong-revision, insufficient-tier, or silently skipped controls;
+- published schemas for the deployment-security-profile root, provider
+  registry, closed action/resource/resolver registry, `ControlTrace`,
+  `ConformanceBundle`, package exit receipt, and versioned
+  `SecurityLimitProfile` as the sole owner of selected values, published
+  defaults, platform hard bounds, and separate value-change and bound-change
+  authority;
+- explicit `site_registry.create` and `site_registry.lifecycle.toggle` actions:
+  creation is unscoped-platform authority, while a toggle may admit only an
+  unscoped admin or a matching canonical site-scoped admin with no environment
+  scope; the typed authorized target must survive unchanged through repository,
+  audit, and engine boundaries;
+- versioned state machines for provider registration/removal, provider-qualified
+  identity and explicit account linking/unlinking, browser sessions and step-up,
+  API-token families/versions, and revocation;
+- separate `SecretReferenceRecord`, runtime `SecretRef`, lease metadata,
+  non-serializable material, resolver, issuer, lease, cryptographic-key,
+  certificate, publisher, and materializer interfaces, with a pinned provider-
+  capability/conformance baseline and negative tests for every enabled adapter
+  and version;
+- explicit delegation records that bind delegator, delegate, audience, action,
+  resource/scope intersection, expiry, chain depth, and revocation, without
+  converting a service or system actor into a human principal; and
+- restore reconciliation against external IdP, secret-manager, PKI/KMS, and
+  policy authority so a backup cannot resurrect externally revoked identity,
+  delegation, credentials, leases, or keys before readiness reopens;
+- externally anchored audit checkpoints and acknowledged transactional-outbox
+  export so database rewrite or SIEM delivery gaps are independently detectable;
+  and
+- release admission that verifies artifact/SBOM/provenance subjects and signer,
+  plus signed recovery-set manifests whose verification trust is separated from
+  primary and backup-writer authority.
 
 ## Backlog (rank order; `[x]` = shipped)
 
@@ -41,16 +137,16 @@ implementing **all 66**. This file tracks execution.
 | 9 | [ ] | Outbound notifications (email/webhook/callback/chat) | Roadmap | L | H | ✓ |
 | 10 | [~] | Destroy/teardown execution mode (live decommission) | Exec | L | H | Terraform `LiveDestroy` is implemented for system-authorized reverse-order compensation after a failed multi-step live run. A successful request still has no operator-governed destroy endpoint; the first test therefore requires the reviewed state-keyed cleanup procedure in `docs/first-test.md`. |
 | 11 | [x] | Pre-dispatch policy gate for unsafe IaC | Exec | M | H | SHIPPED — pure `ryuki_engine::iac_policy::evaluate_iac_bundle` (no-IO) refuses live-mode IaC with unsafe constructs: TF `provisioner` blocks + `data "external"` (line-based HCL scan, comment/block-comment aware); Ansible `check_mode` non-truthy override + legacy `always_run`, `raw`/`script` (incl. FQCN + `action`/`local_action` first-token resolution), external `include/import_*`/`roles`/`import_playbook` (fail-closed as Unscannable), YAML merge-keys resolved via `apply_merge` before scan, non-`.tf`/`.yml` files fail-closed. Wired into all 4 runner live entry points (TF+Ansible plan/apply) BEFORE init/providers → `RunStatus::Failed` + `POLICY-REFUSED` summary. Conformance test: every bundled offering passes. GPT-5.5 Codex (xhigh) found 5 Ansible bypasses on round 1 (check_mode `0`/`"n"`, action-mapping inline args, action-wrapped includes, `<<` merge keys, top-level import_playbook) — ALL fixed + regression-tested; round 2 re-review confirmed closed |
-| 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
+| 12 | [ ] | Agent-side pluggable secret-store resolution | Exec | L | H | Target contract covers Vault, OpenBao, Azure Key Vault, AWS Secrets Manager, Google Secret Manager, and mounted-secret adapters with workload identity and honest lease/rotation capabilities; see SB-5. The control-plane compatibility seam now uses a provider-neutral `SecretResolver` with a fail-closed Vault adapter and explicit development adapter, but typed `SecretRef`, provider registry/versioning, workload identity, lease metadata, and agent-side resolution remain open. |
 | 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | Slice 1: requests_list — filters (status/site/env/type/created_by/q) + allowlisted sort + limit/offset + X-Total-Count (`1f5ecfa`). Slice 2 `1bd4686` — bounded networking-inventory lists (dns_records/ipam_subnets/firewall_rules). Slice 3 `526ea96` — bounded security/admin lists (secrets_list site-scoped; admin_sessions_list + admin_tokens_list, which gained a shared all-Optional AdminListPage query, auth-gate preserved; + a unique `id` tie-breaker on the admin created_at ordering for stable pages). All non-breaking (existing keys kept, generous 500 default cap), scope-safe COUNT, GPT-5.5-Codex-xhigh reviewed, live-DB tested. Remaining: other unbounded lists (patch_waves, failure_patterns, …) — same pattern, piecemeal. NOT doing the breaking {items,total} envelope (bare-array/object + X-Total-Count is the chosen shape). Minor known nit: typed Query rejects malformed ?limit before in-body authz (400 not 403; no data exposed, authn still first) |
 | 15 | [x] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | facets `3a32da0` (env/request_type/created_by) + pagination `a62a80b` (offset/limit page-nav, over-fetch has_next since the portal can't read X-Total-Count, offset clamp, pure tested helpers; codex APPROVED). exact total via X-Total-Count `2535fee` (UpstreamResponse now carries the header; "Showing X-Y of N", inverted-label guarded). FULLY complete |
 | 16 | [x] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [x] | Bulk / batch operations | API | M | H | slice 1 `requests_batch_cancel`; slice 2 batch REJECT shipped — POST /api/requests/batch/reject mirrors batch-cancel (dedupe, cap 100, shared reason, per-item independent tx, partial success, HTTP 200). Factored `reject_one` core shared by single+batch; closed a latent no-DB scope gap in single reject (now scoped like cancel + the DB path); batch-only ≤2000 reason cap (single unchanged); denial audited once via non-id sentinel. codex plan(rd2)+impl APPROVE. slice 3 rework+fail shipped — POST /api/requests/batch/{rework,fail} mirror the reject template; extracted `rework_one`/`fail_one` cores (shared single+batch) and closed the SAME latent no-DB scope gap in single rework + fail; rework→approve, fail→execute (segment-gate auto-maps both); fail records each item's OWN current stage (per-item proven). codex plan+impl reviewed. slice 4 (FINAL) batch APPROVE shipped — POST /api/requests/batch/approve. Extracted `approve_one` (shared single+batch) reusing `apply_approval_decision_audited`, so a batch CANNOT bypass the #4 multi-role quorum: each id gets THIS approver's ONE decision; a required_approval_roles>1 request stays Planned (quorum_met=false) until N distinct roles+approvers — PROVEN by a no-bypass test (one approver → planned + decision recorded; distinct 2nd approver → approved). Per-id result carries request_status + quorum_met; SoD/scope per-item inside the core. codex plan+impl reviewed. #17 COMPLETE (cancel/reject/rework/fail/approve). POST-SHIP HARDENING (verify-first swarm 2026-06-29): `approve_one` was the LONE batch-mutation core missing the NO-DB scope guard its siblings have — a scoped approver in dry-run could approve an out-of-scope request (cross-scope mutation + existence oracle). Added the exact sibling guard (`is_scoped && !row_scope_permits` → 404) to approve_one's first no-DB lock block (404 precedes SoD/engine, mirroring the DB ordering) + a `batch_approve_no_db_is_site_scoped` test asserting the out-of-scope item's EXACT per-result 404 (no-oracle proof). codex plan(MINOR-folded)+impl APPROVE. See approve-one-nodb-scope-guard.md |
-| 18 | [x] | Inbound integration webhook receivers | Integ | L | H | `b60b7d0`/`630d287`/`c364794` — pure constant-time HMAC verifier (webhook_receipt) → dedicated per-connection webhook secret (mig 149, admin-set) → public auth-bypass receiver verifying the signature over the raw body, uniform-401 no-oracle, records integration.webhook-received (NO auto-trigger). Codex-xhigh reviewed each slice. Follow-up: owner-gated auto-triggering of platform actions from a verified webhook |
+| 18 | [x] | Inbound integration webhook receivers | Integ | L | H | `b60b7d0`/`630d287`/`c364794` plus migration 160 — constant-time HMAC over a versioned method/path, connection, timestamp, delivery-ID, and exact-body-digest envelope; five-minute dual-clock freshness; atomic durable replay receipts; uniform-401 no-oracle; and mandatory per-client/global/in-flight pre-auth admission. Records one `integration.webhook-received` event per delivery (NO auto-trigger). Partner senders must adopt the v1 signing contract; provider-native adapters remain follow-up where a vendor cannot emit it. |
 | 19 | [x] | Connection health monitoring (scheduled + history) | Integ | M | H | scheduled sweep shipped — durable-scheduler `connection_health_sweep` (leader-elected, #40 safe-internal-write recipe): lists ALL connections, runs the pure `test_connection_stub` (NO live resolve_credentials), appends a `connection_health_checks` row + refreshes `last_test_*` on the tick tx, deterministic stub credential verdict, aggregate-only detail, no dedup (time series). mig 120 seeds the schedule only (mig 102 already had the index). codex APPROVED round 2 (3 test-quality fixes folded in: restore-seeded-sweep, full seed-contract idempotency, exact-message branch coverage). On-demand probe + history read already existed |
 | 20 | [ ] | Step-up / MFA re-auth for high-risk actions | Security | M | H | — |
-| 21 | [ ] | Live secret rotation (Vault) + break-glass | Security | L | H | ✓ |
+| 21 | [ ] | Live secret-manager rotation + break-glass | Security | L | H | Provider-neutral rotation/lease response plus audited emergency recovery; see SB-1 and SB-5. The non-live VSO skeleton now separates four secret-family identities and declares a bounded restart only for the repository-proven API `envFrom` consumer; rendered controller behavior, effective policies, credential overlap/revocation, broader consumers, and emergency recovery remain external gates. |
 | 22 | [x] | Domain-event alert generation | Observ | M | H | — |
 | 23 | [x] | CP-side poison-job cap / dead-letter | Resil | M | H | shipped — `expire_leases` now caps non-mutating (OfflineDryRun/LivePlan) lease-expiry redispatches at `MAX_REDISPATCHES=5` via a `delivery_attempts` counter (mig 121); at the cap the job becomes terminal `DeadLettered` and emits ONE alert-worthy `job.dead_lettered` domain event (to_status='dead-lettered', `event_alerts` → Critical), all in one tx. Per-replica-safe (row-lock predicate recheck). LiveApply (→ReconcileRequired) unchanged. codex plan + impl both APPROVE; tests incl. concurrency + mixed-count + migration idempotency. Follow-up SHIPPED — operator list + requeue: GET /api/admin/agents/dead-lettered-jobs (admin, secret-safe projection: no spec/live_context) + POST .../{job_id}/requeue (DeadLettered→Pending, delivery_attempts reset to 0 + lease cleared, audited). Requeue GUARDS the parent-request lifecycle (locks the request FOR UPDATE in requests→agent_jobs order; refuses if is_concluded()/orphan/unknown — fail-closed) so it can't re-dispatch stale work for a closed request. codex plan(rd2)+impl reviewed. Remaining follow-up: bulk requeue + portal view |
 | 24 | [x] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
@@ -276,15 +372,64 @@ StaleStatus) + a `certificate_status_deletable` single-source-of-truth classifie
 scope_guard_or_404 (404, no oracle). Tombstone audit (no key/CSR — leaf table has none).
 codex plan+impl APPROVE. See certificate-delete.md.
 
-**Certificate list pagination/filtering** SHIPPED — `GET /api/maintain/certificates/
-inventory` enhanced in place (verify-first swarm 2026-06-29 #8). DIVERGED from the swarm's
-"new endpoint" rec: /inventory ALREADY IS the cert list, so it gained opt-in q/status/
-hostname filters + allowlisted sort + limit/offset pagination + an additive X-Total-Count
-header, mirroring requests_list — backward-compatible (no params = unchanged bare array,
-newest-first). Scope is UNCHANGED (filtering/sort/pagination applied AFTER retain_site_scoped
-so they can only reduce the authorized set; env-scoped → empty + X-Total-Count 0). Invalid
-sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
-plan+impl APPROVE. See certificate-list-pagination.md.
+**Certificate list pagination/filtering** SHIPPED — C278/C279 narrow `GET /api/maintain/
+certificates/inventory` to a fixed `(created_at DESC,id DESC)` keyset: default 50, maximum
+100, B+1 lookahead, no exact total, and explicit rejection of legacy filters, alternate
+sorts, and non-zero offsets. Signed HMAC cursors bind the normalized authorization scope and
+last tuple. Scoped reads cap authorization at 64 sites, take B+1 rows from each matching
+site index, and merge only that finite candidate set. Expiry similarly defaults to 100,
+caps at 200, and authenticates the site, days, fixed threshold, and `(valid_to,id)` cursor.
+Migration 172 adds a 1-32-octet NOT VALID new-write site constraint and four matching partial
+indexes/read predicates, so oversized legacy sites are preserved for explicit reconciliation
+but quarantined from list traversal and cannot abort index rollout; plan and transactional
+3,000-octet legacy probes assert the definitions. Dry-run modes use a process-ephemeral cursor
+key, while persisted auth still requires configured key material. Expiry is explicitly
+at-least-once under concurrent renewal of its mutable `valid_to` key. Environment-scoped
+principals still fail closed to an empty page. See
+certificate-list-pagination.md.
+
+**Audit-chain verification resource bound** SHIPPED — C232 replaced synchronous
+fetch-all/hash work in `POST /api/audit/log/verify` with a durable singleton job (migration
+173). POST only enqueues/joins and returns 202; a dedicated bounded worker captures a stable
+tail, verifies 64-row pages from genesis with a 64-KiB per-detail/16-MiB per-slice envelope,
+persists the predecessor checkpoint atomically, prunes terminal job history in bounded batches,
+and stops after four pages per slice. `GET /api/audit/log/verify/{job_id}` returns safe
+progress/terminal state without requester identity or chain hashes. Detail transfer is
+fail-closed above the per-row byte budget; concurrent replicas converge through the partial
+unique active-job index and `FOR UPDATE SKIP LOCKED`.
+
+**Metric status fan-out bounds** SHIPPED — C234/C235 apply site/environment
+authorization before a 101-row overflow probe, reject more than 100 visible enabled
+definitions before metric work, cap scope probes at 64 values per axis/256 nullable tuples,
+and replace definition rereads with server-built `UNNEST` snapshots. Budget status reads
+250+1 newest samples per distinct series (25,100 maximum rows); a lookahead returns explicit
+partial/indeterminate coverage and cannot drive a healthy or recovery transition. SLO status
+reads 2,000+1 rows for each distinct closed-window counter (400,200 maximum), excludes old
+and future tails, and likewise treats truncation as non-definitive. Background breach scans
+share the same caps and preserve prior state on partial data. Migration 183 provides exact
+scope/order/timestamp/id indexes after a fail-closed preflight: named 1-200-octet constraints
+are added, exact legacy violation counts are reported, and validation completes before any
+index DDL. Violating rows must be explicitly normalized, deleted, or moved to an approved
+quarantine; the migration never truncates identifiers. Exact-boundary, direct-writer,
+transactional failed-rollout, and JSON-plan coverage pin the envelope.
+
+**Canonical noisy-trigger site authority** SHIPPED — C282 migration 181 persists a
+server-maintained site resolved only from active canonical registry entries using exact
+case-insensitive host tokens delimited by `.`, `_`, or `-` (longest token, then lexical), so
+short codes cannot match substrings such as `RA` in `branch`. Registry changes bump a durable
+authority generation under the same advisory-lock domain as trigger inserts (including a
+TRUNCATE-specific fence). The singleton identity cannot be updated, deleted, or truncated;
+its guarded generation is unchanged for progress updates or advances by exactly one for a
+queue transition. The production application role has read-only table access and can invoke
+only the bounded owner-executed reconciler, while trigger-internal queue writers are unavailable
+to `PUBLIC` and direct runtime calls. Raw reset/jump/removal regressions prove transaction rollback
+preserves the prior generation. Every API query
+requires the current generation, making stale classifications invisible immediately. A
+resumable worker reconciles at most 128 rows per pass (SQL hard maximum 256). Unmatched rows
+remain quarantined. Interactive status mutations and suppression expiry acquire the authority
+lock before their mutating statement so a completed registry cutover is observed in a fresh
+snapshot; scoped/unscoped generation-prefixed indexes keep reports and stale-row repair bounded
+while reclassification progresses.
 
 **Auth-gate fix: alert-ack + audit-verify were accidentally admin-only** SHIPPED (2nd
 verify-first analysis swarm, 2026-06-29 run 2 — an INTEGRATION-bug audit of this session's

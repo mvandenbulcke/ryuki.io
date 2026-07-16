@@ -58,13 +58,26 @@ fn compose_ports_are_correctly_mapped() {
     let api_ports = parsed["services"]["platform-api"]["ports"]
         .as_array()
         .unwrap();
-    assert!(api_ports.iter().any(|p| p.as_str() == Some("18080:8080")));
+    assert!(
+        api_ports
+            .iter()
+            .any(|p| p.as_str() == Some("127.0.0.1:18080:8080"))
+    );
 
     let portal_ports = parsed["services"]["portal-ui"]["ports"].as_array().unwrap();
     assert!(
         portal_ports
             .iter()
-            .any(|p| p.as_str() == Some("18000:8080"))
+            .any(|p| p.as_str() == Some("127.0.0.1:18000:8080"))
+    );
+
+    let database_ports = parsed["services"]["platform-db"]["ports"]
+        .as_array()
+        .unwrap();
+    assert!(
+        database_ports
+            .iter()
+            .any(|p| p.as_str() == Some("127.0.0.1:5432:5432"))
     );
 }
 

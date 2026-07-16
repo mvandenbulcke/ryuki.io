@@ -44,6 +44,11 @@ const REQUIRED_INPUTS: &[&str] = &[
 const REQUIRED_GUARDS: &[&str] = &[
     "request-context-known",
     "target-scope-summarized",
+    "canonical-name-site-owner-bound",
+    "server-derived-ou-policy-match",
+    "namespace-provenance-verified",
+    "current-owner-site-active",
+    "quarantine-recovery-maker-checker",
     "ou-policy-reviewed",
     "lifecycle-action-supported",
     "cmdb-state-reviewed",
@@ -70,6 +75,9 @@ const REQUIRED_BLOCKED_REASONS: &[&str] = &[
     "computer-disable-disabled",
     "computer-delete-disabled",
     "computer-recover-disabled",
+    "unverified-namespace-provenance",
+    "inactive-owner-site",
+    "old-replica-drain-required",
     "raw-computer-data-disabled",
     "principal-identifiers-disabled",
     "distinguished-names-disabled",
@@ -212,6 +220,24 @@ const REQUIRED_RULE_DETAILS: &[(&str, &str, &str, &str)] = &[
         "block",
         "AD computer lifecycle records review plans only and never prestages, moves, disables, deletes, recovers, reconciles, or mutates directory computer objects.",
         "Lifecycle review summary",
+    ),
+    (
+        "directory-namespace-owner-required",
+        "block",
+        "A platform-state prestage must derive its active owner site from the canonical computer name, persist only the server-derived role/site OU, and retain the directory-namespace-v1 provenance marker; caller-declared site and OU values are compatibility assertions only.",
+        "OU policy review",
+    ),
+    (
+        "quarantine-recovery-maker-checker-required",
+        "block",
+        "Quarantine is terminal for ordinary move, disable, enable, and delete paths. Platform-state recovery requires a fresh version-bound review, a distinct administrator approval, a non-maker administrator apply, one compare-and-set transaction, and an atomic security-audit append; recovery ends in Disabled and never performs a live directory change.",
+        "Recovery readiness",
+    ),
+    (
+        "inactive-directory-owner-fails-closed",
+        "block",
+        "Every platform-state read, mutation, and quarantine-recovery step requires the persisted namespace owner site to be currently active. Deactivation gates access without rewriting computer or review state; reactivation restores access only to already-Verified provenance, while rows quarantined during legacy backfill remain quarantined pending trusted repair. Deployments must drain or fence replicas that predate the active-owner read predicates before relying on deactivation as a read boundary; database triggers independently fence their stale mutation paths.",
+        "Target scope summary",
     ),
     (
         "ou-policy-review-required",
@@ -2112,5 +2138,25 @@ fn whole_file_text(path: &str, value: &str) -> bool {
 fn expect(condition: bool, errors: &mut Vec<String>, message: &str) {
     if !condition {
         errors.push(message.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_catalog_matches_the_pinned_directory_namespace_contract() {
+        let catalog: Value = serde_yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../catalog/ad-computer-lifecycle-contract.yaml"
+        )))
+        .expect("shipped AD lifecycle catalog must parse");
+        let mut errors = Vec::new();
+        validate_catalog_value(&catalog, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "current AD lifecycle catalog: {errors:?}"
+        );
     }
 }

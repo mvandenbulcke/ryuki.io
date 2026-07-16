@@ -52,6 +52,90 @@ pub struct RbacRole {
     pub name: String,
     pub description: String,
     pub permissions: Vec<String>,
+    /// Provider-neutral functional domains published to access-control clients.
+    /// These are descriptive policy axes; protected mutations are enforced by
+    /// the typed `capabilities` registry below rather than by string matching.
+    #[serde(default)]
+    pub execution_domains: Vec<String>,
+    /// Closed, server-owned operation grants. Identity providers contribute only
+    /// verified role names; callers can never supply these capabilities directly.
+    #[serde(default)]
+    pub capabilities: Vec<OperationCapability>,
+}
+
+/// Functional grants that must not be implied by coarse permissions such as
+/// `request`, `audit`, or `execute`. Keeping these as a closed enum prevents a
+/// typo or a newly added route from silently becoming an authorization grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OperationCapability {
+    #[serde(rename = "identity.ad-computer.delete")]
+    IdentityAdComputerDelete,
+    #[serde(rename = "network.firewall.manage")]
+    NetworkFirewallManage,
+    #[serde(rename = "monitoring.alert-routing.manage")]
+    MonitoringAlertRoutingManage,
+    #[serde(rename = "monitoring.alert.read")]
+    MonitoringAlertRead,
+    #[serde(rename = "monitoring.alert.acknowledge")]
+    MonitoringAlertAcknowledge,
+    #[serde(rename = "storage.array.decommission")]
+    StorageArrayDecommission,
+    #[serde(rename = "software.deployment.execute")]
+    SoftwareDeploymentExecute,
+}
+
+impl OperationCapability {
+    pub const ALL: [Self; 7] = [
+        Self::IdentityAdComputerDelete,
+        Self::NetworkFirewallManage,
+        Self::MonitoringAlertRoutingManage,
+        Self::MonitoringAlertRead,
+        Self::MonitoringAlertAcknowledge,
+        Self::StorageArrayDecommission,
+        Self::SoftwareDeploymentExecute,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityAdComputerDelete => "identity.ad-computer.delete",
+            Self::NetworkFirewallManage => "network.firewall.manage",
+            Self::MonitoringAlertRoutingManage => "monitoring.alert-routing.manage",
+            Self::MonitoringAlertRead => "monitoring.alert.read",
+            Self::MonitoringAlertAcknowledge => "monitoring.alert.acknowledge",
+            Self::StorageArrayDecommission => "storage.array.decommission",
+            Self::SoftwareDeploymentExecute => "software.deployment.execute",
+        }
+    }
+}
+
+/// Server-attested class of the credential actor behind an admitted request.
+///
+/// This is deliberately provider-neutral: an interactive identity is a human
+/// only after its credential kind and exact governed assignment have both been
+/// validated. Role names, provider labels, display names, and token validity do
+/// not establish human provenance. Unknown is the fail-closed default so older
+/// constructors and deserialized payloads cannot acquire sign-off authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActorClass {
+    VerifiedHuman,
+    Workload,
+    Simulated,
+    #[default]
+    Unknown,
+}
+
+impl ActorClass {
+    /// Stable persistence spelling for evidence records. Keep this aligned
+    /// with the serde representation and database CHECK constraints.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedHuman => "verified-human",
+            Self::Workload => "workload",
+            Self::Simulated => "simulated",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,18 +145,25 @@ pub struct AuthSession {
     pub roles: Vec<String>,
     pub token_valid: bool,
     pub provider_mode: String,
-    /// Authorized SITE scopes for this principal (#2). EMPTY = unrestricted
-    /// (the common unscoped admin/operator case). Only a SCOPED api-token
-    /// populates these (from api_tokens.site_scope); every other principal —
-    /// cookie/local/entra session, static dry-run — is unscoped. Transient
-    /// (per-request), not persisted on the sessions table.
+    /// Internal admission evidence. It is never accepted from or emitted to a
+    /// serialized session seam; every request must re-establish it through the
+    /// credential-specific authority boundary.
+    #[serde(skip)]
+    pub actor_class: ActorClass,
+    /// Effective authorized SITE scopes for this principal (#2). EMPTY means
+    /// Global only after the credential-specific admission boundary has proved
+    /// an explicit Global grant (API-token policy, interactive assignment, or
+    /// isolated static development identity). Interactive Unknown/Revoked
+    /// authority never produces a verified `AuthSession`; scoped browser
+    /// sessions persist and reload this effective list.
     ///
     /// `skip_serializing_if` empty keeps the canonical `/me` seam shape unchanged
     /// for the common UNSCOPED case (the keys appear only when a scope is set),
     /// while `default` lets older payloads without the keys deserialize cleanly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub site_scope: Vec<String>,
-    /// Authorized ENVIRONMENT scopes (#2). EMPTY = unrestricted, like `site_scope`.
+    /// Effective ENVIRONMENT scopes. EMPTY has the same admitted-Global
+    /// meaning as `site_scope`; it is never an Unknown fallback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_scope: Vec<String>,
 }
@@ -85,6 +176,7 @@ impl AuthSession {
             roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: false,
             provider_mode: "static-dry-run".to_string(),
+            actor_class: ActorClass::Simulated,
             ..Self::default()
         }
     }
@@ -98,6 +190,12 @@ impl AuthSession {
             provider_mode: "entra-id-unverified".to_string(),
             ..Self::default()
         }
+    }
+
+    /// Whether this request carries fresh server-side proof of an admitted
+    /// human actor. Token validity remains an independent mandatory condition.
+    pub const fn is_verified_human(&self) -> bool {
+        self.token_valid && matches!(self.actor_class, ActorClass::VerifiedHuman)
     }
 }
 
@@ -113,61 +211,131 @@ pub fn get_rbac_roles() -> Vec<RbacRole> {
                 "approve".to_string(),
                 "audit".to_string(),
             ],
+            execution_domains: vec![
+                "platform".to_string(),
+                "governance".to_string(),
+                "emergency".to_string(),
+            ],
+            capabilities: OperationCapability::ALL.to_vec(),
         },
         RbacRole {
             name: APP_ROLE_DATACENTER_APPROVER.to_string(),
             description: "Approvers — datacenter-level approval and audit".to_string(),
             permissions: vec!["approve".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "datacenter".to_string(),
+                "capacity".to_string(),
+                "live-execution-final".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_VMWARE_OPERATOR.to_string(),
             description: "VMware Operators — virtualization execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "vmware".to_string(),
+                "placement".to_string(),
+                "lifecycle".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_HYPERV_OPERATOR.to_string(),
             description: "Hyper-V Operators — virtualization execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "hyper-v".to_string(),
+                "placement".to_string(),
+                "lifecycle".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_PROXMOX_OPERATOR.to_string(),
             description: "Proxmox Operators — virtualization execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "proxmox".to_string(),
+                "placement".to_string(),
+                "lifecycle".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_WINTEL_LINUX_OPERATOR.to_string(),
             description: "Wintel/Linux Operators — OS execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "windows".to_string(),
+                "linux".to_string(),
+                "patching".to_string(),
+                "baseline".to_string(),
+                "software-deployment".to_string(),
+            ],
+            capabilities: vec![OperationCapability::SoftwareDeploymentExecute],
         },
         RbacRole {
             name: APP_ROLE_BACKUP_OPERATOR.to_string(),
             description: "Backup Operators — backup execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "backup".to_string(),
+                "restore".to_string(),
+                "dr".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_MONITORING_OPERATOR.to_string(),
             description: "Monitoring Operators — monitoring execution and audit".to_string(),
             permissions: vec!["execute".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "monitoring".to_string(),
+                "alert-routing".to_string(),
+                "maintenance-window".to_string(),
+            ],
+            capabilities: vec![
+                OperationCapability::MonitoringAlertRoutingManage,
+                OperationCapability::MonitoringAlertRead,
+                OperationCapability::MonitoringAlertAcknowledge,
+            ],
         },
         RbacRole {
             name: APP_ROLE_SERVICE_DESK.to_string(),
             description: "Service Desk — triage, request, and audit access".to_string(),
             permissions: vec!["request".to_string(), "audit".to_string()],
+            execution_domains: vec![
+                "approved-runbook".to_string(),
+                "incident-context".to_string(),
+                "handover".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_AUDITOR.to_string(),
             description: "Auditor — read-only audit access".to_string(),
             permissions: vec!["audit".to_string()],
+            execution_domains: vec![
+                "evidence-review".to_string(),
+                "export-review".to_string(),
+                "compliance".to_string(),
+            ],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_REQUESTER.to_string(),
             description: "Requester — request-only access".to_string(),
             permissions: vec!["request".to_string()],
+            execution_domains: vec!["request-intake".to_string(), "evidence-view".to_string()],
+            capabilities: vec![],
         },
         RbacRole {
             name: APP_ROLE_BREAK_GLASS_ADMIN.to_string(),
             description: "Break-Glass — emergency administration and audit".to_string(),
             permissions: vec!["admin".to_string(), "audit".to_string()],
+            execution_domains: vec!["emergency".to_string()],
+            capabilities: OperationCapability::ALL.to_vec(),
         },
     ]
 }
@@ -239,6 +407,12 @@ fn base64_decode_internal(input: &str) -> Option<Vec<u8>> {
 /// superuser semantics, and a role that merely holds `audit` never leaks into
 /// the mutating permissions.
 pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
+    // `approve` represents durable human judgment. An admin-capable workload
+    // may still perform explicitly authorized machine operations, but it can
+    // never satisfy an approval role resolution or create human evidence.
+    if permission == "approve" && !session.is_verified_human() {
+        return false;
+    }
     let roles = get_rbac_roles();
     let mut held = std::collections::HashSet::new();
     for role_name in &session.roles {
@@ -247,6 +421,29 @@ pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
         }
     }
     held.contains("admin") || held.contains(permission)
+}
+
+/// Defense-in-depth for sign-off sinks that use a permission other than the
+/// ordinary `approve` tier (for example an admin-only live-apply grant).
+pub fn check_human_signoff_permission(session: &AuthSession, permission: &str) -> bool {
+    session.is_verified_human() && check_permission(session, permission)
+}
+
+/// Returns whether a verified session's server-resolved roles grant a typed
+/// functional operation. Generic `execute` never satisfies this check. The
+/// existing `admin` permission remains the explicit superuser override for
+/// PlatformAdmin, BreakGlassAdmin, and any future governed admin role.
+pub fn check_operation_capability(session: &AuthSession, capability: OperationCapability) -> bool {
+    if check_permission(session, "admin") {
+        return true;
+    }
+    let roles = get_rbac_roles();
+    session.roles.iter().any(|role_name| {
+        roles
+            .iter()
+            .find(|role| &role.name == role_name)
+            .is_some_and(|role| role.capabilities.contains(&capability))
+    })
 }
 
 /// Whether a principal whose authorized scopes are `scopes` may act on the
@@ -398,8 +595,7 @@ mod tests {
 
     #[test]
     fn test_check_permission_returns_true_for_matching_role() {
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_PLATFORM_ADMIN.to_string()];
+        let session = verified_human_for_role(APP_ROLE_PLATFORM_ADMIN);
         assert!(check_permission(&session, "admin"));
         assert!(check_permission(&session, "approve"));
         assert!(check_permission(&session, "audit"));
@@ -541,8 +737,7 @@ mod tests {
 
     #[test]
     fn test_platform_admin_has_all_permissions() {
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_PLATFORM_ADMIN.to_string()];
+        let session = verified_human_for_role(APP_ROLE_PLATFORM_ADMIN);
         assert!(check_permission(&session, "admin"));
         assert!(check_permission(&session, "approve"));
         assert!(check_permission(&session, "audit"));
@@ -600,14 +795,23 @@ mod tests {
         }
     }
 
+    fn verified_human_for_role(role: &str) -> AuthSession {
+        AuthSession {
+            user_id: "verified-human".to_string(),
+            display_name: "Verified Human".to_string(),
+            roles: vec![role.to_string()],
+            token_valid: true,
+            provider_mode: "test-carrier".to_string(),
+            actor_class: ActorClass::VerifiedHuman,
+            ..AuthSession::default()
+        }
+    }
+
     #[test]
     fn test_platform_admin_is_superuser() {
-        // PlatformAdmin's role permissions are [admin, approve, audit] — it does
-        // NOT literally hold "execute" or "request". The superuser model makes
-        // the `admin` permission satisfy every check, so PlatformAdmin now passes
-        // execute/request/approve/admin alike (these were false before the fix).
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_PLATFORM_ADMIN.to_string()];
+        // PlatformAdmin's `admin` permission remains a superuser for ordinary
+        // operations. Approval additionally requires admitted-human provenance.
+        let session = verified_human_for_role(APP_ROLE_PLATFORM_ADMIN);
         assert!(check_permission(&session, "execute"));
         assert!(check_permission(&session, "request"));
         assert!(check_permission(&session, "approve"));
@@ -618,9 +822,8 @@ mod tests {
     #[test]
     fn test_break_glass_admin_is_superuser() {
         // BreakGlassAdmin carries `admin` (and `audit`); the superuser model
-        // makes it pass every coarse permission too.
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_BREAK_GLASS_ADMIN.to_string()];
+        // makes it pass every coarse permission when the actor is human.
+        let session = verified_human_for_role(APP_ROLE_BREAK_GLASS_ADMIN);
         assert!(check_permission(&session, "execute"));
         assert!(check_permission(&session, "request"));
         assert!(check_permission(&session, "approve"));
@@ -656,13 +859,178 @@ mod tests {
 
     #[test]
     fn test_approver_holds_approve_but_not_execute() {
-        let mut session = AuthSession::static_dry_run();
-        session.roles = vec![APP_ROLE_DATACENTER_APPROVER.to_string()];
+        let session = verified_human_for_role(APP_ROLE_DATACENTER_APPROVER);
         assert!(check_permission(&session, "approve"));
         assert!(check_permission(&session, "audit"));
         assert!(!check_permission(&session, "execute"));
         assert!(!check_permission(&session, "request"));
         assert!(!check_permission(&session, "admin"));
+    }
+
+    #[test]
+    fn non_human_actor_classes_cannot_resolve_approval() {
+        for actor_class in [
+            ActorClass::Workload,
+            ActorClass::Unknown,
+            ActorClass::Simulated,
+        ] {
+            let session = AuthSession {
+                user_id: "non-human".to_string(),
+                roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
+                token_valid: true,
+                provider_mode: "same-carrier-for-every-class".to_string(),
+                actor_class,
+                ..AuthSession::default()
+            };
+            assert!(!check_permission(&session, "approve"));
+            assert!(!check_human_signoff_permission(&session, "admin"));
+            // Workloads keep their explicitly governed non-signoff authority.
+            assert!(check_permission(&session, "admin"));
+            assert!(check_permission(&session, "execute"));
+        }
+    }
+
+    #[test]
+    fn actor_class_persistence_spelling_is_stable() {
+        assert_eq!(ActorClass::VerifiedHuman.as_str(), "verified-human");
+        assert_eq!(ActorClass::Workload.as_str(), "workload");
+        assert_eq!(ActorClass::Simulated.as_str(), "simulated");
+        assert_eq!(ActorClass::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn invalid_verified_human_cannot_resolve_approval() {
+        let mut session = verified_human_for_role(APP_ROLE_DATACENTER_APPROVER);
+        session.token_valid = false;
+        assert!(!session.is_verified_human());
+        assert!(!check_permission(&session, "approve"));
+    }
+
+    fn session_for_role(role: &str) -> AuthSession {
+        AuthSession {
+            user_id: "capability-test-user".to_string(),
+            display_name: "Capability Test User".to_string(),
+            roles: vec![role.to_string()],
+            token_valid: true,
+            provider_mode: "test-provider".to_string(),
+            ..AuthSession::default()
+        }
+    }
+
+    #[test]
+    fn generic_execute_never_implies_a_functional_operation_capability() {
+        for role in [
+            APP_ROLE_VMWARE_OPERATOR,
+            APP_ROLE_HYPERV_OPERATOR,
+            APP_ROLE_PROXMOX_OPERATOR,
+            APP_ROLE_BACKUP_OPERATOR,
+        ] {
+            let session = session_for_role(role);
+            assert!(check_permission(&session, "execute"));
+            for capability in OperationCapability::ALL {
+                assert!(
+                    !check_operation_capability(&session, capability),
+                    "coarse execute role {role} unexpectedly inherited {}",
+                    capability.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn functional_capabilities_are_role_specific_and_do_not_cross_domains() {
+        let monitoring = session_for_role(APP_ROLE_MONITORING_OPERATOR);
+        assert!(check_operation_capability(
+            &monitoring,
+            OperationCapability::MonitoringAlertRoutingManage
+        ));
+        assert!(check_operation_capability(
+            &monitoring,
+            OperationCapability::MonitoringAlertRead
+        ));
+        assert!(check_operation_capability(
+            &monitoring,
+            OperationCapability::MonitoringAlertAcknowledge
+        ));
+        assert!(!check_operation_capability(
+            &monitoring,
+            OperationCapability::SoftwareDeploymentExecute
+        ));
+
+        let wintel = session_for_role(APP_ROLE_WINTEL_LINUX_OPERATOR);
+        assert!(check_operation_capability(
+            &wintel,
+            OperationCapability::SoftwareDeploymentExecute
+        ));
+        assert!(!check_operation_capability(
+            &wintel,
+            OperationCapability::MonitoringAlertRoutingManage
+        ));
+
+        for capability in [
+            OperationCapability::IdentityAdComputerDelete,
+            OperationCapability::NetworkFirewallManage,
+            OperationCapability::StorageArrayDecommission,
+        ] {
+            assert!(!check_operation_capability(&monitoring, capability));
+            assert!(!check_operation_capability(&wintel, capability));
+        }
+    }
+
+    #[test]
+    fn admin_roles_intentionally_override_every_functional_capability() {
+        for role in [APP_ROLE_PLATFORM_ADMIN, APP_ROLE_BREAK_GLASS_ADMIN] {
+            let session = session_for_role(role);
+            for capability in OperationCapability::ALL {
+                assert!(
+                    check_operation_capability(&session, capability),
+                    "admin role {role} must intentionally satisfy {}",
+                    capability.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_ungranted_roles_have_no_functional_capabilities() {
+        for role in [
+            "UnknownExternalRole",
+            APP_ROLE_DATACENTER_APPROVER,
+            APP_ROLE_SERVICE_DESK,
+            APP_ROLE_AUDITOR,
+            APP_ROLE_REQUESTER,
+        ] {
+            let session = session_for_role(role);
+            for capability in OperationCapability::ALL {
+                assert!(!check_operation_capability(&session, capability));
+            }
+        }
+    }
+
+    #[test]
+    fn role_registry_serializes_stable_capability_identifiers() {
+        let roles = serde_json::to_value(get_rbac_roles()).unwrap();
+        let monitoring = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["name"] == APP_ROLE_MONITORING_OPERATOR)
+            .unwrap();
+        assert_eq!(
+            monitoring["capabilities"],
+            serde_json::json!([
+                "monitoring.alert-routing.manage",
+                "monitoring.alert.read",
+                "monitoring.alert.acknowledge"
+            ])
+        );
+        assert!(
+            monitoring["execution_domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|domain| domain == "alert-routing")
+        );
     }
 
     #[test]

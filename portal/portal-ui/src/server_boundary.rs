@@ -56,8 +56,6 @@ use crate::api_client::{
 use crate::models::platform_settings_summary_fallback;
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
-#[cfg(feature = "ssr")]
-use crate::models::AgentJobSummary;
 #[cfg(any(feature = "ssr", test))]
 use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
@@ -92,8 +90,8 @@ use crate::models::{
     NotificationSummary, OfferingCatalogSnapshot, OperationRunSummary, PlatformHealth,
     PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
     PolicyOutcome, RbacRoleCatalogSnapshot, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
-    RequestSummary, RevokeResult, SecretReferenceSummary, ServiceNowQueueSnapshot,
-    ShiftQueueSnapshot, StageActionResponse, UpdateIntegrationPayload,
+    RequestSummary, ReviewedLivePlanSelection, RevokeResult, SecretReferenceSummary,
+    ServiceNowQueueSnapshot, ShiftQueueSnapshot, StageActionResponse, UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -101,7 +99,8 @@ use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbac
 use crate::models::{request_detail_fallback, request_summary_fallbacks};
 #[cfg(feature = "ssr")]
 use crate::upstream::{
-    clear_portal_session_cookie, cookie_max_age_from_expires_at, session_id_from_request,
+    clear_portal_session_cookie, cookie_max_age_from_expires_at,
+    entra_login_binding_cookie_headers_are_unambiguous, session_id_from_request,
     set_entra_login_binding_cookie, set_portal_session_cookie, UpstreamClient, UpstreamResponse,
 };
 use leptos::prelude::{server, ServerFnError};
@@ -218,7 +217,12 @@ pub(crate) const STATIC_PREVIEW_PLATFORM_SETTINGS_SENTINEL: &str =
 fn upstream_context() -> UpstreamClient {
     use leptos::prelude::use_context;
 
-    use_context::<UpstreamClient>().unwrap_or_else(UpstreamClient::from_env)
+    use_context::<UpstreamClient>().unwrap_or_else(|| {
+        let public_origin = crate::security::PortalPublicOrigin::from_env()
+            .expect("portal public origin must be validated during startup");
+        UpstreamClient::from_env(&public_origin)
+            .expect("portal upstream configuration must be validated during startup")
+    })
 }
 
 /// Extracts the canonical `{"error","message"}` text from an upstream 4xx
@@ -237,6 +241,32 @@ fn api_error_text(response: &UpstreamResponse, fallback: &str) -> String {
             })
             .unwrap_or_else(|| fallback.to_string())
     })
+}
+
+#[cfg(any(feature = "ssr", test))]
+enum LogoutUpstreamOutcome {
+    Confirmed,
+    Rejected(String),
+    Unreachable,
+}
+
+/// Retires the portal-held credential before interpreting the authoritative
+/// revocation result. Local browser state is therefore cleared on every
+/// completed attempt, while only a confirmed upstream result may be projected
+/// as successful logout.
+#[cfg(any(feature = "ssr", test))]
+fn finish_logout(
+    outcome: LogoutUpstreamOutcome,
+    clear_portal_credential: impl FnOnce(),
+) -> Result<(), ServerFnError> {
+    clear_portal_credential();
+    match outcome {
+        LogoutUpstreamOutcome::Confirmed => Ok(()),
+        LogoutUpstreamOutcome::Rejected(message) => Err(ServerFnError::new(message)),
+        LogoutUpstreamOutcome::Unreachable => Err(ServerFnError::new(
+            "Browser credentials were cleared, but server-side session revocation could not be confirmed",
+        )),
+    }
 }
 
 /// Lowercases the engine PascalCase health status enums so the portal badge
@@ -1201,12 +1231,16 @@ pub struct PortalSecretReferenceSnapshot {
     pub api_boundary: String,
     pub execution_mode: String,
     pub secret_references_path: String,
-    pub provider: String,
-    pub management_cli: String,
+    pub provider_model: String,
+    pub management_interface: String,
+    pub fallback_policy: String,
+    pub admitted_provider_classes: Vec<String>,
+    pub capability_interfaces: Vec<String>,
+    pub secret_reference_kinds: Vec<String>,
     pub configured_for_production: bool,
     pub secret_references: Vec<SecretReferenceSummary>,
     pub readiness_state: String,
-    pub live_cli_execution_allowed: bool,
+    pub live_provider_actions_allowed: bool,
     pub provider_calls_allowed: bool,
     pub raw_payload_allowed: bool,
     pub secret_values_allowed: bool,
@@ -1230,12 +1264,16 @@ impl PortalSecretReferenceSnapshot {
             execution_mode: execution_mode_label(&boundary.boundary_status.execution_mode)
                 .to_string(),
             secret_references_path: reference_plan.path.to_string(),
-            provider: catalog_status.primary_provider,
-            management_cli: catalog_status.management_cli,
+            provider_model: catalog_status.provider_model,
+            management_interface: catalog_status.management_interface,
+            fallback_policy: catalog_status.fallback_policy,
+            admitted_provider_classes: catalog_status.admitted_provider_classes,
+            capability_interfaces: catalog_status.capability_interfaces,
+            secret_reference_kinds: catalog_status.secret_reference_kinds,
             configured_for_production: catalog_status.configured_for_production,
             secret_references,
             readiness_state,
-            live_cli_execution_allowed: false,
+            live_provider_actions_allowed: false,
             provider_calls_allowed: false,
             raw_payload_allowed: false,
             secret_values_allowed: false,
@@ -1759,7 +1797,7 @@ pub async fn get_auth_session() -> Result<Option<AuthSession>, ServerFnError> {
     // surface the error and keep the cookie so a transient API problem
     // cannot sign the user out.
     if matches!(response.status, 401 | 403) {
-        clear_portal_session_cookie();
+        clear_portal_session_cookie(upstream.cookie_secure());
         return Ok(None);
     }
     if !response.is_success() {
@@ -1775,7 +1813,7 @@ pub async fn get_auth_session() -> Result<Option<AuthSession>, ServerFnError> {
         Ok(Some(session))
     } else {
         // Expired or unknown upstream session: clear the stale portal cookie.
-        clear_portal_session_cookie();
+        clear_portal_session_cookie(upstream.cookie_secure());
         Ok(None)
     }
 }
@@ -2195,8 +2233,9 @@ pub async fn get_request_intake_form() -> Result<RequestIntakeForm, ServerFnErro
 }
 
 /// Signs in against the upstream local-auth endpoint. The upstream
-/// `session_id` is stored in the portal-origin `ryuki_session` cookie and
-/// never reaches WASM; the browser only receives the [`AuthSession`]
+/// session bearer is stored in the mode-selected portal-origin cookie
+/// (`__Host-ryuki_session` on HTTPS, unprefixed only for explicit loopback
+/// HTTP) and never reaches WASM; the browser only receives the [`AuthSession`]
 /// identity fields.
 #[server(prefix = "/portal/api", endpoint = "auth-login")]
 pub async fn perform_login(
@@ -2236,14 +2275,15 @@ pub async fn perform_login(
     // The cookie lifetime tracks the upstream session expiry, falling back
     // to one day when `expires_at` is absent or unparseable.
     set_portal_session_cookie(
-        &login.session_id,
+        &login.session_token,
         cookie_max_age_from_expires_at(&login.expires_at),
+        upstream.cookie_secure(),
     );
     Ok(AuthSession::from(login))
 }
 
 /// Payload of the upstream `GET /api/auth/entra/authorize-url`. `binding` is
-/// consumed server-side ONLY — it becomes the HttpOnly `entra_login_csrf`
+/// consumed server-side ONLY — it becomes the mode-selected HttpOnly binding
 /// cookie on the portal response and is never part of the value the browser
 /// script receives, so page JavaScript can never read it.
 #[cfg(feature = "ssr")]
@@ -2258,8 +2298,9 @@ struct EntraAuthorizeUrlPayload {
 /// state/nonce/verifier server-side), re-issues the per-browser CSRF-binding
 /// cookie on the portal response, and returns ONLY the authorize URL for the
 /// client to navigate to. The IdP redirects back to the API callback directly
-/// (same-origin deployment), which mints the shared `ryuki_session` cookie the
-/// portal session gate already consumes.
+/// (same-origin deployment), which must mint the same mode-selected cookie the
+/// portal session gate consumes. Production callbacks therefore use
+/// `__Host-ryuki_session`; explicit loopback HTTP uses `ryuki_session`.
 #[server(prefix = "/portal/api", endpoint = "auth-entra-authorize-url")]
 pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -2271,6 +2312,21 @@ pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
         // Static demo builds have no IdP to hand the browser to.
         return Err(ServerFnError::new(
             "Entra ID sign-in requires the live platform API",
+        ));
+    }
+    let headers = leptos_axum::extract::<axum::http::HeaderMap>()
+        .await
+        .map_err(|_| ServerFnError::new("Entra login cookie evidence was unavailable"))?;
+    let cookie_headers = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ServerFnError::new("Entra login cookie evidence was malformed"))?;
+    if !entra_login_binding_cookie_headers_are_unambiguous(cookie_headers, upstream.cookie_secure())
+    {
+        return Err(ServerFnError::new(
+            "Ambiguous Entra login cookie evidence was rejected",
         ));
     }
     let response = upstream.get(path, None).await.map_err(|_| {
@@ -2293,12 +2349,14 @@ pub async fn get_entra_authorize_url() -> Result<String, ServerFnError> {
             "Entra authorize URL response was malformed",
         ));
     }
-    set_entra_login_binding_cookie(&payload.binding);
+    set_entra_login_binding_cookie(&payload.binding, upstream.cookie_secure());
     Ok(payload.authorize_url)
 }
 
-/// Signs out: best-effort upstream logout with the forwarded session header,
-/// then clears the portal cookie regardless of the upstream outcome.
+/// Signs out through the authoritative API and clears the portal cookie for
+/// every outcome. An upstream rejection or transport/server failure is surfaced
+/// to the caller; the portal never claims that durable revocation succeeded
+/// merely because its own cookie was retired.
 #[server(prefix = "/portal/api", endpoint = "auth-logout")]
 pub async fn perform_logout() -> Result<(), ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -2308,9 +2366,19 @@ pub async fn perform_logout() -> Result<(), ServerFnError> {
     let upstream = upstream_context();
     if upstream.live() {
         let session_id = session_id_from_request().await;
-        let _ = upstream.post(path, None, session_id.as_deref()).await;
+        let outcome = match upstream.post(path, None, session_id.as_deref()).await {
+            Ok(response) if response.is_success() => LogoutUpstreamOutcome::Confirmed,
+            Ok(response) => LogoutUpstreamOutcome::Rejected(api_error_text(
+                &response,
+                "Sign-out was rejected by the API",
+            )),
+            Err(_) => LogoutUpstreamOutcome::Unreachable,
+        };
+        return finish_logout(outcome, || {
+            clear_portal_session_cookie(upstream.cookie_secure())
+        });
     }
-    clear_portal_session_cookie();
+    clear_portal_session_cookie(upstream.cookie_secure());
     Ok(())
 }
 
@@ -2838,7 +2906,8 @@ pub async fn get_request_execution_job(
                 {
                     if result_response.is_success() {
                         if let Ok(result) = result_response.json::<ApiAdminAgentJobResult>() {
-                            job = job.with_live_plan_review(result.plan_review);
+                            let reviewed = result.into_reviewed_live_plan(&job_id);
+                            job = job.with_reviewed_live_plan(reviewed);
                         }
                     }
                 }
@@ -2981,6 +3050,63 @@ async fn dispatch_stage_action_live(
     }
 }
 
+/// Build the closed mutation body from the exact immutable plan snapshot that
+/// accompanied the safe review. `approved_plan_digest` is the signed raw-plan
+/// commitment, never the safe evidence digest. No request spec, placement,
+/// provider value, or caller-selected platform is accepted through this boundary.
+#[cfg(any(feature = "ssr", test))]
+fn reviewed_plan_approval_body(
+    selection: &ReviewedLivePlanSelection,
+) -> Result<serde_json::Value, ServerFnError> {
+    if !selection.is_canonical() {
+        return Err(ServerFnError::new(
+            "Live apply requires an exact canonical reviewed-plan selection",
+        ));
+    }
+    Ok(serde_json::json!({
+        "approved_plan_job_id": selection.approved_plan_job_id.as_str(),
+        "approved_plan_attempt_id": selection.approved_plan_attempt_id.as_str(),
+        "approved_plan_digest": selection.approved_plan_digest.as_str(),
+    }))
+}
+
+/// Live POST for the mutation-authorizing approval endpoint. This deliberately
+/// does not reuse the bodyless lifecycle helper: the exact reviewed selection
+/// must cross the final server boundary unchanged.
+#[cfg(feature = "ssr")]
+async fn dispatch_reviewed_live_plan_action_live(
+    request_id: String,
+    selection: &ReviewedLivePlanSelection,
+    path: &str,
+) -> Result<StageActionResponse, ServerFnError> {
+    let upstream = upstream_context();
+    let session_id = session_id_from_request().await;
+    let body = reviewed_plan_approval_body(selection)?;
+    let response = upstream
+        .post(path, Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if response.is_success() {
+        let new_stage = fetch_request_detail_live(&upstream, &request_id)
+            .await
+            .map(|detail| detail.stage)
+            .unwrap_or_default();
+        Ok(StageActionResponse {
+            request_id,
+            success: true,
+            new_stage,
+            message: "live apply completed".to_string(),
+        })
+    } else {
+        Ok(StageActionResponse {
+            request_id,
+            success: false,
+            new_stage: String::new(),
+            message: api_error_text(&response, "live apply was rejected by the API"),
+        })
+    }
+}
+
 #[server(prefix = "/portal/api", endpoint = "request-validate")]
 pub async fn validate_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -3088,6 +3214,7 @@ pub async fn execute_request_live_plan(
 #[server(prefix = "/portal/api", endpoint = "request-approve-live-apply")]
 pub async fn approve_live_apply_request(
     request_id: String,
+    reviewed_plan: ReviewedLivePlanSelection,
 ) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = request_approve_live_apply_path(&request_id).map_err(|_| {
@@ -3102,20 +3229,18 @@ pub async fn approve_live_apply_request(
     if !upstream.live() {
         return reject_static_preview_request_action(request_id, "live apply");
     }
-    dispatch_stage_action_live(request_id, "live apply", &path).await
+    dispatch_reviewed_live_plan_action_live(request_id, &reviewed_plan, &path).await
 }
 
-/// Admin-gated per-step approval for multi-step orchestration (#42 slice
-/// B1b): mints a step-scoped CP-signed LiveApply grant for ONE
-/// `AwaitingApproval` step and dispatches its LiveApply job. Mirrors
-/// `approve_live_apply_request`; the API enforces admin tier, site scope,
-/// separation of duties (the requester cannot approve), and step state — a
-/// step that is not awaiting approval, or a request already rolling back,
-/// answers 409 and the message is surfaced verbatim in the action badge.
+/// Per-step mutation remains fail-closed until the portal can fetch and render
+/// the exact safe review for each independently parked step. Keeping this
+/// server endpoint as an explicit refusal prevents an older hydrated client or
+/// a hand-crafted portal call from reaching the API's disabled route.
 #[server(prefix = "/portal/api", endpoint = "request-step-approve-live-apply")]
 pub async fn approve_step_live_apply(
     request_id: String,
     step_key: String,
+    reviewed_plan: ReviewedLivePlanSelection,
 ) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = request_step_approve_live_apply_path(&request_id, &step_key).map_err(|_| {
@@ -3126,11 +3251,10 @@ pub async fn approve_step_live_apply(
         .map_err(|_| {
             ServerFnError::new("step approve-live-apply API path failed same-origin guard")
         })?;
-    let upstream = upstream_context();
-    if !upstream.live() {
-        return reject_static_preview_request_action(request_id, "step live apply");
-    }
-    dispatch_stage_action_live(request_id, "step live apply", &path).await
+    let _ = reviewed_plan_approval_body(&reviewed_plan)?;
+    Err(ServerFnError::new(
+        "Per-step live approval is disabled until an exact digest-bound step review is available",
+    ))
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
@@ -3981,6 +4105,111 @@ pub async fn list_integrations() -> Result<Vec<IntegrationSummary>, ServerFnErro
 
 // ── Agent server functions ────────────────────────────────────────────────
 
+#[cfg(any(feature = "ssr", test))]
+#[derive(Debug, Deserialize)]
+struct AdminAgentsEnvelope {
+    agents: Vec<AgentSummary>,
+    capped: bool,
+}
+
+#[cfg(any(feature = "ssr", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum AdminAgentsResponseError {
+    Malformed,
+    Truncated,
+}
+
+/// Parse the admin roster through the portal-safe model. Both immutable review
+/// fields are required, so an older or malformed API response cannot render an
+/// approval button that falls back to agent-id-only authorization. Unknown
+/// fields (including a mistakenly returned raw public key) are discarded rather
+/// than copied into the server-function response.
+#[cfg(any(feature = "ssr", test))]
+fn parse_admin_agents_response(
+    raw: serde_json::Value,
+) -> Result<Vec<AgentSummary>, AdminAgentsResponseError> {
+    let envelope = serde_json::from_value::<AdminAgentsEnvelope>(raw)
+        .map_err(|_| AdminAgentsResponseError::Malformed)?;
+    if envelope.capped {
+        return Err(AdminAgentsResponseError::Truncated);
+    }
+    Ok(envelope.agents)
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn is_canonical_enrollment_id(value: &str) -> bool {
+    let mut groups = value.split('-');
+    [8, 4, 4, 4, 12].into_iter().all(|expected_len| {
+        groups.next().is_some_and(|group| {
+            group.len() == expected_len
+                && group
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    }) && groups.next().is_none()
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn is_sha256_fingerprint(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Build the exact API approval payload from one reviewed roster snapshot.
+/// Keeping this pure makes the stale-review contract explicit and testable: the
+/// portal submits the snapshot's immutable values and lets the API reject them
+/// with 409 if the enrollment changed before the click.
+#[cfg(any(feature = "ssr", test))]
+fn validate_agent_enrollment_binding(
+    enrollment_id: &str,
+    public_key_fingerprint: &str,
+) -> Result<(), &'static str> {
+    if !is_canonical_enrollment_id(enrollment_id) {
+        return Err("agent operation requires a valid enrollment binding");
+    }
+    if !is_sha256_fingerprint(public_key_fingerprint) {
+        return Err("agent operation requires a valid public-key fingerprint");
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn agent_approval_body(
+    enrollment_id: &str,
+    public_key_fingerprint: &str,
+    platform: &str,
+) -> Result<serde_json::Value, &'static str> {
+    validate_agent_enrollment_binding(enrollment_id, public_key_fingerprint)?;
+    if platform.trim().is_empty() {
+        return Err("agent approval requires a non-empty platform");
+    }
+    Ok(serde_json::json!({
+        "enrollment_id": enrollment_id,
+        "public_key_fingerprint": public_key_fingerprint,
+        "platform": platform,
+    }))
+}
+
+/// Build the terminal-revocation payload from the same immutable roster binding
+/// used by approval. A stale page therefore asks the API to revoke the reviewed
+/// row, never whichever row currently happens to reuse the human-readable id.
+#[cfg(any(feature = "ssr", test))]
+fn agent_revocation_body(
+    enrollment_id: &str,
+    public_key_fingerprint: &str,
+) -> Result<serde_json::Value, &'static str> {
+    validate_agent_enrollment_binding(enrollment_id, public_key_fingerprint)?;
+    Ok(serde_json::json!({
+        "enrollment_id": enrollment_id,
+        "public_key_fingerprint": public_key_fingerprint,
+    }))
+}
+
 #[server(prefix = "/portal/api", endpoint = "admin-agents-list")]
 pub async fn get_admin_agents() -> Result<Vec<AgentSummary>, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -4003,61 +4232,15 @@ pub async fn get_admin_agents() -> Result<Vec<AgentSummary>, ServerFnError> {
             let raw: serde_json::Value = response
                 .json()
                 .map_err(|_| ServerFnError::new("admin agents response was malformed"))?;
-            let agent_values = raw
-                .get("agents")
-                .and_then(|a| a.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let agents = agent_values
-                .into_iter()
-                .filter_map(|item| {
-                    let agent_id = item.get("agent_id")?.as_str()?.to_string();
-                    let platform = item.get("platform")?.as_str()?.to_string();
-                    let status = item.get("status")?.as_str()?.to_string();
-                    let last_seen_at = item
-                        .get("last_seen_at")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    let created_at = item.get("created_at")?.as_str()?.to_string();
-                    let jobs = item
-                        .get("jobs")
-                        .and_then(|j| j.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|j| {
-                                    let id = j.get("id")?.as_str()?.to_string();
-                                    let mode = j.get("mode")?.as_str()?.to_string();
-                                    let status = j.get("status")?.as_str()?.to_string();
-                                    let result_status = j
-                                        .get("result_status")
-                                        .and_then(|r| r.as_str())
-                                        .map(str::to_string);
-                                    let completed_at = j
-                                        .get("completed_at")
-                                        .and_then(|c| c.as_str())
-                                        .map(str::to_string);
-                                    Some(AgentJobSummary {
-                                        id,
-                                        mode,
-                                        status,
-                                        result_status,
-                                        completed_at,
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    Some(AgentSummary {
-                        agent_id,
-                        platform,
-                        status,
-                        last_seen_at,
-                        created_at,
-                        jobs,
-                    })
-                })
-                .collect();
-            Ok(agents)
+            match parse_admin_agents_response(raw) {
+                Ok(agents) => Ok(agents),
+                Err(AdminAgentsResponseError::Truncated) => Err(ServerFnError::new(
+                    "Agent roster is truncated; review the complete enrollment inventory before approving or closing the enrollment cutover",
+                )),
+                Err(AdminAgentsResponseError::Malformed) => {
+                    Err(ServerFnError::new("admin agents response was malformed"))
+                }
+            }
         }
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
@@ -4069,15 +4252,20 @@ pub async fn get_admin_agents() -> Result<Vec<AgentSummary>, ServerFnError> {
 
 /// `POST /api/admin/agents/{id}/approve` — approve a pending agent enrollment.
 ///
-/// The API's approve body REQUIRES an authoritative `platform`; the portal
-/// re-affirms the agent's currently displayed platform so a PlatformAdmin can
-/// approve in one click. Capabilities are intentionally omitted, so the API
-/// resets them to empty (its documented secure default): the admin must grant
-/// capabilities explicitly rather than trust the agent's self-declared set.
+/// The API's approve body requires the immutable `enrollment_id`, the reviewed
+/// non-secret `public_key_fingerprint`, and an authoritative `platform`. The
+/// portal submits all three values from the same displayed roster snapshot so a
+/// stale page cannot approve a replacement enrollment that reused an agent id.
+/// Capabilities are intentionally omitted, so the API resets them to empty (its
+/// documented secure default): the admin must grant capabilities explicitly
+/// through the authoritative API rather than trust the agent's self-declared
+/// set. The roster exposes the stored document's digest for review/audit.
 /// Mutations never degrade to a fallback — a static/unreachable upstream errors.
 #[server(prefix = "/portal/api", endpoint = "admin-agents-approve")]
 pub async fn approve_agent(
     agent_id: String,
+    enrollment_id: String,
+    public_key_fingerprint: String,
     platform: String,
 ) -> Result<RevokeResult, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -4086,16 +4274,12 @@ pub async fn approve_agent(
     boundary
         .validate_admin_agent_approve_path(&path)
         .map_err(|_| ServerFnError::new("admin agent approve API path failed same-origin guard"))?;
-    if platform.trim().is_empty() {
-        return Err(ServerFnError::new(
-            "agent approval requires a non-empty platform",
-        ));
-    }
+    let body = agent_approval_body(&enrollment_id, &public_key_fingerprint, &platform)
+        .map_err(ServerFnError::new)?;
     let upstream = upstream_context();
     if !upstream.live() {
         return reject_static_preview_agent_approve();
     }
-    let body = serde_json::json!({ "platform": platform });
     let session_id = session_id_from_request().await;
     let response = upstream
         .post(&path, Some(&body), session_id.as_deref())
@@ -4113,25 +4297,33 @@ pub async fn approve_agent(
     })
 }
 
-/// `POST /api/admin/agents/{id}/revoke` — take an enrolled agent offline. The API
-/// sets status='revoked' (terminal) so the agent's token is refused on its next
-/// call. No body. Mutations never degrade to a fallback — a static/unreachable
+/// `POST /api/admin/agents/{id}/revoke` — take one exact enrolled agent offline.
+/// The immutable enrollment id and reviewed key fingerprint are mandatory, so a
+/// stale roster cannot revoke a replacement enrollment that reused the agent id.
+/// The API sets status='revoked' (terminal) so the agent's token is refused on
+/// its next call. Mutations never degrade to a fallback — a static/unreachable
 /// upstream errors.
 #[server(prefix = "/portal/api", endpoint = "admin-agents-revoke")]
-pub async fn revoke_agent(agent_id: String) -> Result<RevokeResult, ServerFnError> {
+pub async fn revoke_agent(
+    agent_id: String,
+    enrollment_id: String,
+    public_key_fingerprint: String,
+) -> Result<RevokeResult, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     let path = admin_agent_revoke_path(&agent_id)
         .map_err(|_| ServerFnError::new("admin agent revoke API path failed same-origin guard"))?;
     boundary
         .validate_admin_agent_revoke_path(&path)
         .map_err(|_| ServerFnError::new("admin agent revoke API path failed same-origin guard"))?;
+    let body = agent_revocation_body(&enrollment_id, &public_key_fingerprint)
+        .map_err(ServerFnError::new)?;
     let upstream = upstream_context();
     if !upstream.live() {
         return reject_static_preview_revoke("agent");
     }
     let session_id = session_id_from_request().await;
     let response = upstream
-        .post(&path, None, session_id.as_deref())
+        .post(&path, Some(&body), session_id.as_deref())
         .await
         .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
     if !response.is_success() {
@@ -4480,6 +4672,36 @@ mod tests {
     use super::*;
     use crate::api::RequestListQuery;
 
+    #[test]
+    fn reviewed_plan_approval_body_is_closed_and_exact() {
+        let selection = ReviewedLivePlanSelection {
+            approved_plan_job_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+            approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+            approved_plan_digest: "d".repeat(64),
+        };
+        let body = reviewed_plan_approval_body(&selection).expect("canonical selection");
+        let keys = body.as_object().expect("approval object");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(body["approved_plan_job_id"], selection.approved_plan_job_id);
+        assert_eq!(
+            body["approved_plan_attempt_id"],
+            selection.approved_plan_attempt_id
+        );
+        assert_eq!(body["approved_plan_digest"], selection.approved_plan_digest);
+        assert!(body.get("platform").is_none());
+        assert!(body.get("spec").is_none());
+    }
+
+    #[test]
+    fn reviewed_plan_approval_body_rejects_noncanonical_selection() {
+        let selection = ReviewedLivePlanSelection {
+            approved_plan_job_id: "not-a-job-id".to_string(),
+            approved_plan_attempt_id: "8d0f778a-8536-41ef-a55c-f18fd20a1bf8".to_string(),
+            approved_plan_digest: "D".repeat(64),
+        };
+        assert!(reviewed_plan_approval_body(&selection).is_err());
+    }
+
     fn summary_row(name: &str, site: &str, status: &str, created: &str) -> RequestSummary {
         RequestSummary {
             id: format!("REQ-{name}"),
@@ -4719,6 +4941,43 @@ mod tests {
     }
 
     #[test]
+    fn logout_completion_clears_local_credential_before_success_or_failure() {
+        use std::cell::Cell;
+
+        for (outcome, succeeds) in [
+            (LogoutUpstreamOutcome::Confirmed, true),
+            (
+                LogoutUpstreamOutcome::Rejected("Sign-out was rejected".to_string()),
+                false,
+            ),
+            (LogoutUpstreamOutcome::Unreachable, false),
+        ] {
+            let cleared = Cell::new(false);
+            let result = finish_logout(outcome, || cleared.set(true));
+            assert!(cleared.get(), "portal credential must always be retired");
+            assert_eq!(result.is_ok(), succeeds);
+        }
+    }
+
+    #[test]
+    fn logout_failure_projection_is_safe_and_distinguishes_rejection() {
+        let rejected = finish_logout(
+            LogoutUpstreamOutcome::Rejected("Canonical API rejection".to_string()),
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rejected.contains("Canonical API rejection"));
+
+        let unreachable = finish_logout(LogoutUpstreamOutcome::Unreachable, || {})
+            .unwrap_err()
+            .to_string();
+        assert!(unreachable.contains("server-side session revocation could not be confirmed"));
+        assert!(!unreachable.contains("connection refused"));
+        assert!(!unreachable.contains("upstream returned status"));
+    }
+
+    #[test]
     fn degraded_route_state_repoints_context_strip_labels() {
         let snapshot = PortalRouteStateSnapshot::degraded_static_fallback()
             .expect("degraded route state snapshot must build");
@@ -4842,6 +5101,172 @@ mod tests {
                 "path {path} must be rejected"
             );
         }
+    }
+
+    fn agent_roster_json(enrollment_id: &str, fingerprint: &str) -> serde_json::Value {
+        serde_json::json!({
+            "agents": [{
+                "enrollment_id": enrollment_id,
+                "cryptographically_admitted": true,
+                "agent_id": "agent-review-01",
+                "platform": "vmware",
+                "status": "pending",
+                "public_key_fingerprint": fingerprint,
+                "capabilities_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                // Defense-in-depth regression fixture: even if an upstream bug
+                // returns this field, the portal model must discard it.
+                "public_key": "raw-public-key-must-not-cross-portal-boundary",
+                "last_seen_at": null,
+                "created_at": "2026-07-15T00:00:00Z",
+                "jobs": []
+            }],
+            "capped": false
+        })
+    }
+
+    #[test]
+    fn agent_mutation_contract_preserves_reviewed_binding_without_raw_key() {
+        let enrollment_id = "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601";
+        let fingerprint = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let agents = parse_admin_agents_response(agent_roster_json(enrollment_id, fingerprint))
+            .expect("a complete roster binding must parse");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].enrollment_id, enrollment_id);
+        assert!(agents[0].cryptographically_admitted);
+        assert_eq!(agents[0].public_key_fingerprint, fingerprint);
+        assert!(is_sha256_fingerprint(&agents[0].capabilities_digest));
+
+        let portal_json =
+            serde_json::to_value(&agents[0]).expect("portal agent summary must serialize");
+        assert!(
+            portal_json.get("public_key").is_none(),
+            "raw public-key bytes must be discarded at the typed portal boundary"
+        );
+
+        let body = agent_approval_body(
+            &agents[0].enrollment_id,
+            &agents[0].public_key_fingerprint,
+            &agents[0].platform,
+        )
+        .expect("a complete reviewed binding must produce an approval body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "enrollment_id": enrollment_id,
+                "public_key_fingerprint": fingerprint,
+                "platform": "vmware"
+            })
+        );
+
+        let revoke_body =
+            agent_revocation_body(&agents[0].enrollment_id, &agents[0].public_key_fingerprint)
+                .expect("a complete reviewed binding must produce a revocation body");
+        assert_eq!(
+            revoke_body,
+            serde_json::json!({
+                "enrollment_id": enrollment_id,
+                "public_key_fingerprint": fingerprint,
+            })
+        );
+    }
+
+    #[test]
+    fn truncated_agent_roster_fails_closed_before_rendering_approval_actions() {
+        let mut raw = agent_roster_json(
+            "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        raw["capped"] = serde_json::json!(true);
+        assert!(matches!(
+            parse_admin_agents_response(raw),
+            Err(AdminAgentsResponseError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn agent_mutation_contract_keeps_stale_snapshot_for_api_conflict() {
+        let reviewed_id = "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601";
+        let reviewed_fingerprint =
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let replacement_id = "0190e17a-e9c3-7d8d-b7a9-933fc05cd53e";
+        let replacement_fingerprint =
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let reviewed =
+            parse_admin_agents_response(agent_roster_json(reviewed_id, reviewed_fingerprint))
+                .expect("reviewed snapshot must parse")
+                .remove(0);
+        let replacement =
+            parse_admin_agents_response(agent_roster_json(replacement_id, replacement_fingerprint))
+                .expect("replacement snapshot must parse")
+                .remove(0);
+        assert_eq!(reviewed.agent_id, replacement.agent_id);
+
+        let stale_body = agent_approval_body(
+            &reviewed.enrollment_id,
+            &reviewed.public_key_fingerprint,
+            &reviewed.platform,
+        )
+        .expect("the reviewed snapshot remains a well-formed request");
+        assert_eq!(stale_body["enrollment_id"], reviewed_id);
+        assert_eq!(stale_body["public_key_fingerprint"], reviewed_fingerprint);
+        assert_ne!(
+            stale_body["enrollment_id"].as_str(),
+            Some(replacement.enrollment_id.as_str())
+        );
+        assert_ne!(
+            stale_body["public_key_fingerprint"].as_str(),
+            Some(replacement.public_key_fingerprint.as_str())
+        );
+
+        let stale_revoke_body =
+            agent_revocation_body(&reviewed.enrollment_id, &reviewed.public_key_fingerprint)
+                .expect("the reviewed snapshot remains a well-formed revoke request");
+        assert_eq!(stale_revoke_body["enrollment_id"], reviewed_id);
+        assert_eq!(
+            stale_revoke_body["public_key_fingerprint"],
+            reviewed_fingerprint
+        );
+        assert_ne!(
+            stale_revoke_body["enrollment_id"].as_str(),
+            Some(replacement.enrollment_id.as_str())
+        );
+        assert_ne!(
+            stale_revoke_body["public_key_fingerprint"].as_str(),
+            Some(replacement.public_key_fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn agent_mutation_contract_rejects_missing_or_malformed_binding() {
+        let enrollment_id = "2f6cb8a7-c2c2-4c96-9f32-c80a2d329601";
+        let fingerprint = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        for missing_field in [
+            "enrollment_id",
+            "public_key_fingerprint",
+            "capabilities_digest",
+        ] {
+            let mut raw = agent_roster_json(enrollment_id, fingerprint);
+            raw["agents"][0]
+                .as_object_mut()
+                .expect("agent fixture must be an object")
+                .remove(missing_field);
+            assert!(
+                parse_admin_agents_response(raw).is_err(),
+                "a roster row missing {missing_field} must fail closed"
+            );
+        }
+
+        assert!(agent_approval_body("", fingerprint, "vmware").is_err());
+        assert!(agent_approval_body(enrollment_id, "", "vmware").is_err());
+        assert!(agent_approval_body(enrollment_id, fingerprint, " ").is_err());
+        assert!(agent_approval_body("not-a-uuid", fingerprint, "vmware").is_err());
+        assert!(agent_approval_body(enrollment_id, "sha256:short", "vmware").is_err());
+        assert!(agent_revocation_body("", fingerprint).is_err());
+        assert!(agent_revocation_body(enrollment_id, "").is_err());
+        assert!(agent_revocation_body("not-a-uuid", fingerprint).is_err());
+        assert!(agent_revocation_body(enrollment_id, "sha256:short").is_err());
     }
 
     #[test]
@@ -5475,19 +5900,40 @@ mod tests {
         assert_eq!(snapshot.execution_mode, "static-dry-run");
         assert_eq!(snapshot.secret_references_path, secret_references_path());
         let catalog_status = secret_reference_catalog_fallback();
-        assert_eq!(snapshot.provider, catalog_status.primary_provider);
-        assert_eq!(snapshot.management_cli, catalog_status.management_cli);
-        assert_eq!(snapshot.secret_references.len(), 2);
+        assert_eq!(snapshot.provider_model, catalog_status.provider_model);
+        assert_eq!(
+            snapshot.management_interface,
+            catalog_status.management_interface
+        );
+        assert_eq!(snapshot.fallback_policy, "disabled");
+        assert_eq!(snapshot.admitted_provider_classes.len(), 5);
+        assert_eq!(
+            snapshot.capability_interfaces,
+            vec!["resolve-read", "publish-version", "materialize-reload"]
+        );
+        assert_eq!(
+            snapshot.secret_reference_kinds,
+            vec![
+                "adapter-credential",
+                "worker-credential",
+                "database-credential",
+                "object-storage-credential",
+                "pki-material",
+                "recovery-material",
+                "signing-material"
+            ]
+        );
+        assert_eq!(snapshot.secret_references.len(), 3);
         assert_eq!(snapshot.readiness_state, "pending-approval");
         assert!(!snapshot.configured_for_production);
-        assert!(!snapshot.live_cli_execution_allowed);
+        assert!(!snapshot.live_provider_actions_allowed);
         assert!(!snapshot.provider_calls_allowed);
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.provider_paths_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
         assert!(snapshot.secret_references.iter().all(|reference| {
-            !reference.live_cli_execution_allowed
+            !reference.live_provider_actions_allowed
                 && !reference.value_exposure_allowed
                 && !reference.provider_path_exposure_allowed
         }));

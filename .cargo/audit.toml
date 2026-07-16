@@ -1,0 +1,6 @@
+[advisories]
+# jsonwebtoken records its optional RustCrypto RSA backend in Cargo.lock even
+# though Ryuki selects only aws_lc_rs. The companion dependency-audit script
+# fails if `rsa` ever becomes reachable in the all-features build graph.
+ignore = ["RUSTSEC-2023-0071"]
+informational_warnings = ["unmaintained", "unsound", "notice"]

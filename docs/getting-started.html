@@ -49,15 +49,29 @@ tool and provider prerequisites
 request contract
 gate 1: repository checks
 gate 2: proving-ground readiness
-gate 3: offline rehearsal
+gate 3: platform no-spawn rehearsal
 gate 4: live plan and state isolation
 gate 5: live apply and verification
 gate 6: mandatory cleanup
 result and evidence" href="/first-test.html">First Test Acceptance</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
+platform security boundary
 network policy
-execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="decision
+evidence basis and current limitations
+scope and non-goals
+pluggable authentication providers
+pluggable secret-management providers
+boundary lifecycle and operational controls
+trust model
+canonical security context
+normative invariants
+options considered
+implementation work packages
+work that does and does not require trusted access
+acceptance criteria
+standards and implementation references" href="/platform-security-boundary.html">Platform Security Boundary</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -65,6 +79,7 @@ validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
+browser redirect registration
 app roles definition
 how it works
 permissions by role
@@ -74,7 +89,8 @@ custom codes
 site selection
 managing sites
 seeded active sites
-important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="roles and permissions
+important notes" href="/site-management.html">Site Management</a></li><li><a class="sb-link" data-sections="boundary convergence
+roles and permissions
 route access classes
 scopes
 enforcement semantics
@@ -87,10 +103,10 @@ the live-apply trust chain
 where to see results
 credentials never reach the control plane
 auto-teardown on failed multi-step runs
-running a live apply against real infrastructure
+preparing for future provider-connected live execution
 what is implemented, and what stays yours" href="/agents-and-live-execution.html">Agents & Live Execution</a></li><li><a class="sb-link" data-sections="what exists today
 how a stepped request runs
-per-step live apply
+per-step live apply is disabled
 automatic teardown
 honest limits" href="/orchestration.html">Multi-Step Orchestration</a></li><li><a class="sb-link" data-sections="what gets notified, and to whom
 recipients and read state
@@ -134,11 +150,14 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>Wait for <code>curl --fail http://127.0.0.1:8081/ready</code> to succeed.</p>
 <h3 id="5-run-the-portal-on-port-8080">5. Run the portal on port 8080</h3>
 <p>In a second terminal:</p>
-<pre><code class="lang-bash"><span class="hl-cmd">RYUKI_API_URL=http://127.0.0.1:8081</span> \
+<pre><code class="lang-bash"><span class="hl-cmd">LEPTOS_SITE_ADDR=127.0.0.1:8080</span> \
+<span class="hl-cmd">RYUKI_API_URL=http://127.0.0.1:8081</span> \
+<span class="hl-cmd">RYUKI_PORTAL_PUBLIC_ORIGIN=http://127.0.0.1:8080</span> \
+<span class="hl-cmd">RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK=true</span> \
 <span class="hl-cmd">RYUKI_PORTAL_EXECUTION_MODE=live-provider</span> \
 <span class="hl-cmd">cargo</span> leptos serve <span class="hl-f">--manifest-path</span> portal/portal-ui/Cargo.toml</code></pre>
 <p>Open <code>http://127.0.0.1:8080</code>. Without <code>live-provider</code>, the portal deliberately uses its labeled static dry-run data instead of forwarding to the API.</p>
-<p>The Compose stack uses different host ports: API <code>18080</code>, portal <code>18000</code>.</p>
+<p>The Compose stack uses different loopback host ports: API <code>18080</code>, portal <code>18000</code>. Its bridged API uses local authentication rather than mock authority on a non-loopback container listener. Before starting the full stack, set <code>RYUKI_LOCAL_AUTH__USERS</code>, explicit site/environment authority modes (and scope lists for <code>scoped</code> modes), and a random, at-least-32-byte <code>RYUKI_SESSION__CREDENTIAL_HMAC_KEY</code> in the gitignored root <code>.env</code>. The default Compose portal remains static dry-run at <code>http://127.0.0.1:18000</code>.</p>
 <h3 id="6-run-tests">6. Run tests</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span></code></pre>
 <h3 id="7-run-validators">7. Run validators</h3>
@@ -150,10 +169,12 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <p>To enable live Entra ID authentication:</p>
 <ol>
 <li>Register an Entra ID application (see <code>docs/configuration.md</code>)</li>
-<li>Set <code>RYUKI_AUTH_MODE=entra-id</code> in <code>.env</code></li>
-<li>Set <code>RYUKI_ENTRA_TENANT_ID</code> and <code>RYUKI_ENTRA_CLIENT_ID</code></li>
-<li>Restart the API</li>
+<li>Export <code>RYUKI_AUTH_MODE=entra-id</code>, <code>RYUKI_ENTRA_TENANT_ID</code>, and <code>RYUKI_ENTRA_CLIENT_ID</code> into the API process (Compose may read them from the gitignored <code>.env</code>; direct Cargo runs do not)</li>
+<li>Inject a random, at-least-32-byte <code>RYUKI_SESSION__CREDENTIAL_HMAC_KEY</code> at runtime</li>
+<li>For browser SSO, also set the exact registered <code>RYUKI_ENTRA_REDIRECT_URI</code>; omit it only for deliberate bearer-only use</li>
+<li>Restart the API and require <code>/ready</code></li>
 </ol>
+<p>For a non-Entra provider, the current release has a single generic OIDC + PKCE profile under <code>RYUKI_OIDC__*</code>. See <a href="configuration.md#generic-oidc-current-single-provider-flow">Configuration</a>. The platform boundary specification defines the remaining multi-provider, brokered SAML/LDAP, WebAuthn emergency, service OAuth, and workload-identity work.</p>
 <h2 id="project-structure">Project Structure</h2>
 <pre><code>ryuki.io/
 ├── sources/

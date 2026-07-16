@@ -7,7 +7,9 @@ Operator runbook for the **Governance catalog API** coverage entry. The platform
 ## Contract
 
 - Contract definition `governance-catalog-api-contract.yaml`
-- Serves contract route `/api/catalog/access-control`.
+- Serves the read-only contract routes `/api/catalog/access-control`,
+  `/api/catalog/approval-routes`, `/api/catalog/evidence-manifest`, and
+  `/api/catalog/secret-references`.
 - Validator slice `governance-catalog-api`
 - Contract `governance-catalog-api-contract.yaml` is marked draft (version 1)
 
@@ -20,6 +22,13 @@ Requests against this contract follow the platform request lifecycle of draft, p
 ## Required inputs and approvals
 
 The contract YAML does not declare structured inputs yet. Capture the requesting role, target site, environment, and the approval decision in the request record before the approve stage completes.
+
+The secret-reference projection exposes the canonical `secretReferenceKinds`
+metadata field with the provider-neutral classifications `adapter-credential`,
+`worker-credential`, `database-credential`, `object-storage-credential`,
+`pki-material`, `recovery-material`, and `signing-material`. It is a value-free
+classification catalog: no secret material, provider locator, credential,
+deployment identifier, or provider response is part of this API shape.
 
 ## Prohibitions
 

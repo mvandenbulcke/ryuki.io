@@ -24,6 +24,76 @@ impl AlertSeverity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlertRule {
+    aggregate_type: &'static str,
+    to_status: &'static str,
+    severity: AlertSeverity,
+}
+
+/// One canonical registry drives precise classification, the coarse SQL status
+/// prefilter, and acknowledgement eligibility. Adding an alert rule anywhere
+/// else would let the read and mutation boundaries drift.
+const ALERT_RULES: &[AlertRule] = &[
+    AlertRule {
+        aggregate_type: "request",
+        to_status: "failed",
+        severity: AlertSeverity::Critical,
+    },
+    AlertRule {
+        aggregate_type: "request",
+        to_status: "drift-detected",
+        severity: AlertSeverity::Critical,
+    },
+    AlertRule {
+        aggregate_type: "request",
+        to_status: "rejected",
+        severity: AlertSeverity::Warning,
+    },
+    AlertRule {
+        aggregate_type: "request",
+        to_status: "cancelled",
+        severity: AlertSeverity::Info,
+    },
+    AlertRule {
+        aggregate_type: "slo",
+        to_status: "breached",
+        severity: AlertSeverity::Critical,
+    },
+    AlertRule {
+        aggregate_type: "budget",
+        to_status: "breached",
+        severity: AlertSeverity::Warning,
+    },
+    AlertRule {
+        aggregate_type: "agent",
+        to_status: "offline",
+        severity: AlertSeverity::Warning,
+    },
+    AlertRule {
+        aggregate_type: "agent_job",
+        to_status: "dead-lettered",
+        severity: AlertSeverity::Critical,
+    },
+    AlertRule {
+        aggregate_type: "agent_job",
+        to_status: "reconcile-required",
+        severity: AlertSeverity::Critical,
+    },
+    AlertRule {
+        aggregate_type: "background_loop",
+        to_status: "overdue",
+        severity: AlertSeverity::Critical,
+    },
+];
+
+fn severity_for(aggregate_type: &str, to_status: &str) -> Option<AlertSeverity> {
+    ALERT_RULES
+        .iter()
+        .find(|rule| rule.aggregate_type == aggregate_type && rule.to_status == to_status)
+        .map(|rule| rule.severity)
+}
+
 /// Classify a request-lifecycle event by its terminal outcome (`to_status`).
 ///
 /// A request reaching a NEGATIVE terminal state is operationally actionable: a
@@ -39,22 +109,13 @@ impl AlertSeverity {
 /// Keyed on `to_status` rather than the event type so it stays correct as new
 /// request event types are added — the outcome is what matters.
 pub fn severity_for_request_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "failed" => Some(AlertSeverity::Critical),
-        "drift-detected" => Some(AlertSeverity::Critical),
-        "rejected" => Some(AlertSeverity::Warning),
-        "cancelled" => Some(AlertSeverity::Info),
-        _ => None,
-    }
+    severity_for("request", to_status)
 }
 
 /// Classify an SLO-scan event (#11 slice 2b) by its `to_status`. A `breached`
 /// SLO is a critical operational signal; `recovered` is good news, not an alert.
 pub fn severity_for_slo_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "breached" => Some(AlertSeverity::Critical),
-        _ => None,
-    }
+    severity_for("slo", to_status)
 }
 
 /// Classify a budget-scan event (#11 slice 2c) by its `to_status`. A `breached`
@@ -62,10 +123,7 @@ pub fn severity_for_slo_status(to_status: &str) -> Option<AlertSeverity> {
 /// a tier below an SLO breach, which is a reliability-contract violation.
 /// `recovered` is not an alert.
 pub fn severity_for_budget_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "breached" => Some(AlertSeverity::Warning),
-        _ => None,
-    }
+    severity_for("budget", to_status)
 }
 
 /// Classify an agent-liveness event (#11 slice 2d) by its `to_status`. An
@@ -73,10 +131,7 @@ pub fn severity_for_budget_status(to_status: &str) -> Option<AlertSeverity> {
 /// healthy agent checks in — operationally important but not, on its own, a
 /// reliability-contract breach. `online` (recovery) is not an alert.
 pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "offline" => Some(AlertSeverity::Warning),
-        _ => None,
-    }
+    severity_for("agent", to_status)
 }
 
 /// Classify an agent-job lifecycle event (#23) by its `to_status`. A
@@ -89,10 +144,7 @@ pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
 /// `failed` request, above the recoverable `offline` agent (a warning). Every
 /// other agent-job status is normal flow and NOT an alert.
 pub fn severity_for_agent_job_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "dead-lettered" | "reconcile-required" => Some(AlertSeverity::Critical),
-        _ => None,
-    }
+    severity_for("agent_job", to_status)
 }
 
 /// Classify a background-loop wedge event by its `to_status`. An `overdue` loop
@@ -103,10 +155,7 @@ pub fn severity_for_agent_job_status(to_status: &str) -> Option<AlertSeverity> {
 /// avoid paging on a human-initiated action), `overdue` is exactly what we WANT to
 /// page on — it is an unattended liveness failure.
 pub fn severity_for_background_loop_status(to_status: &str) -> Option<AlertSeverity> {
-    match to_status {
-        "overdue" => Some(AlertSeverity::Critical),
-        _ => None,
-    }
+    severity_for("background_loop", to_status)
 }
 
 /// The UNION of every alert-worthy `to_status` across all aggregate types.
@@ -117,32 +166,38 @@ pub fn severity_for_background_loop_status(to_status: &str) -> Option<AlertSever
 /// and drops any spurious (aggregate, status) pair. A unit test keeps this union
 /// in lock-step with the per-aggregate classifiers.
 pub fn alert_worthy_statuses() -> &'static [&'static str] {
-    &[
-        "failed",
-        "drift-detected",
-        "rejected",
-        "cancelled",
-        "breached",
-        "offline",
-        "dead-lettered",
-        "reconcile-required",
-        "overdue",
-    ]
+    static STATUSES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let mut statuses = Vec::new();
+        for rule in ALERT_RULES {
+            if !statuses.contains(&rule.to_status) {
+                statuses.push(rule.to_status);
+            }
+        }
+        statuses
+    });
+    STATUSES.as_slice()
+}
+
+/// Exact `(aggregate_type, to_status)` pairs accepted as alerts. Repository
+/// mutation boundaries use this closed registry rather than the coarse status
+/// union above: a status that is alert-worthy for one aggregate must never make
+/// a different aggregate acknowledgeable.
+pub fn alert_worthy_pairs() -> &'static [(&'static str, &'static str)] {
+    static PAIRS: std::sync::LazyLock<Vec<(&'static str, &'static str)>> =
+        std::sync::LazyLock::new(|| {
+            ALERT_RULES
+                .iter()
+                .map(|rule| (rule.aggregate_type, rule.to_status))
+                .collect()
+        });
+    PAIRS.as_slice()
 }
 
 /// Classify any domain event into an optional alert severity. `request`
 /// aggregates key on their terminal status (slice 1); `slo` aggregates on the
 /// breach-scan status (slice 2b). Future operational emitters extend this match.
 pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSeverity> {
-    match aggregate_type {
-        "request" => to_status.and_then(severity_for_request_status),
-        "slo" => to_status.and_then(severity_for_slo_status),
-        "budget" => to_status.and_then(severity_for_budget_status),
-        "agent" => to_status.and_then(severity_for_agent_status),
-        "agent_job" => to_status.and_then(severity_for_agent_job_status),
-        "background_loop" => to_status.and_then(severity_for_background_loop_status),
-        _ => None,
-    }
+    to_status.and_then(|status| severity_for(aggregate_type, status))
 }
 
 #[cfg(test)]
@@ -226,6 +281,21 @@ mod tests {
                     || severity_for_agent_job_status(s).is_some()
                     || severity_for_background_loop_status(s).is_some(),
                 "{s} is in the alert union but no aggregate classifies it as an alert"
+            );
+        }
+
+        for (aggregate_type, to_status) in alert_worthy_pairs() {
+            assert!(
+                classify(aggregate_type, Some(to_status)).is_some(),
+                "exact alert pair ({aggregate_type}, {to_status}) must classify"
+            );
+        }
+        for status in alert_worthy_statuses() {
+            assert!(
+                alert_worthy_pairs()
+                    .iter()
+                    .any(|(_, pair_status)| pair_status == status),
+                "coarse alert status {status} must occur in the exact pair registry"
             );
         }
     }

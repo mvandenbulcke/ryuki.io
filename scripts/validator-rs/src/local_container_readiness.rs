@@ -15,6 +15,8 @@ const PORTAL_CARGO_PATH: &str = "portal/portal-ui/Cargo.toml";
 const PORTAL_MAIN_PATH: &str = "portal/portal-ui/src/main.rs";
 const PORTAL_SERVER_BOUNDARY_PATH: &str = "portal/portal-ui/src/server_boundary.rs";
 const ENDPOINT: &str = "/api/platform/local-container-readiness-contract";
+const PORTAL_RUNTIME_IMAGE: &str =
+    "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818";
 
 const REQUIRED_SURFACES: &[&str] = &[
     "compose-file-readiness",
@@ -232,36 +234,31 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "no-live-local-container-actions",
         decision: "block",
-        requirement:
-            "Local container readiness reports static readiness only and never calls providers, runs compose up, builds images, runs containers, pushes images, accesses registries, mutates services, mutates networks, changes local port bindings, enables environment value material, mounts volumes, creates provider-backed services, enables external egress, or changes runtime state.",
+        requirement: "Local container readiness reports static readiness only and never calls providers, runs compose up, builds images, runs containers, pushes images, accesses registries, mutates services, mutates networks, changes local port bindings, enables environment value material, mounts volumes, creates provider-backed services, enables external egress, or changes runtime state.",
         evidence: "Local container readiness summary",
     },
     RuleDetail {
         id: "two-service-local-topology-required",
         decision: "block",
-        requirement:
-            "Local compose posture must keep the browser-facing portal and server-side API as the only active services until worker, adapter, database, and Vault bootstrap slices are approved.",
+        requirement: "Local compose posture must keep the browser-facing portal and server-side API as the only active services until worker, adapter, database, and Vault bootstrap slices are approved.",
         evidence: "Service topology review",
     },
     RuleDetail {
         id: "local-routing-and-network-required",
         decision: "block",
-        requirement:
-            "Local port bindings, full-stack portal runtime boundary, service dependency order, and bridge-network boundary must be reviewed before local runtime readiness can be accepted.",
+        requirement: "Local port bindings, full-stack portal runtime boundary, service dependency order, and bridge-network boundary must be reviewed before local runtime readiness can be accepted.",
         evidence: "Network boundary review",
     },
     RuleDetail {
         id: "runtime-expansion-excluded",
         decision: "block",
-        requirement:
-            "Database, Vault, provider adapters, worker execution, provider-backed resources, environment value material, local volume mounts, registry access, and external egress must stay excluded from the local skeleton until separately approved.",
+        requirement: "Database, Vault, provider adapters, worker execution, provider-backed resources, environment value material, local volume mounts, registry access, and external egress must stay excluded from the local skeleton until separately approved.",
         evidence: "Excluded runtime review",
     },
     RuleDetail {
         id: "raw-local-runtime-data-not-exposed",
         decision: "block",
-        requirement:
-            "Local container readiness evidence must use safe summaries only and must not expose runtime endpoints, private network details, environment value material, registry material, organization-scope identifiers, provider-side identifiers, sensitive auth material, raw runtime payloads, or provider-returned content.",
+        requirement: "Local container readiness evidence must use safe summaries only and must not expose runtime endpoints, private network details, environment value material, registry material, organization-scope identifiers, provider-side identifiers, sensitive auth material, raw runtime payloads, or provider-returned content.",
         evidence: "Evidence references",
     },
 ];
@@ -655,15 +652,21 @@ fn validate_compose_boundary(compose: &Value, errors: &mut Vec<String>) {
                 if map.contains_key("extra_hosts") {
                     errors.push(format!("{service_name} must not define extra hosts"));
                 }
+                // The compose slice validates the exact checked-in environment
+                // map, including the two required secret interpolation
+                // descriptors. The ignored values are not read here, and no
+                // service-level env_file is allowed to forward unrelated keys.
                 if map.contains_key("environment")
-                    && service_name != "platform-db"
-                    && service_name != "platform-api"
+                    && !matches!(
+                        service_name.as_str(),
+                        "platform-db" | "platform-api" | "portal-ui"
+                    )
                 {
                     errors.push(format!(
                         "{service_name} must not expose environment value material"
                     ));
                 }
-                if map.contains_key("env_file") && service_name != "platform-api" {
+                if map.contains_key("env_file") {
                     errors.push(format!("{service_name} must not define env_file"));
                 }
                 if map.contains_key("volumes") && service_name != "platform-db" {
@@ -687,9 +690,9 @@ fn validate_portal_runtime_boundary(
         "portal Dockerfile must build the full-stack Leptos app",
     );
     expect(
-        dockerfile.contains("FROM debian:bookworm-slim AS runtime"),
+        has_reviewed_portal_runtime_stage(dockerfile),
         errors,
-        "portal Dockerfile must use a Rust portal server runtime stage",
+        "portal Dockerfile must use the exact reviewed Rust portal runtime stage",
     );
     expect(
         dockerfile.contains("LEPTOS_SITE_ROOT=/app/site"),
@@ -758,6 +761,22 @@ fn validate_portal_runtime_boundary(
         errors,
         "portal server boundary must block evidence export by default",
     );
+}
+
+fn has_reviewed_portal_runtime_stage(dockerfile: &str) -> bool {
+    dockerfile.lines().any(|line| {
+        let instruction = line.trim();
+        if instruction.is_empty() || instruction.starts_with('#') {
+            return false;
+        }
+
+        let tokens = instruction.split_ascii_whitespace().collect::<Vec<_>>();
+        tokens.len() == 4
+            && tokens[0].eq_ignore_ascii_case("FROM")
+            && tokens[1] == PORTAL_RUNTIME_IMAGE
+            && tokens[2].eq_ignore_ascii_case("AS")
+            && tokens[3] == "runtime"
+    })
 }
 
 // relaxed: the legacy C# Program.cs (api/Ryuki.Platform.Api/*) parsed here was
@@ -1965,6 +1984,59 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reviewed_compose() -> Value {
+        serde_yaml::from_str(include_str!("../../../deploy/compose/compose.yaml"))
+            .expect("reviewed compose fixture must parse")
+    }
+
+    #[test]
+    fn reviewed_loopback_launch_profile_is_accepted() {
+        let mut errors = Vec::new();
+
+        validate_compose_boundary(&reviewed_compose(), &mut errors);
+
+        assert!(errors.is_empty(), "reviewed profile errors: {errors:?}");
+    }
+
+    #[test]
+    fn arbitrary_portal_environment_is_rejected() {
+        let mut compose = reviewed_compose();
+        compose["services"]["portal-ui"]["environment"]["RYUKI_API_URL"] =
+            Value::String("https://unreviewed.example".to_string());
+        let mut errors = Vec::new();
+
+        validate_compose_boundary(&compose, &mut errors);
+
+        assert!(
+            errors.iter().any(|error| error
+                .contains("portal-ui environment must match the reviewed local-safe profile")),
+            "arbitrary portal environment must fail closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn reviewed_portal_runtime_stage_is_one_active_instruction() {
+        let dockerfile = include_str!("../../../portal/portal-ui/Dockerfile");
+
+        assert!(has_reviewed_portal_runtime_stage(dockerfile));
+    }
+
+    #[test]
+    fn separated_runtime_stage_fragments_are_rejected() {
+        let dockerfile = format!(
+            "FROM {PORTAL_RUNTIME_IMAGE} AS build\nFROM alpine:3.22 AS runtime\n# FROM {PORTAL_RUNTIME_IMAGE} AS runtime\n"
+        );
+
+        assert!(!has_reviewed_portal_runtime_stage(&dockerfile));
+    }
+
+    #[test]
+    fn unreviewed_runtime_digest_is_rejected() {
+        let dockerfile = "FROM debian:bookworm-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS runtime\n";
+
+        assert!(!has_reviewed_portal_runtime_stage(dockerfile));
+    }
 
     #[test]
     fn mapget_routes_accept_whitespace_before_open_paren() {

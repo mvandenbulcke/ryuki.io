@@ -536,6 +536,35 @@ impl std::fmt::Display for PolicyDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2ApprovalEvidence {
+    pub approved_by: String,
+    pub approved_at: String,
+    pub plan_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2LockEvidence {
+    pub lock_id: String,
+    pub locked_by: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+    pub plan_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2Governance {
+    /// SHA-256 over immutable operation and plan fields. Approval and lock
+    /// evidence must repeat this exact digest.
+    pub plan_digest: String,
+    /// Stable, server-derived principal that planned the operation.
+    pub planned_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<VmDay2ApprovalEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_lock: Option<VmDay2LockEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VmDay2ChangeRequest {
     pub id: String,
     pub target_ci_key: String,
@@ -550,6 +579,10 @@ pub struct VmDay2ChangeRequest {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: HashMap<String, String>,
+    /// Durable approval and lock evidence. `None` identifies a legacy row that
+    /// must fail closed before validation/approval/execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<VmDay2Governance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,7 +651,25 @@ pub struct VmDesiredState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotRecord {
     pub id: String,
+    /// Immutable authoritative CMDB identity. Descriptive fields below are not
+    /// authorization identities; site/environment are resolved through this
+    /// relation by the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_item_id: Option<String>,
     pub platform_ci_key: String,
+    /// Canonical scope projected from the related configuration item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// `None` means inventory has not authoritatively classified this axis.
+    /// Environment-scoped access fails closed for such a record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// Verified principal that created the governance row. This is provenance,
+    /// not a substitute for the free-form business `owner` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_provenance: Option<String>,
     pub snapshot_purpose: String,
     pub requested_expiry: String,
     pub owner: String,

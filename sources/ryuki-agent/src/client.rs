@@ -3,11 +3,17 @@
 //! ## Auth model
 //!
 //! - `register_new` is the **unauthenticated** call (called before the agent
-//!   has a token): it constructs a bare `reqwest::Client` and hits
-//!   `POST /api/agents/register`, returning the `(agent_id, token)` pair.
-//! - After registration + approval, construct an authed `CpClient` with
-//!   `CpClient::new(base_url, agent_id, token)`.  Every subsequent call
-//!   includes `Authorization: Bearer <token>`.
+//!   has a token): it hits `POST /api/agents/register`, returning the
+//!   `(agent_id, token)` pair.
+//! - After registration + approval, construct an authed `CpClient` from the
+//!   same validated [`ControlPlaneEndpoint`]. Every subsequent credential-
+//!   bearing call uses that endpoint and includes `Authorization: Bearer
+//!   <token>`.
+//!
+//! The endpoint is parsed and transport-validated once, redirects are disabled,
+//! and HTTPS is enforced again in reqwest. Plain HTTP is available only for an
+//! explicitly enabled loopback development endpoint, with ambient proxies
+//! disabled so the local exception cannot send credentials off-host.
 //!
 //! ## post_result (S4a stub)
 //!
@@ -16,16 +22,17 @@
 //! (with `JobResult` + signed `SignedEnvelope` + evidence) without changing the
 //! client API.  Document the expected shape in the S4b seam note below.
 //!
-//! ## Tests (no live server)
+//! ## Tests
 //!
-//! S4a tests cover:
+//! Tests cover:
 //! - Serde round-trips for all request/response types against the protocol
 //!   types from `ryuki-protocol` and the CP wire types from `ryuki-api`.
 //! - URL construction correctness (trailing-slash normalisation, path segments).
-//!
-//! Live-server end-to-end testing is S4b.
+//! - Transport policy and no-redirect behavior with local one-shot fixtures.
 
-use reqwest::{header, Client, StatusCode};
+use std::net::IpAddr;
+
+use reqwest::{header, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -81,6 +88,11 @@ pub enum ClientError {
         cp_version: u32,
         supported: &'static [u32],
     },
+    /// The configured endpoint does not meet the credential-transport policy.
+    /// The raw value is deliberately omitted because rejected userinfo may
+    /// itself contain a credential.
+    #[error("invalid control-plane endpoint: {reason}")]
+    InvalidEndpoint { reason: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,16 +145,152 @@ fn parse_advertised_protocol_version(body: &serde_json::Value) -> Result<u32, Cl
 }
 
 // ---------------------------------------------------------------------------
+// Validated control-plane endpoint
+// ---------------------------------------------------------------------------
+
+/// A parsed control-plane destination that has already passed the credential-
+/// transport policy.
+///
+/// Fields are private so production callers cannot construct an HTTP endpoint
+/// without passing the explicit loopback-only policy in [`Self::parse`].
+#[derive(Clone, Debug)]
+pub struct ControlPlaneEndpoint {
+    url: Url,
+    insecure_loopback: bool,
+}
+
+impl ControlPlaneEndpoint {
+    /// Parse and validate a control-plane base URL.
+    ///
+    /// HTTPS is always admitted. HTTP is admitted only when
+    /// `allow_insecure_loopback` is explicitly true and the parsed host is the
+    /// exact `localhost` name or an IPv4/IPv6 address for which the standard
+    /// library reports `is_loopback()`. Userinfo, queries, fragments, missing
+    /// hosts, lookalike names, and the unspecified `0.0.0.0` address are
+    /// rejected.
+    pub fn parse(raw: &str, allow_insecure_loopback: bool) -> Result<Self, ClientError> {
+        let raw = raw.trim();
+        let mut url = Url::parse(raw).map_err(|_| ClientError::InvalidEndpoint {
+            reason: "RYUKI_AGENT_CP_URL must be a valid absolute URL",
+        })?;
+        if url.host().is_none() {
+            return Err(ClientError::InvalidEndpoint {
+                reason: "RYUKI_AGENT_CP_URL must contain a host",
+            });
+        }
+        // Url::username() cannot distinguish absent userinfo from the
+        // syntactically present but empty form `https://@host`.
+        let raw_authority_has_userinfo = raw
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+            .is_some_and(|authority| authority.contains('@'));
+        if raw_authority_has_userinfo || !url.username().is_empty() || url.password().is_some() {
+            return Err(ClientError::InvalidEndpoint {
+                reason: "RYUKI_AGENT_CP_URL must not contain userinfo",
+            });
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(ClientError::InvalidEndpoint {
+                reason: "RYUKI_AGENT_CP_URL must not contain a query string or fragment",
+            });
+        }
+        if endpoint_host_address(&url).is_some_and(|address| address.is_unspecified()) {
+            return Err(ClientError::InvalidEndpoint {
+                reason: "RYUKI_AGENT_CP_URL must name a destination, not an unspecified address",
+            });
+        }
+
+        let insecure_loopback = match url.scheme() {
+            "https" => false,
+            "http" if allow_insecure_loopback && endpoint_host_is_loopback(&url) => true,
+            "http" => {
+                return Err(ClientError::InvalidEndpoint {
+                    reason: "RYUKI_AGENT_CP_URL must use HTTPS; plain HTTP is allowed only for an explicitly enabled loopback development endpoint via RYUKI_AGENT_ALLOW_INSECURE_LOOPBACK",
+                });
+            }
+            _ => {
+                return Err(ClientError::InvalidEndpoint {
+                    reason: "RYUKI_AGENT_CP_URL must use the HTTPS scheme",
+                });
+            }
+        };
+
+        // Relative joins below must append beneath an optional reverse-proxy
+        // prefix instead of replacing its final segment.
+        let normalized = format!("{}/", raw.trim_end_matches('/'));
+        url = Url::parse(&normalized).expect("validated control-plane URL must reparse");
+
+        Ok(Self {
+            url,
+            insecure_loopback,
+        })
+    }
+
+    /// Whether this endpoint uses the explicit loopback HTTP development path.
+    pub fn is_insecure_loopback(&self) -> bool {
+        self.insecure_loopback
+    }
+
+    /// Join one API-relative path beneath the validated base URL.
+    fn join(&self, relative: &str) -> Url {
+        self.url
+            .join(relative)
+            .expect("static agent API path must join a validated base URL")
+    }
+}
+
+impl std::fmt::Display for ControlPlaneEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve the previous operator-facing form without a trailing slash.
+        f.write_str(self.url.as_str().trim_end_matches('/'))
+    }
+}
+
+fn endpoint_host_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || endpoint_host_address(url).is_some_and(|address| address.is_loopback())
+}
+
+fn endpoint_host_address(url: &Url) -> Option<IpAddr> {
+    let host = url.host_str()?;
+    let address_literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address_literal.parse::<IpAddr>().ok()
+}
+
+/// Build a client whose second-line transport controls match the validated
+/// endpoint. Redirects are never followed because an authenticated 3xx must not
+/// be able to move a bearer or registration response onto another transport.
+fn endpoint_http_client(endpoint: &ControlPlaneEndpoint) -> Result<Client, ClientError> {
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(!endpoint.insecure_loopback);
+    if endpoint.insecure_loopback {
+        // Ambient HTTP_PROXY settings must not turn the local-only exception
+        // into a cleartext request carrying credentials to a remote proxy.
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
+}
+
+// ---------------------------------------------------------------------------
 // CpClient
 // ---------------------------------------------------------------------------
 
 /// Authenticated control-plane HTTP client.
 ///
-/// All methods append to `base_url`; the URL is stored without a trailing slash.
+/// Every method joins its path beneath one validated endpoint. The HTTP client
+/// cannot follow redirects, and enforces HTTPS unless that endpoint is the
+/// explicit loopback-only development exception.
 #[derive(Clone)]
 pub struct CpClient {
     http: Client,
-    base_url: String,
+    endpoint: ControlPlaneEndpoint,
     /// The `agent_id` string used in URL path segments (e.g. `defra-vcenter-01`).
     agent_id: String,
     /// Bearer token (includes the `rya_` prefix).
@@ -150,21 +298,33 @@ pub struct CpClient {
 }
 
 impl CpClient {
-    /// Construct an authenticated client.
-    ///
-    /// `base_url` may or may not have a trailing slash; it is normalised here.
-    pub fn new(
-        base_url: impl Into<String>,
+    /// Construct an authenticated client from an already-validated endpoint.
+    pub fn from_endpoint(
+        endpoint: &ControlPlaneEndpoint,
+        agent_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self {
+            http: endpoint_http_client(endpoint)?,
+            endpoint: endpoint.clone(),
+            agent_id: agent_id.into(),
+            token: token.into(),
+        })
+    }
+
+    /// Test-only raw constructor. Production code must retain the typed
+    /// endpoint from configuration; unit tests use this explicit loopback
+    /// development policy for their local HTTP stubs.
+    #[cfg(test)]
+    pub(crate) fn new(
+        base_url: &str,
         agent_id: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
-        let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Self {
-            http: Client::new(),
-            base_url,
-            agent_id: agent_id.into(),
-            token: token.into(),
-        }
+        let endpoint = ControlPlaneEndpoint::parse(base_url, true)
+            .expect("test control-plane URL must be HTTPS or loopback HTTP");
+        Self::from_endpoint(&endpoint, agent_id, token)
+            .expect("test control-plane client must initialize")
     }
 
     // ------------------------------------------------------------------
@@ -182,8 +342,9 @@ impl CpClient {
         with_protocol_version(rb).header(header::AUTHORIZATION, self.auth_header())
     }
 
-    fn jobs_base_url(&self) -> String {
-        format!("{}/api/agents/{}/jobs", self.base_url, self.agent_id)
+    fn jobs_base_url(&self) -> Url {
+        self.endpoint
+            .join(&format!("api/agents/{}/jobs", self.agent_id))
     }
 
     // ------------------------------------------------------------------
@@ -198,13 +359,12 @@ impl CpClient {
     /// After the admin approves the agent, the caller constructs a `CpClient`
     /// with the returned token and calls the authed methods.
     pub async fn register_new(
-        base_url: &str,
+        endpoint: &ControlPlaneEndpoint,
         reg: &AgentRegistration,
     ) -> Result<RegisterResponse, ClientError> {
-        let base_url = base_url.trim_end_matches('/');
-        let url = format!("{}/api/agents/register", base_url);
-        let http = Client::new();
-        let resp = with_protocol_version(http.post(&url))
+        let url = endpoint.join("api/agents/register");
+        let http = endpoint_http_client(endpoint)?;
+        let resp = with_protocol_version(http.post(url))
             .json(reg)
             .send()
             .await?;
@@ -222,7 +382,7 @@ impl CpClient {
     /// Returns `None` on HTTP 204 (no job available), `Some(Job)` on 200.
     pub async fn poll(&self) -> Result<Option<Job>, ClientError> {
         let url = self.jobs_base_url();
-        let resp = self.authed(self.http.get(&url)).send().await?;
+        let resp = self.authed(self.http.get(url)).send().await?;
 
         if resp.status() == StatusCode::NO_CONTENT {
             return Ok(None);
@@ -244,12 +404,14 @@ impl CpClient {
         attempt_id: Uuid,
         fencing_token: impl Into<String>,
     ) -> Result<(), ClientError> {
-        let url = format!("{}/{}/ack", self.jobs_base_url(), job_id);
+        let url = self
+            .endpoint
+            .join(&format!("api/agents/{}/jobs/{job_id}/ack", self.agent_id));
         let body = AckBody {
             attempt_id,
             fencing_token: fencing_token.into(),
         };
-        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
         require_2xx(resp).await?;
         Ok(())
     }
@@ -260,9 +422,11 @@ impl CpClient {
     /// because a job id without its exact fencing material must never extend a
     /// lease.
     pub async fn heartbeat(&self) -> Result<(), ClientError> {
-        let url = format!("{}/api/agents/{}/heartbeat", self.base_url, self.agent_id);
+        let url = self
+            .endpoint
+            .join(&format!("api/agents/{}/heartbeat", self.agent_id));
         let body = AgentHeartbeat::idle();
-        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
         require_2xx(resp).await?;
         Ok(())
     }
@@ -275,9 +439,11 @@ impl CpClient {
         job_id: Uuid,
         lease: &JobLease,
     ) -> Result<AgentHeartbeatResponse, ClientError> {
-        let url = format!("{}/api/agents/{}/heartbeat", self.base_url, self.agent_id);
+        let url = self
+            .endpoint
+            .join(&format!("api/agents/{}/heartbeat", self.agent_id));
         let body = AgentHeartbeat::renewing(job_id, lease);
-        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
         let resp = require_2xx(resp).await?;
         Ok(resp.json().await?)
     }
@@ -285,9 +451,8 @@ impl CpClient {
     /// GET /api/agents/cp-public-key
     ///
     /// Fetches the control plane's Ed25519 verifying (public) key as a
-    /// base64-encoded string.  This endpoint is **intentionally unauthenticated**
-    /// on the CP side — a public key is not a secret.  Sending a bearer token
-    /// is harmless; we include it for consistency with other methods.
+    /// base64-encoded string. This endpoint is **intentionally unauthenticated**
+    /// on the CP side, so the client deliberately omits the reusable bearer.
     ///
     /// The caller should pin the returned key at startup (via
     /// `ryuki_agent::live::pin_cp_key`) and use it to verify every
@@ -295,18 +460,16 @@ impl CpClient {
     ///
     /// ## TOFU note
     ///
-    /// Fetching over plain `http://` exposes the key to a MITM who can substitute
-    /// their own key and subsequently forge grants.  In production the CP URL MUST
-    /// use HTTPS, or the operator must pin the key via a separate trusted channel.
-    /// The `ryuki-agent` binary logs a warning when `cp_base_url` is `http://`.
+    /// The typed endpoint makes HTTPS mandatory except for the explicit
+    /// loopback-only development policy, so a remote MITM cannot substitute the
+    /// key during this fetch.
     ///
     /// Returns the raw base64 string (suitable for passing to `pin_cp_key`).
     pub async fn fetch_cp_public_key(&self) -> Result<String, ClientError> {
-        let url = format!("{}/api/agents/cp-public-key", self.base_url);
-        // Bearer token is harmless here (endpoint is unauthenticated), and sending
-        // it (plus the protocol-version header) consistently avoids any future
-        // auth-policy change from silently breaking this call.
-        let resp = self.authed(self.http.get(&url)).send().await?;
+        let url = self.endpoint.join("api/agents/cp-public-key");
+        // This endpoint is intentionally unauthenticated. Do not send the
+        // reusable bearer when the protocol-version header is sufficient.
+        let resp = with_protocol_version(self.http.get(url)).send().await?;
         let resp = require_2xx(resp).await?;
         let body: serde_json::Value = resp.json().await?;
         body.get("public_key")
@@ -322,8 +485,8 @@ impl CpClient {
     /// version. A CP that predates version advertisement omits the field; per the
     /// wire contract such a CP speaks [`ryuki_protocol::PROTOCOL_VERSION_LEGACY`].
     pub async fn fetch_cp_protocol_version(&self) -> Result<u32, ClientError> {
-        let url = format!("{}/api/agents/cp-public-key", self.base_url);
-        let resp = self.authed(self.http.get(&url)).send().await?;
+        let url = self.endpoint.join("api/agents/cp-public-key");
+        let resp = with_protocol_version(self.http.get(url)).send().await?;
         let resp = require_2xx(resp).await?;
         let body: serde_json::Value = resp.json().await?;
         parse_advertised_protocol_version(&body)
@@ -374,8 +537,11 @@ impl CpClient {
         job_id: Uuid,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
-        let url = format!("{}/{}/result", self.jobs_base_url(), job_id);
-        let resp = self.authed(self.http.post(&url)).json(&body).send().await?;
+        let url = self.endpoint.join(&format!(
+            "api/agents/{}/jobs/{job_id}/result",
+            self.agent_id
+        ));
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
         let resp = require_2xx(resp).await?;
         let json: serde_json::Value = resp.json().await?;
         Ok(json)
@@ -383,7 +549,7 @@ impl CpClient {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (no live server — serde round-trips + URL construction)
+// Tests (serde, URL construction, and local one-shot transport fixtures)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -394,7 +560,61 @@ mod tests {
         AgentRegistration, Capabilities, Job, JobLease, JobMode, JobSpec, JobStatus,
     };
     use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use uuid::Uuid;
+
+    async fn one_response_server(response: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test server");
+        let addr = listener.local_addr().expect("local test address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n")
+                && request.len() < 16 * 1024
+            {
+                let read = stream.read(&mut chunk).await.expect("read test request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let required = header_end + 4 + content_length;
+                while request.len() < required && request.len() < 16 * 1024 {
+                    let read = stream
+                        .read(&mut chunk)
+                        .await
+                        .expect("read test request body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+            }
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+            String::from_utf8(request).expect("HTTP request must be UTF-8 in this fixture")
+        });
+        (format!("http://{addr}"), task)
+    }
 
     // -----------------------------------------------------------------------
     // URL construction tests
@@ -404,7 +624,79 @@ mod tests {
     fn poll_url_is_correct() {
         let client = CpClient::new("https://cp.example.com/", "defra-vcenter-01", "rya_tok");
         let expected = "https://cp.example.com/api/agents/defra-vcenter-01/jobs";
-        assert_eq!(client.jobs_base_url(), expected);
+        assert_eq!(client.jobs_base_url().as_str(), expected);
+    }
+
+    #[test]
+    fn endpoint_requires_https_by_default() {
+        let result = ControlPlaneEndpoint::parse("http://127.0.0.1:8081", false);
+        assert!(
+            matches!(result, Err(ClientError::InvalidEndpoint { .. })),
+            "even loopback HTTP must require an explicit development policy"
+        );
+    }
+
+    #[test]
+    fn endpoint_allows_explicit_loopback_http_and_https() {
+        for raw in [
+            "https://cp.example.com",
+            "http://localhost:8081",
+            "http://127.9.8.7:8081",
+            "http://[::1]:8081",
+        ] {
+            let endpoint = ControlPlaneEndpoint::parse(raw, true)
+                .unwrap_or_else(|e| panic!("valid endpoint {raw} was rejected: {e}"));
+            assert_eq!(endpoint.is_insecure_loopback(), raw.starts_with("http://"));
+        }
+    }
+
+    #[test]
+    fn endpoint_rejects_remote_or_ambiguous_http_even_with_switch() {
+        for raw in [
+            "http://cp.example.com",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://0.0.0.0:8081",
+            "https://0.0.0.0:8443",
+            "https://[::]:8443",
+            "http://localhost:8081@evil.example",
+            "http://@localhost:8081",
+        ] {
+            assert!(
+                matches!(
+                    ControlPlaneEndpoint::parse(raw, true),
+                    Err(ClientError::InvalidEndpoint { .. })
+                ),
+                "unsafe endpoint {raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_rejects_credential_components_but_preserves_path_prefix() {
+        for raw in [
+            "https://user@cp.example.com",
+            "https://@cp.example.com",
+            "https://cp.example.com?query=1",
+            "https://cp.example.com#fragment",
+            "ftp://cp.example.com",
+            "https://",
+        ] {
+            assert!(
+                matches!(
+                    ControlPlaneEndpoint::parse(raw, false),
+                    Err(ClientError::InvalidEndpoint { .. })
+                ),
+                "unsafe endpoint {raw:?} must be rejected"
+            );
+        }
+
+        let endpoint = ControlPlaneEndpoint::parse("https://cp.example.com/ryuki///", false)
+            .expect("reverse-proxy path prefix must remain supported");
+        assert_eq!(
+            endpoint.join("api/agents/register").as_str(),
+            "https://cp.example.com/ryuki/api/agents/register"
+        );
     }
 
     #[test]
@@ -460,9 +752,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_is_not_supported_after_state_isolation_upgrade() {
+    fn legacy_versions_are_not_supported_after_execution_authority_upgrade() {
         assert_eq!(ryuki_protocol::PROTOCOL_VERSION_LEGACY, 1);
         assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&1));
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&3));
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&4));
+        assert!(!ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&5));
+        assert_eq!(ryuki_protocol::PROTOCOL_VERSION, 6);
         assert!(
             ryuki_protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&ryuki_protocol::PROTOCOL_VERSION)
         );
@@ -492,7 +788,7 @@ mod tests {
     fn base_url_trailing_slash_stripped() {
         let client = CpClient::new("https://cp.example.com///", "ag", "rya_x");
         // The trailing slashes are stripped.
-        assert_eq!(client.base_url, "https://cp.example.com");
+        assert_eq!(client.endpoint.to_string(), "https://cp.example.com");
     }
 
     #[test]
@@ -503,8 +799,10 @@ mod tests {
             "https://cp.example.com/api/agents/my-agent/jobs/{}/ack",
             job_id
         );
-        let actual = format!("{}/{}/ack", client.jobs_base_url(), job_id);
-        assert_eq!(actual, expected);
+        let actual = client
+            .endpoint
+            .join(&format!("api/agents/my-agent/jobs/{job_id}/ack"));
+        assert_eq!(actual.as_str(), expected.as_str());
     }
 
     #[test]
@@ -515,19 +813,105 @@ mod tests {
             "https://cp.example.com/api/agents/my-agent/jobs/{}/result",
             job_id
         );
-        let actual = format!("{}/{}/result", client.jobs_base_url(), job_id);
-        assert_eq!(actual, expected);
+        let actual = client
+            .endpoint
+            .join(&format!("api/agents/my-agent/jobs/{job_id}/result"));
+        assert_eq!(actual.as_str(), expected.as_str());
     }
 
     #[test]
     fn heartbeat_url_is_correct() {
         let client = CpClient::new("https://cp.example.com", "my-agent", "rya_tok");
         let expected = "https://cp.example.com/api/agents/my-agent/heartbeat";
-        let actual = format!(
-            "{}/api/agents/{}/heartbeat",
-            client.base_url, client.agent_id
+        let actual = client
+            .endpoint
+            .join(&format!("api/agents/{}/heartbeat", client.agent_id));
+        assert_eq!(actual.as_str(), expected);
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_does_not_follow_redirects() {
+        let response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/exfil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let (base_url, server) = one_response_server(response).await;
+        let endpoint = ControlPlaneEndpoint::parse(&base_url, true).expect("loopback opt-in");
+        let client = CpClient::from_endpoint(&endpoint, "agent", "rya_test_bearer")
+            .expect("client must initialize");
+
+        let err = client
+            .heartbeat()
+            .await
+            .expect_err("302 must not be followed");
+        assert!(
+            matches!(&err, ClientError::ErrorStatus { status: 302, .. }),
+            "redirect must surface as the original 302: {err}"
         );
-        assert_eq!(actual, expected);
+        let request = server.await.expect("test server task");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer rya_test_bearer"),
+            "fixture must exercise a credential-bearing request"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_client_does_not_follow_redirects() {
+        let response = "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/exfil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let (base_url, server) = one_response_server(response).await;
+        let endpoint = ControlPlaneEndpoint::parse(&base_url, true).expect("loopback opt-in");
+        let registration = AgentRegistration {
+            enrollment_challenge_id: Uuid::nil(),
+            enrollment_challenge:
+                "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            agent_id: "agent".to_owned(),
+            platform: "defra".to_owned(),
+            capabilities: Capabilities::default(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            enrollment_proof: "proof".to_owned(),
+        };
+
+        let err = CpClient::register_new(&endpoint, &registration)
+            .await
+            .expect_err("307 registration response must not be followed");
+        assert!(
+            matches!(&err, ClientError::ErrorStatus { status: 307, .. }),
+            "registration redirect must surface as the original 307: {err}"
+        );
+        let request = server.await.expect("test server task");
+        assert!(request.starts_with("POST /api/agents/register "));
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "first-boot registration must remain unauthenticated"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_key_fetch_omits_the_reusable_bearer() {
+        let body = r#"{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, server) = one_response_server(response).await;
+        let endpoint = ControlPlaneEndpoint::parse(&base_url, true).expect("loopback opt-in");
+        let client = CpClient::from_endpoint(&endpoint, "agent", "rya_must_not_be_sent")
+            .expect("client must initialize");
+
+        client
+            .fetch_cp_public_key()
+            .await
+            .expect("public-key response must parse");
+        let request = server.await.expect("test server task");
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "unauthenticated public-key fetch must omit the bearer"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-ryuki-protocol-version:"),
+            "wire protocol header must remain present"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -549,16 +933,23 @@ mod tests {
     #[test]
     fn agent_registration_roundtrip() {
         let reg = AgentRegistration {
+            enrollment_challenge_id: Uuid::nil(),
+            enrollment_challenge:
+                "ryc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             agent_id: "gblon-proxmox-01".to_owned(),
             platform: "gblon".to_owned(),
             capabilities: Capabilities::default(),
             public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            enrollment_proof: "proof".to_owned(),
         };
         let json = serde_json::to_string(&reg).expect("serialise");
         let decoded: AgentRegistration = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(decoded.agent_id, reg.agent_id);
         assert_eq!(decoded.platform, reg.platform);
         assert_eq!(decoded.public_key, reg.public_key);
+        assert_eq!(decoded.enrollment_challenge_id, reg.enrollment_challenge_id);
+        assert_eq!(decoded.enrollment_challenge, reg.enrollment_challenge);
+        assert_eq!(decoded.enrollment_proof, reg.enrollment_proof);
     }
 
     #[test]
@@ -618,6 +1009,7 @@ mod tests {
         };
         let job = Job {
             id: Uuid::new_v4(),
+            agent_enrollment_id: Uuid::nil(),
             platform: "defra".to_owned(),
             spec,
             status: JobStatus::Leased,
@@ -650,9 +1042,10 @@ mod tests {
     fn cp_public_key_url_is_correct() {
         let client = CpClient::new("https://cp.example.com/", "defra-vcenter-01", "rya_tok");
         let expected = "https://cp.example.com/api/agents/cp-public-key";
-        let actual = format!("{}/api/agents/cp-public-key", client.base_url);
+        let actual = client.endpoint.join("api/agents/cp-public-key");
         assert_eq!(
-            actual, expected,
+            actual.as_str(),
+            expected,
             "cp-public-key URL must use base_url without trailing slash"
         );
     }

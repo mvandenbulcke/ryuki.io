@@ -37,6 +37,11 @@ Required guards and approvals (from the contract YAML).
 
     request-context-known
     target-scope-summarized
+    canonical-name-site-owner-bound
+    server-derived-ou-policy-match
+    namespace-provenance-verified
+    current-owner-site-active
+    quarantine-recovery-maker-checker
     ou-policy-reviewed
     lifecycle-action-supported
     cmdb-state-reviewed
@@ -52,6 +57,9 @@ Live execution remains blocked until this slice is separately approved for live 
 - No worker execution.
 - No live directory changes.
 - No computer prestage, move, disable, delete, or recover actions.
+- Namespace provenance and the active owner site are required for every
+  platform-state read or mutation. Quarantined legacy rows require a fresh,
+  version-bound maker/checker recovery and are never auto-promoted.
 
 ## Requirements
 

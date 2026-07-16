@@ -12,6 +12,13 @@ The platform's non-negotiable security rules are defined in
 ordered execution lifecycle, browser isolation, deny-all network policy, evidence
 redaction, and adapter least privilege.
 
+The target production ownership model for authentication, sessions,
+authorization, approvals, machine identity, provider credentials, audit, and
+ingress budgets is the
+[Platform Security Boundary Specification](platform-security-boundary.md).
+That specification is a blocking target-state contract; its presence does not
+mean the current implementation conforms.
+
 ## Vault foundation
 
 The committed Vault configuration is a static skeleton: the repository does not

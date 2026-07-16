@@ -7,13 +7,32 @@ if ! command -v rg >/dev/null 2>&1; then
 fi
 
 paths=("$@")
+scope_description=""
+if [ "$#" -gt 0 ]; then
+  scope_description="${paths[*]}"
+fi
 if [ "${#paths[@]}" -eq 0 ]; then
-  # Default scope includes existing paths plus Rust source crates under sources/
-  source_crates=()
-  for d in sources/ryuki-*/; do
-    [ -d "$d" ] && source_crates+=("$d")
-  done
-  paths=(docs catalog fixtures scripts deploy portal "${source_crates[@]}")
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'no-secret-scan default scope requires a Git worktree\n' >&2
+    exit 2
+  fi
+
+  # Cover every commit candidate, including root files and hidden workflow/
+  # tool configuration, while respecting .gitignore for local-only material.
+  paths=()
+  while IFS= read -r -d '' path; do
+    # A tracked path can be an intentional deletion in the current change set.
+    # Scan only commit candidates that still have content to inspect.
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      paths+=("$path")
+    fi
+  done < <(git ls-files --cached --others --exclude-standard -z)
+
+  if [ "${#paths[@]}" -eq 0 ]; then
+    printf 'no-secret-scan found no tracked or unignored files\n' >&2
+    exit 2
+  fi
+  scope_description="${#paths[@]} tracked or unignored files"
 fi
 
 patterns=(
@@ -100,4 +119,4 @@ if [ "$found_any" = true ]; then
   exit 1
 fi
 
-printf 'No secret patterns found in scoped paths: %s\n' "${paths[*]}"
+printf 'No secret patterns found in scope: %s\n' "$scope_description"

@@ -8,26 +8,68 @@ Secret references let platform code and manifests point to runtime-resolved mate
 
 ## Provider direction
 
-Vaultwarden is the runtime provider for every secret reference. References resolve against Vaultwarden at deploy- and run-time and are managed exclusively through the `vaultwarden-cli`. No legacy provider fallbacks are configured.
+Secret references use the platform's capability registry; there is no universal runtime provider and no error-triggered provider fallback. Each reference selects one admitted provider id and immutable configuration version. HashiCorp Vault, OpenBao, cloud secret managers, deployment materializers such as CSI or External Secrets Operator, and approved enterprise adapters can participate only for capabilities their exact adapter version has proven.
 
-Adapters and workers fail closed when a referenced secret is missing, pending approval, or rotation-due: the workflow blocks rather than proceeding with an unresolved or stale credential.
+Resolution, dynamic issuance, lease control, key custody, certificate issuance,
+version publication, and workload materialization are separate capabilities.
+The catalog names them as `resolve-read`, `issue-dynamic-credential`,
+`control-lease`, `custody-key`, `issue-certificate`, `publish-version`, and
+`materialize-reload`. Read support never grants publication; materialization
+never claims source lease, wrapping, or write semantics. A CSI/ESO/VSO
+projection is a new custody boundary. Provider administration uses a versioned
+adapter interface rather than a committed provider CLI or raw provider path.
+
+The schema separates the governed `SecretReferenceRecord`, runtime `SecretRef`,
+value-free `SecretLeaseMetadata`, non-serializable `SecretMaterial`, immutable
+provider capability descriptor, separate provider lifecycle record, value-free
+publication receipt, and materialization receipt. A deployment id and
+trust-domain id, plus an applicable tenant id in multi-tenant mode, are required
+runtime namespaces, but real identifiers and concrete provider paths remain
+deployment data and never enter this seed file.
+
+Adapters and workers fail closed when a reference is missing, pending approval,
+blocked, quarantined, retired, unresolved, or beyond its policy freshness. The
+reference-readiness, provider-lifecycle, and lease-lifecycle state machines are
+distinct. `rotation-due` does not by itself revoke a valid lease: policy decides
+whether it blocks new work, while explicit expiry/revocation controls existing
+authority. Lease metadata is lifecycle-conditional: `requested` carries no
+fabricated lease id, resolved version, or issue/expiry time, while issued and
+active-family states must carry the exact version and timing fields; terminal
+states additionally carry their terminal time.
 
 ## Contract
 
 - Contract definition `secret-reference-catalog.yaml`
 - Serves contract route `/api/catalog/secret-references`.
 - Validator slice `secret-reference`
-- Contract `secret-reference-catalog.yaml` is marked draft (version 1)
+- Contract `secret-reference-catalog.yaml` is marked draft (version 2)
+
+The API projection publishes the catalog's seven `referenceKinds` entries under
+the canonical `secretReferenceKinds` response field. These are classifications
+only: `adapter-credential`, `worker-credential`, `database-credential`,
+`object-storage-credential`, `pki-material`, `recovery-material`, and
+`signing-material`. The projection never includes secret material, provider
+locators, credentials, deployment identifiers, or provider responses.
 
 Re-validate with the ryuki-validator `run-all` subcommand from the checkout root.
 
 ## Lifecycle mapping
 
-Requests against this contract follow the platform request lifecycle of draft, pending-approval, approved, queued, running, and completed, with failed and cancelled exits recorded as evidence. Contract execution maps to the catalog lifecycle stages of intake, validate, plan, approve, lock, execute, verify, protect, publish, maintain, and retire. Stages before execute are review steps and never run provider actions.
+The static catalog moves through authoring, validation, review, publication,
+deprecation, and retirement; it does not resolve material. A governed reference
+record separately moves through its declared readiness states. Provider
+configuration, leases, publication, and materialization each use their own
+versioned lifecycle and evidence. No catalog publication or readiness label can
+skip provider admission, authorization, or runtime lease checks.
 
 ## Required inputs and approvals
 
-The contract YAML does not declare structured inputs yet. Capture the requesting role, target site, environment, and the approval decision in the request record before the approve stage completes.
+The catalog now declares the required governance/runtime schema fields,
+capability interfaces, provider descriptor and lifecycle fields, publication
+and materialization receipts, version selectors, and state models. Runtime
+instances additionally require an exact provider/configuration version,
+deployment/trust-domain and applicable tenant namespace, purpose, consumer/
+workload, policy decision, and value-free conformance evidence.
 
 ## Prohibitions
 

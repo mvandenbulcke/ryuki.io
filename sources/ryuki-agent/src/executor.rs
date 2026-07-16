@@ -72,6 +72,22 @@ pub enum ExecError {
 /// test injection without generic parameters propagating everywhere.
 pub trait JobExecutor: Send + Sync {
     fn execute(&self, spec: &JobSpec) -> Result<Evidence, ExecError>;
+
+    /// Execute while observing the authoritative job-lifecycle cancellation
+    /// signal. Test/stub implementations retain compatibility through this
+    /// default; the production runner overrides it for in-flight propagation.
+    fn execute_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, ExecError> {
+        if cancellation.is_cancelled() {
+            return Err(ExecError::Runner(
+                ryuki_engine::runners::RunnerError::Cancelled,
+            ));
+        }
+        self.execute(spec)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,8 +122,12 @@ impl RunnerExecutor {
     }
 }
 
-impl JobExecutor for RunnerExecutor {
-    fn execute(&self, spec: &JobSpec) -> Result<Evidence, ExecError> {
+impl RunnerExecutor {
+    fn execute_inner(
+        &self,
+        spec: &JobSpec,
+        cancellation: Option<&ryuki_runner::CommandCancellation>,
+    ) -> Result<Evidence, ExecError> {
         // Only OfflineDryRun in S4b.
         if spec.mode != JobMode::OfflineDryRun {
             return Err(ExecError::UnsupportedMode(spec.mode.clone()));
@@ -166,7 +186,12 @@ impl JobExecutor for RunnerExecutor {
             descriptor: "offline-dry-run:no-creds".to_string(),
         };
 
-        let outcome = ryuki_runner::run_offline_dry_run(&plan, &creds)?;
+        let outcome = match cancellation {
+            Some(cancellation) => {
+                ryuki_runner::run_offline_dry_run_with_cancellation(&plan, &creds, cancellation)?
+            }
+            None => ryuki_runner::run_offline_dry_run(&plan, &creds)?,
+        };
 
         // Build evidence bytes: JSON-serialised RunOutcome (already scrubbed by
         // the runner).  Using JSON gives the CP a readable, diffable evidence
@@ -181,6 +206,20 @@ impl JobExecutor for RunnerExecutor {
             evidence_bytes,
             evidence_json,
         })
+    }
+}
+
+impl JobExecutor for RunnerExecutor {
+    fn execute(&self, spec: &JobSpec) -> Result<Evidence, ExecError> {
+        self.execute_inner(spec, None)
+    }
+
+    fn execute_with_cancellation(
+        &self,
+        spec: &JobSpec,
+        cancellation: &ryuki_runner::CommandCancellation,
+    ) -> Result<Evidence, ExecError> {
+        self.execute_inner(spec, Some(cancellation))
     }
 }
 

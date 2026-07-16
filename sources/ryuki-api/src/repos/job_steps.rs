@@ -30,11 +30,11 @@ pub struct JobStepRow {
     // will look up the step by its dispatched agent_job_id.
     #[cfg_attr(not(test), allow(dead_code))]
     pub agent_job_id: Option<Uuid>,
-    // #42 slice B1a: the `agent_jobs.evidence_digest` of this step's most
-    // recent genuinely-successful LivePlan result, recorded when the step
-    // moves to `AwaitingApproval`. NULL until then (and always NULL for
-    // OfflineDryRun-only plans). Surfaced to approvers in slice B1b; read
-    // directly only by tests today.
+    // #42 slice B1a: the signed `agent_jobs.raw_plan_digest` of this step's
+    // exact genuinely-successful LivePlan job/attempt, recorded when the step
+    // moves to `AwaitingApproval`. It commits to the complete canonical plan
+    // and is never interchangeable with the safe-projection evidence digest.
+    // NULL until then (and always NULL for OfflineDryRun-only plans).
     #[cfg_attr(not(test), allow(dead_code))]
     pub live_plan_digest: Option<String>,
 }
@@ -173,6 +173,7 @@ where
 /// number of rows affected — the approval endpoint asserts it is 1, so a
 /// concurrent second approval (whose row is no longer `AwaitingApproval`)
 /// updates zero rows and is rejected rather than minting a second grant.
+#[allow(dead_code)]
 pub async fn mark_applying<'e, E>(
     executor: E,
     step_id: Uuid,
@@ -193,10 +194,11 @@ where
 }
 
 /// Record a step's successful LivePlan result: move it to `AwaitingApproval`
-/// and stamp the plan's `evidence_digest` in one statement (#42 slice B1a).
+/// and stamp the signed raw canonical plan digest in one statement (#42 slice
+/// B1a).
 /// This is the step-scoped analogue of what `requests_approve_live_apply`
 /// already does for the single-job live path (re-deriving the latest
-/// genuinely-successful LivePlan's `evidence_digest` from `agent_jobs`) — the
+/// genuinely-successful LivePlan's `raw_plan_digest` from `agent_jobs`) — the
 /// CALLER (`backlink_request_execution`) is responsible for only invoking
 /// this off a terminal, successful LivePlan result (`Planned`/`CheckOk`);
 /// this function does not re-validate that itself.
@@ -255,7 +257,7 @@ pub async fn load_plan_for_update(
 /// the step is still `AwaitingApproval`, mints the grant, and flips it to
 /// `Applying` — all under this lock, so a racing second approval blocks and
 /// then sees `Applying` (no double-mint).
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub async fn load_step_for_update(
     executor: &mut sqlx::PgConnection,
     request_id: Uuid,
