@@ -1,6 +1,6 @@
 # approve_one no-DB scope guard — close the lone batch-mutation scope gap
 
-Status: implemented (codex plan APPROVE w/ one MINOR folded in — the test now asserts
+Status: implemented (plan APPROVE w/ one MINOR folded in — the test now asserts
 the out-of-scope item's EXACT per-result 404, not merely "failed", so a 403/400 cannot
 masquerade as the no-oracle contract). A verify-first analysis swarm flagged this and I
 VERIFIED it against the code: it is a REAL scope-isolation gap in the batch-approve
@@ -35,7 +35,7 @@ Impact is limited to the no-DB/dry-run deployment (the DB branch is correctly gu
 but the no-DB path is a first-class product surface (the portal runs against it), and
 the #2 invariant is "every no-DB branch enforces the same by-id scope guard as DB".
 
-## Fix (one guard, mirroring the established codex-approved pattern)
+## Fix (one guard, mirroring the established review-approved pattern)
 Add the guard to `approve_one`'s FIRST brief-lock block (where it reads `requester`,
 contracts.rs:16446-16453), AFTER the idx lookup and BEFORE `store[idx].requester.clone()`
 — so an out-of-scope request 404s BEFORE any SoD/engine work, exactly mirroring the DB
@@ -74,7 +74,7 @@ site_scoped` (contracts.rs:37861):
 - Approver = a DEFRA-scoped DatacenterApprover (distinct from the "requester-1" creator,
   so SoD passes).
 - `requests_batch_approve([in_scope, out_scope])` → 200; `succeeded == 1`, `failed == 1`.
-- codex MINOR: the out-of-scope item's PER-RESULT entry must be `ok == false` AND
+- Review MINOR: the out-of-scope item's PER-RESULT entry must be `ok == false` AND
   `status == 404` (not just in the failed bucket — a 403/400 would also fail-and-leave-
   untouched, so only the exact 404 proves the no-oracle contract).
 - In-scope row → status Approved (single-approval no-DB, proves the guard is PER-ITEM and

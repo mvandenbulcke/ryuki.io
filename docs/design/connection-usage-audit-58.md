@@ -1,6 +1,6 @@
 # #58 — Connection usage audit trail
 
-Status: SHIPPED — codex plan-review APPROVE (round 2) + codex impl-review APPROVE.
+Status: SHIPPED — plan-review APPROVE (round 2) + implementation-review APPROVE.
 Round-1 plan fix: audit is AUTHORITATIVE in DB mode (propagates failure), not
 best-effort; no audit.rs change; chain-link + leak-risk + append + actor tests.
 Impl-review MAJOR fix: the detail source-type key is `cred_source`, NOT
@@ -8,7 +8,7 @@ Impl-review MAJOR fix: the detail source-type key is `cred_source`, NOT
 SENSITIVE_KEY_PATTERN, so a `credential_*` key would read back ***REDACTED*** on
 the feed/SIEM export, hiding the field. A redaction-survival test
 (usage_audit_cred_source_survives_redaction_on_read) reads the row back through
-`audit_feed` and asserts the real value survives. Deferred (codex LOW, documented):
+`audit_feed` and asserts the real value survives. Deferred (review LOW, documented):
 an audit-write-failure-injection test (would corrupt the shared hash chain) and a
 no-DB/local-store test (fights the global_pool test-unit/test-db split).
 
@@ -33,7 +33,7 @@ ONE non-test site — `integration_test` (everything else is in
 owner-domain execution lane (out of scope). So a single hook at `integration_test`
 captures all CP connection usage today.
 
-## Reuse the existing audit infrastructure — AUTHORITATIVE recording (codex)
+## Reuse the existing audit infrastructure — AUTHORITATIVE recording
 `audit.rs` already provides everything needed; NO audit.rs change:
 - `record_audit(pool, session, record)` — hash-chained insert in its own short tx
   (`record_audit_tx` takes the chain lock, links `prev_hash` → `entry_hash`).
@@ -41,7 +41,7 @@ captures all CP connection usage today.
 - `AuditRecord` (actor is NOT a field — taken only from the `AuthSession`, so a
   forged actor is impossible).
 
-Codex correction: a credential-ACCESS trail must be AUTHORITATIVE, not best-effort.
+Review correction: a credential-ACCESS trail must be AUTHORITATIVE, not best-effort.
 `last_test_*` / `connection_health_checks` are health TELEMETRY (fine to swallow),
 but credential resolution is the sensitive event — a swallowed audit-write failure
 would let an access go unrecorded, defeating the feature. So in DB-backed mode the
@@ -92,7 +92,7 @@ the call without doing telemetry, and the access is never reported as completed
 without its audit row. Record it whether or not the resolution succeeded (a failed
 resolution is itself audit-worthy — an attempted credential access).
 
-`cred_message` is DELIBERATELY NOT in `detail` (codex): `CredError`'s Display can
+`cred_message` is DELIBERATELY NOT in `detail`: `CredError`'s Display can
 include env key names / vault-resolver text, so only the structured fields above
 are stored.
 
@@ -103,19 +103,19 @@ are stored.
    `actor_principal` = the session user, `to_status='resolved'`,
    `outcome='success'`, `to_stage='security'`, and `detail` carrying
    `connection_id` + `vendor_type` + `cred_source` (the TYPE).
-2. **Failure path with leak risk (codex).** Seed an env-var connection whose ref
+2. **Failure path with leak risk.** Seed an env-var connection whose ref
    names a MISSING key (e.g. `RYUKI_INTEGRATION__R58_MISSING`) so resolution fails;
    call `integration_test`; assert one row with `to_status='error'`,
    `outcome='failure'`, AND that `detail::text` contains NEITHER the credential_ref
    string, the (absent) env value, nor any `credential_message` text.
 3. **No secret leak (success path).** For a resolvable connection, assert the
    stored `detail::text` does NOT contain the credential_ref value or secret.
-4. **Hash chain linked (codex).** Capture the current chain tip (`SELECT entry_hash
+4. **Hash chain linked.** Capture the current chain tip (`SELECT entry_hash
    FROM audit_log ORDER BY id DESC LIMIT 1`, or genesis if empty) BEFORE the call;
    after the call assert the new row's `prev_hash` == that captured tip and its
    `entry_hash IS NOT NULL` (proves it chains the predecessor, not just "a hash
    exists").
-5. **Append (codex).** Call `integration_test` twice for the same connection →
+5. **Append.** Call `integration_test` twice for the same connection →
    exactly two `integration.connection.tested` rows (the trail accumulates).
 6. Actor attribution is structurally guaranteed (AuditRecord has no actor field;
    the recorder reads the `AuthSession`) — assert `actor_principal` == the session

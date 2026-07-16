@@ -1,7 +1,7 @@
 # Background-loop per-iteration timeouts (swarm follow-on to #26)
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, all fixed below. Found by
-the fresh missing-feature swarm. Codex fixes: (major) weakened the
+Status: design — plan-review round 1 NEEDS-CHANGES, all fixed below. Found by
+the fresh missing-feature swarm. Review fixes: (major) weakened the
 cancellation-rollback claim + asserted all 5 work fns are retry-idempotent; (major)
 added a unit-tested `note_failure` helper so "a timeout advances backoff like an
 error" is tested, not untested glue; (minor) `MissedTickBehavior::Skip` on all 5
@@ -53,7 +53,7 @@ pub fn loop_backoff(consecutive_failures: u32) -> u64 {
 /// identically for backoff): increment the counter (saturating) and return the
 /// backoff intervals to sleep. Both the `Failed` and `TimedOut` arms of every loop
 /// call this, so the rule "a timeout advances backoff exactly like an error" is
-/// captured in ONE unit-tested place (codex — the per-loop glue is otherwise
+/// captured in ONE unit-tested place (review note — the per-loop glue is otherwise
 /// untested). Returns `loop_backoff(*consecutive_failures)` AFTER the increment.
 pub fn note_failure(consecutive_failures: &mut u32) -> u64 {
     *consecutive_failures = consecutive_failures.saturating_add(1);
@@ -66,7 +66,7 @@ pub enum IterError<E> { Failed(E), TimedOut }
 
 /// Run one iteration under `timeout`. Returns the work's value on completion, the
 /// inner error as `Failed`, or `TimedOut` if it overran (the future is dropped).
-/// SAFETY (codex): dropping the future cancels it at the current await point —
+/// SAFETY (review note): dropping the future cancels it at the current await point —
 /// rolling back the IN-FLIGHT transaction IFF it had not yet committed. A drop
 /// during `tx.commit()` leaves the commit outcome unknown, and a work fn that uses
 /// MULTIPLE transactions keeps its already-committed ones. This is safe ONLY
@@ -121,7 +121,7 @@ error — verified by `note_failure`'s unit test, not untested per-loop glue), w
 distinct log line. `note_failure`/`loop_backoff` replace each loop's inline
 `(1 << min(4)) - 1` (one tested schedule).
 
-### MissedTickBehavior::Skip on ALL 5 (codex minor)
+### MissedTickBehavior::Skip on ALL 5 (review minor)
 The scheduler sets `ticker.set_missed_tick_behavior(Skip)`; `agent_offline`,
 `slo_breach`, `budget_breach` already do, but `spawn_lease_expiry_sweep` and
 `spawn_idempotency_sweep` do NOT — so after a long backoff/timeout the default
@@ -134,7 +134,7 @@ matching the scheduler.
    `IterError::Failed`; a future that sleeps PAST the timeout → `IterError::TimedOut`
    (use `#[tokio::test(start_paused = true)]` + `tokio::time::sleep` longer than the
    timeout for deterministic, instant virtual-time timeout — no real wall sleep).
-2. `note_failure` (codex) — drives the "timeout counts as a failure" rule: starting
+2. `note_failure` — drives the "timeout counts as a failure" rule: starting
    from 0, successive calls return `1, 3, 7, 15, 15` and leave the counter at
    `1, 2, 3, 4, 5`; saturates (no overflow) at `u32::MAX`. Both loop `Err` arms call
    this, so a `TimedOut` advancing backoff identically to a `Failed` is covered here

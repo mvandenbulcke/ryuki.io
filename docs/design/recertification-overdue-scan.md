@@ -1,11 +1,11 @@
 # Recertification overdue scan — surface overdue access-review campaigns as work
 
-Status: SHIPPED (run-1 #12 / run-2 backlog). codex plan review NEEDS-CHANGES → APPROVE (instance-
-specific source_ci_key + `<= NOW()` + the hygiene/index refinements folded in); codex impl review
+Status: SHIPPED (run-1 #12 / run-2 backlog). Plan review NEEDS-CHANGES → APPROVE (instance-
+specific source_ci_key + `<= NOW()` + the hygiene/index refinements folded in); implementation review
 APPROVE (2 non-blocking MINORs applied: `timestamp_micros()` for exact TIMESTAMPTZ precision in the
 instance key; a stale-item-suppression test + the engine schedulability-matrix assertion). Reuses
 the proven durable-scheduler SAFE-INTERNAL-WRITE recipe (#7 secret-rotation, #17 legal-hold — both
-codex-approved). Additive: ONE engine classifier, ONE scheduler job-kind arm, ONE seed migration,
+reviewed and approved). Additive: ONE engine classifier, ONE scheduler job-kind arm, ONE seed migration,
 ONE shift_queue item-type const. NO hot-path, NO HTTP surface. NO access revocation / provider
 change (the recertification system is review-only — "no-live-access-changes").
 
@@ -39,7 +39,7 @@ pub fn classify_recertification_overdue(end_date_ms: i64, now_ms: i64) -> Recert
 Mirrors `legal_hold::classify_legal_hold_expiry` (simpler — overdue is binary, no "soon" window
 in slice 1). The api scan double-checks `is_actionable()` with Rust's clock AFTER the SQL filter,
 so a near-edge row the DB clock selected but Rust's clock says is not-yet-due is SKIPPED — the same
-clock-skew hardening codex required for legal-hold (a queue item never carries a non-actionable
+clock-skew hardening required by the legal-hold review (a queue item never carries a non-actionable
 verdict).
 
 ### Scheduler arm (ryuki-api/src/scheduler.rs run_job)
@@ -50,15 +50,15 @@ FROM recertification_campaigns WHERE status = 'Active' AND end_date <= NOW() ORD
 ```
 (`end_date <= NOW()` so the SQL filter is a SUPERSET consistent with the `>=` classifier and the
 post-SQL clock-skew guard stays authoritative — an exactly-at-deadline campaign is not delayed a
-day; codex MINOR.) For each row: `classify_recertification_overdue(end_date_ms, now_ms)`; skip if
+day; review MINOR.) For each row: `classify_recertification_overdue(end_date_ms, now_ms)`; skip if
 `!is_actionable()`; build a title/description from the GOVERNANCE metadata and `enqueue_if_absent`.
 A campaign is enqueued even when `completed_count == reviews_count` — if it is still `Active` past
-its deadline it is unclosed operator work (codex).
+its deadline it is unclosed operator work.
 - title: `Recertification overdue: {name}`
 - description: `{review_type} campaign '{name}' (reviewer group {reviewer_group}) blew its
   recertification deadline {end_date} — {completed_count}/{reviews_count} reviews complete. Review
   and close it.`
-- **source_ci_key = `{id}@{start_date_ms}`** — INSTANCE-specific, NOT the bare campaign id (codex
+- **source_ci_key = `{id}@{start_date_ms}`** — INSTANCE-specific, NOT the bare campaign id (review
   MAJOR). Campaign ids are `arcamp-{8hex}` (created) or fixed seed slugs (`arcamp-ad-q2`), so id
   REUSE — though unlikely — is not guaranteed; keying the bare id would let a stale unresolved item
   suppress a genuinely-new overdue campaign that reused the id. `start_date` is the immutable
@@ -73,7 +73,7 @@ SECRET HYGIENE: `recertification_campaigns` has NO sensitive free-text column (u
 `legal_holds.reason`) — name / review_type / reviewer_group / counts / dates are GOVERNANCE
 metadata (not secrets or credentials), appropriate for execute-tier shift_queue viewers who action
 recertification work. Slice 1 surfaces ONLY these campaign-level fields; a follow-up must NOT add
-member lists, provider identifiers beyond the campaign, or rationale/free-text (codex MINOR).
+member lists, provider identifiers beyond the campaign, or rationale/free-text (review MINOR).
 
 ### job_is_schedulable (ryuki-engine/src/scheduler.rs)
 Add `"recertification_overdue_scan"` to the allowlist (it is a safe-internal write, NOT

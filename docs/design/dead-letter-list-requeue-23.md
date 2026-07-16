@@ -1,6 +1,6 @@
 # Dead-lettered agent-job list + requeue (#23 follow-up)
 
-Status: design (pre-codex-plan-review). Additive operator-visibility/recovery
+Status: design (awaiting plan review). Additive operator-visibility/recovery
 endpoints for the dead-letter feature shipped in #23. NO migration, NO engine
 change. CI-verifiable. Picked by the fresh 24-agent analysis swarm (3 lenses).
 
@@ -33,7 +33,7 @@ each handler ALSO re-checks `admin` as defense-in-depth, exactly like `admin_rev
      - `None` → `not_found` (404).
      - `status != 'DeadLettered'` → `conflict` (409, "only DeadLettered jobs can be
        requeued"). Also the idempotency guard: a SECOND requeue sees `Pending` → 409.
-  2. **PARENT-REQUEST GUARD (codex MAJOR)**: `SELECT status FROM requests WHERE
+  2. **PARENT-REQUEST GUARD (MAJOR)**: `SELECT status FROM requests WHERE
      id = request_id FOR UPDATE`.
      - `None` → `conflict` (409, "parent request not found; cannot requeue an
        orphaned job") — never re-dispatch work with no governing request (also covers
@@ -101,11 +101,11 @@ the random-request_id helper (the list does not touch the parent).
 3. **requeue rejects non-dead-lettered**: a Pending job → 409.
 4. **requeue unknown id** → 404 (and a non-UUID job_id → 404).
 5. **requeue idempotency**: first requeue 200, second (now Pending) → 409.
-6. **requeue rejects a concluded parent (codex MAJOR)**: a dead-lettered job whose
+6. **requeue rejects a concluded parent (MAJOR)**: a dead-lettered job whose
    parent request is `Cancelled` (and a second case `Failed`) → 409 and the job is
    UNCHANGED (still `DeadLettered`, `delivery_attempts` not reset). Also: an orphan
    job (request_id with no `requests` row) → 409.
-7. **post-requeue cap still applies (codex MINOR)**: requeue a job, then run it back
+7. **post-requeue cap still applies (MINOR)**: requeue a job, then run it back
    through the fresh budget (re-lease + `expire_leases` x6) and assert it
    dead-letters AGAIN — proving the audited reset does not let a poisoned job escape
    the automatic cap.

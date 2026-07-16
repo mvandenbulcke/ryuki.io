@@ -1,10 +1,10 @@
 # Scheduled legal-hold expiry scan — durable-scheduler job kind
 
-Status: SHIPPED (codex plan NEEDS-CHANGES → 1 MAJOR + 2 MINOR folded in; codex impl
-APPROVE, no findings. Per a codex impl NOTE, added a pure regression test
+Status: SHIPPED (plan review NEEDS-CHANGES → 1 MAJOR + 2 MINOR folded in; implementation review
+APPROVE, no findings. A review note prompted the addition of a pure regression test
 `execute_holders_also_hold_audit` (ryuki-engine/auth.rs) pinning the `execute ⊆ audit`
 RBAC invariant that the cross-tier hygiene argument relies on — if a future role got
-execute without audit, it fails loudly). See "## Codex plan-review fixes" at the end.
+execute without audit, it fails loudly). See "## Plan-review fixes" at the end.
 Verify-first swarm 2026-06-29 finding #17.
 VERIFIED: `job_is_schedulable` (ryuki-engine/scheduler.rs) now lists 5 write kinds (incl.
 the just-shipped `secret_rotation_due_scan`) — NO legal-hold scan. `GET /api/protect/
@@ -102,13 +102,13 @@ tick; aggregate `detail` format. Per-id assertions (shared DB).
 - Auto-releasing/auto-expiring a hold (this is enumeration → work queue only, no state
   change to the hold — releasing a legal hold is a deliberate, audited human action).
 - A portal view of the legal-hold queue.
-- Auto-RESOLVING an already-open queue item when a hold is later Released/Expired (codex
-  MINOR): the `status='Active'` filter + the partial unique index prevent NEW/duplicate
+- Auto-RESOLVING an already-open queue item when a hold is later Released/Expired
+  (MINOR): the `status='Active'` filter + the partial unique index prevent NEW/duplicate
   items, but do NOT resolve an existing open item on a later state transition — same as
   the restore/secret scans (resolution is operator action). A "resolve on release"
   follow-up is separate.
 
-## Codex plan-review fixes (SUPERSEDE the body where they conflict)
+## Plan-review fixes (SUPERSEDE the body where they conflict)
 - **MAJOR — boundary/clock alignment.** SQL filters `expiry_date <= NOW() + INTERVAL
   '30 days'` (inclusive), but DB `NOW()` and the Rust `now_ms` are DIFFERENT clocks, so a
   hold near the 30-day edge could be SELECTed yet classify `Active`. Fix BOTH ends: (1) the
@@ -122,7 +122,7 @@ tick; aggregate `detail` format. Per-id assertions (shared DB).
   restore/secret scans' `reason` key — justified by the column-name collision.)
 - **MINOR — stale items** documented above (Out of scope).
 
-## Cross-tier hygiene analysis (codex Q2) — asset name + hold_type are SAFE
+## Cross-tier hygiene analysis — asset name + hold_type are SAFE
 The shift queue reads at the `execute` tier (`is_execute_read_path`, main.rs:715 — operator
 working data). Legal-hold reads (`/api/protect/legal-hold/...`) are `audit`-tier (not a
 sensitive-read prefix). In the RBAC map EVERY `execute`-holder also holds `audit` (all

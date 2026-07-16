@@ -1,7 +1,7 @@
 # Per-platform execution agent — design
 
-Status: **design, hardened** (unparked 2026-06-15; revised after a GPT-5 Codex
-adversarial design review). This is the live-execution architecture that closes
+Status: **design, hardened** (unparked 2026-06-15; revised after an adversarial
+design review). This is the live-execution architecture that closes
 the largest AWX-parity gap — running approved Terraform/Ansible against real
 platforms — while keeping Ryuki's approval gates, dry-run-by-default posture, and
 tamper-evident evidence, which AWX lacks.
@@ -156,7 +156,7 @@ inside the platform zone), with: state-key naming per request/resource, locking
 to enforce **single-writer**, encryption at rest, backups, and a documented DR /
 state-recovery procedure. No live apply runs without a healthy locked backend.
 
-## 8. Build slices (each: delegate → Opus review → GPT-5 Codex adversarial → gate → commit)
+## 8. Build slices (each: delegate → independent review → adversarial review → gate → commit)
 
 - **S1 — Runner extraction (safe refactor, no behavior change).** Move
   `runner/*` from `ryuki-api` into `ryuki-runner`; fix imports; all tests stay

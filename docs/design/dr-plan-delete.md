@@ -1,8 +1,8 @@
 # DR-plan DELETE — CRUD completion (deferred half of dr-plan-update-delete)
 
-Status: IMPLEMENTED (dedicated fresh-context session). Codex plan review = 3 rounds
-(1 blocker + majors + the store-model blocker, all folded in below); codex
-implementation review = 4 rounds (round 1: fail-open hydration + reconcile-test
+Status: IMPLEMENTED (dedicated fresh-context session). Plan review took 3 rounds
+(1 blocker + majors + the store-model blocker, all folded in below); implementation
+review took 4 rounds (round 1: fail-open hydration + reconcile-test
 overclaim; round 2: "unknown ≠ empty" for the store-backed reads; round 3: scoped
 the FK pg_constraint guard + accurate lock comment; round 4: final APPROVE). The
 DEFERRAL reasoning below is retained as the historical record of WHY this was a
@@ -19,7 +19,7 @@ startup reconcile, replacing upsert-on-top so a deleted seed plan can't resurrec
 `dr_test_start` 23503→409 catch; fatal-on-failure DB-mode hydration. 8 new DR
 DB-tests + 1 engine test, all green.
 
-## Codex round-1 fixes (folded into the sections below)
+## Round-1 review fixes (folded into the sections below)
 - BLOCKER (FK safety): migration 124 must BACKFILL the 3 migration-087 `dr_plans`
   seed rows (INSERT … ON CONFLICT DO NOTHING) BEFORE any orphan handling — an older
   DB with 087 marked-applied-but-seed-rows-absent + the static `seed_data()` store
@@ -37,9 +37,9 @@ DB-tests + 1 engine test, all green.
   concurrent run insert and the FK can make the DELETE itself ERROR (not return 0
   rows). The repo `delete` must catch FK `23503` ⇒ `HasHistory`, AND re-read on 0
   rows ⇒ `NotFound`/`StaleVersion`. (Parent-row `SELECT … FOR UPDATE` is the
-  alternative; the 23503-catch is simpler and codex-accepted.)
+  alternative; the 23503-catch is simpler and was accepted in review.)
 
-## Codex round-2 — the deeper blocker (why this needs a dedicated session)
+## Round 2 — the deeper blocker (why this needs a dedicated session)
 Round 2 confirmed the four fixes above but found a STORE-MODEL major: DELETE is not
 durable for SEED plans across a restart. `DR_STORE` is initialized from
 `seed_data()` at every startup (`dr_testing.rs:105`) and hydration only UPSERTS DB
@@ -52,7 +52,7 @@ delete. The proper fix is to make DB-mode startup RECONCILE the store to be
 DB-authoritative (replace, not just upsert-on-top-of-seed) — an architectural change
 to the DR domain's bootstrap, plus a restart/hydration regression test. THIS is why
 implementation is deferred to a dedicated session: across the PUT review + two DELETE
-reviews, codex has peeled back three layers of store-vs-DB entanglement, and a
+reviews, three layers of store-vs-DB entanglement emerged, and a
 correct DELETE requires making the DR store DB-authoritative — not a CRUD add-on.
 
 ## Goal
@@ -61,7 +61,7 @@ plan. A plan with test-run HISTORY must NOT be silently deletable (the runs are
 audit-relevant), and a concurrent `dr_test_start` must never orphan a run against a
 deleted plan.
 
-## The race + why an FK is the fix (codex blocker from the PUT review)
+## The race + why an FK is the fix (blocker from the PUT review)
 `dr_test_runs.plan_id` has NO FK (mig 088), and `dr_test_start` resolves the plan
 from the in-memory store (`get_plan_from_store`) then INSERTs a run — so a NOT-EXISTS
 check in the DELETE cannot stop a concurrent test-start from inserting a run after
@@ -80,7 +80,7 @@ from `dr_plans`, which the FK would reject. Verified this cannot happen in DB mo
   DB-resident plan → the FK is always satisfied. (No-DB mode never inserts — it 503s
   at `get_db()`.) So the FK needs NO change to `dr_test_start`.
 
-## Migration 124 (idempotent, guarded — codex-corrected)
+## Migration 124 (idempotent and guarded)
 ```sql
 -- 1. BACKFILL the 3 migration-087 seed plans first (covers an older DB where 087
 --    is marked applied but its seed rows are absent), so static-store seed plans
@@ -121,14 +121,14 @@ WHERE id = $1 AND xmin = $2::xid
 ```
 Returns `Deleted` when `rows_affected()==1`. When `0`, the caller re-reads to
 disambiguate: `NotFound` (row gone), `HasHistory` (runs exist), or `StaleVersion`
-(xmin changed). CODEX FIX (race): the repo ALSO catches an FK `23503` error from the
+(xmin changed). To close the race, the repo ALSO catches an FK `23503` error from the
 DELETE itself (a run inserted concurrently after the NOT-EXISTS snapshot makes the
 RESTRICT block the delete) and maps it to `HasHistory`. So both the 0-row path
 (re-read) AND the constraint-error path resolve to a precise outcome — the
 `NOT EXISTS` is the friendly common-case precheck and the FK is the structural race
 backstop (a concurrent test-start can't orphan; its INSERT fails the FK).
 
-## `dr_test_start` (codex major — concurrent-delete must not 500)
+## `dr_test_start` (major — concurrent-delete must not 500)
 A concurrent delete makes a racing `dr_test_start`'s run INSERT fail the new FK
 (`23503`). Today that maps through generic `db_error` ⇒ HTTP 500. Add a targeted
 catch in `dr_test_start`: an FK `23503` on the run insert ⇒ 409/404 ("plan was
@@ -169,11 +169,11 @@ load+scope shape):
    (an orphan INSERT is rejected) after re-run.
 8. **Engine**: `remove_plan` makes a seeded plan un-resolvable via
    `get_plan_from_store`.
-9. **Second DELETE** (codex): a second DELETE after a successful one → 404 (and the
+9. **Second DELETE**: a second DELETE after a successful one → 404 (and the
    store stays absent).
-10. **Concurrent test-start vs delete** (codex): a `dr_test_start` racing a delete
+10. **Concurrent test-start vs delete**: a `dr_test_start` racing a delete
     → 409/404 ("deleted concurrently"), NOT 500.
-11. **Migration backfill** (codex): with `dr_test_runs` seeds present but a
+11. **Migration backfill**: with `dr_test_runs` seeds present but a
     `dr_plans` seed row absent, migration 124 BACKFILLS the seed (history kept), and
     only a truly-unknown orphan makes it RAISE — it never silently drops history.
 

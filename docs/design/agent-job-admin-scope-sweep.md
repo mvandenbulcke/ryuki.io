@@ -127,11 +127,12 @@ unrestricted principals. Rollback = revert.
 wrong-status→404-not-409 oracle-ordering cases), requeue in-scope happy path, dead_lettered +
 queue_depth scoped-narrow + dead_lettered unrestricted-sees-all, 4 fleet scoped→403. **Gap (by
 design):** `approve_live_apply` has no db test — its `cp_signing_key` 503-check precedes the guard,
-so a db test needs CP-key setup that reorders past it; guard verified by inspection + Codex instead.
+so a db test needs CP-key setup that reorders past it; the guard was verified by inspection and
+independent review instead.
 Test gotchas fixed: the scoped-admin helper must use `APP_ROLE_PLATFORM_ADMIN` (role `"admin"` grants
 nothing → 403 before the guard); tests use `handler_pool_lenient()` (strict `handler_pool()` silently
 SKIPS on local migration drift, masking everything).
 
 ## Review
-Decision rationale GPT-5 Codex-reviewed (APPROVE-WITH-CHANGES; all 6 changes folded in above).
-Implementation GPT-5 Codex-reviewed before commit (see commit trailer).
+Decision rationale reviewed (APPROVE-WITH-CHANGES; all 6 changes folded in above).
+Implementation reviewed before commit (see commit trailer).

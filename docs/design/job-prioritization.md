@@ -1,7 +1,7 @@
 # Job prioritization — priority-weighted agent-job dispatch
 
-Status: SHIPPED (codex plan APPROVE + codex impl APPROVE, no findings; 4 MINORs folded in,
-1 deferred — see "## Codex plan-review fixes" at the end). Verify-first swarm 2026-06-29
+Status: SHIPPED (plan review APPROVE + implementation review APPROVE, no findings; 4 MINORs folded in,
+1 deferred — see "## Plan-review fixes" at the end). Verify-first swarm 2026-06-29
 finding #15.
 VERIFIED: agent-job dispatch (`poll_job`, agents.rs:549) is `SELECT id FROM agent_jobs
 WHERE platform = $6 AND status = 'Pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT
@@ -65,7 +65,7 @@ static `jobs` segment coexists with `/api/admin/agents/{agent_id}/...` and
 - sources/ryuki-api/src/agents.rs (dispatch ORDER BY + admin_set_job_priority + Body struct
   + tests), and the route registration (wherever the admin agent routes live).
 
-## Codex plan-review fixes (SUPERSEDE the body where they conflict)
+## Plan-review fixes (SUPERSEDE the body where they conflict)
 - **MINOR — `id` tie-breaker.** Dispatch is `ORDER BY priority DESC, created_at, id` (and the
   index is `(platform, priority DESC, created_at, id) WHERE status='Pending'`) so equal
   (priority, created_at) jobs have a fully deterministic, stable order.

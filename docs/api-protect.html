@@ -2546,9 +2546,6 @@
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
 <p>For <code>200</code>, the known response body type is <code>Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
-<h4><code>200</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>X-Total-Count</code></td><td><code>integer</code></td><td><span class="req req-required">Required</span></td><td>Filtered total before limit/offset pagination, returned alongside the successful bare JSON array.</td></tr></tbody></table>
-<p>Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>

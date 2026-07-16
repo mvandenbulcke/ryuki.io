@@ -1,6 +1,6 @@
 # Batch approve (quorum-aware) — #17 final slice
 
-Status: design (pre-codex-plan-review). Completes the request batch-ops surface
+Status: design (pre-plan-review). Completes the request batch-ops surface
 (cancel + reject + rework + fail shipped; approve is the last + the only
 quorum-sensitive one). Additive, NO migration, NO engine change. SECURITY-CRITICAL.
 

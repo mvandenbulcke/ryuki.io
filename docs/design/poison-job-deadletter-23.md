@@ -1,6 +1,6 @@
 # #23 — CP-side poison-job cap / dead-letter
 
-Status: design — codex plan-review APPROVE (2 minors + 2 nits folded in:
+Status: design — plan-review APPROVE (2 minors + 2 nits folded in:
 per-replica concurrency wording + a concurrency test, migration-wording precision,
 and a brand-new-insert-defaults-0 test).
 
@@ -62,7 +62,7 @@ it is dead-lettered. Total dispatch attempts before dead-letter = 6 (1 initial +
    exhausted every redispatch is a HARD execution failure — that request's work
    will never run without operator intervention — so it ranks with a `failed`
    request (Critical), above the recoverable `offline` agent (Warning). (Severity
-   tier is a codex-review question; Critical is the proposed default.)
+   tier remains a review question; Critical is the proposed default.)
 2. Add `"dead-lettered"` to `alert_worthy_statuses()` (the coarse SQL-filter
    union) — the existing `alert_status_union_matches_the_classifiers` test then
    forces a classifier to cover it (satisfied by #1).
@@ -132,14 +132,14 @@ any test that calls `expire_leases`.
    `delivery_attempts` is forced ≥ MAX.
 4. **DeadLettered is terminal.** A second `expire_leases` after dead-letter does
    NOT touch the row (status no longer in Leased/Running) and emits no new event.
-5. **Per-replica concurrency (codex).** Under `EXPIRE_TEST_LOCK`, seed ONE expired
+5. **Per-replica concurrency (review requirement).** Under `EXPIRE_TEST_LOCK`, seed ONE expired
    non-mutating job and run two `expire_leases(&pool)` calls concurrently
    (`tokio::join!`). At `delivery_attempts = 4`: assert exactly one increment (→5)
    and ZERO dead-letter events. At `delivery_attempts = 5`: assert exactly one
    `DeadLettered` row and EXACTLY one `job.dead_lettered` event (proves the
    row-lock predicate recheck prevents a double-increment / double-emit across
    replicas).
-6. **Brand-new insert defaults (codex).** A fresh `create_agent_job` (which omits
+6. **Brand-new insert defaults (review requirement).** A fresh `create_agent_job` (which omits
    `delivery_attempts`) reads back `delivery_attempts = 0` — the `NOT NULL DEFAULT
    0` column is safe for existing INSERTs and needs no `AGENT_JOB_COLUMNS` change.
 7. **Engine:** the `event_alerts` unit tests above (run in the engine suite).

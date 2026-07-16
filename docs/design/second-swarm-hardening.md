@@ -1,8 +1,8 @@
 # Second-swarm hardening of this session's work
 
-Status: SHIPPED (codex plan NEEDS-CHANGES → 2 MINOR + the approval-quorum follow-up folded
-in; codex impl APPROVE, no findings — codex swept for other /api/requests/{id}/* audit-handler
-gaps and found NONE, so approval-decisions + approval-quorum are the complete set). The 2nd
+Status: SHIPPED (plan review requested 2 MINOR changes, and the approval-quorum follow-up was folded in;
+implementation review APPROVED with no findings after reviewers swept for other
+`/api/requests/{id}/*` audit-handler gaps and found NONE, so approval-decisions + approval-quorum are the complete set). The 2nd
 verify-first analysis swarm (2026-06-29 run 2) found these gaps in features shipped THIS
 session. Both are small, low-risk hardening. NO migration, NO engine change.
 

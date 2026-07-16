@@ -1,6 +1,6 @@
 # #52 (slice 2) — Route FAILED-latest restore tests into the work queue
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES, all fixed below
+Status: design — plan-review round 1 NEEDS-CHANGES, all fixed below
 ((major) blank-key exclusion at the query source; (major) chronological tie-break
 `updated_at DESC, created_at DESC, id DESC`; (minor) count = rows_affected with a
 second-tick `failed=0` test; (nit) named item-type constants). Completes the #52
@@ -34,14 +34,14 @@ newest row per system; the outer `WHERE status='Failed'` keeps only systems whos
 newest attempt failed. New fn `restore_requests::latest_failed_systems(executor) ->
 Vec<String>` (source_ci_keys).
 
-CODEX FIX (major — tie-break): `id` is a `gen_random_uuid()` (NOT chronological),
+REVIEW FIX (major — tie-break): `id` is a `gen_random_uuid()` (NOT chronological),
 so `id DESC` alone could pick the wrong row on an equal-`updated_at` tie (e.g. a
 Failed and a Verified row stamped the same instant). The tiebreak is therefore
 `updated_at DESC, created_at DESC, id DESC` — `created_at` (NOT NULL) gives the
 chronologically-newest row, with `id` only as a final deterministic fallback. An
 equal-`updated_at` test asserts the correct row wins.
 
-CODEX FIX (major — blank key): `source_ci_key` is `NOT NULL` but has no non-empty
+REVIEW FIX (major — blank key): `source_ci_key` is `NOT NULL` but has no non-empty
 CHECK, and `enqueue_if_absent` REJECTS a blank key (would abort the tick). The
 query excludes blanks at the source (`AND btrim(source_ci_key) <> ''`), so a blank
 latest-Failed row never reaches the enqueue (mirrors the overdue arm's skip). A DB
@@ -64,7 +64,7 @@ seed). After the existing overdue loop:
 
 A system can receive BOTH an overdue AND a failed item (distinct signals, distinct
 item_types) — intentional; they convey different things and dedup is per
-item_type. (Codex-review question: should FAILED suppress the overdue item for the
+item_type. (Review question: should FAILED suppress the overdue item for the
 same system to cut noise, or keep them independent?)
 
 ### Detail format change
@@ -78,7 +78,7 @@ shipped #52 test).
 `enqueue_if_absent` currently hardcodes `RESTORE_OVERDUE_ITEM_TYPE`. Add an
 `item_type: &str` parameter (bound into both the INSERT and the NOT EXISTS
 predicate); the empty-`source_ci_key` rejection and the WHERE-NOT-EXISTS + ON
-CONFLICT DO NOTHING stay. CODEX FIX (nit — named constants): keep
+CONFLICT DO NOTHING stay. REVIEW FIX (nit — named constants): keep
 `RESTORE_OVERDUE_ITEM_TYPE` and add `pub const RESTORE_FAILED_ITEM_TYPE:
 &str = "restore-test-failed"` in `repos/shift_queue.rs`; BOTH call sites pass the
 constant (never a string literal) so the values can't drift from the partial-index
@@ -100,17 +100,17 @@ combined arm). Idempotent (`IF NOT EXISTS`).
    detail shows the failed count.
 2. **Latest-success NOT flagged**: seed a system with an OLD `Failed` then a NEWER
    `Verified` → no `restore-test-failed` item (only the latest status matters).
-3. **Dedup + count accounting** (codex): a second tick adds no duplicate failed
+3. **Dedup + count accounting**: a second tick adds no duplicate failed
    item AND its detail reports `failed = 0` (the count is `rows_affected`, not
    candidates — the still-latest-Failed system contributes 0 when an open item
    already exists).
 4. **Both signals**: a system that is overdue AND latest-failed → BOTH a
    `restore-test-overdue` and a `restore-test-failed` open item.
 5. **Combined detail** format asserted exactly.
-6. **Latest-status precedence** (codex tie-break): a system with a Failed and a
+6. **Latest-status precedence** (reviewed tie-break): a system with a Failed and a
    Verified row at the SAME `updated_at` but `created_at(Verified) > created_at(Failed)`
    → NOT flagged (the chronologically-newer success wins the tiebreak).
-7. **Blank key does not abort** (codex): a blank-`source_ci_key` latest-Failed row
+7. **Blank key does not abort**: a blank-`source_ci_key` latest-Failed row
    present alongside a valid latest-Failed system → the valid one is still flagged
    and the scan succeeds (the blank is excluded at the query source).
 8. **Migration 123**: idempotency + the new partial unique index rejects a second

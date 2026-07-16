@@ -1,14 +1,14 @@
 # Certificate expiry scan — surface expiring/expired TLS certs as work
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). codex plan NEEDS-CHANGES → APPROVE (MAJOR 1
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED M/S). Plan review NEEDS-CHANGES → APPROVE (MAJOR 1
 confirmed by verifying renewal updates the same row; MAJOR 2 = the refresh-open-item-each-scan; MINOR
-= priority-by-state), codex impl review APPROVE (no findings).
+= priority-by-state), implementation review APPROVE (no findings).
 Reuses the proven durable-scheduler SAFE-INTERNAL-WRITE recipe (#7 secret-rotation, #17 legal-hold,
-#12 recertification — all codex-approved). Additive: ONE engine classifier, ONE scheduler job-kind
+#12 recertification — all review-approved). Additive: ONE engine classifier, ONE scheduler job-kind
 arm, ONE seed migration, ONE shift_queue item-type. NO hot-path, NO HTTP surface. Highest-stakes of
 the expiring-scan family (an expired TLS cert = a user-facing outage).
 
-## Row-lifecycle contract (codex plan MAJOR 1, CONFIRMED)
+## Row-lifecycle contract (plan-review MAJOR 1, CONFIRMED)
 `certificates.id` IS the currently-deployed cert binding, and renewal UPDATES THE SAME ROW:
 `renew_certificate` (certificate_lifecycle.rs:95) clones the record keeping its `id` and moves
 `valid_to` forward; the API persists it via `repos::certificates::transition` on that row
@@ -53,14 +53,14 @@ truth; an `Expired`-status cert that is genuinely past IS surfaced; a stale `Act
 a past `valid_to` is still surfaced.) For each: classify with the CP-clock `now_ms` + a 30-day soon
 window; skip `!is_actionable()`; then enqueue AND REFRESH:
 - source_ci_key = the cert `id` (bare UUID — see the row-lifecycle contract above).
-- `priority` BY STATE (codex MINOR): `Expired` → `P1` (it is an outage NOW), `ExpiringSoon` → `P2`.
+- `priority` BY STATE (review MINOR): `Expired` → `P1` (it is an outage NOW), `ExpiringSoon` → `P2`.
 - title: `Certificate {state}: {common_name}` (state = expired / expiring-soon)
 - description: `{service_type} certificate '{common_name}' on {hostname} ({site}) — valid_to
   {valid_to}. Renew or replace it.`
 - metadata: `{ source_ci_key: id, common_name, hostname, service_type, site, valid_to,
   cert_status: status, expiry_state: state }`
 - `enqueue_if_absent(tx, CERTIFICATE_EXPIRY_ITEM_TYPE, &id, title, description, priority, metadata)`
-- **REFRESH the OPEN item to the current state (codex MAJOR 2):** `enqueue_if_absent` is INSERT … ON
+- **REFRESH the OPEN item to the current state (review MAJOR 2):** `enqueue_if_absent` is INSERT … ON
   CONFLICT DO NOTHING, so an item first seen as `expiring-soon` would keep a STALE title /
   `expiry_state` / `P2` priority after the cert crosses into `expired` — unacceptable for a
   high-impact TLS cert. So, right after the enqueue, run one `UPDATE shift_queue SET title=$,
@@ -100,10 +100,10 @@ Add `"certificate_expiry_scan"` to the safe-internal-write allowlist (it writes 
   "expiring-soon") + a far-future cert → run the scan → expired + soon each enqueue ONE item with the
   right `expiry_state`/priority; the far-future cert enqueues nothing; re-running is idempotent
   (dedup). NO private-key/secret in any surfaced field.
-- Scheduler (DB) — REFRESH (codex MAJOR 2): an open item first created for an `expiring-soon` cert,
+- Scheduler (DB) — REFRESH (review MAJOR 2): an open item first created for an `expiring-soon` cert,
   whose `valid_to` is then moved into the past → the next scan UPGRADES the same open item to
   `expiry_state` "expired" + priority "P1" (no duplicate row).
-- Scheduler (DB) — stale-status (codex): a cert with `status='Active'` but a PAST `valid_to` is still
+- Scheduler (DB) — stale-status: a cert with `status='Active'` but a PAST `valid_to` is still
   surfaced (the predicate is on `valid_to`, not the stale status).
 
 ## Out of scope (the sibling run-3 scans)

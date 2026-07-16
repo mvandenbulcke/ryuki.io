@@ -8,7 +8,8 @@ verifier, step-bound-grant required) `9ff9e22`, B2-2 (CP auto-teardown orchestra
 dependency-order `LiveDestroy` cascade, teardown-failure and lease-expiry halts, and the
 rollback-safety guards: sweep parked `AwaitingApproval` on teardown entry, block step approval
 mid-rollback, non-cancellable teardown jobs, and cancel the `Pending` linked job of any swept
-in-flight step). All GPT-5.5-Codex-xhigh reviewed. **B2-3 (agent-side `terraform destroy`
+in-flight step). The completed slices have undergone adversarial review. **B2-3
+(agent-side `terraform destroy`
 execution) + C (real per-step apply) are operator-gated — they need real provider infra and are
 not CI-validatable; until B2-3 the agent `LiveRefuse`s a `LiveDestroy` job, which routes through
 the teardown-failure halt.**

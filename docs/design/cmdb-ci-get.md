@@ -1,6 +1,6 @@
 # CMDB CI GET — read a configuration item from the real table
 
-Status: SHIPPED (codex plan NEEDS-CHANGES → 2 MAJOR + 2 MINOR folded in; codex impl
+Status: SHIPPED (plan NEEDS-CHANGES → 2 MAJOR + 2 MINOR folded in; implementation
 APPROVE, no findings). Verify-first swarm 2026-06-29 finding #18.
 VERIFIED: the `configuration_items` table (mig 014: id UUID PK, ci_name TEXT UNIQUE, ci_type
 CHECK(Server/Application/Database/Network/Storage), criticality CHECK(Low/Medium/High/
@@ -82,7 +82,7 @@ Seed via a direct INSERT with a unique ci_name; clean up.
   change; this slice just exposes the table by name).
 - ci_relationships traversal (the impact endpoints' concern).
 
-## Codex plan-review fixes (SUPERSEDE the body where they conflict)
+## Plan-review fixes (SUPERSEDE the body where they conflict)
 - **MAJOR 1 — AUDIT-only (explicit handler check).** The central read gate authorizes
   `audit OR request` (read_authorized), so without a handler check this would be
   REQUESTER-readable. CI criticality/owner are real inventory signals, so the handler adds

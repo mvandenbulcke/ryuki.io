@@ -1,7 +1,7 @@
 # Patch-wave DELETE — CRUD completion
 
-Status: SHIPPED (codex plan rd2 APPROVE — MAJOR under-auth + MINOR repo-guard folded
-in; codex impl APPROVE — both MINORs closed: audit before/after-delta assertion +
+Status: SHIPPED (plan review round 2 APPROVE — MAJOR under-auth + MINOR repo-guard folded
+in; implementation review APPROVE — both MINORs closed: audit before/after-delta assertion +
 explicit DELETE route-gate test). VERIFY-FIRST corrected the swarm's "patch-wave
 CRUD" candidate: CREATE (`POST /api/maintain/patch/plan` → `patch_waves::insert`) and
 UPDATE (the validate/approve/execute/verify lifecycle transitions) ALREADY EXIST —
@@ -12,11 +12,11 @@ The patch-wave lifecycle is plan→validate→approve→(schedule)→execute→v
 there is no way to REMOVE a mistaken / draft / to-be-cancelled wave — operators are
 stuck with bad waves forever. Add `DELETE /api/maintain/patch/waves/{id}`.
 
-## Status guard — only UNAPPROVED DRAFTS are deletable (codex MAJOR)
+## Status guard — only UNAPPROVED DRAFTS are deletable (review MAJOR)
 `PatchWaveStatus` = Draft / Validated / Approved / Scheduled / InProgress / Completed
 / Failed. DELETE maps to `execute`-tier at the central gate (method-agnostic
 last-segment fallthrough), so an Operator must NOT be able to delete an `Approved`
-wave — that would CANCEL approver-reviewed work without approve-tier (codex MAJOR).
+wave — that would CANCEL approver-reviewed work without approve-tier (review MAJOR).
 And an executed wave carries evidence. So the boundary is the UNAPPROVED-draft set:
 - DELETABLE (execute-tier, pre-approval, no evidence): `Draft`, `Validated` —
   cleanup of a mistaken wave BEFORE it is approved.

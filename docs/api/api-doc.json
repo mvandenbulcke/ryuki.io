@@ -752,6 +752,12 @@
                     "doc": null
                   },
                   {
+                    "name": "raw_plan_digest",
+                    "type": "Value",
+                    "optional": false,
+                    "doc": null
+                  },
+                  {
                     "name": "signed_envelope",
                     "type": "Value",
                     "optional": false,
@@ -777,7 +783,7 @@
           "auth_exempt": false,
           "handler": "admin_agent_job_get",
           "summary": "GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent job's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch attempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail / cancel / reconcile it.",
-          "description": "GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent\njob's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch\nattempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail\n/ cancel / reconcile it. Admin-only. SECRET-SAFE: never returns spec / fencing_token /\ncp_nonce / live_context / raw evidence / the signed envelope (the attestation is\nGET .../result). The 5-segment `…/state` path (vs a bare 4-segment `…/jobs/{job_id}`)\navoids shadowing `…/agents/{agent_id}/approve|revoke` for an agent literally named\n\"jobs\" — a bare GET there would 405 the agent's approve/revoke (codex).",
+          "description": "GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent\njob's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch\nattempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail\n/ cancel / reconcile it. Admin-only. SECRET-SAFE: never returns spec / fencing_token /\ncp_nonce / live_context / raw evidence / the signed envelope (the attestation is\nGET .../result). The 5-segment `…/state` path (vs a bare 4-segment `…/jobs/{job_id}`)\navoids shadowing `…/agents/{agent_id}/approve|revoke` for an agent literally named\n\"jobs\" — a bare GET there would 405 the agent's approve/revoke.",
           "path_params": [
             {
               "name": "job_id",
@@ -57770,17 +57776,10 @@
                 "type": "Value",
                 "fields": null
               },
-              "headers": [
-                {
-                  "name": "X-Total-Count",
-                  "type": "integer",
-                  "required": true,
-                  "description": "Filtered total before limit/offset pagination, returned alongside the successful bare JSON array."
-                }
-              ]
+              "headers": []
             }
           ],
-          "response_notes": "Returns a bare JSON array; the filtered total is exposed via the X-Total-Count response header."
+          "response_notes": null
         },
         {
           "method": "GET",

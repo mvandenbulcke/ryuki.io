@@ -8083,7 +8083,7 @@ struct JobInspectRow {
 /// cp_nonce / live_context / raw evidence / the signed envelope (the attestation is
 /// GET .../result). The 5-segment `…/state` path (vs a bare 4-segment `…/jobs/{job_id}`)
 /// avoids shadowing `…/agents/{agent_id}/approve|revoke` for an agent literally named
-/// "jobs" — a bare GET there would 405 the agent's approve/revoke (codex).
+/// "jobs" — a bare GET there would 405 the agent's approve/revoke.
 pub async fn admin_agent_job_get(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,

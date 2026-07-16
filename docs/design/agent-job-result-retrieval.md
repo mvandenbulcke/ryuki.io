@@ -1,6 +1,6 @@
 # Agent-job result retrieval — GET the signed attestation + result metadata
 
-Status: SHIPPED (codex plan APPROVE; codex impl review NEEDS-CHANGES×2 → APPROVE). Plan
+Status: SHIPPED (plan APPROVE; implementation review NEEDS-CHANGES×2 → APPROVE). Plan
 refinements folded in — (1) parse the uuid BEFORE get_db so a malformed id 404s even with no
 DB; (2) the happy test asserts the serialized body has NO sentinel-secret substring AND
 top-level evidence_digest == signed_envelope.evidence_digest; (3) HARDENING: deserialize the
@@ -37,7 +37,7 @@ outcome; the `evidence_digest` can be cross-checked against the redacted evidenc
 the existing evidence-verify path) + the result metadata. That is the audit/compliance value
 without the raw-payload leak risk.
 
-### Ingestion guard on `redaction_policy_version` (codex impl review, MAJOR)
+### Ingestion guard on `redaction_policy_version` (implementation review, MAJOR)
 The read view re-serialises the TYPED `SignedEnvelope`, so it strips stray JSONB keys — but it
 still returns every KNOWN field. Of those, `agent_id` / `platform` / `key_id` / `cp_nonce` are
 all cross-checked against authoritative CP state at ingestion (the POST verifier), so they
@@ -47,8 +47,8 @@ to this view. So the POST verifier now gates it (Step 5b, fail-closed like every
 against the CLOSED allowlist of policy versions the CP recognises —
 `ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS` (currently
 `["ryuki-redaction-v2"]`, the value the real agent emits via
-`ryuki_protocol::REDACTION_POLICY_VERSION`). A charset/length heuristic was NOT enough (codex
-2nd pass): a bare token like `SUPERSECRET` is alphanumeric and short, so it would have passed —
+`ryuki_protocol::REDACTION_POLICY_VERSION`). A charset/length heuristic was NOT enough (second
+review pass): a bare token like `SUPERSECRET` is alphanumeric and short, so it would have passed —
 only an exact-match allowlist actually closes the channel. The value is an opaque SLUG, not a
 semver number (the prior type doc said "semver, e.g. 1.0.0", which was wrong — corrected). A
 validly-signed envelope whose policy version is not on the allowlist is rejected with 400 and

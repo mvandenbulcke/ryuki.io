@@ -25,7 +25,7 @@ SEPARATE, lower-priority concern — shipped as an immediate follow-up commit (s
 `DELETE`). The reset audits the PRIOR state via `DELETE … RETURNING state`: detail carries
 `previous_state` (the breaker's state before reset, or null when no row existed) and
 `breaker_cleared` — true ONLY for a tripped prior state (`open`/`half_open`), since a row can be
-persisted as healthy `closed`, so row-existence alone is not a real reset (codex). With it, EVERY
+persisted as healthy `closed`, so row-existence alone is not a real reset. With it, EVERY
 integration mutation (create / update / delete / set-credential-expiry / circuit_reset) now writes
 an atomic, secret-safe audit row.
 
@@ -62,7 +62,7 @@ feature already hit this and solved it by naming the key `cred_source` (test
 `vendor_type`, `site_scope`, `cleared` are already pattern-free. A new test asserts the keys survive
 `redact_detail` on the read path.
 
-### Audit the PERSISTED row (codex blocker 2)
+### Audit the PERSISTED row (blocker 2)
 
 Mirror DELETE: the audit detail is built from `... RETURNING vendor_type, site_scope,
 credential_source` (the row the DB actually persisted), NOT from caller-derived or pre-read state,

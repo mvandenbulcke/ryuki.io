@@ -1,7 +1,7 @@
 # Notification dispatch outbox — the dry-run seam for outbound delivery
 
-Status: SHIPPED (run-2 swarm #9, CONFIRMED H). codex plan review NEEDS-CHANGES → APPROVE (the
-fail-open BLOCKER fixed with a SAVEPOINT design); codex impl review NEEDS-CHANGES (minor only,
+Status: SHIPPED (run-2 swarm #9, CONFIRMED H). Plan review NEEDS-CHANGES → APPROVE (the
+fail-open BLOCKER fixed with a SAVEPOINT design); implementation review NEEDS-CHANGES (minor only,
 "the savepoint/atomicity crux is sound") → both minors fixed (DispatchChannel serde
 `rename_all="lowercase"` to match `as_db()`; a fail-open regression test that forces the outbox
 insert to fail and proves the in-app notification still commits). The SMALLEST additive,
@@ -50,7 +50,7 @@ CREATE TABLE notification_dispatch_outbox (
   UNIQUE (notification_id, channel)                 -- dedup: one row per (notification, channel)
 );
 -- Default admin listing is ORDER BY planned_at DESC (no status filter), so it needs a
--- planned_at index; the (status, planned_at DESC) index serves status-filtered reads (codex).
+-- planned_at index; the (status, planned_at DESC) index serves status-filtered reads (review note).
 CREATE INDEX ... ON notification_dispatch_outbox (planned_at DESC);
 CREATE INDEX ... ON notification_dispatch_outbox (status, planned_at DESC);
 ```
@@ -65,7 +65,7 @@ follow-up); slice 1 only ever writes `dry_run_logged`.
 The dry-run outbox is STRICTLY SUBORDINATE to the in-app notification and to the operational
 alert: recording a dispatch plan must NEVER fail or roll back the notification/alert it
 describes. In Postgres a single failed statement aborts the ENTIRE surrounding transaction, so
-the outbox write CANNOT simply share the caller's tx (codex BLOCKER) — an outbox-specific
+the outbox write CANNOT simply share the caller's tx (review BLOCKER) — an outbox-specific
 failure (rollout-window missing migration, lock timeout, PK collision, future constraint drift)
 would abort the alert/notification. So the helper wraps its inserts in a SAVEPOINT (sqlx nested
 tx) and swallows+logs any failure, rolling back ONLY the outbox work:
@@ -83,9 +83,9 @@ async fn record_dispatch_plan_best_effort(conn: &mut PgConnection, notification_
 Wired into BOTH emitters, computing `plan_dispatch(draft)` per draft, passing the existing
 `&mut *tx` / `&mut *conn`:
 - `emit_for_transition` (best-effort, own tx): the savepoint guarantees an outbox failure does
-  NOT roll back the in-app notification row (codex MAJOR — the notification outranks the outbox).
+  NOT roll back the in-app notification row (review MAJOR — the notification outranks the outbox).
 - `insert_draft_tx` (the atomic operational-alert path): the savepoint guarantees an outbox
-  failure does NOT abort the caller's alert+event tx (codex BLOCKER). The alert always commits;
+  failure does NOT abort the caller's alert+event tx (review BLOCKER). The alert always commits;
   its dispatch plan is recorded when it can be, skipped (logged) when it can't.
 
 Most lifecycle notifications are Info/Success → `plan_dispatch` returns `[]` → no savepoint, no
@@ -108,7 +108,7 @@ Mirrors the admin GET conventions (AuthExtractor, `get_db()` → 503/empty on no
 - Migration idempotency: `migration_128_is_idempotent` (re-run seed/DDL is a clean no-op).
 - Endpoint: admin lists rows (DB) + no-DB degrades; non-admin → 403 at the gate.
 
-## Routing policy is DRY-RUN TELEMETRY, not a send-ready queue (codex MAJOR)
+## Routing policy is DRY-RUN TELEMETRY, not a send-ready queue (review MAJOR)
 `plan_dispatch` is severity-only — a deliberately simple baseline that records "what a naive
 severity policy would dispatch." It is NOT a send-ready queue, and the real-dispatch follow-up
 MUST NOT blindly promote historical `dry_run_logged` rows to real sends: severity conflates

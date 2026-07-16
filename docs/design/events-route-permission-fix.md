@@ -1,7 +1,7 @@
 # Fix: /api/events POST mutations are accidentally admin-only
 
-Status: SHIPPED (codex plan NEEDS-CHANGES → 3 MAJOR + 1 MINOR folded in; codex impl APPROVE,
-no blocking findings — codex also swept for the same bug class and found NO remaining
+Status: SHIPPED (plan review NEEDS-CHANGES → 3 MAJOR + 1 MINOR folded in; implementation
+review APPROVE, no blocking findings — a follow-up sweep for the same bug class found NO remaining
 instances, so these two were the only ones). Second verify-first analysis swarm (2026-06-29
 run 2) found the /api/events INTEGRATION BUG; I VERIFIED both against the code — REAL, and the
 /api/events one predates the bulk-alert-ack slice (the single-ack has it too).
@@ -31,19 +31,19 @@ The ONLY POST routes under `/api/events` are the two ack endpoints (both `reques
 handlers). There is no event-CREATE/DELETE POST. So a single `/api/events → request` prefix
 entry affects ONLY these two acks — it cannot loosen a more-privileged route.
 
-## Tier — `request` (codex-resolved)
-`request`, matching the handlers. NOT broadened to `audit`: codex verified that `events_list`
+## Tier — `request` (resolved in review)
+`request`, matching the handlers. NOT broadened to `audit`: verification found that `events_list`
 + `events_alerts` (the alert READS) ALSO handler-check `"request"` (contracts.rs:18781/18850),
 so the feed is request-tier end-to-end. Broadening ack to `audit||request` would let the
 read-only `Auditor` mutate ack state — a policy change, out of scope.
 
-## A SECOND same-class bug (codex MAJOR): /api/audit/log/verify
+## A SECOND same-class bug (MAJOR): /api/audit/log/verify
 `POST /api/audit/log/verify` (contracts.rs:177) → `audit_log_verify` checks
 `check_permission("audit")` (contracts.rs:19634), but no `/api/audit` mutating prefix exists
 (only `/api/audit/compliance/*` specifics), so the middleware defaults it to `admin` — an
 auditor cannot re-verify the hash chain. Same class, fixed in the same patch.
 
-## Fix — a tight SHAPE MATCHER (codex MINOR — preserve fail-closed)
+## Fix — a tight SHAPE MATCHER (MINOR — preserve fail-closed)
 Mirror `approval_signoff_permission` (a special-case fn checked in `route_permission_for`
 BEFORE the prefix table), NOT a method-agnostic `/api/events`/`/api/audit` prefix (which would
 silently open FUTURE unsafe routes under those families). Add:
@@ -65,7 +65,7 @@ table. So `/api/events/alerts/{id}/ack` + `/api/events/alerts/batch/ack` → `re
 `/api/audit/log/verify` → `audit`; any OTHER `/api/events/*` or `/api/audit/*` mutation stays
 fail-closed (admin default).
 
-## Tests (codex: the == assertions are NECESSARY — MUTATING_ROUTES alone isn't enough since
+## Tests (the == assertions are NECESSARY — MUTATING_ROUTES alone isn't enough since
 `admin` is a valid resolved permission)
 - `route_permission_for(POST, "/api/events/alerts/e1/ack") == "request"`,
   `(... "/api/events/alerts/batch/ack") == "request"`, `(... "/api/audit/log/verify") ==

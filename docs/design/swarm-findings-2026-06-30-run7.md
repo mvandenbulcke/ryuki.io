@@ -5,11 +5,11 @@ resilience-errors / schema-migration / protocol-contract / execution-agent-seam 
 each finder pipelined into a default-refute adversarial verifier.
 
 ## Run caveat (transient platform instability)
-- First attempt: ALL 7 finders STALLED (no tool-call progress for 180s × 6 retries; 0 candidates,
-  ~73 min wasted). A single narrow probe Explore agent run immediately afterward worked fine, so the
+- First attempt: ALL 7 finders STALLED (no progress for 180s × 6 retries; 0 candidates,
+  ~73 min wasted). A single narrow probe immediately afterward worked fine, so the
   stall was a transient platform/load blip, not a design issue. Hardened the script with an explicit
-  READ-BUDGET rule (never Read contracts.rs/agents.rs/main.rs whole; rg → targeted <=400-line windows;
-  ~25 tool-call cap) and re-ran.
+  bounded-read rule (never read contracts.rs/agents.rs/main.rs whole; rg → targeted <=400-line windows;
+  ~25-operation cap) and re-ran.
 - Second attempt: 5 of 7 finders + 2 verifiers failed with "Failed to authenticate. API Error: Access
   Notification" (transient auth blips). Only the **input-validation-panics** dimension completed →
   2 confirmed findings (below). The other dimensions (concurrency-races, resilience-errors,
@@ -26,12 +26,12 @@ each finder pipelined into a default-refute adversarial verifier.
   the IP counts have NO DB CHECK (migration 050 INTEGER NOT NULL, 099 didn't constrain them), so they
   are the genuine unguarded gap. FIX: mirror the write-path clamp in to_engine() — `vlan_id.clamp(1,
   4094)`, `total_ips/used_ips/available_ips.max(0)`. + pure unit test (corrupt → clamped, valid →
-  unchanged). rg confirmed this was the ONLY `self.X as uN` read-path cast (no siblings). codex review
+  unchanged). rg confirmed this was the ONLY `self.X as uN` read-path cast (no siblings). Review
   pending.
 
-## Schema-migration sweep (single targeted agent — the parallel swarm was auth-degraded)
-Ran a single Explore agent on schema/migration integrity (single agents stayed reliable while the
-parallel fan-out failed). 3 confirmed missing-index findings; codex reviewed the index DESIGN before
+## Schema-migration sweep (single targeted pass — the parallel swarm was auth-degraded)
+Ran a single targeted schema/migration integrity pass after the parallel fan-out failed.
+Three missing-index findings were confirmed; the index design was reviewed before
 implementation.
 - ✅ **Missing list-query indexes** — SHIPPED migration 138 (idx_requests_site_env_created_at;
   idx_domain_events_to_status_occurred_id partial-expr; idx_agent_jobs_dead_lettered_updated_at
@@ -41,15 +41,15 @@ implementation.
   intended defs, and EXPLAIN (seqscan off) confirms each is USED (requests + agent_jobs = ordered
   index scan no-sort; domain_events = bitmap scan of only the alert rows + a small sort, since a
   multi-value `= ANY` can't be an ordered btree scan).
-- **Deferred (codex)**: (a) the `(status, created_at)` requests index — highest write-amplification
+- **Deferred after review**: (a) the `(status, created_at)` requests index — highest write-amplification
   (status changes every transition), uncertain benefit → measure first (task_53bc69da).
-  **RESOLVED → DEFER (do not add): see `docs/design/requests-status-index-decision.md`** (codex-reviewed;
+  **RESOLVED → DEFER (do not add): see `docs/design/requests-status-index-decision.md`** (reviewed;
   read benefit narrow + unproven, no-site path is an operator minority, and the OR-NULL caveat below
   blocks it until (b) lands). (b) the OR-NULL predicate (`$n IS NULL OR col=$n`) in requests_list can
   defeat idx_requests_site_env on a generic prepared plan; the real fix is dynamic SQL emitting only
   active predicates (task_02ed10ce) — STILL OPEN, and a prerequisite for ever revisiting (a).
 
-## Resilience sweep (single targeted agent, on retry after the opus-unavailable blip)
+## Resilience sweep (single targeted agent, on retry after a transient availability blip)
 1 confirmed finding (with a thorough "checked but sound" list — timeouts on all reqwest clients +
 subprocess loops, exponential backoff via background::run_bounded, audit/event inserts use `?` in-tx
 so no partial commit, etc.):
@@ -59,7 +59,7 @@ so no partial commit, etc.):
   client RETRY of the same key gets a 409 InFlight until ~IN_FLIGHT_TTL_SECS (5 min) even though the
   resource was created — invisibly to operators. FIX: `if let Err(error) = ... { tracing::warn!(...) }`
   on BOTH writes — log-not-fail (the response is already buffered; the Ok-0-rows claim_id reclaim fence
-  stays silent). Behavior-preserving; 13/13 idempotency tests green. codex review pending.
+  stays silent). Behavior-preserving; 13/13 idempotency tests green. Review pending.
 
 ## Execution-agent-seam sweep (single targeted agent)
 2 findings amid a strong verified-clean list (result-CAS double-accept guarded on attempt_id +
@@ -73,7 +73,7 @@ idempotent outbox replay returns 200 only on matching result_id+attempt_id). The
   stage (unchanged); Err LOGS + writes the ORIGINAL stages JSONB back UNTOUCHED (never wipe), still
   advancing status. Deliberately NOT returning Err (backlink is in the result tx; Err would roll back
   and the agent's at-least-once retry would re-hit the parse failure forever). + regression test
-  (db_backlink_preserves_unparseable_stages). codex review pending.
+  (db_backlink_preserves_unparseable_stages). Review pending.
 - **DESIGN (flagged, task_6456e60c)**: create_live_apply_job's all-status partial unique index
   (mig 057) permanently blocks re-minting a LiveApply once one reaches a TERMINAL non-Succeeded state
   (Failed/ReconcileRequired/LiveRefused/DeadLettered) — no operator escape hatch → a request can be
@@ -91,15 +91,15 @@ job_spec_digest recomputed by CP; 10 MiB body limit).
   post-approval. FIX: `decode_verifying_key(public_key)` at registration (reject 400), store the TRIMMED
   key (the old bind was untrimmed — a whitespace key would later fail the result-side decode). +test
   db_register_validates_ed25519_public_key (malformed -> 400 before INSERT; valid generated key
-  accepted). codex review pending.
+  accepted). Review pending.
 - ✅ **`JobResultStatus::Verified` accepted on the wire** — SHIPPED: it's deserializable + CP-accepted
   (maps to Succeeded/"verified") but the engine RunStatus has no Verified variant and map_run_status
   never produces it (VERIFIED: arms are Validated/CheckOk→CheckOk, Planned→Planned, Failed/RunnerUnavail/
   WorkspaceError→Failed, Applied/Changed→Applied), so a legitimate agent can't send it. An enrolled/
   compromised agent could craft a signed Verified result → false "verified" audit step. FIX: reject
   `env.status == Verified` at ingestion (after sig-verify + status-match, before any DB write). +test
-  db_verified_status_is_not_agent_reportable (signed Verified result → 400, job stays Running). codex
-  review pending.
+  db_verified_status_is_not_agent_reportable (signed Verified result → 400, job stays Running). Review
+  pending.
 - **DEFERRED (low, design, task_ca74b21a)**: no CP↔agent protocol VERSION field/negotiation anywhere in
   ryuki-protocol — schema evolution can silently mis-deserialize an old agent's payloads. Flagged.
 
@@ -110,9 +110,9 @@ list-refresh all verified SOUND.
   all 13 Action handlers refetched detail_resource + audit_resource but NOT execution_job_resource, so
   after `execute` dispatched a job the "Execution Job" panel stayed stale until a hard reload. FIX: add
   `execution_job_resource.refetch()` to all 13 handlers (consistent: any lifecycle action refreshes all
-  3 panels). cargo check + clippy clean. codex review pending. (Verification: compile + codex — browser
-  verification needs the full stack [portal dev server + API + the locally-drifted DB], disproportionate
-  for a refetch identical to the 13 existing working ones.)
+  3 panels). cargo check + clippy clean. Review pending. Browser verification was deferred because
+  it requires the full stack (portal dev server + API + the locally-drifted DB), which is disproportionate
+  for a refetch identical to the 13 existing working ones.
 - **FLAGGED (task) — the other 3 portal findings** (need the full-stack browser-verify path, batched for
   a dedicated portal session):
   - (med) notifications.rs mark_all/mark_one DISCARD errors with `let _ =` — a failed POST silently
@@ -131,4 +131,4 @@ requests dynamic-SQL, status index, LiveApply re-mint, protocol versioning, the 
 (schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
 low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
 causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors
-single-agent attempt hit the same transient "opus temporarily unavailable" platform blip — retry.)
+single-agent attempt hit the same transient platform-availability blip — retry.)

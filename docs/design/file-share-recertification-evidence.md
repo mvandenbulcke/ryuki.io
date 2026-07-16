@@ -1,6 +1,6 @@
 # File-share recertification evidence boundary
 
-Status: implemented locally for Codex Security finding
+Status: implemented locally for security finding
 `csf_c42dc76098d8a30d7e7249f1` (`R01-MB-C140`). Runtime verification remains
 part of the repository-wide remediation wave.
 

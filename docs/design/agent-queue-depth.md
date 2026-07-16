@@ -1,6 +1,6 @@
 # Agent queue-depth visibility — GET /api/admin/agents/queue-depth
 
-Status: SHIPPED (codex plan APPROVE + codex impl APPROVE, no findings; 2 MINORs folded in
+Status: SHIPPED (plan APPROVE + implementation APPROVE, no findings; 2 MINORs folded in
 — the handler maps each
 `QueueDepthRow` to `json!` MANUALLY (FromRow alone isn't enough for serialization), and the
 `oldest_pending_at` test binds a FIXED `DateTime<Utc>` into `created_at` and asserts exact

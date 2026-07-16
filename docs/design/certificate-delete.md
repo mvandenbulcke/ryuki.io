@@ -1,6 +1,6 @@
 # Certificate DELETE — terminal-cert cleanup (CRUD completion)
 
-Status: implemented (codex plan APPROVE, no findings; one impl caveat folded in — the
+Status: implemented (plan APPROVE, no findings; one implementation caveat folded in — the
 cert `transition` UPDATE rewrites `site = $8`, so site IS mechanically mutable; the repo
 delete therefore CASes on `site` too (`AND site = $3`, binding the loaded site) so a
 concurrent site change between the scope check and the delete yields StaleStatus → 409,
@@ -9,7 +9,7 @@ VERIFIED: no `certificates_delete` handler, no `repos::certificates::delete`, no
 route (only test cleanup runs `DELETE FROM certificates`). The cert lifecycle is
 request→validate→approve→install→verify→(renew)→revoke (status transitions Active/
 Expiring/Expired/Revoked), but there is no way to REMOVE a dead cert record. This is a
-near-exact clone of the codex-approved patch-wave-delete (2acdc50-era), SIMPLER: NO FK
+near-exact clone of the review-approved patch-wave-delete (2acdc50-era), SIMPLER: NO FK
 references certificates (leaf table → no cascade), and certs are SITE-ONLY scoped.
 Additive: NO migration, NO engine change.
 
@@ -71,7 +71,7 @@ NO migration, NO engine change.
 - Deleting Active/Expiring certs (blocked — they are live; revoke them first, which lands
   Revoked → then deletable).
 
-## Codex review (both rounds APPROVE)
+## Review outcome (both rounds APPROVE)
 Plan APPROVE (no findings; the site-CAS impl caveat folded in). Impl APPROVE (no
 BLOCKER/MAJOR); one MINOR folded in — a dedicated repo test passes the right status but a
 WRONG `expected_site` to PIN the site CAS (right status, wrong site → StaleStatus, never a

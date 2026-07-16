@@ -1,6 +1,6 @@
 # Bulk alert acknowledge — POST /api/events/alerts/batch/ack
 
-Status: SHIPPED (codex plan APPROVE + impl APPROVE, no defects; 3 plan MINORs folded in —
+Status: SHIPPED (plan APPROVE + implementation APPROVE, no defects; 3 plan MINORs folded in —
 an explicit whole-batch 403 test with the ack-specific body; the dedup test asserts the
 RESPONSE contract (results.len()==1, not just the upsert DB row); the note-validation test
 uses an embedded control char "bad\nnote" that survives trim). Verify-first swarm

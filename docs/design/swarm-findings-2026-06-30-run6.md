@@ -2,7 +2,7 @@
 
 A 7-finder evidence-grounded discovery sweep (request-lifecycle / agent-execution / correctness /
 security-authz / data-retention / observability-ops / api-completeness) → 1 default-refute
-adversarial verifier per candidate. **13 candidates → 12 confirmed.** The orchestrator (Opus)
+adversarial verifier per candidate. **13 candidates → 12 confirmed.** The orchestrator
 independently re-triaged every confirmed item before acting — and DOWNGRADED several (see triage),
 because the verifier confirmed some items that are actually blocked on a deferred decision or whose
 proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm output.
@@ -15,8 +15,8 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   (`repos::incident_contexts::list_active`) fetched UNBOUNDED rows. The run-5 no-LIMIT sweep capped
   the INLINE-SQL handlers (slo_list/noise_detect/alert_routes_list/runbook_active) but missed these
   two because they route through REPO list fns. FIX: threaded `limit: i64` through both repo fns
-  (bound `LIMIT $N`), handlers pass the shared `MAX_LIST_ROWS=1000`; +2 cap-assertion tests. codex
-  impl review pending/approve. (The non-active `incident_contexts::list` is dead_code, no endpoint —
+  (bound `LIMIT $N`), handlers pass the shared `MAX_LIST_ROWS=1000`; +2 cap-assertion tests.
+  Implementation review APPROVED. (The non-active `incident_contexts::list` is dead_code, no endpoint —
   left unchanged.)
 
 ### NEXT (clean, actionable, NOT blocked)
@@ -24,11 +24,11 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   (`job.requeued`) and `admin_set_job_priority` (`job.reprioritized`) now emit a NON-alerting
   domain event atomically (inside the tx, after audit, before commit), mirroring the cancel/
   force-fail pattern. `to_status` sentinels 'admin-requeued'/'admin-reprioritized' are NOT in
-  alert_worthy_statuses() so they never page (codex verified vs the `to_status = ANY($1)` prefilter
+  alert_worthy_statuses() so they never page (verified against the `to_status = ANY($1)` prefilter
   + classify). Platform-global (site/env None → no B0 leak). aggregate_id is the CANONICAL uuid
-  (codex Low finding — raw path string could miss /api/events lookups; siblings flagged as a
+  (Low-severity review finding — raw path string could miss /api/events lookups; siblings flagged as a
   follow-up task). priority UPDATE RETURNING extended to include platform. +event assertions on the
-  requeue/reprioritize happy tests. codex impl APPROVE (1 Low fixed); green on a fresh DB.
+  requeue/reprioritize happy tests. Implementation review APPROVED (1 Low fixed); green on a fresh DB.
 - ✅ **Stage completion timestamps** (request-lifecycle, high) — SHIPPED: `completed_request_stage()`
   (contracts.rs ~14856) set `started_at/completed_at: None` on a `Completed` stage, persisting NULL
   timestamps in the stages JSONB (audit/temporal gap) — inconsistent with the engine, which stamps
@@ -37,18 +37,18 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   pre-creates Pending placeholders for protect/publish (null by design); the real transition APPENDS
   a Completed stage of the same name — the DB confirmed the Completed protect/publish now carry a
   timestamp while the Pending placeholder stays null. Strengthened the persistence test to assert the
-  Completed stage's started_at == completed_at non-empty. codex impl APPROVE (no blocking; started_at
+  Completed stage's started_at == completed_at non-empty. Implementation review APPROVED (no blocking; started_at
   hardening added). The `dry_run: true` metadata left unchanged (separate concern).
 
 ### NEWLY FOUND while verifying — test-harness fail-closed bug class (SWEPT)
 - ✅ **aiops `test_pool()` not fail-closed / not drift-tolerant** (repos/aiops.rs) — SHIPPED fe4ad3b.
   When `RYUKI_DATABASE_URL` was unset it fell back to a DEFAULT localhost URL instead of None, then
   `run_migrations(...).expect(...)` PANICKED (8 aiops_db_tests fail) against a drifted local DB / any
-  no-DB run. Fixed to `std::env::var(...).ok()?` + `run_migrations(...).ok()?`. codex APPROVE.
+  no-DB run. Fixed to `std::env::var(...).ok()?` + `run_migrations(...).ok()?`. Review APPROVED.
 - ✅ **sql_deployment `test_pool()` URL-fallback** (repos/sql_deployment.rs) — SHIPPED: same
   hard-coded localhost fallback (unintended-DB hazard); it did NOT panic only because its migrations
   already used `.ok()?` (so it skipped on the resulting drift). Fixed the fallback to fail-closed
-  `.ok()?`. Verified both ways (no-DB skip / fresh-DB pass). codex review pending.
+  `.ok()?`. Verified both ways (no-DB skip / fresh-DB pass). Review pending.
 - **Bug-class scope** (swept, deliberately bounded): the URL-fallback anti-pattern existed in exactly
   these two test helpers (rg `unwrap_or_else(...postgres://...)`); `config.rs default_database_url()`
   is a PRODUCTION serde default (correctly left). The OTHER DB-test helpers that use
@@ -78,7 +78,7 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   for LiveRefused jobs** (agent-execution, high/med). When an agent refuses a LiveApply (missing
   grant / plan divergence / no --allow-live), the request is terminal-failed and there is no API to
   correct the cause and retry the same job. Whether LiveRefused SHOULD be recoverable vs terminal is
-  a deliberate trust-model decision (the live path was GPT-hardened). Flag to owner.
+  a deliberate trust-model decision (the live path was previously hardened). Flag to owner.
 
 ### NON-FINDING
 - **Empty audit `detail` for protect/publish/retire** — the verifier itself concluded this is a

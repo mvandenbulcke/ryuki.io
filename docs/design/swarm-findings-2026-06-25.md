@@ -83,7 +83,7 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   slo_status + _list, metering_usage, chargeback_report, requests_list, and the
   analytics/capacity family (capacity, capacity_cluster, capacity_forecast,
   cost_summary, waste, rightsizing, trend, vmware_cluster_capacity_admission).
-  Dual-reviewed (GPT-5 Codex + fresh-context agent): both SHIP the code; no leak
+  Dual-reviewed independently: both reviews recommended shipping; no leak
   in any enforced handler.
 
 - **STATUS (2026-06-26) — slice 2 (request-by-id reads) shipped (commit d4c00b9):**
@@ -91,7 +91,7 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   `request_site_env`) on requests_get, requests_policy_eval, requests_execution_job,
   request_evidence_pack, requests_approval_quorum, requests_audit. Out-of-scope is
   byte-indistinguishable from not-found (404, or the empty trail for audit) — no
-  existence oracle. Codex caught + we fixed a fail-open (scope-lookup DB error fell
+  existence oracle. Review caught and fixed a fail-open (scope-lookup DB error fell
   through to serving the audit trail; now fails closed).
 
 - **STATUS (2026-06-26) — COMPLETE:** All 116 site/env-filtered handlers from the
@@ -100,7 +100,7 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   mutation (CAS, bare-by-id-with-FOR-UPDATE/RETURNING, atomic AND-site predicate),
   the per-row-list reads, the by-id reads, the list-all reads (per-row filter), all
   remaining single-site reads, and the 4 hardware all-site-load BUGS. Each slice
-  fmt/clippy/no-DB-suite/secret-scan green + GPT-5-Codex-reviewed (the uniform
+  fmt/clippy/no-DB-suite/secret-scan green and independently reviewed (the uniform
   enforce_site_scope read pattern was reviewed once then applied verbatim). Finding
   #2 (tracker) marked [x].
 
@@ -137,7 +137,7 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   authoritative readiness endpoint `/api/platform/health/dependencies` already
   reports no-pool as `down`. `/health/all` keeps its advisory marker. The five
   components we cannot probe (api/portal/validator/k8s/vault) remain honestly
-  `source="simulated"`. Dual-reviewed (GPT-5 Codex + fresh-context agent), engine
+  `source="simulated"`. Dual-reviewed independently, with engine
   + api tests green.
 
 ### 5. Security operations lack audit trail logging
@@ -758,7 +758,7 @@ their value:
   ops control rather than a code change.
 - **#33 (agent_jobs composite index)** — SHIPPED `33a7ded`: migration 117 swaps the
   (platform, status) index for (platform, status, created_at) so the lease query
-  satisfies filter + ORDER BY from the index (EXPLAIN confirms no Sort); codex APPROVED.
+  satisfies filter + ORDER BY from the index (EXPLAIN confirms no Sort); review APPROVED.
 - **#30 (scheduler lease heartbeat)** — still tracked as a background-task chip.
 - **#34 (client ids in error messages)** — 72+ instances, `low` severity; the
   reviewer noted these ids are not secrets. A full opaque-error-code sweep is a

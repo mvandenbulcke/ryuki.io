@@ -1,7 +1,7 @@
 # Emit a domain event when a LiveApply lease expires → ReconcileRequired
 
-Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/S). codex review APPROVE (the event-emit), then
-APPROVE again after I expanded it (per codex's own MINOR) to make `reconcile-required` genuinely
+Status: SHIPPED (run-3 discovery swarm, CONFIRMED H/S). Review approved the event emission, then
+approved it again after a MINOR expansion made `reconcile-required` genuinely
 alert-worthy (Critical) — closing the risk-profile asymmetry where the costliest mode alerted
 weaker than dead-letter. Additive, NO migration, NO schema change.
 
@@ -36,7 +36,7 @@ let reconcile = reconciled.len() as u64;
 ```
 - NO migration: `domain_events.event_type` is free TEXT (no CHECK); `job.dead_lettered` was added
   the same way.
-- ALERT-WORTHY PARITY (codex): the alert classifier `severity_for_agent_job_status`
+- ALERT-WORTHY PARITY: the alert classifier `severity_for_agent_job_status`
   (ryuki-engine event_alerts.rs:83) is extended so `to_status = "reconcile-required"` ⇒ `Critical`
   (and `alert_worthy_statuses()` gains it, kept in lock-step by the existing union test). Without
   this, only `dead-lettered` surfaced in the alert feed as Critical — so the LESS-risky dead-letter
@@ -46,7 +46,7 @@ let reconcile = reconciled.len() as u64;
   `domain_events` → `alert_worthy_statuses()` SQL prefilter + `classify` path the dead-letter event
   uses — no extra emit in `expire_leases`. (EXACT parity with dead-letter: like dead-letter, it does
   NOT auto-insert a `portal_notification` — those are explicit emitter-side
-  `draft_for_alert`/`insert_draft_tx` inserts, a separate concern for both — codex.)
+  `draft_for_alert`/`insert_draft_tx` inserts, a separate concern for both.)
 - Secret hygiene: payload is platform / request_id / mode / a static note — no secrets (same shape
   as the dead-letter payload).
 - `ReconcileRequiredJobRow { id, request_id, platform }` — `mode` is constant `LiveApply`, and
@@ -60,7 +60,7 @@ let reconcile = reconciled.len() as u64;
   comment ("no event" → "a reconcile_required event, never a dead-letter event"). NOTE:
   `cleanup_dead_letter_events` is a best-effort no-op — `domain_events` is append-only (mig 111
   blocks DELETE; the call `.ok()`-swallows the error). Test isolation comes from the per-test UNIQUE
-  job id (the count helpers filter by `aggregate_id`), NOT from deletion (codex).
+  job id (the count helpers filter by `aggregate_id`), NOT from deletion.
 - Engine: add a `severity_for_agent_job_status("reconcile-required") == Critical` assertion to the
   existing classifier test; the union lock-step test passes automatically once `reconcile-required`
   is in both the classifier and `alert_worthy_statuses()`.
