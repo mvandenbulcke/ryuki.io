@@ -1,0 +1,46 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: /portal/portal-ui
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /scripts/validator-rs
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /sources/ryuki-api
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /sources/ryuki-core
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /sources/ryuki-engine
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: docker
+    directory: /sources/ryuki-api
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /portal/portal-ui
+    schedule:
+      interval: weekly
