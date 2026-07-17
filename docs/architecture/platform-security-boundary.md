@@ -1094,12 +1094,29 @@ recomputed ids, count, and inventory digest must exactly equal that independentl
 derived result; deleting a row and its evidence, inventing a row, changing a
 dimension, or swapping a trace or subject fails equality.
 
-This slice does not derive deployment or provider-capability instances.
-Deployment applicability remains a runtime-owned union of the admitted
-deployment profile, active provider configurations and descriptors, advertised
-capabilities, topology, tenancy, and policy facts, and that derivation is not
-yet implemented. The build inventory therefore discharges neither remaining
-production blocker: semantic receipt closure must still consume the opaque
+The deployment/provider derivation slice now implements the corresponding
+runtime-owned inventory without treating its inputs as authority. It requires
+the exact profile and ControlTrace binding, one reconciled checkpoint projection
+per selected trust domain, the exact loaded provider-registry and security-limit
+references, latest-active provider configurations, descriptor-to-shipped-
+adapter kind/version/baseline equality, the complete advertised capability
+inventory, production eligibility on both sides, and the build-owned mandatory
+baseline trace ids. Deployment subjects fan out across active non-null-tier
+deployment traces; provider-capability subjects additionally fan out across
+each active provider capability and its compiled baseline. Null, inactive,
+unknown, inapplicable, mismatched, duplicate, unbounded, or recomputed-but-
+shrunken inventories fail. The API loader retains the lossless provider facts
+and verifies their exact measured-build binding for later closure.
+
+This derivation deliberately requires `deployment.artifact_digest` from a
+separately verified deployed-OCI/workload claim and merely checks that claim
+against the manifest's OCI subject; the manifest declaration cannot prove its
+own deployment. No such opaque workload proof exists yet. The checked-in
+provider is development-only, every compiled adapter remains production-
+ineligible, and its build-owned baseline traces currently have null deployment
+tiers, so present artifacts still fail closed before a deployment inventory can
+be sealed. Package receipts and bundles also retain their legacy applicability
+shape. Consequently semantic receipt closure must still consume the opaque
 current-root proof against the complete independently derived universe, and the
 runtime admission boundary must still verify every live guard fact. Production
 startup remains fail-closed.

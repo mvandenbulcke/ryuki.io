@@ -538,12 +538,6 @@ fn validate_adapter(adapter: &ShippedAdapter, errors: &mut Vec<String>) {
             adapter.adapter_kind
         ));
     }
-    if adapter.production_eligible {
-        errors.push(format!(
-            "shipped adapter {} cannot be production eligible in manifest v2",
-            adapter.adapter_kind
-        ));
-    }
     if adapter.capability_ids.is_empty()
         || adapter.capability_ids.len() > MAX_CAPABILITIES_PER_ADAPTER
         || !strictly_sorted(adapter.capability_ids.iter().map(String::as_str))
@@ -985,6 +979,13 @@ mod tests {
     #[test]
     fn complete_manifest_is_semantically_valid() {
         assert!(valid_manifest().validate_semantics().is_empty());
+    }
+
+    #[test]
+    fn production_eligibility_is_a_measured_adapter_fact() {
+        let mut manifest = valid_manifest();
+        manifest.shipped_adapters[0].production_eligible = true;
+        assert!(manifest.validate_semantics().is_empty());
     }
 
     #[test]

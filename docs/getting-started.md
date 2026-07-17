@@ -79,9 +79,11 @@ digest, and locator; it cannot bootstrap or auto-advance authority state.
 The build manifest pins expected build identity and claims an implementation-
 applicability inventory; startup independently derives that build-side
 inventory from the authenticated ControlTrace and measured build facts and
-requires exact equality. It does not derive deployment/provider applicability,
-authenticate deployed OCI provenance, establish semantic conformance closure,
-or verify live runtime facts. Those remain production blockers.
+requires exact equality. The loader also retains exact provider descriptors and
+the core can derive deployment/provider applicability from authenticated facts,
+but startup cannot seal that inventory until an independent deployed-OCI proof
+exists. It also does not yet establish semantic conformance closure or verify
+live runtime facts. Those remain production blockers.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

@@ -288,7 +288,7 @@
       "properties": {
         "adapter_kind": { "$ref": "#/$defs/canonicalName" },
         "adapter_version": { "$ref": "#/$defs/semanticVersion" },
-        "production_eligible": { "const": false },
+        "production_eligible": { "type": "boolean" },
         "capability_ids": {
           "type": "array",
           "minItems": 1,

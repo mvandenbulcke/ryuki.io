@@ -329,6 +329,7 @@
             "operands": {
               "type": "array",
               "minItems": 1,
+              "maxItems": 64,
               "items": {
                 "$ref": "#/$defs/expression"
               }
@@ -396,6 +397,7 @@
             "values": {
               "type": "array",
               "minItems": 1,
+              "maxItems": 64,
               "uniqueItems": true,
               "items": {
                 "$ref": "#/$defs/scalar"

@@ -31,9 +31,13 @@ use ryuki_core::production_applicability::validate_exact_implementation_applicab
 use ryuki_core::production_build::{
     BuildComponent, BuildSelectorDisposition, ProductionBuildManifest, ShippedAdapter,
 };
+use ryuki_core::production_deployment_applicability::{
+    ActiveProviderApplicabilityClaim, ActiveProviderRegistryApplicabilityClaim,
+    ProviderMandatoryBaselineClaim,
+};
 use ryuki_core::security_profile::{
-    ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile,
-    StartupAdmissionContext, VersionedContentReference,
+    ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, ProviderLifecycleState,
+    SecurityProfile, StartupAdmissionContext, VersionedContentReference,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -260,6 +264,19 @@ struct CredentialReferenceBinding {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProviderCapabilityDescriptorBinding {
+    descriptor_id: String,
+    descriptor_version: u64,
+    adapter_kind: String,
+    adapter_version: String,
+    advertised_capabilities: Vec<String>,
+    mandatory_baseline_ref: ContentReferenceBinding,
+    implementation_applicable: bool,
+    production_eligible: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DevelopmentFixtureKindConfig {
     configuration_kind: String,
     fixture_type: String,
@@ -300,12 +317,31 @@ struct LocalWebauthnKindConfig {
     step_up_limit_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityProviderKindConfig {
+    configuration_kind: String,
+    /// Runtime adapter selector. This is independently projected from the
+    /// kind-specific provider configuration and must exactly match the
+    /// capability descriptor's attested adapter identity.
+    adapter_kind: String,
+    endpoint_policy_ref: ContentReferenceBinding,
+    authentication_ref: ContentReferenceBinding,
+    capability_policy_ref: ContentReferenceBinding,
+    rotation_policy_ref: ContentReferenceBinding,
+    revocation_policy_ref: ContentReferenceBinding,
+}
+
 #[derive(Debug, Clone)]
 enum ActiveProviderKindConfig {
     DevelopmentFixture(Box<DevelopmentFixtureKindConfig>),
     Oidc(Box<OidcKindConfig>),
     LocalWebauthn(Box<LocalWebauthnKindConfig>),
-    NonAuthenticator {
+    CapabilityProvider(Box<CapabilityProviderKindConfig>),
+    /// These provider kinds have no kind-specific runtime adapter selector in
+    /// the v1 contract. Keeping this variant closed to that exact set prevents
+    /// an adapter-bearing capability provider from being treated as opaque.
+    NonAdapterProvider {
         configuration_kind: String,
         content_addressed: Value,
     },
@@ -317,6 +353,9 @@ pub(crate) struct ActiveProviderConfiguration {
     config_version: u64,
     payload_digest: String,
     kind: String,
+    trust_domain_id: String,
+    active_lifecycle_record_version: u64,
+    capability_descriptor: ProviderCapabilityDescriptorBinding,
     credential_refs: Vec<CredentialReferenceBinding>,
     kind_config: ActiveProviderKindConfig,
 }
@@ -401,6 +440,10 @@ pub(crate) struct SecurityContractContext {
     pub(crate) production_build_manifest: Option<PinnedProductionBuildManifest>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
+    /// Lossless, non-authoritative projection retained for independent
+    /// deployment/provider applicability derivation. Authority comes from the
+    /// authenticated registry and later runtime proofs, never from this claim.
+    pub(crate) provider_registry_applicability: ActiveProviderRegistryApplicabilityClaim,
 }
 
 #[derive(Debug)]
@@ -413,6 +456,7 @@ struct PreparedSecurityContract {
     raw_document_bytes: BTreeMap<String, Vec<u8>>,
     reference_document_digests: BTreeMap<String, String>,
     active_providers: BTreeMap<String, ActiveProviderConfiguration>,
+    provider_registry_applicability: ActiveProviderRegistryApplicabilityClaim,
     conformance_registry_lineage: Option<ValidatedConformanceRegistryLineage>,
     production_build_manifest: Option<PinnedProductionBuildManifest>,
 }
@@ -489,11 +533,17 @@ impl SecurityContractContext {
                     )
                 })
                 .unwrap_or_else(|| "no pinned production build manifest".into());
+            let provider_applicability = format!(
+                "provider registry version {} with {} active provider applicability claims",
+                self.provider_registry_applicability.registry_version,
+                self.provider_registry_applicability.active_providers.len(),
+            );
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {} signed closure documents authenticated; semantic closure remains unavailable)",
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {}; {} signed closure documents authenticated; semantic closure, verified deployed-OCI identity, and live runtime facts remain unavailable)",
                 checkpoint,
                 production_root,
                 build_manifest,
+                provider_applicability,
                 verified_document_count,
             ));
         }
@@ -796,6 +846,7 @@ fn prepare_startup_security_contract(
         documents,
         raw_document_bytes,
         reference_document_digests,
+        provider_registry_version,
         active_providers,
         production_build_manifest,
     ) = {
@@ -807,6 +858,8 @@ fn prepare_startup_security_contract(
             .documents
             .get(provider_locator)
             .ok_or_else(|| "provider registry reference did not resolve to JSON".to_string())?;
+        let provider_registry_version =
+            required_u64(provider_registry, "registry_version", "provider registry")?;
         let active_providers =
             validate_provider_registry(provider_registry, &profile, now, &verifier.documents)?;
 
@@ -852,10 +905,23 @@ fn prepare_startup_security_contract(
             verifier.documents,
             verifier.document_bytes,
             verifier.visited,
+            provider_registry_version,
             active_providers,
             production_build_manifest,
         )
     };
+
+    let provider_registry_applicability = build_provider_registry_applicability_claim(
+        &profile,
+        provider_registry_version,
+        &active_providers,
+    )?;
+    if let Some(manifest) = production_build_manifest.as_ref() {
+        validate_production_provider_build_bindings(
+            &provider_registry_applicability,
+            &manifest.document,
+        )?;
+    }
 
     Ok(PreparedSecurityContract {
         profile,
@@ -866,6 +932,7 @@ fn prepare_startup_security_contract(
         raw_document_bytes,
         reference_document_digests,
         active_providers,
+        provider_registry_applicability,
         conformance_registry_lineage,
         production_build_manifest,
     })
@@ -1311,7 +1378,11 @@ fn finalize_startup_security_contract(
     } else {
         None
     };
-    reject_incomplete_production_startup(&prepared.profile, verified_document_count)?;
+    reject_incomplete_production_startup(
+        &prepared.profile,
+        verified_document_count,
+        &prepared.provider_registry_applicability,
+    )?;
 
     Ok(SecurityContractContext {
         profile: prepared.profile,
@@ -1323,6 +1394,7 @@ fn finalize_startup_security_contract(
         verified_conformance_production_root,
         production_build_manifest: prepared.production_build_manifest,
         active_providers: prepared.active_providers,
+        provider_registry_applicability: prepared.provider_registry_applicability,
     })
 }
 
@@ -1366,10 +1438,13 @@ fn trusted_time_point(now: DateTime<Utc>) -> ConformanceTrustedTimeWindow {
 fn reject_incomplete_production_startup(
     profile: &DeploymentSecurityProfile,
     verified_document_count: usize,
+    provider_registry: &ActiveProviderRegistryApplicabilityClaim,
 ) -> Result<(), String> {
     if profile.security_profile.is_production() {
         Err(format!(
-            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; semantic closure and live runtime facts remain unavailable)"
+            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; provider registry version {} retained with {} active provider applicability claims; semantic closure, verified deployed-OCI identity, and live runtime facts remain unavailable)",
+            provider_registry.registry_version,
+            provider_registry.active_providers.len(),
         ))
     } else {
         Ok(())
@@ -2942,32 +3017,8 @@ fn validate_provider_registry(
             return Err(format!("tombstoned provider id {provider_id} is reused"));
         }
         validate_provider_payload(configuration)?;
-        typed_configs.insert(
-            (provider_id.into(), version),
-            parse_active_provider_configuration(configuration)?,
-        );
-        let trust_domain =
-            required_str(configuration, "trust_domain_id", "provider configuration")?;
-        if !profile
-            .trust_topology
-            .trust_domain_ids
-            .iter()
-            .any(|candidate| candidate == trust_domain)
-        {
-            return Err(format!(
-                "provider {provider_id} uses an unbound trust domain"
-            ));
-        }
-        if !string_set(configuration.get("allowed_security_profiles"))
-            .contains(profile.security_profile.as_str())
-        {
-            return Err(format!(
-                "provider {provider_id} is not allowed in the selected profile"
-            ));
-        }
-        if kind == "development-fixture" && profile.security_profile.is_production() {
-            return Err("development provider is never applicable to production".into());
-        }
+        let typed_configuration = parse_active_provider_configuration(configuration)?;
+        typed_configs.insert((provider_id.into(), version), typed_configuration);
     }
 
     let records = registry
@@ -3020,7 +3071,6 @@ fn validate_provider_registry(
         }
     }
     let mut active = BTreeMap::<String, ActiveProviderConfiguration>::new();
-    let mut active_configurations = BTreeSet::<(String, u64)>::new();
     for ((provider_id, config_version), mut history) in grouped {
         history.sort_by_key(|(version, _)| *version);
         for (index, (version, record)) in history.iter().enumerate() {
@@ -3047,6 +3097,13 @@ fn validate_provider_registry(
                         "provider lifecycle {provider_id}@{config_version} has a broken supersession chain"
                     ));
                 }
+                let previous_effective = lifecycle_effective_at(previous)?;
+                let effective = lifecycle_effective_at(record)?;
+                if effective < previous_effective {
+                    return Err(format!(
+                        "provider lifecycle {provider_id}@{config_version} effective_at chronology regresses from record {previous_version} to {version}"
+                    ));
+                }
                 validate_lifecycle_transition(
                     required_str(previous, "state", "provider lifecycle")?,
                     required_str(record, "state", "provider lifecycle")?,
@@ -3062,36 +3119,84 @@ fn validate_provider_registry(
                 )?;
             }
         }
-        let (_, latest) = history.last().expect("non-empty lifecycle history");
+        let (latest_record_version, latest) = history.last().expect("non-empty lifecycle history");
         if required_str(latest, "state", "provider lifecycle")? == "active" {
             let configuration = typed_configs
                 .get(&(provider_id.clone(), config_version))
                 .expect("lifecycle configuration checked above");
-            if active
-                .insert(provider_id.clone(), configuration.clone())
-                .is_some()
+            let mut configuration = configuration.clone();
+            configuration.active_lifecycle_record_version = *latest_record_version;
+            let raw_configuration = configs
+                .get(&(provider_id.clone(), config_version))
+                .expect("active lifecycle configuration checked above");
+            if !profile
+                .trust_topology
+                .trust_domain_ids
+                .iter()
+                .any(|candidate| candidate == &configuration.trust_domain_id)
             {
+                return Err(format!(
+                    "active provider {provider_id}@{config_version} uses an unbound trust domain"
+                ));
+            }
+            if !string_set(raw_configuration.get("allowed_security_profiles"))
+                .contains(profile.security_profile.as_str())
+            {
+                return Err(format!(
+                    "active provider {provider_id}@{config_version} is not allowed in the selected profile"
+                ));
+            }
+            if configuration.kind == "development-fixture"
+                && profile.security_profile.is_production()
+            {
+                return Err("active development provider is never applicable to production".into());
+            }
+            if profile.security_profile.is_production()
+                && !configuration.capability_descriptor.production_eligible
+            {
+                return Err(format!(
+                    "active provider {provider_id}@{config_version} is not production eligible"
+                ));
+            }
+            if active.insert(provider_id.clone(), configuration).is_some() {
                 return Err(format!(
                     "provider {provider_id} has multiple active configuration versions"
                 ));
             }
-            active_configurations.insert((provider_id.clone(), config_version));
         }
     }
     if active.is_empty() {
         return Err("provider registry has no active provider authority".into());
     }
-    for ((provider_id, config_version), configuration) in &configs {
-        if string_set(configuration.get("required_for_profiles"))
-            .contains(profile.security_profile.as_str())
-            && !active_configurations.contains(&(provider_id.clone(), *config_version))
-        {
+    let declared_provider_kinds = string_set(registry.pointer("/applicability/provider_kinds"));
+    for provider in active.values() {
+        if !declared_provider_kinds.contains(provider.kind.as_str()) {
             return Err(format!(
-                "required provider {provider_id}@{config_version} is not active"
+                "active provider {} kind {} is omitted from registry applicability",
+                provider.provider_id, provider.kind
             ));
         }
     }
+    let mut required_provider_ids = BTreeSet::new();
+    for ((provider_id, _), configuration) in &configs {
+        if string_set(configuration.get("required_for_profiles"))
+            .contains(profile.security_profile.as_str())
+        {
+            required_provider_ids.insert(provider_id.clone());
+        }
+    }
+    for provider_id in required_provider_ids {
+        if !active.contains_key(&provider_id) {
+            return Err(format!("required provider {provider_id} is not active"));
+        }
+    }
     Ok(active)
+}
+
+fn lifecycle_effective_at(record: &Value) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(required_str(record, "effective_at", "provider lifecycle")?)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "provider lifecycle effective_at is invalid".to_string())
 }
 
 fn parse_active_provider_configuration(
@@ -3101,6 +3206,15 @@ fn parse_active_provider_configuration(
     let config_version = required_u64(configuration, "config_version", "provider configuration")?;
     let payload_digest = required_str(configuration, "payload_digest", "provider configuration")?;
     let kind = required_str(configuration, "kind", "provider configuration")?;
+    let trust_domain_id = required_str(configuration, "trust_domain_id", "provider configuration")?;
+    let capability_descriptor = serde_json::from_value::<ProviderCapabilityDescriptorBinding>(
+        configuration
+            .get("capability_descriptor")
+            .cloned()
+            .ok_or_else(|| "provider configuration omits capability_descriptor".to_string())?,
+    )
+    .map_err(|error| format!("provider capability descriptor is not typed: {error}"))?;
+    capability_descriptor.validate()?;
     let credential_refs = serde_json::from_value::<Vec<CredentialReferenceBinding>>(
         configuration
             .get("credential_refs")
@@ -3130,25 +3244,167 @@ fn parse_active_provider_configuration(
             serde_json::from_value(raw_kind_config)
                 .map_err(|error| format!("local WebAuthn kind_config is not typed: {error}"))?,
         )),
-        _ => ActiveProviderKindConfig::NonAuthenticator {
-            configuration_kind: raw_kind_config
-                .get("configuration_kind")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "provider kind_config omits configuration_kind".to_string())?
-                .into(),
-            content_addressed: raw_kind_config,
-        },
+        "secret-service" | "key-custody" | "certificate-authority" => {
+            ActiveProviderKindConfig::CapabilityProvider(Box::new(
+                serde_json::from_value(raw_kind_config).map_err(|error| {
+                    format!("capability provider kind_config is not typed: {error}")
+                })?,
+            ))
+        }
+        "oauth-service" | "api-token" | "workload" => {
+            ActiveProviderKindConfig::NonAdapterProvider {
+                configuration_kind: raw_kind_config
+                    .get("configuration_kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "provider kind_config omits configuration_kind".to_string())?
+                    .into(),
+                content_addressed: raw_kind_config,
+            }
+        }
+        _ => {
+            return Err(format!(
+                "provider kind {kind} has no closed typed kind_config projection"
+            ));
+        }
     };
     kind_config.validate_type(kind)?;
+    kind_config.validate_adapter_binding(kind, &capability_descriptor.adapter_kind)?;
 
     Ok(ActiveProviderConfiguration {
         provider_id: provider_id.into(),
         config_version,
         payload_digest: payload_digest.into(),
         kind: kind.into(),
+        trust_domain_id: trust_domain_id.into(),
+        active_lifecycle_record_version: 0,
+        capability_descriptor,
         credential_refs,
         kind_config,
     })
+}
+
+fn build_provider_registry_applicability_claim(
+    profile: &DeploymentSecurityProfile,
+    registry_version: u64,
+    active_providers: &BTreeMap<String, ActiveProviderConfiguration>,
+) -> Result<ActiveProviderRegistryApplicabilityClaim, String> {
+    if registry_version == 0 {
+        return Err(
+            "provider registry applicability projection has a zero registry version".into(),
+        );
+    }
+    let providers = active_providers
+        .values()
+        .map(|provider| {
+            if provider.active_lifecycle_record_version == 0 {
+                return Err(format!(
+                    "active provider {} has no selected lifecycle record version",
+                    provider.provider_id
+                ));
+            }
+            Ok(ActiveProviderApplicabilityClaim {
+                provider_id: provider.provider_id.clone(),
+                provider_kind: provider.kind.clone(),
+                configuration_version: provider.config_version,
+                configuration_payload_digest: provider.payload_digest.clone(),
+                lifecycle_record_version: provider.active_lifecycle_record_version,
+                lifecycle_state: ProviderLifecycleState::Active,
+                trust_domain_id: provider.trust_domain_id.clone(),
+                descriptor_id: provider.capability_descriptor.descriptor_id.clone(),
+                descriptor_version: provider.capability_descriptor.descriptor_version,
+                adapter_kind: provider.capability_descriptor.adapter_kind.clone(),
+                adapter_version: provider.capability_descriptor.adapter_version.clone(),
+                advertised_capability_ids: provider
+                    .capability_descriptor
+                    .advertised_capabilities
+                    .clone(),
+                production_eligible: provider.capability_descriptor.production_eligible,
+                mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                    document_id: provider
+                        .capability_descriptor
+                        .mandatory_baseline_ref
+                        .document_id
+                        .clone(),
+                    document_version: provider
+                        .capability_descriptor
+                        .mandatory_baseline_ref
+                        .document_version,
+                    content_digest: provider
+                        .capability_descriptor
+                        .mandatory_baseline_ref
+                        .content_digest
+                        .clone(),
+                    artifact_locator: provider
+                        .capability_descriptor
+                        .mandatory_baseline_ref
+                        .artifact_locator
+                        .clone(),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ActiveProviderRegistryApplicabilityClaim {
+        document_id: profile.provider_registry_ref.document_id.clone(),
+        document_version: profile.provider_registry_ref.document_version,
+        content_digest: profile.provider_registry_ref.content_digest.clone(),
+        artifact_locator: profile.provider_registry_ref.artifact_locator.clone(),
+        registry_version,
+        active_providers: providers,
+    })
+}
+
+fn validate_production_provider_build_bindings(
+    registry: &ActiveProviderRegistryApplicabilityClaim,
+    manifest: &ProductionBuildManifest,
+) -> Result<(), String> {
+    let shipped = manifest
+        .shipped_adapters
+        .iter()
+        .map(|adapter| (adapter.adapter_kind.as_str(), adapter))
+        .collect::<BTreeMap<_, _>>();
+    if shipped.len() != manifest.shipped_adapters.len() {
+        return Err("production build repeats a shipped adapter kind".into());
+    }
+    for provider in &registry.active_providers {
+        let adapter = shipped
+            .get(provider.adapter_kind.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "active provider {} references adapter {} that is not shipped in the measured build",
+                    provider.provider_id, provider.adapter_kind
+                )
+            })?;
+        if !provider.production_eligible || !adapter.production_eligible {
+            return Err(format!(
+                "active provider {} and measured adapter {} must both be production eligible",
+                provider.provider_id, provider.adapter_kind
+            ));
+        }
+        if provider.adapter_version != adapter.adapter_version {
+            return Err(format!(
+                "active provider {} adapter version does not match the measured build",
+                provider.provider_id
+            ));
+        }
+        if provider.advertised_capability_ids != adapter.capability_ids {
+            return Err(format!(
+                "active provider {} capability inventory does not exactly match measured adapter {}",
+                provider.provider_id, provider.adapter_kind
+            ));
+        }
+        let baseline = &provider.mandatory_baseline_ref;
+        if baseline.document_id != adapter.mandatory_baseline.document_id
+            || baseline.document_version != adapter.mandatory_baseline.document_version
+            || baseline.content_digest != adapter.mandatory_baseline.content_digest
+            || baseline.artifact_locator != adapter.mandatory_baseline.artifact_locator
+        {
+            return Err(format!(
+                "active provider {} mandatory baseline reference does not match measured adapter {}",
+                provider.provider_id, provider.adapter_kind
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ContentReferenceBinding {
@@ -3180,6 +3436,37 @@ impl CredentialReferenceBinding {
     }
 }
 
+impl ProviderCapabilityDescriptorBinding {
+    fn validate(&self) -> Result<(), String> {
+        if self.descriptor_id.is_empty()
+            || self.descriptor_version == 0
+            || self.adapter_kind.is_empty()
+            || self.adapter_version.is_empty()
+        {
+            return Err(
+                "typed provider capability descriptor omits identity, adapter, or version".into(),
+            );
+        }
+        if !self.implementation_applicable {
+            return Err(
+                "typed provider capability descriptor must remain implementation-applicable".into(),
+            );
+        }
+        if self.advertised_capabilities.is_empty()
+            || self
+                .advertised_capabilities
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(
+                "typed provider advertised capabilities must be non-empty and strictly sorted"
+                    .into(),
+            );
+        }
+        self.mandatory_baseline_ref.validate()
+    }
+}
+
 impl ActiveProviderKindConfig {
     fn validate_type(&self, provider_kind: &str) -> Result<(), String> {
         match self {
@@ -3201,14 +3488,64 @@ impl ActiveProviderKindConfig {
             {
                 local.security_binding_summary().map(|_| ())
             }
-            Self::NonAuthenticator {
+            Self::CapabilityProvider(capability)
+                if matches!(
+                    provider_kind,
+                    "secret-service" | "key-custody" | "certificate-authority"
+                ) && capability.configuration_kind == provider_kind =>
+            {
+                capability.security_binding_summary().map(|_| ())
+            }
+            Self::NonAdapterProvider {
                 configuration_kind,
                 content_addressed,
-            } if configuration_kind == provider_kind && content_addressed.is_object() => Ok(()),
+            } if matches!(provider_kind, "oauth-service" | "api-token" | "workload")
+                && configuration_kind == provider_kind
+                && content_addressed.is_object() =>
+            {
+                Ok(())
+            }
             _ => Err(format!(
                 "provider kind {provider_kind} does not match its typed kind_config"
             )),
         }
+    }
+
+    fn validate_adapter_binding(
+        &self,
+        provider_kind: &str,
+        descriptor_adapter_kind: &str,
+    ) -> Result<(), String> {
+        let Self::CapabilityProvider(capability) = self else {
+            return Ok(());
+        };
+        if capability.adapter_kind != descriptor_adapter_kind {
+            return Err(format!(
+                "provider kind {provider_kind} runtime adapter selector {} does not exactly match capability descriptor adapter {}",
+                capability.adapter_kind, descriptor_adapter_kind
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CapabilityProviderKindConfig {
+    fn security_binding_summary(&self) -> Result<usize, String> {
+        if self.adapter_kind.is_empty() {
+            return Err(
+                "capability provider kind_config omits its runtime adapter selector".into(),
+            );
+        }
+        for reference in [
+            &self.endpoint_policy_ref,
+            &self.authentication_ref,
+            &self.capability_policy_ref,
+            &self.rotation_policy_ref,
+            &self.revocation_policy_ref,
+        ] {
+            reference.validate()?;
+        }
+        Ok(5)
     }
 }
 
@@ -3588,6 +3925,19 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
+    }
+
+    fn empty_provider_registry_applicability(
+        profile: &DeploymentSecurityProfile,
+    ) -> ActiveProviderRegistryApplicabilityClaim {
+        ActiveProviderRegistryApplicabilityClaim {
+            document_id: profile.provider_registry_ref.document_id.clone(),
+            document_version: profile.provider_registry_ref.document_version,
+            content_digest: profile.provider_registry_ref.content_digest.clone(),
+            artifact_locator: profile.provider_registry_ref.artifact_locator.clone(),
+            registry_version: 1,
+            active_providers: Vec::new(),
+        }
     }
 
     fn test_runtime_build_identity() -> RuntimeBuildIdentity {
@@ -4050,6 +4400,7 @@ mod tests {
             raw_document_bytes: prepared.raw_document_bytes.clone(),
             reference_document_digests: prepared.reference_document_digests.clone(),
             active_providers: prepared.active_providers.clone(),
+            provider_registry_applicability: prepared.provider_registry_applicability.clone(),
             conformance_registry_lineage: prepared.conformance_registry_lineage.clone(),
             production_build_manifest: None,
         }
@@ -4856,6 +5207,55 @@ mod tests {
     }
 
     #[test]
+    fn provider_applicability_must_exactly_match_the_measured_build() {
+        let fixture = ActiveFixture::build();
+        let profile: DeploymentSecurityProfile = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        let runtime = test_runtime_build_identity();
+        let (_, control_trace) = test_production_control_trace(&fixture);
+        let mut manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
+        manifest.shipped_adapters[0].production_eligible = true;
+        let adapter = &manifest.shipped_adapters[0];
+        let mut registry = empty_provider_registry_applicability(&profile);
+        registry
+            .active_providers
+            .push(ActiveProviderApplicabilityClaim {
+                provider_id: "provider:test".into(),
+                provider_kind: "oidc".into(),
+                configuration_version: 1,
+                configuration_payload_digest: format!("sha256:{}", "8".repeat(64)),
+                lifecycle_record_version: 3,
+                lifecycle_state: ProviderLifecycleState::Active,
+                trust_domain_id: profile.trust_topology.trust_domain_ids[0].clone(),
+                descriptor_id: "capability-descriptor:test".into(),
+                descriptor_version: 1,
+                adapter_kind: adapter.adapter_kind.clone(),
+                adapter_version: adapter.adapter_version.clone(),
+                advertised_capability_ids: adapter.capability_ids.clone(),
+                production_eligible: true,
+                mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                    document_id: adapter.mandatory_baseline.document_id.clone(),
+                    document_version: adapter.mandatory_baseline.document_version,
+                    content_digest: adapter.mandatory_baseline.content_digest.clone(),
+                    artifact_locator: adapter.mandatory_baseline.artifact_locator.clone(),
+                },
+            });
+        validate_production_provider_build_bindings(&registry, &manifest)
+            .expect("exact provider/build binding must pass");
+
+        registry.active_providers[0]
+            .advertised_capability_ids
+            .push("unmeasured-capability".into());
+        assert!(
+            validate_production_provider_build_bindings(&registry, &manifest)
+                .unwrap_err()
+                .contains("does not exactly match")
+        );
+    }
+
+    #[test]
     fn detached_build_manifest_rejects_identity_swaps_before_checkpoint_io() {
         let fixture = ActiveFixture::build();
         let mut profile: DeploymentSecurityProfile = serde_json::from_slice(
@@ -4964,6 +5364,18 @@ mod tests {
         let fixture = ActiveFixture::build();
         let context = fixture.load().expect("active test contract must load");
         assert_eq!(context.active_providers.len(), 1);
+        assert_eq!(context.provider_registry_applicability.registry_version, 1);
+        let provider_claim = &context.provider_registry_applicability.active_providers[0];
+        assert_eq!(
+            provider_claim.adapter_kind,
+            "fixture.repository-static-dry-run"
+        );
+        assert_eq!(provider_claim.adapter_version, "1.0.0");
+        assert_eq!(provider_claim.lifecycle_record_version, 3);
+        assert_eq!(
+            provider_claim.advertised_capability_ids,
+            ["dry-run-only", "static-human-fixture"]
+        );
         assert!(context.verified_conformance_trust_checkpoint.is_none());
         assert!(context.verified_conformance_documents.is_empty());
         assert!(context
@@ -5163,6 +5575,7 @@ mod tests {
             raw_document_bytes: document_bytes.clone(),
             reference_document_digests: reference_digests.clone(),
             active_providers: BTreeMap::new(),
+            provider_registry_applicability: empty_provider_registry_applicability(&profile),
             conformance_registry_lineage: Some(lineage),
             production_build_manifest: None,
         };
@@ -5243,6 +5656,7 @@ mod tests {
             verified_conformance_production_root: Some(verified_root),
             production_build_manifest: None,
             active_providers: BTreeMap::new(),
+            provider_registry_applicability: empty_provider_registry_applicability(&profile),
         };
         context
             .validate_serving_checkpoint_freshness(fixed_now())
@@ -5275,6 +5689,7 @@ mod tests {
             raw_document_bytes: document_bytes.clone(),
             reference_document_digests: reference_digests,
             active_providers: BTreeMap::new(),
+            provider_registry_applicability: empty_provider_registry_applicability(&profile),
             conformance_registry_lineage: None,
             production_build_manifest: None,
         };
@@ -5681,10 +6096,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exact current SB-9"));
-        let final_block = reject_incomplete_production_startup(&profile, verified_document_count)
-            .expect_err("cryptographic verification alone cannot authorize production");
+        let provider_registry = empty_provider_registry_applicability(&profile);
+        let final_block = reject_incomplete_production_startup(
+            &profile,
+            verified_document_count,
+            &provider_registry,
+        )
+        .expect_err("cryptographic verification alone cannot authorize production");
         assert!(final_block.contains("2 signed closure documents authenticated"));
-        assert!(final_block.contains("semantic closure and live runtime facts remain unavailable"));
+        assert!(final_block.contains("semantic closure"));
+        assert!(final_block.contains("live runtime facts remain unavailable"));
 
         let mut swapped_bytes = document_bytes.clone();
         let bundle_bytes = swapped_bytes
@@ -5884,11 +6305,14 @@ mod tests {
         let verified_document_count = verified.len();
         verify_current_production_root_binding(&checkpoint, &profile, &mut verified)
             .expect("the v2 lineage checkpoint must bind its exact current SB-9 root");
-        assert!(
-            reject_incomplete_production_startup(&profile, verified_document_count)
-                .unwrap_err()
-                .contains("2 signed closure documents authenticated")
-        );
+        let provider_registry = empty_provider_registry_applicability(&profile);
+        assert!(reject_incomplete_production_startup(
+            &profile,
+            verified_document_count,
+            &provider_registry,
+        )
+        .unwrap_err()
+        .contains("2 signed closure documents authenticated"));
     }
 
     #[test]
@@ -5972,6 +6396,188 @@ mod tests {
             .load()
             .unwrap_err()
             .contains("tombstoned provider"));
+    }
+
+    #[test]
+    fn capability_provider_runtime_adapter_must_match_attested_descriptor() {
+        let fixture = ActiveFixture::build();
+        let registry: Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .root
+                    .join("catalog/security-contracts/v1/provider-registry.runtime-test.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut configuration = registry["configurations"][0].clone();
+        let reference = configuration["capability_descriptor"]["mandatory_baseline_ref"].clone();
+        configuration["kind"] = json!("secret-service");
+        configuration["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": "runtime.secret-service",
+            "endpoint_policy_ref": reference,
+            "authentication_ref": reference,
+            "capability_policy_ref": reference,
+            "rotation_policy_ref": reference,
+            "revocation_policy_ref": reference
+        });
+
+        let error = parse_active_provider_configuration(&configuration)
+            .expect_err("a runtime adapter selector cannot diverge from its attestation");
+        assert!(error.contains("runtime adapter selector"), "{error}");
+
+        configuration["capability_descriptor"]["adapter_kind"] = json!("runtime.secret-service");
+        parse_active_provider_configuration(&configuration)
+            .expect("an exact runtime/descriptor adapter binding must parse");
+    }
+
+    #[test]
+    fn provider_rotation_selects_latest_active_version_and_rejects_dual_active() {
+        let mut fixture = ActiveFixture::build();
+        let provider_id = "provider:repository-static-dry-run";
+        let drain_digest = write_json(
+            &fixture.root,
+            "evidence/provider-v1-draining.json",
+            &json!({
+                "document_id": "transition-receipt:provider-v1-draining",
+                "document_version": 1,
+                "provider_id": provider_id,
+                "config_version": 1,
+                "from_lifecycle_record_version": 3,
+                "to_lifecycle_record_version": 4,
+                "from_state": "active",
+                "to_state": "draining",
+                "result": "pass"
+            }),
+        );
+        let v2_validated_digest = write_json(
+            &fixture.root,
+            "evidence/provider-v2-validated.json",
+            &json!({
+                "document_id": "transition-receipt:provider-v2-validated",
+                "document_version": 1,
+                "provider_id": provider_id,
+                "config_version": 2,
+                "from_lifecycle_record_version": 1,
+                "to_lifecycle_record_version": 2,
+                "from_state": "configured",
+                "to_state": "validated",
+                "result": "pass"
+            }),
+        );
+        let v2_active_digest = write_json(
+            &fixture.root,
+            "evidence/provider-v2-active.json",
+            &json!({
+                "document_id": "transition-receipt:provider-v2-active",
+                "document_version": 1,
+                "provider_id": provider_id,
+                "config_version": 2,
+                "from_lifecycle_record_version": 2,
+                "to_lifecycle_record_version": 3,
+                "from_state": "validated",
+                "to_state": "active",
+                "result": "pass"
+            }),
+        );
+        let root = fixture.root.clone();
+        fixture.rewrite_provider(|provider| {
+            provider["configurations"][0]["required_for_profiles"] = json!(["test"]);
+            let mut v2 = provider["configurations"][0].clone();
+            v2["config_version"] = json!(2);
+            v2["required_for_profiles"] = json!([]);
+            let v1 = provider["configurations"][0].clone();
+            provider["configurations"] = json!([v2, v1]);
+
+            let configured_v1 = provider["provider_lifecycle"][0].clone();
+            let validated_v1 = provider["provider_lifecycle"][1].clone();
+            let active_v1 = provider["provider_lifecycle"][2].clone();
+            let mut draining_v1 = active_v1.clone();
+            draining_v1["lifecycle_record_version"] = json!(4);
+            draining_v1["state"] = json!("draining");
+            draining_v1["effective_at"] = json!("2026-07-16T01:00:00Z");
+            draining_v1["supersedes_lifecycle_record_version"] = json!(3);
+            draining_v1["transition_receipt_ref"] = json!({
+                "document_id": "transition-receipt:provider-v1-draining",
+                "document_version": 1,
+                "content_digest": drain_digest,
+                "artifact_locator": "evidence/provider-v1-draining.json"
+            });
+
+            let mut configured_v2 = configured_v1.clone();
+            configured_v2["config_version"] = json!(2);
+            configured_v2["effective_at"] = json!("2026-07-16T00:30:00Z");
+            let mut validated_v2 = configured_v2.clone();
+            validated_v2["lifecycle_record_version"] = json!(2);
+            validated_v2["state"] = json!("validated");
+            validated_v2["effective_at"] = json!("2026-07-16T00:45:00Z");
+            validated_v2["supersedes_lifecycle_record_version"] = json!(1);
+            validated_v2["transition_receipt_ref"] = json!({
+                "document_id": "transition-receipt:provider-v2-validated",
+                "document_version": 1,
+                "content_digest": v2_validated_digest,
+                "artifact_locator": "evidence/provider-v2-validated.json"
+            });
+            let mut active_v2 = validated_v2.clone();
+            active_v2["lifecycle_record_version"] = json!(3);
+            active_v2["state"] = json!("active");
+            active_v2["effective_at"] = json!("2026-07-16T01:00:00Z");
+            active_v2["supersedes_lifecycle_record_version"] = json!(2);
+            active_v2["transition_receipt_ref"] = json!({
+                "document_id": "transition-receipt:provider-v2-active",
+                "document_version": 1,
+                "content_digest": v2_active_digest,
+                "artifact_locator": "evidence/provider-v2-active.json"
+            });
+
+            // Deliberately reverse/interleave both histories: lifecycle record
+            // version, not JSON array order, is authoritative.
+            provider["provider_lifecycle"] = json!([
+                active_v2,
+                draining_v1,
+                configured_v2,
+                active_v1,
+                validated_v2,
+                configured_v1,
+                validated_v1
+            ]);
+            refresh_reference_digests(provider, &root);
+            refresh_provider_payload_digests(provider);
+        });
+
+        let context = fixture
+            .load()
+            .expect("historical draining v1 and active v2 must be admitted");
+        let selected = context.active_providers.get(provider_id).unwrap();
+        assert_eq!(selected.config_version, 2);
+        assert_eq!(selected.active_lifecycle_record_version, 3);
+
+        fixture.rewrite_provider(|provider| {
+            provider["provider_lifecycle"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|record| {
+                    record["config_version"].as_u64() != Some(1)
+                        || record["lifecycle_record_version"].as_u64() != Some(4)
+                });
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("multiple active configuration versions"));
+    }
+
+    #[test]
+    fn provider_lifecycle_rejects_effective_time_regression() {
+        let mut fixture = ActiveFixture::build();
+        fixture.rewrite_provider(|provider| {
+            provider["provider_lifecycle"][2]["effective_at"] = json!("2026-07-15T23:59:59Z");
+        });
+        assert!(fixture
+            .load()
+            .unwrap_err()
+            .contains("effective_at chronology regresses"));
     }
 
     #[cfg(unix)]

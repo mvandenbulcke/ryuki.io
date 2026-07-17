@@ -438,6 +438,11 @@ fn evaluate_expression(
                 )));
             }
             let values = required_array(expression, "values", "applicability expression")?;
+            if values.is_empty() || values.len() > MAX_EXPRESSION_OPERANDS {
+                return Err(invalid(format!(
+                    "{operator} applicability expression must have 1 through {MAX_EXPRESSION_OPERANDS} values"
+                )));
+            }
             let present = values.contains(actual);
             Ok(if operator == "in" { present } else { !present })
         }
@@ -686,6 +691,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("undeclared or unavailable dimension"));
+    }
+
+    #[test]
+    fn membership_expression_values_are_bounded() {
+        let mut trace = trace_fixture();
+        trace["traces"][0]["applicability_expression"]["implementation"] = json!({
+            "operator": "in",
+            "dimension": "implementation.source_revision",
+            "values": vec!["a"; 65]
+        });
+        let error = derive_implementation_applicability(&trace, &manifest())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 through 64 values"));
     }
 
     #[test]

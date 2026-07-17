@@ -4684,7 +4684,7 @@ fn standard_base64_value(byte: u8) -> Result<u8, String> {
 }
 
 fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
-    let mut configuration_keys = BTreeSet::new();
+    let mut configuration_keys = BTreeSet::<(String, u64)>::new();
     let mut provider_kinds = BTreeMap::new();
     for (index, configuration) in array(registry, "configurations").iter().enumerate() {
         let path = format!("provider-registry.implementation.json:/configurations/{index}");
@@ -4693,9 +4693,11 @@ fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
             .get("config_version")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let key = format!("{provider_id}@{version}");
-        if !configuration_keys.insert(key.clone()) {
-            errors.push(format!("{path}: duplicate provider configuration {key}"));
+        let key = (provider_id.to_string(), version);
+        if !configuration_keys.insert(key) {
+            errors.push(format!(
+                "{path}: duplicate provider configuration {provider_id}@{version}"
+            ));
         }
         if let Some(previous) = provider_kinds.insert(
             provider_id.to_string(),
@@ -4709,31 +4711,141 @@ fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
                 ));
             }
         }
+        let descriptor = configuration
+            .get("capability_descriptor")
+            .unwrap_or(&Value::Null);
+        let advertised = array(descriptor, "advertised_capabilities");
+        if advertised.is_empty()
+            || advertised
+                .windows(2)
+                .any(|pair| pair[0].as_str().unwrap_or("") >= pair[1].as_str().unwrap_or(""))
+        {
+            errors.push(format!(
+                "{path}: capability_descriptor.advertised_capabilities must be non-empty and strictly sorted"
+            ));
+        }
         validate_provider_payload_digest(configuration, &path, errors);
     }
 
     let mut lifecycle_keys = BTreeSet::new();
+    let mut lifecycle_histories = BTreeMap::<(String, u64), Vec<(u64, &Value)>>::new();
     for (index, lifecycle) in array(registry, "provider_lifecycle").iter().enumerate() {
         let path = format!("provider-registry.implementation.json:/provider_lifecycle/{index}");
         let provider_id = string_field(lifecycle, "provider_id").unwrap_or("");
-        let version = lifecycle
+        let config_version = lifecycle
             .get("config_version")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let key = format!("{provider_id}@{version}");
-        if !lifecycle_keys.insert(key.clone()) {
-            errors.push(format!("{path}: duplicate provider lifecycle record {key}"));
-        }
-        if !configuration_keys.contains(&key) {
+        let record_version = lifecycle
+            .get("lifecycle_record_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let configuration_key = format!("{provider_id}@{config_version}");
+        let lifecycle_key = format!("{configuration_key}#{record_version}");
+        let unique_record = lifecycle_keys.insert(lifecycle_key.clone());
+        if !unique_record {
             errors.push(format!(
-                "{path}: lifecycle record references unknown provider configuration {key}"
+                "{path}: duplicate provider lifecycle record {lifecycle_key}"
+            ));
+        }
+        if !configuration_keys.contains(&(provider_id.to_string(), config_version)) {
+            errors.push(format!(
+                "{path}: lifecycle record references unknown provider configuration {configuration_key}"
+            ));
+        }
+        let _ = parse_timestamp_value(lifecycle, "effective_at", &path, errors);
+        if unique_record {
+            lifecycle_histories
+                .entry((provider_id.to_string(), config_version))
+                .or_default()
+                .push((record_version, lifecycle));
+        }
+    }
+
+    for (provider_id, config_version) in &configuration_keys {
+        if !lifecycle_histories.contains_key(&(provider_id.clone(), *config_version)) {
+            errors.push(format!(
+                "provider-registry.implementation.json:/configurations: provider configuration {provider_id}@{config_version} has no lifecycle history"
+            ));
+        }
+    }
+
+    let mut active_configurations = BTreeMap::<String, Vec<u64>>::new();
+    for ((provider_id, config_version), history) in &mut lifecycle_histories {
+        history.sort_by_key(|(record_version, _)| *record_version);
+        let context = format!("provider lifecycle {provider_id}@{config_version}");
+        for (index, (record_version, record)) in history.iter().enumerate() {
+            if index == 0 {
+                if *record_version != 1
+                    || record.get("supersedes_lifecycle_record_version").is_some()
+                {
+                    errors.push(format!("{context} must start at version 1"));
+                }
+                if string_field(record, "state") != Some("configured") {
+                    errors.push(format!("{context} must begin configured"));
+                }
+                continue;
+            }
+
+            let (previous_version, previous_record) = history[index - 1];
+            if *record_version != previous_version.saturating_add(1)
+                || record
+                    .get("supersedes_lifecycle_record_version")
+                    .and_then(Value::as_u64)
+                    != Some(previous_version)
+            {
+                errors.push(format!("{context} has a broken supersession chain"));
+            }
+
+            let previous_path = format!(
+                "provider-registry.implementation.json:/provider_lifecycle/{provider_id}@{config_version}#{previous_version}"
+            );
+            let current_path = format!(
+                "provider-registry.implementation.json:/provider_lifecycle/{provider_id}@{config_version}#{record_version}"
+            );
+            let previous_effective =
+                parse_timestamp_value(previous_record, "effective_at", &previous_path, errors);
+            let current_effective =
+                parse_timestamp_value(record, "effective_at", &current_path, errors);
+            if previous_effective
+                .zip(current_effective)
+                .is_some_and(|(previous, current)| current <= previous)
+            {
+                errors.push(format!(
+                    "{current_path}: effective_at must strictly increase from lifecycle record {previous_version}"
+                ));
+            }
+
+            validate_provider_lifecycle_transition(
+                string_field(previous_record, "state").unwrap_or(""),
+                string_field(record, "state").unwrap_or(""),
+                &current_path,
+                errors,
+            );
+        }
+
+        if history
+            .last()
+            .and_then(|(_, record)| string_field(record, "state"))
+            == Some("active")
+        {
+            active_configurations
+                .entry(provider_id.clone())
+                .or_default()
+                .push(*config_version);
+        }
+    }
+    for (provider_id, versions) in active_configurations {
+        if versions.len() > 1 {
+            errors.push(format!(
+                "provider-registry.implementation.json:/provider_lifecycle: provider {provider_id} has multiple active configuration versions {versions:?}"
             ));
         }
     }
 
     let configured_ids: BTreeSet<String> = configuration_keys
         .iter()
-        .filter_map(|key| key.split_once('@').map(|(id, _)| id.to_string()))
+        .map(|(provider_id, _)| provider_id.clone())
         .collect();
     let mut tombstone_ids = BTreeSet::new();
     for (index, tombstone) in array(registry, "provider_id_tombstones").iter().enumerate() {
@@ -4748,6 +4860,31 @@ fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
                 "provider-registry.implementation.json:/provider_id_tombstones/{index}: tombstoned provider_id {provider_id} is still configured"
             ));
         }
+    }
+}
+
+fn validate_provider_lifecycle_transition(
+    previous: &str,
+    next: &str,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let allowed = matches!(
+        (previous, next),
+        ("configured", "validated")
+            | ("configured", "quarantined")
+            | ("validated", "active")
+            | ("validated", "quarantined")
+            | ("active", "draining")
+            | ("active", "quarantined")
+            | ("draining", "removed")
+            | ("draining", "quarantined")
+            | ("quarantined", "removed")
+    );
+    if !allowed {
+        errors.push(format!(
+            "{path}: invalid provider lifecycle transition {previous}->{next}"
+        ));
     }
 }
 
@@ -5372,6 +5509,51 @@ mod tests {
     fn load(relative: &str) -> Value {
         serde_json::from_slice(&fs::read(root().join(relative)).expect("read fixture"))
             .expect("parse fixture")
+    }
+
+    fn refresh_provider_payload_digest(configuration: &mut Value) {
+        let mut payload = configuration.clone();
+        payload
+            .as_object_mut()
+            .expect("provider configuration object")
+            .remove("payload_digest");
+        configuration["payload_digest"] = json!(format!(
+            "sha256:{:x}",
+            Sha256::digest(canonical_json(&payload).as_bytes())
+        ));
+    }
+
+    fn provider_lifecycle_record(
+        genesis: &Value,
+        config_version: u64,
+        lifecycle_record_version: u64,
+        state: &str,
+        effective_at: &str,
+        supersedes: Option<u64>,
+    ) -> Value {
+        let mut record = genesis.clone();
+        record["config_version"] = json!(config_version);
+        record["lifecycle_record_version"] = json!(lifecycle_record_version);
+        record["state"] = json!(state);
+        record["effective_at"] = json!(effective_at);
+        if let Some(supersedes) = supersedes {
+            record["supersedes_lifecycle_record_version"] = json!(supersedes);
+            record["transition_receipt_ref"] = json!({
+                "document_id": format!(
+                    "provider-transition:{}-{config_version}-{lifecycle_record_version}",
+                    string_field(genesis, "provider_id").unwrap_or("provider:unknown")
+                ),
+                "document_version": 1,
+                "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "artifact_locator": format!(
+                    "catalog/security-contracts/v1/provider-transitions/{config_version}-{lifecycle_record_version}.json"
+                )
+            });
+        } else if let Some(object) = record.as_object_mut() {
+            object.remove("supersedes_lifecycle_record_version");
+            object.remove("transition_receipt_ref");
+        }
+        record
     }
 
     fn ledger() -> Value {
@@ -7279,6 +7461,92 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("closed ryuki-canonical-json-v1 SHA-256 contract")));
+
+        let mut unsorted =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        unsorted["configurations"][0]["capability_descriptor"]["advertised_capabilities"] =
+            json!(["static-human-fixture", "dry-run-only"]);
+        let mut errors = Vec::new();
+        validate_provider_registry(&unsorted, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("advertised_capabilities must be non-empty and strictly sorted")
+        }));
+    }
+
+    #[test]
+    fn provider_registry_accepts_coherent_multi_record_lifecycle_history() {
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        let genesis = registry["provider_lifecycle"][0].clone();
+        registry["provider_lifecycle"] = json!([
+            provider_lifecycle_record(&genesis, 1, 1, "configured", "2026-07-16T00:00:00Z", None),
+            provider_lifecycle_record(&genesis, 1, 2, "validated", "2026-07-16T00:01:00Z", Some(1),),
+            provider_lifecycle_record(&genesis, 1, 3, "active", "2026-07-16T00:02:00Z", Some(2),),
+        ]);
+
+        let mut errors = Vec::new();
+        validate_provider_registry(&registry, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn provider_registry_rejects_broken_or_non_monotonic_lifecycle_history() {
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        let genesis = registry["provider_lifecycle"][0].clone();
+        registry["provider_lifecycle"] = json!([
+            provider_lifecycle_record(&genesis, 1, 1, "configured", "2026-07-16T00:00:00Z", None),
+            provider_lifecycle_record(&genesis, 1, 2, "validated", "2026-07-16T00:00:00Z", Some(7),),
+        ]);
+
+        let mut errors = Vec::new();
+        validate_provider_registry(&registry, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("broken supersession chain")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("effective_at must strictly increase")));
+    }
+
+    #[test]
+    fn provider_registry_selects_only_latest_active_state_and_rejects_simultaneous_active_versions()
+    {
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        let first_configuration = registry["configurations"][0].clone();
+        let mut second_configuration = first_configuration.clone();
+        second_configuration["config_version"] = json!(2);
+        refresh_provider_payload_digest(&mut second_configuration);
+        registry["configurations"] = json!([first_configuration, second_configuration]);
+
+        let genesis = registry["provider_lifecycle"][0].clone();
+        let first_draining =
+            provider_lifecycle_record(&genesis, 1, 4, "draining", "2026-07-16T00:03:00Z", Some(3));
+        registry["provider_lifecycle"] = json!([
+            provider_lifecycle_record(&genesis, 1, 1, "configured", "2026-07-16T00:00:00Z", None),
+            provider_lifecycle_record(&genesis, 1, 2, "validated", "2026-07-16T00:01:00Z", Some(1),),
+            provider_lifecycle_record(&genesis, 1, 3, "active", "2026-07-16T00:02:00Z", Some(2),),
+            first_draining.clone(),
+            provider_lifecycle_record(&genesis, 2, 1, "configured", "2026-07-16T00:04:00Z", None),
+            provider_lifecycle_record(&genesis, 2, 2, "validated", "2026-07-16T00:05:00Z", Some(1),),
+            provider_lifecycle_record(&genesis, 2, 3, "active", "2026-07-16T00:06:00Z", Some(2),),
+        ]);
+
+        let mut errors = Vec::new();
+        validate_provider_registry(&registry, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        registry["provider_lifecycle"]
+            .as_array_mut()
+            .expect("provider lifecycle array")
+            .retain(|record| record != &first_draining);
+        let mut errors = Vec::new();
+        validate_provider_registry(&registry, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("provider provider:repository-static-dry-run")
+                && error.contains("multiple active configuration versions")
+        }));
     }
 
     #[test]
