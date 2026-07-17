@@ -1,5 +1,6 @@
 pub mod config;
 pub mod conformance_applicability;
+pub mod conformance_closure;
 pub mod conformance_trust;
 pub mod production_applicability;
 pub mod production_build;

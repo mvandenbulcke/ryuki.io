@@ -85,9 +85,11 @@
       }
     },
     "input_digests": {
+      "description": "Strictly bytewise-sorted exact set of the bound ControlTrace digest, closure-context artifact/profile/policy/configuration/provider/adapter/security-limit digests, and every direct prerequisite receipt digest. It is a redundant projection, never an artifact discovery list.",
       "$ref": "#/$defs/digestSet"
     },
     "output_digests": {
+      "description": "Strictly bytewise-sorted exact set of raw conformance-bundle digests in evaluated_sets.evidence_bindings. It is a redundant projection, never an artifact discovery list.",
       "$ref": "#/$defs/digestSet"
     },
     "evidence_tier": {
@@ -234,6 +236,25 @@
       "if": {
         "properties": {
           "package_id": {
+            "enum": ["SB-8", "SB-9"]
+          }
+        },
+        "required": ["package_id"]
+      },
+      "then": {
+        "properties": {
+          "evidence_tier": {
+            "properties": {
+              "rank": { "minimum": 2 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "package_id": {
             "const": "SB-9"
           }
         }
@@ -242,6 +263,13 @@
         "properties": {
           "retirement_closure": {
             "$ref": "#/$defs/retirementClosure"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "retirement_closure": {
+            "type": "null"
           }
         }
       }
@@ -379,9 +407,10 @@
     "digestSet": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 4096,
       "uniqueItems": true,
       "items": {
-        "$ref": "#/$defs/digest"
+        "$ref": "#/$defs/nonzeroDigest"
       }
     },
     "artifactLocator": {
@@ -673,9 +702,11 @@
           "$ref": "#/$defs/deploymentProfileBinding"
         },
         "policy_versions": {
+          "description": "Exact id-sorted bindings derived from the deployment profile action-resource registry, egress policy, retention policy, and optional federation-policy references.",
           "$ref": "#/$defs/versionBindingSet"
         },
         "configuration_versions": {
+          "description": "Exact id-sorted bindings derived from the deployment profile provider-registry and control-plane-topology references.",
           "$ref": "#/$defs/versionBindingSet"
         },
         "provider_versions": {
@@ -867,6 +898,7 @@
       ],
       "properties": {
         "zero_consumer_evidence_instance_ids": {
+          "description": "Strictly sorted exact current SB-9 evidence set. Version 1 conservatively requires the complete independently derived SB-9 set until scoped retirement-role metadata is published by ControlTrace.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
@@ -875,6 +907,7 @@
           }
         },
         "zero_live_authority_evidence_instance_ids": {
+          "description": "Strictly sorted exact current SB-9 evidence set. Version 1 conservatively requires the complete independently derived SB-9 set until scoped retirement-role metadata is published by ControlTrace.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
@@ -883,6 +916,7 @@
           }
         },
         "retired_bypass_evidence_instance_ids": {
+          "description": "Strictly sorted exact current SB-9 evidence set. Version 1 conservatively requires the complete independently derived SB-9 set until scoped retirement-role metadata is published by ControlTrace.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,

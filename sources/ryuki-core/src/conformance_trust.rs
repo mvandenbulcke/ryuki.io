@@ -602,6 +602,10 @@ pub struct VerifiedConformanceTrustCheckpoint {
     valid_until: DateTime<Utc>,
     current_production_root: CheckpointCurrentProductionRoot,
     acceptance_records: Vec<TrustedAcceptanceRecord>,
+    /// SHA-256 of the exact independently authenticated reconciliation
+    /// response. Artifacts inherit this private binding so semantic closure
+    /// cannot mix otherwise similar proofs from different snapshots.
+    snapshot_binding_digest: String,
 }
 
 /// Opaque proof that an authenticated SB-9 receipt is the exact current root
@@ -616,6 +620,7 @@ pub struct VerifiedConformanceProductionRoot {
     artifact: VerifiedConformanceArtifact,
     checkpoint_sequence: u64,
     authority_revision: u64,
+    snapshot_binding_digest: String,
 }
 
 impl VerifiedConformanceProductionRoot {
@@ -653,6 +658,10 @@ impl VerifiedConformanceProductionRoot {
 
     pub fn authority_revision(&self) -> u64 {
         self.authority_revision
+    }
+
+    pub(crate) fn snapshot_binding_digest(&self) -> &str {
+        &self.snapshot_binding_digest
     }
 }
 
@@ -722,12 +731,13 @@ struct ConformanceDocumentProof {
     trust_domain_id: String,
     package_id: String,
     evidence_tier: EvidenceTier,
+    snapshot_binding_digest: String,
 }
 
 /// Opaque, non-cloneable aggregate binding exact raw bytes, their strict JSON
 /// parse, source locator, traversal digest, and authenticated acceptance proof.
-/// Future semantic closure must consume this aggregate instead of parallel
-/// `(Value, digest, proof)` inputs.
+/// Semantic closure consumes this aggregate instead of parallel
+/// `(Value, digest, proof)` inputs and retains it for the closure lifetime.
 ///
 /// ```compile_fail
 /// fn requires_clone<T: Clone>() {}
@@ -758,6 +768,10 @@ impl fmt::Debug for VerifiedConformanceArtifact {
 }
 
 impl VerifiedConformanceArtifact {
+    pub(crate) fn snapshot_binding_digest(&self) -> &str {
+        &self.proof.snapshot_binding_digest
+    }
+
     pub fn source_locator(&self) -> &str {
         &self.source_locator
     }
@@ -1408,11 +1422,16 @@ impl ValidatedConformanceRegistryLineage {
             valid_until: checkpoint.valid_until,
             current_production_root: response.current_production_root,
             acceptance_records: response.acceptance_records,
+            snapshot_binding_digest: sha256_digest(raw_response),
         })
     }
 }
 
 impl VerifiedConformanceTrustCheckpoint {
+    pub(crate) fn snapshot_binding_digest(&self) -> &str {
+        &self.snapshot_binding_digest
+    }
+
     pub fn authority_id(&self) -> &str {
         &self.authority_id
     }
@@ -1431,6 +1450,30 @@ impl VerifiedConformanceTrustCheckpoint {
 
     pub fn checkpoint_sequence(&self) -> u64 {
         self.checkpoint_sequence
+    }
+
+    pub fn deployment_id(&self) -> &str {
+        &self.namespace.deployment_id
+    }
+
+    pub fn trust_domain_id(&self) -> &str {
+        &self.namespace.trust_domain_id
+    }
+
+    pub fn registry_id(&self) -> &str {
+        &self.lineage.registry_id
+    }
+
+    pub fn registry_version(&self) -> u64 {
+        self.lineage.current_registry_version
+    }
+
+    pub fn registry_digest(&self) -> &str {
+        &self.lineage.current_registry_digest
+    }
+
+    pub fn registry_locator(&self) -> &str {
+        &self.lineage.current_artifact_locator
     }
 
     pub fn observed_at_not_before(&self) -> DateTime<Utc> {
@@ -1464,6 +1507,7 @@ impl VerifiedConformanceTrustCheckpoint {
             || document.authority_epoch != self.authority_epoch
             || document.authority_revision != self.authority_revision
             || document.checkpoint_sequence != self.checkpoint_sequence
+            || document.snapshot_binding_digest != self.snapshot_binding_digest
             || document.deployment_id != self.namespace.deployment_id
             || document.trust_domain_id != self.namespace.trust_domain_id
             || document.acceptance_sequence > self.checkpoint_sequence
@@ -1477,6 +1521,7 @@ impl VerifiedConformanceTrustCheckpoint {
             artifact,
             checkpoint_sequence: self.checkpoint_sequence,
             authority_revision: self.authority_revision,
+            snapshot_binding_digest: self.snapshot_binding_digest.clone(),
         })
     }
 
@@ -1649,6 +1694,7 @@ impl VerifiedConformanceTrustCheckpoint {
             trust_domain_id: context.trust_domain_id.to_owned(),
             package_id: context.package_id.to_owned(),
             evidence_tier: context.evidence_tier,
+            snapshot_binding_digest: self.snapshot_binding_digest.clone(),
         };
         Ok(VerifiedConformanceArtifact {
             source_locator,
@@ -2207,7 +2253,7 @@ impl<'de> Visitor<'de> for DuplicateCheckedValueVisitor {
     }
 }
 
-fn parse_json_strict(bytes: &[u8]) -> Result<Value, ConformanceTrustError> {
+pub(crate) fn parse_json_strict(bytes: &[u8]) -> Result<Value, ConformanceTrustError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = DuplicateCheckedValue::deserialize(&mut deserializer)
         .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?
@@ -3738,6 +3784,93 @@ mod tests {
                 trusted_now(),
             ),
             Err(ConformanceTrustError::InvalidAcceptance(_))
+        ));
+    }
+
+    #[test]
+    fn production_root_rejects_an_artifact_from_a_different_checkpoint_snapshot() {
+        let key = SigningKey::from_bytes(&[81; 32]);
+        let (first, second, _, second_digest) = two_version_chain(&key);
+        let lineage = lineage_for_chain(&first, &second, &second_digest).unwrap();
+        let authority = AuthorityFixture::new(111);
+        let request = request_for(&lineage, &authority, &[]);
+        let response = sign_response(response_value(&request, &authority, vec![]), &authority);
+        let checkpoint = lineage
+            .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
+            .unwrap();
+
+        let root = &checkpoint.current_production_root;
+        let mismatched_snapshot = if checkpoint.snapshot_binding_digest() == pin() {
+            format!("sha256:{:064x}", 2)
+        } else {
+            pin().to_owned()
+        };
+        let artifact = VerifiedConformanceArtifact {
+            source_locator: root.receipt_ref.artifact_locator.clone(),
+            raw_bytes: b"{}".to_vec().into_boxed_slice(),
+            document: json!({}),
+            proof: ConformanceDocumentProof {
+                kind: ConformanceDocumentKind::PackageExitReceipt,
+                document_id: root.receipt_ref.document_id.clone(),
+                document_version: root.receipt_ref.document_version,
+                key_id: "conformance-key:test-key".into(),
+                registry_id: checkpoint.registry_id().into(),
+                registry_version: checkpoint.registry_version(),
+                registry_digest: checkpoint.registry_digest().into(),
+                complete_document_digest: root.receipt_ref.content_digest.clone(),
+                signature_digest: pin().into(),
+                signed_subject_digest: pin().into(),
+                claimed_signed_at: at("2026-07-16T09:59:00Z"),
+                accepted_at_not_before: at("2026-07-16T09:59:58Z"),
+                accepted_at_not_after: at("2026-07-16T09:59:59Z"),
+                acceptance_record_id: root.acceptance_record_id.clone(),
+                acceptance_sequence: 19,
+                authority_id: checkpoint.authority_id().into(),
+                authority_epoch: checkpoint.authority_epoch(),
+                authority_revision: checkpoint.authority_revision(),
+                checkpoint_sequence: checkpoint.checkpoint_sequence(),
+                deployment_id: checkpoint.deployment_id().into(),
+                trust_domain_id: checkpoint.trust_domain_id().into(),
+                package_id: "SB-9".into(),
+                evidence_tier: EvidenceTier::ExternallyAttested,
+                snapshot_binding_digest: mismatched_snapshot,
+            },
+        };
+
+        assert_eq!(artifact.source_locator(), root.receipt_ref.artifact_locator);
+        assert_eq!(artifact.document_id(), root.receipt_ref.document_id);
+        assert_eq!(
+            artifact.document_version(),
+            root.receipt_ref.document_version
+        );
+        assert_eq!(
+            artifact.complete_document_digest(),
+            root.receipt_ref.content_digest
+        );
+        assert_eq!(artifact.acceptance_record_id(), root.acceptance_record_id);
+        assert_eq!(artifact.package_id(), "SB-9");
+        assert_eq!(artifact.authority_id(), checkpoint.authority_id());
+        assert_eq!(artifact.authority_epoch(), checkpoint.authority_epoch());
+        assert_eq!(
+            artifact.authority_revision(),
+            checkpoint.authority_revision()
+        );
+        assert_eq!(
+            artifact.checkpoint_sequence(),
+            checkpoint.checkpoint_sequence()
+        );
+        assert_eq!(artifact.deployment_id(), checkpoint.deployment_id());
+        assert_eq!(artifact.trust_domain_id(), checkpoint.trust_domain_id());
+        assert!(artifact.acceptance_sequence() <= checkpoint.checkpoint_sequence());
+        assert_ne!(
+            artifact.snapshot_binding_digest(),
+            checkpoint.snapshot_binding_digest()
+        );
+
+        assert!(matches!(
+            checkpoint.verify_current_production_root(artifact),
+            Err(ConformanceTrustError::InvalidAcceptance(message))
+                if message.contains("exact current SB-9 production root")
         ));
     }
 

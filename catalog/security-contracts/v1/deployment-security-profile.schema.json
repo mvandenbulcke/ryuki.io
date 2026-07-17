@@ -347,7 +347,7 @@
       "required": ["guard_id", "control_ids", "receipt_ref"],
       "properties": {
         "guard_id": { "enum": ["durable-postgresql", "approved-secret-provider", "https-public-urls", "secure-cookies", "non-development-authenticator", "external-signing-key-material", "mock-dependencies-disabled", "first-owner-path-closed"] },
-        "control_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^SB-[A-Z0-9]+-[0-9]{2}[A-Z]?$" } },
+        "control_ids": { "description": "Nonempty controls covered by the exact current receipt. Semantic closure also requires global uniqueness across all eight guards.", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^SB-[A-Z0-9]+-[0-9]{2}[A-Z]?$" } },
         "receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" }
       }
     },
@@ -357,7 +357,7 @@
       "required": ["mode", "guards", "runtime_cross_check_required"],
       "properties": {
         "mode": { "enum": ["not_applicable", "receipt_bound"] },
-        "guards": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/guardEvidence" } },
+        "guards": { "description": "Production uses each of the eight guard IDs exactly once; control IDs cannot repeat across guards and every reference must resolve to a current causally prior receipt in the selected SB-9 graph.", "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/guardEvidence" } },
         "runtime_cross_check_required": { "const": true }
       }
     }

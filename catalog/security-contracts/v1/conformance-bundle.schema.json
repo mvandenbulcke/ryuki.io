@@ -611,9 +611,11 @@
           "$ref": "#/$defs/deploymentProfileBinding"
         },
         "policy_versions": {
+          "description": "Exact id-sorted bindings derived from the deployment profile action-resource registry, egress policy, retention policy, and optional federation-policy references.",
           "$ref": "#/$defs/versionBindingSet"
         },
         "configuration_versions": {
+          "description": "Exact id-sorted bindings derived from the deployment profile provider-registry and control-plane-topology references.",
           "$ref": "#/$defs/versionBindingSet"
         },
         "provider_versions": {

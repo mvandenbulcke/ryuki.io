@@ -1012,7 +1012,9 @@ control, owner, rationale, compensating control, exact scope, approval, and
 expiry; neither a build manifest nor a provider can make a baseline disappear
 by editing its claimed inventory or capability descriptor. The records above
 define the inventory; this ledger defines their executable serialization and
-trust semantics.
+trust semantics. Until waiver approval has its own independently authenticated,
+opaque authority proof, production semantic closure requires `waivers: []`;
+schema-shaped approval data alone grants no exception.
 
 **SB-CONF-04 — Executable control trace.** One machine-readable `ControlTrace`
 ledger is the source of truth for the expected static control mapping. Each row
@@ -1125,7 +1127,44 @@ Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
 control, acceptance-case, and evidence-instance sets, input and output digests,
 evidence tier, result, creation/expiry time, and superseded receipt. The
-production deployment root must carry one exact
+digest arrays are redundant exact projections, never discovery or authority
+lists. `input_digests` is the strictly bytewise-sorted unique set containing
+the exact ControlTrace digest; the closure-context artifact digest; the
+cycle-free deployment-profile binding digest; every policy, configuration,
+provider, adapter, and security-limit binding digest; and each direct
+prerequisite receipt's authenticated raw-byte digest. `output_digests` is the
+strictly bytewise-sorted unique set of authenticated raw-byte bundle digests in
+the receipt's evidence bindings. Both sets contain 1 through 4096 nonzero
+SHA-256 digests; missing, additional, duplicated, unsorted, zero, transitive,
+or self-referential entries fail closure. A bundle acceptance event precedes
+its containing receipt, every prerequisite receipt acceptance event precedes
+its dependent receipt, and every supersession acceptance event strictly
+follows its predecessor in the external namespace sequence. A receipt's tier
+is exactly the weakest direct bundle or prerequisite tier, and SB-8 and SB-9
+require at least operator-environment evidence. The policy binding set is the
+exact id-sorted projection of the selected profile's action-resource registry,
+egress policy, retention policy, and optional federation-policy references.
+The configuration binding set is the exact id-sorted projection of its
+provider-registry and control-plane-topology references. Each projection uses
+the referenced document id, decimal document version, and content digest;
+caller-authored empty or partial arrays fail closure. The provider binding set is
+exactly the active provider ids, immutable configuration versions, and payload
+digests retained from the authenticated provider registry. The adapter binding
+set is exactly the measured build's shipped adapter kinds, adapter versions,
+and mandatory-baseline digests. The security-limit binding exactly names the
+authenticated limit-profile id, profile version, and raw digest. A caller-
+assembled binding set cannot substitute for those retained inputs.
+
+The version-1 SB-9 `retirement_closure` arrays do not yet carry scoped role
+metadata. To prevent a receipt from shrinking its own retirement obligations,
+each of the zero-consumer, zero-live-authority, and retired-bypass arrays must
+therefore equal the complete strictly sorted set of current accepted SB-9
+evidence derived from the authenticated ControlTrace and v2 applicability
+universe. A later wire version may partition those arrays only after the
+ControlTrace publishes per-scope retirement roles; until then repository-local
+evidence cannot by itself satisfy the SB-9 operator-environment gate.
+
+The production deployment root must carry one exact
 `production_acceptance_receipt_ref` selecting the current SB-9 package-exit
 receipt by kind, identity, version, raw-byte digest, and locator. That root
 receipt recursively binds the accepted SB-0 through SB-8 receipts; a receipt
@@ -1139,8 +1178,14 @@ profile-selected candidate root into the request digest and requiring the
 signed response's current root to name the same receipt and its exact
 same-response acceptance event. Production startup remains blocked until the
 semantic closure consumes that opaque current-root proof and the later runtime
-admission boundary verifies every live guard fact. To avoid cryptographic
-cycles, every bundle and receipt
+admission boundary verifies every live guard fact. The verifier privately binds
+the SHA-256 digest of that exact signed reconciliation response into the
+checkpoint, root, and every authenticated artifact; semantic closure rejects
+proofs from any other response even when their public counters happen to be
+equal. Deployment-applicability checkpoint rows must equal the consumed opaque
+checkpoint's deployment, trust domain, authority id and epoch, sequence, and
+current registry id, version, digest, and locator; caller-constructed checkpoint
+claims grant no authority. To avoid cryptographic cycles, every bundle and receipt
 identifies its deployment-profile digest contract as
 `ryuki-deployment-profile-conformance-binding-v1`: remove the top-level
 `production_acceptance_receipt_ref`; replace only each
@@ -1152,7 +1197,14 @@ sentinel; canonicalize the resulting profile with
 control ids, receipt identities, versions, and locators remain bound. The
 complete raw profile bytes, including the exact SB-9 reference and every exact
 nonzero guard or overlay receipt digest, remain covered by the independent
-startup digest pin.
+startup digest pin. Production carries each of the eight runtime guard ids
+exactly once. Guard control ids are nonempty and globally unique across guards,
+map to active ControlTrace rows, and are covered by the exact current receipt
+reference in the selected SB-9 graph; that receipt's external acceptance event
+precedes the root. Receipt closure only establishes the evidence requirement.
+Before any worker, router, or listener starts, a separate typed runtime witness
+for each guard must measure the live fact and equal the receipt-bound expected
+value; a passing receipt or boolean alone cannot authorize runtime admission.
 Every non-null evidence or receipt supersession also carries an exact typed
 reference containing the predecessor identity, version, raw-byte digest, and
 locator. Bare predecessor ids are descriptive only and cannot make historical

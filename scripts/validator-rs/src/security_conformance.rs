@@ -46,6 +46,7 @@ const MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS: usize = 1024;
 const MAX_APPLICABILITY_EXPRESSION_DEPTH: usize = 32;
 const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
 const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
+const MAX_RECEIPT_DIGESTS: usize = 4096;
 
 const SCHEMAS: [(&str, &str); 10] = [
     (
@@ -1061,11 +1062,18 @@ fn validate_closure_semantics_at(
         .collect();
 
     let expected_deployment_profile_binding = load_deployment_profile_binding(root);
+    let expected_profile_version_bindings = load_deployment_profile_version_bindings(root);
     for document in bundles {
         validate_deployment_profile_binding(
             document.value.pointer("/bindings/deployment_profile"),
             expected_deployment_profile_binding.as_ref(),
             &format!("{}:/bindings/deployment_profile", document.label),
+            errors,
+        );
+        validate_profile_version_bindings(
+            document.value.pointer("/bindings"),
+            expected_profile_version_bindings.as_ref(),
+            &format!("{}:/bindings", document.label),
             errors,
         );
     }
@@ -1076,6 +1084,12 @@ fn validate_closure_semantics_at(
                 .pointer("/closure_context/deployment_profile"),
             expected_deployment_profile_binding.as_ref(),
             &format!("{}:/closure_context/deployment_profile", document.label),
+            errors,
+        );
+        validate_profile_version_bindings(
+            document.value.pointer("/closure_context"),
+            expected_profile_version_bindings.as_ref(),
+            &format!("{}:/closure_context", document.label),
             errors,
         );
     }
@@ -1869,10 +1883,215 @@ fn is_nonzero_sha256_digest(digest: &str) -> bool {
         && digest != ZERO_SHA256_DIGEST
 }
 
+fn validate_receipt_digest_projections(document: &LoadedDocument, errors: &mut Vec<String>) {
+    let expected_inputs = receipt_input_digest_projection(&document.value);
+    let expected_outputs = receipt_output_digest_projection(&document.value);
+
+    validate_exact_digest_set(
+        document,
+        "input_digests",
+        &expected_inputs,
+        "ControlTrace, closure-context, and direct-prerequisite input",
+        errors,
+    );
+    validate_exact_digest_set(
+        document,
+        "output_digests",
+        &expected_outputs,
+        "evaluated evidence-bundle output",
+        errors,
+    );
+}
+
+fn receipt_input_digest_projection(receipt: &Value) -> BTreeSet<String> {
+    let closure = receipt.get("closure_context").unwrap_or(&Value::Null);
+    let mut digests = BTreeSet::new();
+
+    for digest in [
+        receipt.pointer("/ledger_binding/ledger_digest"),
+        closure.get("artifact_digest"),
+        closure.pointer("/deployment_profile/digest"),
+        closure.pointer("/security_limit_profile/digest"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    {
+        digests.insert(digest.to_string());
+    }
+    for field in [
+        "policy_versions",
+        "configuration_versions",
+        "provider_versions",
+        "adapter_versions",
+    ] {
+        for binding in array(closure, field) {
+            if let Some(digest) = string_field(binding, "digest") {
+                digests.insert(digest.to_string());
+            }
+        }
+    }
+    for prerequisite in array(receipt, "prerequisite_receipts") {
+        if let Some(digest) = string_field(prerequisite, "receipt_digest") {
+            digests.insert(digest.to_string());
+        }
+    }
+    digests
+}
+
+fn receipt_output_digest_projection(receipt: &Value) -> BTreeSet<String> {
+    array(
+        receipt.get("evaluated_sets").unwrap_or(&Value::Null),
+        "evidence_bindings",
+    )
+    .iter()
+    .filter_map(|binding| string_field(binding, "bundle_digest"))
+    .map(str::to_string)
+    .collect()
+}
+
+fn validate_exact_digest_set(
+    document: &LoadedDocument,
+    field: &str,
+    expected: &BTreeSet<String>,
+    projection_label: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(values) = document.value.get(field).and_then(Value::as_array) else {
+        errors.push(format!(
+            "{}: {field} must be a nonempty bounded digest array",
+            document.label
+        ));
+        return;
+    };
+    if values.is_empty() || values.len() > MAX_RECEIPT_DIGESTS {
+        errors.push(format!(
+            "{}: {field} must contain 1 through {MAX_RECEIPT_DIGESTS} digests; got {}",
+            document.label,
+            values.len()
+        ));
+    }
+
+    let mut actual = BTreeSet::new();
+    let mut previous: Option<&str> = None;
+    for (index, value) in values.iter().enumerate() {
+        let Some(digest) = value.as_str() else {
+            errors.push(format!(
+                "{}: {field}/{index} must be a nonzero lowercase SHA-256 digest",
+                document.label
+            ));
+            previous = None;
+            continue;
+        };
+        if !is_nonzero_sha256_digest(digest) {
+            errors.push(format!(
+                "{}: {field}/{index} must be a nonzero lowercase SHA-256 digest",
+                document.label
+            ));
+        }
+        if let Some(previous) = previous {
+            if previous >= digest {
+                errors.push(format!(
+                    "{}: {field} must be strictly bytewise sorted with no duplicates; {digest} is not after {previous}",
+                    document.label
+                ));
+            }
+        }
+        if !actual.insert(digest.to_string()) {
+            errors.push(format!(
+                "{}: {field} contains duplicate digest {digest}",
+                document.label
+            ));
+        }
+        if digest == document.digest {
+            errors.push(format!(
+                "{}: {field} cannot contain the receipt's own raw-byte digest",
+                document.label
+            ));
+        }
+        previous = Some(digest);
+    }
+
+    if &actual != expected {
+        errors.push(format!(
+            "{}: {field} {:?} is not the exact {projection_label} digest set {:?}",
+            document.label, actual, expected
+        ));
+    }
+}
+
 fn load_deployment_profile_binding(root: &Path) -> Option<Value> {
     let bytes = fs::read(root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
     let profile = parse_json_strict(&bytes).ok()?;
     deployment_profile_binding(&profile)
+}
+
+fn load_deployment_profile_version_bindings(root: &Path) -> Option<(Value, Value)> {
+    let bytes = fs::read(root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
+    let profile = parse_json_strict(&bytes).ok()?;
+    let policies = profile_reference_version_bindings(
+        &profile,
+        &[
+            "/action_resource_registry_ref",
+            "/egress_policy_ref",
+            "/retention_policy_ref",
+            "/trust_topology/federation_policy_ref",
+        ],
+    )?;
+    let configurations = profile_reference_version_bindings(
+        &profile,
+        &["/provider_registry_ref", "/control_plane_topology_ref"],
+    )?;
+    Some((Value::Array(policies), Value::Array(configurations)))
+}
+
+fn profile_reference_version_bindings(profile: &Value, pointers: &[&str]) -> Option<Vec<Value>> {
+    let mut bindings = Vec::new();
+    for pointer in pointers {
+        let Some(reference) = profile.pointer(pointer) else {
+            if *pointer == "/trust_topology/federation_policy_ref" {
+                continue;
+            }
+            return None;
+        };
+        if reference.is_null() && *pointer == "/trust_topology/federation_policy_ref" {
+            continue;
+        }
+        bindings.push(serde_json::json!({
+            "id": string_field(reference, "document_id")?,
+            "version": reference.get("document_version")?.as_u64()?.to_string(),
+            "digest": string_field(reference, "content_digest")?,
+        }));
+    }
+    bindings.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    Some(bindings)
+}
+
+fn validate_profile_version_bindings(
+    closure_context: Option<&Value>,
+    expected: Option<&(Value, Value)>,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let (Some(closure_context), Some((expected_policies, expected_configurations))) =
+        (closure_context, expected)
+    else {
+        return;
+    };
+    if closure_context.get("policy_versions") != Some(expected_policies) {
+        errors.push(format!(
+            "{context}/policy_versions: must exactly equal the profile-derived policy artifact set"
+        ));
+    }
+    if closure_context.get("configuration_versions") != Some(expected_configurations) {
+        errors.push(format!(
+            "{context}/configuration_versions: must exactly equal the profile-derived configuration artifact set"
+        ));
+    }
 }
 
 fn deployment_profile_binding(profile: &Value) -> Option<Value> {
@@ -1966,6 +2185,109 @@ fn require_matching_reference_field(
         errors.push(format!(
             "{context}: {field} does not match the referenced closure document"
         ));
+    }
+}
+
+fn validate_receipt_package_constraints(
+    document: &LoadedDocument,
+    evidence_ids: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let receipt = &document.value;
+    let package_id = string_field(receipt, "package_id").unwrap_or("");
+    if matches!(package_id, "SB-8" | "SB-9") {
+        let tier_name = receipt
+            .pointer("/evidence_tier/name")
+            .and_then(Value::as_str);
+        let tier_rank = receipt
+            .pointer("/evidence_tier/rank")
+            .and_then(Value::as_u64);
+        if !matches!(
+            tier_name,
+            Some("operator_environment" | "externally_attested")
+        ) || !tier_rank.is_some_and(|rank| rank >= 2)
+        {
+            errors.push(format!(
+                "{}: {package_id} evidence tier must be at least operator_environment (rank 2)",
+                document.label
+            ));
+        }
+    }
+
+    if package_id != "SB-9" {
+        if receipt.get("retirement_closure") != Some(&Value::Null) {
+            errors.push(format!(
+                "{}: non-SB-9 receipt {package_id} must have retirement_closure=null",
+                document.label
+            ));
+        }
+        return;
+    }
+
+    if evidence_ids.is_empty() {
+        errors.push(format!(
+            "{}: SB-9 retirement closure requires a nonempty current evaluated evidence set",
+            document.label
+        ));
+    }
+    let Some(retirement) = receipt.get("retirement_closure").and_then(Value::as_object) else {
+        errors.push(format!(
+            "{}: SB-9 receipt must carry retirement_closure",
+            document.label
+        ));
+        return;
+    };
+    for field in [
+        "zero_consumer_evidence_instance_ids",
+        "zero_live_authority_evidence_instance_ids",
+        "retired_bypass_evidence_instance_ids",
+    ] {
+        let Some(values) = retirement.get(field).and_then(Value::as_array) else {
+            errors.push(format!(
+                "{}: retirement_closure.{field} must be a nonempty strictly sorted evidence-ID array",
+                document.label
+            ));
+            continue;
+        };
+        if values.is_empty() {
+            errors.push(format!(
+                "{}: retirement_closure.{field} must be nonempty",
+                document.label
+            ));
+        }
+        let mut actual = BTreeSet::new();
+        let mut previous: Option<&str> = None;
+        for (index, value) in values.iter().enumerate() {
+            let Some(evidence_id) = value.as_str() else {
+                errors.push(format!(
+                    "{}: retirement_closure.{field}/{index} must be an evidence instance ID",
+                    document.label
+                ));
+                previous = None;
+                continue;
+            };
+            if let Some(previous) = previous {
+                if previous >= evidence_id {
+                    errors.push(format!(
+                        "{}: retirement_closure.{field} must be strictly bytewise sorted with no duplicates",
+                        document.label
+                    ));
+                }
+            }
+            if !actual.insert(evidence_id.to_string()) {
+                errors.push(format!(
+                    "{}: retirement_closure.{field} contains duplicate evidence ID {evidence_id}",
+                    document.label
+                ));
+            }
+            previous = Some(evidence_id);
+        }
+        if &actual != evidence_ids {
+            errors.push(format!(
+                "{}: retirement_closure.{field} {:?} is not the exact current SB-9 receipt evidence set {:?}",
+                document.label, actual, evidence_ids
+            ));
+        }
     }
 }
 
@@ -2097,6 +2419,7 @@ fn validate_receipts(
         let claims_authoritative_closure = claims_authoritative_closure(receipt);
         validate_ledger_binding(document, ledger, ledger_digest, errors);
         validate_receipt_timestamps(document, now, claims_authoritative_closure, errors);
+        validate_receipt_digest_projections(document, errors);
         if claims_authoritative_closure && superseded_receipts.contains(receipt_id) {
             errors.push(format!(
                 "{}: authoritative receipt {receipt_id} has been superseded",
@@ -2142,6 +2465,8 @@ fn validate_receipts(
                 ));
             }
         }
+        let evaluated_evidence_ids = evidence_bindings.keys().cloned().collect::<BTreeSet<_>>();
+        validate_receipt_package_constraints(document, &evaluated_evidence_ids, errors);
         let mut projected_controls = BTreeSet::new();
         let mut projected_cases = BTreeSet::new();
         for trace_id in &trace_ids {
@@ -3092,6 +3417,7 @@ fn validate_cross_document_semantics(
             enabled, applicable_enabled
         ));
     }
+    validate_runtime_guard_control_ownership(deployment, errors);
 
     if let Some(provider) = instances.get("provider-registry.implementation.json") {
         validate_provider_registry(provider, errors);
@@ -3110,6 +3436,33 @@ fn validate_cross_document_semantics(
             errors,
         );
         validate_trust_registry_applicability(deployment, registry, errors);
+    }
+}
+
+fn validate_runtime_guard_control_ownership(deployment: &Value, errors: &mut Vec<String>) {
+    let runtime_guards = deployment
+        .pointer("/runtime_guard_evidence/guards")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut owner_by_control = BTreeMap::<String, String>::new();
+
+    for (guard_index, guard) in runtime_guards.iter().enumerate() {
+        let guard_id = string_field(guard, "guard_id")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("guard-index-{guard_index}"));
+        for (control_index, control) in array(guard, "control_ids").iter().enumerate() {
+            let Some(control_id) = control.as_str() else {
+                continue;
+            };
+            if let Some(previous_guard) =
+                owner_by_control.insert(control_id.to_string(), guard_id.clone())
+            {
+                errors.push(format!(
+                    "deployment-security-profile.implementation.json:/runtime_guard_evidence/guards/{guard_index}/control_ids/{control_index}: runtime guard control {control_id} is assigned to both {previous_guard} and {guard_id}; control IDs must be globally unique across runtime guards"
+                ));
+            }
+        }
     }
 }
 
@@ -6699,6 +7052,108 @@ mod tests {
     }
 
     #[test]
+    fn closure_policy_and_configuration_sets_are_exact_profile_projections() {
+        let (policies, configurations) =
+            load_deployment_profile_version_bindings(&root()).expect("checked-in profile bindings");
+        let mut context = json!({
+            "policy_versions": policies,
+            "configuration_versions": configurations,
+        });
+        let expected = load_deployment_profile_version_bindings(&root()).unwrap();
+        let mut errors = Vec::new();
+        validate_profile_version_bindings(Some(&context), Some(&expected), "test", &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        context["policy_versions"].as_array_mut().unwrap().pop();
+        validate_profile_version_bindings(Some(&context), Some(&expected), "test", &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("policy artifact set")));
+    }
+
+    #[test]
+    fn receipt_digest_projections_are_exact_sorted_nonzero_and_bounded() {
+        let (_, _, receipt) = authoritative_candidate_fixture();
+        let mut errors = Vec::new();
+        validate_receipt_digest_projections(&receipt, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let mut invalid = receipt;
+        invalid.value["input_digests"]
+            .as_array_mut()
+            .expect("input digests")
+            .reverse();
+        invalid.value["output_digests"] = json!([ZERO_SHA256_DIGEST]);
+        let mut errors = Vec::new();
+        validate_receipt_digest_projections(&invalid, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("strictly bytewise sorted")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("nonzero lowercase SHA-256")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact evaluated evidence-bundle")));
+
+        invalid.value["input_digests"] = Value::Array(vec![
+            json!(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            MAX_RECEIPT_DIGESTS + 1
+        ]);
+        errors.clear();
+        validate_receipt_digest_projections(&invalid, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("1 through 4096 digests")));
+    }
+
+    #[test]
+    fn receipt_package_constraints_bind_tier_and_complete_sb9_retirement() {
+        let (_, _, mut receipt) = authoritative_candidate_fixture();
+        let evidence_ids = BTreeSet::from(["evidence:authoritative".to_string()]);
+        receipt.value["package_id"] = json!("SB-8");
+        receipt.value["retirement_closure"] = json!({});
+        let mut errors = Vec::new();
+        validate_receipt_package_constraints(&receipt, &evidence_ids, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("at least operator_environment")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must have retirement_closure=null")));
+
+        receipt.value["package_id"] = json!("SB-9");
+        receipt.value["evidence_tier"] = json!({"name": "operator_environment", "rank": 2});
+        receipt.value["retirement_closure"] = json!({
+            "zero_consumer_evidence_instance_ids": ["evidence:authoritative"],
+            "zero_live_authority_evidence_instance_ids": ["evidence:authoritative"],
+            "retired_bypass_evidence_instance_ids": ["evidence:wrong"]
+        });
+        errors.clear();
+        validate_receipt_package_constraints(&receipt, &evidence_ids, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact current SB-9 receipt evidence set")));
+    }
+
+    #[test]
+    fn runtime_guard_control_ids_are_globally_unique() {
+        let deployment = json!({
+            "runtime_guard_evidence": {"guards": [
+                {"guard_id": "durable-postgresql", "control_ids": ["SB-OPS-01"]},
+                {"guard_id": "approved-secret-provider", "control_ids": ["SB-OPS-01"]}
+            ]}
+        });
+        let mut errors = Vec::new();
+        validate_runtime_guard_control_ownership(&deployment, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("globally unique across runtime guards")));
+    }
+
+    #[test]
     fn duplicate_json_keys_are_rejected_recursively() {
         let error = parse_json_strict(br#"{"outer":{"id":1,"id":2}}"#)
             .expect_err("duplicate key must fail");
@@ -8268,6 +8723,29 @@ mod tests {
         assert!(first.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
+    fn closure_context_fixture() -> Value {
+        let deployment_profile = load_deployment_profile_binding(&root())
+            .expect("checked-in deployment profile binding");
+        let (policy_versions, configuration_versions) =
+            load_deployment_profile_version_bindings(&root())
+                .expect("checked-in profile version bindings");
+        json!({
+            "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "artifact_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "deployment_profile": deployment_profile,
+            "policy_versions": policy_versions,
+            "configuration_versions": configuration_versions,
+            "provider_versions": [{"id": "provider:test", "version": "1", "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],
+            "adapter_versions": [{"id": "adapter:test", "version": "1", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"}],
+            "security_limit_profile": {"id": "security-limit-profile:test", "version": "1", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}
+        })
+    }
+
+    fn refresh_receipt_digest_projections(receipt: &mut LoadedDocument) {
+        receipt.value["input_digests"] = json!(receipt_input_digest_projection(&receipt.value));
+        receipt.value["output_digests"] = json!(receipt_output_digest_projection(&receipt.value));
+    }
+
     fn authoritative_candidate_fixture() -> (Value, LoadedDocument, LoadedDocument) {
         let ledger = json!({
             "document_id": "control-trace:test",
@@ -8300,6 +8778,7 @@ mod tests {
             }]
         });
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let closure_context = closure_context_fixture();
         let bundle = LoadedDocument {
             label: "test:authoritative-bundle".to_string(),
             digest: digest.to_string(),
@@ -8313,6 +8792,16 @@ mod tests {
                 "trace_id": "TRACE-TEST-AC-001",
                 "control_id": "SB-TEST-01",
                 "acceptance_case_id": "AC-001",
+                "source_revision": closure_context["source_revision"].clone(),
+                "artifact": {"digest": closure_context["artifact_digest"].clone()},
+                "bindings": {
+                    "deployment_profile": closure_context["deployment_profile"].clone(),
+                    "policy_versions": closure_context["policy_versions"].clone(),
+                    "configuration_versions": closure_context["configuration_versions"].clone(),
+                    "provider_versions": closure_context["provider_versions"].clone(),
+                    "adapter_versions": closure_context["adapter_versions"].clone(),
+                    "security_limit_profile": closure_context["security_limit_profile"].clone()
+                },
                 "evaluated_applicability": {
                     "implementation": {"applicable": true, "dimensions": []},
                     "deployment": {"applicable": true, "dimensions": []}
@@ -8334,7 +8823,7 @@ mod tests {
             root().join("catalog/security-contracts/v1/control-trace.implementation.json"),
         )
         .expect("ledger bytes");
-        let receipt = LoadedDocument {
+        let mut receipt = LoadedDocument {
             label: "test:authoritative-receipt".to_string(),
             digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
@@ -8371,10 +8860,13 @@ mod tests {
                     "implementation_dimensions": [],
                     "deployment_dimensions": []
                 }],
-                "closure_context": {},
+                "closure_context": closure_context,
                 "prerequisite_receipts": [],
+                "input_digests": [],
+                "output_digests": [],
                 "evidence_tier": {"name": "repository_local", "rank": 1},
                 "waivers": [],
+                "retirement_closure": null,
                 "result": "blocked",
                 "receipt_lifecycle": "produced",
                 "created_at": "2026-07-15T01:00:00Z",
@@ -8383,6 +8875,7 @@ mod tests {
                 "supersedes_receipt_ref": null
             }),
         };
+        refresh_receipt_digest_projections(&mut receipt);
         (ledger, bundle, receipt)
     }
 
@@ -8678,7 +9171,7 @@ mod tests {
                 .map(|name| json!({"name": name, "value": "fixture"}))
                 .collect::<Vec<_>>()
         };
-        LoadedDocument {
+        let mut receipt = LoadedDocument {
             label: format!("test:{receipt_id}"),
             digest: digest.to_string(),
             value: json!({
@@ -8709,15 +9202,18 @@ mod tests {
                         "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     }]
                 },
-                "closure_context": {},
+                "closure_context": closure_context_fixture(),
                 "applicability_instances": [{
                     "instance_id": "applicability:fixture",
                     "implementation_dimensions": dimensions("implementation"),
                     "deployment_dimensions": dimensions("deployment")
                 }],
                 "prerequisite_receipts": prerequisites,
+                "input_digests": [],
+                "output_digests": [],
                 "evidence_tier": {"name": "repository_local", "rank": 1},
                 "waivers": [],
+                "retirement_closure": null,
                 "result": "blocked",
                 "receipt_lifecycle": "produced",
                 "created_at": "2026-01-01T00:00:00Z",
@@ -8725,6 +9221,8 @@ mod tests {
                 "supersedes_receipt_id": null,
                 "supersedes_receipt_ref": null
             }),
-        }
+        };
+        refresh_receipt_digest_projections(&mut receipt);
+        receipt
     }
 }
