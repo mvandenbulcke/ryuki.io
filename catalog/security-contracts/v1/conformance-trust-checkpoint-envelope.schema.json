@@ -1,0 +1,448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json",
+  "title": "Ryuki external conformance trust reconciliation response",
+  "description": "Closed response envelope returned by the independently governed conformance trust-checkpoint authority. Schema validity never grants trust: the verifier must use separately provisioned authority, key, fingerprint, minimum-epoch, and transport bindings; verify the domain-separated Ed25519 signature and exact request echo; enforce freshness and trusted-time uncertainty; and require the candidate head, including its locator, to equal the authority's current head. Version 1 is read/reconcile only and cannot bootstrap, relocate, or advance authority state at runtime.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_kind",
+    "canonicalization",
+    "signature_algorithm",
+    "authority",
+    "request_nonce",
+    "request_digest",
+    "namespace",
+    "candidate_head",
+    "current_head",
+    "validated_lineage_digest",
+    "state",
+    "outcome",
+    "reconciliation",
+    "checkpoint",
+    "acceptance_records",
+    "signature_base64"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "contract_kind": {
+      "const": "conformance-trust-reconciliation-response"
+    },
+    "canonicalization": {
+      "const": "ryuki-canonical-json-v1"
+    },
+    "signature_algorithm": {
+      "const": "ed25519"
+    },
+    "authority": {
+      "$ref": "#/$defs/authority"
+    },
+    "request_nonce": {
+      "$ref": "#/$defs/nonce"
+    },
+    "request_digest": {
+      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes, including its unique lexicographically sorted requested_document_digests list of at most 64 complete raw-document SHA-256 digests.",
+      "$ref": "#/$defs/digest"
+    },
+    "namespace": {
+      "$ref": "#/$defs/namespace"
+    },
+    "candidate_head": {
+      "$ref": "#/$defs/registryHead"
+    },
+    "current_head": {
+      "$ref": "#/$defs/registryHead"
+    },
+    "validated_lineage_digest": {
+      "description": "SHA-256 binding of the exact ordered, validated registry lineage supplied with the request. The verifier independently recomputes this value.",
+      "$ref": "#/$defs/digest"
+    },
+    "state": {
+      "const": "external_strongly_consistent"
+    },
+    "outcome": {
+      "description": "Version 1 admits only an exact read/reconcile match. Bootstrap, relocation, rollback, fork resolution, and head advance require a separately authorized administrative protocol and are not representable here.",
+      "const": "matched"
+    },
+    "reconciliation": {
+      "$ref": "#/$defs/reconciliation"
+    },
+    "checkpoint": {
+      "$ref": "#/$defs/checkpoint"
+    },
+    "acceptance_records": {
+      "description": "Bounded, exact accepted-document records observed in the same linearizable namespace history as the trust head. The response must contain exactly one record for every digest in the request's unique lexicographically sorted requested_document_digests list and no others; unsolicited, duplicate, or omitted records fail. Semantic verification requires acceptance_record_id, complete_document_digest, and authority_sequence each to be unique within the response. Empty is valid only for an empty lookup and cannot satisfy a production closure that requires accepted documents.",
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/acceptanceRecord"
+      }
+    },
+    "signature_base64": {
+      "description": "Canonical Base64 encoding of the 64-byte Ed25519 signature. Signing bytes are two consecutive frames: each frame is an unsigned u64 little-endian byte length followed by those bytes; the first frame contains the fixed UTF-8 domain ryuki-v1/conformance-trust-reconciliation-response and the second contains ryuki-canonical-json-v1 bytes of the response object with signature_base64 removed.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
+    }
+  },
+  "$defs": {
+    "positiveCounter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "nonce": {
+      "description": "Canonical Base64 encoding of exactly 32 unpredictable request bytes.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "not": {
+        "const": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "maxLength": 35,
+      "format": "date-time"
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "registryId": {
+      "type": "string",
+      "pattern": "^conformance-trust-root-registry:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "artifactLocator": {
+      "description": "Normalized safe relative path to the exact registry artifact. Locator changes are authority changes even when content bytes are unchanged.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\\.json$",
+      "not": {
+        "pattern": "(?:^|/)\\.\\.?(?:/|$)"
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_id",
+        "key_id",
+        "public_key_fingerprint"
+      ],
+      "properties": {
+        "authority_id": {
+          "type": "string",
+          "pattern": "^conformance-trust-checkpoint-authority:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^conformance-trust-checkpoint-key:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "public_key_fingerprint": {
+          "description": "SHA-256 of the decoded raw 32-byte Ed25519 public key. The value must equal the independently configured fingerprint; it is never a self-authenticating key declaration.",
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_id",
+        "trust_domain_id",
+        "registry_id"
+      ],
+      "properties": {
+        "deployment_id": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "trust_domain_id": {
+          "$ref": "#/$defs/trustDomainId"
+        },
+        "registry_id": {
+          "$ref": "#/$defs/registryId"
+        }
+      }
+    },
+    "registryHead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_version",
+        "content_digest",
+        "artifact_locator"
+      ],
+      "properties": {
+        "registry_version": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "content_digest": {
+          "description": "SHA-256 of the exact raw registry artifact bytes.",
+          "$ref": "#/$defs/digest"
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/artifactLocator"
+        }
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_matches_current",
+        "restored_state_reconciled",
+        "no_auto_advance"
+      ],
+      "properties": {
+        "candidate_matches_current": {
+          "const": true
+        },
+        "restored_state_reconciled": {
+          "description": "The external authority has reconciled its durable namespace state before returning this proof; a restored or recovering namespace must not claim this value.",
+          "const": true
+        },
+        "no_auto_advance": {
+          "description": "The read/reconcile operation cannot mutate or advance the stored head. Exact preauthorized compare-and-swap is a separate administrative protocol.",
+          "const": true
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "authority_epoch",
+        "authority_revision",
+        "observed_at",
+        "valid_until"
+      ],
+      "properties": {
+        "sequence": {
+          "description": "Linearizable sequence shared by trust-head and document-acceptance events within the exact namespace.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "authority_epoch": {
+          "description": "Fencing epoch that must meet the independently configured minimum authority epoch.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "authority_revision": {
+          "description": "Current monotonic external authority record revision for this exact namespace. Every distinct head commit strictly advances this revision.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "observed_at": {
+          "description": "Trusted authority observation interval. Semantic verification requires not_after to be no later than the verifier's trusted-now lower bound.",
+          "$ref": "#/$defs/trustedTimeInterval"
+        },
+        "valid_until": {
+          "description": "Exclusive proof-expiry boundary. Semantic verification requires this value to be strictly later than observed_at.not_after, no more than 300 seconds after observed_at.not_before, and strictly later than the verifier's trusted-now upper bound.",
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "trustedTimeInterval": {
+      "description": "Inclusive trusted-time uncertainty interval. A verifier rejects an interval that straddles an acceptance, expiry, revocation, or freshness cutoff.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "not_before",
+        "not_after"
+      ],
+      "properties": {
+        "not_before": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "not_after": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "acceptanceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptance_record_id",
+        "document",
+        "signer",
+        "registry",
+        "deployment_id",
+        "trust_domain_id",
+        "work_package_id",
+        "purpose",
+        "evidence_tier",
+        "authority_sequence",
+        "authority_epoch",
+        "accepted_at",
+        "lifecycle"
+      ],
+      "properties": {
+        "acceptance_record_id": {
+          "type": "string",
+          "pattern": "^conformance-acceptance:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "document": {
+          "$ref": "#/$defs/acceptedDocument"
+        },
+        "signer": {
+          "$ref": "#/$defs/acceptedSigner"
+        },
+        "registry": {
+          "$ref": "#/$defs/acceptedRegistry"
+        },
+        "deployment_id": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "trust_domain_id": {
+          "$ref": "#/$defs/trustDomainId"
+        },
+        "work_package_id": {
+          "enum": [
+            "SB-0",
+            "SB-1",
+            "SB-2",
+            "SB-3",
+            "SB-4",
+            "SB-5",
+            "SB-6",
+            "SB-7",
+            "SB-8",
+            "SB-9"
+          ]
+        },
+        "purpose": {
+          "enum": [
+            "conformance_bundle",
+            "package_exit_receipt"
+          ]
+        },
+        "evidence_tier": {
+          "enum": [
+            "repository_local",
+            "operator_environment",
+            "externally_attested"
+          ]
+        },
+        "authority_sequence": {
+          "description": "The acceptance event's position in the same namespace sequence as checkpoint.sequence.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "authority_epoch": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "accepted_at": {
+          "$ref": "#/$defs/trustedTimeInterval"
+        },
+        "lifecycle": {
+          "const": "accepted"
+        }
+      }
+    },
+    "acceptedDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_kind",
+        "document_id",
+        "document_version",
+        "complete_document_digest",
+        "signature_digest",
+        "signed_subject_digest"
+      ],
+      "properties": {
+        "contract_kind": {
+          "enum": [
+            "conformance-bundle",
+            "package-exit-receipt"
+          ]
+        },
+        "document_id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "document_version": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "complete_document_digest": {
+          "description": "SHA-256 of the exact complete raw document bytes, including its signature object.",
+          "$ref": "#/$defs/digest"
+        },
+        "signature_digest": {
+          "description": "SHA-256 of the exact decoded document signature bytes.",
+          "$ref": "#/$defs/digest"
+        },
+        "signed_subject_digest": {
+          "description": "Digest asserted by the document signature and independently recomputed by the verifier.",
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "acceptedSigner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_id",
+        "public_key_fingerprint"
+      ],
+      "properties": {
+        "key_id": {
+          "type": "string",
+          "pattern": "^conformance-key:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "public_key_fingerprint": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "acceptedRegistry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_id",
+        "registry_version",
+        "registry_digest",
+        "artifact_locator",
+        "head_sequence",
+        "head_authority_revision"
+      ],
+      "properties": {
+        "registry_id": {
+          "$ref": "#/$defs/registryId"
+        },
+        "registry_version": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "registry_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/artifactLocator"
+        },
+        "head_sequence": {
+          "description": "Namespace sequence at which this exact registry head became current. Semantic verification requires head_sequence <= the acceptance event's authority_sequence <= checkpoint.sequence.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "head_authority_revision": {
+          "description": "External authority record revision that committed this exact registry head. Distinct head commits strictly advance the value.",
+          "$ref": "#/$defs/positiveCounter"
+        }
+      }
+    }
+  }
+}

@@ -13,13 +13,18 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
+use rand::{rngs::OsRng, RngCore};
 use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::conformance_trust::{
-    ConformanceRegistryArtifact, ConformanceTrustAnchor, ConformanceTrustStore,
-    ConformanceVerificationContext, EvidenceTier, VerifiedConformanceDocument,
+    ConformanceCheckpointAuthorityAnchor, ConformanceRegistryArtifact, ConformanceTrustAnchor,
+    ConformanceTrustScope, ConformanceTrustedTimeWindow, ConformanceVerificationContext,
+    EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceDocument,
+    VerifiedConformanceTrustCheckpoint,
 };
 use ryuki_core::security_profile::{
     DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile, StartupAdmissionContext,
@@ -29,6 +34,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
+use crate::boundary::trust_checkpoint_transport::{
+    TrustCheckpointTransportBounds, UnixTrustCheckpointTransport,
+};
+
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
 pub(crate) const SECURITY_PROFILE_DIGEST_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST";
@@ -36,6 +45,18 @@ pub(crate) const CONFORMANCE_TRUST_ROOT_REGISTRY_PATH_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH";
 pub(crate) const CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_KEY_ID_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT";
+pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV: &str =
+    "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH";
 pub(crate) const EXPECTED_DEPLOYMENT_ID_ENV: &str = "RYUKI_EXPECTED_DEPLOYMENT_ID";
 pub(crate) const SECURITY_PROFILE_ENV: &str = "RYUKI_SECURITY_PROFILE";
 
@@ -49,6 +70,9 @@ const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_NODES: usize = 100_000;
 const MAX_JSON_ARRAY_ITEMS: usize = 4_096;
 const MAX_JSON_OBJECT_MEMBERS: usize = 4_096;
+const CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
+const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 64;
+const CHECKPOINT_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 
 const PROFILE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/deployment-security-profile.schema.json");
@@ -69,12 +93,23 @@ const PACKAGE_EXIT_RECEIPT_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/package-exit-receipt.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupTrustCheckpointAuthorityPins {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) authority_id: String,
+    pub(crate) key_id: String,
+    pub(crate) public_key_base64: String,
+    pub(crate) public_key_fingerprint: String,
+    pub(crate) minimum_authority_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartupSecurityPins {
     pub(crate) contract_root: PathBuf,
     pub(crate) profile_path: PathBuf,
     pub(crate) profile_digest: String,
     pub(crate) conformance_trust_root_registry_path: PathBuf,
     pub(crate) conformance_trust_root_registry_digest: String,
+    pub(crate) conformance_trust_checkpoint_authority: Option<StartupTrustCheckpointAuthorityPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
 }
@@ -118,6 +153,8 @@ impl StartupSecurityPins {
             &conformance_trust_root_registry_digest,
         )?;
 
+        let conformance_trust_checkpoint_authority = optional_trust_checkpoint_authority(&mut get)?;
+
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
         validate_namespaced_id(EXPECTED_DEPLOYMENT_ID_ENV, &deployment_id, "deployment:")?;
 
@@ -132,6 +169,11 @@ impl StartupSecurityPins {
                 ));
             }
         };
+        if security_profile.is_production() && conformance_trust_checkpoint_authority.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently governed conformance trust-checkpoint authority binding beginning with {CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV}"
+            ));
+        }
 
         Ok(Self {
             contract_root,
@@ -139,6 +181,7 @@ impl StartupSecurityPins {
             profile_digest,
             conformance_trust_root_registry_path,
             conformance_trust_root_registry_digest,
+            conformance_trust_checkpoint_authority,
             deployment_id,
             security_profile,
         })
@@ -238,18 +281,56 @@ pub(crate) struct ActiveProviderConfiguration {
     kind_config: ActiveProviderKindConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SecurityContractContext {
     pub(crate) profile: DeploymentSecurityProfile,
     pub(crate) profile_digest: String,
     pub(crate) contract_root: PathBuf,
     pub(crate) profile_path: PathBuf,
+    /// Opaque evidence that this process reconciled its exact local registry
+    /// lineage against the independently governed monotonic authority. This is
+    /// never constructed from local contract/configuration state.
+    pub(crate) verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
     pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceDocument>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedSecurityContract {
+    profile: DeploymentSecurityProfile,
+    profile_digest: String,
+    contract_root: PathBuf,
+    profile_path: PathBuf,
+    documents: BTreeMap<String, Value>,
+    raw_document_bytes: BTreeMap<String, Vec<u8>>,
+    reference_document_digests: BTreeMap<String, String>,
+    active_providers: BTreeMap<String, ActiveProviderConfiguration>,
+    conformance_registry_lineage: Option<ValidatedConformanceRegistryLineage>,
+}
+
 impl SecurityContractContext {
+    pub(crate) fn validate_serving_checkpoint_freshness(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            return Ok(());
+        }
+        let checkpoint = self
+            .verified_conformance_trust_checkpoint
+            .as_ref()
+            .ok_or_else(|| {
+                "production serving startup has no externally reconciled conformance checkpoint proof"
+                    .to_string()
+            })?;
+        checkpoint
+            .ensure_fresh(trusted_time_point(now))
+            .map_err(|error| {
+                format!("production conformance checkpoint is no longer fresh: {error}")
+            })
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
@@ -257,9 +338,23 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if self.profile.security_profile.is_production() {
+            let checkpoint = self
+                .verified_conformance_trust_checkpoint
+                .as_ref()
+                .map(|proof| {
+                    format!(
+                        "authority {} epoch {} revision {} checkpoint {}",
+                        proof.authority_id(),
+                        proof.authority_epoch(),
+                        proof.authority_revision(),
+                        proof.checkpoint_sequence()
+                    )
+                })
+                .unwrap_or_else(|| "no external checkpoint proof".into());
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({} signed closure documents authenticated; semantic closure remains unavailable)",
-                self.verified_conformance_documents.len()
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {} signed closure documents authenticated; semantic closure remains unavailable)",
+                checkpoint,
+                self.verified_conformance_documents.len(),
             ));
         }
 
@@ -465,10 +560,42 @@ fn validate_development_runtime(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn load_startup_security_contract(
     pins: &StartupSecurityPins,
     now: DateTime<Utc>,
 ) -> Result<SecurityContractContext, String> {
+    let prepared = prepare_startup_security_contract(pins, now)?;
+    if prepared.profile.security_profile.is_production() {
+        return Err(
+            "production serving startup requires asynchronous external conformance checkpoint reconciliation"
+                .into(),
+        );
+    }
+    finalize_startup_security_contract(prepared, None, || now)
+}
+
+/// Performs the complete serving-time admission before database, application
+/// configuration, signing-key, worker, router, or listener initialization.
+/// Non-production profiles remain local-only. Production performs exactly one
+/// read/reconcile exchange with the independently pinned authority and cannot
+/// bootstrap, accept, or advance external state.
+pub(crate) async fn load_startup_security_contract_for_serving(
+    pins: &StartupSecurityPins,
+) -> Result<SecurityContractContext, String> {
+    let mut prepared = prepare_startup_security_contract(pins, Utc::now())?;
+    let checkpoint = if prepared.profile.security_profile.is_production() {
+        Some(reconcile_external_conformance_checkpoint(&mut prepared, pins).await?)
+    } else {
+        None
+    };
+    finalize_startup_security_contract(prepared, checkpoint, Utc::now)
+}
+
+fn prepare_startup_security_contract(
+    pins: &StartupSecurityPins,
+    now: DateTime<Utc>,
+) -> Result<PreparedSecurityContract, String> {
     let mut store = ArtifactStore::open(&pins.contract_root)?;
     let profile_bytes = store.read(&pins.profile_path, MAX_PROFILE_BYTES)?;
     let actual_profile_digest = raw_digest(&profile_bytes);
@@ -501,7 +628,7 @@ pub(crate) fn load_startup_security_contract(
         ));
     }
 
-    let conformance_trust_store =
+    let conformance_registry_lineage =
         load_pinned_conformance_trust_root_registry(&mut store, pins, &profile, now)?;
 
     let allow_repository_fixture_evidence = profile.security_profile.admits_development_fixture()
@@ -513,58 +640,253 @@ pub(crate) fn load_startup_security_contract(
             .enabled_features
             .iter()
             .any(|feature| feature == "static-dry-run");
-    let mut verifier = ReferenceVerifier::new(&mut store, allow_repository_fixture_evidence);
-    verifier.verify_value(&profile_value, 0)?;
+    let (documents, raw_document_bytes, reference_document_digests, active_providers) = {
+        let mut verifier = ReferenceVerifier::new(&mut store, allow_repository_fixture_evidence);
+        verifier.verify_value(&profile_value, 0)?;
 
-    let provider_locator = &profile.provider_registry_ref.artifact_locator;
-    let provider_registry = verifier
-        .documents
-        .get(provider_locator)
-        .ok_or_else(|| "provider registry reference did not resolve to JSON".to_string())?;
-    let active_providers =
-        validate_provider_registry(provider_registry, &profile, now, &verifier.documents)?;
-    let verified_conformance_documents = verify_loaded_conformance_documents(
-        &verifier.documents,
-        conformance_trust_store.as_ref(),
-        &profile,
-        now,
-    )?;
-
-    for (label, reference, expected_schema) in [
-        (
-            "provider registry",
-            &profile.provider_registry_ref,
-            PROVIDER_SCHEMA,
-        ),
-        (
-            "action/resource registry",
-            &profile.action_resource_registry_ref,
-            ACTION_SCHEMA,
-        ),
-        (
-            "security limit profile",
-            &profile.security_limit_profile_ref,
-            LIMIT_SCHEMA,
-        ),
-    ] {
-        let document = verifier
+        let provider_locator = &profile.provider_registry_ref.artifact_locator;
+        let provider_registry = verifier
             .documents
-            .get(&reference.artifact_locator)
-            .ok_or_else(|| format!("{label} reference did not resolve to JSON"))?;
-        validate_against_schema(label, expected_schema, document)?;
-        validate_active_deployment_document(label, document, &profile, now)?;
-    }
+            .get(provider_locator)
+            .ok_or_else(|| "provider registry reference did not resolve to JSON".to_string())?;
+        let active_providers =
+            validate_provider_registry(provider_registry, &profile, now, &verifier.documents)?;
 
-    reject_incomplete_production_startup(&profile, verified_conformance_documents.len())?;
+        for (label, reference, expected_schema) in [
+            (
+                "provider registry",
+                &profile.provider_registry_ref,
+                PROVIDER_SCHEMA,
+            ),
+            (
+                "action/resource registry",
+                &profile.action_resource_registry_ref,
+                ACTION_SCHEMA,
+            ),
+            (
+                "security limit profile",
+                &profile.security_limit_profile_ref,
+                LIMIT_SCHEMA,
+            ),
+        ] {
+            let document = verifier
+                .documents
+                .get(&reference.artifact_locator)
+                .ok_or_else(|| format!("{label} reference did not resolve to JSON"))?;
+            validate_against_schema(label, expected_schema, document)?;
+            validate_active_deployment_document(label, document, &profile, now)?;
+        }
 
-    Ok(SecurityContractContext {
+        (
+            verifier.documents,
+            verifier.document_bytes,
+            verifier.visited,
+            active_providers,
+        )
+    };
+
+    Ok(PreparedSecurityContract {
         profile,
         profile_digest: actual_profile_digest,
         contract_root: store.root,
         profile_path: pins.profile_path.clone(),
-        verified_conformance_documents,
+        documents,
+        raw_document_bytes,
+        reference_document_digests,
         active_providers,
+        conformance_registry_lineage,
     })
+}
+
+async fn reconcile_external_conformance_checkpoint(
+    prepared: &mut PreparedSecurityContract,
+    pins: &StartupSecurityPins,
+) -> Result<VerifiedConformanceTrustCheckpoint, String> {
+    reconcile_external_conformance_checkpoint_with_clock(prepared, pins, Utc::now).await
+}
+
+async fn reconcile_external_conformance_checkpoint_with_clock(
+    prepared: &mut PreparedSecurityContract,
+    pins: &StartupSecurityPins,
+    mut trusted_now: impl FnMut() -> DateTime<Utc>,
+) -> Result<VerifiedConformanceTrustCheckpoint, String> {
+    let [trust_domain_id] = prepared.profile.trust_topology.trust_domain_ids.as_slice() else {
+        return Err(
+            "production conformance checkpoint reconciliation requires exactly one trust domain until per-document trust-domain partitioning is implemented"
+                .into(),
+        );
+    };
+    let authority_pins = pins
+        .conformance_trust_checkpoint_authority
+        .as_ref()
+        .ok_or_else(|| {
+            "production startup requires an independently pinned conformance checkpoint authority"
+                .to_string()
+        })?;
+    let authority_public_key = decode_checkpoint_authority_public_key(authority_pins)?;
+    let authority = ConformanceCheckpointAuthorityAnchor {
+        authority_id: &authority_pins.authority_id,
+        key_id: &authority_pins.key_id,
+        public_key: &authority_public_key,
+        public_key_fingerprint: &authority_pins.public_key_fingerprint,
+        minimum_authority_epoch: authority_pins.minimum_authority_epoch,
+    };
+    let requested_document_digests = conformance_document_digests(
+        &prepared.documents,
+        &prepared.raw_document_bytes,
+        &prepared.reference_document_digests,
+    )?;
+    let lineage = prepared
+        .conformance_registry_lineage
+        .take()
+        .ok_or_else(|| {
+            "production startup did not validate a conformance registry lineage".to_string()
+        })?;
+
+    let mut request_nonce = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut request_nonce)
+        .map_err(|error| format!("failed to obtain a cryptographic checkpoint nonce: {error}"))?;
+    let request = lineage
+        .reconciliation_request(
+            ConformanceTrustScope {
+                deployment_id: &prepared.profile.deployment_id,
+                trust_domain_id,
+            },
+            authority,
+            request_nonce,
+            trusted_now(),
+            &requested_document_digests,
+        )
+        .map_err(|error| format!("conformance checkpoint request is invalid: {error}"))?;
+    let transport = UnixTrustCheckpointTransport::new(
+        authority_pins.socket_path.clone(),
+        CHECKPOINT_TRANSPORT_PHASE_DEADLINE,
+        TrustCheckpointTransportBounds::production(),
+    )
+    .map_err(|error| format!("conformance checkpoint transport is invalid: {error}"))?;
+    let raw_response = transport
+        .read_reconcile(request.as_bytes())
+        .await
+        .map_err(|error| format!("conformance checkpoint reconciliation failed: {error}"))?;
+    let trusted_now = trusted_now();
+    lineage
+        .verify_reconciliation_response(
+            &request,
+            &raw_response,
+            authority,
+            ConformanceTrustedTimeWindow {
+                not_before: trusted_now,
+                not_after: trusted_now,
+            },
+        )
+        .map_err(|error| format!("conformance checkpoint response is untrusted: {error}"))
+}
+
+fn decode_checkpoint_authority_public_key(
+    pins: &StartupTrustCheckpointAuthorityPins,
+) -> Result<[u8; CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+    let decoded = BASE64_STANDARD
+        .decode(&pins.public_key_base64)
+        .map_err(|_| {
+            "configured checkpoint authority public key is not canonical base64".to_string()
+        })?;
+    if BASE64_STANDARD.encode(&decoded) != pins.public_key_base64
+        || raw_digest(&decoded) != pins.public_key_fingerprint
+    {
+        return Err(
+            "configured checkpoint authority public key does not match its canonical independent fingerprint pin"
+                .into(),
+        );
+    }
+    decoded
+        .try_into()
+        .map_err(|_| "configured checkpoint authority public key is not 32 bytes".to_string())
+}
+
+fn conformance_document_digests(
+    documents: &BTreeMap<String, Value>,
+    raw_document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let digests = documents
+        .iter()
+        .filter(|(_, document)| is_conformance_document(document))
+        .map(|(locator, _)| {
+            let exact_digest = raw_document_bytes
+                .get(locator)
+                .map(|bytes| raw_digest(bytes))
+                .ok_or_else(|| {
+                    format!(
+                        "conformance document {locator} has no exact raw bytes from reference traversal"
+                    )
+                })?;
+            let reference_digest = reference_document_digests.get(locator).ok_or_else(|| {
+                format!(
+                    "conformance document {locator} has no verified digest from reference traversal"
+                )
+            })?;
+            if reference_digest != &exact_digest {
+                return Err(format!(
+                    "conformance document {locator} exact raw bytes do not match the verified reference digest"
+                ));
+            }
+            Ok(reference_digest.clone())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if digests.len() > MAX_CHECKPOINT_DOCUMENT_DIGESTS {
+        return Err(format!(
+            "production checkpoint lookup requires {} unique conformance document digests, exceeding the bounded maximum of {MAX_CHECKPOINT_DOCUMENT_DIGESTS}",
+            digests.len()
+        ));
+    }
+    Ok(digests.into_iter().collect())
+}
+
+fn finalize_startup_security_contract(
+    prepared: PreparedSecurityContract,
+    verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
+    mut trusted_now: impl FnMut() -> DateTime<Utc>,
+) -> Result<SecurityContractContext, String> {
+    let verified_conformance_documents = verify_loaded_conformance_documents(
+        &prepared.documents,
+        &prepared.raw_document_bytes,
+        verified_conformance_trust_checkpoint.as_ref(),
+        &prepared.profile,
+        trusted_now(),
+    )?;
+    if prepared.profile.security_profile.is_production() {
+        verified_conformance_trust_checkpoint
+            .as_ref()
+            .ok_or_else(|| {
+                "production serving startup has no externally reconciled conformance checkpoint proof"
+                    .to_string()
+            })?
+            .ensure_fresh(trusted_time_point(trusted_now()))
+            .map_err(|error| {
+                format!(
+                    "production conformance checkpoint expired during document verification: {error}"
+                )
+            })?;
+    }
+    reject_incomplete_production_startup(&prepared.profile, verified_conformance_documents.len())?;
+
+    Ok(SecurityContractContext {
+        profile: prepared.profile,
+        profile_digest: prepared.profile_digest,
+        contract_root: prepared.contract_root,
+        profile_path: prepared.profile_path,
+        verified_conformance_trust_checkpoint,
+        verified_conformance_documents,
+        active_providers: prepared.active_providers,
+    })
+}
+
+fn trusted_time_point(now: DateTime<Utc>) -> ConformanceTrustedTimeWindow {
+    ConformanceTrustedTimeWindow {
+        not_before: now,
+        not_after: now,
+    }
 }
 
 fn reject_incomplete_production_startup(
@@ -585,7 +907,7 @@ fn load_pinned_conformance_trust_root_registry(
     pins: &StartupSecurityPins,
     profile: &DeploymentSecurityProfile,
     now: DateTime<Utc>,
-) -> Result<Option<ConformanceTrustStore>, String> {
+) -> Result<Option<ValidatedConformanceRegistryLineage>, String> {
     let reference = &profile.conformance_trust_root_registry_ref;
     let reference_path = Path::new(&reference.artifact_locator);
     if reference_path != pins.conformance_trust_root_registry_path.as_path() {
@@ -614,7 +936,7 @@ fn load_pinned_conformance_trust_root_registry(
         .ok_or_else(|| "conformance trust-root registry lineage is empty".to_string())?;
     validate_conformance_trust_root_registry_lifecycle(&head.document, profile, now)?;
 
-    let trust_store = if profile.security_profile.is_production() {
+    let validated_lineage = if profile.security_profile.is_production() {
         let artifacts = lineage
             .iter()
             .map(|artifact| ConformanceRegistryArtifact {
@@ -623,7 +945,7 @@ fn load_pinned_conformance_trust_root_registry(
             })
             .collect::<Vec<_>>();
         Some(
-            ConformanceTrustStore::from_registry_chain(
+            ValidatedConformanceRegistryLineage::from_registry_chain(
                 &artifacts,
                 ConformanceTrustAnchor {
                     artifact_locator: &reference.artifact_locator,
@@ -638,7 +960,7 @@ fn load_pinned_conformance_trust_root_registry(
     } else {
         None
     };
-    Ok(trust_store)
+    Ok(validated_lineage)
 }
 
 #[derive(Debug)]
@@ -905,24 +1227,20 @@ fn validate_conformance_trust_root_registry_lifecycle(
 
 fn verify_loaded_conformance_documents(
     documents: &BTreeMap<String, Value>,
-    trust_store: Option<&ConformanceTrustStore>,
+    raw_document_bytes: &BTreeMap<String, Vec<u8>>,
+    trust_checkpoint: Option<&VerifiedConformanceTrustCheckpoint>,
     profile: &DeploymentSecurityProfile,
-    now: DateTime<Utc>,
+    trusted_now: DateTime<Utc>,
 ) -> Result<BTreeMap<String, VerifiedConformanceDocument>, String> {
     let conformance_documents = documents
         .iter()
-        .filter(|(_, document)| {
-            matches!(
-                document.get("contract_kind").and_then(Value::as_str),
-                Some("conformance-bundle" | "package-exit-receipt")
-            )
-        })
+        .filter(|(_, document)| is_conformance_document(document))
         .collect::<Vec<_>>();
     if conformance_documents.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let trust_store = trust_store.ok_or_else(|| {
-        "signed conformance documents require an active, production-accepted trust-root registry"
+    let trust_checkpoint = trust_checkpoint.ok_or_else(|| {
+        "signed conformance documents require a fresh, independently authenticated external checkpoint lookup"
             .to_string()
     })?;
     let [trust_domain_id] = profile.trust_topology.trust_domain_ids.as_slice() else {
@@ -1005,21 +1323,41 @@ fn verify_loaded_conformance_documents(
                 ));
             }
         };
-        let proof = trust_store
+        let raw_document = raw_document_bytes.get(locator).ok_or_else(|| {
+            format!(
+                "conformance document {locator} has no exact raw bytes from reference traversal"
+            )
+        })?;
+        let parsed_raw_document = parse_json_strict(raw_document).map_err(|error| {
+            format!("conformance document {locator} exact raw bytes are invalid: {error}")
+        })?;
+        if &parsed_raw_document != document {
+            return Err(format!(
+                "conformance document {locator} is untrusted: parsed document does not match its exact raw bytes"
+            ));
+        }
+        let proof = trust_checkpoint
             .verify_document(
-                document,
+                raw_document,
                 ConformanceVerificationContext {
                     deployment_id: &profile.deployment_id,
                     trust_domain_id,
                     package_id,
                     evidence_tier,
                 },
-                now,
+                trusted_time_point(trusted_now),
             )
             .map_err(|error| format!("conformance document {locator} is untrusted: {error}"))?;
         verified.insert((*locator).clone(), proof);
     }
     Ok(verified)
+}
+
+fn is_conformance_document(document: &Value) -> bool {
+    matches!(
+        document.get("contract_kind").and_then(Value::as_str),
+        Some("conformance-bundle" | "package-exit-receipt")
+    )
 }
 
 fn json_string_set(value: &Value, field: &str) -> Result<BTreeSet<String>, String> {
@@ -1050,6 +1388,149 @@ fn required_unicode(
         ));
     }
     Ok(value)
+}
+
+fn optional_unicode(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} must contain valid UTF-8"))?;
+    if value.is_empty() || value.trim() != value {
+        return Err(format!(
+            "{name} must be non-empty and contain no surrounding whitespace"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn optional_trust_checkpoint_authority(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupTrustCheckpointAuthorityPins>, String> {
+    let socket_path = optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV)?;
+    let authority_id = optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV)?;
+    let key_id = optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_KEY_ID_ENV)?;
+    let public_key_base64 =
+        optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV)?;
+    let public_key_fingerprint =
+        optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV)?;
+    let minimum_authority_epoch =
+        optional_unicode(get, CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV)?;
+
+    let any_present = socket_path.is_some()
+        || authority_id.is_some()
+        || key_id.is_some()
+        || public_key_base64.is_some()
+        || public_key_fingerprint.is_some()
+        || minimum_authority_epoch.is_some();
+    if !any_present {
+        return Ok(None);
+    }
+
+    let socket_path = socket_path.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+    let authority_id = authority_id.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+    let key_id = key_id.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_KEY_ID_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+    let public_key_base64 = public_key_base64.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+    let public_key_fingerprint = public_key_fingerprint.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+    let minimum_authority_epoch = minimum_authority_epoch.ok_or_else(|| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV} is required when any conformance trust-checkpoint authority binding is configured"
+        )
+    })?;
+
+    validate_absolute_socket_path(CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV, &socket_path)?;
+    validate_namespaced_id(
+        CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV,
+        &authority_id,
+        "conformance-trust-checkpoint-authority:",
+    )?;
+    validate_namespaced_id(
+        CONFORMANCE_TRUST_CHECKPOINT_KEY_ID_ENV,
+        &key_id,
+        "conformance-trust-checkpoint-key:",
+    )?;
+    validate_digest_pin(
+        CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV,
+        &public_key_fingerprint,
+    )?;
+    let public_key = BASE64_STANDARD
+        .decode(&public_key_base64)
+        .map_err(|_| {
+            format!(
+                "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+            )
+        })?;
+    if public_key.len() != CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES
+        || BASE64_STANDARD.encode(&public_key) != public_key_base64
+    {
+        return Err(format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        ));
+    }
+    if raw_digest(&public_key) != public_key_fingerprint {
+        return Err(format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
+        ));
+    }
+    let minimum_authority_epoch = minimum_authority_epoch.parse::<u64>().map_err(|_| {
+        format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV} must be a positive base-10 integer"
+        )
+    })?;
+    if minimum_authority_epoch == 0 {
+        return Err(format!(
+            "{CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV} must be a positive base-10 integer"
+        ));
+    }
+
+    Ok(Some(StartupTrustCheckpointAuthorityPins {
+        socket_path: PathBuf::from(socket_path),
+        authority_id,
+        key_id,
+        public_key_base64,
+        public_key_fingerprint,
+        minimum_authority_epoch,
+    }))
+}
+
+fn validate_absolute_socket_path(name: &str, raw: &str) -> Result<(), String> {
+    let path = Path::new(raw);
+    if raw.len() > 1024
+        || !path.is_absolute()
+        || raw.contains('\\')
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(format!(
+            "{name} must be a normalized absolute Unix-domain socket path"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_namespaced_id(name: &str, value: &str, prefix: &str) -> Result<(), String> {
@@ -1299,6 +1780,7 @@ struct ReferenceVerifier<'a> {
     visited: BTreeMap<String, String>,
     stack: Vec<String>,
     documents: BTreeMap<String, Value>,
+    document_bytes: BTreeMap<String, Vec<u8>>,
     reference_bindings: usize,
     allow_repository_fixture_evidence: bool,
 }
@@ -1310,6 +1792,7 @@ impl<'a> ReferenceVerifier<'a> {
             visited: BTreeMap::new(),
             stack: Vec::new(),
             documents: BTreeMap::new(),
+            document_bytes: BTreeMap::new(),
             reference_bindings: 0,
             allow_repository_fixture_evidence,
         }
@@ -1404,6 +1887,7 @@ impl<'a> ReferenceVerifier<'a> {
 
         self.documents
             .insert(reference.locator.clone(), document.clone());
+        self.document_bytes.insert(reference.locator.clone(), bytes);
         self.stack.push(reference.locator.clone());
         let result = self.verify_value(&document, depth + 1);
         self.stack.pop();
@@ -2481,13 +2965,19 @@ mod tests {
     use chrono::TimeZone;
     use ed25519_dalek::{Signer, SigningKey};
     use ryuki_core::conformance_trust::{
-        conformance_signed_subject_digest, conformance_signing_bytes, CANONICALIZATION_PROFILE,
-        CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN, SIGNATURE_ALGORITHM,
-        SIGNATURE_VERSION,
+        canonical_json_bytes, conformance_signed_subject_digest, conformance_signing_bytes,
+        CANONICALIZATION_PROFILE, CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN,
+        SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
     use ryuki_core::security_profile::{ArtifactKind, MigrationOverlay, VersionedContentReference};
     use serde_json::json;
+    #[cfg(unix)]
+    use tempfile::Builder;
     use tempfile::TempDir;
+    #[cfg(unix)]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
 
     use super::*;
 
@@ -2603,6 +3093,206 @@ mod tests {
         document["signer"]["signature_base64"] =
             json!(BASE64_STANDARD.encode(signature.to_bytes()));
         document
+    }
+
+    fn raw_document_bytes(documents: &BTreeMap<String, Value>) -> BTreeMap<String, Vec<u8>> {
+        documents
+            .iter()
+            .filter(|(_, document)| is_conformance_document(document))
+            .map(|(locator, document)| {
+                (
+                    locator.clone(),
+                    serde_json::to_vec(document).expect("synthetic document bytes"),
+                )
+            })
+            .collect()
+    }
+
+    fn reference_document_digests(
+        document_bytes: &BTreeMap<String, Vec<u8>>,
+    ) -> BTreeMap<String, String> {
+        document_bytes
+            .iter()
+            .map(|(locator, bytes)| (locator.clone(), raw_digest(bytes)))
+            .collect()
+    }
+
+    fn checkpoint_response(
+        request_bytes: &[u8],
+        request_digest: &str,
+        checkpoint_key: &SigningKey,
+        conformance_key: &SigningKey,
+        documents: &BTreeMap<String, Value>,
+        document_bytes: &BTreeMap<String, Vec<u8>>,
+        registry_locator: &str,
+    ) -> Vec<u8> {
+        let request_value: Value =
+            serde_json::from_slice(request_bytes).expect("canonical request JSON");
+        let conformance_key_fingerprint = raw_digest(&conformance_key.verifying_key().to_bytes());
+        let acceptance_records = documents
+            .iter()
+            .filter(|(_, document)| is_conformance_document(document))
+            .enumerate()
+            .map(|(index, (locator, document))| {
+                let signer = &document["signer"];
+                let signature = BASE64_STANDARD
+                    .decode(signer["signature_base64"].as_str().unwrap())
+                    .unwrap();
+                let document_id = document
+                    .get("bundle_id")
+                    .or_else(|| document.get("receipt_id"))
+                    .and_then(Value::as_str)
+                    .unwrap();
+                let authority_sequence = u64::try_from(index).unwrap() + 10;
+                json!({
+                    "acceptance_record_id": format!("conformance-acceptance:runtime-{authority_sequence}"),
+                    "document": {
+                        "contract_kind": document["contract_kind"],
+                        "document_id": document_id,
+                        "document_version": document["document_version"],
+                        "complete_document_digest": raw_digest(document_bytes.get(locator).unwrap()),
+                        "signature_digest": raw_digest(&signature),
+                        "signed_subject_digest": signer["signed_subject_digest"],
+                    },
+                    "signer": {
+                        "key_id": signer["key_id"],
+                        "public_key_fingerprint": conformance_key_fingerprint,
+                    },
+                    "registry": {
+                        "registry_id": signer["trust_registry_id"],
+                        "registry_version": signer["trust_registry_version"],
+                        "registry_digest": signer["trust_registry_digest"],
+                        "artifact_locator": registry_locator,
+                        "head_sequence": 1,
+                        "head_authority_revision": 3,
+                    },
+                    "deployment_id": DEPLOYMENT_ID,
+                    "trust_domain_id": request_value["namespace"]["trust_domain_id"],
+                    "work_package_id": "SB-0",
+                    "purpose": signer["purpose"],
+                    "evidence_tier": "externally_attested",
+                    "authority_sequence": authority_sequence,
+                    "authority_epoch": 7,
+                    "accepted_at": {
+                        "not_before": "2026-07-16T10:00:01Z",
+                        "not_after": "2026-07-16T10:00:02Z",
+                    },
+                    "lifecycle": "accepted",
+                })
+            })
+            .collect::<Vec<_>>();
+        let checkpoint_fingerprint = raw_digest(&checkpoint_key.verifying_key().to_bytes());
+        let mut response = json!({
+            "schema_version": "1.0.0",
+            "contract_kind": "conformance-trust-reconciliation-response",
+            "canonicalization": CANONICALIZATION_PROFILE,
+            "signature_algorithm": SIGNATURE_ALGORITHM,
+            "authority": {
+                "authority_id": "conformance-trust-checkpoint-authority:runtime-test",
+                "key_id": "conformance-trust-checkpoint-key:runtime-test",
+                "public_key_fingerprint": checkpoint_fingerprint,
+            },
+            "request_nonce": request_value["request_nonce"],
+            "request_digest": request_digest,
+            "namespace": request_value["namespace"],
+            "candidate_head": request_value["candidate_head"],
+            "current_head": request_value["candidate_head"],
+            "validated_lineage_digest": request_value["validated_lineage_digest"],
+            "state": "external_strongly_consistent",
+            "outcome": "matched",
+            "reconciliation": {
+                "candidate_matches_current": true,
+                "restored_state_reconciled": true,
+                "no_auto_advance": true,
+            },
+            "checkpoint": {
+                "sequence": 20,
+                "authority_epoch": 7,
+                "authority_revision": 3,
+                "observed_at": {
+                    "not_before": "2026-07-16T11:59:58Z",
+                    "not_after": "2026-07-16T11:59:59Z",
+                },
+                "valid_until": "2026-07-16T12:04:00Z",
+            },
+            "acceptance_records": acceptance_records,
+            "signature_base64": BASE64_STANDARD.encode([0u8; 64]),
+        });
+        let mut signed_subject = response.clone();
+        signed_subject
+            .as_object_mut()
+            .unwrap()
+            .remove("signature_base64");
+        let canonical = canonical_json_bytes(&signed_subject).unwrap();
+        let mut signing_bytes = Vec::new();
+        for frame in [
+            TRUST_RECONCILIATION_RESPONSE_DOMAIN.as_bytes(),
+            canonical.as_slice(),
+        ] {
+            signing_bytes.extend_from_slice(&(frame.len() as u64).to_le_bytes());
+            signing_bytes.extend_from_slice(frame);
+        }
+        response["signature_base64"] =
+            json!(BASE64_STANDARD.encode(checkpoint_key.sign(&signing_bytes).to_bytes()));
+        serde_json::to_vec(&response).unwrap()
+    }
+
+    fn verified_checkpoint_for_documents(
+        lineage: ValidatedConformanceRegistryLineage,
+        profile: &DeploymentSecurityProfile,
+        conformance_key: &SigningKey,
+        documents: &BTreeMap<String, Value>,
+        document_bytes: &BTreeMap<String, Vec<u8>>,
+        registry_locator: &str,
+    ) -> VerifiedConformanceTrustCheckpoint {
+        let checkpoint_key = SigningKey::from_bytes(&[91u8; 32]);
+        let checkpoint_public_key = checkpoint_key.verifying_key().to_bytes();
+        let checkpoint_fingerprint = raw_digest(&checkpoint_public_key);
+        let authority = ConformanceCheckpointAuthorityAnchor {
+            authority_id: "conformance-trust-checkpoint-authority:runtime-test",
+            key_id: "conformance-trust-checkpoint-key:runtime-test",
+            public_key: &checkpoint_public_key,
+            public_key_fingerprint: &checkpoint_fingerprint,
+            minimum_authority_epoch: 7,
+        };
+        let requested_document_digests = conformance_document_digests(
+            documents,
+            document_bytes,
+            &reference_document_digests(document_bytes),
+        )
+        .unwrap();
+        let request = lineage
+            .reconciliation_request(
+                ConformanceTrustScope {
+                    deployment_id: &profile.deployment_id,
+                    trust_domain_id: &profile.trust_topology.trust_domain_ids[0],
+                },
+                authority,
+                [42u8; 32],
+                fixed_now(),
+                &requested_document_digests,
+            )
+            .unwrap();
+        let response = checkpoint_response(
+            request.as_bytes(),
+            request.digest(),
+            &checkpoint_key,
+            conformance_key,
+            documents,
+            document_bytes,
+            registry_locator,
+        );
+        lineage
+            .verify_reconciliation_response(
+                &request,
+                &response,
+                authority,
+                ConformanceTrustedTimeWindow {
+                    not_before: fixed_now(),
+                    not_after: fixed_now(),
+                },
+            )
+            .unwrap()
     }
 
     fn repository_root() -> PathBuf {
@@ -2832,6 +3522,7 @@ mod tests {
                 profile_digest,
                 conformance_trust_root_registry_path: PathBuf::from(TRUST_ROOT_REGISTRY_PATH),
                 conformance_trust_root_registry_digest: trust_root_registry_digest,
+                conformance_trust_checkpoint_authority: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
             };
@@ -3116,6 +3807,92 @@ mod tests {
             );
         }
 
+        let checkpoint_key = SigningKey::from_bytes(&[41u8; 32]);
+        let checkpoint_public_key =
+            BASE64_STANDARD.encode(checkpoint_key.verifying_key().to_bytes());
+        let checkpoint_fingerprint = raw_digest(&checkpoint_key.verifying_key().to_bytes());
+        let mut complete_checkpoint = values.clone();
+        for (name, value) in [
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV,
+                "/run/ryuki/trust-checkpoint/authority.sock".to_string(),
+            ),
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV,
+                "conformance-trust-checkpoint-authority:runtime-test".to_string(),
+            ),
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_KEY_ID_ENV,
+                "conformance-trust-checkpoint-key:runtime-test".to_string(),
+            ),
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV,
+                checkpoint_public_key,
+            ),
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV,
+                checkpoint_fingerprint,
+            ),
+            (
+                CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV,
+                "7".to_string(),
+            ),
+        ] {
+            complete_checkpoint.insert(name.into(), OsString::from(value));
+        }
+        let checkpoint_pins =
+            StartupSecurityPins::from_source(|name| complete_checkpoint.get(name).cloned())
+                .unwrap()
+                .conformance_trust_checkpoint_authority
+                .expect("complete checkpoint binding");
+        assert_eq!(
+            checkpoint_pins.socket_path,
+            PathBuf::from("/run/ryuki/trust-checkpoint/authority.sock")
+        );
+        assert_eq!(checkpoint_pins.minimum_authority_epoch, 7);
+
+        let mut partial_checkpoint = values.clone();
+        partial_checkpoint.insert(
+            CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV.into(),
+            OsString::from("/run/ryuki/trust-checkpoint/authority.sock"),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| partial_checkpoint.get(name).cloned())
+                .unwrap_err()
+                .contains(CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID_ENV)
+        );
+
+        let mut production_without_checkpoint = values.clone();
+        production_without_checkpoint
+            .insert(SECURITY_PROFILE_ENV.into(), OsString::from("production"));
+        assert!(StartupSecurityPins::from_source(|name| {
+            production_without_checkpoint.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("independently governed"));
+
+        let mut relative_socket = complete_checkpoint.clone();
+        relative_socket.insert(
+            CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV.into(),
+            OsString::from("run/ryuki/trust-checkpoint.sock"),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| relative_socket.get(name).cloned())
+                .unwrap_err()
+                .contains("normalized absolute")
+        );
+
+        let mut mismatched_checkpoint_key = complete_checkpoint;
+        mismatched_checkpoint_key.insert(
+            CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+            OsString::from(format!("sha256:{}", "b".repeat(64))),
+        );
+        assert!(StartupSecurityPins::from_source(|name| {
+            mismatched_checkpoint_key.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("does not match"));
+
         let mut malformed_trust_root_digest = values;
         malformed_trust_root_digest.insert(
             CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST_ENV.into(),
@@ -3133,7 +3910,11 @@ mod tests {
         let fixture = ActiveFixture::build();
         let context = fixture.load().expect("active test contract must load");
         assert_eq!(context.active_providers.len(), 1);
+        assert!(context.verified_conformance_trust_checkpoint.is_none());
         assert!(context.verified_conformance_documents.is_empty());
+        assert!(context
+            .validate_serving_checkpoint_freshness(fixed_now())
+            .is_ok());
         let mut config = RyukiConfig {
             auth_mode: AuthMode::StaticDryRun,
             ..RyukiConfig::default()
@@ -3147,6 +3928,304 @@ mod tests {
             .validate_runtime_bindings(&config, false, fixed_now())
             .unwrap_err()
             .contains("does not exactly match"));
+    }
+
+    #[tokio::test]
+    async fn nonproduction_serving_loader_never_contacts_a_checkpoint_authority() {
+        let fixture = ActiveFixture::build();
+        assert!(fixture
+            .pins
+            .conformance_trust_checkpoint_authority
+            .is_none());
+        let context = load_startup_security_contract_for_serving(&fixture.pins)
+            .await
+            .expect("test startup remains a bounded local admission");
+        assert!(context.verified_conformance_trust_checkpoint.is_none());
+        assert!(context.verified_conformance_documents.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_lookup_digests_are_exact_sorted_unique_and_bounded() {
+        let first = json!({
+            "contract_kind": "conformance-bundle",
+            "bundle_id": "bundle:first"
+        });
+        let second = json!({
+            "contract_kind": "package-exit-receipt",
+            "receipt_id": "package-exit-receipt:second"
+        });
+        let documents = BTreeMap::from([
+            ("z.json".into(), first.clone()),
+            ("a.json".into(), second.clone()),
+        ]);
+        let bytes = BTreeMap::from([
+            ("z.json".into(), serde_json::to_vec_pretty(&first).unwrap()),
+            ("a.json".into(), serde_json::to_vec(&second).unwrap()),
+        ]);
+        let reference_digests = reference_document_digests(&bytes);
+        let digests = conformance_document_digests(&documents, &bytes, &reference_digests).unwrap();
+        let mut expected = bytes
+            .values()
+            .map(|bytes| raw_digest(bytes))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(digests, expected);
+
+        let mut mismatched_reference_digests = reference_digests.clone();
+        mismatched_reference_digests.insert("z.json".into(), format!("sha256:{}", "b".repeat(64)));
+        assert!(
+            conformance_document_digests(&documents, &bytes, &mismatched_reference_digests,)
+                .unwrap_err()
+                .contains("do not match the verified reference digest")
+        );
+
+        let mut missing = bytes.clone();
+        missing.remove("z.json");
+        assert!(
+            conformance_document_digests(&documents, &missing, &reference_digests)
+                .unwrap_err()
+                .contains("exact raw bytes")
+        );
+
+        let oversized_documents = (0..=MAX_CHECKPOINT_DOCUMENT_DIGESTS)
+            .map(|index| {
+                (
+                    format!("document-{index}.json"),
+                    json!({
+                        "contract_kind": "conformance-bundle",
+                        "bundle_id": format!("bundle:{index}")
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oversized_bytes = oversized_documents
+            .iter()
+            .map(|(locator, document)| (locator.clone(), serde_json::to_vec(document).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(conformance_document_digests(
+            &oversized_documents,
+            &oversized_bytes,
+            &reference_document_digests(&oversized_bytes),
+        )
+        .unwrap_err()
+        .contains("bounded maximum of 64"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_reconciliation_wires_random_request_transport_and_core_proof() {
+        let conformance_key = SigningKey::from_bytes(&[23u8; 32]);
+        let checkpoint_key = SigningKey::from_bytes(&[91u8; 32]);
+        let checkpoint_public_key = checkpoint_key.verifying_key().to_bytes();
+        let checkpoint_fingerprint = raw_digest(&checkpoint_public_key);
+        let mut fixture = ActiveFixture::build();
+        let mut profile_value: Value = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        profile_value["security_profile"] = json!("production");
+        profile_value["applicability"]["security_profiles"] = json!(["production"]);
+        profile_value["conformance_trust_root_registry_ref"]["document_id"] =
+            json!("conformance-trust-root-registry:runtime-test");
+        profile_value["conformance_trust_root_registry_ref"]["document_version"] = json!(1);
+        let provisional_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile_value.clone()).unwrap();
+        let registry = production_trust_registry(&conformance_key, &provisional_profile);
+        let registry_bytes = serde_json::to_vec_pretty(&registry).unwrap();
+        let registry_digest = raw_digest(&registry_bytes);
+        profile_value["conformance_trust_root_registry_ref"]["content_digest"] =
+            json!(registry_digest);
+        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        fixture.rewrite_trust_root_registry_raw(&registry_bytes);
+
+        let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
+        let lineage = load_pinned_conformance_trust_root_registry(
+            &mut artifact_store,
+            &fixture.pins,
+            &profile,
+            fixed_now(),
+        )
+        .unwrap()
+        .expect("production lineage");
+        let finalization_lineage = lineage.clone();
+        let bundle = signed_closure_document(
+            "conformance-bundle",
+            &conformance_key,
+            1,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let documents = BTreeMap::from([
+            (
+                profile.control_trace_ref.artifact_locator.clone(),
+                json!({
+                    "traces": [{
+                        "trace_id": "TRACE-RUNTIME-TEST",
+                        "owning_work_package": "SB-0"
+                    }]
+                }),
+            ),
+            ("evidence/runtime-bundle.json".into(), bundle),
+        ]);
+        let document_bytes = raw_document_bytes(&documents);
+        let reference_digests = reference_document_digests(&document_bytes);
+        let requested_digests =
+            conformance_document_digests(&documents, &document_bytes, &reference_digests).unwrap();
+
+        let socket_directory = Builder::new()
+            .prefix("ryuki-api-ckpt-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket_path = socket_directory.path().join("authority.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let mut pins = fixture.pins.clone();
+        pins.security_profile = SecurityProfile::Production;
+        pins.conformance_trust_checkpoint_authority = Some(StartupTrustCheckpointAuthorityPins {
+            socket_path: socket_path.clone(),
+            authority_id: "conformance-trust-checkpoint-authority:runtime-test".into(),
+            key_id: "conformance-trust-checkpoint-key:runtime-test".into(),
+            public_key_base64: BASE64_STANDARD.encode(checkpoint_public_key),
+            public_key_fingerprint: checkpoint_fingerprint,
+            minimum_authority_epoch: 7,
+        });
+        let mut prepared = PreparedSecurityContract {
+            profile: profile.clone(),
+            profile_digest: fixture.pins.profile_digest.clone(),
+            contract_root: fixture.root.clone(),
+            profile_path: fixture.pins.profile_path.clone(),
+            documents: documents.clone(),
+            raw_document_bytes: document_bytes.clone(),
+            reference_document_digests: reference_digests.clone(),
+            active_providers: BTreeMap::new(),
+            conformance_registry_lineage: Some(lineage),
+        };
+        let mut missing_socket_prepared = prepared.clone();
+
+        let server_documents = documents.clone();
+        let server_document_bytes = document_bytes.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut request = vec![0u8; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            let request_value: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request_value["operation"].as_str(), Some("read_reconcile"));
+            assert_eq!(
+                request_value["requested_document_digests"],
+                json!(requested_digests)
+            );
+            let zero_nonce = BASE64_STANDARD.encode([0u8; 32]);
+            assert_ne!(
+                request_value["request_nonce"].as_str(),
+                Some(zero_nonce.as_str())
+            );
+            let response = checkpoint_response(
+                &request,
+                &raw_digest(&request),
+                &checkpoint_key,
+                &conformance_key,
+                &server_documents,
+                &server_document_bytes,
+                TRUST_ROOT_REGISTRY_PATH,
+            );
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let checkpoint =
+            reconcile_external_conformance_checkpoint_with_clock(&mut prepared, &pins, fixed_now)
+                .await
+                .expect("signed read/reconcile response must produce an opaque proof");
+        server.await.unwrap();
+        assert_eq!(
+            checkpoint.authority_id(),
+            "conformance-trust-checkpoint-authority:runtime-test"
+        );
+        assert_eq!(checkpoint.authority_epoch(), 7);
+        assert_eq!(checkpoint.checkpoint_sequence(), 20);
+        let verified = verify_loaded_conformance_documents(
+            &documents,
+            &document_bytes,
+            Some(&checkpoint),
+            &profile,
+            fixed_now(),
+        )
+        .expect("the returned proof must authenticate the exact requested bytes");
+        assert_eq!(verified.len(), 1);
+        let context = SecurityContractContext {
+            profile: profile.clone(),
+            profile_digest: fixture.pins.profile_digest.clone(),
+            contract_root: fixture.root.clone(),
+            profile_path: fixture.pins.profile_path.clone(),
+            verified_conformance_trust_checkpoint: Some(checkpoint),
+            verified_conformance_documents: verified,
+            active_providers: BTreeMap::new(),
+        };
+        context
+            .validate_serving_checkpoint_freshness(fixed_now())
+            .expect("fresh proof must survive the final listener fence");
+        assert!(context
+            .validate_serving_checkpoint_freshness(
+                Utc.with_ymd_and_hms(2026, 7, 16, 12, 4, 1).unwrap()
+            )
+            .unwrap_err()
+            .contains("no longer fresh"));
+
+        let expiring_checkpoint = verified_checkpoint_for_documents(
+            finalization_lineage,
+            &profile,
+            &SigningKey::from_bytes(&[23u8; 32]),
+            &documents,
+            &document_bytes,
+            TRUST_ROOT_REGISTRY_PATH,
+        );
+        let expiring_prepared = PreparedSecurityContract {
+            profile: profile.clone(),
+            profile_digest: fixture.pins.profile_digest.clone(),
+            contract_root: fixture.root.clone(),
+            profile_path: fixture.pins.profile_path.clone(),
+            documents: documents.clone(),
+            raw_document_bytes: document_bytes.clone(),
+            reference_document_digests: reference_digests,
+            active_providers: BTreeMap::new(),
+            conformance_registry_lineage: None,
+        };
+        let mut time_sample = 0usize;
+        let error = finalize_startup_security_contract(
+            expiring_prepared,
+            Some(expiring_checkpoint),
+            || {
+                time_sample += 1;
+                if time_sample == 1 {
+                    fixed_now()
+                } else {
+                    Utc.with_ymd_and_hms(2026, 7, 16, 12, 4, 1).unwrap()
+                }
+            },
+        )
+        .expect_err("a checkpoint expiring during document verification must fail closed");
+        assert!(error.contains("expired during document verification"));
+
+        let mut missing_socket_pins = pins;
+        missing_socket_pins
+            .conformance_trust_checkpoint_authority
+            .as_mut()
+            .unwrap()
+            .socket_path = socket_directory.path().join("missing.sock");
+        let error = reconcile_external_conformance_checkpoint_with_clock(
+            &mut missing_socket_prepared,
+            &missing_socket_pins,
+            fixed_now,
+        )
+        .await
+        .expect_err("serving startup must fail closed when the authority is unavailable");
+        assert!(error.contains("reconciliation failed"));
     }
 
     #[test]
@@ -3427,14 +4506,14 @@ mod tests {
         fixture.rewrite_trust_root_registry_raw(&registry_bytes);
 
         let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
-        let trust_store = load_pinned_conformance_trust_root_registry(
+        let lineage = load_pinned_conformance_trust_root_registry(
             &mut artifact_store,
             &fixture.pins,
             &profile,
             fixed_now(),
         )
         .expect("production trust registry must load")
-        .expect("production registry must create a trust store");
+        .expect("production registry must create a validated lineage");
 
         let bundle = signed_closure_document(
             "conformance-bundle",
@@ -3461,9 +4540,19 @@ mod tests {
             ("evidence/runtime-bundle.json".into(), bundle),
             ("receipts/runtime-sb0.json".into(), receipt),
         ]);
+        let document_bytes = raw_document_bytes(&documents);
+        let checkpoint = verified_checkpoint_for_documents(
+            lineage,
+            &profile,
+            &key,
+            &documents,
+            &document_bytes,
+            TRUST_ROOT_REGISTRY_PATH,
+        );
         let verified = verify_loaded_conformance_documents(
             &documents,
-            Some(&trust_store),
+            &document_bytes,
+            Some(&checkpoint),
             &profile,
             fixed_now(),
         )
@@ -3484,9 +4573,11 @@ mod tests {
         let mut tampered = documents.clone();
         tampered.get_mut("evidence/runtime-bundle.json").unwrap()["signer"]["signature_base64"] =
             BASE64_STANDARD.encode([0u8; 64]).into();
+        let tampered_bytes = raw_document_bytes(&tampered);
         let error = verify_loaded_conformance_documents(
             &tampered,
-            Some(&trust_store),
+            &tampered_bytes,
+            Some(&checkpoint),
             &profile,
             fixed_now(),
         )
@@ -3514,9 +4605,11 @@ mod tests {
                 .unwrap()
                 .pointer_mut(pointer)
                 .unwrap() = replacement;
+            let scoped_tamper_bytes = raw_document_bytes(&scoped_tamper);
             assert!(verify_loaded_conformance_documents(
                 &scoped_tamper,
-                Some(&trust_store),
+                &scoped_tamper_bytes,
+                Some(&checkpoint),
                 &profile,
                 fixed_now(),
             )
@@ -3525,9 +4618,11 @@ mod tests {
 
         let mut package_tamper = documents.clone();
         package_tamper.get_mut("receipts/runtime-sb0.json").unwrap()["package_id"] = json!("SB-1");
+        let package_tamper_bytes = raw_document_bytes(&package_tamper);
         assert!(verify_loaded_conformance_documents(
             &package_tamper,
-            Some(&trust_store),
+            &package_tamper_bytes,
+            Some(&checkpoint),
             &profile,
             fixed_now(),
         )
@@ -3537,7 +4632,8 @@ mod tests {
         wrong_domain_profile.trust_topology.trust_domain_ids = vec!["trust-domain:other".into()];
         assert!(verify_loaded_conformance_documents(
             &documents,
-            Some(&trust_store),
+            &document_bytes,
+            Some(&checkpoint),
             &wrong_domain_profile,
             fixed_now(),
         )
@@ -3584,14 +4680,14 @@ mod tests {
         fixture.rewrite_trust_root_registry_raw(&head_bytes);
 
         let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
-        let trust_store = load_pinned_conformance_trust_root_registry(
+        let lineage = load_pinned_conformance_trust_root_registry(
             &mut artifact_store,
             &fixture.pins,
             &profile,
             fixed_now(),
         )
         .expect("complete production registry lineage must load")
-        .expect("production lineage must construct a trust store");
+        .expect("production lineage must construct a validated lineage");
 
         let bundle = signed_closure_document(
             "conformance-bundle",
@@ -3611,9 +4707,19 @@ mod tests {
             ),
             ("evidence/runtime-v2-bundle.json".into(), bundle),
         ]);
+        let document_bytes = raw_document_bytes(&documents);
+        let checkpoint = verified_checkpoint_for_documents(
+            lineage,
+            &profile,
+            &key,
+            &documents,
+            &document_bytes,
+            TRUST_ROOT_REGISTRY_PATH,
+        );
         let verified = verify_loaded_conformance_documents(
             &documents,
-            Some(&trust_store),
+            &document_bytes,
+            Some(&checkpoint),
             &profile,
             fixed_now(),
         )

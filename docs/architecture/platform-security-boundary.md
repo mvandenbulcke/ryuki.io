@@ -979,6 +979,7 @@ reviewable records:
 | Incident and recovery evidence | Proves revocation, quarantine, key compromise, restored-state reconciliation, and dormant/activation/aftercare break-glass drills. |
 | Deployment security profile | Is the executable root that binds deployment/profile version, deployment id, tenancy mode, trust topology, provider-registry/lifecycle snapshot, policy/configuration versions, and active security-limit profile. |
 | Security-limit profile | Is the sole normative owner of selected values, platform-enforced hard bounds, units, scopes, failure behavior, telemetry, and change authority for every bounded resource; code and manifests consume or validate its version rather than redefining limits. |
+| External conformance trust checkpoint and acceptance ledger | Independently anchors the highest admitted trust-registry head and exact accepted-document events under one deployment/trust-domain/registry namespace sequence. Its custody and authentication are outside the rollbackable contract/profile channel. |
 | Production conformance report | Binds all permanent acceptance-case evidence to an exact source revision, config/provider/limit-profile version, image digest, and deployment. |
 
 ### Machine-readable conformance ledger and evidence trust
@@ -1048,10 +1049,92 @@ evidence tier, result, creation/expiry time, and superseded receipt. The
 implementation must publish schemas for
 `deployment-security-profile.schema.json`, `provider-registry.schema.json`,
 `action-resource-registry.schema.json`, `security-limit-profile.schema.json`,
-`control-trace.schema.json`,
+`control-trace.schema.json`, `conformance-trust-root-registry.schema.json`,
+`conformance-trust-checkpoint-envelope.schema.json`,
 `conformance-bundle.schema.json`, and `package-exit-receipt.schema.json` in the
 versioned security contract set; prose or a package-owned boolean cannot replace
 them.
+
+**SB-CONF-05 — Externally anchored conformance trust.** Production admission
+must reconcile the candidate conformance trust-registry head against an
+independently authenticated, external strongly consistent checkpoint keyed by
+the exact `(deployment_id, trust_domain_id, registry_id)` namespace. The
+request binds a fresh nonce, its canonical digest, the candidate registry
+version, exact raw-byte digest and artifact locator, the validated lineage
+digest, and a unique lexicographically sorted list of at most 64 exact raw
+document digests whose acceptance is required. The signed response echoes the
+request binding and returns exactly one acceptance record for every requested
+digest and no others; unsolicited, duplicate, or omitted records fail. It also
+binds the authority id, separately pinned Ed25519 key id and raw-key
+fingerprint, signed actual authority epoch, authority revision, and one
+linearizable namespace sequence shared by head changes and document-acceptance
+events. The verifier enforces its independently pinned minimum authority epoch
+against that signed actual epoch. The checkpoint authority and its pins come
+from a separately governed workload/deployment trust channel, never from the
+rollbackable contract root, deployment profile, registry, or conformance
+signer. SB-0 owns the admission verifier and its fail-closed contract; SB-8 owns
+the separately operated live authority, pin custody, fencing, trusted time,
+administration, and recovery evidence.
+
+`authority_revision` is the current monotonic revision of the external
+namespace/authority record, and every distinct head commit strictly advances
+it. An acceptance record's `head_authority_revision` is the exact authority
+revision that committed its bound registry head; `head_sequence` is the
+corresponding shared namespace sequence.
+
+The closed v1 request object contains exactly
+`schema_version: "1.0.0"`,
+`contract_kind: "conformance-trust-reconciliation-request"`,
+`operation: "read_reconcile"`,
+`canonicalization: "ryuki-canonical-json-v1"`,
+`signature_algorithm: "ed25519"`, `authority_id`, `authority_key_id`,
+`namespace`, `candidate_head`, `validated_lineage_digest`, `request_nonce`,
+`requested_at`, and `requested_document_digests`; no other request field is
+permitted. Canonical object-key sorting, rather than source field order, fixes
+the byte representation.
+
+`request_digest` is SHA-256 of the exact unframed
+`ryuki-canonical-json-v1` request bytes. Response signing removes only the
+top-level `signature_base64`, canonicalizes the remaining response, and signs
+two consecutive frames: an unsigned little-endian `u64` byte length followed
+by the fixed UTF-8 domain
+`ryuki-v1/conformance-trust-reconciliation-response`, then another unsigned
+little-endian `u64` byte length followed by the canonical response bytes.
+
+The v1 Unix-socket transport performs exactly one exchange per connection.
+Each request and response is one four-byte unsigned big-endian length followed
+by exactly that many payload bytes. The client sends the canonical request,
+closes its write half, then accepts exactly one response frame followed by EOF;
+a truncated frame, a second frame, or any trailing byte fails closed. Requests
+are limited to 16 KiB and responses to 256 KiB. Connect, write, and read have
+independent deadlines; the current runtime uses 10 seconds per phase and never
+permits a phase deadline above 30 seconds.
+
+Startup is a read/reconcile operation. The candidate head, including its
+locator, must equal the externally stored current head; equal bytes at a new
+locator are a relocation and fail until separately authorized. Runtime startup
+cannot bootstrap, blindly advance, or repair the checkpoint. An advance is
+permitted only through a distinct operator-authorized protocol using an exact
+preauthorized compare-and-swap over the expected namespace revision/sequence,
+current head, candidate head, and validated ancestry; that protocol is not an
+admission fallback. Restored or recovering checkpoint state stays quarantined
+until external reconciliation proves its current epoch and history.
+
+Every accepted conformance document is recorded under the same namespace
+sequence with the exact complete raw-document digest, signature digest,
+signed-subject digest, signer key id and raw-key fingerprint, registry id,
+version, digest, locator, head sequence and authority revision, deployment,
+trust domain, work package, purpose, evidence tier, authority epoch/sequence,
+and a trusted acceptance-time interval. Signer-controlled `signed_at` is never
+acceptance time. Trusted time is represented as an uncertainty interval; an
+interval that straddles an activation, retirement, revocation, expiry, or
+freshness cutoff fails closed. The authority observation interval must end no
+later than the verifier's trusted-now lower bound. `valid_until` must be
+strictly after the observation interval, no more than 300 seconds after its
+lower bound, and strictly after the verifier's trusted-now upper bound.
+Missing, stale, oversized, wrong-namespace,
+wrong-key, wrong-epoch, reordered, forked, relocated, or unverifiable responses
+block before migration, database, worker, router, or listener initialization.
 
 ## Trust model
 
@@ -2090,6 +2173,11 @@ from the active trace ledger.
   unclassified route.
 - Add a validator contract for every invariant in this specification that can
   be checked statically.
+- Publish the closed external trust-checkpoint envelope and implement its
+  bounded, strict, independently pinned verifier before production startup.
+  SB-0 owns the wire contract, canonical request/signature rules, namespace and
+  raw-byte bindings, equality-only admission reconciliation, and fail-closed
+  tests; no checked-in fixture or self-declared response can become authority.
 
 ### SB-1 — Unify human identity and sessions
 
@@ -2250,6 +2338,12 @@ from the active trace ledger.
 - Sign recovery-set manifests outside backup-writer authority and verify trust
   domain, epoch, schema, component digests, key versions, completeness, and
   retained-copy independence before import.
+- Provision and operate the separately governed, strongly consistent
+  conformance trust-checkpoint authority; govern its Ed25519 custody, minimum
+  epoch, revision/sequence fencing, exact compare-and-swap administration,
+  trusted time, freshness, capacity, recovery, and restore reconciliation. SB-8
+  owns live authority and disaster-recovery evidence; SB-0's local verifier
+  cannot substitute for it.
 
 ### SB-9 — Remove migration bypasses
 
@@ -2309,7 +2403,7 @@ until operator-owned evidence exists.
 
 The boundary is not complete until all of the following pass on the refreshed
 implementation revision. Each list number is also a permanent, three-digit
-acceptance-case id (`1` is `AC-001`, `54` is `AC-054`); existing cases are never
+acceptance-case id (`1` is `AC-001`, `55` is `AC-055`); existing cases are never
 renumbered or reused, and new cases append. The `ControlTrace` ledger carries
 the explicit `AC-nnn` value rather than relying on display order.
 
@@ -2567,6 +2661,24 @@ the explicit `AC-nnn` value rather than relying on display order.
     maps to value-change and bound-change owners, a failure projection, low-
     cardinality telemetry signal, and at least one boundary/boundary-plus-one
     fixture.
+55. External conformance trust-checkpoint tests prove strict, bounded request
+    and response parsing; independent authority id/key/fingerprint and minimum-
+    epoch pins; domain-separated Ed25519 verification; exact nonce, request and
+    unique sorted bounded document-lookup set,
+    namespace, candidate/current head version, raw digest, locator, and lineage
+    binding; equality-only startup with no bootstrap or auto-advance; one
+    linearizable head/acceptance sequence; and exact accepted-document,
+    signature, signer, registry-head sequence/revision, purpose, package, tier,
+    and trusted-time bindings. Negative fixtures reject coordinated profile/head
+    rollback, same-bytes relocation, fork or non-descendant state, wrong key or
+    epoch, replay, stale/oversized response, restored-unreconciled authority,
+    sequence inversion, forged acceptance, and every trusted-time interval that
+    straddles an activation, retirement, revocation, expiry, or freshness
+    cutoff before listener binding. Live production evidence additionally
+    proves separately governed strongly consistent custody, authenticated local
+    transport, key/epoch rotation, exact preauthorized compare-and-swap
+    administration, and recovery reconciliation; repository fixtures cannot
+    satisfy that evidence tier.
 
 ## Standards and implementation references
 

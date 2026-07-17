@@ -77,6 +77,14 @@ an exact, bounded N-1 chain, so every predecessor through version 1 must also
 be present in that tree. The chain does not replace an external monotonic head
 checkpoint and cannot authorize production on its own.
 
+The proving-ground bundle also intentionally provisions no
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_*` pins or separately governed authority
+socket. Those values must never be copied into the rollbackable contract
+inputs merely to make this environment start. Consequently this deployment
+cannot exercise production checkpoint reconciliation or count as production
+eligibility evidence; the operator-owned authority and recovery integration
+remain SB-8 work.
+
 Agent values are parsed as literal `KEY=value` text. HCL spaces, semicolons,
 `$()`, and other shell metacharacters are not evaluated. Do not add an inline
 comment to an agent value because it becomes part of that literal value.

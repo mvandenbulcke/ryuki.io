@@ -35,21 +35,21 @@
     "artifact_kind": "control-trace",
     "document_id": "control-trace:ryuki-security-boundary-v1",
     "document_version": 1,
-    "content_digest": "sha256:5eaa90b3e46457df4fcb9623da345c9e683a1e0c6f9235319e3a7cbf986b45b0",
+    "content_digest": "sha256:c5fd1821ab07a8ef8b93eb60e558ef179a2bebc1c0b2922b64d6f27edff56098",
     "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json"
   },
   "provider_registry_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:cfdcef55625fab3ddb3105af33296e48e7b548391f8a1a792748f0b3dd9856b1",
+    "content_digest": "sha256:2065f06a4cf428562d09e65ddc7924c6141fea67852c09622c35d94b299022e9",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json"
   },
   "provider_lifecycle_snapshot_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:cfdcef55625fab3ddb3105af33296e48e7b548391f8a1a792748f0b3dd9856b1",
+    "content_digest": "sha256:2065f06a4cf428562d09e65ddc7924c6141fea67852c09622c35d94b299022e9",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json",
     "projection": "provider_lifecycle",
     "required_states": ["active"]
@@ -58,35 +58,35 @@
     "artifact_kind": "action-resource-registry",
     "document_id": "action-resource-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:abdfcec7cd9015bafc116b95ca9643ea7190b0a8053606015e9c652473cd8215",
+    "content_digest": "sha256:bbcf7653f847f1990b08196230a9254583b93e2c1a25ae55d2cf95796f334ecf",
     "artifact_locator": "catalog/security-contracts/v1/action-resource-registry.implementation.json"
   },
   "security_limit_profile_ref": {
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:c21074bb33cfa98b111b902027466d707823f7528de235f467172d50cb89abd8",
+    "content_digest": "sha256:1e16ae1e03710fbda75423da91576f68e76fd09ee8f36da57b4b8707ceeb9c1b",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {
     "artifact_kind": "control-plane-topology",
     "document_id": "control-plane-topology:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "content_digest": "sha256:8a2fa0d7c78cfa5d7a745509e93f4b6f1c11b9c577209106d7b9b8c17a5d19e7",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "egress_policy_ref": {
     "artifact_kind": "egress-policy",
     "document_id": "egress-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "content_digest": "sha256:8a2fa0d7c78cfa5d7a745509e93f4b6f1c11b9c577209106d7b9b8c17a5d19e7",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "retention_policy_ref": {
     "artifact_kind": "retention-policy",
     "document_id": "retention-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:aa50a5e928e55e1f7b7b268d6aed7b01897f6c253ea6dfbd26000efb30e59e56",
+    "content_digest": "sha256:8a2fa0d7c78cfa5d7a745509e93f4b6f1c11b9c577209106d7b9b8c17a5d19e7",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "enabled_features": ["repository-conformance", "static-dry-run"],

@@ -150,6 +150,13 @@
       "waivable": false
     },
     {
+      "control_id": "SB-CONF-05",
+      "title": "Externally anchored conformance trust checkpoint",
+      "owning_work_package": "SB-0",
+      "owning_team": "platform-security-contracts",
+      "waivable": false
+    },
+    {
       "control_id": "SB-CTX-01",
       "title": "Orthogonal namespaces",
       "owning_work_package": "SB-2",
@@ -1272,6 +1279,12 @@
       "title": "Security-limit profile governance",
       "owning_work_package": "SB-5",
       "owning_team": "execution-and-secrets-platform"
+    },
+    {
+      "acceptance_case_id": "AC-055",
+      "title": "Externally anchored trust-head and acceptance-time reconciliation",
+      "owning_work_package": "SB-0",
+      "owning_team": "platform-security-contracts"
     }
   ],
   "traces": [
@@ -1963,6 +1976,51 @@
       },
       "fixture_or_probe_id": "security_conformance::ac_048",
       "pass_condition": "Conformance closure tests validate the published `ControlTrace`, `ConformanceBundle`, and package-receipt schemas and reject orphan or multiply owned controls/cases, duplicate static mapping tuples or evidence- instance ids, omission, unknown controls, missing repeated provider/ deployment evidence instances, circular supersession, applicability mismatch, downgrade, expired or revoked evidence, forged signer, wrong revision, deployment/configuration/ provider/limit-profile mismatch, insufficient evidence tier, secret-bearing evidence, and unauthorized skips or waivers.",
+      "trace_lifecycle": "active",
+      "supersedes_trace_id": null
+    },
+    {
+      "trace_id": "TRACE-SB-CONF-05-AC-055",
+      "control_id": "SB-CONF-05",
+      "acceptance_case_id": "AC-055",
+      "owning_work_package": "SB-0",
+      "owning_team": "platform-security-contracts",
+      "applicability_expression": {
+        "implementation": {
+          "operator": "always"
+        },
+        "deployment": {
+          "operator": "always"
+        }
+      },
+      "evidence_instance_dimensions": {
+        "implementation": [
+          "implementation.source_revision",
+          "implementation.artifact_digest",
+          "implementation.fixture_or_probe_id"
+        ],
+        "deployment": [
+          "deployment.deployment_id",
+          "deployment.trust_domain_id",
+          "deployment.conformance_trust_checkpoint_authority_id",
+          "deployment.conformance_trust_checkpoint_authority_epoch",
+          "deployment.conformance_trust_checkpoint_sequence",
+          "deployment.conformance_trust_registry_digest",
+          "deployment.conformance_trust_registry_locator"
+        ]
+      },
+      "minimum_evidence_tier": {
+        "implementation": {
+          "name": "repository_local",
+          "rank": 1
+        },
+        "deployment": {
+          "name": "externally_attested",
+          "rank": 3
+        }
+      },
+      "fixture_or_probe_id": "conformance_trust::tests::ac_055_external_checkpoint_reconciliation_contract",
+      "pass_condition": "Production startup verifies an external_strongly_consistent, independently signed read/reconcile response for the exact deployment/trust-domain/registry namespace; exact candidate and current registry version, raw digest, and locator match; request nonce, request digest, and validated-lineage digest echo; authority epoch, revision, shared namespace sequence, and freshness are current; trusted-time intervals do not straddle any cutoff; every accepted document is bound to exact raw/signature/subject digests, signer fingerprint, registry-head sequence/revision, purpose, package, and tier; rollback, relocation, stale or restored-unreconciled state, forged or wrong-key response, and runtime bootstrap or auto-advance all fail before listener binding.",
       "trace_lifecycle": "active",
       "supersedes_trace_id": null
     },

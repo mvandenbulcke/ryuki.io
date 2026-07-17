@@ -62,7 +62,15 @@ The selected registry is the head of a bounded, exact N-1 predecessor chain;
 all referenced registry versions must be present as regular `.json` files
 beneath the same immutable contract root. A valid chain alone cannot prevent
 rollback of the profile and head pins as one unit, and production therefore
-remains blocked until an external monotonic head checkpoint exists.
+also requires `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET`,
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID`,
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID`,
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64`,
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT`, and
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH`. Provision them from a
+separately governed workload/deployment trust channel, never from the
+rollbackable contract root. Startup only reconciles exact head version, raw
+digest, and locator; it cannot bootstrap or auto-advance authority state.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

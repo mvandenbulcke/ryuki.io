@@ -2965,7 +2965,8 @@ async fn main() {
             std::process::exit(1);
         });
     let security_contract =
-        security_contracts::load_startup_security_contract(&security_pins, chrono::Utc::now())
+        security_contracts::load_startup_security_contract_for_serving(&security_pins)
+            .await
             .unwrap_or_else(|error| {
                 eprintln!("security contract preflight failed: {error}");
                 std::process::exit(1);
@@ -2992,6 +2993,12 @@ async fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         });
+        security_contract
+            .validate_serving_checkpoint_freshness(chrono::Utc::now())
+            .unwrap_or_else(|error| {
+                eprintln!("security checkpoint freshness fence failed before migration: {error}");
+                std::process::exit(1);
+            });
         match database::apply_embedded_migrations_with_role_contract(
             &migration_url,
             timeouts,
@@ -3097,6 +3104,15 @@ async fn main() {
             "insecure loopback cookie mode uses a non-loopback internal listener; ensure the public endpoint remains loopback-only"
         );
     }
+    // Database verification, migration, and reconciliation are authority-
+    // bearing startup operations. Do not begin them under an expired external
+    // checkpoint, even though the listener has its own later freshness fence.
+    config_store::get_security_contract_context()
+        .validate_serving_checkpoint_freshness(chrono::Utc::now())
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "security checkpoint freshness fence failed before database startup");
+            std::process::exit(1);
+        });
     match migration_mode {
         database::MigrationStartupMode::VerifyOnly => {
             let role_contract =
@@ -3353,6 +3369,16 @@ async fn main() {
             }
         }
     }
+
+    // Do not start serving-related background work under a checkpoint that
+    // expired while database/configuration/key startup was in progress. The
+    // listener boundary repeats this check after router construction.
+    config_store::get_security_contract_context()
+        .validate_serving_checkpoint_freshness(chrono::Utc::now())
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "security checkpoint freshness fence failed");
+            std::process::exit(1);
+        });
 
     // Spawn background sweeps (lease-expiry + idempotency retention). Only when
     // a DB pool is available. Both are idempotent and cancelled automatically
@@ -3623,6 +3649,15 @@ async fn main() {
     // outermost so timeout/access middleware can read it from extensions.
     let app = with_response_envelope(app);
 
+    // Startup work can outlive the authority's short checkpoint lease. Recheck
+    // the immutable admitted proof at the final serving boundary so an expired
+    // reconciliation can never be carried into a newly bound listener.
+    config_store::get_security_contract_context()
+        .validate_serving_checkpoint_freshness(chrono::Utc::now())
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "security checkpoint freshness fence failed");
+            std::process::exit(1);
+        });
     let listener = match tokio::net::TcpListener::bind(&app_config.server.bind_address).await {
         Ok(l) => l,
         Err(e) => {

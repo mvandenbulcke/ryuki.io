@@ -28,7 +28,7 @@ const MAX_TRUST_REGISTRY_KEYS: usize = 256;
 const MAX_TRUST_REGISTRY_TOMBSTONES: usize = 4096;
 const MAX_TRUST_REGISTRY_SCOPE_ITEMS: usize = 256;
 
-const SCHEMAS: [(&str, &str); 8] = [
+const SCHEMAS: [(&str, &str); 9] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -36,6 +36,10 @@ const SCHEMAS: [(&str, &str); 8] = [
     (
         "conformance-bundle.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+    ),
+    (
+        "conformance-trust-checkpoint-envelope.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json",
     ),
     (
         "conformance-trust-root-registry.schema.json",
@@ -92,7 +96,7 @@ const INSTANCES: [(&str, &str); 6] = [
 
 // This list is intentionally independent of control-trace.implementation.json.
 // Editing the ledger cannot silently redefine the normative control inventory.
-const CANONICAL_CONTROL_IDS: [&str; 134] = [
+const CANONICAL_CONTROL_IDS: [&str; 135] = [
     "SB-BOUND-01",
     "SB-BOUND-02",
     "SB-IDL-01",
@@ -113,6 +117,7 @@ const CANONICAL_CONTROL_IDS: [&str; 134] = [
     "SB-CONF-02",
     "SB-CONF-03",
     "SB-CONF-04",
+    "SB-CONF-05",
     "SB-CTX-01",
     "SB-SES-08",
     "SB-CFG-01",
@@ -772,7 +777,7 @@ fn validate_ledger_semantics(ledger: &Value, errors: &mut Vec<String>) {
         .iter()
         .map(|id| (*id).to_string())
         .collect();
-    let canonical_cases: BTreeSet<String> = (1..=54).map(|n| format!("AC-{n:03}")).collect();
+    let canonical_cases: BTreeSet<String> = (1..=55).map(|n| format!("AC-{n:03}")).collect();
 
     let controls = array(ledger, "controls");
     let acceptance_cases = array(ledger, "acceptance_cases");
@@ -4908,10 +4913,208 @@ mod tests {
         errors
     }
 
+    fn trust_checkpoint_envelope_fixture() -> Value {
+        json!({
+            "schema_version": "1.0.0",
+            "contract_kind": "conformance-trust-reconciliation-response",
+            "canonicalization": "ryuki-canonical-json-v1",
+            "signature_algorithm": "ed25519",
+            "authority": {
+                "authority_id": "conformance-trust-checkpoint-authority:test",
+                "key_id": "conformance-trust-checkpoint-key:test-primary",
+                "public_key_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "request_nonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "request_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "namespace": {
+                "deployment_id": "deployment:test",
+                "trust_domain_id": "trust-domain:test",
+                "registry_id": "conformance-trust-root-registry:test"
+            },
+            "candidate_head": {
+                "registry_version": 2,
+                "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "artifact_locator": "catalog/security-contracts/v1/trust-registry-v2.json"
+            },
+            "current_head": {
+                "registry_version": 2,
+                "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "artifact_locator": "catalog/security-contracts/v1/trust-registry-v2.json"
+            },
+            "validated_lineage_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "state": "external_strongly_consistent",
+            "outcome": "matched",
+            "reconciliation": {
+                "candidate_matches_current": true,
+                "restored_state_reconciled": true,
+                "no_auto_advance": true
+            },
+            "checkpoint": {
+                "sequence": 12,
+                "authority_epoch": 3,
+                "authority_revision": 7,
+                "observed_at": {
+                    "not_before": "2026-07-17T09:00:00Z",
+                    "not_after": "2026-07-17T09:00:01Z"
+                },
+                "valid_until": "2026-07-17T09:05:00Z"
+            },
+            "acceptance_records": [{
+                "acceptance_record_id": "conformance-acceptance:test-bundle",
+                "document": {
+                    "contract_kind": "conformance-bundle",
+                    "document_id": "bundle:test",
+                    "document_version": 1,
+                    "complete_document_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "signature_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "signed_subject_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "signer": {
+                    "key_id": "conformance-key:test-primary",
+                    "public_key_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "registry": {
+                    "registry_id": "conformance-trust-root-registry:test",
+                    "registry_version": 2,
+                    "registry_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "artifact_locator": "catalog/security-contracts/v1/trust-registry-v2.json",
+                    "head_sequence": 9,
+                    "head_authority_revision": 7
+                },
+                "deployment_id": "deployment:test",
+                "trust_domain_id": "trust-domain:test",
+                "work_package_id": "SB-0",
+                "purpose": "conformance_bundle",
+                "evidence_tier": "repository_local",
+                "authority_sequence": 11,
+                "authority_epoch": 3,
+                "accepted_at": {
+                    "not_before": "2026-07-17T08:59:58Z",
+                    "not_after": "2026-07-17T08:59:59Z"
+                },
+                "lifecycle": "accepted"
+            }],
+            "signature_base64": format!("{}==", "A".repeat(86))
+        })
+    }
+
     #[test]
     fn repository_security_contracts_pass_the_real_gate() {
         let errors = validate_repository(&root()).expect("repository validation should run");
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn trust_checkpoint_envelope_schema_accepts_exact_closed_response() {
+        let schema =
+            load("catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json");
+        let mut errors = Vec::new();
+
+        validate_instance(
+            "test:trust-checkpoint-envelope",
+            "conformance-trust-checkpoint-envelope.schema.json",
+            &schema,
+            &trust_checkpoint_envelope_fixture(),
+            &mut errors,
+        );
+
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn trust_checkpoint_envelope_schema_rejects_ambiguous_or_unbounded_input() {
+        let schema =
+            load("catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json");
+        let fixture = trust_checkpoint_envelope_fixture();
+        let mut cases = Vec::new();
+
+        let mut unknown_root = fixture.clone();
+        unknown_root["public_key_base64"] = json!("self-declared-key");
+        cases.push(("unknown root field", unknown_root));
+
+        let mut unknown_nested = fixture.clone();
+        unknown_nested["acceptance_records"][0]["document"]["untrusted_status"] = json!("accepted");
+        cases.push(("unknown nested field", unknown_nested));
+
+        let mut bad_namespace = fixture.clone();
+        bad_namespace["namespace"]["deployment_id"] = json!("test");
+        cases.push(("non-canonical namespace", bad_namespace));
+
+        let mut traversal = fixture.clone();
+        traversal["current_head"]["artifact_locator"] = json!("../registry.json");
+        cases.push(("unsafe head locator", traversal));
+
+        let mut generic_outcome = fixture.clone();
+        generic_outcome["outcome"] = json!("ok");
+        cases.push(("generic outcome", generic_outcome));
+
+        let mut oversized_counter = fixture.clone();
+        oversized_counter["checkpoint"]["sequence"] = json!(9_007_199_254_740_992_u64);
+        cases.push((
+            "counter above canonical JSON exact-integer range",
+            oversized_counter,
+        ));
+
+        let mut zero_digest = fixture.clone();
+        zero_digest["request_digest"] =
+            json!("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        cases.push(("zero request digest", zero_digest));
+
+        let mut invalid_signature = fixture.clone();
+        invalid_signature["signature_base64"] = json!("not-base64");
+        cases.push(("invalid signature encoding", invalid_signature));
+
+        let mut nonce_pad_bits = fixture.clone();
+        nonce_pad_bits["request_nonce"] = json!(format!("{}B=", "A".repeat(42)));
+        cases.push(("non-canonical nonce pad bits", nonce_pad_bits));
+
+        let mut signature_pad_bits = fixture.clone();
+        signature_pad_bits["signature_base64"] = json!(format!("{}B==", "A".repeat(85)));
+        cases.push(("non-canonical signature pad bits", signature_pad_bits));
+
+        let mut zero_nonce = fixture.clone();
+        zero_nonce["request_nonce"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        cases.push(("all-zero request nonce", zero_nonce));
+
+        let mut oversized_acceptances = fixture.clone();
+        let template = oversized_acceptances["acceptance_records"][0].clone();
+        oversized_acceptances["acceptance_records"] = Value::Array(
+            (0..65)
+                .map(|index| {
+                    let mut record = template.clone();
+                    record["acceptance_record_id"] =
+                        json!(format!("conformance-acceptance:test-{index:03}"));
+                    record
+                })
+                .collect(),
+        );
+        cases.push(("oversized acceptance lookup", oversized_acceptances));
+
+        let mut missing_nonce = fixture.clone();
+        missing_nonce
+            .as_object_mut()
+            .expect("checkpoint fixture object")
+            .remove("request_nonce");
+        cases.push(("missing request nonce", missing_nonce));
+
+        let mut missing_revision = fixture;
+        missing_revision["checkpoint"]
+            .as_object_mut()
+            .expect("checkpoint object")
+            .remove("authority_revision");
+        cases.push(("missing authority revision", missing_revision));
+
+        for (label, candidate) in cases {
+            let mut errors = Vec::new();
+            validate_instance(
+                label,
+                "conformance-trust-checkpoint-envelope.schema.json",
+                &schema,
+                &candidate,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "{label} must fail schema validation");
+        }
     }
 
     #[test]

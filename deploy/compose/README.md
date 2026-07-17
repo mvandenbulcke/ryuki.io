@@ -32,6 +32,14 @@ registry is a lineage head; every exact N-1 predecessor through version 1 must
 also be baked into that root. Startup verifies the complete bounded chain, but
 the chain is not an external monotonic checkpoint and cannot by itself detect
 rollback of the profile and head pins together.
+This local Compose skeleton intentionally does not forward any
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_*` binding and does not mount or provision a
+separately governed authority socket. Adding those pins beside the rollbackable
+contract/profile inputs would not create an independent trust channel. Compose
+therefore cannot exercise production checkpoint reconciliation or claim
+production eligibility; operator-owned strongly consistent authority,
+authenticated transport, key/epoch custody, and recovery integration remain
+SB-8 work.
 The checked-in bundle is `implementation_only`, so it
 is not selected automatically and cannot start this stack. Until an active
 typed provider profile can bind every runtime authentication value, the full

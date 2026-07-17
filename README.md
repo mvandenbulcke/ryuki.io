@@ -140,6 +140,11 @@ API startup also requires `RYUKI_SECURITY_CONTRACT_ROOT`,
 `RYUKI_EXPECTED_DEPLOYMENT_ID`, and `RYUKI_SECURITY_PROFILE` to have been
 exported for a reviewed active contract and independently approved trust-root
 registry.
+Production additionally requires the external conformance trust-checkpoint
+socket, authority id, Ed25519 key id/public key/fingerprint, and minimum
+authority epoch described below. Those bindings must be delivered through a
+separately governed workload/deployment trust channel, never through the
+rollbackable security-contract root.
 The checked-in `implementation_only` fixtures are validation inputs and cannot
 start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
 before using the API command above; no runnable digest is inferred from Git.
@@ -229,6 +234,12 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw profile bytes |
 | `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized `.json` path of the current trust-registry lineage head, relative to the immutable contract root |
 | `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of that head's exact raw bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID` | Independently pinned id beginning `conformance-trust-checkpoint-authority:` |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID` | Independently pinned Ed25519 key id beginning `conformance-trust-checkpoint-key:` |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64` | Canonical Base64 of the independently provisioned raw 32-byte Ed25519 checkpoint public key |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT` | Independently pinned SHA-256 fingerprint of those decoded public-key bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH` | Minimum independently accepted checkpoint authority fencing epoch |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -243,7 +254,7 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK` | Explicitly permit HTTP only for a loopback portal/API origin |
 | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Runtime-only verifier key required for local, Entra, and OIDC sessions |
 
-The trust-root path and digest pin the current registry head. Every registry
+The trust-root path and digest select the candidate registry head. Every registry
 after version 1 must reference the exact raw bytes of version N-1, and startup
 structurally walks that bounded chain back to version 1. Production trust
 construction additionally binds key identifiers to SHA-256 fingerprints of
@@ -252,8 +263,16 @@ rejects gaps, relabeling, resurrection, or policy/effective-time rollback
 before accepting any signing key. Test and development profiles construct no
 signature authority from their structural chain. The chain does not detect
 rollback when the profile and independent head pins are rolled back together;
-production remains blocked until an external monotonic registry-head
-checkpoint is reconciled.
+production therefore also requires a fresh, independently signed reconciliation
+response from the external checkpoint authority. The exact candidate version,
+raw digest, and locator must equal its stored current head under the deployment/
+trust-domain/registry namespace. Startup is read-only: it never bootstraps,
+relocates, or advances the checkpoint. Exact compare-and-swap administration,
+authority recovery, and key/epoch rotation remain separately authorized
+operator workflows, not admission fallbacks.
+This checkpoint is only one production prerequisite. Production remains
+blocked until trusted closure receipts, live runtime facts, and the remaining
+normative boundary work packages are implemented and verified.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

@@ -28,10 +28,18 @@ files, including every content-addressed predecessor from the selected trust
 registry head back to version 1. Startup rejects missing, gapped, relabeled,
 resurrected, or digest-mismatched lineage before any runtime side effect. The
 hash chain is not an external monotonic rollback checkpoint, so production
-remains blocked until that separate authority is available. The base does not
-fabricate the admission ConfigMap, and its checked-in
-image contains only non-production implementation fixtures, so an unoverlaid
-production render remains fail-closed.
+also requires the separately governed external checkpoint authority and its six
+`RYUKI_CONFORMANCE_TRUST_CHECKPOINT_*` production bindings. This base
+deliberately provisions neither the authority socket nor those pins, and they
+must not be added to the rollbackable `platform-security-admission-config`.
+An operator-owned overlay must authenticate and mount the local authority
+socket and deliver the authority/key/fingerprint/minimum-epoch pins through a
+separate workload/deployment trust channel. Until that SB-8 integration and its
+recovery evidence exist, this skeleton cannot exercise checkpoint
+reconciliation or claim production eligibility. The base does not fabricate
+the admission ConfigMap, and its checked-in image contains only non-production
+implementation fixtures, so an unoverlaid production render remains
+fail-closed.
 
 `platform-api` reads its non-secret settings from the `platform-api-config`
 ConfigMap and `RYUKI_DATABASE_URL` from the `ryuki-platform-api-db` Secret.

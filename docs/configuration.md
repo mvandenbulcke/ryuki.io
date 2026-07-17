@@ -29,6 +29,21 @@ default and empty values fail closed:
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independent canonical `deployment:` pin that must equal the document's deployment identity |
 | `RYUKI_SECURITY_PROFILE` | Independent profile-class pin, exactly `development`, `test`, or `production`, that must equal the document |
 
+Production additionally requires these external checkpoint bindings:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID` | Independently pinned canonical id beginning `conformance-trust-checkpoint-authority:` |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID` | Independently pinned canonical Ed25519 key id beginning `conformance-trust-checkpoint-key:` |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64` | Canonical Base64 of exactly 32 raw Ed25519 public-key bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT` | Nonzero `sha256:<64 lowercase hex>` digest of those decoded public-key bytes |
+| `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH` | Positive independently held minimum authority fencing epoch |
+
+All six values come from a separately governed workload/deployment trust
+channel. They must never be supplied by, inferred from, or stored only beside
+the rollbackable contract root, profile, registry, or conformance documents.
+
 The deployment, profile, and trust-root-registry pins come from process
 configuration, not from the documents being admitted. Preflight verifies the
 root-owned, immutable, content-addressed root before
@@ -45,15 +60,27 @@ contiguous link. For a production profile, trust-store construction then
 verifies every effective-time and policy transition, decoded-key fingerprint,
 and terminal tombstone before signature verification. Test and development
 profiles construct no signature authority from their structural chain.
-Historical snapshots remain lineage evidence only: without an independently
-trusted acceptance timestamp, signer-controlled `signed_at` cannot prove that
-a signature predates cutover. The current implementation therefore admits only
-an active key from the pinned head; overlap, retired, revoked, and historical
-authority all fail closed.
+Historical snapshots do not become authority from signer-controlled `signed_at`.
+After external reconciliation, however, an exact accepted-document record may
+authorize a current or historical registry snapshot. An active key must be
+valid for the complete trusted acceptance-time interval; a retired key is
+accepted only when that complete interval is strictly before its cutoff.
+Overlap keys cannot newly sign, and revoked or subsequently revoked keys always
+fail closed. An interval that straddles any activation, retirement, revocation,
+expiry, or freshness cutoff also fails closed.
 Rolling back the profile and both independent head pins together is outside
-what a self-contained hash chain can detect, so production admission remains
-unavailable until a durable external monotonic head checkpoint is implemented
-and reconciled.
+what a self-contained hash chain can detect. Production therefore requires a
+fresh domain-separated Ed25519 response from the separately pinned external
+checkpoint authority. The request binds its nonce and digest, exact namespace,
+candidate head including locator, validated lineage digest, and a unique sorted
+lookup of at most 64 complete document digests. The response must prove
+`external_strongly_consistent` state, exact equality with the authority's
+current head, a current authority epoch/revision and one linearizable sequence
+for head and document-acceptance events, trusted-time intervals that do not
+straddle a cutoff, and exact accepted-document/signature/signer/registry
+bindings. Startup never bootstraps, relocates, or advances checkpoint state;
+administrative compare-and-swap and recovery reconciliation remain separate
+operator workflows.
 
 Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment

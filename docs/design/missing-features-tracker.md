@@ -40,7 +40,7 @@ Track the convergence as one dependency-ordered P0 program:
 
 | Package | State | Outcome |
 | --- | --- | --- |
-| SB-0 Contract, bootstrap, and fail-closed profiles | `[ ]` | Missing/unknown profiles and invalid production configuration fail before bind; production cannot start with development auth, mock dependencies, insecure transport/cookies, or an open/reopened first-owner path; the executable deployment-security-profile root and provider/action/resource/conformance/limit schemas, route coverage, privileged-domain separation, and versioned no-downgrade contracts are complete. |
+| SB-0 Contract, bootstrap, and fail-closed profiles | `[ ]` | Missing/unknown profiles and invalid production configuration fail before bind; production cannot start with development auth, mock dependencies, insecure transport/cookies, an open/reopened first-owner path, or a missing/stale/unreconciled external conformance trust checkpoint; the executable deployment-security-profile root and provider/action/resource/conformance/limit/checkpoint schemas, route coverage, privileged-domain separation, and versioned no-downgrade contracts are complete. |
 | SB-1 Unified human identity and sessions | `[ ]` | A singular credential-admission classifier and versioned authenticator registry support multiple generic OIDC issuers, brokered SAML/LDAP/AD, separate ordinary and break-glass WebAuthn, native/device/service OAuth profiles, API/workload identities, one durable `SessionRepository`, CSRF, step-up, and lifecycle revocation. |
 | SB-2 Typed authorization and scoping | `[ ]` | One default-deny action/resource registry issues unforgeable permits only after typed obligations pass; protected collection queries require kernel-issued query permits across all actor kinds, routes, owner/site/environment/tenant scope, and DB/no-DB paths. |
 | SB-3 Approval, transition, and audit binding | `[ ]` | Principal lifecycle/authority versions, control-plane authority epoch, policy, actor/effective subject, scope, plan/provider identity, quorum, idempotency, transition, and outbox are bound atomically; audit is independently anchored and exported without silent gaps. |
@@ -48,7 +48,7 @@ Track the convergence as one dependency-ordered P0 program:
 | SB-5 Credential brokerage and bounded execution | `[ ]` | Capability-tested Vault/OpenBao/cloud/enterprise adapters issue job-scoped capabilities; governance records, runtime references, leases, material, resolution, dynamic issuance, lease control, key custody, certificate issuance, version publication, and CSI/ESO/VSO materialization remain separate; complete secret handling and bounded work obey the active security-limit profile. |
 | SB-6 Deployment and supply-chain integrity | `[ ]` | Immutable privileged inputs, complete scan scope, safe build contexts, signed digest-bound SBOM/provenance, deployment admission, and an owned vulnerability/exception lifecycle cover every deployable and rollback artifact. |
 | SB-7 Adapter, egress, and data boundary | `[ ]` | First-party adapters are provenance-bound; every plugin is out-of-process and capability-sandboxed; credential-bearing redirects fail closed; classification, executable retention, privacy/audit reconciliation, backups, and orthogonal deployment/tenancy/trust-topology gates are enforced. |
-| SB-8 Distributed security operations and recovery | `[ ]` | Governed policy/config changes, cryptographic inventory, authority epochs/fencing, trusted time, fair distributed budgets, degraded modes, explicit RTO/RPO, authenticated recovery media, compromise response, and restore-without-resurrection are implemented and rehearsed. |
+| SB-8 Distributed security operations and recovery | `[ ]` | Governed policy/config changes, cryptographic inventory, authority epochs/fencing, trusted time, fair distributed budgets, degraded modes, explicit RTO/RPO, authenticated recovery media, compromise response, and restore-without-resurrection are implemented and rehearsed, including separately governed strongly consistent trust-checkpoint custody and recovery reconciliation. |
 | SB-9 Security-state migration, bypass retirement, and production acceptance | `[ ]` | Expand/migrate/verify/contract and rollback fencing are proven, legacy fallbacks are removed, and local plus operator-owned identity-provider, secret-manager/PKI, and live acceptance evidence passes. |
 
 SB-1 now has an identity-epoch slice in migration 165 and an explicit
@@ -93,10 +93,18 @@ leaving their behavior implicit:
   downgraded, wrong-revision, insufficient-tier, or silently skipped controls;
 - published schemas for the deployment-security-profile root, provider
   registry, closed action/resource/resolver registry, `ControlTrace`,
-  `ConformanceBundle`, package exit receipt, and versioned
+  `ConformanceBundle`, package exit receipt, external conformance trust-
+  checkpoint response, and versioned
   `SecurityLimitProfile` as the sole owner of selected values, published
   defaults, platform hard bounds, and separate value-change and bound-change
   authority;
+- a production-only external conformance trust-checkpoint authority keyed by
+  deployment, trust domain, and registry id, authenticated from a separately
+  governed workload/deployment channel. Startup is equality-only reconciliation
+  of exact head version, raw digest, and locator under one linearizable head/
+  acceptance sequence; it cannot auto-bootstrap or advance. Its live custody,
+  trusted-time, minimum-epoch, compare-and-swap administration, and restore
+  evidence remain open SB-8 work and cannot be satisfied by repository fixtures;
 - explicit `site_registry.create` and `site_registry.lifecycle.toggle` actions:
   creation is unscoped-platform authority, while a toggle may admit only an
   unscoped admin or a matching canonical site-scoped admin with no environment
