@@ -21,6 +21,7 @@ use thiserror::Error;
 pub const TRUST_REGISTRY_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-root-registry.schema.json";
 pub const TRUST_REGISTRY_SCHEMA_VERSION: &str = "1.0.0";
+pub const TRUST_RECONCILIATION_PROTOCOL_VERSION: &str = "2.0.0";
 pub const TRUST_REGISTRY_CONTRACT_KIND: &str = "conformance-trust-root-registry";
 pub const SIGNATURE_VERSION: &str = "1.0.0";
 pub const CANONICALIZATION_PROFILE: &str = "ryuki-canonical-json-v1";
@@ -30,9 +31,9 @@ pub const PACKAGE_EXIT_RECEIPT_DOMAIN: &str = "ryuki-v1/package-exit-receipt";
 pub const TRUST_RECONCILIATION_REQUEST_KIND: &str = "conformance-trust-reconciliation-request";
 pub const TRUST_RECONCILIATION_RESPONSE_KIND: &str = "conformance-trust-reconciliation-response";
 pub const TRUST_RECONCILIATION_REQUEST_DOMAIN: &str =
-    "ryuki-v1/conformance-trust-reconciliation-request";
+    "ryuki-v2/conformance-trust-reconciliation-request";
 pub const TRUST_RECONCILIATION_RESPONSE_DOMAIN: &str =
-    "ryuki-v1/conformance-trust-reconciliation-response";
+    "ryuki-v2/conformance-trust-reconciliation-response";
 
 const MAX_REGISTRY_LINEAGE: usize = 16;
 const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
@@ -176,6 +177,20 @@ pub struct ConformanceTrustScope<'a> {
     pub trust_domain_id: &'a str,
 }
 
+/// Exact profile-selected SB-9 receipt that the external checkpoint must
+/// independently identify as the namespace's current production root.
+///
+/// The artifact kind is fixed by this type and serialized as
+/// `package-exit-receipt`; callers cannot reinterpret another document kind as
+/// production authority.
+#[derive(Debug, Clone, Copy)]
+pub struct ConformanceProductionRootRef<'a> {
+    pub document_id: &'a str,
+    pub document_version: u64,
+    pub content_digest: &'a str,
+    pub artifact_locator: &'a str,
+}
+
 /// Independently provisioned external checkpoint authority pin.
 ///
 /// The raw public key and its fingerprint are both required so a text/config
@@ -214,6 +229,23 @@ struct CheckpointRegistryHead {
     artifact_locator: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointProductionRootRef {
+    artifact_kind: String,
+    document_id: String,
+    document_version: u64,
+    content_digest: String,
+    artifact_locator: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCurrentProductionRoot {
+    receipt_ref: CheckpointProductionRootRef,
+    acceptance_record_id: String,
+}
+
 /// Opaque canonical request for the semantic-free checkpoint transport.
 #[derive(Debug, Clone)]
 pub struct ConformanceCheckpointRequest {
@@ -224,6 +256,7 @@ pub struct ConformanceCheckpointRequest {
     authority_key_id: String,
     namespace: CheckpointNamespace,
     candidate_head: CheckpointRegistryHead,
+    candidate_production_root: CheckpointProductionRootRef,
     validated_lineage_digest: String,
     requested_document_digests: Vec<String>,
 }
@@ -265,6 +298,8 @@ struct ReconciliationResponse {
     namespace: CheckpointNamespace,
     candidate_head: CheckpointRegistryHead,
     current_head: CheckpointRegistryHead,
+    candidate_production_root: CheckpointProductionRootRef,
+    current_production_root: CheckpointCurrentProductionRoot,
     validated_lineage_digest: String,
     state: String,
     outcome: String,
@@ -287,6 +322,7 @@ struct ResponseAuthority {
 #[serde(deny_unknown_fields)]
 struct ResponseReconciliation {
     candidate_matches_current: bool,
+    candidate_production_root_matches_current: bool,
     restored_state_reconciled: bool,
     no_auto_advance: bool,
 }
@@ -564,7 +600,56 @@ pub struct VerifiedConformanceTrustCheckpoint {
     checkpoint_sequence: u64,
     observed_at: TrustedTimeInterval,
     valid_until: DateTime<Utc>,
+    current_production_root: CheckpointCurrentProductionRoot,
     acceptance_records: Vec<TrustedAcceptanceRecord>,
+}
+
+/// Opaque proof that an authenticated SB-9 receipt is the exact current root
+/// named by the external checkpoint snapshot.
+#[derive(Debug)]
+pub struct VerifiedConformanceProductionRoot {
+    document_id: String,
+    document_version: u64,
+    content_digest: String,
+    artifact_locator: String,
+    acceptance_record_id: String,
+    acceptance_sequence: u64,
+    checkpoint_sequence: u64,
+    authority_revision: u64,
+}
+
+impl VerifiedConformanceProductionRoot {
+    pub fn document_id(&self) -> &str {
+        &self.document_id
+    }
+
+    pub fn document_version(&self) -> u64 {
+        self.document_version
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub fn artifact_locator(&self) -> &str {
+        &self.artifact_locator
+    }
+
+    pub fn acceptance_record_id(&self) -> &str {
+        &self.acceptance_record_id
+    }
+
+    pub fn acceptance_sequence(&self) -> u64 {
+        self.acceptance_sequence
+    }
+
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
 }
 
 /// Proof that one exact conformance document passed registry, scope, lifetime,
@@ -1003,12 +1088,13 @@ impl ValidatedConformanceRegistryLineage {
         })
     }
 
-    /// Builds the only serving-time operation supported by protocol v1. The
+    /// Builds the only serving-time operation supported by protocol v2. The
     /// request asks for a read/reconcile proof and pre-existing acceptance
     /// records; it cannot bootstrap, relocate, advance, or accept anything.
     pub fn reconciliation_request(
         &self,
         scope: ConformanceTrustScope<'_>,
+        production_root: ConformanceProductionRootRef<'_>,
         authority: ConformanceCheckpointAuthorityAnchor<'_>,
         request_nonce: [u8; 32],
         requested_at: DateTime<Utc>,
@@ -1033,6 +1119,15 @@ impl ValidatedConformanceRegistryLineage {
         {
             return Err(invalid_checkpoint(
                 "requested document digests must be valid, unique, sorted, and bounded to 4096",
+            ));
+        }
+        let candidate_production_root = checkpoint_production_root(production_root)?;
+        if requested_document_digests
+            .binary_search(&candidate_production_root.content_digest)
+            .is_err()
+        {
+            return Err(invalid_checkpoint(
+                "the current production-root candidate digest must be present in requested_document_digests",
             ));
         }
         let snapshot = self
@@ -1061,7 +1156,7 @@ impl ValidatedConformanceRegistryLineage {
             artifact_locator: self.current_artifact_locator.clone(),
         };
         let value = serde_json::json!({
-            "schema_version": TRUST_REGISTRY_SCHEMA_VERSION,
+            "schema_version": TRUST_RECONCILIATION_PROTOCOL_VERSION,
             "contract_kind": TRUST_RECONCILIATION_REQUEST_KIND,
             "operation": "read_reconcile",
             "canonicalization": CANONICALIZATION_PROFILE,
@@ -1070,6 +1165,7 @@ impl ValidatedConformanceRegistryLineage {
             "authority_key_id": authority.key_id,
             "namespace": namespace,
             "candidate_head": candidate_head,
+            "candidate_production_root": candidate_production_root,
             "validated_lineage_digest": self.validated_lineage_digest,
             "request_nonce": nonce,
             "requested_at": requested_at,
@@ -1088,6 +1184,7 @@ impl ValidatedConformanceRegistryLineage {
             authority_key_id: authority.key_id.to_owned(),
             namespace,
             candidate_head,
+            candidate_production_root,
             validated_lineage_digest: self.validated_lineage_digest.clone(),
             requested_document_digests: requested_document_digests.to_vec(),
         })
@@ -1133,7 +1230,7 @@ impl ValidatedConformanceRegistryLineage {
         let response: ReconciliationResponse = serde_json::from_value(value)
             .map_err(|error| ConformanceTrustError::InvalidTypedValue(error.to_string()))?;
 
-        if response.schema_version != TRUST_REGISTRY_SCHEMA_VERSION
+        if response.schema_version != TRUST_RECONCILIATION_PROTOCOL_VERSION
             || response.contract_kind != TRUST_RECONCILIATION_RESPONSE_KIND
             || response.canonicalization != CANONICALIZATION_PROFILE
             || response.signature_algorithm != SIGNATURE_ALGORITHM
@@ -1146,6 +1243,9 @@ impl ValidatedConformanceRegistryLineage {
             || response.state != "external_strongly_consistent"
             || response.outcome != "matched"
             || !response.reconciliation.candidate_matches_current
+            || !response
+                .reconciliation
+                .candidate_production_root_matches_current
             || !response.reconciliation.restored_state_reconciled
             || !response.reconciliation.no_auto_advance
         {
@@ -1167,6 +1267,14 @@ impl ValidatedConformanceRegistryLineage {
             return Err(ConformanceTrustError::ReconciliationRequired(format!(
                 "external head decision is {decision:?}"
             )));
+        }
+        if response.candidate_production_root != request.candidate_production_root
+            || response.current_production_root.receipt_ref != request.candidate_production_root
+        {
+            return Err(ConformanceTrustError::ReconciliationRequired(
+                "external current production root does not exactly match the profile-selected candidate"
+                    .into(),
+            ));
         }
 
         let checkpoint = &response.checkpoint;
@@ -1199,6 +1307,10 @@ impl ValidatedConformanceRegistryLineage {
             checkpoint,
             &request.requested_document_digests,
         )?;
+        validate_current_production_root(
+            &response.current_production_root,
+            &response.acceptance_records,
+        )?;
 
         Ok(VerifiedConformanceTrustCheckpoint {
             lineage: self,
@@ -1210,6 +1322,7 @@ impl ValidatedConformanceRegistryLineage {
             checkpoint_sequence: checkpoint.sequence,
             observed_at: checkpoint.observed_at.clone(),
             valid_until: checkpoint.valid_until,
+            current_production_root: response.current_production_root,
             acceptance_records: response.acceptance_records,
         })
     }
@@ -1246,6 +1359,44 @@ impl VerifiedConformanceTrustCheckpoint {
 
     pub fn valid_until(&self) -> DateTime<Utc> {
         self.valid_until
+    }
+
+    /// Binds an already authenticated receipt proof to the exact externally
+    /// current SB-9 root selected in this checkpoint snapshot.
+    pub fn verify_current_production_root(
+        &self,
+        document: &VerifiedConformanceDocument,
+    ) -> Result<VerifiedConformanceProductionRoot, ConformanceTrustError> {
+        let root = &self.current_production_root;
+        if document.kind != ConformanceDocumentKind::PackageExitReceipt
+            || document.document_id != root.receipt_ref.document_id
+            || document.document_version != root.receipt_ref.document_version
+            || document.complete_document_digest != root.receipt_ref.content_digest
+            || document.acceptance_record_id != root.acceptance_record_id
+            || document.package_id != "SB-9"
+            || document.authority_id != self.authority_id
+            || document.authority_epoch != self.authority_epoch
+            || document.authority_revision != self.authority_revision
+            || document.checkpoint_sequence != self.checkpoint_sequence
+            || document.deployment_id != self.namespace.deployment_id
+            || document.trust_domain_id != self.namespace.trust_domain_id
+            || document.acceptance_sequence > self.checkpoint_sequence
+        {
+            return Err(ConformanceTrustError::InvalidAcceptance(
+                "authenticated document is not the exact current SB-9 production root".into(),
+            ));
+        }
+
+        Ok(VerifiedConformanceProductionRoot {
+            document_id: root.receipt_ref.document_id.clone(),
+            document_version: root.receipt_ref.document_version,
+            content_digest: root.receipt_ref.content_digest.clone(),
+            artifact_locator: root.receipt_ref.artifact_locator.clone(),
+            acceptance_record_id: root.acceptance_record_id.clone(),
+            acceptance_sequence: document.acceptance_sequence,
+            checkpoint_sequence: self.checkpoint_sequence,
+            authority_revision: self.authority_revision,
+        })
     }
 
     /// Rechecks the externally authenticated proof at the final startup fence.
@@ -1402,6 +1553,62 @@ impl VerifiedConformanceTrustCheckpoint {
             evidence_tier: context.evidence_tier,
         })
     }
+}
+
+fn checkpoint_production_root(
+    root: ConformanceProductionRootRef<'_>,
+) -> Result<CheckpointProductionRootRef, ConformanceTrustError> {
+    if !valid_scoped_id(root.document_id, "package-exit-receipt:")
+        || !valid_counter(root.document_version)
+        || !is_digest(root.content_digest)
+        || !valid_artifact_locator(root.artifact_locator)
+    {
+        return Err(invalid_checkpoint(
+            "production root must be an exact nonzero, normalized package-exit-receipt reference",
+        ));
+    }
+    Ok(CheckpointProductionRootRef {
+        artifact_kind: "package-exit-receipt".into(),
+        document_id: root.document_id.to_owned(),
+        document_version: root.document_version,
+        content_digest: root.content_digest.to_owned(),
+        artifact_locator: root.artifact_locator.to_owned(),
+    })
+}
+
+fn validate_current_production_root(
+    root: &CheckpointCurrentProductionRoot,
+    records: &[TrustedAcceptanceRecord],
+) -> Result<(), ConformanceTrustError> {
+    if root.receipt_ref.artifact_kind != "package-exit-receipt"
+        || !valid_scoped_id(&root.acceptance_record_id, "conformance-acceptance:")
+    {
+        return Err(ConformanceTrustError::InvalidAcceptance(
+            "current production root has an invalid kind or acceptance record id".into(),
+        ));
+    }
+    let record = records
+        .iter()
+        .find(|record| record.acceptance_record_id == root.acceptance_record_id)
+        .ok_or_else(|| {
+            ConformanceTrustError::InvalidAcceptance(
+                "current production root does not name an acceptance record in this response"
+                    .into(),
+            )
+        })?;
+    if record.document.contract_kind != "package-exit-receipt"
+        || record.document.document_id != root.receipt_ref.document_id
+        || record.document.document_version != root.receipt_ref.document_version
+        || record.document.complete_document_digest != root.receipt_ref.content_digest
+        || record.work_package_id != "SB-9"
+        || record.purpose != ConformancePurpose::PackageExitReceipt
+        || record.lifecycle != "accepted"
+    {
+        return Err(ConformanceTrustError::InvalidAcceptance(
+            "current production root does not bind the exact accepted SB-9 package receipt".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_checkpoint_authority(
@@ -2862,6 +3069,57 @@ mod tests {
         sha256_digest(&serde_json::to_vec(document).unwrap())
     }
 
+    fn production_root_digest() -> String {
+        format!("sha256:{:064x}", 1)
+    }
+
+    fn production_root_ref() -> ConformanceProductionRootRef<'static> {
+        ConformanceProductionRootRef {
+            document_id: "package-exit-receipt:production-root",
+            document_version: 1,
+            content_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+            artifact_locator: "receipts/production-root.json",
+        }
+    }
+
+    fn production_root_acceptance_record(request: &ConformanceCheckpointRequest) -> Value {
+        json!({
+            "acceptance_record_id": "conformance-acceptance:production-root",
+            "document": {
+                "contract_kind": "package-exit-receipt",
+                "document_id": "package-exit-receipt:production-root",
+                "document_version": 1,
+                "complete_document_digest": production_root_digest(),
+                "signature_digest": pin(),
+                "signed_subject_digest": pin(),
+            },
+            "signer": {
+                "key_id": "conformance-key:test-key",
+                "public_key_fingerprint": pin(),
+            },
+            "registry": {
+                "registry_id": request.namespace.registry_id,
+                "registry_version": request.candidate_head.registry_version,
+                "registry_digest": request.candidate_head.content_digest,
+                "artifact_locator": request.candidate_head.artifact_locator,
+                "head_sequence": request.candidate_head.registry_version,
+                "head_authority_revision": request.candidate_head.registry_version,
+            },
+            "deployment_id": request.namespace.deployment_id,
+            "trust_domain_id": request.namespace.trust_domain_id,
+            "work_package_id": "SB-9",
+            "purpose": "package_exit_receipt",
+            "evidence_tier": "externally_attested",
+            "authority_sequence": 19,
+            "authority_epoch": 7,
+            "accepted_at": {
+                "not_before": "2026-07-16T09:59:58Z",
+                "not_after": "2026-07-16T09:59:59Z",
+            },
+            "lifecycle": "accepted",
+        })
+    }
+
     fn acceptance_record(
         document: &Value,
         complete_digest: &str,
@@ -2917,10 +3175,11 @@ mod tests {
     fn response_value(
         request: &ConformanceCheckpointRequest,
         authority: &AuthorityFixture,
-        acceptance_records: Vec<Value>,
+        mut acceptance_records: Vec<Value>,
     ) -> Value {
+        acceptance_records.push(production_root_acceptance_record(request));
         json!({
-            "schema_version": TRUST_REGISTRY_SCHEMA_VERSION,
+            "schema_version": TRUST_RECONCILIATION_PROTOCOL_VERSION,
             "contract_kind": TRUST_RECONCILIATION_RESPONSE_KIND,
             "canonicalization": CANONICALIZATION_PROFILE,
             "signature_algorithm": SIGNATURE_ALGORITHM,
@@ -2934,11 +3193,17 @@ mod tests {
             "namespace": request.namespace,
             "candidate_head": request.candidate_head,
             "current_head": request.candidate_head,
+            "candidate_production_root": request.candidate_production_root,
+            "current_production_root": {
+                "receipt_ref": request.candidate_production_root,
+                "acceptance_record_id": "conformance-acceptance:production-root",
+            },
             "validated_lineage_digest": request.validated_lineage_digest,
             "state": "external_strongly_consistent",
             "outcome": "matched",
             "reconciliation": {
                 "candidate_matches_current": true,
+                "candidate_production_root_matches_current": true,
                 "restored_state_reconciled": true,
                 "no_auto_advance": true,
             },
@@ -2984,16 +3249,21 @@ mod tests {
         authority: &AuthorityFixture,
         document_digests: &[String],
     ) -> ConformanceCheckpointRequest {
+        let mut requested = document_digests.to_vec();
+        requested.push(production_root_digest());
+        requested.sort();
+        requested.dedup();
         lineage
             .reconciliation_request(
                 ConformanceTrustScope {
                     deployment_id: "deployment:test",
                     trust_domain_id: "trust-domain:test",
                 },
+                production_root_ref(),
                 authority.anchor(7),
                 [42; 32],
                 at("2026-07-16T09:59:59Z"),
-                document_digests,
+                &requested,
             )
             .unwrap()
     }
@@ -3230,6 +3500,136 @@ mod tests {
     }
 
     #[test]
+    fn production_root_request_and_response_are_exact_and_rootless_v1_is_rejected() {
+        let key = SigningKey::from_bytes(&[79; 32]);
+        let (first, second, _, second_digest) = two_version_chain(&key);
+        let lineage = lineage_for_chain(&first, &second, &second_digest).unwrap();
+        let authority = AuthorityFixture::new(109);
+
+        assert!(matches!(
+            lineage.reconciliation_request(
+                ConformanceTrustScope {
+                    deployment_id: "deployment:test",
+                    trust_domain_id: "trust-domain:test",
+                },
+                production_root_ref(),
+                authority.anchor(7),
+                [1; 32],
+                at("2026-07-16T09:59:59Z"),
+                &[],
+            ),
+            Err(ConformanceTrustError::InvalidCheckpoint(message))
+                if message.contains("production-root candidate digest")
+        ));
+
+        let request = request_for(&lineage, &authority, &[]);
+        let valid = sign_response(response_value(&request, &authority, vec![]), &authority);
+        lineage
+            .clone()
+            .verify_reconciliation_response(&request, &valid, authority.anchor(7), trusted_now())
+            .expect("an exact v2 current-root assertion must reconcile");
+
+        for pointer in [
+            "/current_production_root/receipt_ref/document_id",
+            "/current_production_root/receipt_ref/document_version",
+            "/current_production_root/receipt_ref/content_digest",
+            "/current_production_root/receipt_ref/artifact_locator",
+        ] {
+            let mut mismatch = response_value(&request, &authority, vec![]);
+            *mismatch.pointer_mut(pointer).unwrap() = match pointer {
+                "/current_production_root/receipt_ref/document_id" => {
+                    json!("package-exit-receipt:newer-root")
+                }
+                "/current_production_root/receipt_ref/document_version" => json!(2),
+                "/current_production_root/receipt_ref/content_digest" => {
+                    json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                }
+                _ => json!("receipts/newer-root.json"),
+            };
+            let mismatch = sign_response(mismatch, &authority);
+            assert!(matches!(
+                lineage.clone().verify_reconciliation_response(
+                    &request,
+                    &mismatch,
+                    authority.anchor(7),
+                    trusted_now(),
+                ),
+                Err(ConformanceTrustError::ReconciliationRequired(_))
+            ));
+        }
+
+        let mut rootless_v1 = response_value(&request, &authority, vec![]);
+        rootless_v1["schema_version"] = json!("1.0.0");
+        rootless_v1
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_production_root");
+        rootless_v1
+            .as_object_mut()
+            .unwrap()
+            .remove("current_production_root");
+        rootless_v1["reconciliation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_production_root_matches_current");
+        let rootless_v1 = sign_response(rootless_v1, &authority);
+        assert!(
+            lineage
+                .verify_reconciliation_response(
+                    &request,
+                    &rootless_v1,
+                    authority.anchor(7),
+                    trusted_now(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_root_must_name_the_same_response_accepted_sb9_receipt() {
+        let key = SigningKey::from_bytes(&[80; 32]);
+        let (first, second, _, second_digest) = two_version_chain(&key);
+        let lineage = lineage_for_chain(&first, &second, &second_digest).unwrap();
+        let authority = AuthorityFixture::new(110);
+        let request = request_for(&lineage, &authority, &[]);
+
+        let mut wrong_record_id = response_value(&request, &authority, vec![]);
+        wrong_record_id["current_production_root"]["acceptance_record_id"] =
+            json!("conformance-acceptance:missing-root");
+        let wrong_record_id = sign_response(wrong_record_id, &authority);
+        assert!(matches!(
+            lineage.clone().verify_reconciliation_response(
+                &request,
+                &wrong_record_id,
+                authority.anchor(7),
+                trusted_now(),
+            ),
+            Err(ConformanceTrustError::InvalidAcceptance(_))
+        ));
+
+        let mut wrong_package = response_value(&request, &authority, vec![]);
+        let root_record = wrong_package["acceptance_records"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| {
+                record["acceptance_record_id"] == "conformance-acceptance:production-root"
+            })
+            .unwrap();
+        root_record["work_package_id"] = json!("SB-8");
+        let wrong_package = sign_response(wrong_package, &authority);
+        assert!(matches!(
+            lineage.verify_reconciliation_response(
+                &request,
+                &wrong_package,
+                authority.anchor(7),
+                trusted_now(),
+            ),
+            Err(ConformanceTrustError::InvalidAcceptance(_))
+        ));
+    }
+
+    #[test]
     fn checkpoint_authority_is_independently_scoped_key_separated_and_epoch_fenced() {
         let key = SigningKey::from_bytes(&[73; 32]);
         let (first, second, _, second_digest) = two_version_chain(&key);
@@ -3241,6 +3641,7 @@ mod tests {
                     deployment_id: "deployment:test",
                     trust_domain_id: "trust-domain:test",
                 },
+                production_root_ref(),
                 reused_authority.anchor(7),
                 [1; 32],
                 at("2026-07-16T09:59:59Z"),
@@ -3258,6 +3659,7 @@ mod tests {
                         deployment_id: "deployment:other",
                         trust_domain_id: "trust-domain:test",
                     },
+                    production_root_ref(),
                     authority.anchor(7),
                     [1; 32],
                     at("2026-07-16T09:59:59Z"),
@@ -3272,6 +3674,7 @@ mod tests {
                         deployment_id: "deployment:test",
                         trust_domain_id: "trust-domain:test",
                     },
+                    production_root_ref(),
                     authority.anchor(7),
                     [0; 32],
                     at("2026-07-16T09:59:59Z"),
@@ -3286,10 +3689,11 @@ mod tests {
                     deployment_id: "deployment:test",
                     trust_domain_id: "trust-domain:test",
                 },
+                production_root_ref(),
                 authority.anchor(8),
                 [1; 32],
                 at("2026-07-16T09:59:59Z"),
-                &[],
+                &[production_root_digest()],
             )
             .unwrap();
         let response = sign_response(response_value(&request, &authority, vec![]), &authority);
@@ -3321,6 +3725,7 @@ mod tests {
                     deployment_id: "deployment:test",
                     trust_domain_id: "trust-domain:test",
                 },
+                production_root_ref(),
                 authority.anchor(7),
                 [1; 32],
                 at("2026-07-16T09:59:59Z"),
@@ -3338,6 +3743,7 @@ mod tests {
                         deployment_id: "deployment:test",
                         trust_domain_id: "trust-domain:test",
                     },
+                    production_root_ref(),
                     authority.anchor(7),
                     [1; 32],
                     at("2026-07-16T09:59:59Z"),
@@ -3366,6 +3772,7 @@ mod tests {
                         deployment_id: "deployment:test",
                         trust_domain_id: "trust-domain:test",
                     },
+                    production_root_ref(),
                     authority.anchor(7),
                     [1; 32],
                     at("2026-07-16T09:59:59Z"),
@@ -3384,6 +3791,7 @@ mod tests {
                         deployment_id: "deployment:test",
                         trust_domain_id: "trust-domain:test",
                     },
+                    production_root_ref(),
                     authority.anchor(7),
                     [1; 32],
                     at("2026-07-16T09:59:59Z"),

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json",
   "title": "Ryuki external conformance trust reconciliation response",
-  "description": "Closed response envelope returned by the independently governed conformance trust-checkpoint authority. Schema validity never grants trust: the verifier must use separately provisioned authority, key, fingerprint, minimum-epoch, and transport bindings; verify the domain-separated Ed25519 signature and exact request echo; enforce freshness and trusted-time uncertainty; and require the candidate head, including its locator, to equal the authority's current head. Version 1 is read/reconcile only and cannot bootstrap, relocate, or advance authority state at runtime.",
+  "description": "Closed response envelope returned by the independently governed conformance trust-checkpoint authority. Schema validity never grants trust: the verifier must use separately provisioned authority, key, fingerprint, minimum-epoch, and transport bindings; verify the domain-separated Ed25519 signature and exact request echo; enforce freshness and trusted-time uncertainty; require the candidate registry head, including its locator, to equal the authority's current head; and require the profile-selected SB-9 receipt to equal the authority's current production root and name its exact acceptance event. Version 2 is read/reconcile only and cannot bootstrap, relocate, accept a document, select a production root, or advance authority state at runtime.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,6 +16,8 @@
     "namespace",
     "candidate_head",
     "current_head",
+    "candidate_production_root",
+    "current_production_root",
     "validated_lineage_digest",
     "state",
     "outcome",
@@ -26,7 +28,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "1.0.0"
+      "const": "2.0.0"
     },
     "contract_kind": {
       "const": "conformance-trust-reconciliation-response"
@@ -44,7 +46,7 @@
       "$ref": "#/$defs/nonce"
     },
     "request_digest": {
-      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes, including its unique lexicographically sorted requested_document_digests list of at most 4096 complete raw-document SHA-256 digests.",
+      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes, including the exact candidate_production_root and its unique lexicographically sorted requested_document_digests list of at most 4096 complete raw-document SHA-256 digests. The candidate production-root digest must be present in that list.",
       "$ref": "#/$defs/digest"
     },
     "namespace": {
@@ -56,6 +58,14 @@
     "current_head": {
       "$ref": "#/$defs/registryHead"
     },
+    "candidate_production_root": {
+      "description": "Exact profile-selected SB-9 package-exit receipt echoed from the request. Semantic verification requires field-for-field equality with current_production_root.receipt_ref and requires its content digest in the request's exact acceptance lookup.",
+      "$ref": "#/$defs/productionRootReference"
+    },
+    "current_production_root": {
+      "description": "Externally authoritative current SB-9 production root and the exact pre-existing acceptance event selected by the authority's current namespace state.",
+      "$ref": "#/$defs/currentProductionRoot"
+    },
     "validated_lineage_digest": {
       "description": "SHA-256 binding of the exact ordered, validated registry lineage supplied with the request. The verifier independently recomputes this value.",
       "$ref": "#/$defs/digest"
@@ -64,7 +74,7 @@
       "const": "external_strongly_consistent"
     },
     "outcome": {
-      "description": "Version 1 admits only an exact read/reconcile match. Bootstrap, relocation, rollback, fork resolution, and head advance require a separately authorized administrative protocol and are not representable here.",
+      "description": "Version 2 admits only an exact read/reconcile match for both the registry head and current production root. Bootstrap, relocation, acceptance, production-root selection, rollback, fork resolution, and head advance require a separately authorized administrative protocol and are not representable here.",
       "const": "matched"
     },
     "reconciliation": {
@@ -74,16 +84,47 @@
       "$ref": "#/$defs/checkpoint"
     },
     "acceptance_records": {
-      "description": "Bounded, exact accepted-document records observed in the same linearizable namespace history as the trust head. The response must contain exactly one record for every digest in the request's unique lexicographically sorted requested_document_digests list and no others; unsolicited, duplicate, or omitted records fail. Semantic verification requires acceptance_record_id, complete_document_digest, and authority_sequence each to be unique within the response. Empty is valid only for an empty lookup and cannot satisfy a production closure that requires accepted documents.",
+      "description": "Bounded, exact accepted-document records observed in the same linearizable namespace history as the trust head and production-root selection. The response must contain exactly one record for every digest in the request's unique lexicographically sorted requested_document_digests list and no others; unsolicited, duplicate, or omitted records fail. Semantic verification requires acceptance_record_id, complete_document_digest, and authority_sequence each to be unique within the response, and current_production_root.acceptance_record_id must resolve to the exact accepted SB-9 package-exit receipt selected by current_production_root.receipt_ref. Empty cannot satisfy this version's mandatory production root.",
       "type": "array",
+      "minItems": 1,
       "maxItems": 4096,
       "uniqueItems": true,
+      "contains": {
+        "required": [
+          "document",
+          "work_package_id",
+          "purpose",
+          "lifecycle"
+        ],
+        "properties": {
+          "document": {
+            "required": [
+              "contract_kind"
+            ],
+            "properties": {
+              "contract_kind": {
+                "const": "package-exit-receipt"
+              }
+            }
+          },
+          "work_package_id": {
+            "const": "SB-9"
+          },
+          "purpose": {
+            "const": "package_exit_receipt"
+          },
+          "lifecycle": {
+            "const": "accepted"
+          }
+        }
+      },
+      "minContains": 1,
       "items": {
         "$ref": "#/$defs/acceptanceRecord"
       }
     },
     "signature_base64": {
-      "description": "Canonical Base64 encoding of the 64-byte Ed25519 signature. Signing bytes are two consecutive frames: each frame is an unsigned u64 little-endian byte length followed by those bytes; the first frame contains the fixed UTF-8 domain ryuki-v1/conformance-trust-reconciliation-response and the second contains ryuki-canonical-json-v1 bytes of the response object with signature_base64 removed.",
+      "description": "Canonical Base64 encoding of the 64-byte Ed25519 signature. Signing bytes are two consecutive frames: each frame is an unsigned u64 little-endian byte length followed by those bytes; the first frame contains the fixed UTF-8 domain ryuki-v2/conformance-trust-reconciliation-response and the second contains ryuki-canonical-json-v1 bytes of the response object with signature_base64 removed.",
       "type": "string",
       "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
     }
@@ -200,11 +241,67 @@
         }
       }
     },
+    "productionReceiptLocator": {
+      "description": "Normalized safe relative JSON path to the exact SB-9 package-exit receipt. Absolute paths, empty or dot segments, traversal, backslashes, fragments, and JSON Pointer locators are forbidden.",
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 512,
+      "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+    },
+    "productionRootReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "document_id",
+        "document_version",
+        "content_digest",
+        "artifact_locator"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "package-exit-receipt"
+        },
+        "document_id": {
+          "type": "string",
+          "pattern": "^package-exit-receipt:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "document_version": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "content_digest": {
+          "description": "SHA-256 of the exact complete raw SB-9 receipt bytes, including its signature object.",
+          "$ref": "#/$defs/digest"
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/productionReceiptLocator"
+        }
+      }
+    },
+    "currentProductionRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_ref",
+        "acceptance_record_id"
+      ],
+      "properties": {
+        "receipt_ref": {
+          "$ref": "#/$defs/productionRootReference"
+        },
+        "acceptance_record_id": {
+          "description": "Exact acceptance event in this response that the authoritative current-root state selects. Semantic verification requires one matching record whose document identity, version, and complete digest equal receipt_ref and whose package, purpose, and lifecycle are SB-9, package_exit_receipt, and accepted.",
+          "type": "string",
+          "pattern": "^conformance-acceptance:[a-z0-9][a-z0-9._-]{2,126}$"
+        }
+      }
+    },
     "reconciliation": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "candidate_matches_current",
+        "candidate_production_root_matches_current",
         "restored_state_reconciled",
         "no_auto_advance"
       ],
@@ -212,12 +309,16 @@
         "candidate_matches_current": {
           "const": true
         },
+        "candidate_production_root_matches_current": {
+          "description": "The profile-selected candidate production-root receipt exactly equals the externally stored current production-root receipt reference. The semantic verifier independently recomputes this equality.",
+          "const": true
+        },
         "restored_state_reconciled": {
           "description": "The external authority has reconciled its durable namespace state before returning this proof; a restored or recovering namespace must not claim this value.",
           "const": true
         },
         "no_auto_advance": {
-          "description": "The read/reconcile operation cannot mutate or advance the stored head. Exact preauthorized compare-and-swap is a separate administrative protocol.",
+          "description": "The read/reconcile operation cannot mutate or advance the stored head, accept a document, or select a production root. Exact preauthorized compare-and-swap is a separate administrative protocol.",
           "const": true
         }
       }
@@ -234,7 +335,7 @@
       ],
       "properties": {
         "sequence": {
-          "description": "Linearizable sequence shared by trust-head and document-acceptance events within the exact namespace.",
+          "description": "Linearizable sequence shared by trust-head, document-acceptance, and production-root selection events within the exact namespace.",
           "$ref": "#/$defs/positiveCounter"
         },
         "authority_epoch": {
@@ -242,7 +343,7 @@
           "$ref": "#/$defs/positiveCounter"
         },
         "authority_revision": {
-          "description": "Current monotonic external authority record revision for this exact namespace. Every distinct head commit strictly advances this revision.",
+          "description": "Current monotonic external authority record revision for this exact namespace. Every distinct head or production-root selection commit strictly advances this revision.",
           "$ref": "#/$defs/positiveCounter"
         },
         "observed_at": {

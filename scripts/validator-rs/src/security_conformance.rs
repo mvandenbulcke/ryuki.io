@@ -5347,7 +5347,7 @@ mod tests {
 
     fn trust_checkpoint_envelope_fixture() -> Value {
         json!({
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "contract_kind": "conformance-trust-reconciliation-response",
             "canonicalization": "ryuki-canonical-json-v1",
             "signature_algorithm": "ed25519",
@@ -5373,11 +5373,29 @@ mod tests {
                 "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "artifact_locator": "catalog/security-contracts/v1/trust-registry-v2.json"
             },
+            "candidate_production_root": {
+                "artifact_kind": "package-exit-receipt",
+                "document_id": "package-exit-receipt:sb-9-production-root",
+                "document_version": 3,
+                "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/sb-9-production-root.json"
+            },
+            "current_production_root": {
+                "receipt_ref": {
+                    "artifact_kind": "package-exit-receipt",
+                    "document_id": "package-exit-receipt:sb-9-production-root",
+                    "document_version": 3,
+                    "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/sb-9-production-root.json"
+                },
+                "acceptance_record_id": "conformance-acceptance:sb-9-production-root"
+            },
             "validated_lineage_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "state": "external_strongly_consistent",
             "outcome": "matched",
             "reconciliation": {
                 "candidate_matches_current": true,
+                "candidate_production_root_matches_current": true,
                 "restored_state_reconciled": true,
                 "no_auto_advance": true
             },
@@ -5392,11 +5410,11 @@ mod tests {
                 "valid_until": "2026-07-17T09:05:00Z"
             },
             "acceptance_records": [{
-                "acceptance_record_id": "conformance-acceptance:test-bundle",
+                "acceptance_record_id": "conformance-acceptance:sb-9-production-root",
                 "document": {
-                    "contract_kind": "conformance-bundle",
-                    "document_id": "bundle:test",
-                    "document_version": 1,
+                    "contract_kind": "package-exit-receipt",
+                    "document_id": "package-exit-receipt:sb-9-production-root",
+                    "document_version": 3,
                     "complete_document_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                     "signature_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                     "signed_subject_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -5415,9 +5433,9 @@ mod tests {
                 },
                 "deployment_id": "deployment:test",
                 "trust_domain_id": "trust-domain:test",
-                "work_package_id": "SB-0",
-                "purpose": "conformance_bundle",
-                "evidence_tier": "repository_local",
+                "work_package_id": "SB-9",
+                "purpose": "package_exit_receipt",
+                "evidence_tier": "operator_environment",
                 "authority_sequence": 11,
                 "authority_epoch": 3,
                 "accepted_at": {
@@ -5451,6 +5469,129 @@ mod tests {
         );
 
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn trust_checkpoint_production_root_schema_rejects_incomplete_or_unsafe_bindings() {
+        let schema =
+            load("catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json");
+        let fixture = trust_checkpoint_envelope_fixture();
+        let mut cases = Vec::new();
+
+        let mut old_wire_version = fixture.clone();
+        old_wire_version["schema_version"] = json!("1.0.0");
+        cases.push(("rootless v1 wire version", old_wire_version));
+
+        for top_level in ["candidate_production_root", "current_production_root"] {
+            let mut missing = fixture.clone();
+            missing
+                .as_object_mut()
+                .expect("checkpoint fixture object")
+                .remove(top_level);
+            cases.push(("missing mandatory production root", missing));
+        }
+
+        for field in [
+            "artifact_kind",
+            "document_id",
+            "document_version",
+            "content_digest",
+            "artifact_locator",
+        ] {
+            let mut incomplete = fixture.clone();
+            incomplete["candidate_production_root"]
+                .as_object_mut()
+                .expect("candidate production root")
+                .remove(field);
+            cases.push(("incomplete five-field candidate root", incomplete));
+        }
+
+        let mut unknown_candidate_field = fixture.clone();
+        unknown_candidate_field["candidate_production_root"]["authority_hint"] =
+            json!("self-declared");
+        cases.push(("unknown candidate root field", unknown_candidate_field));
+
+        let mut wrong_kind = fixture.clone();
+        wrong_kind["candidate_production_root"]["artifact_kind"] = json!("conformance-bundle");
+        cases.push(("wrong candidate root kind", wrong_kind));
+
+        let mut wrong_identity = fixture.clone();
+        wrong_identity["candidate_production_root"]["document_id"] = json!("bundle:not-sb-9");
+        cases.push(("wrong candidate root identity", wrong_identity));
+
+        let mut zero_digest = fixture.clone();
+        zero_digest["candidate_production_root"]["content_digest"] =
+            json!("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        cases.push(("zero candidate root digest", zero_digest));
+
+        let mut unsafe_locator = fixture.clone();
+        unsafe_locator["candidate_production_root"]["artifact_locator"] =
+            json!("../sb-9-production-root.json");
+        cases.push(("unsafe candidate root locator", unsafe_locator));
+
+        let mut unknown_current_field = fixture.clone();
+        unknown_current_field["current_production_root"]["selection_hint"] = json!(7);
+        cases.push(("unknown current root field", unknown_current_field));
+
+        let mut incomplete_current_ref = fixture.clone();
+        incomplete_current_ref["current_production_root"]["receipt_ref"]
+            .as_object_mut()
+            .expect("current production root receipt ref")
+            .remove("artifact_locator");
+        cases.push((
+            "incomplete current root receipt ref",
+            incomplete_current_ref,
+        ));
+
+        let mut missing_acceptance = fixture.clone();
+        missing_acceptance["current_production_root"]
+            .as_object_mut()
+            .expect("current production root")
+            .remove("acceptance_record_id");
+        cases.push(("missing current root acceptance event", missing_acceptance));
+
+        let mut invalid_acceptance = fixture.clone();
+        invalid_acceptance["current_production_root"]["acceptance_record_id"] =
+            json!("package-exit-receipt:not-an-acceptance");
+        cases.push(("invalid current root acceptance event", invalid_acceptance));
+
+        let mut empty_acceptance_lookup = fixture.clone();
+        empty_acceptance_lookup["acceptance_records"] = json!([]);
+        cases.push(("missing SB-9 acceptance record", empty_acceptance_lookup));
+
+        let mut non_root_acceptance = fixture.clone();
+        non_root_acceptance["acceptance_records"][0]["work_package_id"] = json!("SB-8");
+        cases.push(("non-SB-9 acceptance record", non_root_acceptance));
+
+        let mut missing_reconciliation_flag = fixture.clone();
+        missing_reconciliation_flag["reconciliation"]
+            .as_object_mut()
+            .expect("reconciliation")
+            .remove("candidate_production_root_matches_current");
+        cases.push((
+            "missing production root reconciliation flag",
+            missing_reconciliation_flag,
+        ));
+
+        let mut false_reconciliation_flag = fixture;
+        false_reconciliation_flag["reconciliation"]["candidate_production_root_matches_current"] =
+            json!(false);
+        cases.push((
+            "false production root reconciliation flag",
+            false_reconciliation_flag,
+        ));
+
+        for (label, candidate) in cases {
+            let mut errors = Vec::new();
+            validate_instance(
+                label,
+                "conformance-trust-checkpoint-envelope.schema.json",
+                &schema,
+                &candidate,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "{label} must fail schema validation");
+        }
     }
 
     #[test]

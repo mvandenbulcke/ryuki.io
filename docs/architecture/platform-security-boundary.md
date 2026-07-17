@@ -979,7 +979,7 @@ reviewable records:
 | Incident and recovery evidence | Proves revocation, quarantine, key compromise, restored-state reconciliation, and dormant/activation/aftercare break-glass drills. |
 | Deployment security profile | Is the executable root that binds deployment/profile version, deployment id, tenancy mode, trust topology, provider-registry/lifecycle snapshot, policy/configuration versions, and active security-limit profile. |
 | Security-limit profile | Is the sole normative owner of selected values, platform-enforced hard bounds, units, scopes, failure behavior, telemetry, and change authority for every bounded resource; code and manifests consume or validate its version rather than redefining limits. |
-| External conformance trust checkpoint and acceptance ledger | Independently anchors the highest admitted trust-registry head and exact accepted-document events under one deployment/trust-domain/registry namespace sequence. Its custody and authentication are outside the rollbackable contract/profile channel. |
+| External conformance trust checkpoint and acceptance ledger | Independently anchors the highest admitted trust-registry head, the exact current SB-9 production root, and exact accepted-document events under one deployment/trust-domain/registry namespace sequence. Its custody and authentication are outside the rollbackable contract/profile channel. |
 | Production conformance report | Binds all permanent acceptance-case evidence to an exact source revision, config/provider/limit-profile version, image digest, and deployment. |
 
 ### Machine-readable conformance ledger and evidence trust
@@ -1055,8 +1055,13 @@ has no startup authority. The profile-selected root is also insufficient by
 itself: the external monotonic checkpoint must identify the same exact SB-9
 identity, version, raw-byte digest, and locator as its current production root.
 An older accepted graph cannot become current merely by omitting its successor.
-Until that current-root assertion is implemented and reconciled, production
-startup remains blocked. To avoid cryptographic cycles, every bundle and receipt
+The v2 reconciliation contract implements this assertion by binding the exact
+profile-selected candidate root into the request digest and requiring the
+signed response's current root to name the same receipt and its exact
+same-response acceptance event. Production startup remains blocked until the
+semantic closure consumes that opaque current-root proof and the later runtime
+admission boundary verifies every live guard fact. To avoid cryptographic
+cycles, every bundle and receipt
 identifies its deployment-profile digest contract as
 `ryuki-deployment-profile-conformance-binding-v1`: remove the top-level
 `production_acceptance_receipt_ref`; replace only each
@@ -1088,10 +1093,14 @@ independently authenticated, external strongly consistent checkpoint keyed by
 the exact `(deployment_id, trust_domain_id, registry_id)` namespace. The
 request binds a fresh nonce, its canonical digest, the candidate registry
 version, exact raw-byte digest and artifact locator, the validated lineage
-digest, and a unique lexicographically sorted list of at most 4096 exact raw
-document digests whose acceptance is required. The signed response echoes the
-request binding and returns exactly one acceptance record for every requested
-digest and no others; unsolicited, duplicate, or omitted records fail. It also
+digest, the exact profile-selected SB-9 candidate production-root receipt, and
+a unique lexicographically sorted list of at most 4096 exact raw document
+digests whose acceptance is required. The candidate-root digest must be in that
+list. The signed response echoes the request binding and returns exactly one
+acceptance record for every requested digest and no others; unsolicited,
+duplicate, or omitted records fail. Its current production root must equal the
+candidate field-for-field and name the exact accepted SB-9 receipt record in
+the same response. It also
 binds the authority id, separately pinned Ed25519 key id and raw-key
 fingerprint, signed actual authority epoch, authority revision, and one
 linearizable namespace sequence shared by head changes and document-acceptance
@@ -1109,26 +1118,27 @@ it. An acceptance record's `head_authority_revision` is the exact authority
 revision that committed its bound registry head; `head_sequence` is the
 corresponding shared namespace sequence.
 
-The closed v1 request object contains exactly
-`schema_version: "1.0.0"`,
+The closed v2 request object contains exactly
+`schema_version: "2.0.0"`,
 `contract_kind: "conformance-trust-reconciliation-request"`,
 `operation: "read_reconcile"`,
 `canonicalization: "ryuki-canonical-json-v1"`,
 `signature_algorithm: "ed25519"`, `authority_id`, `authority_key_id`,
-`namespace`, `candidate_head`, `validated_lineage_digest`, `request_nonce`,
-`requested_at`, and `requested_document_digests`; no other request field is
-permitted. Canonical object-key sorting, rather than source field order, fixes
-the byte representation.
+`namespace`, `candidate_head`, `candidate_production_root`,
+`validated_lineage_digest`, `request_nonce`, `requested_at`, and
+`requested_document_digests`; no other request field is permitted. Canonical
+object-key sorting, rather than source field order, fixes the byte
+representation.
 
 `request_digest` is SHA-256 of the exact unframed
 `ryuki-canonical-json-v1` request bytes. Response signing removes only the
 top-level `signature_base64`, canonicalizes the remaining response, and signs
 two consecutive frames: an unsigned little-endian `u64` byte length followed
 by the fixed UTF-8 domain
-`ryuki-v1/conformance-trust-reconciliation-response`, then another unsigned
+`ryuki-v2/conformance-trust-reconciliation-response`, then another unsigned
 little-endian `u64` byte length followed by the canonical response bytes.
 
-The v1 Unix-socket transport performs exactly one exchange per connection.
+The v2 Unix-socket transport performs exactly one exchange per connection.
 Each request and response is one four-byte unsigned big-endian length followed
 by exactly that many payload bytes. The client sends the canonical request,
 closes its write half, then accepts exactly one response frame followed by EOF;
@@ -1138,14 +1148,17 @@ independent deadlines; the current runtime uses 10 seconds per phase and never
 permits a phase deadline above 30 seconds.
 
 Startup is a read/reconcile operation. The candidate head, including its
-locator, must equal the externally stored current head; equal bytes at a new
-locator are a relocation and fail until separately authorized. Runtime startup
-cannot bootstrap, blindly advance, or repair the checkpoint. An advance is
+locator, must equal the externally stored current head, and the candidate
+production root must equal the externally stored current root field-for-field;
+equal bytes at a new locator are a relocation and fail until separately
+authorized. Runtime startup cannot bootstrap, select a production root,
+blindly advance, or repair the checkpoint. An advance or root selection is
 permitted only through a distinct operator-authorized protocol using an exact
 preauthorized compare-and-swap over the expected namespace revision/sequence,
-current head, candidate head, and validated ancestry; that protocol is not an
-admission fallback. Restored or recovering checkpoint state stays quarantined
-until external reconciliation proves its current epoch and history.
+current head, candidate head, current root, candidate root, and validated
+ancestry; that protocol is not an admission fallback. Restored or recovering
+checkpoint state stays quarantined until external reconciliation proves its
+current epoch and history.
 
 Every accepted conformance document is recorded under the same namespace
 sequence with the exact complete raw-document digest, signature digest,
@@ -2693,8 +2706,11 @@ the explicit `AC-nnn` value rather than relying on display order.
     epoch pins; domain-separated Ed25519 verification; exact nonce, request and
     unique sorted bounded document-lookup set,
     namespace, candidate/current head version, raw digest, locator, and lineage
-    binding; equality-only startup with no bootstrap or auto-advance; one
-    linearizable head/acceptance sequence; and exact accepted-document,
+    binding; exact candidate/current SB-9 production-root identity, version,
+    raw digest, and locator equality; the selected root's exact same-response
+    acceptance-record binding; equality-only startup with no bootstrap, root
+    selection, or auto-advance; one linearizable head/root/acceptance sequence;
+    and exact accepted-document,
     signature, signer, registry-head sequence/revision, purpose, package, tier,
     and trusted-time bindings. Negative fixtures reject coordinated profile/head
     rollback, same-bytes relocation, fork or non-descendant state, wrong key or

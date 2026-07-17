@@ -21,13 +21,15 @@ use jsonschema::{Retrieve, Uri};
 use rand::{rngs::OsRng, RngCore};
 use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::conformance_trust::{
-    ConformanceCheckpointAuthorityAnchor, ConformanceRegistryArtifact, ConformanceTrustAnchor,
-    ConformanceTrustScope, ConformanceTrustedTimeWindow, ConformanceVerificationContext,
-    EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceDocument,
-    VerifiedConformanceTrustCheckpoint,
+    ConformanceCheckpointAuthorityAnchor, ConformanceProductionRootRef,
+    ConformanceRegistryArtifact, ConformanceTrustAnchor, ConformanceTrustScope,
+    ConformanceTrustedTimeWindow, ConformanceVerificationContext, EvidenceTier,
+    ValidatedConformanceRegistryLineage, VerifiedConformanceDocument,
+    VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
 };
 use ryuki_core::security_profile::{
-    DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile, StartupAdmissionContext,
+    ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile,
+    StartupAdmissionContext, VersionedContentReference,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -294,6 +296,9 @@ pub(crate) struct SecurityContractContext {
     /// never constructed from local contract/configuration state.
     pub(crate) verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
     pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceDocument>,
+    /// Opaque binding between the exact profile-selected SB-9 receipt and the
+    /// independently asserted current root in the same checkpoint snapshot.
+    pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
 }
@@ -353,9 +358,26 @@ impl SecurityContractContext {
                     )
                 })
                 .unwrap_or_else(|| "no external checkpoint proof".into());
+            let production_root = self
+                .verified_conformance_production_root
+                .as_ref()
+                .map(|root| {
+                    format!(
+                        "current SB-9 root {} version {} at {} (acceptance {} sequence {}, checkpoint {}, revision {})",
+                        root.document_id(),
+                        root.document_version(),
+                        root.artifact_locator(),
+                        root.acceptance_record_id(),
+                        root.acceptance_sequence(),
+                        root.checkpoint_sequence(),
+                        root.authority_revision(),
+                    )
+                })
+                .unwrap_or_else(|| "no externally current SB-9 root proof".into());
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {} signed closure documents authenticated; semantic closure remains unavailable)",
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {} signed closure documents authenticated; semantic closure remains unavailable)",
                 checkpoint,
+                production_root,
                 self.verified_conformance_documents.len(),
             ));
         }
@@ -738,6 +760,15 @@ async fn reconcile_external_conformance_checkpoint_with_clock(
         &prepared.raw_document_bytes,
         &prepared.reference_document_digests,
     )?;
+    let production_root = exact_profile_production_root(prepared)?;
+    if requested_document_digests
+        .binary_search(&production_root.content_digest)
+        .is_err()
+    {
+        return Err(
+            "production acceptance root is absent from the exact checkpoint document lookup".into(),
+        );
+    }
     let lineage = prepared
         .conformance_registry_lineage
         .take()
@@ -754,6 +785,12 @@ async fn reconcile_external_conformance_checkpoint_with_clock(
             ConformanceTrustScope {
                 deployment_id: &prepared.profile.deployment_id,
                 trust_domain_id,
+            },
+            ConformanceProductionRootRef {
+                document_id: &production_root.document_id,
+                document_version: production_root.document_version,
+                content_digest: &production_root.content_digest,
+                artifact_locator: &production_root.artifact_locator,
             },
             authority,
             request_nonce,
@@ -783,6 +820,56 @@ async fn reconcile_external_conformance_checkpoint_with_clock(
             },
         )
         .map_err(|error| format!("conformance checkpoint response is untrusted: {error}"))
+}
+
+fn exact_profile_production_root(
+    prepared: &PreparedSecurityContract,
+) -> Result<VersionedContentReference, String> {
+    let reference = prepared
+        .profile
+        .production_acceptance_receipt_ref
+        .as_ref()
+        .ok_or_else(|| {
+            "production profile has no exact production_acceptance_receipt_ref".to_string()
+        })?;
+    if reference.artifact_kind != ArtifactKind::PackageExitReceipt {
+        return Err("production acceptance root is not a package-exit receipt".into());
+    }
+    let raw_bytes = prepared
+        .raw_document_bytes
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| {
+            "production acceptance root has no exact bytes from reference traversal".to_string()
+        })?;
+    let raw_bytes_digest = raw_digest(raw_bytes);
+    let traversed_digest = prepared
+        .reference_document_digests
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "production acceptance root has no verified traversal digest".to_string())?;
+    if raw_bytes_digest != reference.content_digest || traversed_digest != &reference.content_digest
+    {
+        return Err(
+            "production acceptance root bytes do not match the exact profile-selected digest"
+                .into(),
+        );
+    }
+    let document = prepared
+        .documents
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "production acceptance root did not resolve to typed JSON".to_string())?;
+    if document.get("contract_kind").and_then(Value::as_str) != Some("package-exit-receipt")
+        || document.get("receipt_id").and_then(Value::as_str)
+            != Some(reference.document_id.as_str())
+        || document.get("document_version").and_then(Value::as_u64)
+            != Some(reference.document_version)
+        || document.get("package_id").and_then(Value::as_str) != Some("SB-9")
+    {
+        return Err(
+            "production acceptance root reference does not identify the exact loaded SB-9 receipt"
+                .into(),
+        );
+    }
+    Ok(reference.clone())
 }
 
 fn decode_checkpoint_authority_public_key(
@@ -857,20 +944,29 @@ fn finalize_startup_security_contract(
         &prepared.profile,
         trusted_now(),
     )?;
-    if prepared.profile.security_profile.is_production() {
-        verified_conformance_trust_checkpoint
+    let verified_conformance_production_root = if prepared.profile.security_profile.is_production()
+    {
+        let checkpoint = verified_conformance_trust_checkpoint
             .as_ref()
             .ok_or_else(|| {
                 "production serving startup has no externally reconciled conformance checkpoint proof"
                     .to_string()
-            })?
+            })?;
+        checkpoint
             .ensure_fresh(trusted_time_point(trusted_now()))
             .map_err(|error| {
                 format!(
                     "production conformance checkpoint expired during document verification: {error}"
                 )
             })?;
-    }
+        Some(verify_current_production_root_binding(
+            checkpoint,
+            &prepared.profile,
+            &verified_conformance_documents,
+        )?)
+    } else {
+        None
+    };
     reject_incomplete_production_startup(&prepared.profile, verified_conformance_documents.len())?;
 
     Ok(SecurityContractContext {
@@ -880,8 +976,37 @@ fn finalize_startup_security_contract(
         profile_path: prepared.profile_path,
         verified_conformance_trust_checkpoint,
         verified_conformance_documents,
+        verified_conformance_production_root,
         active_providers: prepared.active_providers,
     })
+}
+
+fn verify_current_production_root_binding(
+    checkpoint: &VerifiedConformanceTrustCheckpoint,
+    profile: &DeploymentSecurityProfile,
+    documents: &BTreeMap<String, VerifiedConformanceDocument>,
+) -> Result<VerifiedConformanceProductionRoot, String> {
+    let reference = profile
+        .production_acceptance_receipt_ref
+        .as_ref()
+        .ok_or_else(|| "production profile has no selected SB-9 receipt".to_string())?;
+    let document = documents.get(&reference.artifact_locator).ok_or_else(|| {
+        "profile-selected SB-9 receipt has no authenticated document proof".to_string()
+    })?;
+    let root = checkpoint
+        .verify_current_production_root(document)
+        .map_err(|error| format!("production root assertion is untrusted: {error}"))?;
+    if root.document_id() != reference.document_id
+        || root.document_version() != reference.document_version
+        || root.content_digest() != reference.content_digest
+        || root.artifact_locator() != reference.artifact_locator
+    {
+        return Err(
+            "external current production root differs from the exact profile-selected SB-9 receipt"
+                .into(),
+        );
+    }
+    Ok(root)
 }
 
 fn trusted_time_point(now: DateTime<Utc>) -> ConformanceTrustedTimeWindow {
@@ -2969,7 +3094,8 @@ mod tests {
     use ryuki_core::conformance_trust::{
         canonical_json_bytes, conformance_signed_subject_digest, conformance_signing_bytes,
         CANONICALIZATION_PROFILE, CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN,
-        SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_RESPONSE_DOMAIN,
+        SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
+        TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
     use ryuki_core::security_profile::{ArtifactKind, MigrationOverlay, VersionedContentReference};
     use serde_json::json;
@@ -3022,7 +3148,7 @@ mod tests {
                 "public_key_fingerprint": raw_digest(&key.verifying_key().to_bytes()),
                 "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
                 "allowed_evidence_tiers": ["externally_attested"],
-                "allowed_package_ids": ["SB-0"],
+                "allowed_package_ids": ["SB-0", "SB-9"],
                 "deployment_ids": profile.applicability.deployment_ids,
                 "trust_domain_ids": profile.trust_topology.trust_domain_ids,
                 "valid_from": "2026-07-15T00:00:00Z",
@@ -3084,7 +3210,7 @@ mod tests {
             document["bindings"] = json!({"deployment_profile": {"deployment_id": DEPLOYMENT_ID}});
             document["provenance"] = json!({"evidence_tier": {"name": "externally_attested"}});
         } else {
-            document["package_id"] = json!("SB-0");
+            document["package_id"] = json!("SB-9");
             document["closure_context"] =
                 json!({"deployment_profile": {"deployment_id": DEPLOYMENT_ID}});
             document["evidence_tier"] = json!({"name": "externally_attested"});
@@ -3119,6 +3245,26 @@ mod tests {
             .collect()
     }
 
+    fn bind_production_root(
+        profile: &mut DeploymentSecurityProfile,
+        locator: &str,
+        receipt: &Value,
+    ) {
+        let bytes = serde_json::to_vec(receipt).expect("synthetic production root bytes");
+        profile.production_acceptance_receipt_ref = Some(VersionedContentReference {
+            artifact_kind: ArtifactKind::PackageExitReceipt,
+            document_id: receipt["receipt_id"]
+                .as_str()
+                .expect("synthetic receipt id")
+                .to_owned(),
+            document_version: receipt["document_version"]
+                .as_u64()
+                .expect("synthetic receipt version"),
+            content_digest: raw_digest(&bytes),
+            artifact_locator: locator.to_owned(),
+        });
+    }
+
     fn checkpoint_response(
         request_bytes: &[u8],
         request_digest: &str,
@@ -3146,6 +3292,10 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap();
                 let authority_sequence = u64::try_from(index).unwrap() + 10;
+                let work_package_id = document
+                    .get("package_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("SB-0");
                 json!({
                     "acceptance_record_id": format!("conformance-acceptance:runtime-{authority_sequence}"),
                     "document": {
@@ -3170,7 +3320,7 @@ mod tests {
                     },
                     "deployment_id": DEPLOYMENT_ID,
                     "trust_domain_id": request_value["namespace"]["trust_domain_id"],
-                    "work_package_id": "SB-0",
+                    "work_package_id": work_package_id,
                     "purpose": signer["purpose"],
                     "evidence_tier": "externally_attested",
                     "authority_sequence": authority_sequence,
@@ -3183,9 +3333,15 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        let production_root_acceptance_record_id = acceptance_records
+            .iter()
+            .find(|record| record["work_package_id"] == "SB-9")
+            .and_then(|record| record["acceptance_record_id"].as_str())
+            .expect("checkpoint fixture must contain an accepted SB-9 production root")
+            .to_owned();
         let checkpoint_fingerprint = raw_digest(&checkpoint_key.verifying_key().to_bytes());
         let mut response = json!({
-            "schema_version": "1.0.0",
+            "schema_version": TRUST_RECONCILIATION_PROTOCOL_VERSION,
             "contract_kind": "conformance-trust-reconciliation-response",
             "canonicalization": CANONICALIZATION_PROFILE,
             "signature_algorithm": SIGNATURE_ALGORITHM,
@@ -3199,11 +3355,17 @@ mod tests {
             "namespace": request_value["namespace"],
             "candidate_head": request_value["candidate_head"],
             "current_head": request_value["candidate_head"],
+            "candidate_production_root": request_value["candidate_production_root"],
+            "current_production_root": {
+                "receipt_ref": request_value["candidate_production_root"],
+                "acceptance_record_id": production_root_acceptance_record_id,
+            },
             "validated_lineage_digest": request_value["validated_lineage_digest"],
             "state": "external_strongly_consistent",
             "outcome": "matched",
             "reconciliation": {
                 "candidate_matches_current": true,
+                "candidate_production_root_matches_current": true,
                 "restored_state_reconciled": true,
                 "no_auto_advance": true,
             },
@@ -3268,6 +3430,18 @@ mod tests {
                 ConformanceTrustScope {
                     deployment_id: &profile.deployment_id,
                     trust_domain_id: &profile.trust_topology.trust_domain_ids[0],
+                },
+                {
+                    let root = profile
+                        .production_acceptance_receipt_ref
+                        .as_ref()
+                        .expect("production fixture root");
+                    ConformanceProductionRootRef {
+                        document_id: &root.document_id,
+                        document_version: root.document_version,
+                        content_digest: &root.content_digest,
+                        artifact_locator: &root.artifact_locator,
+                    }
                 },
                 authority,
                 [42u8; 32],
@@ -4040,7 +4214,7 @@ mod tests {
         let registry_digest = raw_digest(&registry_bytes);
         profile_value["conformance_trust_root_registry_ref"]["content_digest"] =
             json!(registry_digest);
-        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        let mut profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
         fixture.rewrite_trust_root_registry_raw(&registry_bytes);
 
         let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
@@ -4059,6 +4233,14 @@ mod tests {
             1,
             &fixture.pins.conformance_trust_root_registry_digest,
         );
+        let production_root = signed_closure_document(
+            "package-exit-receipt",
+            &conformance_key,
+            1,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let production_root_locator = "receipts/runtime-sb9-root.json";
+        bind_production_root(&mut profile, production_root_locator, &production_root);
         let documents = BTreeMap::from([
             (
                 profile.control_trace_ref.artifact_locator.clone(),
@@ -4070,6 +4252,7 @@ mod tests {
                 }),
             ),
             ("evidence/runtime-bundle.json".into(), bundle),
+            (production_root_locator.into(), production_root),
         ]);
         let document_bytes = raw_document_bytes(&documents);
         let reference_digests = reference_document_digests(&document_bytes);
@@ -4161,7 +4344,14 @@ mod tests {
             fixed_now(),
         )
         .expect("the returned proof must authenticate the exact requested bytes");
-        assert_eq!(verified.len(), 1);
+        assert_eq!(verified.len(), 2);
+        let verified_root =
+            verify_current_production_root_binding(&checkpoint, &profile, &verified)
+                .expect("the external checkpoint must bind the exact profile-selected SB-9 root");
+        assert_eq!(
+            verified_root.document_id(),
+            "package-exit-receipt:runtime-test"
+        );
         let context = SecurityContractContext {
             profile: profile.clone(),
             profile_digest: fixture.pins.profile_digest.clone(),
@@ -4169,6 +4359,7 @@ mod tests {
             profile_path: fixture.pins.profile_path.clone(),
             verified_conformance_trust_checkpoint: Some(checkpoint),
             verified_conformance_documents: verified,
+            verified_conformance_production_root: Some(verified_root),
             active_providers: BTreeMap::new(),
         };
         context
@@ -4506,7 +4697,7 @@ mod tests {
         let registry_digest = raw_digest(&registry_bytes);
         profile_value["conformance_trust_root_registry_ref"]["content_digest"] =
             json!(registry_digest);
-        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        let mut profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
         fixture.rewrite_trust_root_registry_raw(&registry_bytes);
 
         let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
@@ -4531,6 +4722,8 @@ mod tests {
             1,
             &fixture.pins.conformance_trust_root_registry_digest,
         );
+        let production_root_locator = "receipts/runtime-sb9.json";
+        bind_production_root(&mut profile, production_root_locator, &receipt);
         let documents = BTreeMap::from([
             (
                 profile.control_trace_ref.artifact_locator.clone(),
@@ -4542,7 +4735,7 @@ mod tests {
                 }),
             ),
             ("evidence/runtime-bundle.json".into(), bundle),
-            ("receipts/runtime-sb0.json".into(), receipt),
+            (production_root_locator.into(), receipt),
         ]);
         let document_bytes = raw_document_bytes(&documents);
         let checkpoint = verified_checkpoint_for_documents(
@@ -4566,9 +4759,11 @@ mod tests {
         assert!(verified.values().all(|proof| {
             proof.deployment_id() == DEPLOYMENT_ID
                 && proof.trust_domain_id() == expected_trust_domain
-                && proof.package_id() == "SB-0"
+                && matches!(proof.package_id(), "SB-0" | "SB-9")
                 && proof.evidence_tier() == EvidenceTier::ExternallyAttested
         }));
+        verify_current_production_root_binding(&checkpoint, &profile, &verified)
+            .expect("the accepted SB-9 receipt must match the external current root");
         let final_block = reject_incomplete_production_startup(&profile, verified.len())
             .expect_err("cryptographic verification alone cannot authorize production");
         assert!(final_block.contains("2 signed closure documents authenticated"));
@@ -4621,7 +4816,7 @@ mod tests {
         }
 
         let mut package_tamper = documents.clone();
-        package_tamper.get_mut("receipts/runtime-sb0.json").unwrap()["package_id"] = json!("SB-1");
+        package_tamper.get_mut(production_root_locator).unwrap()["package_id"] = json!("SB-8");
         let package_tamper_bytes = raw_document_bytes(&package_tamper);
         assert!(verify_loaded_conformance_documents(
             &package_tamper,
@@ -4680,7 +4875,7 @@ mod tests {
         let head_bytes = serde_json::to_vec_pretty(&head).unwrap();
         let head_digest = raw_digest(&head_bytes);
         profile_value["conformance_trust_root_registry_ref"]["content_digest"] = json!(head_digest);
-        let profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
+        let mut profile: DeploymentSecurityProfile = serde_json::from_value(profile_value).unwrap();
         fixture.rewrite_trust_root_registry_raw(&head_bytes);
 
         let mut artifact_store = ArtifactStore::open(&fixture.root).unwrap();
@@ -4699,6 +4894,14 @@ mod tests {
             2,
             &fixture.pins.conformance_trust_root_registry_digest,
         );
+        let production_root = signed_closure_document(
+            "package-exit-receipt",
+            &key,
+            2,
+            &fixture.pins.conformance_trust_root_registry_digest,
+        );
+        let production_root_locator = "receipts/runtime-v2-sb9.json";
+        bind_production_root(&mut profile, production_root_locator, &production_root);
         let documents = BTreeMap::from([
             (
                 profile.control_trace_ref.artifact_locator.clone(),
@@ -4710,6 +4913,7 @@ mod tests {
                 }),
             ),
             ("evidence/runtime-v2-bundle.json".into(), bundle),
+            (production_root_locator.into(), production_root),
         ]);
         let document_bytes = raw_document_bytes(&documents);
         let checkpoint = verified_checkpoint_for_documents(
@@ -4728,11 +4932,13 @@ mod tests {
             fixed_now(),
         )
         .expect("the current lineage head must authenticate its exact signed document");
-        assert_eq!(verified.len(), 1);
+        assert_eq!(verified.len(), 2);
+        verify_current_production_root_binding(&checkpoint, &profile, &verified)
+            .expect("the v2 lineage checkpoint must bind its exact current SB-9 root");
         assert!(
             reject_incomplete_production_startup(&profile, verified.len())
                 .unwrap_err()
-                .contains("1 signed closure documents authenticated")
+                .contains("2 signed closure documents authenticated")
         );
     }
 
