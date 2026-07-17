@@ -27,6 +27,11 @@ use ryuki_core::conformance_trust::{
     EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
     VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
 };
+use ryuki_core::deployed_workload::{
+    build_deployed_workload_attestation_request, verify_deployed_workload_attestation,
+    DeployedWorkloadAuthorityAnchor, ExpectedDeployedWorkload, VerifiedDeployedWorkload,
+    MAX_DEPLOYED_WORKLOAD_REQUEST_BYTES, MAX_DEPLOYED_WORKLOAD_RESPONSE_BYTES,
+};
 use ryuki_core::production_applicability::validate_exact_implementation_applicability;
 use ryuki_core::production_build::{
     BuildComponent, BuildSelectorDisposition, ProductionBuildManifest, ShippedAdapter,
@@ -44,6 +49,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
+use crate::boundary::authority_transport::{
+    AuthorityTransportBounds, AuthorityTransportDeadlines, AuthorityTransportHardLimits,
+    UnixAuthorityTransport,
+};
 use crate::boundary::trust_checkpoint_transport::{
     TrustCheckpointTransportBounds, UnixTrustCheckpointTransport,
 };
@@ -67,6 +76,25 @@ pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT";
 pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION";
+pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV: &str =
+    "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST";
+pub(crate) const EXPECTED_WORKLOAD_ID_ENV: &str = "RYUKI_EXPECTED_WORKLOAD_ID";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
     "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
@@ -90,9 +118,13 @@ const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_NODES: usize = 262_144;
 const MAX_JSON_ARRAY_ITEMS: usize = 16_384;
 const MAX_JSON_OBJECT_MEMBERS: usize = 4_096;
-const CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
+const ED25519_AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
+const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_AUTHORITY_SOCKET_PATH_BYTES: usize = 103;
 const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 4096;
 const CHECKPOINT_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
+const DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 
 const PROFILE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/deployment-security-profile.schema.json");
@@ -124,6 +156,20 @@ pub(crate) struct StartupTrustCheckpointAuthorityPins {
     pub(crate) minimum_authority_epoch: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupDeployedWorkloadAttestationPins {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) authority_id: String,
+    pub(crate) key_id: String,
+    pub(crate) public_key_base64: String,
+    pub(crate) public_key_fingerprint: String,
+    pub(crate) minimum_authority_epoch: u64,
+    pub(crate) measurement_profile_id: String,
+    pub(crate) measurement_profile_version: u64,
+    pub(crate) measurement_profile_digest: String,
+    pub(crate) workload_id: String,
+}
+
 /// Detached build identity selected by independently governed deployment
 /// configuration. The manifest deliberately lives outside the rollbackable
 /// security-contract root and is bound by the digest supplied here.
@@ -141,6 +187,7 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) conformance_trust_root_registry_path: PathBuf,
     pub(crate) conformance_trust_root_registry_digest: String,
     pub(crate) conformance_trust_checkpoint_authority: Option<StartupTrustCheckpointAuthorityPins>,
+    pub(crate) deployed_workload_attestation: Option<StartupDeployedWorkloadAttestationPins>,
     pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
@@ -186,6 +233,7 @@ impl StartupSecurityPins {
         )?;
 
         let conformance_trust_checkpoint_authority = optional_trust_checkpoint_authority(&mut get)?;
+        let deployed_workload_attestation = optional_deployed_workload_attestation(&mut get)?;
         let production_build_manifest = optional_production_build_manifest(&mut get)?;
 
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
@@ -212,9 +260,19 @@ impl StartupSecurityPins {
                 "production {SECURITY_PROFILE_ENV} requires the complete independently pinned build-manifest binding beginning with {PRODUCTION_BUILD_MANIFEST_PATH_ENV}"
             ));
         }
+        if security_profile.is_production() && deployed_workload_attestation.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently pinned deployed-workload attestation binding beginning with {DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV}"
+            ));
+        }
         if !security_profile.is_production() && production_build_manifest.is_some() {
             return Err(format!(
                 "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} and {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} are production-only and must be unset for {profile_raw}"
+            ));
+        }
+        if !security_profile.is_production() && deployed_workload_attestation.is_some() {
+            return Err(format!(
+                "the deployed-workload attestation binding beginning with {DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
             ));
         }
 
@@ -225,6 +283,7 @@ impl StartupSecurityPins {
             conformance_trust_root_registry_path,
             conformance_trust_root_registry_digest,
             conformance_trust_checkpoint_authority,
+            deployed_workload_attestation,
             production_build_manifest,
             deployment_id,
             security_profile,
@@ -434,6 +493,11 @@ pub(crate) struct SecurityContractContext {
     /// Opaque binding between the exact profile-selected SB-9 receipt and the
     /// independently asserted current root in the same checkpoint snapshot.
     pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
+    /// Short-lived, nonce-bound proof that an independently pinned authority
+    /// measured this exact running peer as the manifest-selected OCI workload.
+    /// This remains insufficient for production admission without semantic
+    /// conformance closure and the complete live runtime-guard witness set.
+    pub(crate) verified_deployed_workload: Option<VerifiedDeployedWorkload>,
     /// Exact build identity plus detached, independently derived implementation
     /// applicability. Present only for production; it is not deployment/provider
     /// applicability, semantic receipt closure, or deployed-OCI proof.
@@ -480,6 +544,15 @@ impl SecurityContractContext {
             .ensure_fresh(trusted_time_point(now))
             .map_err(|error| {
                 format!("production conformance checkpoint is no longer fresh: {error}")
+            })?;
+        self.verified_deployed_workload
+            .as_ref()
+            .ok_or_else(|| {
+                "production serving startup has no verified deployed-workload proof".to_string()
+            })?
+            .ensure_fresh(trusted_time_point(now))
+            .map_err(|error| {
+                format!("production deployed-workload proof is no longer fresh: {error}")
             })
     }
 
@@ -533,16 +606,32 @@ impl SecurityContractContext {
                     )
                 })
                 .unwrap_or_else(|| "no pinned production build manifest".into());
+            let deployed_workload = self
+                .verified_deployed_workload
+                .as_ref()
+                .map(|proof| {
+                    format!(
+                        "workload {} measured by {} epoch {} revision {} through profile {}@{}",
+                        proof.workload_id(),
+                        proof.authority_id(),
+                        proof.authority_epoch(),
+                        proof.authority_revision(),
+                        proof.measurement_profile_id(),
+                        proof.measurement_profile_version(),
+                    )
+                })
+                .unwrap_or_else(|| "no verified deployed-workload proof".into());
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {}; {} signed closure documents authenticated; semantic closure, verified deployed-OCI identity, and live runtime facts remain unavailable)",
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {}; {}; {} signed closure documents authenticated; semantic closure and live runtime facts remain unavailable)",
                 checkpoint,
                 production_root,
                 build_manifest,
+                deployed_workload,
                 provider_applicability,
                 verified_document_count,
             ));
@@ -762,7 +851,7 @@ pub(crate) fn load_startup_security_contract(
                 .into(),
         );
     }
-    finalize_startup_security_contract(prepared, None, || now)
+    finalize_startup_security_contract(prepared, None, None, || now)
 }
 
 /// Performs the complete serving-time admission before database, application
@@ -779,7 +868,22 @@ pub(crate) async fn load_startup_security_contract_for_serving(
     } else {
         None
     };
-    finalize_startup_security_contract(prepared, checkpoint, Utc::now)
+    let deployed_workload = if prepared.profile.security_profile.is_production() {
+        Some(
+            reconcile_external_deployed_workload(
+                &prepared,
+                pins,
+                checkpoint.as_ref().ok_or_else(|| {
+                    "production startup lost its verified conformance checkpoint before workload attestation"
+                        .to_string()
+                })?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    finalize_startup_security_contract(prepared, checkpoint, deployed_workload, Utc::now)
 }
 
 fn prepare_startup_security_contract(
@@ -1231,6 +1335,100 @@ async fn reconcile_external_conformance_checkpoint_with_clock(
         .map_err(|error| format!("conformance checkpoint response is untrusted: {error}"))
 }
 
+async fn reconcile_external_deployed_workload(
+    prepared: &PreparedSecurityContract,
+    pins: &StartupSecurityPins,
+    checkpoint: &VerifiedConformanceTrustCheckpoint,
+) -> Result<VerifiedDeployedWorkload, String> {
+    let authority_pins = pins.deployed_workload_attestation.as_ref().ok_or_else(|| {
+        "production startup requires an independently pinned deployed-workload attestation authority"
+            .to_string()
+    })?;
+    if checkpoint.deployment_id() != pins.deployment_id
+        || checkpoint.deployment_id() != prepared.profile.deployment_id
+    {
+        return Err(
+            "verified conformance checkpoint deployment does not match the independent startup deployment pin"
+                .into(),
+        );
+    }
+    let build = prepared
+        .production_build_manifest
+        .as_ref()
+        .ok_or_else(|| "production startup has no pinned build manifest".to_string())?;
+    let authority_public_key = decode_deployed_workload_authority_public_key(authority_pins)?;
+    let authority = DeployedWorkloadAuthorityAnchor {
+        authority_id: &authority_pins.authority_id,
+        key_id: &authority_pins.key_id,
+        public_key: &authority_public_key,
+        public_key_fingerprint: &authority_pins.public_key_fingerprint,
+        minimum_authority_epoch: authority_pins.minimum_authority_epoch,
+        measurement_profile_id: &authority_pins.measurement_profile_id,
+        measurement_profile_version: authority_pins.measurement_profile_version,
+        measurement_profile_digest: &authority_pins.measurement_profile_digest,
+    };
+
+    let requested_at = Utc::now();
+    checkpoint
+        .ensure_fresh(trusted_time_point(requested_at))
+        .map_err(|error| {
+            format!(
+                "production conformance checkpoint expired before deployed-workload attestation: {error}"
+            )
+        })?;
+    let mut request_nonce = [0u8; 32];
+    OsRng.try_fill_bytes(&mut request_nonce).map_err(|error| {
+        format!("failed to obtain a cryptographic deployed-workload nonce: {error}")
+    })?;
+    let request = build_deployed_workload_attestation_request(
+        ExpectedDeployedWorkload {
+            deployment_id: &pins.deployment_id,
+            trust_domain_id: checkpoint.trust_domain_id(),
+            workload_id: &authority_pins.workload_id,
+            oci_subject: &build.document.oci_subject,
+            runtime_executable: &build.document.runtime_executable,
+        },
+        authority,
+        request_nonce,
+        requested_at,
+    )
+    .map_err(|error| format!("deployed-workload attestation request is invalid: {error}"))?;
+
+    let transport = UnixAuthorityTransport::new(
+        authority_pins.socket_path.clone(),
+        AuthorityTransportDeadlines {
+            connect: DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE,
+            write: DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE,
+            read: DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE,
+        },
+        AuthorityTransportBounds {
+            max_request_bytes: MAX_DEPLOYED_WORKLOAD_REQUEST_BYTES,
+            max_response_bytes: MAX_DEPLOYED_WORKLOAD_RESPONSE_BYTES,
+        },
+        AuthorityTransportHardLimits {
+            max_socket_path_bytes: MAX_AUTHORITY_SOCKET_PATH_BYTES,
+            max_phase_deadline: MAX_DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE,
+            max_request_bytes: MAX_DEPLOYED_WORKLOAD_REQUEST_BYTES,
+            max_response_bytes: MAX_DEPLOYED_WORKLOAD_RESPONSE_BYTES,
+        },
+    )
+    .map_err(|error| format!("deployed-workload attestation transport is invalid: {error}"))?;
+    let raw_response = transport
+        .exchange(request.as_bytes())
+        .await
+        .map_err(|error| {
+            format!("deployed-workload attestation exchange failed without retry: {error}")
+        })?;
+    let verified_at = Utc::now();
+    verify_deployed_workload_attestation(
+        request,
+        &raw_response,
+        authority,
+        trusted_time_point(verified_at),
+    )
+    .map_err(|error| format!("deployed-workload attestation response is untrusted: {error}"))
+}
+
 fn exact_profile_production_root(
     prepared: &PreparedSecurityContract,
 ) -> Result<VersionedContentReference, String> {
@@ -1283,7 +1481,7 @@ fn exact_profile_production_root(
 
 fn decode_checkpoint_authority_public_key(
     pins: &StartupTrustCheckpointAuthorityPins,
-) -> Result<[u8; CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+) -> Result<[u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES], String> {
     let decoded = BASE64_STANDARD
         .decode(&pins.public_key_base64)
         .map_err(|_| {
@@ -1300,6 +1498,27 @@ fn decode_checkpoint_authority_public_key(
     decoded
         .try_into()
         .map_err(|_| "configured checkpoint authority public key is not 32 bytes".to_string())
+}
+
+fn decode_deployed_workload_authority_public_key(
+    pins: &StartupDeployedWorkloadAttestationPins,
+) -> Result<[u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+    let decoded = BASE64_STANDARD
+        .decode(&pins.public_key_base64)
+        .map_err(|_| {
+            "configured deployed-workload authority public key is not canonical base64".to_string()
+        })?;
+    if BASE64_STANDARD.encode(&decoded) != pins.public_key_base64
+        || raw_digest(&decoded) != pins.public_key_fingerprint
+    {
+        return Err(
+            "configured deployed-workload authority public key does not match its canonical independent fingerprint pin"
+                .into(),
+        );
+    }
+    decoded.try_into().map_err(|_| {
+        "configured deployed-workload authority public key is not 32 bytes".to_string()
+    })
 }
 
 fn conformance_document_digests(
@@ -1344,6 +1563,7 @@ fn conformance_document_digests(
 fn finalize_startup_security_contract(
     mut prepared: PreparedSecurityContract,
     verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
+    verified_deployed_workload: Option<VerifiedDeployedWorkload>,
     mut trusted_now: impl FnMut() -> DateTime<Utc>,
 ) -> Result<SecurityContractContext, String> {
     let mut verified_conformance_documents = verify_loaded_conformance_documents(
@@ -1392,6 +1612,7 @@ fn finalize_startup_security_contract(
         verified_conformance_trust_checkpoint,
         verified_conformance_documents,
         verified_conformance_production_root,
+        verified_deployed_workload,
         production_build_manifest: prepared.production_build_manifest,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
@@ -1442,7 +1663,7 @@ fn reject_incomplete_production_startup(
 ) -> Result<(), String> {
     if profile.security_profile.is_production() {
         Err(format!(
-            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; provider registry version {} retained with {} active provider applicability claims; semantic closure, verified deployed-OCI identity, and live runtime facts remain unavailable)",
+            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; provider registry version {} retained with {} active provider applicability claims; semantic closure and live runtime facts remain unavailable)",
             provider_registry.registry_version,
             provider_registry.active_providers.len(),
         ))
@@ -2040,7 +2261,7 @@ fn optional_trust_checkpoint_authority(
                 "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
             )
         })?;
-    if public_key.len() != CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES
+    if public_key.len() != ED25519_AUTHORITY_PUBLIC_KEY_BYTES
         || BASE64_STANDARD.encode(&public_key) != public_key_base64
     {
         return Err(format!(
@@ -2052,16 +2273,10 @@ fn optional_trust_checkpoint_authority(
             "{CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
         ));
     }
-    let minimum_authority_epoch = minimum_authority_epoch.parse::<u64>().map_err(|_| {
-        format!(
-            "{CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV} must be a positive base-10 integer"
-        )
-    })?;
-    if minimum_authority_epoch == 0 {
-        return Err(format!(
-            "{CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV} must be a positive base-10 integer"
-        ));
-    }
+    let minimum_authority_epoch = parse_positive_exact_json_integer(
+        CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV,
+        &minimum_authority_epoch,
+    )?;
 
     Ok(Some(StartupTrustCheckpointAuthorityPins {
         socket_path: PathBuf::from(socket_path),
@@ -2070,6 +2285,155 @@ fn optional_trust_checkpoint_authority(
         public_key_base64,
         public_key_fingerprint,
         minimum_authority_epoch,
+    }))
+}
+
+fn optional_deployed_workload_attestation(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupDeployedWorkloadAttestationPins>, String> {
+    let socket_path = optional_unicode(get, DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV)?;
+    let authority_id = optional_unicode(get, DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID_ENV)?;
+    let key_id = optional_unicode(get, DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 =
+        optional_unicode(get, DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV)?;
+    let public_key_fingerprint = optional_unicode(
+        get,
+        DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch =
+        optional_unicode(get, DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV)?;
+    let measurement_profile_id = optional_unicode(
+        get,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID_ENV,
+    )?;
+    let measurement_profile_version = optional_unicode(
+        get,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV,
+    )?;
+    let measurement_profile_digest = optional_unicode(
+        get,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV,
+    )?;
+    let workload_id = optional_unicode(get, EXPECTED_WORKLOAD_ID_ENV)?;
+
+    let any_present = [
+        socket_path.as_ref(),
+        authority_id.as_ref(),
+        key_id.as_ref(),
+        public_key_base64.as_ref(),
+        public_key_fingerprint.as_ref(),
+        minimum_authority_epoch.as_ref(),
+        measurement_profile_id.as_ref(),
+        measurement_profile_version.as_ref(),
+        measurement_profile_digest.as_ref(),
+        workload_id.as_ref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if !any_present {
+        return Ok(None);
+    }
+
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| {
+            format!(
+                "{name} is required when any deployed-workload attestation binding is configured"
+            )
+        })
+    };
+    let socket_path = required(socket_path, DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV)?;
+    let authority_id = required(authority_id, DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID_ENV)?;
+    let key_id = required(key_id, DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 = required(
+        public_key_base64,
+        DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+    )?;
+    let public_key_fingerprint = required(
+        public_key_fingerprint,
+        DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch = required(
+        minimum_authority_epoch,
+        DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+    )?;
+    let measurement_profile_id = required(
+        measurement_profile_id,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID_ENV,
+    )?;
+    let measurement_profile_version = required(
+        measurement_profile_version,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV,
+    )?;
+    let measurement_profile_digest = required(
+        measurement_profile_digest,
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV,
+    )?;
+    let workload_id = required(workload_id, EXPECTED_WORKLOAD_ID_ENV)?;
+
+    validate_absolute_socket_path(DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV, &socket_path)?;
+    validate_namespaced_id(
+        DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID_ENV,
+        &authority_id,
+        "deployed-workload-attestation-authority:",
+    )?;
+    validate_namespaced_id(
+        DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID_ENV,
+        &key_id,
+        "deployed-workload-attestation-key:",
+    )?;
+    validate_namespaced_id(
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID_ENV,
+        &measurement_profile_id,
+        "deployed-workload-measurement-profile:",
+    )?;
+    validate_namespaced_id(EXPECTED_WORKLOAD_ID_ENV, &workload_id, "workload:")?;
+    validate_digest_pin(
+        DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+        &public_key_fingerprint,
+    )?;
+    validate_digest_pin(
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV,
+        &measurement_profile_digest,
+    )?;
+    let public_key = BASE64_STANDARD
+        .decode(&public_key_base64)
+        .map_err(|_| {
+            format!(
+                "{DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+            )
+        })?;
+    if public_key.len() != ED25519_AUTHORITY_PUBLIC_KEY_BYTES
+        || BASE64_STANDARD.encode(&public_key) != public_key_base64
+    {
+        return Err(format!(
+            "{DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        ));
+    }
+    if raw_digest(&public_key) != public_key_fingerprint {
+        return Err(format!(
+            "{DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
+        ));
+    }
+    let minimum_authority_epoch = parse_positive_exact_json_integer(
+        DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+        &minimum_authority_epoch,
+    )?;
+    let measurement_profile_version = parse_positive_exact_json_integer(
+        DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV,
+        &measurement_profile_version,
+    )?;
+
+    Ok(Some(StartupDeployedWorkloadAttestationPins {
+        socket_path: PathBuf::from(socket_path),
+        authority_id,
+        key_id,
+        public_key_base64,
+        public_key_fingerprint,
+        minimum_authority_epoch,
+        measurement_profile_id,
+        measurement_profile_version,
+        measurement_profile_digest,
+        workload_id,
     }))
 }
 
@@ -2101,9 +2465,18 @@ fn optional_production_build_manifest(
 
 fn validate_absolute_socket_path(name: &str, raw: &str) -> Result<(), String> {
     let path = Path::new(raw);
-    if raw.len() > 1024
+    let components_are_lexically_normal = raw.strip_prefix('/').is_some_and(|suffix| {
+        !suffix.is_empty()
+            && !suffix
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    });
+    if raw.len() > MAX_AUTHORITY_SOCKET_PATH_BYTES
         || !path.is_absolute()
+        || path.file_name().is_none()
+        || raw.as_bytes().contains(&0)
         || raw.contains('\\')
+        || !components_are_lexically_normal
         || path
             .components()
             .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
@@ -2113,6 +2486,20 @@ fn validate_absolute_socket_path(name: &str, raw: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn parse_positive_exact_json_integer(name: &str, raw: &str) -> Result<u64, String> {
+    let value = raw.parse::<u64>().map_err(|_| {
+        format!(
+            "{name} must be a canonical positive base-10 integer no larger than {MAX_EXACT_JSON_INTEGER}"
+        )
+    })?;
+    if value == 0 || value > MAX_EXACT_JSON_INTEGER || value.to_string() != raw {
+        return Err(format!(
+            "{name} must be a canonical positive base-10 integer no larger than {MAX_EXACT_JSON_INTEGER}"
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_json_absolute_path(name: &str, raw: &str) -> Result<(), String> {
@@ -4318,7 +4705,7 @@ mod tests {
         document_bytes: &BTreeMap<String, Vec<u8>>,
         registry_locator: &str,
     ) -> VerifiedConformanceTrustCheckpoint {
-        let checkpoint_key = SigningKey::from_bytes(&[91u8; 32]);
+        let checkpoint_key = SigningKey::from_bytes(&rand::random());
         let checkpoint_public_key = checkpoint_key.verifying_key().to_bytes();
         let checkpoint_fingerprint = raw_digest(&checkpoint_public_key);
         let authority = ConformanceCheckpointAuthorityAnchor {
@@ -4627,6 +5014,7 @@ mod tests {
                 conformance_trust_root_registry_path: PathBuf::from(TRUST_ROOT_REGISTRY_PATH),
                 conformance_trust_root_registry_digest: trust_root_registry_digest,
                 conformance_trust_checkpoint_authority: None,
+                deployed_workload_attestation: None,
                 production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
@@ -4913,7 +5301,7 @@ mod tests {
             );
         }
 
-        let checkpoint_key = SigningKey::from_bytes(&[41u8; 32]);
+        let checkpoint_key = SigningKey::from_bytes(&rand::random());
         let checkpoint_public_key =
             BASE64_STANDARD.encode(checkpoint_key.verifying_key().to_bytes());
         let checkpoint_fingerprint = raw_digest(&checkpoint_key.verifying_key().to_bytes());
@@ -4996,9 +5384,67 @@ mod tests {
             PRODUCTION_BUILD_MANIFEST_DIGEST_ENV.into(),
             OsString::from(&digest),
         );
+        assert!(
+            StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
+                .unwrap_err()
+                .contains(DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV)
+        );
+
+        let workload_key = SigningKey::from_bytes(&rand::random());
+        let workload_public_key = BASE64_STANDARD.encode(workload_key.verifying_key().to_bytes());
+        let workload_fingerprint = raw_digest(&workload_key.verifying_key().to_bytes());
+        let workload_group = [
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV,
+                "/run/ryuki/workload-attestation/authority.sock".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID_ENV,
+                "deployed-workload-attestation-authority:runtime-test".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID_ENV,
+                "deployed-workload-attestation-key:runtime-test".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+                workload_public_key,
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+                workload_fingerprint,
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+                "11".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID_ENV,
+                "deployed-workload-measurement-profile:runtime-test".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV,
+                "3".to_string(),
+            ),
+            (
+                DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV,
+                digest.clone(),
+            ),
+            (EXPECTED_WORKLOAD_ID_ENV, "workload:ryuki-api".to_string()),
+        ];
+        for (name, value) in &workload_group {
+            production_complete.insert((*name).into(), OsString::from(value));
+        }
         let production_pins =
             StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
                 .expect("production pins are complete");
+        let workload_pins = production_pins
+            .deployed_workload_attestation
+            .as_ref()
+            .expect("production workload attestation binding");
+        assert_eq!(workload_pins.minimum_authority_epoch, 11);
+        assert_eq!(workload_pins.measurement_profile_version, 3);
+        assert_eq!(workload_pins.workload_id, "workload:ryuki-api");
         let build_pins = production_pins
             .production_build_manifest
             .expect("production build manifest binding");
@@ -5019,6 +5465,26 @@ mod tests {
         })
         .unwrap_err()
         .contains("production-only"));
+
+        let mut nonproduction_with_workload = values.clone();
+        for (name, value) in &workload_group {
+            nonproduction_with_workload.insert((*name).into(), OsString::from(value));
+        }
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_workload.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("production-only"));
+
+        for (missing, _) in &workload_group {
+            assert!(StartupSecurityPins::from_source(|name| {
+                (name != *missing)
+                    .then(|| production_complete.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err()
+            .contains(*missing));
+        }
 
         for missing in [
             PRODUCTION_BUILD_MANIFEST_PATH_ENV,
@@ -5049,6 +5515,44 @@ mod tests {
                     .contains("normalized absolute .json")
             );
         }
+        for invalid_counter in ["0", "03", "9007199254740992"] {
+            let mut invalid = production_complete.clone();
+            invalid.insert(
+                DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV.into(),
+                OsString::from(invalid_counter),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("canonical positive")
+            );
+        }
+        for invalid_socket in [
+            "run/ryuki/workload-attestation.sock".to_string(),
+            "/run//ryuki/workload-attestation.sock".to_string(),
+            format!("/run/{}.sock", "a".repeat(MAX_AUTHORITY_SOCKET_PATH_BYTES)),
+        ] {
+            let mut invalid = production_complete.clone();
+            invalid.insert(
+                DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV.into(),
+                OsString::from(invalid_socket),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("normalized absolute")
+            );
+        }
+        let mut mismatched_workload_key = production_complete.clone();
+        mismatched_workload_key.insert(
+            DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV.into(),
+            OsString::from(format!("sha256:{}", "b".repeat(64))),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| mismatched_workload_key.get(name).cloned())
+                .unwrap_err()
+                .contains("does not match")
+        );
         let mut zero_build_digest = production_complete;
         zero_build_digest.insert(
             PRODUCTION_BUILD_MANIFEST_DIGEST_ENV.into(),
@@ -5407,6 +5911,7 @@ mod tests {
             .await
             .expect("test startup remains a bounded local admission");
         assert!(context.verified_conformance_trust_checkpoint.is_none());
+        assert!(context.verified_deployed_workload.is_none());
         assert!(context.verified_conformance_documents.is_empty());
     }
 
@@ -5483,8 +5988,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn production_reconciliation_wires_random_request_transport_and_core_proof() {
-        let conformance_key = SigningKey::from_bytes(&[23u8; 32]);
-        let checkpoint_key = SigningKey::from_bytes(&[91u8; 32]);
+        let conformance_key = SigningKey::from_bytes(&rand::random());
+        let checkpoint_key = SigningKey::from_bytes(&rand::random());
         let checkpoint_public_key = checkpoint_key.verifying_key().to_bytes();
         let checkpoint_fingerprint = raw_digest(&checkpoint_public_key);
         let mut fixture = ActiveFixture::build();
@@ -5583,6 +6088,8 @@ mod tests {
 
         let server_documents = documents.clone();
         let server_document_bytes = document_bytes.clone();
+        let server_checkpoint_key = checkpoint_key.clone();
+        let server_conformance_key = conformance_key.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut header = [0u8; 4];
@@ -5603,8 +6110,8 @@ mod tests {
             let response = checkpoint_response(
                 &request,
                 &raw_digest(&request),
-                &checkpoint_key,
-                &conformance_key,
+                &server_checkpoint_key,
+                &server_conformance_key,
                 &server_documents,
                 &server_document_bytes,
                 TRUST_ROOT_REGISTRY_PATH,
@@ -5654,13 +6161,15 @@ mod tests {
             verified_conformance_trust_checkpoint: Some(checkpoint),
             verified_conformance_documents: verified,
             verified_conformance_production_root: Some(verified_root),
+            verified_deployed_workload: None,
             production_build_manifest: None,
             active_providers: BTreeMap::new(),
             provider_registry_applicability: empty_provider_registry_applicability(&profile),
         };
-        context
+        let missing_workload = context
             .validate_serving_checkpoint_freshness(fixed_now())
-            .expect("fresh proof must survive the final listener fence");
+            .expect_err("checkpoint proof alone cannot survive the final listener fence");
+        assert!(missing_workload.contains("no verified deployed-workload proof"));
         let runtime_block = context
             .validate_runtime_bindings(&RyukiConfig::default(), false, fixed_now())
             .expect_err("runtime binding remains blocked after current-root verification");
@@ -5675,7 +6184,7 @@ mod tests {
         let expiring_checkpoint = verified_checkpoint_for_documents(
             finalization_lineage,
             &profile,
-            &SigningKey::from_bytes(&[23u8; 32]),
+            &conformance_key,
             &documents,
             &document_bytes,
             TRUST_ROOT_REGISTRY_PATH,
@@ -5697,6 +6206,7 @@ mod tests {
         let error = finalize_startup_security_contract(
             expiring_prepared,
             Some(expiring_checkpoint),
+            None,
             || {
                 time_sample += 1;
                 if time_sample == 1 {
@@ -5981,7 +6491,7 @@ mod tests {
         // Exercise the cryptographic stage in isolation. Full production startup
         // remains intentionally unreachable earlier in reference traversal until
         // topology, egress, and retention artifacts have embedded trusted schemas.
-        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let key = SigningKey::from_bytes(&rand::random());
         let mut fixture = ActiveFixture::build();
         let mut profile_value: Value = serde_json::from_slice(
             &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
@@ -6207,7 +6717,7 @@ mod tests {
 
     #[test]
     fn production_signature_stage_selects_the_exact_two_version_lineage_head() {
-        let key = SigningKey::from_bytes(&[29u8; 32]);
+        let key = SigningKey::from_bytes(&rand::random());
         let mut fixture = ActiveFixture::build();
         let mut profile_value: Value = serde_json::from_slice(
             &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),

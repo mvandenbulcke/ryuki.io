@@ -24553,7 +24553,8 @@ mod step_authoring_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+        let cp_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        crate::cp_identity::init_cp_key_for_test(cp_key.clone());
         let admin = admin_session("step-author-la-guard");
 
         let Ok(Json(created)) = requests_create(
@@ -24570,7 +24571,6 @@ mod step_authoring_db_tests {
         // Directly exercise the shared minting choke point (this is what
         // requests_approve_live_apply delegates to once it has a completed
         // plan+grant; the guard fires before any of that machinery matters).
-        let cp_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
             offering_id: Uuid::new_v4(),
@@ -24640,7 +24640,8 @@ mod step_authoring_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+        let cp_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        crate::cp_identity::init_cp_key_for_test(cp_key.clone());
         let admin = admin_session("step-author-la-normal");
 
         let Ok(Json(created)) = requests_create(
@@ -24654,7 +24655,6 @@ mod step_authoring_db_tests {
         let id_str = created["id"].as_str().expect("id").to_string();
         let id = Uuid::parse_str(&id_str).expect("uuid");
 
-        let cp_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let spec = ryuki_protocol::JobSpec {
             request_id: id,
             offering_id: Uuid::new_v4(),
@@ -67045,7 +67045,9 @@ mod db_lifecycle_tests {
             return;
         };
         // Idempotent test init of the process-global CP signing key.
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
+            &rand::random(),
+        ));
         let admin = admin_session("approver-la");
         let requester = admin_session("requester-la");
         let p = |s: &str| Path(s.to_string());
@@ -67334,7 +67336,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
+            &rand::random(),
+        ));
         let (req_id, step_id, plan_agent_id, reviewed_selection) =
             seed_b1b_step_request(pool, "AwaitingApproval", "orig-requester").await;
 
@@ -67402,7 +67406,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
+            &rand::random(),
+        ));
         let (req_id, _step_id, plan_agent_id, reviewed_selection) =
             seed_b1b_step_request(pool, "AwaitingApproval", "self-approver").await;
 
@@ -67452,7 +67458,9 @@ mod db_lifecycle_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(
+            &rand::random(),
+        ));
         // Step is still Planning (its LivePlan hasn't completed) -> not approvable.
         let (req_id, _step_id, plan_agent_id, reviewed_selection) =
             seed_b1b_step_request(pool, "Planning", "orig-requester").await;

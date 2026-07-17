@@ -150,6 +150,14 @@ conformance trust-checkpoint socket, authority id, Ed25519 key id/public
 key/fingerprint, and minimum authority epoch described below. Those checkpoint
 bindings must be delivered through a separately governed workload/deployment
 trust channel, never through the rollbackable security-contract root.
+The complete deployed-workload attestation binding described below is a third
+production prerequisite alongside the build-manifest and checkpoint bindings.
+All ten values, including `RYUKI_EXPECTED_WORKLOAD_ID`, are complete-or-none,
+independently pinned, and production-only; development and test must leave them
+unset. Startup sends one request containing a fresh nonce, computes the digest
+of its exact canonical bytes, then accepts only the pinned authority's short-
+lived signed response that echoes both values, so an attestation cannot be
+replayed as a later admission.
 The checked-in `implementation_only` fixtures are validation inputs and cannot
 start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
 before using the API command above; no runnable digest is inferred from Git.
@@ -247,6 +255,16 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_BASE64` | Canonical Base64 of the independently provisioned raw 32-byte Ed25519 checkpoint public key |
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT` | Independently pinned SHA-256 fingerprint of those decoded public-key bytes |
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH` | Minimum independently accepted checkpoint authority fencing epoch |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET` | Production-only normalized absolute Unix-socket path with a file name, no NUL, and at most 103 path bytes; configure with the complete attestation group |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID` | Production-only independently pinned id beginning `deployed-workload-attestation-authority:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID` | Production-only independently pinned Ed25519 key id beginning `deployed-workload-attestation-key:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64` | Production-only canonical Base64 of exactly 32 raw Ed25519 authority public-key bytes |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Production-only nonzero `sha256:<64 lowercase hex>` fingerprint of those decoded public-key bytes |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH` | Production-only canonical positive base-10 independently accepted authority fencing epoch, at most 9,007,199,254,740,991 |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID` | Production-only independently pinned id beginning `deployed-workload-measurement-profile:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned measurement-profile version, at most 9,007,199,254,740,991 |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved measurement profile |
+| `RYUKI_EXPECTED_WORKLOAD_ID` | Production-only independently pinned `workload:` identity; part of the complete deployed-workload attestation binding |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -277,13 +295,19 @@ trust-domain/registry namespace. Startup is read-only: it never bootstraps,
 relocates, or advances the checkpoint. Exact compare-and-swap administration,
 authority recovery, and key/epoch rotation remain separately authorized
 operator workflows, not admission fallbacks.
-This checkpoint is only one production prerequisite. Production remains
-blocked even with a valid build-manifest binding: that binding pins build
-identity and a declared applicability candidate, but does not independently
-derive that universe, authenticate deployed OCI provenance, prove semantic
-conformance closure, or verify live runtime facts. Those blockers, plus the
-remaining normative boundary work packages, must be implemented and verified
-before production admission.
+The checkpoint, build-manifest binding, and independently pinned deployed-
+workload attestation are all production prerequisites. For the workload proof,
+startup sends one request containing a fresh unpredictable nonce, computes the
+digest of its exact canonical bytes, then accepts only a matching signed,
+short-lived response that echoes both values and binds the pinned authority,
+measurement profile, workload namespace, and exact requested deployed OCI
+subject and executable. For an OCI index, the
+authority-signed child-manifest resolution must also be internally consistent.
+The current startup verifies this proof and passes it toward the later exact
+deployment/provider applicability seal, but still exits at the explicit
+semantic-closure and live-runtime-guard blocker before completing that seal.
+Those blockers, plus the remaining normative boundary work packages, must be
+implemented and verified before production admission.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

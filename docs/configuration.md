@@ -42,11 +42,12 @@ and test deployments must leave both unset. The manifest independently pins the
 expected build identity and claims an implementation-applicability inventory.
 Startup independently derives that build-side inventory from the authenticated
 ControlTrace and measured build facts and requires exact equality. The loader
-also retains exact provider descriptors and the core can derive deployment/
-provider applicability from authenticated facts, but startup cannot seal that
-inventory until an independent deployed-OCI proof exists. Semantic conformance
-closure and verification of live runtime facts remain unconditional production
-blockers.
+also retains exact provider descriptors and derives deployment/provider
+applicability from authenticated facts. The independently pinned deployed-
+workload attestation below supplies the deployed-OCI and executable facts
+needed for a later exact seal. Current startup verifies and passes that proof
+toward the seal, but still exits at the explicit semantic-closure and live-
+runtime-guard blocker before completing it.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -62,6 +63,42 @@ Production additionally requires these external checkpoint bindings:
 All six values come from a separately governed workload/deployment trust
 channel. They must never be supplied by, inferred from, or stored only beside
 the rollbackable contract root, profile, registry, or conformance documents.
+
+Production also requires this independently pinned deployed-workload
+attestation binding:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID` | Independently pinned canonical id beginning `deployed-workload-attestation-authority:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID` | Independently pinned canonical Ed25519 key id beginning `deployed-workload-attestation-key:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64` | Canonical Base64 of exactly 32 raw Ed25519 public-key bytes |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Nonzero `sha256:<64 lowercase hex>` digest of those decoded public-key bytes |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH` | Canonical positive base-10 independently held minimum authority fencing epoch, at most 9,007,199,254,740,991 |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID` | Independently pinned canonical id beginning `deployed-workload-measurement-profile:` |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION` | Canonical positive base-10 independently pinned profile version, at most 9,007,199,254,740,991 |
+| `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the approved measurement profile |
+| `RYUKI_EXPECTED_WORKLOAD_ID` | Independently pinned canonical `workload:` identity expected in the attested namespace |
+
+These ten variables are one complete-or-none binding. Setting any one requires
+all the others, and the complete group is mandatory in production alongside
+the build-manifest pair and external checkpoint bindings. Development and test
+deployments must leave all ten unset. Provision the authority, key,
+fingerprint, measurement profile, and expected workload through an independent
+deployment trust channel; startup never learns a pin from the contract root,
+build manifest, or attestation response.
+
+For each production admission, startup creates a fresh unpredictable 32-byte
+nonce, sends it in one bounded request, and computes the digest of the request's
+exact canonical bytes. It accepts only a corresponding domain-separated
+Ed25519 response that exactly echoes that nonce and digest; matches the pinned
+deployment and workload, the checkpoint-bound trust domain, and the pinned
+authority, key, epoch floor, and measurement profile; and prove a current,
+running, reconciled peer whose deployed OCI subject and executable match the
+measured build facts. For an OCI index, the authority-signed child-manifest
+resolution must be internally consistent. The short-lived proof remains bound
+to that one admission and cannot be replayed or reused as authority for a later
+startup.
 
 The deployment, profile, and trust-root-registry pins come from process
 configuration, not from the documents being admitted. Preflight verifies the
@@ -103,10 +140,10 @@ operator workflows.
 
 Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
-authority, and cannot start the API or migration runner. A valid external
-build-manifest binding still cannot start production until trusted semantic
-conformance closure and live runtime facts can be verified. The proving ground
-likewise requires a separately reviewed active
+authority, and cannot start the API or migration runner. Even valid checkpoint,
+build-manifest, and deployed-workload bindings cannot start production until
+trusted semantic conformance closure and the remaining live runtime facts can
+be verified. The proving ground likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.
 

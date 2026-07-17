@@ -76,14 +76,32 @@ value over the manifest's exact raw bytes. Production also requires
 separately governed workload/deployment trust channel, never from the
 rollbackable contract root. Startup only reconciles exact head version, raw
 digest, and locator; it cannot bootstrap or auto-advance authority state.
+Production also requires the complete deployed-workload attestation binding:
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_SOCKET`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_AUTHORITY_ID`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_KEY_ID`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_BASE64`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_PUBLIC_KEY_FINGERPRINT`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MIN_AUTHORITY_EPOCH`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_ID`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION`,
+`RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST`, and
+`RYUKI_EXPECTED_WORKLOAD_ID`. These ten independently pinned values are
+complete-or-none and mandatory alongside the build-manifest and checkpoint
+bindings; development and test must leave all ten unset. Startup sends one
+request containing a fresh nonce to the pinned Unix-socket authority, computes
+the digest of the exact canonical request bytes, and accepts only a short-lived
+Ed25519 response that echoes both values, so the proof cannot be replayed as a
+later admission.
 The build manifest pins expected build identity and claims an implementation-
 applicability inventory; startup independently derives that build-side
 inventory from the authenticated ControlTrace and measured build facts and
-requires exact equality. The loader also retains exact provider descriptors and
-the core can derive deployment/provider applicability from authenticated facts,
-but startup cannot seal that inventory until an independent deployed-OCI proof
-exists. It also does not yet establish semantic conformance closure or verify
-live runtime facts. Those remain production blockers.
+requires exact equality. The workload response independently proves the exact
+deployed OCI subject and executable; for an OCI index, the authority-signed
+child-manifest resolution must also be internally consistent. Current startup
+verifies and passes that proof toward the later exact deployment/provider
+applicability seal, but still exits at the explicit semantic-closure and live-
+runtime-guard blocker before completing it.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 
