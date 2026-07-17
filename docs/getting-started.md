@@ -98,10 +98,13 @@ applicability inventory; startup independently derives that build-side
 inventory from the authenticated ControlTrace and measured build facts and
 requires exact equality. The workload response independently proves the exact
 deployed OCI subject and executable; for an OCI index, the authority-signed
-child-manifest resolution must also be internally consistent. Current startup
-verifies and passes that proof toward the later exact deployment/provider
-applicability seal, but still exits at the explicit semantic-closure and live-
-runtime-guard blocker before completing it.
+child-manifest resolution must also be internally consistent. Startup now
+derives the complete implementation-plus-deployment applicability inventory,
+verifies exact semantic closure, and consumes the checkpoint, current SB-9
+root, authenticated documents, pinned profile/build, and workload proof into
+one non-cloneable production-boundary proof. It still exits before migrations,
+workers, routing, or listeners until all eight receipt-bound live runtime guard
+witnesses are verified; that witness verifier is not yet implemented.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

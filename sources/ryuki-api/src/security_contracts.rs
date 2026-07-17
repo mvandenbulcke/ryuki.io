@@ -20,6 +20,11 @@ use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
 use rand::{rngs::OsRng, RngCore};
 use ryuki_core::config::{AuthMode, RyukiConfig};
+use ryuki_core::conformance_closure::{
+    derive_production_conformance_closure_context, verify_control_trace_artifact,
+    verify_production_conformance_closure, ProductionConformanceClosureInputs,
+    VerifiedConformanceClosure,
+};
 use ryuki_core::conformance_trust::{
     ConformanceArtifactCandidate, ConformanceCheckpointAuthorityAnchor,
     ConformanceProductionRootRef, ConformanceRegistryArtifact, ConformanceTrustAnchor,
@@ -38,7 +43,8 @@ use ryuki_core::production_build::{
 };
 use ryuki_core::production_deployment_applicability::{
     ActiveProviderApplicabilityClaim, ActiveProviderRegistryApplicabilityClaim,
-    ProviderMandatoryBaselineClaim,
+    DeploymentCheckpointApplicabilityClaim, ProductionDeploymentApplicabilityClaims,
+    ProviderMandatoryBaselineClaim, SecurityLimitApplicabilityClaim,
 };
 use ryuki_core::security_profile::{
     ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, ProviderLifecycleState,
@@ -479,29 +485,146 @@ impl fmt::Debug for PinnedProductionBuildManifest {
     }
 }
 
+/// Non-cloneable proof that semantic conformance, the measured running build,
+/// the exact pinned profile bytes, and the independently attested deployed
+/// workload are one production identity.
+///
+/// This is deliberately still not serving authority: the later runtime
+/// admission layer must consume it together with all eight receipt-bound live
+/// guard witnesses.
+pub(crate) struct VerifiedProductionBoundary {
+    conformance: VerifiedConformanceClosure,
+    deployed_workload: VerifiedDeployedWorkload,
+    pinned_build: PinnedProductionBuildManifest,
+    profile_raw_bytes: Box<[u8]>,
+    profile_raw_digest: String,
+}
+
+impl fmt::Debug for VerifiedProductionBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedProductionBoundary")
+            .field("closure_digest", &self.conformance.closure_digest())
+            .field("deployment_id", &self.conformance.deployment_id())
+            .field("trust_domain_id", &self.conformance.trust_domain_id())
+            .field("source_revision", &self.conformance.source_revision())
+            .field("artifact_digest", &self.conformance.artifact_digest())
+            .field("build_manifest_raw_digest", &self.pinned_build.raw_digest)
+            .field("profile_raw_digest", &self.profile_raw_digest)
+            .field("profile_byte_len", &self.profile_raw_bytes.len())
+            .field(
+                "workload_response_digest",
+                &self.deployed_workload.response_digest(),
+            )
+            .field(
+                "semantic_valid_until",
+                &self.conformance.semantic_valid_until(),
+            )
+            .field(
+                "workload_valid_until",
+                &self.deployed_workload.valid_until(),
+            )
+            .finish()
+    }
+}
+
+impl VerifiedProductionBoundary {
+    fn seal(
+        conformance: VerifiedConformanceClosure,
+        deployed_workload: VerifiedDeployedWorkload,
+        pinned_build: PinnedProductionBuildManifest,
+        profile_raw_bytes: Box<[u8]>,
+        profile_raw_digest: String,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<Self, String> {
+        if profile_raw_bytes.is_empty()
+            || raw_digest(&profile_raw_bytes) != profile_raw_digest
+            || conformance.deployment_profile_raw_digest() != profile_raw_digest
+        {
+            return Err(
+                "production boundary profile bytes differ from the independent startup digest pin"
+                    .into(),
+            );
+        }
+        let exact_profile_value = parse_json_strict(&profile_raw_bytes)
+            .map_err(|error| format!("production boundary profile JSON is invalid: {error}"))?;
+        let exact_profile: DeploymentSecurityProfile = serde_json::from_value(exact_profile_value)
+            .map_err(|error| {
+                format!("production boundary profile is not losslessly typed: {error}")
+            })?;
+        if conformance.deployment_profile() != &exact_profile {
+            return Err(
+                "semantic closure deployment profile differs from the exact pinned profile bytes"
+                    .into(),
+            );
+        }
+        if conformance.production_build_manifest() != &pinned_build.document {
+            return Err(
+                "semantic closure build manifest differs from the exact pinned build manifest"
+                    .into(),
+            );
+        }
+        if conformance.deployment_id() != deployed_workload.deployment_id()
+            || conformance.trust_domain_id() != deployed_workload.trust_domain_id()
+            || conformance.source_revision() != pinned_build.document.source.revision
+            || conformance.artifact_digest() != pinned_build.document.oci_subject.content_digest
+            || deployed_workload.oci_subject_kind()
+                != pinned_build.document.oci_subject.subject_kind
+            || deployed_workload.oci_repository() != pinned_build.document.oci_subject.repository
+            || deployed_workload.oci_subject_digest()
+                != pinned_build.document.oci_subject.content_digest
+            || deployed_workload.runtime_executable_digest()
+                != pinned_build.document.runtime_executable.content_digest
+            || deployed_workload.runtime_executable_byte_length()
+                != pinned_build.document.runtime_executable.byte_length
+        {
+            return Err(
+                "semantic closure, pinned build, and deployed-workload proof do not identify one exact production workload"
+                    .into(),
+            );
+        }
+        conformance
+            .ensure_fresh(trusted_now)
+            .map_err(|error| format!("production semantic closure is stale: {error}"))?;
+        deployed_workload
+            .ensure_fresh(trusted_now)
+            .map_err(|error| format!("production deployed-workload proof is stale: {error}"))?;
+        Ok(Self {
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+        })
+    }
+
+    fn ensure_fresh(&self, trusted_now: ConformanceTrustedTimeWindow) -> Result<(), String> {
+        self.conformance
+            .ensure_fresh(trusted_now)
+            .map_err(|error| format!("production semantic closure is no longer fresh: {error}"))?;
+        self.deployed_workload
+            .ensure_fresh(trusted_now)
+            .map_err(|error| {
+                format!("production deployed-workload proof is no longer fresh: {error}")
+            })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ConformanceState {
+    NonProduction,
+    Production(Box<VerifiedProductionBoundary>),
+}
+
 #[derive(Debug)]
 pub(crate) struct SecurityContractContext {
     pub(crate) profile: DeploymentSecurityProfile,
     pub(crate) profile_digest: String,
     pub(crate) contract_root: PathBuf,
     pub(crate) profile_path: PathBuf,
-    /// Opaque evidence that this process reconciled its exact local registry
-    /// lineage against the independently governed monotonic authority. This is
-    /// never constructed from local contract/configuration state.
-    pub(crate) verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
-    pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceArtifact>,
-    /// Opaque binding between the exact profile-selected SB-9 receipt and the
-    /// independently asserted current root in the same checkpoint snapshot.
-    pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
-    /// Short-lived, nonce-bound proof that an independently pinned authority
-    /// measured this exact running peer as the manifest-selected OCI workload.
-    /// This remains insufficient for production admission without semantic
-    /// conformance closure and the complete live runtime-guard witness set.
-    pub(crate) verified_deployed_workload: Option<VerifiedDeployedWorkload>,
-    /// Exact build identity plus detached, independently derived implementation
-    /// applicability. Present only for production; it is not deployment/provider
-    /// applicability, semantic receipt closure, or deployed-OCI proof.
-    pub(crate) production_build_manifest: Option<PinnedProductionBuildManifest>,
+    /// Production owns one indivisible proof aggregate. Non-production cannot
+    /// retain detached production proof parts.
+    pub(crate) conformance_state: ConformanceState,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     /// Lossless, non-authoritative projection retained for independent
@@ -513,6 +636,7 @@ pub(crate) struct SecurityContractContext {
 #[derive(Debug)]
 struct PreparedSecurityContract {
     profile: DeploymentSecurityProfile,
+    profile_raw_bytes: Box<[u8]>,
     profile_digest: String,
     contract_root: PathBuf,
     profile_path: PathBuf,
@@ -533,27 +657,12 @@ impl SecurityContractContext {
         if !self.profile.security_profile.is_production() {
             return Ok(());
         }
-        let checkpoint = self
-            .verified_conformance_trust_checkpoint
-            .as_ref()
-            .ok_or_else(|| {
-                "production serving startup has no externally reconciled conformance checkpoint proof"
-                    .to_string()
-            })?;
-        checkpoint
-            .ensure_fresh(trusted_time_point(now))
-            .map_err(|error| {
-                format!("production conformance checkpoint is no longer fresh: {error}")
-            })?;
-        self.verified_deployed_workload
-            .as_ref()
-            .ok_or_else(|| {
-                "production serving startup has no verified deployed-workload proof".to_string()
-            })?
-            .ensure_fresh(trusted_time_point(now))
-            .map_err(|error| {
-                format!("production deployed-workload proof is no longer fresh: {error}")
-            })
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err(
+                "production serving startup has no sealed production-boundary proof".into(),
+            );
+        };
+        boundary.ensure_fresh(trusted_time_point(now))
     }
 
     pub(crate) fn validate_runtime_bindings(
@@ -563,77 +672,21 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if self.profile.security_profile.is_production() {
-            let verified_document_count = self.verified_conformance_documents.len()
-                + usize::from(self.verified_conformance_production_root.is_some());
-            let checkpoint = self
-                .verified_conformance_trust_checkpoint
-                .as_ref()
-                .map(|proof| {
-                    format!(
-                        "authority {} epoch {} revision {} checkpoint {}",
-                        proof.authority_id(),
-                        proof.authority_epoch(),
-                        proof.authority_revision(),
-                        proof.checkpoint_sequence()
-                    )
-                })
-                .unwrap_or_else(|| "no external checkpoint proof".into());
-            let production_root = self
-                .verified_conformance_production_root
-                .as_ref()
-                .map(|root| {
-                    format!(
-                        "current SB-9 root {} version {} at {} (acceptance {} sequence {}, checkpoint {}, revision {})",
-                        root.document_id(),
-                        root.document_version(),
-                        root.artifact_locator(),
-                        root.acceptance_record_id(),
-                        root.acceptance_sequence(),
-                        root.checkpoint_sequence(),
-                        root.authority_revision(),
-                    )
-                })
-                .unwrap_or_else(|| "no externally current SB-9 root proof".into());
-            let build_manifest = self
-                .production_build_manifest
-                .as_ref()
-                .map(|manifest| {
-                    format!(
-                        "build manifest {} version {} digest {}",
-                        manifest.document.document_id,
-                        manifest.document.document_version,
-                        manifest.raw_digest,
-                    )
-                })
-                .unwrap_or_else(|| "no pinned production build manifest".into());
-            let deployed_workload = self
-                .verified_deployed_workload
-                .as_ref()
-                .map(|proof| {
-                    format!(
-                        "workload {} measured by {} epoch {} revision {} through profile {}@{}",
-                        proof.workload_id(),
-                        proof.authority_id(),
-                        proof.authority_epoch(),
-                        proof.authority_revision(),
-                        proof.measurement_profile_id(),
-                        proof.measurement_profile_version(),
-                    )
-                })
-                .unwrap_or_else(|| "no verified deployed-workload proof".into());
+            let ConformanceState::Production(boundary) = &self.conformance_state else {
+                return Err("production startup has no sealed production-boundary proof".into());
+            };
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {}; {}; {} signed closure documents authenticated; semantic closure and live runtime facts remain unavailable)",
-                checkpoint,
-                production_root,
-                build_manifest,
-                deployed_workload,
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}); startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified",
+                boundary.conformance.closure_digest(),
+                boundary.conformance.package_count(),
+                boundary.conformance.evidence_count(),
+                boundary.deployed_workload.workload_id(),
                 provider_applicability,
-                verified_document_count,
             ));
         }
 
@@ -1029,6 +1082,7 @@ fn prepare_startup_security_contract(
 
     Ok(PreparedSecurityContract {
         profile,
+        profile_raw_bytes: profile_bytes.into_boxed_slice(),
         profile_digest: actual_profile_digest,
         contract_root: store.root,
         profile_path: pins.profile_path.clone(),
@@ -1574,7 +1628,6 @@ fn finalize_startup_security_contract(
         &prepared.profile,
         trusted_now(),
     )?;
-    let verified_document_count = verified_conformance_documents.len();
     let verified_conformance_production_root = if prepared.profile.security_profile.is_production()
     {
         let checkpoint = verified_conformance_trust_checkpoint
@@ -1598,24 +1651,144 @@ fn finalize_startup_security_contract(
     } else {
         None
     };
-    reject_incomplete_production_startup(
-        &prepared.profile,
-        verified_document_count,
-        &prepared.provider_registry_applicability,
-    )?;
+
+    let conformance_state = if prepared.profile.security_profile.is_production() {
+        let checkpoint = verified_conformance_trust_checkpoint.ok_or_else(|| {
+            "production startup lost its verified conformance checkpoint before semantic closure"
+                .to_string()
+        })?;
+        let production_root = verified_conformance_production_root.ok_or_else(|| {
+            "production startup lost its verified current SB-9 root before semantic closure"
+                .to_string()
+        })?;
+        let deployed_workload = verified_deployed_workload.ok_or_else(|| {
+            "production startup lost its verified deployed-workload proof before semantic closure"
+                .to_string()
+        })?;
+        let pinned_build = prepared.production_build_manifest.take().ok_or_else(|| {
+            "production startup lost its pinned build manifest before semantic closure".to_string()
+        })?;
+        let control_trace_bytes = prepared
+            .raw_document_bytes
+            .remove(&prepared.profile.control_trace_ref.artifact_locator)
+            .ok_or_else(|| {
+                "production semantic closure has no exact ControlTrace bytes".to_string()
+            })?;
+        let control_trace =
+            verify_control_trace_artifact(&prepared.profile.control_trace_ref, control_trace_bytes)
+                .map_err(|error| format!("production ControlTrace proof is invalid: {error}"))?;
+        let security_limit_profile = security_limit_applicability_claim(&prepared)?;
+        let deployment_claims = ProductionDeploymentApplicabilityClaims {
+            checkpoints: vec![DeploymentCheckpointApplicabilityClaim {
+                trust_domain_id: checkpoint.trust_domain_id().to_owned(),
+                authority_id: checkpoint.authority_id().to_owned(),
+                authority_epoch: checkpoint.authority_epoch(),
+                sequence: checkpoint.checkpoint_sequence(),
+                trust_registry_digest: checkpoint.registry_digest().to_owned(),
+                trust_registry_locator: checkpoint.registry_locator().to_owned(),
+            }],
+            provider_registry: prepared.provider_registry_applicability.clone(),
+            security_limit_profile,
+            deployed_artifact: deployed_workload.applicability_claim(),
+        };
+        let derived_context = derive_production_conformance_closure_context(
+            &pinned_build.document,
+            &prepared.profile,
+            &deployment_claims,
+            &prepared.profile_raw_bytes,
+        )
+        .map_err(|error| format!("production conformance closure context is invalid: {error}"))?;
+        let verification_started_at = trusted_now();
+        let conformance = verify_production_conformance_closure(
+            checkpoint,
+            production_root,
+            verified_conformance_documents.into_values().collect(),
+            control_trace,
+            ProductionConformanceClosureInputs {
+                manifest: &pinned_build.document,
+                profile: &prepared.profile,
+                deployment_claims: &deployment_claims,
+                context: &derived_context,
+            },
+            trusted_time_point(verification_started_at),
+        )
+        .map_err(|error| format!("production semantic conformance closure failed: {error}"))?;
+        let verification_finished_at = trusted_now();
+        let final_semantic_time =
+            semantic_verification_window(verification_started_at, verification_finished_at)?;
+        ConformanceState::Production(Box::new(VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            std::mem::take(&mut prepared.profile_raw_bytes),
+            prepared.profile_digest.clone(),
+            final_semantic_time,
+        )?))
+    } else {
+        if verified_conformance_trust_checkpoint.is_some()
+            || verified_conformance_production_root.is_some()
+            || verified_deployed_workload.is_some()
+            || prepared.production_build_manifest.is_some()
+            || !verified_conformance_documents.is_empty()
+        {
+            return Err(
+                "non-production startup cannot retain detached production proof parts".into(),
+            );
+        }
+        ConformanceState::NonProduction
+    };
+
+    reject_incomplete_runtime_guard_admission(&conformance_state)?;
 
     Ok(SecurityContractContext {
         profile: prepared.profile,
         profile_digest: prepared.profile_digest,
         contract_root: prepared.contract_root,
         profile_path: prepared.profile_path,
-        verified_conformance_trust_checkpoint,
-        verified_conformance_documents,
-        verified_conformance_production_root,
-        verified_deployed_workload,
-        production_build_manifest: prepared.production_build_manifest,
+        conformance_state,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
+    })
+}
+
+fn security_limit_applicability_claim(
+    prepared: &PreparedSecurityContract,
+) -> Result<SecurityLimitApplicabilityClaim, String> {
+    let reference = &prepared.profile.security_limit_profile_ref;
+    let document = prepared
+        .documents
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile reference did not resolve to JSON".to_string())?;
+    let raw_bytes = prepared
+        .raw_document_bytes
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile has no exact raw bytes".to_string())?;
+    let traversed_digest = prepared
+        .reference_document_digests
+        .get(&reference.artifact_locator)
+        .ok_or_else(|| "security-limit profile has no verified traversal digest".to_string())?;
+    let exact_document = parse_json_strict(raw_bytes)
+        .map_err(|error| format!("security-limit profile JSON is invalid: {error}"))?;
+    if raw_digest(raw_bytes) != reference.content_digest
+        || traversed_digest != &reference.content_digest
+        || &exact_document != document
+        || document.get("contract_kind").and_then(Value::as_str) != Some("security-limit-profile")
+        || document.get("document_id").and_then(Value::as_str)
+            != Some(reference.document_id.as_str())
+        || document.get("document_version").and_then(Value::as_u64)
+            != Some(reference.document_version)
+    {
+        return Err(
+            "security-limit applicability claim differs from the exact profile-selected artifact"
+                .into(),
+        );
+    }
+    Ok(SecurityLimitApplicabilityClaim {
+        document_id: reference.document_id.clone(),
+        document_version: reference.document_version,
+        content_digest: reference.content_digest.clone(),
+        artifact_locator: reference.artifact_locator.clone(),
+        profile_version: required_u64(document, "profile_version", "security-limit profile")?,
     })
 }
 
@@ -1656,20 +1829,31 @@ fn trusted_time_point(now: DateTime<Utc>) -> ConformanceTrustedTimeWindow {
     }
 }
 
-fn reject_incomplete_production_startup(
-    profile: &DeploymentSecurityProfile,
-    verified_document_count: usize,
-    provider_registry: &ActiveProviderRegistryApplicabilityClaim,
-) -> Result<(), String> {
-    if profile.security_profile.is_production() {
-        Err(format!(
-            "production startup is blocked until trusted conformance receipts and runtime facts are verified ({verified_document_count} signed closure documents authenticated; provider registry version {} retained with {} active provider applicability claims; semantic closure and live runtime facts remain unavailable)",
-            provider_registry.registry_version,
-            provider_registry.active_providers.len(),
-        ))
-    } else {
-        Ok(())
+fn semantic_verification_window(
+    verification_started_at: DateTime<Utc>,
+    verification_finished_at: DateTime<Utc>,
+) -> Result<ConformanceTrustedTimeWindow, String> {
+    if verification_finished_at < verification_started_at {
+        return Err(
+            "trusted time moved backwards during production semantic closure verification".into(),
+        );
     }
+    Ok(ConformanceTrustedTimeWindow {
+        not_before: verification_started_at,
+        not_after: verification_finished_at,
+    })
+}
+
+fn reject_incomplete_runtime_guard_admission(
+    conformance_state: &ConformanceState,
+) -> Result<(), String> {
+    let ConformanceState::Production(boundary) = conformance_state else {
+        return Ok(());
+    };
+    Err(format!(
+        "production semantic closure {} is verified and sealed to the pinned build and deployed workload, but startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified",
+        boundary.conformance.closure_digest(),
+    ))
 }
 
 fn load_pinned_conformance_trust_root_registry(
@@ -4272,18 +4456,20 @@ mod tests {
     use std::io::Write;
 
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-    use chrono::TimeZone;
+    use chrono::{TimeDelta, TimeZone};
     use ed25519_dalek::{Signer, SigningKey};
     use ryuki_core::conformance_applicability::{
         ApplicabilityInventoryBinding, APPLICABILITY_IDENTITY_CONTRACT,
         APPLICABILITY_INVENTORY_CONTRACT,
     };
+    use ryuki_core::conformance_closure::tests::genuine_production_closure_fixture;
     use ryuki_core::conformance_trust::{
         canonical_json_bytes, conformance_signed_subject_digest, conformance_signing_bytes,
         CANONICALIZATION_PROFILE, CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN,
         SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
         TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
+    use ryuki_core::deployed_workload::tests::genuine_deployed_workload_fixture;
     use ryuki_core::production_applicability::derive_implementation_applicability;
     use ryuki_core::production_build::{
         BuildEndian, BuildSource, BuildTarget, MandatoryCapabilityBaseline, OciSubject,
@@ -4312,6 +4498,141 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
+    }
+
+    fn production_composition_time(seconds: i64, end_seconds: i64) -> ConformanceTrustedTimeWindow {
+        let base = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        ConformanceTrustedTimeWindow {
+            not_before: base + TimeDelta::seconds(seconds),
+            not_after: base + TimeDelta::seconds(end_seconds),
+        }
+    }
+
+    fn pinned_fixture_build(manifest: ProductionBuildManifest) -> PinnedProductionBuildManifest {
+        let manifest_value = serde_json::to_value(&manifest).unwrap();
+        let raw_bytes = canonical_json_bytes(&manifest_value).unwrap();
+        PinnedProductionBuildManifest {
+            source_path: PathBuf::from("fixtures/production-build-manifest.json"),
+            raw_digest: raw_digest(&raw_bytes),
+            raw_bytes: raw_bytes.into_boxed_slice(),
+            document: manifest,
+        }
+    }
+
+    fn genuine_production_boundary_parts(
+        workload_deployment_id: Option<&str>,
+        workload_valid_for_seconds: i64,
+    ) -> (
+        VerifiedConformanceClosure,
+        VerifiedDeployedWorkload,
+        PinnedProductionBuildManifest,
+        Box<[u8]>,
+        String,
+    ) {
+        let (conformance, profile_raw_bytes) = genuine_production_closure_fixture()
+            .expect("the genuine signed closure fixture must verify");
+        let manifest = conformance.production_build_manifest().clone();
+        let deployed_workload = genuine_deployed_workload_fixture(
+            workload_deployment_id.unwrap_or(conformance.deployment_id()),
+            conformance.trust_domain_id(),
+            "workload:ryuki-api-fixture",
+            &manifest.oci_subject,
+            &manifest.runtime_executable,
+            workload_valid_for_seconds,
+        )
+        .expect("the genuine signed workload fixture must verify");
+        let profile_raw_digest = raw_digest(&profile_raw_bytes);
+        let pinned_build = pinned_fixture_build(manifest);
+        (
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+        )
+    }
+
+    #[test]
+    fn genuine_semantic_boundary_reaches_the_exact_live_guard_blocker() {
+        let (conformance, deployed_workload, pinned_build, profile_raw_bytes, profile_raw_digest) =
+            genuine_production_boundary_parts(None, 240);
+        let boundary = VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .expect("one exact signed production identity must seal");
+        let state = ConformanceState::Production(Box::new(boundary));
+        let error = reject_incomplete_runtime_guard_admission(&state).unwrap_err();
+        assert!(error.contains(
+            "startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified"
+        ));
+    }
+
+    #[test]
+    fn production_boundary_rejects_a_genuine_cross_deployment_workload_proof() {
+        let (conformance, deployed_workload, pinned_build, profile_raw_bytes, profile_raw_digest) =
+            genuine_production_boundary_parts(Some("deployment:cross-wired-fixture"), 240);
+        let error = VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .unwrap_err();
+        assert!(error.contains(
+            "semantic closure, pinned build, and deployed-workload proof do not identify one exact production workload"
+        ));
+    }
+
+    #[test]
+    fn production_boundary_rejects_a_profile_raw_digest_substitution() {
+        let (conformance, deployed_workload, pinned_build, profile_raw_bytes, _) =
+            genuine_production_boundary_parts(None, 240);
+        let error = VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            format!("sha256:{}", "f".repeat(64)),
+            production_composition_time(5, 6),
+        )
+        .unwrap_err();
+        assert!(error.contains(
+            "production boundary profile bytes differ from the independent startup digest pin"
+        ));
+    }
+
+    #[test]
+    fn production_boundary_rejects_a_workload_that_expires_before_sealing() {
+        let (conformance, deployed_workload, pinned_build, profile_raw_bytes, profile_raw_digest) =
+            genuine_production_boundary_parts(None, 4);
+        let error = VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .unwrap_err();
+        assert!(error.contains("production deployed-workload proof is stale"));
+    }
+
+    #[test]
+    fn semantic_verification_window_rejects_a_backward_trusted_clock() {
+        let started = Utc.with_ymd_and_hms(2026, 7, 17, 8, 0, 6).unwrap();
+        let finished = Utc.with_ymd_and_hms(2026, 7, 17, 8, 0, 5).unwrap();
+        let error = semantic_verification_window(started, finished).unwrap_err();
+        assert_eq!(
+            error,
+            "trusted time moved backwards during production semantic closure verification"
+        );
     }
 
     fn empty_provider_registry_applicability(
@@ -4780,6 +5101,7 @@ mod tests {
         assert!(prepared.production_build_manifest.is_none());
         PreparedSecurityContract {
             profile: prepared.profile.clone(),
+            profile_raw_bytes: prepared.profile_raw_bytes.clone(),
             profile_digest: prepared.profile_digest.clone(),
             contract_root: prepared.contract_root.clone(),
             profile_path: prepared.profile_path.clone(),
@@ -5880,8 +6202,10 @@ mod tests {
             provider_claim.advertised_capability_ids,
             ["dry-run-only", "static-human-fixture"]
         );
-        assert!(context.verified_conformance_trust_checkpoint.is_none());
-        assert!(context.verified_conformance_documents.is_empty());
+        assert!(matches!(
+            &context.conformance_state,
+            ConformanceState::NonProduction
+        ));
         assert!(context
             .validate_serving_checkpoint_freshness(fixed_now())
             .is_ok());
@@ -5900,6 +6224,41 @@ mod tests {
             .contains("does not exactly match"));
     }
 
+    #[test]
+    fn security_limit_claim_is_bound_to_exact_profile_selected_bytes() {
+        let fixture = ActiveFixture::build();
+        let mut prepared = prepare_startup_security_contract(&fixture.pins, fixed_now()).unwrap();
+        let reference = prepared.profile.security_limit_profile_ref.clone();
+        let claim = security_limit_applicability_claim(&prepared).unwrap();
+        assert_eq!(claim.document_id, reference.document_id);
+        assert_eq!(claim.document_version, reference.document_version);
+        assert_eq!(claim.content_digest, reference.content_digest);
+        assert_eq!(claim.artifact_locator, reference.artifact_locator);
+        assert_eq!(claim.profile_version, 1);
+
+        prepared
+            .raw_document_bytes
+            .get_mut(&reference.artifact_locator)
+            .unwrap()
+            .push(b' ');
+        assert!(security_limit_applicability_claim(&prepared)
+            .unwrap_err()
+            .contains("exact profile-selected artifact"));
+
+        prepared
+            .raw_document_bytes
+            .get_mut(&reference.artifact_locator)
+            .unwrap()
+            .pop();
+        prepared
+            .documents
+            .get_mut(&reference.artifact_locator)
+            .unwrap()["profile_version"] = json!(2);
+        assert!(security_limit_applicability_claim(&prepared)
+            .unwrap_err()
+            .contains("exact profile-selected artifact"));
+    }
+
     #[tokio::test]
     async fn nonproduction_serving_loader_never_contacts_a_checkpoint_authority() {
         let fixture = ActiveFixture::build();
@@ -5910,9 +6269,10 @@ mod tests {
         let context = load_startup_security_contract_for_serving(&fixture.pins)
             .await
             .expect("test startup remains a bounded local admission");
-        assert!(context.verified_conformance_trust_checkpoint.is_none());
-        assert!(context.verified_deployed_workload.is_none());
-        assert!(context.verified_conformance_documents.is_empty());
+        assert!(matches!(
+            &context.conformance_state,
+            ConformanceState::NonProduction
+        ));
     }
 
     #[test]
@@ -6071,9 +6431,13 @@ mod tests {
             public_key_fingerprint: checkpoint_fingerprint,
             minimum_authority_epoch: 7,
         });
+        let profile_document = serde_json::to_value(&profile).unwrap();
+        let profile_raw_bytes = serde_json::to_vec_pretty(&profile_document).unwrap();
+        let profile_digest = raw_digest(&profile_raw_bytes);
         let mut prepared = PreparedSecurityContract {
             profile: profile.clone(),
-            profile_digest: fixture.pins.profile_digest.clone(),
+            profile_raw_bytes: profile_raw_bytes.clone().into_boxed_slice(),
+            profile_digest: profile_digest.clone(),
             contract_root: fixture.root.clone(),
             profile_path: fixture.pins.profile_path.clone(),
             documents: documents.clone(),
@@ -6153,33 +6517,14 @@ mod tests {
             verified_root.document_id(),
             "package-exit-receipt:runtime-test"
         );
-        let context = SecurityContractContext {
-            profile: profile.clone(),
-            profile_digest: fixture.pins.profile_digest.clone(),
-            contract_root: fixture.root.clone(),
-            profile_path: fixture.pins.profile_path.clone(),
-            verified_conformance_trust_checkpoint: Some(checkpoint),
-            verified_conformance_documents: verified,
-            verified_conformance_production_root: Some(verified_root),
-            verified_deployed_workload: None,
-            production_build_manifest: None,
-            active_providers: BTreeMap::new(),
-            provider_registry_applicability: empty_provider_registry_applicability(&profile),
-        };
-        let missing_workload = context
-            .validate_serving_checkpoint_freshness(fixed_now())
-            .expect_err("checkpoint proof alone cannot survive the final listener fence");
-        assert!(missing_workload.contains("no verified deployed-workload proof"));
-        let runtime_block = context
-            .validate_runtime_bindings(&RyukiConfig::default(), false, fixed_now())
-            .expect_err("runtime binding remains blocked after current-root verification");
-        assert!(runtime_block.contains("2 signed closure documents authenticated"));
-        assert!(context
-            .validate_serving_checkpoint_freshness(
-                Utc.with_ymd_and_hms(2026, 7, 16, 12, 4, 1).unwrap()
-            )
+        assert_eq!(verified.len(), 1);
+        assert!(checkpoint
+            .ensure_fresh(trusted_time_point(
+                Utc.with_ymd_and_hms(2026, 7, 16, 12, 4, 1).unwrap(),
+            ))
             .unwrap_err()
-            .contains("no longer fresh"));
+            .to_string()
+            .contains("stale"));
 
         let expiring_checkpoint = verified_checkpoint_for_documents(
             finalization_lineage,
@@ -6191,7 +6536,8 @@ mod tests {
         );
         let expiring_prepared = PreparedSecurityContract {
             profile: profile.clone(),
-            profile_digest: fixture.pins.profile_digest.clone(),
+            profile_raw_bytes: profile_raw_bytes.into_boxed_slice(),
+            profile_digest,
             contract_root: fixture.root.clone(),
             profile_path: fixture.pins.profile_path.clone(),
             documents: documents.clone(),
@@ -6570,7 +6916,6 @@ mod tests {
         )
         .expect("valid signatures must authenticate");
         assert_eq!(verified.len(), 2);
-        let verified_document_count = verified.len();
         let expected_trust_domain = profile.trust_topology.trust_domain_ids[0].as_str();
         assert!(verified.values().all(|proof| {
             proof.deployment_id() == DEPLOYMENT_ID
@@ -6606,17 +6951,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exact current SB-9"));
-        let provider_registry = empty_provider_registry_applicability(&profile);
-        let final_block = reject_incomplete_production_startup(
-            &profile,
-            verified_document_count,
-            &provider_registry,
-        )
-        .expect_err("cryptographic verification alone cannot authorize production");
-        assert!(final_block.contains("2 signed closure documents authenticated"));
-        assert!(final_block.contains("semantic closure"));
-        assert!(final_block.contains("live runtime facts remain unavailable"));
-
         let mut swapped_bytes = document_bytes.clone();
         let bundle_bytes = swapped_bytes
             .remove("evidence/runtime-bundle.json")
@@ -6812,17 +7146,9 @@ mod tests {
         )
         .expect("the current lineage head must authenticate its exact signed document");
         assert_eq!(verified.len(), 2);
-        let verified_document_count = verified.len();
         verify_current_production_root_binding(&checkpoint, &profile, &mut verified)
             .expect("the v2 lineage checkpoint must bind its exact current SB-9 root");
-        let provider_registry = empty_provider_registry_applicability(&profile);
-        assert!(reject_incomplete_production_startup(
-            &profile,
-            verified_document_count,
-            &provider_registry,
-        )
-        .unwrap_err()
-        .contains("2 signed closure documents authenticated"));
+        assert_eq!(verified.len(), 1);
     }
 
     #[test]

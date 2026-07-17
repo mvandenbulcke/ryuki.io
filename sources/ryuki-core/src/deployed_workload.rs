@@ -786,8 +786,10 @@ fn invalid(message: impl Into<String>) -> DeployedWorkloadError {
     DeployedWorkloadError::Invalid(message.into())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "security-test-support"))]
+pub mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1037,6 +1039,60 @@ mod tests {
         let request = fixture.request();
         let response = fixture.response_with(&request, mutate);
         fixture.verify(request, &response)
+    }
+
+    /// Produces a genuinely signed workload proof for downstream composition
+    /// tests while preserving the production verifier as the only constructor
+    /// of `VerifiedDeployedWorkload`.
+    #[cfg(feature = "security-test-support")]
+    pub fn genuine_deployed_workload_fixture(
+        deployment_id: &str,
+        trust_domain_id: &str,
+        workload_id: &str,
+        oci_subject: &OciSubject,
+        runtime_executable: &RuntimeExecutable,
+        valid_for_seconds: i64,
+    ) -> Result<VerifiedDeployedWorkload, DeployedWorkloadError> {
+        let composition_base = Utc
+            .with_ymd_and_hms(2026, 7, 16, 12, 0, 0)
+            .single()
+            .expect("composition fixture instant is valid");
+        let mut fixture = Fixture::new(oci_subject.subject_kind);
+        fixture.oci_subject = oci_subject.clone();
+        fixture.runtime_executable = runtime_executable.clone();
+        fixture.resolved_manifest_digest = match oci_subject.subject_kind {
+            OciSubjectKind::OciImageManifest => oci_subject.content_digest.clone(),
+            OciSubjectKind::OciImageIndex => digest_for(b"resolved fixture OCI index member"),
+        };
+        let request = build_deployed_workload_attestation_request(
+            ExpectedDeployedWorkload {
+                deployment_id,
+                trust_domain_id,
+                workload_id,
+                oci_subject: &fixture.oci_subject,
+                runtime_executable: &fixture.runtime_executable,
+            },
+            fixture.authority(),
+            test_entropy(b"downstream composition request nonce"),
+            composition_base - TimeDelta::seconds(5),
+        )?;
+        let response = fixture.response_with(&request, |response| {
+            response["measurement"]["observed_at"]["not_before"] =
+                json!(composition_base - TimeDelta::seconds(2));
+            response["measurement"]["observed_at"]["not_after"] =
+                json!(composition_base - TimeDelta::seconds(1));
+            response["measurement"]["valid_until"] =
+                json!(composition_base + TimeDelta::seconds(valid_for_seconds));
+        });
+        verify_deployed_workload_attestation(
+            request,
+            &response,
+            fixture.authority(),
+            ConformanceTrustedTimeWindow {
+                not_before: composition_base + TimeDelta::seconds(1),
+                not_after: composition_base + TimeDelta::seconds(2),
+            },
+        )
     }
 
     #[test]

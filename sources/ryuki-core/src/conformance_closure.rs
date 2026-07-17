@@ -47,6 +47,7 @@ const CANONICAL_CASE_SET_DIGEST: &str =
     "sha256:e85db6dbcc2bb50045b712d264feb918e8ecd7f60750873b5b5fc5d8a6bc8002";
 const MAX_LEDGER_ROWS: usize = 4096;
 const MAX_CONTROL_TRACE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DEPLOYMENT_PROFILE_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_TRACE_JSON_DEPTH: usize = 32;
 const MAX_CONTROL_TRACE_JSON_NODES: usize = 100_000;
 const MAX_CONTROL_TRACE_COLLECTION_ITEMS: usize = 4096;
@@ -225,6 +226,158 @@ pub struct ConformanceClosureContext<'a> {
     pub production_acceptance_receipt_ref: &'a VersionedContentReference,
 }
 
+/// Exact, independently derived context bindings consumed by production
+/// conformance closure verification.
+///
+/// Keeping these values behind one constructor prevents an admission layer
+/// from reimplementing the profile/provider/build projection rules and
+/// accidentally drifting from the verifier. This value is data, not an
+/// authority capability; only [`verify_production_conformance_closure`] can
+/// mint the opaque closure proof.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedConformanceClosureContext {
+    deployment_id: String,
+    trust_domain_id: String,
+    source_revision: String,
+    artifact_digest: String,
+    deployment_profile: Value,
+    policy_versions: Value,
+    configuration_versions: Value,
+    provider_versions: Value,
+    adapter_versions: Value,
+    security_limit_profile: Value,
+    deployment_profile_document: Value,
+    deployment_profile_raw_bytes: Box<[u8]>,
+    deployment_profile_raw_digest: String,
+    production_acceptance_receipt_ref: VersionedContentReference,
+}
+
+impl DerivedConformanceClosureContext {
+    pub fn as_context(&self) -> ConformanceClosureContext<'_> {
+        ConformanceClosureContext {
+            deployment_id: &self.deployment_id,
+            trust_domain_id: &self.trust_domain_id,
+            source_revision: &self.source_revision,
+            artifact_digest: &self.artifact_digest,
+            deployment_profile: &self.deployment_profile,
+            policy_versions: &self.policy_versions,
+            configuration_versions: &self.configuration_versions,
+            provider_versions: &self.provider_versions,
+            adapter_versions: &self.adapter_versions,
+            security_limit_profile: &self.security_limit_profile,
+            deployment_profile_document: &self.deployment_profile_document,
+            production_acceptance_receipt_ref: &self.production_acceptance_receipt_ref,
+        }
+    }
+
+    pub fn deployment_profile_raw_digest(&self) -> &str {
+        &self.deployment_profile_raw_digest
+    }
+}
+
+/// Derives every semantic-context value whose ownership belongs to the exact
+/// profile, measured build, and independently retained deployment claims.
+pub fn derive_production_conformance_closure_context(
+    manifest: &ProductionBuildManifest,
+    profile: &DeploymentSecurityProfile,
+    deployment_claims: &ProductionDeploymentApplicabilityClaims,
+    deployment_profile_raw_bytes: &[u8],
+) -> Result<DerivedConformanceClosureContext, ConformanceClosureError> {
+    if deployment_profile_raw_bytes.is_empty()
+        || deployment_profile_raw_bytes.len() > MAX_DEPLOYMENT_PROFILE_BYTES
+    {
+        return Err(invalid(
+            "exact deployment profile bytes are empty or exceed the bounded maximum",
+        ));
+    }
+    let deployment_profile_document = parse_json_strict(deployment_profile_raw_bytes)
+        .map_err(|error| invalid(format!("invalid exact deployment profile JSON: {error}")))?;
+    let exact_profile: DeploymentSecurityProfile =
+        serde_json::from_value(deployment_profile_document.clone())
+            .map_err(|error| invalid(format!("invalid exact deployment profile: {error}")))?;
+    if profile != &exact_profile || !profile.security_profile.is_production() {
+        return Err(invalid(
+            "typed deployment profile differs from the exact production profile document",
+        ));
+    }
+    let [trust_domain_id] = profile.trust_topology.trust_domain_ids.as_slice() else {
+        return Err(invalid(
+            "production conformance closure requires exactly one trust domain",
+        ));
+    };
+    let production_acceptance_receipt_ref = profile
+        .production_acceptance_receipt_ref
+        .clone()
+        .ok_or_else(|| invalid("production profile omits its acceptance receipt reference"))?;
+    let deployment_profile_digest =
+        deployment_profile_conformance_binding_digest(&deployment_profile_document)?;
+    let deployment_profile = json!({
+        "deployment_id": profile.deployment_id,
+        "id": profile.document_id,
+        "version": profile.document_version.to_string(),
+        "digest_contract": DEPLOYMENT_PROFILE_CONFORMANCE_BINDING_DIGEST_CONTRACT,
+        "digest": deployment_profile_digest,
+    });
+    let policy_versions = Value::Array(profile_policy_version_bindings(profile));
+    let configuration_versions = Value::Array(profile_configuration_version_bindings(profile));
+    let mut providers = deployment_claims
+        .provider_registry
+        .active_providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "id": provider.provider_id,
+                "version": provider.configuration_version.to_string(),
+                "digest": provider.configuration_payload_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    let mut adapters = manifest
+        .shipped_adapters
+        .iter()
+        .map(|adapter| {
+            json!({
+                "id": adapter.adapter_kind,
+                "version": adapter.adapter_version,
+                "digest": adapter.mandatory_baseline.content_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    adapters.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    let limit = &deployment_claims.security_limit_profile;
+    let derived = DerivedConformanceClosureContext {
+        deployment_id: profile.deployment_id.clone(),
+        trust_domain_id: trust_domain_id.clone(),
+        source_revision: manifest.source.revision.clone(),
+        artifact_digest: deployment_claims.deployed_artifact.subject_digest.clone(),
+        deployment_profile,
+        policy_versions,
+        configuration_versions,
+        provider_versions: Value::Array(providers),
+        adapter_versions: Value::Array(adapters),
+        security_limit_profile: json!({
+            "id": limit.document_id,
+            "version": limit.profile_version.to_string(),
+            "digest": limit.content_digest,
+        }),
+        deployment_profile_document,
+        deployment_profile_raw_bytes: deployment_profile_raw_bytes.to_vec().into_boxed_slice(),
+        deployment_profile_raw_digest: digest_bytes(deployment_profile_raw_bytes),
+        production_acceptance_receipt_ref,
+    };
+    validate_context(derived.as_context())?;
+    Ok(derived)
+}
+
 /// Independently bound inputs from which the closure derives the complete v2
 /// implementation-plus-deployment applicability universe.
 #[derive(Debug, Clone, Copy)]
@@ -232,7 +385,7 @@ pub struct ProductionConformanceClosureInputs<'a> {
     pub manifest: &'a ProductionBuildManifest,
     pub profile: &'a DeploymentSecurityProfile,
     pub deployment_claims: &'a ProductionDeploymentApplicabilityClaims,
-    pub context: ConformanceClosureContext<'a>,
+    pub context: &'a DerivedConformanceClosureContext,
 }
 
 #[derive(Debug)]
@@ -276,9 +429,9 @@ impl VerifiedRuntimeGuardRequirement {
 ///
 /// This capability deliberately does not prove that the constructible build,
 /// deployment, provider, or limit claims came from live production. The API
-/// admission layer must retain its independently pinned build and future opaque
-/// workload proof alongside this value, then verify typed live guard witnesses
-/// before treating the combined aggregate as runtime authority.
+/// admission layer retains its independently pinned build and verified opaque
+/// workload proof alongside this value, then must verify typed live guard
+/// witnesses before treating the combined aggregate as runtime authority.
 pub struct VerifiedConformanceClosure {
     checkpoint: VerifiedConformanceTrustCheckpoint,
     _current_root: VerifiedConformanceProductionRoot,
@@ -287,6 +440,8 @@ pub struct VerifiedConformanceClosure {
     applicability: DerivedProductionApplicability,
     _manifest: ProductionBuildManifest,
     _profile: DeploymentSecurityProfile,
+    _profile_raw_bytes: Box<[u8]>,
+    profile_raw_digest: String,
     closure_digest: String,
     ledger_digest: String,
     deployment_id: String,
@@ -448,6 +603,21 @@ impl VerifiedConformanceClosure {
     pub fn runtime_guard_requirements(&self) -> &[VerifiedRuntimeGuardRequirement] {
         &self.runtime_guard_requirements
     }
+
+    /// Exact typed manifest retained by the non-cloneable closure proof.
+    pub fn production_build_manifest(&self) -> &ProductionBuildManifest {
+        &self._manifest
+    }
+
+    /// Exact typed deployment profile retained by the non-cloneable closure
+    /// proof.
+    pub fn deployment_profile(&self) -> &DeploymentSecurityProfile {
+        &self._profile
+    }
+
+    pub fn deployment_profile_raw_digest(&self) -> &str {
+        &self.profile_raw_digest
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +685,7 @@ pub fn verify_production_conformance_closure(
     inputs: ProductionConformanceClosureInputs<'_>,
     trusted_now: ConformanceTrustedTimeWindow,
 ) -> Result<VerifiedConformanceClosure, ConformanceClosureError> {
+    let context = inputs.context.as_context();
     checkpoint
         .ensure_fresh(trusted_now)
         .map_err(|error| invalid(format!("conformance checkpoint is stale: {error}")))?;
@@ -529,7 +700,7 @@ pub fn verify_production_conformance_closure(
         ));
     }
     let exact_profile: DeploymentSecurityProfile =
-        serde_json::from_value(inputs.context.deployment_profile_document.clone())
+        serde_json::from_value(context.deployment_profile_document.clone())
             .map_err(|error| invalid(format!("invalid exact deployment profile: {error}")))?;
     let profile_errors = exact_profile.validate_structure_at(trusted_now.not_before);
     if !profile_errors.is_empty() {
@@ -543,6 +714,22 @@ pub fn verify_production_conformance_closure(
             "typed deployment profile differs from the exact bound profile document",
         ));
     }
+    let migration_overlay_retirement_deadline = exact_profile
+        .migration_overlay
+        .as_ref()
+        .map(|overlay| {
+            DateTime::parse_from_rfc3339(&overlay.retirement_deadline)
+                .map(|deadline| deadline.with_timezone(&Utc))
+                .map_err(|_| invalid("migration overlay retirement_deadline is not RFC3339"))
+        })
+        .transpose()?;
+    if migration_overlay_retirement_deadline
+        .is_some_and(|deadline| deadline <= trusted_now.not_after)
+    {
+        return Err(invalid(
+            "migration overlay retirement_deadline does not remain valid through the trusted-time verification window",
+        ));
+    }
     if inputs.profile.control_trace_ref.artifact_locator != control_trace.artifact_locator
         || inputs.profile.control_trace_ref.content_digest != control_trace.raw_digest
         || inputs.manifest.control_trace_ref != inputs.profile.control_trace_ref
@@ -551,9 +738,8 @@ pub fn verify_production_conformance_closure(
             "ControlTrace is not exactly bound by both profile and measured build manifest",
         ));
     }
-    if inputs.context.source_revision != inputs.manifest.source.revision
-        || inputs.context.artifact_digest
-            != inputs.deployment_claims.deployed_artifact.subject_digest
+    if context.source_revision != inputs.manifest.source.revision
+        || context.artifact_digest != inputs.deployment_claims.deployed_artifact.subject_digest
     {
         return Err(invalid(
             "closure source revision or deployed artifact digest differs from the measured production inputs",
@@ -606,9 +792,10 @@ pub fn verify_production_conformance_closure(
         &bundles,
         &receipts,
         &proof_facts,
-        inputs.context,
+        context,
         &applicability,
         trusted_now,
+        migration_overlay_retirement_deadline,
         current_root.artifact().complete_document_digest(),
         current_root.artifact().acceptance_record_id(),
     )?;
@@ -644,6 +831,8 @@ pub fn verify_production_conformance_closure(
         applicability,
         _manifest: inputs.manifest.clone(),
         _profile: inputs.profile.clone(),
+        _profile_raw_bytes: inputs.context.deployment_profile_raw_bytes.clone(),
+        profile_raw_digest: inputs.context.deployment_profile_raw_digest.clone(),
         closure_digest,
         ledger_digest,
         deployment_id,
@@ -672,6 +861,7 @@ fn validate_claim_context_bindings(
     checkpoint: &VerifiedConformanceTrustCheckpoint,
     inputs: ProductionConformanceClosureInputs<'_>,
 ) -> Result<(), ConformanceClosureError> {
+    let context = inputs.context.as_context();
     let claims = &inputs.deployment_claims.checkpoints;
     let profile_registry = &inputs.profile.conformance_trust_root_registry_ref;
     if claims.len() != 1
@@ -681,8 +871,8 @@ fn validate_claim_context_bindings(
         || claims[0].sequence != checkpoint.checkpoint_sequence()
         || claims[0].trust_registry_digest != checkpoint.registry_digest()
         || claims[0].trust_registry_locator != checkpoint.registry_locator()
-        || inputs.context.deployment_id != checkpoint.deployment_id()
-        || inputs.context.trust_domain_id != checkpoint.trust_domain_id()
+        || context.deployment_id != checkpoint.deployment_id()
+        || context.trust_domain_id != checkpoint.trust_domain_id()
         || profile_registry.document_id != checkpoint.registry_id()
         || profile_registry.document_version != checkpoint.registry_version()
         || profile_registry.content_digest != checkpoint.registry_digest()
@@ -735,11 +925,11 @@ fn validate_claim_context_bindings(
         "version": limit.profile_version.to_string(),
         "digest": limit.content_digest,
     });
-    if inputs.context.policy_versions != &Value::Array(policies)
-        || inputs.context.configuration_versions != &Value::Array(configurations)
-        || inputs.context.provider_versions != &Value::Array(providers)
-        || inputs.context.adapter_versions != &Value::Array(adapters)
-        || inputs.context.security_limit_profile != &expected_limit
+    if context.policy_versions != &Value::Array(policies)
+        || context.configuration_versions != &Value::Array(configurations)
+        || context.provider_versions != &Value::Array(providers)
+        || context.adapter_versions != &Value::Array(adapters)
+        || context.security_limit_profile != &expected_limit
     {
         return Err(invalid(
             "closure policy, configuration, provider, adapter, or security-limit bindings differ from the independently retained inputs",
@@ -919,6 +1109,7 @@ fn verify_with_proof_facts(
     context: ConformanceClosureContext<'_>,
     applicability: &DerivedProductionApplicability,
     trusted_now: ConformanceTrustedTimeWindow,
+    semantic_validity_ceiling: Option<DateTime<Utc>>,
     current_root_digest: &str,
     current_root_acceptance_record_id: &str,
 ) -> Result<ClosureProjection, ConformanceClosureError> {
@@ -1117,6 +1308,24 @@ fn verify_with_proof_facts(
         proofs_by_digest,
         selected_root_proof,
     )?;
+    let mut semantic_valid_until = semantic_validity_ceiling;
+    for receipt in current_receipts.values() {
+        let expires = parse_timestamp(receipt.input.value, "expires_at", receipt.id)?;
+        semantic_valid_until = Some(
+            semantic_valid_until.map_or(expires, |current: DateTime<Utc>| current.min(expires)),
+        );
+    }
+    for evidence_id in &used_evidence_ids {
+        let bundle = bundle_by_evidence
+            .get(evidence_id.as_str())
+            .expect("every used evidence id was resolved");
+        let expires = parse_timestamp(bundle.input.value, "expires_at", bundle.id)?;
+        semantic_valid_until = Some(
+            semantic_valid_until.map_or(expires, |current: DateTime<Utc>| current.min(expires)),
+        );
+    }
+    let semantic_valid_until = semantic_valid_until
+        .ok_or_else(|| invalid("verified semantic closure has no expiring evidence"))?;
     let semantic_context = conformance_context_projection(context);
     let context_digest = conformance_closure_context_digest(context)?;
     let closure_projection = json!({
@@ -1164,11 +1373,7 @@ fn verify_with_proof_facts(
         authority_revision: authority.authority_revision,
         checkpoint_sequence: authority.checkpoint_sequence,
         snapshot_binding_digest: authority.snapshot_binding_digest.clone(),
-        semantic_valid_until: parse_timestamp(
-            selected_root.input.value,
-            "expires_at",
-            selected_root.id,
-        )?,
+        semantic_valid_until,
         root_receipt_id: context
             .production_acceptance_receipt_ref
             .document_id
@@ -3458,8 +3663,10 @@ fn reject_cycles(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "security-test-support"))]
+pub mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4129,6 +4336,7 @@ mod tests {
                 self.context(),
                 &self.applicability,
                 self.trusted_now,
+                None,
                 &self.root_ref.content_digest,
                 &self.current_root_acceptance_record_id,
             )
@@ -4669,6 +4877,9 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum PublicFixtureMutation {
         None,
+        OverlayRetiresWithinVerificationWindow,
+        OverlayWithEarlierSemanticExpiry,
+        WrongDerivedProfile,
         WrongTypedProfile,
     }
 
@@ -4738,6 +4949,32 @@ mod tests {
             artifact_locator: receipt_locator("SB-9"),
         };
         profile["production_acceptance_receipt_ref"] = serde_json::to_value(&root_ref).unwrap();
+        if matches!(
+            mutation,
+            PublicFixtureMutation::OverlayRetiresWithinVerificationWindow
+                | PublicFixtureMutation::OverlayWithEarlierSemanticExpiry
+        ) {
+            let retirement_deadline = match mutation {
+                PublicFixtureMutation::OverlayRetiresWithinVerificationWindow => {
+                    "2026-07-16T12:00:03Z"
+                }
+                PublicFixtureMutation::OverlayWithEarlierSemanticExpiry => "2026-07-16T12:00:10Z",
+                _ => unreachable!(),
+            };
+            profile["migration_overlay"] = json!({
+                "overlay_id": "migration-overlay:public-closure-fixture",
+                "overlay_version": 1,
+                "security_profile": "production",
+                "authority_source": "provider_registry",
+                "legacy_selector_present": true,
+                "provider_registry_present": true,
+                "retirement_deadline": retirement_deadline,
+                "conflict_telemetry_name": "security_migration_conflicts_total",
+                "grants_authority": false,
+                "live_execution_allowed": false,
+                "zero_consumer_receipt_ref": root_ref.clone(),
+            });
+        }
         let guard_packages = &PACKAGES[..8];
         profile["runtime_guard_evidence"] = json!({
             "mode": "receipt_bound",
@@ -5058,6 +5295,10 @@ mod tests {
         let root_index = receipt_index_by_package["SB-9"];
         root_ref.content_digest = receipts[root_index].raw_digest.clone();
         profile["production_acceptance_receipt_ref"] = serde_json::to_value(&root_ref).unwrap();
+        if profile["migration_overlay"].is_object() {
+            profile["migration_overlay"]["zero_consumer_receipt_ref"] =
+                serde_json::to_value(&root_ref).unwrap();
+        }
         for (guard_index, package_id) in guard_packages.iter().enumerate() {
             let receipt_index = receipt_index_by_package[*package_id];
             profile["runtime_guard_evidence"]["guards"][guard_index]["receipt_ref"]["content_digest"] =
@@ -5183,13 +5424,25 @@ mod tests {
             verify_control_trace_artifact(&exact_profile.control_trace_ref, ledger_raw)
                 .map_err(|error| error.to_string())?;
         let mut supplied_profile = exact_profile.clone();
-        if matches!(mutation, PublicFixtureMutation::WrongTypedProfile) {
+        if matches!(
+            mutation,
+            PublicFixtureMutation::WrongDerivedProfile | PublicFixtureMutation::WrongTypedProfile
+        ) {
             supplied_profile.policy_version += 1;
         }
-        let production_acceptance_receipt_ref = exact_profile
-            .production_acceptance_receipt_ref
-            .as_ref()
-            .unwrap();
+        let context_profile = if matches!(mutation, PublicFixtureMutation::WrongDerivedProfile) {
+            &supplied_profile
+        } else {
+            &exact_profile
+        };
+        let profile_raw_bytes = canonical_json_bytes(&profile).unwrap();
+        let derived_context = derive_production_conformance_closure_context(
+            &manifest,
+            context_profile,
+            &claims,
+            &profile_raw_bytes,
+        )
+        .map_err(|error| error.to_string())?;
         verify_production_conformance_closure(
             checkpoint,
             current_root,
@@ -5199,24 +5452,25 @@ mod tests {
                 manifest: &manifest,
                 profile: &supplied_profile,
                 deployment_claims: &claims,
-                context: ConformanceClosureContext {
-                    deployment_id: DEPLOYMENT_ID,
-                    trust_domain_id: TRUST_DOMAIN_ID,
-                    source_revision: SOURCE_REVISION,
-                    artifact_digest: ARTIFACT_DIGEST,
-                    deployment_profile: &deployment_profile,
-                    policy_versions: &policy_versions,
-                    configuration_versions: &configuration_versions,
-                    provider_versions: &provider_versions,
-                    adapter_versions: &adapter_versions,
-                    security_limit_profile: &security_limit_profile,
-                    deployment_profile_document: &profile,
-                    production_acceptance_receipt_ref,
-                },
+                context: &derived_context,
             },
             trusted_now,
         )
         .map_err(|error| error.to_string())
+    }
+
+    /// Builds the same genuinely signed 139-instance closure used by the core
+    /// acceptance test and returns its exact bound profile representation.
+    ///
+    /// This is feature-gated test support so downstream startup-composition
+    /// tests can exercise opaque production capabilities without adding a
+    /// production constructor or fabricating proof facts.
+    #[cfg(feature = "security-test-support")]
+    pub fn genuine_production_closure_fixture()
+    -> Result<(VerifiedConformanceClosure, Box<[u8]>), String> {
+        let closure = verify_public_fixture(PublicFixtureMutation::None)?;
+        let profile_raw_bytes = closure._profile_raw_bytes.clone();
+        Ok((closure, profile_raw_bytes))
     }
 
     #[test]
@@ -5227,6 +5481,11 @@ mod tests {
         assert_eq!(closure.evidence_count(), 139);
         assert_eq!(closure.applicability_instances().len(), 139);
         assert_eq!(closure.runtime_guard_requirements().len(), 8);
+        assert_eq!(
+            closure.production_build_manifest().source.revision,
+            SOURCE_REVISION
+        );
+        assert_eq!(closure.deployment_profile().deployment_id, DEPLOYMENT_ID);
         closure
             .ensure_fresh(ConformanceTrustedTimeWindow {
                 not_before: timestamp("2026-07-16T12:00:04Z"),
@@ -5241,6 +5500,109 @@ mod tests {
         assert!(
             error
                 .contains("typed deployment profile differs from the exact bound profile document")
+        );
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_overlay_retirement_inside_the_verification_window() {
+        let error =
+            verify_public_fixture(PublicFixtureMutation::OverlayRetiresWithinVerificationWindow)
+                .unwrap_err();
+        assert!(error.contains(
+            "migration overlay retirement_deadline does not remain valid through the trusted-time verification window"
+        ));
+    }
+
+    #[test]
+    fn overlay_retirement_deadline_bounds_the_verified_closure_lifetime() {
+        let closure =
+            verify_public_fixture(PublicFixtureMutation::OverlayWithEarlierSemanticExpiry)
+                .expect("a live overlay should verify before its retirement deadline");
+        assert_eq!(
+            closure.semantic_valid_until(),
+            timestamp("2026-07-16T12:00:10Z")
+        );
+        closure
+            .ensure_fresh(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-07-16T12:00:08Z"),
+                not_after: timestamp("2026-07-16T12:00:09Z"),
+            })
+            .unwrap();
+        assert!(
+            closure
+                .ensure_fresh(ConformanceTrustedTimeWindow {
+                    not_before: timestamp("2026-07-16T12:00:09Z"),
+                    not_after: timestamp("2026-07-16T12:00:10Z"),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn derived_context_rejects_typed_profile_different_from_exact_document() {
+        let error = verify_public_fixture(PublicFixtureMutation::WrongDerivedProfile).unwrap_err();
+        assert!(error.contains(
+            "typed deployment profile differs from the exact production profile document"
+        ));
+    }
+
+    #[test]
+    fn derived_context_retains_the_exact_raw_profile_representation() {
+        let mut profile_value: Value = serde_json::from_str(PROFILE_JSON).unwrap();
+        profile_value["security_profile"] = json!("production");
+        profile_value["deployment_id"] = json!(DEPLOYMENT_ID);
+        profile_value["applicability"]["security_profiles"] = json!(["production"]);
+        profile_value["applicability"]["deployment_ids"] = json!([DEPLOYMENT_ID]);
+        profile_value["trust_topology"]["trust_domain_ids"] = json!([TRUST_DOMAIN_ID]);
+        profile_value["production_acceptance_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "document_id": "package-exit-receipt:raw-profile-test",
+            "document_version": 1,
+            "content_digest": test_digest("raw-profile-test-root"),
+            "artifact_locator": "receipts/raw-profile-test.json",
+        });
+        profile_value["migration_overlay"] = Value::Null;
+        let profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile_value.clone()).unwrap();
+        let ledger: Value = serde_json::from_str(CONTROL_TRACE_JSON).unwrap();
+        let manifest = fixture_manifest(&ledger, &profile.control_trace_ref);
+        let claims = fixture_deployment_claims(&profile, &manifest);
+        let explicit_null_raw = canonical_json_bytes(&profile_value).unwrap();
+        let explicit_null = derive_production_conformance_closure_context(
+            &manifest,
+            &profile,
+            &claims,
+            &explicit_null_raw,
+        )
+        .unwrap();
+
+        profile_value
+            .as_object_mut()
+            .unwrap()
+            .remove("migration_overlay");
+        let omitted_raw = canonical_json_bytes(&profile_value).unwrap();
+        let omitted_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile_value).unwrap();
+        assert_eq!(omitted_profile, profile);
+        let omitted = derive_production_conformance_closure_context(
+            &manifest,
+            &omitted_profile,
+            &claims,
+            &omitted_raw,
+        )
+        .unwrap();
+
+        assert_ne!(
+            explicit_null.deployment_profile_raw_digest(),
+            omitted.deployment_profile_raw_digest()
+        );
+        assert_eq!(
+            explicit_null.deployment_profile_raw_digest(),
+            digest_bytes(&explicit_null_raw)
+        );
+        assert_eq!(
+            omitted.deployment_profile_raw_digest(),
+            digest_bytes(&omitted_raw)
         );
     }
 

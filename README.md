@@ -303,11 +303,15 @@ short-lived response that echoes both values and binds the pinned authority,
 measurement profile, workload namespace, and exact requested deployed OCI
 subject and executable. For an OCI index, the
 authority-signed child-manifest resolution must also be internally consistent.
-The current startup verifies this proof and passes it toward the later exact
-deployment/provider applicability seal, but still exits at the explicit
-semantic-closure and live-runtime-guard blocker before completing that seal.
-Those blockers, plus the remaining normative boundary work packages, must be
-implemented and verified before production admission.
+Startup now consumes that proof with the exact checkpoint snapshot, current
+SB-9 root, authenticated receipts and evidence, ControlTrace, pinned profile
+bytes, provider and security-limit claims, and build manifest. It independently
+derives the complete implementation-plus-deployment applicability inventory,
+verifies semantic closure, and seals the result into one non-cloneable
+production-boundary proof. Startup still exits before migrations, workers,
+routing, or listeners until all eight receipt-bound live runtime guard
+witnesses are verified. Those witnesses and the remaining normative boundary
+work packages must be implemented and verified before production admission.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

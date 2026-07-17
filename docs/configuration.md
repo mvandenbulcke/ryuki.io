@@ -44,10 +44,14 @@ Startup independently derives that build-side inventory from the authenticated
 ControlTrace and measured build facts and requires exact equality. The loader
 also retains exact provider descriptors and derives deployment/provider
 applicability from authenticated facts. The independently pinned deployed-
-workload attestation below supplies the deployed-OCI and executable facts
-needed for a later exact seal. Current startup verifies and passes that proof
-toward the seal, but still exits at the explicit semantic-closure and live-
-runtime-guard blocker before completing it.
+workload attestation below supplies the deployed-OCI and executable facts.
+Startup now derives the complete implementation-plus-deployment applicability
+inventory, verifies the exact semantic receipt closure, and consumes the
+checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
+and workload proof into one non-cloneable production-boundary proof. It still
+exits before migrations, workers, routing, or listeners until all eight
+receipt-bound live runtime guard witnesses are verified; that witness verifier
+is not yet implemented.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -129,7 +133,7 @@ what a self-contained hash chain can detect. Production therefore requires a
 fresh domain-separated Ed25519 response from the separately pinned external
 checkpoint authority. The request binds its nonce and digest, exact namespace,
 candidate head including locator, validated lineage digest, and a unique sorted
-lookup of at most 64 complete document digests. The response must prove
+lookup of at most 4,096 complete document digests. The response must prove
 `external_strongly_consistent` state, exact equality with the authority's
 current head, a current authority epoch/revision and one linearizable sequence
 for head and document-acceptance events, trusted-time intervals that do not
@@ -140,10 +144,11 @@ operator workflows.
 
 Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
-authority, and cannot start the API or migration runner. Even valid checkpoint,
-build-manifest, and deployed-workload bindings cannot start production until
-trusted semantic conformance closure and the remaining live runtime facts can
-be verified. The proving ground likewise requires a separately reviewed active
+authority, and cannot start the API or migration runner. Even a valid sealed
+semantic closure, build manifest, and deployed-workload proof cannot start
+production until all eight receipt-bound live runtime guard witnesses are
+verified; that witness verifier is not yet implemented. The proving ground
+likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.
 

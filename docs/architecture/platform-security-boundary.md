@@ -1118,17 +1118,20 @@ short-lived deployed-workload capability. It accepts only an exact peer
 measurement signed by an independently pinned Ed25519 authority, binds the
 deployment/trust-domain/workload namespace and measurement profile, and matches
 the OCI subject, resolved image manifest, and executable digest/length exactly.
-The semantic-neutral one-shot Unix transport prerequisite is also available,
-but the API has not yet pinned a live workload authority, invoked the protocol,
-or consumed the capability during startup. The checked-in provider is
-development-only, every compiled adapter remains production-ineligible, and
-its build-owned baseline traces currently have null deployment tiers, so
-present artifacts still fail closed before a deployment inventory can be
-sealed. Package receipts and bundles also retain their legacy applicability
-shape. Consequently semantic receipt closure must still consume the opaque
-current-root proof against the complete independently derived universe, and the
-runtime admission boundary must still verify every live guard fact. Production
-startup remains fail-closed.
+The API now requires the complete independently pinned workload-authority and
+measurement-profile binding, performs exactly one bounded workload-attestation
+Unix exchange, and
+consumes the resulting capability with the exact checkpoint, current root,
+authenticated artifacts, ControlTrace, provider/security-limit claims, pinned
+profile bytes, and build manifest. It independently derives the complete
+implementation-plus-deployment applicability universe, verifies semantic
+receipt closure, and seals all static proof ownership into one non-cloneable
+production-boundary capability. The checked-in provider remains development-
+only, every compiled adapter remains production-ineligible, and the checked-in
+documents are implementation fixtures rather than active signed production
+authority. The runtime admission boundary also still lacks the eight typed
+live guard witnesses. Production therefore remains fail-closed before
+migrations, workers, routing, or listeners.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
@@ -1183,9 +1186,9 @@ An older accepted graph cannot become current merely by omitting its successor.
 The v2 reconciliation contract implements this assertion by binding the exact
 profile-selected candidate root into the request digest and requiring the
 signed response's current root to name the same receipt and its exact
-same-response acceptance event. Production startup remains blocked until the
-semantic closure consumes that opaque current-root proof and the later runtime
-admission boundary verifies every live guard fact. The verifier privately binds
+same-response acceptance event. Production startup now consumes that opaque
+current-root proof in semantic closure and remains blocked until the later
+runtime admission boundary verifies every live guard fact. The verifier privately binds
 the SHA-256 digest of that exact signed reconciliation response into the
 checkpoint, root, and every authenticated artifact; semantic closure rejects
 proofs from any other response even when their public counters happen to be

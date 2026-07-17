@@ -38,6 +38,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 [dev-dependencies]
 aws-lc-rs = "1"
 pkcs8 = "0.10"
+ryuki-core = { workspace = true, features = ["security-test-support"] }
 ryuki-agent = { workspace = true }
 tempfile = "3"
 # `test-util` enables the paused-clock test runtime (`start_paused = true`) used
