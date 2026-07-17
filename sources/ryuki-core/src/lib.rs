@@ -1,5 +1,7 @@
 pub mod config;
+pub mod conformance_applicability;
 pub mod conformance_trust;
+pub mod production_applicability;
 pub mod production_build;
 pub mod secret_scan;
 pub mod security_profile;

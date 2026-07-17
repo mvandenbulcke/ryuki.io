@@ -76,10 +76,12 @@ value over the manifest's exact raw bytes. Production also requires
 separately governed workload/deployment trust channel, never from the
 rollbackable contract root. Startup only reconciles exact head version, raw
 digest, and locator; it cannot bootstrap or auto-advance authority state.
-The build manifest pins expected build identity and a declared applicability
-candidate, but it does not independently derive that universe, authenticate
-deployed OCI provenance, establish semantic conformance closure, or verify live
-runtime facts. Those remain production blockers.
+The build manifest pins expected build identity and claims an implementation-
+applicability inventory; startup independently derives that build-side
+inventory from the authenticated ControlTrace and measured build facts and
+requires exact equality. It does not derive deployment/provider applicability,
+authenticate deployed OCI provenance, establish semantic conformance closure,
+or verify live runtime facts. Those remain production blockers.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

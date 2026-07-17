@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
+use ryuki_core::production_build::ProductionBuildManifest;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
@@ -41,12 +42,10 @@ const MAX_TRUST_REGISTRY_PROFILES: usize = 3;
 const MAX_TRUST_KEY_PURPOSES: usize = 2;
 const MAX_TRUST_KEY_EVIDENCE_TIERS: usize = 3;
 const MAX_TRUST_KEY_PACKAGES: usize = 10;
-const MAX_PRODUCTION_BUILD_ADAPTERS: usize = 256;
-const MAX_PRODUCTION_BUILD_CAPABILITIES_PER_ADAPTER: usize = 256;
-const MAX_PRODUCTION_BUILD_BASELINE_TRACES_PER_ADAPTER: usize = 4096;
-const MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS: usize = 1024;
-const MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES: usize = 16_384;
 const MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS: usize = 1024;
+const MAX_APPLICABILITY_EXPRESSION_DEPTH: usize = 32;
+const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
+const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 
 const SCHEMAS: [(&str, &str); 10] = [
     (
@@ -796,429 +795,38 @@ fn validate_declared_schema(
     }
 }
 
-/// Validate bounded, document-internal inventory closure. Exact trace
-/// membership and full active-trace coverage require the independently pinned
-/// ControlTrace bytes and are enforced by the runtime loader, not by this
-/// schema-only repository gate.
+/// Validate the typed v2 build-manifest contract and its document-internal
+/// applicability closure. Exact membership against the independently pinned
+/// ControlTrace is still enforced by the runtime loader; this repository gate
+/// rejects malformed identities, stale inventory bindings, and cross-field
+/// gaps without treating manifest-owned rows as an authority source.
 fn validate_production_build_manifest_semantics(
     file_name: &str,
     manifest: &Value,
     errors: &mut Vec<String>,
 ) {
     let error_start = errors.len();
-    if let Some(source) = manifest.get("source") {
-        let revision_algorithm = string_field(source, "revision_algorithm");
-        let revision = string_field(source, "revision");
-        let expected_length = match revision_algorithm {
-            Some("git_sha1") => Some(40),
-            Some("git_sha256") => Some(64),
-            _ => None,
-        };
-        if let (Some(expected_length), Some(revision)) = (expected_length, revision) {
-            if revision.len() != expected_length
-                || !revision
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            {
-                push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{file_name}:/source/revision: {revision_algorithm:?} requires exactly {expected_length} lowercase hexadecimal characters"
-                    ),
-                );
-            }
+    let manifest = match serde_json::from_value::<ProductionBuildManifest>(manifest.clone()) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            errors.push(format!(
+                "{file_name}: production build manifest typed decode failed: {error}"
+            ));
+            return;
         }
-    }
+    };
 
-    let shipped_adapters = manifest
-        .get("shipped_adapters")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if shipped_adapters.is_empty() || shipped_adapters.len() > MAX_PRODUCTION_BUILD_ADAPTERS {
-        push_production_build_error(
-            errors,
-            error_start,
-            format!(
-                "{file_name}:/shipped_adapters: inventory must contain 1..={MAX_PRODUCTION_BUILD_ADAPTERS} entries"
-            ),
-        );
-    }
-
-    let mut adapters = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
-    let mut previous_adapter_kind: Option<String> = None;
-    for (index, adapter) in shipped_adapters
-        .iter()
-        .take(MAX_PRODUCTION_BUILD_ADAPTERS)
-        .enumerate()
+    for error in manifest
+        .validate_semantics()
+        .into_iter()
+        .take(MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS)
     {
-        let path = format!("{file_name}:/shipped_adapters/{index}");
-        let Some(adapter_kind) = string_field(adapter, "adapter_kind") else {
-            continue;
-        };
-        if previous_adapter_kind
-            .as_deref()
-            .is_some_and(|previous| previous >= adapter_kind)
-        {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{file_name}:/shipped_adapters: entries must be strictly sorted and unique by adapter_kind; {adapter_kind} is out of order at index {index}"
-                ),
-            );
+        if errors.len().saturating_sub(error_start) >= MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS {
+            break;
         }
-        previous_adapter_kind = Some(adapter_kind.to_string());
-
-        if adapter.get("production_eligible").and_then(Value::as_bool) != Some(false) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{path}/production_eligible: v1 build manifests require false until production adapter admission is implemented"
-                ),
-            );
-        }
-
-        let capabilities = validate_sorted_bounded_string_inventory(
-            adapter,
-            "capability_ids",
-            1,
-            MAX_PRODUCTION_BUILD_CAPABILITIES_PER_ADAPTER,
-            &path,
-            error_start,
-            errors,
-        );
-        let required_trace_ids = adapter
-            .get("mandatory_baseline")
-            .map(|baseline| {
-                validate_sorted_bounded_string_inventory(
-                    baseline,
-                    "required_trace_ids",
-                    1,
-                    MAX_PRODUCTION_BUILD_BASELINE_TRACES_PER_ADAPTER,
-                    &format!("{path}/mandatory_baseline"),
-                    error_start,
-                    errors,
-                )
-            })
-            .unwrap_or_default();
-        if adapters
-            .insert(adapter_kind.to_string(), (capabilities, required_trace_ids))
-            .is_some()
-        {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{file_name}:/shipped_adapters/{index}/adapter_kind: duplicate shipped adapter {adapter_kind}"
-                ),
-            );
-        }
-    }
-
-    let selectors = manifest
-        .get("selector_dispositions")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if selectors.is_empty() || selectors.len() > MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS {
-        push_production_build_error(
-            errors,
-            error_start,
-            format!(
-                "{file_name}:/selector_dispositions: inventory must contain 1..={MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS} entries"
-            ),
-        );
-    }
-    let mut previous_selector: Option<(String, String)> = None;
-    let mut selector_keys = BTreeSet::new();
-    let mut implemented_adapter_kinds = BTreeSet::new();
-    for (index, selector) in selectors
-        .iter()
-        .take(MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS)
-        .enumerate()
-    {
-        let path = format!("{file_name}:/selector_dispositions/{index}");
-        let (Some(domain), Some(name)) = (
-            string_field(selector, "selector_domain"),
-            string_field(selector, "selector"),
-        ) else {
-            continue;
-        };
-        let key = (domain.to_string(), name.to_string());
-        if previous_selector
-            .as_ref()
-            .is_some_and(|previous| previous >= &key)
-        {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{file_name}:/selector_dispositions: entries must be strictly sorted and unique by (selector_domain, selector); ({domain}, {name}) is out of order at index {index}"
-                ),
-            );
-        }
-        previous_selector = Some(key.clone());
-        if !selector_keys.insert(key) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!("{path}: duplicate selector disposition ({domain}, {name})"),
-            );
-        }
-
-        let disposition = string_field(selector, "disposition");
-        let adapter_kind = selector.get("adapter_kind").and_then(Value::as_str);
-        match disposition {
-            Some("implemented") => match adapter_kind {
-                Some(adapter_kind) if adapters.contains_key(adapter_kind) => {
-                    implemented_adapter_kinds.insert(adapter_kind.to_string());
-                }
-                Some(adapter_kind) => push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{path}/adapter_kind: implemented selector references unshipped adapter {adapter_kind}"
-                    ),
-                ),
-                None => push_production_build_error(
-                    errors,
-                    error_start,
-                    format!("{path}/adapter_kind: implemented selector requires an adapter_kind"),
-                ),
-            },
-            Some("catalog_only") => match adapter_kind {
-                Some(adapter_kind) if !adapters.contains_key(adapter_kind) => {}
-                Some(adapter_kind) => push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{path}/adapter_kind: catalog_only selector must reference an adapter absent from shipped_adapters, but {adapter_kind} is shipped"
-                    ),
-                ),
-                None => push_production_build_error(
-                    errors,
-                    error_start,
-                    format!("{path}/adapter_kind: catalog_only selector requires an adapter_kind"),
-                ),
-            },
-            Some("unsupported") | Some("sentinel") if adapter_kind.is_some() => {
-                push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{path}/adapter_kind: {disposition:?} selector requires a null adapter_kind"
-                    ),
-                );
-            }
-            _ => {}
-        }
-    }
-    for adapter_kind in adapters.keys() {
-        if !implemented_adapter_kinds.contains(adapter_kind) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{file_name}:/selector_dispositions: shipped adapter {adapter_kind} has no implemented selector"
-                ),
-            );
-        }
-    }
-
-    let expected_instances = manifest
-        .get("expected_trace_instances")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if expected_instances.is_empty()
-        || expected_instances.len() > MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES
-    {
-        push_production_build_error(
-            errors,
-            error_start,
-            format!(
-                "{file_name}:/expected_trace_instances: inventory must contain 1..={MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES} entries"
-            ),
-        );
-    }
-    let component_id = manifest
-        .pointer("/component/component_id")
-        .and_then(Value::as_str);
-    let mut previous_expected_key: Option<(String, String)> = None;
-    let mut expected_keys = BTreeSet::new();
-    let mut instance_ids = BTreeSet::new();
-    let mut traces_by_subject = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut component_subject_present = false;
-    for (index, expected) in expected_instances
-        .iter()
-        .take(MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES)
-        .enumerate()
-    {
-        let path = format!("{file_name}:/expected_trace_instances/{index}");
-        let (Some(trace_id), Some(subject_id)) = (
-            string_field(expected, "trace_id"),
-            string_field(expected, "subject_id"),
-        ) else {
-            continue;
-        };
-        let key = (trace_id.to_string(), subject_id.to_string());
-        if previous_expected_key
-            .as_ref()
-            .is_some_and(|previous| previous >= &key)
-        {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{file_name}:/expected_trace_instances: entries must be strictly sorted and unique by (trace_id, subject_id); ({trace_id}, {subject_id}) is out of order at index {index}"
-                ),
-            );
-        }
-        previous_expected_key = Some(key.clone());
-        if !expected_keys.insert(key) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!("{path}: duplicate expected (trace_id, subject_id) pair"),
-            );
-        }
-        if let Some(instance_id) = string_field(expected, "applicability_instance_id") {
-            if !instance_ids.insert(instance_id.to_string()) {
-                push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{path}/applicability_instance_id: duplicate instance ID {instance_id}"
-                    ),
-                );
-            }
-        }
-
-        let is_component_subject = component_id == Some(subject_id);
-        if is_component_subject {
-            component_subject_present = true;
-        }
-        let known_subject = is_component_subject
-            || parse_adapter_capability_subject(subject_id).is_some_and(
-                |(adapter_kind, capability_id)| {
-                    adapters
-                        .get(adapter_kind)
-                        .is_some_and(|(capabilities, _)| capabilities.contains(capability_id))
-                },
-            );
-        if !known_subject {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!("{path}/subject_id: unknown build subject {subject_id}"),
-            );
-            continue;
-        }
-        traces_by_subject
-            .entry(subject_id.to_string())
-            .or_default()
-            .insert(trace_id.to_string());
-    }
-    if !component_subject_present {
-        push_production_build_error(
-            errors,
-            error_start,
-            format!(
-                "{file_name}:/expected_trace_instances: inventory omits the build component subject"
-            ),
-        );
-    }
-
-    for (adapter_kind, (capabilities, required_trace_ids)) in &adapters {
-        for capability_id in capabilities {
-            let subject_id = format!("adapter-capability:{adapter_kind}:{capability_id}");
-            let Some(actual_traces) = traces_by_subject.get(&subject_id) else {
-                push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{file_name}:/expected_trace_instances: missing subject {subject_id} for shipped adapter capability"
-                    ),
-                );
-                continue;
-            };
-            if let Some(missing_trace_id) = required_trace_ids
-                .iter()
-                .find(|trace_id| !actual_traces.contains(*trace_id))
-            {
-                push_production_build_error(
-                    errors,
-                    error_start,
-                    format!(
-                        "{file_name}:/expected_trace_instances: subject {subject_id} is missing mandatory baseline trace {missing_trace_id}"
-                    ),
-                );
-            }
-        }
-    }
-}
-
-fn validate_sorted_bounded_string_inventory(
-    value: &Value,
-    field: &str,
-    minimum: usize,
-    maximum: usize,
-    path: &str,
-    error_start: usize,
-    errors: &mut Vec<String>,
-) -> BTreeSet<String> {
-    let values = value
-        .get(field)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if values.len() < minimum || values.len() > maximum {
-        push_production_build_error(
-            errors,
-            error_start,
-            format!("{path}/{field}: inventory must contain {minimum}..={maximum} entries"),
-        );
-    }
-    let mut result = BTreeSet::new();
-    let mut previous: Option<String> = None;
-    for (index, item) in values.iter().take(maximum).enumerate() {
-        let Some(item) = item.as_str() else {
-            continue;
-        };
-        if previous.as_deref().is_some_and(|previous| previous >= item) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!(
-                    "{path}/{field}: values must be strictly sorted and unique; {item} is out of order at index {index}"
-                ),
-            );
-        }
-        previous = Some(item.to_string());
-        if !result.insert(item.to_string()) {
-            push_production_build_error(
-                errors,
-                error_start,
-                format!("{path}/{field}/{index}: duplicate value {item}"),
-            );
-        }
-    }
-    result
-}
-
-fn parse_adapter_capability_subject(subject_id: &str) -> Option<(&str, &str)> {
-    let remainder = subject_id.strip_prefix("adapter-capability:")?;
-    let (adapter_kind, capability_id) = remainder.split_once(':')?;
-    (!adapter_kind.is_empty() && !capability_id.is_empty() && !capability_id.contains(':'))
-        .then_some((adapter_kind, capability_id))
-}
-
-fn push_production_build_error(errors: &mut Vec<String>, error_start: usize, error: String) {
-    if errors.len().saturating_sub(error_start) < MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS {
-        errors.push(error);
+        errors.push(format!(
+            "{file_name}: production build manifest semantic error: {error}"
+        ));
     }
 }
 
@@ -1733,6 +1341,18 @@ fn validate_bundle_applicability(
                 document.label
             ));
         }
+        let scope_has_minimum_tier = trace
+            .pointer(&format!("/minimum_evidence_tier/{scope}"))
+            .is_some_and(|tier| !tier.is_null());
+        if !scope_has_minimum_tier {
+            if applicable {
+                errors.push(format!(
+                    "{}: {scope} evidence is applicable even though the trace has no minimum evidence tier for that scope",
+                    document.label
+                ));
+            }
+            continue;
+        }
         match expression
             .get(scope)
             .and_then(|value| string_field(value, "operator"))
@@ -1786,6 +1406,23 @@ fn evaluate_expression(
     expression: &Value,
     dimensions: &BTreeMap<String, Value>,
 ) -> Result<bool, String> {
+    let mut nodes = 0;
+    evaluate_expression_bounded(expression, dimensions, 0, &mut nodes)
+}
+
+fn evaluate_expression_bounded(
+    expression: &Value,
+    dimensions: &BTreeMap<String, Value>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<bool, String> {
+    if depth > MAX_APPLICABILITY_EXPRESSION_DEPTH {
+        return Err("applicability expression exceeds maximum depth".to_string());
+    }
+    *nodes += 1;
+    if *nodes > MAX_APPLICABILITY_EXPRESSION_NODES {
+        return Err("applicability expression exceeds maximum node count".to_string());
+    }
     let operator = string_field(expression, "operator")
         .ok_or_else(|| "applicability expression omits operator".to_string())?;
     match operator {
@@ -1793,9 +1430,19 @@ fn evaluate_expression(
         "never" => Ok(false),
         "all" | "any" => {
             let operands = array(expression, "operands");
+            if operands.is_empty() || operands.len() > MAX_APPLICABILITY_EXPRESSION_OPERANDS {
+                return Err(format!(
+                    "{operator} applicability expression must have 1 through {MAX_APPLICABILITY_EXPRESSION_OPERANDS} operands"
+                ));
+            }
             let mut results = Vec::with_capacity(operands.len());
             for operand in operands {
-                results.push(evaluate_expression(operand, dimensions)?);
+                results.push(evaluate_expression_bounded(
+                    operand,
+                    dimensions,
+                    depth + 1,
+                    nodes,
+                )?);
             }
             Ok(if operator == "all" {
                 results.into_iter().all(|result| result)
@@ -1803,11 +1450,13 @@ fn evaluate_expression(
                 results.into_iter().any(|result| result)
             })
         }
-        "not" => Ok(!evaluate_expression(
+        "not" => Ok(!evaluate_expression_bounded(
             expression
                 .get("operand")
                 .ok_or_else(|| "not expression omits operand".to_string())?,
             dimensions,
+            depth + 1,
+            nodes,
         )?),
         "equals" | "not_equals" | "contains" => {
             let dimension = string_field(expression, "dimension")
@@ -1858,6 +1507,12 @@ fn evaluate_trace_scope(
     scope: &str,
     errors: &mut Vec<String>,
 ) -> Option<bool> {
+    if trace
+        .pointer(&format!("/minimum_evidence_tier/{scope}"))
+        .is_none_or(Value::is_null)
+    {
+        return Some(false);
+    }
     let dimensions = dimension_map(
         instance,
         &format!("{scope}_dimensions"),
@@ -5703,6 +5358,11 @@ fn require_exact_bool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryuki_core::conformance_applicability::{
+        recompute_applicability_instance_id, recompute_applicability_inventory_binding,
+        ApplicabilityControlTraceBinding, ApplicabilityInstance, ApplicabilityScope,
+        ApplicabilitySubject,
+    };
     use serde_json::json;
 
     fn root() -> PathBuf {
@@ -5759,9 +5419,48 @@ mod tests {
     }
 
     fn production_build_manifest_fixture() -> Value {
+        let control_trace = ApplicabilityControlTraceBinding {
+            document_id: "control-trace:ryuki-security-boundary-v1".into(),
+            document_version: 1,
+            content_digest:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+        };
+        let mut component_instance = ApplicabilityInstance {
+            applicability_instance_id: String::new(),
+            trace_id: "TRACE-SB-EXT-01-AC-017".into(),
+            owning_work_package: "SB-4".into(),
+            scope: ApplicabilityScope::Implementation,
+            subject: ApplicabilitySubject::Component {
+                component_id: "component:ryuki-api".into(),
+                component_version: "1.0.0".into(),
+            },
+            dimensions: Vec::new(),
+        };
+        component_instance.applicability_instance_id =
+            recompute_applicability_instance_id(&control_trace, &component_instance)
+                .expect("component applicability identity");
+        let mut adapter_instance = ApplicabilityInstance {
+            applicability_instance_id: String::new(),
+            trace_id: "TRACE-SB-EXT-01-AC-017".into(),
+            owning_work_package: "SB-4".into(),
+            scope: ApplicabilityScope::Implementation,
+            subject: ApplicabilitySubject::AdapterCapability {
+                adapter_kind: "mock-adapter".into(),
+                adapter_version: "1.0.0".into(),
+                capability_id: "resource-read".into(),
+            },
+            dimensions: Vec::new(),
+        };
+        adapter_instance.applicability_instance_id =
+            recompute_applicability_instance_id(&control_trace, &adapter_instance)
+                .expect("adapter applicability identity");
+        let instances = vec![component_instance, adapter_instance];
+        let inventory = recompute_applicability_inventory_binding(&control_trace, &instances)
+            .expect("implementation applicability inventory");
+
         json!({
             "$schema": "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json",
-            "schema_version": "1.0.0",
+            "schema_version": "2.0.0",
             "contract_kind": "production-build-manifest",
             "document_id": "production-build-manifest:ryuki-api-linux-amd64",
             "document_version": 1,
@@ -5816,18 +5515,8 @@ mod tests {
                 "disposition": "implemented",
                 "adapter_kind": "mock-adapter"
             }],
-            "expected_trace_instances": [
-                {
-                    "trace_id": "TRACE-SB-EXT-01-AC-017",
-                    "applicability_instance_id": "applicability:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                    "subject_id": "adapter-capability:mock-adapter:resource-read"
-                },
-                {
-                    "trace_id": "TRACE-SB-EXT-01-AC-017",
-                    "applicability_instance_id": "applicability:sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                    "subject_id": "component:ryuki-api"
-                }
-            ]
+            "implementation_applicability": inventory,
+            "implementation_applicability_instances": instances
         })
     }
 
@@ -6050,7 +5739,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("/source/revision") && error.contains("exactly 40")),
+                .any(|error| error.contains("source revision does not match revision_algorithm")),
             "missing revision binding error: {}",
             errors.join("\n")
         );
@@ -6079,7 +5768,11 @@ mod tests {
         );
         assert!(
             errors.iter().any(|error| {
-                error.contains("/shipped_adapters/0/capability_ids") && error.contains("duplicate")
+                (error.contains("/shipped_adapters/0/capability_ids")
+                    && error.contains("uniqueItems"))
+                    || error.contains(
+                        "shipped adapter mock-adapter capability_ids must be nonempty, unique, sorted, and bounded",
+                    )
             }),
             "missing duplicate inventory error: {}",
             errors.join("\n")
@@ -6095,10 +5788,9 @@ mod tests {
             &mut errors,
         );
         assert!(
-            errors.iter().any(|error| {
-                error.contains("/shipped_adapters/0/capability_ids")
-                    && error.contains("strictly sorted")
-            }),
+            errors.iter().any(|error| error.contains(
+                "shipped adapter mock-adapter capability_ids must be nonempty, unique, sorted, and bounded"
+            )),
             "missing canonical-order error: {}",
             errors.join("\n")
         );
@@ -6109,10 +5801,10 @@ mod tests {
         let fixture = production_build_manifest_fixture();
 
         let mut missing_component = fixture.clone();
-        missing_component["expected_trace_instances"]
+        missing_component["implementation_applicability_instances"]
             .as_array_mut()
-            .expect("expected trace inventory")
-            .pop();
+            .expect("implementation applicability inventory")
+            .remove(0);
         let mut errors = Vec::new();
         validate_production_build_manifest_semantics(
             "test:production-build-manifest-missing-component",
@@ -6122,7 +5814,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("omits the build component subject")),
+                .any(|error| error.contains("omit the exact component subject")),
             "missing component closure error: {}",
             errors.join("\n")
         );
@@ -6136,16 +5828,17 @@ mod tests {
             &mut errors,
         );
         assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("implemented selector references unshipped adapter")),
+            errors.iter().any(|error| {
+                error.contains("implemented selector")
+                    && error.contains("references unshipped adapter")
+            }),
             "missing selector closure error: {}",
             errors.join("\n")
         );
 
         let mut unknown_subject = fixture.clone();
-        unknown_subject["expected_trace_instances"][0]["subject_id"] =
-            json!("adapter-capability:mock-adapter:resource-delete");
+        unknown_subject["implementation_applicability_instances"][1]["subject"]["capability_id"] =
+            json!("resource-delete");
         errors.clear();
         validate_production_build_manifest_semantics(
             "test:production-build-manifest-unknown-subject",
@@ -6155,7 +5848,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("unknown build subject")),
+                .any(|error| error.contains("references unknown capability")),
             "missing subject closure error: {}",
             errors.join("\n")
         );
@@ -6172,8 +5865,84 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("missing mandatory baseline trace")),
+                .any(|error| error.contains("omits mandatory baseline trace")),
             "missing baseline closure error: {}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn production_build_manifest_rejects_stale_applicability_binding_after_row_changes() {
+        let fixture = production_build_manifest_fixture();
+
+        let mut omitted = fixture.clone();
+        omitted["implementation_applicability_instances"]
+            .as_array_mut()
+            .expect("implementation applicability inventory")
+            .pop();
+        let mut errors = Vec::new();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-omitted-row",
+            &omitted,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "implementation_applicability binding does not exactly match its instances"
+            )),
+            "missing omission binding error: {}",
+            errors.join("\n")
+        );
+
+        let mut added = fixture.clone();
+        let control_trace = ApplicabilityControlTraceBinding {
+            document_id: "control-trace:ryuki-security-boundary-v1".into(),
+            document_version: 1,
+            content_digest:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+        };
+        let mut extra: ApplicabilityInstance =
+            serde_json::from_value(added["implementation_applicability_instances"][0].clone())
+                .expect("decode canonical applicability row");
+        extra.trace_id = "TRACE-SB-EXT-02-AC-017".into();
+        extra.applicability_instance_id =
+            recompute_applicability_instance_id(&control_trace, &extra)
+                .expect("extra applicability identity");
+        added["implementation_applicability_instances"]
+            .as_array_mut()
+            .expect("implementation applicability inventory")
+            .push(serde_json::to_value(extra).expect("encode extra applicability row"));
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-added-row",
+            &added,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "implementation_applicability binding does not exactly match its instances"
+            )),
+            "missing addition binding error: {}",
+            errors.join("\n")
+        );
+
+        let mut mutated = fixture;
+        mutated["implementation_applicability_instances"][1]["subject"]["capability_id"] =
+            json!("resource-write");
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-mutated-row",
+            &mutated,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("applicability_instance_id does not match the canonical identity")
+                    || error.contains(
+                        "implementation_applicability binding does not exactly match its instances",
+                    )
+            }),
+            "missing mutation identity error: {}",
             errors.join("\n")
         );
     }
@@ -7169,6 +6938,89 @@ mod tests {
             ]
         });
         assert_eq!(evaluate_expression(&expression, &dimensions), Ok(true));
+    }
+
+    #[test]
+    fn ac_048_treats_a_null_minimum_tier_as_out_of_scope() {
+        let trace = json!({
+            "trace_id": "TRACE-TEST-AC-001",
+            "applicability_expression": {
+                "implementation": {"operator": "always"},
+                "deployment": {"operator": "always"}
+            },
+            "evidence_instance_dimensions": {
+                "implementation": [],
+                "deployment": []
+            },
+            "minimum_evidence_tier": {
+                "implementation": null,
+                "deployment": {"name": "repository_local", "rank": 1}
+            }
+        });
+        let instance = json!({
+            "implementation_dimensions": [],
+            "deployment_dimensions": []
+        });
+        let bundle = LoadedDocument {
+            label: "test:null-tier-bundle".to_string(),
+            digest: ZERO_SHA256_DIGEST.to_string(),
+            value: json!({
+                "evaluated_applicability": {
+                    "implementation": {"applicable": false, "dimensions": []},
+                    "deployment": {"applicable": true, "dimensions": []}
+                },
+                "provenance": {
+                    "evidence_tier": {"name": "repository_local", "rank": 1}
+                }
+            }),
+        };
+        let mut errors = Vec::new();
+
+        assert_eq!(
+            evaluate_trace_scope(&bundle, &trace, &instance, "implementation", &mut errors,),
+            Some(false)
+        );
+        validate_bundle_applicability(&bundle, &trace, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn ac_048_bounds_recursive_applicability_expressions() {
+        let dimensions = BTreeMap::new();
+        let too_many_operands = json!({
+            "operator": "all",
+            "operands": (0..=MAX_APPLICABILITY_EXPRESSION_OPERANDS)
+                .map(|_| json!({"operator": "always"}))
+                .collect::<Vec<_>>()
+        });
+        assert!(evaluate_expression(&too_many_operands, &dimensions)
+            .unwrap_err()
+            .contains("1 through 64 operands"));
+
+        let mut too_deep = json!({"operator": "always"});
+        for _ in 0..=MAX_APPLICABILITY_EXPRESSION_DEPTH {
+            too_deep = json!({"operator": "not", "operand": too_deep});
+        }
+        assert!(evaluate_expression(&too_deep, &dimensions)
+            .unwrap_err()
+            .contains("maximum depth"));
+
+        fn binary_expression(depth: usize) -> Value {
+            if depth == 0 {
+                json!({"operator": "always"})
+            } else {
+                json!({
+                    "operator": "all",
+                    "operands": [
+                        binary_expression(depth - 1),
+                        binary_expression(depth - 1)
+                    ]
+                })
+            }
+        }
+        assert!(evaluate_expression(&binary_expression(12), &dimensions)
+            .unwrap_err()
+            .contains("maximum node count"));
     }
 
     #[test]

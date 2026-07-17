@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json",
   "title": "Ryuki Production Build Manifest",
-  "description": "Detached, content-addressed build identity and independently generated conformance-applicability inventory. This record is evidence input and never grants production authority by itself.",
+  "description": "Detached, content-addressed build identity and independently generated implementation-applicability inventory. This record contains no deployment-applicability facts, is evidence input, and never grants production authority by itself.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -18,13 +18,14 @@
     "control_trace_ref",
     "shipped_adapters",
     "selector_dispositions",
-    "expected_trace_instances"
+    "implementation_applicability",
+    "implementation_applicability_instances"
   ],
   "properties": {
     "$schema": {
       "const": "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json"
     },
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "2.0.0" },
     "contract_kind": { "const": "production-build-manifest" },
     "document_id": {
       "type": "string",
@@ -50,12 +51,15 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/selectorDisposition" }
     },
-    "expected_trace_instances": {
+    "implementation_applicability": {
+      "$ref": "#/$defs/implementationApplicabilityBinding"
+    },
+    "implementation_applicability_instances": {
       "type": "array",
       "minItems": 1,
       "maxItems": 16384,
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/expectedTraceInstance" }
+      "items": { "$ref": "#/$defs/implementationApplicabilityInstance" }
     }
   },
   "$defs": {
@@ -88,6 +92,21 @@
       "minLength": 7,
       "maxLength": 134,
       "pattern": "^TRACE-[A-Z0-9][A-Z0-9._-]{2,127}$"
+    },
+    "workPackageId": {
+      "type": "string",
+      "enum": [
+        "SB-0",
+        "SB-1",
+        "SB-2",
+        "SB-3",
+        "SB-4",
+        "SB-5",
+        "SB-6",
+        "SB-7",
+        "SB-8",
+        "SB-9"
+      ]
     },
     "normalizedJsonLocator": {
       "type": "string",
@@ -300,26 +319,133 @@
         }
       }
     },
-    "expectedTraceInstance": {
+    "implementationApplicabilityBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["trace_id", "applicability_instance_id", "subject_id"],
+      "required": [
+        "inventory_contract",
+        "identity_contract",
+        "instance_count",
+        "content_digest"
+      ],
       "properties": {
-        "trace_id": { "$ref": "#/$defs/traceId" },
+        "inventory_contract": {
+          "const": "ryuki-applicability-inventory-v2"
+        },
+        "identity_contract": {
+          "const": "ryuki-applicability-instance-v2"
+        },
+        "instance_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "content_digest": {
+          "description": "SHA-256 of ryuki-canonical-json-v1 bytes for {domain: ryuki-applicability-inventory-v2, control_trace: {document_id, document_version, content_digest}, instances: implementation_applicability_instances in canonical order}. Semantic validation recomputes the exact preimage and requires this digest and instance_count to match.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
+    },
+    "implementationApplicabilityInstance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicability_instance_id",
+        "trace_id",
+        "owning_work_package",
+        "scope",
+        "subject",
+        "dimensions"
+      ],
+      "properties": {
         "applicability_instance_id": {
+          "description": "applicability:sha256:<hex> where hex is SHA-256 of ryuki-canonical-json-v1 bytes for {domain: ryuki-applicability-instance-v2, control_trace: {document_id, document_version, content_digest}, trace_id, owning_work_package, scope, subject, dimensions}; applicability_instance_id itself is excluded. Semantic validation recomputes the complete preimage.",
           "type": "string",
           "pattern": "^applicability:sha256:[a-f0-9]{64}$"
         },
-        "subject_id": {
+        "trace_id": { "$ref": "#/$defs/traceId" },
+        "owning_work_package": { "$ref": "#/$defs/workPackageId" },
+        "scope": { "const": "implementation" },
+        "subject": { "$ref": "#/$defs/implementationApplicabilitySubject" },
+        "dimensions": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/implementationApplicabilityDimension" }
+        }
+      }
+    },
+    "implementationApplicabilitySubject": {
+      "oneOf": [
+        { "$ref": "#/$defs/componentApplicabilitySubject" },
+        { "$ref": "#/$defs/adapterCapabilityApplicabilitySubject" }
+      ]
+    },
+    "componentApplicabilitySubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_kind", "component_id", "component_version"],
+      "properties": {
+        "subject_kind": { "const": "component" },
+        "component_id": { "const": "component:ryuki-api" },
+        "component_version": { "$ref": "#/$defs/semanticVersion" }
+      }
+    },
+    "adapterCapabilityApplicabilitySubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject_kind",
+        "adapter_kind",
+        "adapter_version",
+        "capability_id"
+      ],
+      "properties": {
+        "subject_kind": { "const": "adapter_capability" },
+        "adapter_kind": { "$ref": "#/$defs/canonicalName" },
+        "adapter_version": { "$ref": "#/$defs/semanticVersion" },
+        "capability_id": { "$ref": "#/$defs/canonicalName" }
+      }
+    },
+    "implementationApplicabilityDimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 160,
+          "pattern": "^implementation\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+        },
+        "value": {
           "oneOf": [
-            { "const": "component:ryuki-api" },
+            { "$ref": "#/$defs/applicabilityScalar" },
             {
-              "type": "string",
-              "pattern": "^adapter-capability:[a-z][a-z0-9._-]{1,95}:[a-z][a-z0-9._-]{1,95}$"
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 256,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/applicabilityScalar" }
             }
           ]
         }
       }
+    },
+    "applicabilityScalar": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        { "type": "boolean" },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      ]
     }
   }
 }

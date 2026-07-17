@@ -3,7 +3,7 @@
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
 - Evidence revision: `8212748308372e92d9cf794907d85fe103afd1da`
-- Last updated: 2026-07-15
+- Last updated: 2026-07-17
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -978,6 +978,7 @@ reviewable records:
 | Threat and abuse-case registry | Covers every actor kind, trust boundary, dangerous action, provider adapter, and failure mode. |
 | Incident and recovery evidence | Proves revocation, quarantine, key compromise, restored-state reconciliation, and dormant/activation/aftercare break-glass drills. |
 | Deployment security profile | Is the executable root that binds deployment/profile version, deployment id, tenancy mode, trust topology, provider-registry/lifecycle snapshot, policy/configuration versions, and active security-limit profile. |
+| Production build manifest | Binds the measured executable and source revision to the exact shipped component, adapter/capability surface, authenticated ControlTrace, and independently derived implementation-applicability v2 inventory. It does not assert deployment/provider applicability. |
 | Security-limit profile | Is the sole normative owner of selected values, platform-enforced hard bounds, units, scopes, failure behavior, telemetry, and change authority for every bounded resource; code and manifests consume or validate its version rather than redefining limits. |
 | External conformance trust checkpoint and acceptance ledger | Independently anchors the highest admitted trust-registry head, the exact current SB-9 production root, and exact accepted-document events under one deployment/trust-domain/registry namespace sequence. Its custody and authentication are outside the rollbackable contract/profile channel. |
 | Production conformance report | Binds all permanent acceptance-case evidence to an exact source revision, config/provider/limit-profile version, image digest, and deployment. |
@@ -1001,14 +1002,17 @@ minimum tier, bound to the current revision and configuration, can satisfy a
 readiness gate. Repository tests cannot masquerade as production/operator
 evidence, and trusted evidence cannot override a failing repository invariant.
 
-**SB-CONF-03 — Anti-skip closure.** The expected control set is generated from
-the deployment profile and every advertised capability. Missing, duplicate,
-unknown, expired, downgraded, wrong-revision, insufficient-tier, or skipped
-mandatory controls fail closure. A waiver names an explicitly waivable control,
-owner, rationale, compensating control, exact scope, approval, and expiry; a
-provider cannot make a baseline disappear by editing its capability descriptor.
-The records above define the inventory; this ledger defines their executable
-serialization and trust semantics.
+**SB-CONF-03 — Anti-skip closure.** The expected applicability universe is
+independently generated from the authenticated ControlTrace, measured component
+identity, shipped adapter/capability build facts, admitted deployment profile,
+configured provider descriptors, and every advertised capability. Missing,
+duplicate, unknown, expired, downgraded, wrong-revision, insufficient-tier, or
+skipped mandatory controls fail closure. A waiver names an explicitly waivable
+control, owner, rationale, compensating control, exact scope, approval, and
+expiry; neither a build manifest nor a provider can make a baseline disappear
+by editing its claimed inventory or capability descriptor. The records above
+define the inventory; this ledger defines their executable serialization and
+trust semantics.
 
 **SB-CONF-04 — Executable control trace.** One machine-readable `ControlTrace`
 ledger is the source of truth for the expected static control mapping. Each row
@@ -1041,6 +1045,64 @@ requirements. Platform-minimum controls are always applicable in production.
 An optional unconfigured adapter may be absent from a deployment bundle, but a
 shipped adapter cannot escape implementation conformance and a configured or
 advertised capability cannot be omitted from deployment closure.
+
+The v2 applicability contract keeps those scopes separate. An implementation
+instance has exactly one `component` or `adapter_capability` subject; a
+deployment instance has exactly one `deployment` or `provider_capability`
+subject. Every instance also carries its exact `trace_id`, owning work package,
+scope, and strictly name-sorted dimension list. A trace contributes to a scope
+only when it is active, its minimum evidence tier for that scope is non-null,
+and its applicability expression evaluates true from authoritative facts. A
+null minimum tier means that the scope is absent; even an `always` expression
+cannot create an obligation for that scope. Every expression-referenced
+dimension must be declared by the trace and available from the authoritative
+fact set, and missing, additional, unknown, duplicate, or differently valued
+dimensions fail derivation.
+
+An applicability instance id is SHA-256 over `ryuki-canonical-json-v1` bytes of
+this complete preimage:
+
+`{domain: "ryuki-applicability-instance-v2", control_trace: {document_id, document_version, content_digest}, trace_id, owning_work_package, scope, subject, dimensions}`.
+
+The serialized id is `applicability:sha256:<lowercase hex>`. The inventory is
+strictly ordered by scope rank (`implementation` = 0, `deployment` = 1), trace
+id, owning work package, structured subject, dimensions, then recomputed
+instance id. Subject ranks are `component` = 0, `adapter_capability` = 1,
+`deployment` = 2, and `provider_capability` = 3; fields within one subject
+variant compare in their serialized declaration order. Dimension lists compare
+name then value and finally length. Dimension-value ranks are boolean = 0,
+integer = 1, string = 2, and set = 3. Set elements are strictly ordered by
+scalar rank—boolean = 0, integer = 1, string = 2—then by their native value;
+sets compare element by element and then by length. Dimension names are strictly
+increasing. String comparisons use Rust bytewise lexicographic ordering,
+booleans order false before true, and integers use numeric order. The binding
+records the identity contract, inventory contract, exact instance count, and
+SHA-256 digest of canonical JSON for:
+
+`{domain: "ryuki-applicability-inventory-v2", control_trace: {document_id, document_version, content_digest}, instances}`.
+
+For the current build-side slice, the claimed implementation inventory is not
+its own authority. Release admission independently derives it from the exact
+authenticated ControlTrace plus measured build facts: component identity and
+version, source revision, runtime-executable digest, fixture/probe id, and the
+shipped adapter kind/version/capability inventory. The component subject fans
+out across every active trace with a non-null implementation tier whose
+expression evaluates true. Each shipped adapter capability separately fans out
+across its mandatory-baseline trace ids, and each referenced trace must itself
+be active, implementation-scoped, and applicable. The manifest's rows, order,
+recomputed ids, count, and inventory digest must exactly equal that independently
+derived result; deleting a row and its evidence, inventing a row, changing a
+dimension, or swapping a trace or subject fails equality.
+
+This slice does not derive deployment or provider-capability instances.
+Deployment applicability remains a runtime-owned union of the admitted
+deployment profile, active provider configurations and descriptors, advertised
+capabilities, topology, tenancy, and policy facts, and that derivation is not
+yet implemented. The build inventory therefore discharges neither remaining
+production blocker: semantic receipt closure must still consume the opaque
+current-root proof against the complete independently derived universe, and the
+runtime admission boundary must still verify every live guard fact. Production
+startup remains fail-closed.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
@@ -1081,7 +1143,8 @@ artifacts discoverable or authoritative at runtime. The
 implementation must publish schemas for
 `deployment-security-profile.schema.json`, `provider-registry.schema.json`,
 `action-resource-registry.schema.json`, `security-limit-profile.schema.json`,
-`control-trace.schema.json`, `conformance-trust-root-registry.schema.json`,
+`control-trace.schema.json`, `production-build-manifest.schema.json`,
+`conformance-trust-root-registry.schema.json`,
 `conformance-trust-checkpoint-envelope.schema.json`,
 `conformance-bundle.schema.json`, and `package-exit-receipt.schema.json` in the
 versioned security contract set; prose or a package-owned boolean cannot replace

@@ -38,11 +38,13 @@ Production also requires this independently pinned build-manifest pair:
 
 The two variables form one complete binding: setting only one fails closed,
 and both are mandatory when `RYUKI_SECURITY_PROFILE=production`. Development
-and test deployments must leave both unset. The manifest independently pins
-the expected build identity and a declared applicability candidate, but it does
-not independently derive that universe or authenticate deployed OCI provenance.
-Semantic conformance closure and verification of live runtime facts remain
-unconditional production blockers.
+and test deployments must leave both unset. The manifest independently pins the
+expected build identity and claims an implementation-applicability inventory.
+Startup independently derives that build-side inventory from the authenticated
+ControlTrace and measured build facts and requires exact equality. It does not
+derive deployment/provider applicability or authenticate deployed OCI
+provenance. Semantic conformance closure and verification of live runtime facts
+remain unconditional production blockers.
 
 Production additionally requires these external checkpoint bindings:
 

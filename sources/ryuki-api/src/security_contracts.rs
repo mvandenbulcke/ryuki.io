@@ -27,6 +27,7 @@ use ryuki_core::conformance_trust::{
     EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
     VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
 };
+use ryuki_core::production_applicability::validate_exact_implementation_applicability;
 use ryuki_core::production_build::{
     BuildComponent, BuildSelectorDisposition, ProductionBuildManifest, ShippedAdapter,
 };
@@ -352,13 +353,14 @@ impl fmt::Debug for ProductionBuildManifestCandidate {
 
 /// Opaque non-cloneable aggregate binding the detached manifest's exact raw
 /// bytes to deployment pins, the running executable, the compiled selector
-/// inventory, and exact coverage of the active ControlTrace trace-ID set.
+/// inventory, and the exact independently derived implementation applicability
+/// inventory for the content-addressed ControlTrace.
 ///
-/// This capability closes build identity only. It is intentionally insufficient
-/// for independently derived applicability, semantic conformance closure, OCI
-/// deployment provenance, or production runtime admission. The manifest's OCI
-/// subject remains a pinned external declaration until a later deployment proof
-/// binds it to the running workload.
+/// This capability closes build identity and build-side applicability only. It
+/// is intentionally insufficient for deployment/provider applicability,
+/// semantic receipt closure, OCI deployment provenance, or production runtime
+/// admission. The manifest's OCI subject remains a pinned external declaration
+/// until a later deployment proof binds it to the running workload.
 pub(crate) struct PinnedProductionBuildManifest {
     source_path: PathBuf,
     raw_bytes: Box<[u8]>,
@@ -393,9 +395,9 @@ pub(crate) struct SecurityContractContext {
     /// Opaque binding between the exact profile-selected SB-9 receipt and the
     /// independently asserted current root in the same checkpoint snapshot.
     pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
-    /// Exact build identity plus a detached, independently pinned applicability
-    /// declaration. Present only for production; it is not yet an authoritative
-    /// applicability derivation or deployed-OCI proof.
+    /// Exact build identity plus detached, independently derived implementation
+    /// applicability. Present only for production; it is not deployment/provider
+    /// applicability, semantic receipt closure, or deployed-OCI proof.
     pub(crate) production_build_manifest: Option<PinnedProductionBuildManifest>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
@@ -835,14 +837,13 @@ fn prepare_startup_security_contract(
 
         let production_build_manifest = match production_build_manifest_candidate {
             Some(candidate) => {
-                let control_trace = verifier
-                    .documents
+                let control_trace_bytes = verifier
+                    .document_bytes
                     .get(&profile.control_trace_ref.artifact_locator)
                     .ok_or_else(|| {
-                        "production build manifest control-trace reference did not resolve"
-                            .to_string()
+                        "production build manifest control-trace bytes did not resolve".to_string()
                     })?;
-                Some(candidate.seal(control_trace)?)
+                Some(candidate.seal(control_trace_bytes)?)
             }
             None => None,
         };
@@ -1027,8 +1028,22 @@ fn load_production_build_manifest_candidate(
 }
 
 impl ProductionBuildManifestCandidate {
-    fn seal(self, control_trace: &Value) -> Result<PinnedProductionBuildManifest, String> {
-        validate_manifest_trace_inventory(&self.document, control_trace)?;
+    fn seal(self, control_trace_bytes: &[u8]) -> Result<PinnedProductionBuildManifest, String> {
+        let measured_digest = raw_digest(control_trace_bytes);
+        if measured_digest != self.document.control_trace_ref.content_digest {
+            return Err(
+                "production build manifest ControlTrace bytes do not match its content-addressed reference"
+                    .into(),
+            );
+        }
+        let control_trace = parse_json_strict(control_trace_bytes)
+            .map_err(|error| format!("profile-selected ControlTrace JSON is invalid: {error}"))?;
+        validate_against_schema(
+            "profile-selected ControlTrace",
+            CONTROL_TRACE_SCHEMA,
+            &control_trace,
+        )?;
+        validate_manifest_trace_inventory(&self.document, &control_trace)?;
         Ok(PinnedProductionBuildManifest {
             source_path: self.source_path,
             raw_bytes: self.raw_bytes,
@@ -1042,43 +1057,11 @@ fn validate_manifest_trace_inventory(
     manifest: &ProductionBuildManifest,
     control_trace: &Value,
 ) -> Result<(), String> {
-    let traces = control_trace
-        .get("traces")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "profile-selected ControlTrace omits traces".to_string())?;
-    let mut active_trace_ids = BTreeSet::new();
-    for trace in traces {
-        if trace.get("trace_lifecycle").and_then(Value::as_str) != Some("active") {
-            continue;
-        }
-        let trace_id = required_str(trace, "trace_id", "ControlTrace row")?;
-        if !active_trace_ids.insert(trace_id) {
-            return Err(format!(
-                "profile-selected ControlTrace has duplicate active trace {trace_id}"
-            ));
-        }
-    }
-    let expected_trace_ids = manifest
-        .expected_trace_instances
-        .iter()
-        .map(|instance| instance.trace_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if expected_trace_ids != active_trace_ids {
-        let missing = active_trace_ids
-            .difference(&expected_trace_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        let unknown = expected_trace_ids
-            .difference(&active_trace_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "production build manifest trace-ID coverage is not the exact active ControlTrace set ({} missing, {} unknown)",
-            missing.len(),
-            unknown.len()
-        ));
-    }
-    Ok(())
+    validate_exact_implementation_applicability(control_trace, manifest).map_err(|error| {
+        format!(
+            "production build manifest implementation applicability failed independent derivation: {error}"
+        )
+    })
 }
 
 async fn reconcile_external_conformance_checkpoint(
@@ -3567,15 +3550,20 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use chrono::TimeZone;
     use ed25519_dalek::{Signer, SigningKey};
+    use ryuki_core::conformance_applicability::{
+        ApplicabilityInventoryBinding, APPLICABILITY_IDENTITY_CONTRACT,
+        APPLICABILITY_INVENTORY_CONTRACT,
+    };
     use ryuki_core::conformance_trust::{
         canonical_json_bytes, conformance_signed_subject_digest, conformance_signing_bytes,
         CANONICALIZATION_PROFILE, CONFORMANCE_BUNDLE_DOMAIN, PACKAGE_EXIT_RECEIPT_DOMAIN,
         SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
         TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
+    use ryuki_core::production_applicability::derive_implementation_applicability;
     use ryuki_core::production_build::{
-        BuildEndian, BuildSource, BuildTarget, ExpectedTraceInstance, MandatoryCapabilityBaseline,
-        OciSubject, OciSubjectKind, RuntimeExecutable, SelectorDisposition, SelectorDomain,
+        BuildEndian, BuildSource, BuildTarget, MandatoryCapabilityBaseline, OciSubject,
+        OciSubjectKind, RuntimeExecutable, SelectorDisposition, SelectorDomain,
         SourceRevisionAlgorithm, PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND,
         PRODUCTION_BUILD_MANIFEST_SCHEMA_URI, PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION,
     };
@@ -3645,8 +3633,9 @@ mod tests {
     fn test_production_build_manifest(
         runtime: &RuntimeBuildIdentity,
         profile: &DeploymentSecurityProfile,
+        control_trace: &Value,
     ) -> ProductionBuildManifest {
-        ProductionBuildManifest {
+        let mut manifest = ProductionBuildManifest {
             schema_uri: PRODUCTION_BUILD_MANIFEST_SCHEMA_URI.into(),
             schema_version: PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION.into(),
             contract_kind: PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND.into(),
@@ -3669,19 +3658,25 @@ mod tests {
             control_trace_ref: profile.control_trace_ref.clone(),
             shipped_adapters: runtime.shipped_adapters.clone(),
             selector_dispositions: runtime.selector_dispositions.clone(),
-            expected_trace_instances: vec![
-                ExpectedTraceInstance {
-                    trace_id: "TRACE-SB-BOUND-01-AC-040".into(),
-                    applicability_instance_id: format!("applicability:sha256:{}", "1".repeat(64)),
-                    subject_id: "adapter-capability:auth.test:authenticate".into(),
-                },
-                ExpectedTraceInstance {
-                    trace_id: "TRACE-SB-BOUND-01-AC-040".into(),
-                    applicability_instance_id: format!("applicability:sha256:{}", "2".repeat(64)),
-                    subject_id: "component:ryuki-api".into(),
-                },
-            ],
-        }
+            implementation_applicability: ApplicabilityInventoryBinding {
+                identity_contract: APPLICABILITY_IDENTITY_CONTRACT.into(),
+                inventory_contract: APPLICABILITY_INVENTORY_CONTRACT.into(),
+                instance_count: 1,
+                content_digest: format!("sha256:{}", "f".repeat(64)),
+            },
+            implementation_applicability_instances: Vec::new(),
+        };
+        let derived = derive_implementation_applicability(control_trace, &manifest)
+            .expect("derive test implementation applicability");
+        manifest.implementation_applicability = derived.binding;
+        manifest.implementation_applicability_instances = derived.instances;
+        manifest
+    }
+
+    fn test_production_control_trace(fixture: &ActiveFixture) -> (Vec<u8>, Value) {
+        let bytes = fs::read(fixture.root.join(CONTROL_TRACE_PATH)).unwrap();
+        let value = parse_json_strict(&bytes).unwrap();
+        (bytes, value)
     }
 
     fn production_trust_registry(key: &SigningKey, profile: &DeploymentSecurityProfile) -> Value {
@@ -4829,7 +4824,8 @@ mod tests {
         )
         .unwrap();
         let runtime = test_runtime_build_identity();
-        let manifest = test_production_build_manifest(&runtime, &profile);
+        let (control_trace_bytes, control_trace) = test_production_control_trace(&fixture);
+        let manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
         let detached = TempDir::new().expect("detached build-manifest root");
         let detached_root = fs::canonicalize(detached.path()).unwrap();
         let path = detached_root.join("production-build-manifest.json");
@@ -4846,12 +4842,7 @@ mod tests {
                 .expect("exact detached manifest must bind the runtime build surface");
         fs::write(&path, b"{}").unwrap();
         let proof = candidate
-            .seal(&json!({
-                "traces": [{
-                    "trace_id": "TRACE-SB-BOUND-01-AC-040",
-                    "trace_lifecycle": "active"
-                }]
-            }))
+            .seal(&control_trace_bytes)
             .expect("sealing consumes the already loaded bytes without rereading the path");
         let debug = format!("{proof:?}");
         assert!(debug.contains("production-build-manifest:runtime-test"));
@@ -4867,16 +4858,17 @@ mod tests {
     #[test]
     fn detached_build_manifest_rejects_identity_swaps_before_checkpoint_io() {
         let fixture = ActiveFixture::build();
-        let profile: DeploymentSecurityProfile = serde_json::from_slice(
+        let mut profile: DeploymentSecurityProfile = serde_json::from_slice(
             &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
         )
         .unwrap();
         let runtime = test_runtime_build_identity();
+        let (_, control_trace) = test_production_control_trace(&fixture);
         let detached = TempDir::new().expect("detached build-manifest root");
         let detached_root = fs::canonicalize(detached.path()).unwrap();
         let path = detached_root.join("production-build-manifest.json");
 
-        let mut manifest = test_production_build_manifest(&runtime, &profile);
+        let mut manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
         manifest.source.revision = "f".repeat(40);
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&path, &bytes).unwrap();
@@ -4891,8 +4883,11 @@ mod tests {
                 .contains("embedded release revision")
         );
 
-        let mut manifest = test_production_build_manifest(&runtime, &profile);
+        let mut manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
         manifest.shipped_adapters[0].adapter_version = "0.2.0".into();
+        let derived = derive_implementation_applicability(&control_trace, &manifest).unwrap();
+        manifest.implementation_applicability = derived.binding;
+        manifest.implementation_applicability_instances = derived.instances;
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&path, &bytes).unwrap();
         pins.production_build_manifest.as_mut().unwrap().digest = raw_digest(&bytes);
@@ -4902,22 +4897,40 @@ mod tests {
                 .contains("compiled build surface")
         );
 
-        let manifest = test_production_build_manifest(&runtime, &profile);
+        let manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&path, &bytes).unwrap();
         pins.production_build_manifest.as_mut().unwrap().digest = raw_digest(&bytes);
         let candidate =
             load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime)
                 .unwrap();
+        let mut changed_trace = control_trace.clone();
+        let mut extra = changed_trace["traces"][0].clone();
+        extra["trace_id"] = json!("TRACE-SB-OTHER-01-AC-001");
+        changed_trace["traces"].as_array_mut().unwrap().push(extra);
+        let changed_trace_bytes = serde_json::to_vec_pretty(&changed_trace).unwrap();
         assert!(candidate
-            .seal(&json!({
-                "traces": [{
-                    "trace_id": "TRACE-SB-OTHER-01-AC-001",
-                    "trace_lifecycle": "active"
-                }]
-            }))
+            .seal(&changed_trace_bytes)
             .unwrap_err()
-            .contains("exact active ControlTrace set"));
+            .contains("content-addressed reference"));
+
+        profile.control_trace_ref.content_digest = raw_digest(&changed_trace_bytes);
+        let mut stale_manifest = manifest;
+        stale_manifest.control_trace_ref = profile.control_trace_ref.clone();
+        let stale_inventory =
+            derive_implementation_applicability(&control_trace, &stale_manifest).unwrap();
+        stale_manifest.implementation_applicability = stale_inventory.binding;
+        stale_manifest.implementation_applicability_instances = stale_inventory.instances;
+        let bytes = serde_json::to_vec_pretty(&stale_manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        pins.production_build_manifest.as_mut().unwrap().digest = raw_digest(&bytes);
+        let candidate =
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime)
+                .unwrap();
+        assert!(candidate
+            .seal(&changed_trace_bytes)
+            .unwrap_err()
+            .contains("not the exact independently derived inventory"));
     }
 
     #[test]
@@ -4928,7 +4941,8 @@ mod tests {
         )
         .unwrap();
         let runtime = test_runtime_build_identity();
-        let manifest = test_production_build_manifest(&runtime, &profile);
+        let (_, control_trace) = test_production_control_trace(&fixture);
+        let manifest = test_production_build_manifest(&runtime, &profile, &control_trace);
         let path = fixture.root.join("production-build-manifest.json");
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         fs::write(&path, &bytes).unwrap();

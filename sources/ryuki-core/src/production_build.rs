@@ -5,16 +5,23 @@
 //! the compiled build-surface inventory. Parsing this type never grants
 //! production authority.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
+use crate::conformance_applicability::{
+    ApplicabilityControlTraceBinding, ApplicabilityInstance, ApplicabilityInventoryBinding,
+    ApplicabilityScope, ApplicabilitySubject, compare_applicability_instances,
+    recompute_applicability_instance_id, validate_applicability_instance,
+    validate_applicability_inventory, validate_applicability_inventory_binding,
+};
 use crate::security_profile::{ArtifactKind, VersionedContentReference};
 
 pub const PRODUCTION_BUILD_MANIFEST_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json";
-pub const PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
+pub const PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION: &str = "2.0.0";
 pub const PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND: &str = "production-build-manifest";
 pub const PRODUCTION_BUILD_COMPONENT_ID: &str = "component:ryuki-api";
 pub const PRODUCTION_BUILD_EXECUTABLE_NAME: &str = "ryuki-api";
@@ -23,7 +30,7 @@ const MAX_ADAPTERS: usize = 256;
 const MAX_CAPABILITIES_PER_ADAPTER: usize = 256;
 const MAX_BASELINE_TRACES: usize = 4096;
 const MAX_SELECTORS: usize = 1024;
-const MAX_EXPECTED_TRACE_INSTANCES: usize = 16_384;
+const MAX_IMPLEMENTATION_APPLICABILITY_INSTANCES: usize = 16_384;
 const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_RUNTIME_EXECUTABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -43,7 +50,8 @@ pub struct ProductionBuildManifest {
     pub control_trace_ref: VersionedContentReference,
     pub shipped_adapters: Vec<ShippedAdapter>,
     pub selector_dispositions: Vec<BuildSelectorDisposition>,
-    pub expected_trace_instances: Vec<ExpectedTraceInstance>,
+    pub implementation_applicability: ApplicabilityInventoryBinding,
+    pub implementation_applicability_instances: Vec<ApplicabilityInstance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,14 +192,6 @@ impl SelectorDisposition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExpectedTraceInstance {
-    pub trace_id: String,
-    pub applicability_instance_id: String,
-    pub subject_id: String,
-}
-
 impl ProductionBuildManifest {
     /// Enforces semantic invariants that JSON Schema cannot express, including
     /// strict ordering and cross-reference closure. Errors are sorted and
@@ -281,11 +281,12 @@ impl ProductionBuildManifest {
                 "selector_dispositions must contain between 1 and {MAX_SELECTORS} entries"
             ));
         }
-        if self.expected_trace_instances.is_empty()
-            || self.expected_trace_instances.len() > MAX_EXPECTED_TRACE_INSTANCES
-        {
+        let applicability_is_bounded = !self.implementation_applicability_instances.is_empty()
+            && self.implementation_applicability_instances.len()
+                <= MAX_IMPLEMENTATION_APPLICABILITY_INSTANCES;
+        if !applicability_is_bounded {
             errors.push(format!(
-                "expected_trace_instances must contain between 1 and {MAX_EXPECTED_TRACE_INSTANCES} entries"
+                "implementation_applicability_instances must contain between 1 and {MAX_IMPLEMENTATION_APPLICABILITY_INSTANCES} entries"
             ));
         }
 
@@ -368,85 +369,151 @@ impl ProductionBuildManifest {
             }
         }
 
-        let mut expected_pairs = BTreeSet::new();
-        let mut instance_ids = BTreeSet::new();
-        let mut subject_traces = BTreeMap::<&str, BTreeSet<&str>>::new();
-        let mut previous_expected: Option<(&str, &str)> = None;
-        let mut component_subject_present = false;
-        for expected in &self.expected_trace_instances {
-            let key = (expected.trace_id.as_str(), expected.subject_id.as_str());
-            if previous_expected.is_some_and(|previous| previous >= key) {
+        if applicability_is_bounded {
+            let trace_binding = ApplicabilityControlTraceBinding {
+                document_id: self.control_trace_ref.document_id.clone(),
+                document_version: self.control_trace_ref.document_version,
+                content_digest: self.control_trace_ref.content_digest.clone(),
+            };
+            let instances = &self.implementation_applicability_instances;
+
+            if let Err(error) = validate_applicability_inventory(&trace_binding, instances) {
+                errors.push(format!(
+                    "implementation_applicability_instances are invalid: {error}"
+                ));
+            }
+            if let Err(error) = validate_applicability_inventory_binding(
+                &trace_binding,
+                instances,
+                &self.implementation_applicability,
+            ) {
+                errors.push(format!(
+                    "implementation_applicability binding does not exactly match its instances: {error}"
+                ));
+            }
+
+            let mut instance_ids = BTreeSet::new();
+            let mut previous_instance: Option<&ApplicabilityInstance> = None;
+            let mut component_subject_present = false;
+            let mut adapter_subject_traces = BTreeMap::<(String, String), BTreeSet<String>>::new();
+
+            for (index, instance) in instances.iter().enumerate() {
+                if previous_instance.is_some_and(|previous| {
+                    compare_applicability_instances(previous, instance) != Ordering::Less
+                }) {
+                    errors.push(
+                        "implementation_applicability_instances must be in strict canonical order"
+                            .into(),
+                    );
+                }
+                previous_instance = Some(instance);
+
+                if instance.scope != ApplicabilityScope::Implementation {
+                    errors.push(format!(
+                        "implementation_applicability_instances[{index}] must use implementation scope"
+                    ));
+                }
+                if !instance_ids.insert(instance.applicability_instance_id.as_str()) {
+                    errors.push(format!(
+                        "duplicate applicability_instance_id {}",
+                        instance.applicability_instance_id
+                    ));
+                }
+                if let Err(error) = validate_applicability_instance(&trace_binding, instance) {
+                    errors.push(format!(
+                        "implementation_applicability_instances[{index}] is invalid: {error}"
+                    ));
+                }
+                match recompute_applicability_instance_id(&trace_binding, instance) {
+                    Ok(expected_id) if expected_id != instance.applicability_instance_id => {
+                        errors.push(format!(
+                            "implementation_applicability_instances[{index}] applicability_instance_id does not match its canonical identity"
+                        ));
+                    }
+                    Err(error) => errors.push(format!(
+                        "implementation_applicability_instances[{index}] identity cannot be recomputed: {error}"
+                    )),
+                    _ => {}
+                }
+
+                match &instance.subject {
+                    ApplicabilitySubject::Component {
+                        component_id,
+                        component_version,
+                    } => {
+                        let exact_component = component_id == &self.component.component_id
+                            && component_version == &self.component.component_version;
+                        if !exact_component {
+                            errors.push(format!(
+                                "implementation_applicability_instances[{index}] component subject does not match the manifest component identity and version"
+                            ));
+                        } else {
+                            component_subject_present = true;
+                        }
+                    }
+                    ApplicabilitySubject::AdapterCapability {
+                        adapter_kind,
+                        adapter_version,
+                        capability_id,
+                    } => match shipped.get(adapter_kind.as_str()) {
+                        Some(adapter) => {
+                            let version_matches =
+                                adapter.adapter_version.as_str() == adapter_version.as_str();
+                            let capability_matches = adapter
+                                .capability_ids
+                                .binary_search_by(|item| item.as_str().cmp(capability_id.as_str()))
+                                .is_ok();
+                            if !version_matches {
+                                errors.push(format!(
+                                    "implementation_applicability_instances[{index}] adapter {adapter_kind} version does not match the shipped adapter"
+                                ));
+                            }
+                            if !capability_matches {
+                                errors.push(format!(
+                                    "implementation_applicability_instances[{index}] references unknown capability {adapter_kind}:{capability_id}"
+                                ));
+                            }
+                            if version_matches && capability_matches {
+                                adapter_subject_traces
+                                    .entry((adapter_kind.clone(), capability_id.clone()))
+                                    .or_default()
+                                    .insert(instance.trace_id.clone());
+                            }
+                        }
+                        None => errors.push(format!(
+                            "implementation_applicability_instances[{index}] references unshipped adapter {adapter_kind}"
+                        )),
+                    },
+                    ApplicabilitySubject::Deployment { .. }
+                    | ApplicabilitySubject::ProviderCapability { .. } => errors.push(format!(
+                        "implementation_applicability_instances[{index}] uses a deployment-owned subject"
+                    )),
+                }
+            }
+
+            if !component_subject_present {
                 errors.push(
-                    "expected_trace_instances must be strictly sorted by trace_id and subject_id"
+                    "implementation_applicability_instances omit the exact component subject"
                         .into(),
                 );
             }
-            previous_expected = Some(key);
-            if !expected_pairs.insert(key) {
-                errors.push(format!(
-                    "duplicate expected trace/subject pair {}:{}",
-                    expected.trace_id, expected.subject_id
-                ));
-            }
-            if !instance_ids.insert(expected.applicability_instance_id.as_str()) {
-                errors.push(format!(
-                    "duplicate applicability_instance_id {}",
-                    expected.applicability_instance_id
-                ));
-            }
-            if !is_trace_id(&expected.trace_id) {
-                errors.push(format!("invalid trace_id {}", expected.trace_id));
-            }
-            if !is_applicability_id(&expected.applicability_instance_id) {
-                errors.push(format!(
-                    "invalid applicability_instance_id {}",
-                    expected.applicability_instance_id
-                ));
-            }
-            if expected.subject_id == self.component.component_id {
-                component_subject_present = true;
-            } else if let Some((adapter_kind, capability_id)) =
-                split_adapter_capability_subject(&expected.subject_id)
-            {
-                match shipped.get(adapter_kind) {
-                    Some(adapter)
-                        if adapter
-                            .capability_ids
-                            .binary_search_by(|item| item.as_str().cmp(capability_id))
-                            .is_ok() => {}
-                    _ => errors.push(format!(
-                        "expected trace subject {} is not a shipped adapter capability",
-                        expected.subject_id
-                    )),
-                }
-            } else {
-                errors.push(format!(
-                    "expected trace subject {} is not authoritative",
-                    expected.subject_id
-                ));
-            }
-            subject_traces
-                .entry(&expected.subject_id)
-                .or_default()
-                .insert(&expected.trace_id);
-        }
-        if !component_subject_present {
-            errors.push("expected_trace_instances omit the component subject".into());
-        }
-        for adapter in self.shipped_adapters.iter() {
-            for capability in &adapter.capability_ids {
-                let subject = format!("adapter-capability:{}:{}", adapter.adapter_kind, capability);
-                let Some(traces) = subject_traces.get(subject.as_str()) else {
-                    errors.push(format!(
-                        "expected_trace_instances omit shipped subject {subject}"
-                    ));
-                    continue;
-                };
-                for required_trace in &adapter.mandatory_baseline.required_trace_ids {
-                    if !traces.contains(required_trace.as_str()) {
+            for adapter in &self.shipped_adapters {
+                for capability in &adapter.capability_ids {
+                    let key = (adapter.adapter_kind.clone(), capability.clone());
+                    let Some(traces) = adapter_subject_traces.get(&key) else {
                         errors.push(format!(
-                            "subject {subject} omits mandatory baseline trace {required_trace}"
+                            "implementation_applicability_instances omit shipped adapter capability {}:{}",
+                            adapter.adapter_kind, capability
                         ));
+                        continue;
+                    };
+                    for required_trace in &adapter.mandatory_baseline.required_trace_ids {
+                        if !traces.contains(required_trace) {
+                            errors.push(format!(
+                                "shipped adapter capability {}:{} omits mandatory baseline trace {required_trace}",
+                                adapter.adapter_kind, capability
+                            ));
+                        }
                     }
                 }
             }
@@ -473,7 +540,7 @@ fn validate_adapter(adapter: &ShippedAdapter, errors: &mut Vec<String>) {
     }
     if adapter.production_eligible {
         errors.push(format!(
-            "shipped adapter {} cannot be production eligible in manifest v1",
+            "shipped adapter {} cannot be production eligible in manifest v2",
             adapter.adapter_kind
         ));
     }
@@ -752,24 +819,6 @@ fn is_trace_id(value: &str) -> bool {
         })
 }
 
-fn is_applicability_id(value: &str) -> bool {
-    value
-        .strip_prefix("applicability:sha256:")
-        .is_some_and(|hex| hex.len() == 64 && is_lower_hex(hex))
-}
-
-fn split_adapter_capability_subject(value: &str) -> Option<(&str, &str)> {
-    let rest = value.strip_prefix("adapter-capability:")?;
-    let (adapter, capability) = rest.split_once(':')?;
-    if capability.contains(':')
-        || !is_canonical_name(adapter, 96)
-        || !is_canonical_name(capability, 96)
-    {
-        return None;
-    }
-    Some((adapter, capability))
-}
-
 fn strictly_sorted<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let Some(mut previous) = values.next() else {
         return true;
@@ -786,16 +835,97 @@ fn strictly_sorted<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conformance_applicability::{
+        ApplicabilityDimension, ApplicabilityDimensionValue,
+        recompute_applicability_inventory_binding,
+    };
 
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
 
-    fn instance(byte: char) -> String {
-        format!("applicability:sha256:{}", byte.to_string().repeat(64))
+    fn control_trace_ref() -> VersionedContentReference {
+        VersionedContentReference {
+            artifact_kind: ArtifactKind::ControlTrace,
+            document_id: "control-trace:fixture".into(),
+            document_version: 1,
+            content_digest: digest('d'),
+            artifact_locator: "catalog/security/control-trace.json".into(),
+        }
+    }
+
+    fn trace_binding(reference: &VersionedContentReference) -> ApplicabilityControlTraceBinding {
+        ApplicabilityControlTraceBinding {
+            document_id: reference.document_id.clone(),
+            document_version: reference.document_version,
+            content_digest: reference.content_digest.clone(),
+        }
+    }
+
+    fn applicability_instance(
+        reference: &VersionedContentReference,
+        trace_id: &str,
+        subject: ApplicabilitySubject,
+        probe_id: &str,
+    ) -> ApplicabilityInstance {
+        let binding = trace_binding(reference);
+        let mut instance = ApplicabilityInstance {
+            applicability_instance_id: format!("applicability:sha256:{}", "0".repeat(64)),
+            trace_id: trace_id.into(),
+            owning_work_package: "SB-0".into(),
+            scope: ApplicabilityScope::Implementation,
+            subject,
+            dimensions: vec![ApplicabilityDimension {
+                name: "implementation.fixture_or_probe_id".into(),
+                value: ApplicabilityDimensionValue::String(probe_id.into()),
+            }],
+        };
+        instance.applicability_instance_id =
+            recompute_applicability_instance_id(&binding, &instance).unwrap();
+        instance
+    }
+
+    fn rebind_applicability(manifest: &mut ProductionBuildManifest) {
+        manifest
+            .implementation_applicability_instances
+            .sort_by(compare_applicability_instances);
+        manifest.implementation_applicability = recompute_applicability_inventory_binding(
+            &trace_binding(&manifest.control_trace_ref),
+            &manifest.implementation_applicability_instances,
+        )
+        .unwrap();
     }
 
     fn valid_manifest() -> ProductionBuildManifest {
+        let control_trace_ref = control_trace_ref();
+        let mut implementation_applicability_instances = vec![
+            applicability_instance(
+                &control_trace_ref,
+                "TRACE-SB-CONF-03-AC-048",
+                ApplicabilitySubject::AdapterCapability {
+                    adapter_kind: "auth.entra-id".into(),
+                    adapter_version: "0.1.0".into(),
+                    capability_id: "authenticate".into(),
+                },
+                "security_conformance::adapter_ac_048",
+            ),
+            applicability_instance(
+                &control_trace_ref,
+                "TRACE-SB-CONF-04-AC-048",
+                ApplicabilitySubject::Component {
+                    component_id: PRODUCTION_BUILD_COMPONENT_ID.into(),
+                    component_version: "0.1.0".into(),
+                },
+                "security_conformance::component_ac_048",
+            ),
+        ];
+        implementation_applicability_instances.sort_by(compare_applicability_instances);
+        let implementation_applicability = recompute_applicability_inventory_binding(
+            &trace_binding(&control_trace_ref),
+            &implementation_applicability_instances,
+        )
+        .unwrap();
+
         ProductionBuildManifest {
             schema_uri: PRODUCTION_BUILD_MANIFEST_SCHEMA_URI.into(),
             schema_version: PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION.into(),
@@ -827,13 +957,7 @@ mod tests {
                 repository: "ghcr.io/example/ryuki-platform-api".into(),
                 content_digest: digest('c'),
             },
-            control_trace_ref: VersionedContentReference {
-                artifact_kind: ArtifactKind::ControlTrace,
-                document_id: "control-trace:fixture".into(),
-                document_version: 1,
-                content_digest: digest('d'),
-                artifact_locator: "catalog/security/control-trace.json".into(),
-            },
+            control_trace_ref,
             shipped_adapters: vec![ShippedAdapter {
                 adapter_kind: "auth.entra-id".into(),
                 adapter_version: "0.1.0".into(),
@@ -853,18 +977,8 @@ mod tests {
                 disposition: SelectorDisposition::Implemented,
                 adapter_kind: Some("auth.entra-id".into()),
             }],
-            expected_trace_instances: vec![
-                ExpectedTraceInstance {
-                    trace_id: "TRACE-SB-CONF-03-AC-048".into(),
-                    applicability_instance_id: instance('1'),
-                    subject_id: "adapter-capability:auth.entra-id:authenticate".into(),
-                },
-                ExpectedTraceInstance {
-                    trace_id: "TRACE-SB-CONF-04-AC-048".into(),
-                    applicability_instance_id: instance('2'),
-                    subject_id: PRODUCTION_BUILD_COMPONENT_ID.into(),
-                },
-            ],
+            implementation_applicability,
+            implementation_applicability_instances,
         }
     }
 
@@ -887,23 +1001,25 @@ mod tests {
     fn adapter_and_selector_inventories_cannot_self_shrink() {
         let mut manifest = valid_manifest();
         manifest.selector_dispositions.clear();
-        manifest.expected_trace_instances.remove(0);
+        manifest
+            .implementation_applicability_instances
+            .retain(|instance| matches!(&instance.subject, ApplicabilitySubject::Component { .. }));
         let errors = manifest.validate_semantics().join("; ");
         assert!(errors.contains("selector_dispositions"));
         assert!(errors.contains("no implemented selector"));
-        assert!(errors.contains("omit shipped subject"));
+        assert!(errors.contains("omit shipped adapter capability"));
     }
 
     #[test]
-    fn expected_pairs_are_trace_specific_sorted_and_unique() {
+    fn applicability_rows_are_canonical_recomputed_and_unique() {
         let mut manifest = valid_manifest();
-        manifest.expected_trace_instances.swap(0, 1);
+        manifest.implementation_applicability_instances.swap(0, 1);
         let errors = manifest.validate_semantics().join("; ");
-        assert!(errors.contains("strictly sorted"));
+        assert!(errors.contains("strict canonical order"));
 
         let mut manifest = valid_manifest();
-        manifest.expected_trace_instances[1].applicability_instance_id = manifest
-            .expected_trace_instances[0]
+        manifest.implementation_applicability_instances[1].applicability_instance_id = manifest
+            .implementation_applicability_instances[0]
             .applicability_instance_id
             .clone();
         assert!(
@@ -912,6 +1028,77 @@ mod tests {
                 .join("; ")
                 .contains("duplicate applicability_instance_id")
         );
+    }
+
+    #[test]
+    fn repeated_trace_and_subject_are_allowed_for_distinct_dimensions() {
+        let mut manifest = valid_manifest();
+        let mut repeated = manifest
+            .implementation_applicability_instances
+            .iter()
+            .find(|instance| matches!(&instance.subject, ApplicabilitySubject::Component { .. }))
+            .unwrap()
+            .clone();
+        repeated.dimensions[0].value =
+            ApplicabilityDimensionValue::String("security_conformance::second_probe".into());
+        repeated.applicability_instance_id = recompute_applicability_instance_id(
+            &trace_binding(&manifest.control_trace_ref),
+            &repeated,
+        )
+        .unwrap();
+        manifest
+            .implementation_applicability_instances
+            .push(repeated);
+        rebind_applicability(&mut manifest);
+
+        assert!(manifest.validate_semantics().is_empty());
+    }
+
+    #[test]
+    fn inventory_binding_and_subject_authority_are_exact() {
+        let mut manifest = valid_manifest();
+        manifest.implementation_applicability.instance_count += 1;
+        assert!(
+            manifest
+                .validate_semantics()
+                .join("; ")
+                .contains("binding does not exactly match")
+        );
+
+        let mut manifest = valid_manifest();
+        let binding = trace_binding(&manifest.control_trace_ref);
+        let row = manifest
+            .implementation_applicability_instances
+            .iter_mut()
+            .find(|instance| {
+                matches!(
+                    &instance.subject,
+                    ApplicabilitySubject::AdapterCapability { .. }
+                )
+            })
+            .unwrap();
+        if let ApplicabilitySubject::AdapterCapability {
+            adapter_version, ..
+        } = &mut row.subject
+        {
+            *adapter_version = "9.9.9".into();
+        }
+        row.applicability_instance_id = recompute_applicability_instance_id(&binding, row).unwrap();
+        rebind_applicability(&mut manifest);
+        assert!(
+            manifest
+                .validate_semantics()
+                .join("; ")
+                .contains("version does not match")
+        );
+    }
+
+    #[test]
+    fn deployment_scope_and_subjects_are_rejected() {
+        let mut manifest = valid_manifest();
+        manifest.implementation_applicability_instances[0].scope = ApplicabilityScope::Deployment;
+        let errors = manifest.validate_semantics().join("; ");
+        assert!(errors.contains("must use implementation scope"));
     }
 
     #[test]
