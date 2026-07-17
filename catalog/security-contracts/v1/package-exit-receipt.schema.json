@@ -30,7 +30,8 @@
     "provenance",
     "created_at",
     "expires_at",
-    "supersedes_receipt_id"
+    "supersedes_receipt_id",
+    "supersedes_receipt_ref"
   ],
   "properties": {
     "$schema": {
@@ -44,7 +45,8 @@
     },
     "document_version": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "receipt_id": {
       "$ref": "#/$defs/receiptId"
@@ -148,6 +150,16 @@
           "type": "null"
         }
       ]
+    },
+    "supersedes_receipt_ref": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/supersedesReceiptRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "allOf": [
@@ -233,6 +245,30 @@
           }
         }
       }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "supersedes_receipt_id": {
+              "type": "null"
+            },
+            "supersedes_receipt_ref": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "supersedes_receipt_id": {
+              "$ref": "#/$defs/receiptId"
+            },
+            "supersedes_receipt_ref": {
+              "$ref": "#/$defs/supersedesReceiptRef"
+            }
+          }
+        }
+      ]
     }
   ],
   "$defs": {
@@ -288,6 +324,57 @@
     "digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonzeroDigest": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "not": {
+            "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ]
+    },
+    "packageExitReceiptLocator": {
+      "type": "string",
+      "minLength": 58,
+      "maxLength": 512,
+      "pattern": "^catalog/security-contracts/v1/package-exit-receipts/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+    },
+    "supersedesReceiptRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "receipt_id",
+        "document_version",
+        "artifact_locator",
+        "package_id",
+        "receipt_digest"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "package-exit-receipt"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/receiptId"
+        },
+        "document_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/packageExitReceiptLocator"
+        },
+        "package_id": {
+          "$ref": "#/$defs/workPackageId"
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
     },
     "digestSet": {
       "type": "array",
@@ -535,6 +622,7 @@
         "id",
         "version",
         "deployment_id",
+        "digest_contract",
         "digest"
       ],
       "properties": {
@@ -542,12 +630,17 @@
           "$ref": "#/$defs/identifier"
         },
         "version": {
+          "description": "Decimal string representation of the exact top-level document_version in the bound deployment-security-profile document.",
           "type": "string",
           "minLength": 1,
           "maxLength": 128
         },
         "deployment_id": {
           "$ref": "#/$defs/identifier"
+        },
+        "digest_contract": {
+          "description": "SHA-256 over ryuki-canonical-json-v1 after removing top-level production_acceptance_receipt_ref and replacing each runtime guard receipt_ref.content_digest plus any migration overlay zero-consumer receipt content_digest with the canonical all-zero SHA-256 sentinel; all receipt identities, versions, locators, guard identities, and controls remain bound.",
+          "const": "ryuki-deployment-profile-conformance-binding-v1"
         },
         "digest": {
           "$ref": "#/$defs/digest"

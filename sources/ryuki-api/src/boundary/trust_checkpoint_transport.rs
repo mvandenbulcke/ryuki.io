@@ -29,8 +29,8 @@ use tokio::time::timeout;
 /// or below 103 bytes makes the same configured endpoint safe on both supported families.
 #[cfg(unix)]
 pub(crate) const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
-pub(crate) const MAX_CHECKPOINT_REQUEST_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_CHECKPOINT_REQUEST_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(unix)]
 pub(crate) const MAX_CHECKPOINT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 

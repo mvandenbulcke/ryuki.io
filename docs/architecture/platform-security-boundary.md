@@ -1046,6 +1046,33 @@ Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
 control, acceptance-case, and evidence-instance sets, input and output digests,
 evidence tier, result, creation/expiry time, and superseded receipt. The
+production deployment root must carry one exact
+`production_acceptance_receipt_ref` selecting the current SB-9 package-exit
+receipt by kind, identity, version, raw-byte digest, and locator. That root
+receipt recursively binds the accepted SB-0 through SB-8 receipts; a receipt
+discovered only through its own graph, or selected by a non-production profile,
+has no startup authority. The profile-selected root is also insufficient by
+itself: the external monotonic checkpoint must identify the same exact SB-9
+identity, version, raw-byte digest, and locator as its current production root.
+An older accepted graph cannot become current merely by omitting its successor.
+Until that current-root assertion is implemented and reconciled, production
+startup remains blocked. To avoid cryptographic cycles, every bundle and receipt
+identifies its deployment-profile digest contract as
+`ryuki-deployment-profile-conformance-binding-v1`: remove the top-level
+`production_acceptance_receipt_ref`; replace only each
+`runtime_guard_evidence.guards[*].receipt_ref.content_digest` with the canonical
+`sha256:` plus 64-zero sentinel; when a migration overlay is present, replace
+only `migration_overlay.zero_consumer_receipt_ref.content_digest` with the same
+sentinel; canonicalize the resulting profile with
+`ryuki-canonical-json-v1`; then hash those UTF-8 bytes with SHA-256. Guard ids,
+control ids, receipt identities, versions, and locators remain bound. The
+complete raw profile bytes, including the exact SB-9 reference and every exact
+nonzero guard or overlay receipt digest, remain covered by the independent
+startup digest pin.
+Every non-null evidence or receipt supersession also carries an exact typed
+reference containing the predecessor identity, version, raw-byte digest, and
+locator. Bare predecessor ids are descriptive only and cannot make historical
+artifacts discoverable or authoritative at runtime. The
 implementation must publish schemas for
 `deployment-security-profile.schema.json`, `provider-registry.schema.json`,
 `action-resource-registry.schema.json`, `security-limit-profile.schema.json`,
@@ -1061,7 +1088,7 @@ independently authenticated, external strongly consistent checkpoint keyed by
 the exact `(deployment_id, trust_domain_id, registry_id)` namespace. The
 request binds a fresh nonce, its canonical digest, the candidate registry
 version, exact raw-byte digest and artifact locator, the validated lineage
-digest, and a unique lexicographically sorted list of at most 64 exact raw
+digest, and a unique lexicographically sorted list of at most 4096 exact raw
 document digests whose acceptance is required. The signed response echoes the
 request binding and returns exactly one acceptance record for every requested
 digest and no others; unsolicited, duplicate, or omitted records fail. It also
@@ -1106,7 +1133,7 @@ Each request and response is one four-byte unsigned big-endian length followed
 by exactly that many payload bytes. The client sends the canonical request,
 closes its write half, then accepts exactly one response frame followed by EOF;
 a truncated frame, a second frame, or any trailing byte fails closed. Requests
-are limited to 16 KiB and responses to 256 KiB. Connect, write, and read have
+are limited to 512 KiB and responses to 32 MiB. Connect, write, and read have
 independent deadlines; the current runtime uses 10 seconds per phase and never
 permits a phase deadline above 30 seconds.
 

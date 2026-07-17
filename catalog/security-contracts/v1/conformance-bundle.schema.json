@@ -35,7 +35,8 @@
     "verified_at",
     "accepted_at",
     "expires_at",
-    "supersedes_evidence_instance_id"
+    "supersedes_evidence_instance_id",
+    "supersedes_evidence_ref"
   ],
   "properties": {
     "$schema": {
@@ -49,7 +50,8 @@
     },
     "document_version": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "bundle_id": {
       "$ref": "#/$defs/identifier"
@@ -152,6 +154,16 @@
       "oneOf": [
         {
           "$ref": "#/$defs/identifier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "supersedes_evidence_ref": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/supersedesEvidenceRef"
         },
         {
           "type": "null"
@@ -267,6 +279,30 @@
           }
         }
       }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "supersedes_evidence_instance_id": {
+              "type": "null"
+            },
+            "supersedes_evidence_ref": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "supersedes_evidence_instance_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "supersedes_evidence_ref": {
+              "$ref": "#/$defs/supersedesEvidenceRef"
+            }
+          }
+        }
+      ]
     }
   ],
   "$defs": {
@@ -313,6 +349,57 @@
     "digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonzeroDigest": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/digest"
+        },
+        {
+          "not": {
+            "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ]
+    },
+    "conformanceBundleLocator": {
+      "type": "string",
+      "minLength": 56,
+      "maxLength": 512,
+      "pattern": "^catalog/security-contracts/v1/conformance-bundles/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+    },
+    "supersedesEvidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "bundle_id",
+        "document_version",
+        "artifact_locator",
+        "evidence_instance_id",
+        "bundle_digest"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "conformance-bundle"
+        },
+        "bundle_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "document_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "artifact_locator": {
+          "$ref": "#/$defs/conformanceBundleLocator"
+        },
+        "evidence_instance_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "bundle_digest": {
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
     },
     "digestSet": {
       "type": "array",
@@ -476,6 +563,7 @@
         "id",
         "version",
         "deployment_id",
+        "digest_contract",
         "digest"
       ],
       "properties": {
@@ -483,12 +571,17 @@
           "$ref": "#/$defs/identifier"
         },
         "version": {
+          "description": "Decimal string representation of the exact top-level document_version in the bound deployment-security-profile document.",
           "type": "string",
           "minLength": 1,
           "maxLength": 128
         },
         "deployment_id": {
           "$ref": "#/$defs/identifier"
+        },
+        "digest_contract": {
+          "description": "SHA-256 over ryuki-canonical-json-v1 after removing top-level production_acceptance_receipt_ref and replacing each runtime guard receipt_ref.content_digest plus any migration overlay zero-consumer receipt content_digest with the canonical all-zero SHA-256 sentinel; all receipt identities, versions, locators, guard identities, and controls remain bound.",
+          "const": "ryuki-deployment-profile-conformance-binding-v1"
         },
         "digest": {
           "$ref": "#/$defs/digest"

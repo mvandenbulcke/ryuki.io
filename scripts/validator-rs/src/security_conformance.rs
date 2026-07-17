@@ -19,6 +19,16 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 const CONTRACT_DIR: &str = "catalog/security-contracts/v1";
+const CONFORMANCE_BUNDLE_LOCATOR_PREFIX: &str =
+    "catalog/security-contracts/v1/conformance-bundles/";
+const PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX: &str =
+    "catalog/security-contracts/v1/package-exit-receipts/";
+const DEPLOYMENT_PROFILE_LOCATOR: &str =
+    "catalog/security-contracts/v1/deployment-security-profile.implementation.json";
+const DEPLOYMENT_PROFILE_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-deployment-profile-conformance-binding-v1";
+const ZERO_SHA256_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const TRUST_REGISTRY_HEAD_LOCATOR: &str =
     "catalog/security-contracts/v1/conformance-trust-root-registry.implementation.json";
 const TRUST_REGISTRY_SCHEMA_NAME: &str = "conformance-trust-root-registry.schema.json";
@@ -27,6 +37,10 @@ const MAX_TRUST_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TRUST_REGISTRY_KEYS: usize = 256;
 const MAX_TRUST_REGISTRY_TOMBSTONES: usize = 4096;
 const MAX_TRUST_REGISTRY_SCOPE_ITEMS: usize = 256;
+const MAX_TRUST_REGISTRY_PROFILES: usize = 3;
+const MAX_TRUST_KEY_PURPOSES: usize = 2;
+const MAX_TRUST_KEY_EVIDENCE_TIERS: usize = 3;
+const MAX_TRUST_KEY_PACKAGES: usize = 10;
 
 const SCHEMAS: [(&str, &str); 9] = [
     (
@@ -996,9 +1010,31 @@ fn validate_closure_semantics_at(
         })
         .collect();
 
+    let expected_deployment_profile_binding = load_deployment_profile_binding(root);
+    for document in bundles {
+        validate_deployment_profile_binding(
+            document.value.pointer("/bindings/deployment_profile"),
+            expected_deployment_profile_binding.as_ref(),
+            &format!("{}:/bindings/deployment_profile", document.label),
+            errors,
+        );
+    }
+    for document in receipts {
+        validate_deployment_profile_binding(
+            document
+                .value
+                .pointer("/closure_context/deployment_profile"),
+            expected_deployment_profile_binding.as_ref(),
+            &format!("{}:/closure_context/deployment_profile", document.label),
+            errors,
+        );
+    }
+
     let mut bundle_ids = BTreeSet::new();
     let mut evidence = BTreeMap::new();
     let mut evidence_supersession = BTreeMap::new();
+    let mut evidence_successor_by_target = BTreeMap::new();
+    let mut forked_evidence_targets = BTreeSet::new();
     for document in bundles {
         let bundle = &document.value;
         let bundle_id = string_field(bundle, "bundle_id").unwrap_or("");
@@ -1014,6 +1050,36 @@ fn validate_closure_semantics_at(
                 "{}: duplicate evidence_instance_id {evidence_id}; first declared by {}",
                 document.label, previous.label
             ));
+        }
+        let target = bundle
+            .get("supersedes_evidence_instance_id")
+            .and_then(Value::as_str);
+        let has_reference = bundle
+            .get("supersedes_evidence_ref")
+            .is_some_and(|reference| !reference.is_null());
+        if target.is_some() != has_reference {
+            errors.push(format!(
+                "{}: supersedes_evidence_instance_id and supersedes_evidence_ref must both be null or both identify the predecessor",
+                document.label
+            ));
+        }
+        if let Some(target) = target {
+            if target == evidence_id {
+                errors.push(format!(
+                    "{}: evidence instance {evidence_id} cannot supersede itself",
+                    document.label
+                ));
+            }
+            if let Some(previous_successor) =
+                evidence_successor_by_target.insert(target.to_string(), evidence_id.to_string())
+            {
+                forked_evidence_targets.insert(target.to_string());
+                errors.push(format!(
+                    "{}: evidence predecessor {target} has multiple successors {previous_successor} and {evidence_id}",
+                    document.label
+                ));
+            }
+            evidence_supersession.insert(evidence_id.to_string(), target.to_string());
         }
         let trace_id = string_field(bundle, "trace_id").unwrap_or("");
         let Some(trace) = traces.get(trace_id) else {
@@ -1033,22 +1099,10 @@ fn validate_closure_semantics_at(
         }
         validate_bundle_applicability(document, trace, errors);
         validate_bundle_timestamps(document, errors);
-        if let Some(target) = bundle
-            .get("supersedes_evidence_instance_id")
-            .and_then(Value::as_str)
-        {
-            if target == evidence_id {
-                errors.push(format!(
-                    "{}: evidence instance {evidence_id} cannot supersede itself",
-                    document.label
-                ));
-            }
-            evidence_supersession.insert(evidence_id.to_string(), target.to_string());
-        }
     }
     let mut superseded_evidence = BTreeSet::new();
     for (source, target) in &evidence_supersession {
-        let mut valid_lineage = source != target;
+        let mut valid_lineage = source != target && !forked_evidence_targets.contains(target);
         let Some(source_bundle) = evidence.get(source) else {
             continue;
         };
@@ -1058,6 +1112,8 @@ fn validate_closure_semantics_at(
             ));
             continue;
         };
+        valid_lineage &=
+            validate_evidence_supersession_reference(source_bundle, target_bundle, target, errors);
         for field in ["trace_id", "applicability_instance_id"] {
             if source_bundle.value.get(field) != target_bundle.value.get(field) {
                 valid_lineage = false;
@@ -1081,6 +1137,23 @@ fn validate_closure_semantics_at(
             valid_lineage = false;
             errors.push(format!(
                 "{}: superseding evidence {source} document_version {source_version} must exceed {target_version}",
+                source_bundle.label
+            ));
+        }
+        let source_tier = source_bundle
+            .value
+            .pointer("/provenance/evidence_tier/rank")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let target_tier = target_bundle
+            .value
+            .pointer("/provenance/evidence_tier/rank")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if source_tier < target_tier {
+            valid_lineage = false;
+            errors.push(format!(
+                "{}: superseding evidence {source} tier rank {source_tier} must not be below predecessor {target} rank {target_tier}",
                 source_bundle.label
             ));
         }
@@ -1519,6 +1592,258 @@ fn validate_prerequisite_reference(
     );
 }
 
+fn validate_evidence_supersession_reference(
+    source: &LoadedDocument,
+    target: &LoadedDocument,
+    predecessor_id: &str,
+    errors: &mut Vec<String>,
+) -> bool {
+    let errors_before = errors.len();
+    let context = format!(
+        "{}: supersedes evidence instance {predecessor_id}",
+        source.label
+    );
+    let reference = source
+        .value
+        .get("supersedes_evidence_ref")
+        .unwrap_or(&Value::Null);
+    if !reference.is_object() {
+        errors.push(format!(
+            "{context}: supersedes_evidence_ref must be a typed predecessor reference"
+        ));
+        return false;
+    }
+    require_reference_string(
+        reference,
+        "artifact_kind",
+        "conformance-bundle",
+        &context,
+        errors,
+    );
+    require_reference_string(
+        reference,
+        "evidence_instance_id",
+        predecessor_id,
+        &context,
+        errors,
+    );
+    require_matching_reference_field(reference, &target.value, "bundle_id", &context, errors);
+    require_matching_reference_field(
+        reference,
+        &target.value,
+        "document_version",
+        &context,
+        errors,
+    );
+    require_matching_reference_field(
+        reference,
+        &target.value,
+        "evidence_instance_id",
+        &context,
+        errors,
+    );
+    validate_supersession_locator(
+        reference,
+        &target.label,
+        CONFORMANCE_BUNDLE_LOCATOR_PREFIX,
+        &context,
+        errors,
+    );
+    validate_supersession_digest(reference, "bundle_digest", &target.digest, &context, errors);
+    errors.len() == errors_before
+}
+
+fn validate_receipt_supersession_reference(
+    source: &LoadedDocument,
+    target: &LoadedDocument,
+    predecessor_id: &str,
+    errors: &mut Vec<String>,
+) -> bool {
+    let errors_before = errors.len();
+    let context = format!("{}: supersedes receipt {predecessor_id}", source.label);
+    let reference = source
+        .value
+        .get("supersedes_receipt_ref")
+        .unwrap_or(&Value::Null);
+    if !reference.is_object() {
+        errors.push(format!(
+            "{context}: supersedes_receipt_ref must be a typed predecessor reference"
+        ));
+        return false;
+    }
+    require_reference_string(
+        reference,
+        "artifact_kind",
+        "package-exit-receipt",
+        &context,
+        errors,
+    );
+    require_reference_string(reference, "receipt_id", predecessor_id, &context, errors);
+    for field in ["receipt_id", "document_version", "package_id"] {
+        require_matching_reference_field(reference, &target.value, field, &context, errors);
+    }
+    if reference.get("package_id") != source.value.get("package_id") {
+        errors.push(format!(
+            "{context}: package_id must match the superseding receipt"
+        ));
+    }
+    validate_supersession_locator(
+        reference,
+        &target.label,
+        PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX,
+        &context,
+        errors,
+    );
+    validate_supersession_digest(
+        reference,
+        "receipt_digest",
+        &target.digest,
+        &context,
+        errors,
+    );
+    errors.len() == errors_before
+}
+
+fn validate_supersession_locator(
+    reference: &Value,
+    expected: &str,
+    required_prefix: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    require_reference_string(reference, "artifact_locator", expected, context, errors);
+    let Some(locator) = string_field(reference, "artifact_locator") else {
+        return;
+    };
+    if !is_normalized_closure_locator(locator, required_prefix) {
+        errors.push(format!(
+            "{context}: artifact_locator must be a normalized JSON path below {required_prefix}"
+        ));
+    }
+}
+
+fn is_normalized_closure_locator(locator: &str, required_prefix: &str) -> bool {
+    if locator.len() > 512 || locator.contains('\\') {
+        return false;
+    }
+    let Some(relative) = locator.strip_prefix(required_prefix) else {
+        return false;
+    };
+    relative.ends_with(".json")
+        && relative.split('/').all(|component| {
+            let mut characters = component.chars();
+            characters
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+                && characters.all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
+}
+
+fn validate_supersession_digest(
+    reference: &Value,
+    field: &str,
+    expected: &str,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let actual = string_field(reference, field);
+    if actual != Some(expected) {
+        errors.push(format!(
+            "{context}: {field} does not match the exact predecessor bytes"
+        ));
+    }
+    if !actual.is_some_and(is_nonzero_sha256_digest) {
+        errors.push(format!(
+            "{context}: {field} must be a nonzero lowercase SHA-256 digest"
+        ));
+    }
+}
+
+fn is_nonzero_sha256_digest(digest: &str) -> bool {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && digest != ZERO_SHA256_DIGEST
+}
+
+fn load_deployment_profile_binding(root: &Path) -> Option<Value> {
+    let bytes = fs::read(root.join(DEPLOYMENT_PROFILE_LOCATOR)).ok()?;
+    let profile = parse_json_strict(&bytes).ok()?;
+    deployment_profile_binding(&profile)
+}
+
+fn deployment_profile_binding(profile: &Value) -> Option<Value> {
+    let id = string_field(profile, "document_id")?;
+    let version = profile.get("document_version")?.as_u64()?;
+    let deployment_id = string_field(profile, "deployment_id")?;
+    let mut digest_input = profile.clone();
+    digest_input
+        .as_object_mut()?
+        .remove("production_acceptance_receipt_ref");
+    if let Some(guards) = digest_input
+        .pointer_mut("/runtime_guard_evidence/guards")
+        .and_then(Value::as_array_mut)
+    {
+        for guard in guards {
+            if let Some(content_digest) = guard.pointer_mut("/receipt_ref/content_digest") {
+                *content_digest = Value::String(ZERO_SHA256_DIGEST.to_string());
+            }
+        }
+    }
+    if let Some(content_digest) =
+        digest_input.pointer_mut("/migration_overlay/zero_consumer_receipt_ref/content_digest")
+    {
+        *content_digest = Value::String(ZERO_SHA256_DIGEST.to_string());
+    }
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_json(&digest_input).as_bytes())
+    );
+    Some(serde_json::json!({
+        "id": id,
+        "version": version.to_string(),
+        "deployment_id": deployment_id,
+        "digest_contract": DEPLOYMENT_PROFILE_BINDING_DIGEST_CONTRACT,
+        "digest": digest
+    }))
+}
+
+fn validate_deployment_profile_binding(
+    binding: Option<&Value>,
+    expected: Option<&Value>,
+    context: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(binding) = binding else {
+        return;
+    };
+    let Some(expected) = expected else {
+        errors.push(format!(
+            "{context}: cannot derive the authoritative deployment-profile binding"
+        ));
+        return;
+    };
+    for field in [
+        "id",
+        "version",
+        "deployment_id",
+        "digest_contract",
+        "digest",
+    ] {
+        if binding.get(field) != expected.get(field) {
+            errors.push(format!(
+                "{context}: {field} does not match the exact deployment-profile conformance binding"
+            ));
+        }
+    }
+}
+
 fn require_reference_string(
     reference: &Value,
     field: &str,
@@ -1571,20 +1896,47 @@ fn validate_receipts(
     }
 
     let mut prerequisite_graph = BTreeMap::new();
-    let receipt_supersession: BTreeMap<String, String> = receipts
-        .iter()
-        .filter_map(|document| {
-            let receipt_id = string_field(&document.value, "receipt_id")?;
-            let target = document
-                .value
-                .get("supersedes_receipt_id")
-                .and_then(Value::as_str)?;
-            Some((receipt_id.to_string(), target.to_string()))
-        })
-        .collect();
+    let mut receipt_supersession = BTreeMap::new();
+    let mut receipt_successor_by_target = BTreeMap::new();
+    let mut forked_receipt_targets = BTreeSet::new();
+    for document in receipts {
+        let receipt_id = string_field(&document.value, "receipt_id").unwrap_or("");
+        let target = document
+            .value
+            .get("supersedes_receipt_id")
+            .and_then(Value::as_str);
+        let has_reference = document
+            .value
+            .get("supersedes_receipt_ref")
+            .is_some_and(|reference| !reference.is_null());
+        if target.is_some() != has_reference {
+            errors.push(format!(
+                "{}: supersedes_receipt_id and supersedes_receipt_ref must both be null or both identify the predecessor",
+                document.label
+            ));
+        }
+        if let Some(target) = target {
+            if target == receipt_id {
+                errors.push(format!(
+                    "{}: receipt {receipt_id} cannot supersede itself",
+                    document.label
+                ));
+            }
+            if let Some(previous_successor) =
+                receipt_successor_by_target.insert(target.to_string(), receipt_id.to_string())
+            {
+                forked_receipt_targets.insert(target.to_string());
+                errors.push(format!(
+                    "{}: receipt predecessor {target} has multiple successors {previous_successor} and {receipt_id}",
+                    document.label
+                ));
+            }
+            receipt_supersession.insert(receipt_id.to_string(), target.to_string());
+        }
+    }
     let mut superseded_receipts = BTreeSet::new();
     for (source, target) in &receipt_supersession {
-        let mut valid_lineage = source != target;
+        let mut valid_lineage = source != target && !forked_receipt_targets.contains(target);
         let Some(source_receipt) = receipt_map.get(source) else {
             continue;
         };
@@ -1594,6 +1946,8 @@ fn validate_receipts(
             ));
             continue;
         };
+        valid_lineage &=
+            validate_receipt_supersession_reference(source_receipt, target_receipt, target, errors);
         if source_receipt.value.get("package_id") != target_receipt.value.get("package_id") {
             valid_lineage = false;
             errors.push(format!(
@@ -1615,6 +1969,23 @@ fn validate_receipts(
             valid_lineage = false;
             errors.push(format!(
                 "{}: superseding receipt {source} document_version {source_version} must exceed {target_version}",
+                source_receipt.label
+            ));
+        }
+        let source_tier = source_receipt
+            .value
+            .pointer("/evidence_tier/rank")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let target_tier = target_receipt
+            .value
+            .pointer("/evidence_tier/rank")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if source_tier < target_tier {
+            valid_lineage = false;
+            errors.push(format!(
+                "{}: superseding receipt {source} tier rank {source_tier} must not be below predecessor {target} rank {target_tier}",
                 source_receipt.label
             ));
         }
@@ -3216,6 +3587,19 @@ fn validate_conformance_trust_root_registry_document_at(
         &format!("{label}:/applicability"),
         errors,
     );
+    for (field, maximum) in [
+        ("security_profiles", MAX_TRUST_REGISTRY_PROFILES),
+        ("deployment_ids", MAX_TRUST_REGISTRY_SCOPE_ITEMS),
+        ("trust_domain_ids", MAX_TRUST_REGISTRY_SCOPE_ITEMS),
+    ] {
+        enforce_array_bound(
+            applicability,
+            field,
+            maximum,
+            &format!("{label}:/applicability"),
+            errors,
+        );
+    }
     let registry_deployments = unique_string_array(
         applicability,
         "deployment_ids",
@@ -3228,23 +3612,12 @@ fn validate_conformance_trust_root_registry_document_at(
         &format!("{label}:/applicability"),
         errors,
     );
-    let registry_profiles = unique_string_array(
+    unique_string_array(
         applicability,
         "security_profiles",
         &format!("{label}:/applicability"),
         errors,
     );
-    for (field, values) in [
-        ("security_profiles", &registry_profiles),
-        ("deployment_ids", &registry_deployments),
-        ("trust_domain_ids", &registry_domains),
-    ] {
-        if values.len() > MAX_TRUST_REGISTRY_SCOPE_ITEMS {
-            errors.push(format!(
-                "{label}:/applicability: {field} exceeds {MAX_TRUST_REGISTRY_SCOPE_ITEMS} items"
-            ));
-        }
-    }
 
     let mut keys = BTreeMap::new();
     let mut key_material = BTreeSet::new();
@@ -3291,23 +3664,20 @@ fn validate_conformance_trust_root_registry_document_at(
             ("deployment_ids", &registry_deployments),
             ("trust_domain_ids", &registry_domains),
         ] {
+            enforce_array_bound(key, field, MAX_TRUST_REGISTRY_SCOPE_ITEMS, &context, errors);
             let values = unique_string_array(key, field, &context, errors);
-            if values.len() > MAX_TRUST_REGISTRY_SCOPE_ITEMS {
-                errors.push(format!(
-                    "{context}: {field} exceeds {MAX_TRUST_REGISTRY_SCOPE_ITEMS} items"
-                ));
-            }
             for value in values.difference(allowed) {
                 errors.push(format!(
                     "{context}: {field} value {value} is outside registry applicability"
                 ));
             }
         }
-        for field in [
-            "allowed_purposes",
-            "allowed_evidence_tiers",
-            "allowed_package_ids",
+        for (field, maximum) in [
+            ("allowed_purposes", MAX_TRUST_KEY_PURPOSES),
+            ("allowed_evidence_tiers", MAX_TRUST_KEY_EVIDENCE_TIERS),
+            ("allowed_package_ids", MAX_TRUST_KEY_PACKAGES),
         ] {
+            enforce_array_bound(key, field, maximum, &context, errors);
             if unique_string_array(key, field, &context, errors).is_empty() {
                 errors.push(format!("{context}: {field} must not be empty"));
             }
@@ -4906,6 +5276,68 @@ mod tests {
         load("catalog/security-contracts/v1/control-trace.implementation.json")
     }
 
+    fn production_deployment_profile_fixture() -> Value {
+        let mut profile =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        profile["security_profile"] = json!("production");
+        profile["applicability"]["security_profiles"] = json!(["production"]);
+        profile["production_acceptance_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "document_id": "package-exit-receipt:production-root",
+            "document_version": 1,
+            "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/production-root.json"
+        });
+        let guard_ids = [
+            "durable-postgresql",
+            "approved-secret-provider",
+            "https-public-urls",
+            "secure-cookies",
+            "non-development-authenticator",
+            "external-signing-key-material",
+            "mock-dependencies-disabled",
+            "first-owner-path-closed",
+        ];
+        profile["runtime_guard_evidence"] = json!({
+            "mode": "receipt_bound",
+            "guards": guard_ids.iter().enumerate().map(|(index, guard_id)| json!({
+                "guard_id": guard_id,
+                "control_ids": ["SB-OPS-01"],
+                "receipt_ref": {
+                    "artifact_kind": "package-exit-receipt",
+                    "document_id": format!("package-exit-receipt:production-guard-{index}"),
+                    "document_version": 1,
+                    "content_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "artifact_locator": format!("catalog/security-contracts/v1/package-exit-receipts/production-guard-{index}.json")
+                }
+            })).collect::<Vec<_>>(),
+            "runtime_cross_check_required": true
+        });
+        profile
+    }
+
+    fn add_production_migration_overlay(profile: &mut Value) {
+        profile["migration_overlay"] = json!({
+            "overlay_id": "migration-overlay:production-test",
+            "overlay_version": 1,
+            "security_profile": "production",
+            "authority_source": "legacy_auth_mode",
+            "legacy_selector_present": true,
+            "provider_registry_present": true,
+            "retirement_deadline": "2026-08-01T00:00:00Z",
+            "conflict_telemetry_name": "security.migration.conflict",
+            "grants_authority": false,
+            "live_execution_allowed": false,
+            "zero_consumer_receipt_ref": {
+                "artifact_kind": "package-exit-receipt",
+                "document_id": "package-exit-receipt:zero-consumer",
+                "document_version": 1,
+                "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/zero-consumer.json"
+            }
+        });
+    }
+
     fn semantic_errors(ledger: &Value) -> Vec<String> {
         let mut errors = Vec::new();
         validate_ledger_semantics(ledger, &mut errors);
@@ -5022,6 +5454,74 @@ mod tests {
     }
 
     #[test]
+    fn trust_checkpoint_accepted_document_id_enforces_160_byte_limit() {
+        let schema =
+            load("catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json");
+        let mut at_limit = trust_checkpoint_envelope_fixture();
+        at_limit["acceptance_records"][0]["document"]["document_id"] =
+            Value::String("a".repeat(160));
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:checkpoint-document-id-at-limit",
+            "conformance-trust-checkpoint-envelope.schema.json",
+            &schema,
+            &at_limit,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let mut over_limit = at_limit;
+        over_limit["acceptance_records"][0]["document"]["document_id"] =
+            Value::String("a".repeat(161));
+        validate_instance(
+            "test:checkpoint-document-id-over-limit",
+            "conformance-trust-checkpoint-envelope.schema.json",
+            &schema,
+            &over_limit,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("at /acceptance_records/0/document/document_id")
+                && error.contains("/maxLength")
+        }));
+    }
+
+    #[test]
+    fn closure_document_versions_enforce_exact_json_integer_limit() {
+        for schema_name in [
+            "conformance-bundle.schema.json",
+            "package-exit-receipt.schema.json",
+        ] {
+            let schema = load(&format!("catalog/security-contracts/v1/{schema_name}"));
+            let version_schema = schema
+                .pointer("/properties/document_version")
+                .expect("top-level document_version schema");
+            let mut errors = Vec::new();
+            validate_instance(
+                "test:document-version-at-limit",
+                schema_name,
+                version_schema,
+                &json!(9_007_199_254_740_991_u64),
+                &mut errors,
+            );
+            assert!(errors.is_empty(), "{schema_name}: {}", errors.join("\n"));
+
+            validate_instance(
+                "test:document-version-over-limit",
+                schema_name,
+                version_schema,
+                &json!(9_007_199_254_740_992_u64),
+                &mut errors,
+            );
+            assert!(
+                errors.iter().any(|error| error.contains("via /maximum")),
+                "{schema_name}: {}",
+                errors.join("\n")
+            );
+        }
+    }
+
+    #[test]
     fn trust_checkpoint_envelope_schema_rejects_ambiguous_or_unbounded_input() {
         let schema =
             load("catalog/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json");
@@ -5076,19 +5576,56 @@ mod tests {
         zero_nonce["request_nonce"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
         cases.push(("all-zero request nonce", zero_nonce));
 
-        let mut oversized_acceptances = fixture.clone();
-        let template = oversized_acceptances["acceptance_records"][0].clone();
-        oversized_acceptances["acceptance_records"] = Value::Array(
-            (0..65)
+        let template = fixture["acceptance_records"][0].clone();
+        let mut bounded_acceptances = fixture.clone();
+        bounded_acceptances["acceptance_records"] = Value::Array(
+            (0..4096)
                 .map(|index| {
                     let mut record = template.clone();
                     record["acceptance_record_id"] =
-                        json!(format!("conformance-acceptance:test-{index:03}"));
+                        json!(format!("conformance-acceptance:test-{index:04}"));
                     record
                 })
                 .collect(),
         );
-        cases.push(("oversized acceptance lookup", oversized_acceptances));
+        let mut bounded_errors = Vec::new();
+        validate_instance(
+            "test:bounded-complete-acceptance-lookup",
+            "conformance-trust-checkpoint-envelope.schema.json",
+            &schema,
+            &bounded_acceptances,
+            &mut bounded_errors,
+        );
+        assert!(bounded_errors.is_empty(), "{}", bounded_errors.join("\n"));
+
+        let mut oversized_acceptances = fixture.clone();
+        oversized_acceptances["acceptance_records"] = Value::Array(
+            (0..4097)
+                .map(|index| {
+                    let mut record = template.clone();
+                    record["acceptance_record_id"] =
+                        json!(format!("conformance-acceptance:oversized-{index:04}"));
+                    record
+                })
+                .collect(),
+        );
+        let mut oversized_errors = Vec::new();
+        validate_instance(
+            "test:oversized-otherwise-valid-acceptance-lookup",
+            "conformance-trust-checkpoint-envelope.schema.json",
+            &schema,
+            &oversized_acceptances,
+            &mut oversized_errors,
+        );
+        assert!(
+            oversized_errors.iter().any(|error| {
+                error.contains("at /acceptance_records")
+                    && error.contains("/properties/acceptance_records/maxItems")
+            }),
+            "missing maxItems error: {}",
+            oversized_errors.join("\n")
+        );
+        assert_eq!(oversized_errors.len(), 1, "{}", oversized_errors.join("\n"));
 
         let mut missing_nonce = fixture.clone();
         missing_nonce
@@ -5144,6 +5681,191 @@ mod tests {
             error.contains("conformance_trust_root_registry_ref")
                 && error.contains("content_digest does not match the exact raw bytes")
         }));
+    }
+
+    #[test]
+    fn deployment_profile_requires_root_acceptance_only_for_production() {
+        let schema = load("catalog/security-contracts/v1/deployment-security-profile.schema.json");
+        let fixture =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+
+        let mut production_without_acceptance = production_deployment_profile_fixture();
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:otherwise-valid-production-root",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &production_without_acceptance,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        production_without_acceptance["production_acceptance_receipt_ref"] = Value::Null;
+        validate_instance(
+            "test:production-without-root-acceptance",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &production_without_acceptance,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("at /production_acceptance_receipt_ref") && error.contains("object")
+            }),
+            "missing targeted production root error: {}",
+            errors.join("\n")
+        );
+
+        let mut nonproduction_with_acceptance = fixture;
+        nonproduction_with_acceptance["production_acceptance_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "document_id": "package-exit-receipt:forbidden-test-authority",
+            "document_version": 1,
+            "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "artifact_locator": "receipts/forbidden-test-authority.json"
+        });
+        errors.clear();
+        validate_instance(
+            "test:nonproduction-with-root-acceptance",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &nonproduction_with_acceptance,
+            &mut errors,
+        );
+        assert!(
+            !errors.is_empty(),
+            "non-production must not carry production acceptance authority"
+        );
+    }
+
+    #[test]
+    fn deployment_profile_references_reject_zero_digests_and_json_pointer_locators() {
+        let schema = load("catalog/security-contracts/v1/deployment-security-profile.schema.json");
+        let production = production_deployment_profile_fixture();
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:valid-production-reference-baseline",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &production,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let mut production_with_overlay = production.clone();
+        add_production_migration_overlay(&mut production_with_overlay);
+        validate_instance(
+            "test:valid-production-overlay-reference-baseline",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &production_with_overlay,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        for field in [
+            "conformance_trust_root_registry_ref",
+            "control_trace_ref",
+            "provider_registry_ref",
+            "provider_lifecycle_snapshot_ref",
+            "action_resource_registry_ref",
+            "security_limit_profile_ref",
+            "control_plane_topology_ref",
+            "egress_policy_ref",
+            "retention_policy_ref",
+        ] {
+            for (member, invalid) in [
+                ("content_digest", json!(ZERO_SHA256_DIGEST)),
+                ("artifact_locator", json!(format!("json-pointer:#/{field}"))),
+            ] {
+                let mut candidate = production.clone();
+                candidate[field][member] = invalid;
+                let mut errors = Vec::new();
+                validate_instance(
+                    &format!("test:{field}-{member}"),
+                    "deployment-security-profile.schema.json",
+                    &schema,
+                    &candidate,
+                    &mut errors,
+                );
+                let expected_path = format!("/{field}/{member}");
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains(&format!("at {expected_path}"))),
+                    "{field}.{member} missing {expected_path}: {}",
+                    errors.join("\n")
+                );
+            }
+        }
+
+        let mut cases = Vec::new();
+        let mut candidate = production.clone();
+        candidate["production_acceptance_receipt_ref"]["content_digest"] =
+            json!(ZERO_SHA256_DIGEST);
+        cases.push((
+            "root receipt zero digest",
+            candidate,
+            "/production_acceptance_receipt_ref/content_digest",
+        ));
+        let mut candidate = production.clone();
+        candidate["production_acceptance_receipt_ref"]["artifact_locator"] =
+            json!("json-pointer:#/production_acceptance_receipt_ref");
+        cases.push((
+            "root receipt JSON Pointer locator",
+            candidate,
+            "/production_acceptance_receipt_ref/artifact_locator",
+        ));
+        let mut candidate = production.clone();
+        candidate["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["content_digest"] =
+            json!(ZERO_SHA256_DIGEST);
+        cases.push((
+            "guard receipt zero digest",
+            candidate,
+            "/runtime_guard_evidence/guards/0/receipt_ref/content_digest",
+        ));
+        let mut candidate = production.clone();
+        candidate["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["artifact_locator"] =
+            json!("json-pointer:#/runtime_guard_evidence/guards/0/receipt_ref");
+        cases.push((
+            "guard receipt JSON Pointer locator",
+            candidate,
+            "/runtime_guard_evidence/guards/0/receipt_ref/artifact_locator",
+        ));
+        let mut candidate = production_with_overlay.clone();
+        candidate["migration_overlay"]["zero_consumer_receipt_ref"]["content_digest"] =
+            json!(ZERO_SHA256_DIGEST);
+        cases.push((
+            "migration receipt zero digest",
+            candidate,
+            "/migration_overlay/zero_consumer_receipt_ref/content_digest",
+        ));
+        let mut candidate = production_with_overlay;
+        candidate["migration_overlay"]["zero_consumer_receipt_ref"]["artifact_locator"] =
+            json!("json-pointer:#/migration_overlay/zero_consumer_receipt_ref");
+        cases.push((
+            "migration receipt JSON Pointer locator",
+            candidate,
+            "/migration_overlay/zero_consumer_receipt_ref/artifact_locator",
+        ));
+
+        for (label, candidate, expected_path) in cases {
+            let mut errors = Vec::new();
+            validate_instance(
+                label,
+                "deployment-security-profile.schema.json",
+                &schema,
+                &candidate,
+                &mut errors,
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains(&format!("at {expected_path}"))),
+                "{label} missing {expected_path}: {}",
+                errors.join("\n")
+            );
+        }
     }
 
     #[test]
@@ -5426,10 +6148,19 @@ mod tests {
         let ledger = ledger();
         let trace = &ledger["traces"][0];
         let mut old = bundle_for_trace("bundle:old", "evidence:old", trace, false);
+        old.label = format!("{CONFORMANCE_BUNDLE_LOCATOR_PREFIX}bundle-old.json");
         make_bundle_production_accepted(&mut old);
         let mut replacement = bundle_for_trace("bundle:new", "evidence:new", trace, false);
         replacement.value["document_version"] = json!(2);
         replacement.value["supersedes_evidence_instance_id"] = json!("evidence:old");
+        replacement.value["supersedes_evidence_ref"] = json!({
+            "artifact_kind": "conformance-bundle",
+            "bundle_id": old.value["bundle_id"].clone(),
+            "document_version": old.value["document_version"].clone(),
+            "artifact_locator": old.label.clone(),
+            "evidence_instance_id": old.value["evidence_instance_id"].clone(),
+            "bundle_digest": old.digest.clone()
+        });
         let package = trace["owning_work_package"].as_str().expect("package");
         let mut receipt = receipt_for_trace(
             "package-exit-receipt:superseded",
@@ -5441,6 +6172,8 @@ mod tests {
             &ledger,
         );
         make_receipt_candidate(&mut receipt);
+        receipt.value["evaluated_sets"]["evidence_bindings"][0]["artifact_locator"] =
+            json!(old.label.clone());
 
         let mut errors = Vec::new();
         validate_closure_semantics_at(
@@ -5458,13 +6191,24 @@ mod tests {
 
     #[test]
     fn ac_048_rejects_cross_instance_or_non_monotonic_evidence_supersession() {
-        let (ledger, old, receipt) = authoritative_candidate_fixture();
+        let (ledger, mut old, mut receipt) = authoritative_candidate_fixture();
+        old.label = format!("{CONFORMANCE_BUNDLE_LOCATOR_PREFIX}authoritative-bundle.json");
+        receipt.value["evaluated_sets"]["evidence_bindings"][0]["artifact_locator"] =
+            json!(old.label.clone());
         let mut invalid = old.clone();
         invalid.label = "test:invalid-successor".to_string();
         invalid.value["bundle_id"] = json!("bundle:invalid-successor");
         invalid.value["evidence_instance_id"] = json!("evidence:invalid-successor");
         invalid.value["applicability_instance_id"] = json!("applicability:other");
         invalid.value["supersedes_evidence_instance_id"] = json!("evidence:authoritative");
+        invalid.value["supersedes_evidence_ref"] = json!({
+            "artifact_kind": "conformance-bundle",
+            "bundle_id": old.value["bundle_id"].clone(),
+            "document_version": old.value["document_version"].clone(),
+            "artifact_locator": old.label.clone(),
+            "evidence_instance_id": old.value["evidence_instance_id"].clone(),
+            "bundle_digest": old.digest.clone()
+        });
         let mut errors = Vec::new();
         validate_closure_semantics_at(
             &root(),
@@ -5656,7 +6400,8 @@ mod tests {
 
     #[test]
     fn ac_048_rejects_superseded_authoritative_receipt_directly() {
-        let (ledger, bundle, old) = authoritative_candidate_fixture();
+        let (ledger, bundle, mut old) = authoritative_candidate_fixture();
+        old.label = format!("{PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX}authoritative-candidate.json");
         let mut replacement = old.clone();
         replacement.label = "test:replacement-receipt".to_string();
         replacement.digest =
@@ -5665,6 +6410,14 @@ mod tests {
         replacement.value["document_version"] = json!(2);
         replacement.value["supersedes_receipt_id"] =
             json!("package-exit-receipt:authoritative-candidate");
+        replacement.value["supersedes_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "receipt_id": old.value["receipt_id"].clone(),
+            "document_version": old.value["document_version"].clone(),
+            "artifact_locator": old.label.clone(),
+            "package_id": old.value["package_id"].clone(),
+            "receipt_digest": old.digest.clone()
+        });
         let mut errors = Vec::new();
         validate_closure_semantics_at(
             &root(),
@@ -5675,6 +6428,117 @@ mod tests {
             &mut errors,
         );
         assert!(errors.iter().any(|error| {
+            error.contains("authoritative receipt package-exit-receipt:authoritative-candidate")
+                && error.contains("superseded")
+        }));
+    }
+
+    #[test]
+    fn ac_048_rejects_supersession_forks_for_evidence_and_receipts() {
+        let (ledger, mut bundle, mut receipt) = authoritative_candidate_fixture();
+        bundle.label = format!("{CONFORMANCE_BUNDLE_LOCATOR_PREFIX}authoritative-bundle.json");
+        receipt.value["evaluated_sets"]["evidence_bindings"][0]["artifact_locator"] =
+            json!(bundle.label.clone());
+        receipt.label =
+            format!("{PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX}authoritative-candidate.json");
+
+        let first_bundle = successor_bundle(
+            &bundle,
+            "bundle:fork-one",
+            "evidence:fork-one",
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        let second_bundle = successor_bundle(
+            &bundle,
+            "bundle:fork-two",
+            "evidence:fork-two",
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        );
+        let first_receipt = successor_receipt(
+            &receipt,
+            "package-exit-receipt:fork-one",
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        );
+        let second_receipt = successor_receipt(
+            &receipt,
+            "package-exit-receipt:fork-two",
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        );
+
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle, first_bundle, second_bundle],
+            &[receipt, first_receipt, second_receipt],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("evidence predecessor evidence:authoritative has multiple successors")
+        }));
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "receipt predecessor package-exit-receipt:authoritative-candidate has multiple successors",
+            )
+        }));
+        assert!(!errors
+            .iter()
+            .any(|error| error.contains("evidence evidence:authoritative has been superseded")));
+        assert!(!errors.iter().any(|error| {
+            error.contains("authoritative receipt package-exit-receipt:authoritative-candidate")
+                && error.contains("superseded")
+        }));
+    }
+
+    #[test]
+    fn ac_048_rejects_supersession_evidence_tier_downgrades() {
+        let (ledger, mut bundle, mut receipt) = authoritative_candidate_fixture();
+        bundle.label = format!("{CONFORMANCE_BUNDLE_LOCATOR_PREFIX}authoritative-bundle.json");
+        bundle.value["provenance"]["evidence_tier"] =
+            json!({"name": "externally_attested", "rank": 3});
+        receipt.value["evaluated_sets"]["evidence_bindings"][0]["artifact_locator"] =
+            json!(bundle.label.clone());
+        receipt.value["evidence_tier"] = json!({"name": "externally_attested", "rank": 3});
+        receipt.label =
+            format!("{PACKAGE_EXIT_RECEIPT_LOCATOR_PREFIX}authoritative-candidate.json");
+
+        let mut bundle_successor = successor_bundle(
+            &bundle,
+            "bundle:downgraded",
+            "evidence:downgraded",
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        );
+        bundle_successor.value["provenance"]["evidence_tier"] =
+            json!({"name": "repository_local", "rank": 1});
+        let mut receipt_successor = successor_receipt(
+            &receipt,
+            "package-exit-receipt:downgraded",
+            "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        );
+        receipt_successor.value["evidence_tier"] = json!({"name": "repository_local", "rank": 1});
+
+        let mut errors = Vec::new();
+        validate_closure_semantics_at(
+            &root(),
+            &ledger,
+            &[bundle, bundle_successor],
+            &[receipt, receipt_successor],
+            closure_test_now(),
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("superseding evidence evidence:downgraded tier rank 1")
+                && error.contains("predecessor evidence:authoritative rank 3")
+        }));
+        assert!(errors.iter().any(|error| {
+            error.contains("superseding receipt package-exit-receipt:downgraded tier rank 1")
+                && error.contains("predecessor package-exit-receipt:authoritative-candidate rank 3")
+        }));
+        assert!(!errors
+            .iter()
+            .any(|error| error.contains("evidence evidence:authoritative has been superseded")));
+        assert!(!errors.iter().any(|error| {
             error.contains("authoritative receipt package-exit-receipt:authoritative-candidate")
                 && error.contains("superseded")
         }));
@@ -5698,6 +6562,165 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("closed ryuki-canonical-json-v1 SHA-256 contract")));
+    }
+
+    #[test]
+    fn deployment_profile_conformance_binding_cycle_normalizes_receipt_digests() {
+        let profile =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        let binding = deployment_profile_binding(&profile).expect("deployment profile binding");
+        assert_eq!(
+            string_field(&binding, "digest_contract"),
+            Some(DEPLOYMENT_PROFILE_BINDING_DIGEST_CONTRACT)
+        );
+        assert_eq!(binding.get("id"), profile.get("document_id"));
+        let expected_version = profile["document_version"]
+            .as_u64()
+            .expect("document version")
+            .to_string();
+        assert_eq!(
+            string_field(&binding, "version"),
+            Some(expected_version.as_str())
+        );
+        assert_eq!(binding.get("deployment_id"), profile.get("deployment_id"));
+
+        let mut unequal_versions = profile.clone();
+        unequal_versions["document_version"] = json!(7);
+        unequal_versions["deployment_profile_version"] = json!(99);
+        let unequal_binding =
+            deployment_profile_binding(&unequal_versions).expect("unequal profile versions");
+        assert_eq!(string_field(&unequal_binding, "version"), Some("7"));
+
+        let mut receipt_bound = profile.clone();
+        receipt_bound["production_acceptance_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "document_id": "package-exit-receipt:test-root",
+            "document_version": 1,
+            "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/test-root.json"
+        });
+        let receipt_binding =
+            deployment_profile_binding(&receipt_bound).expect("receipt-bound profile");
+        assert_eq!(receipt_binding.get("digest"), binding.get("digest"));
+
+        let mut changed_root_digest = receipt_bound.clone();
+        changed_root_digest["production_acceptance_receipt_ref"]["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let changed_root_binding =
+            deployment_profile_binding(&changed_root_digest).expect("changed root digest");
+        assert_eq!(changed_root_binding.get("digest"), binding.get("digest"));
+
+        let guard = json!({
+            "guard_id": "durable-postgresql",
+            "control_ids": ["SB-OPS-01"],
+            "receipt_ref": {
+                "artifact_kind": "package-exit-receipt",
+                "document_id": "package-exit-receipt:test-guard",
+                "document_version": 1,
+                "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/test-guard.json"
+            }
+        });
+        let mut guard_bound = profile.clone();
+        guard_bound["runtime_guard_evidence"] = json!({
+            "mode": "receipt_bound",
+            "guards": [guard],
+            "runtime_cross_check_required": true
+        });
+        let guard_binding = deployment_profile_binding(&guard_bound).expect("guard-bound profile");
+        let mut changed_guard_digest = guard_bound.clone();
+        changed_guard_digest["runtime_guard_evidence"]["guards"][0]["receipt_ref"]
+            ["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let changed_guard_binding =
+            deployment_profile_binding(&changed_guard_digest).expect("changed guard digest");
+        assert_eq!(
+            changed_guard_binding.get("digest"),
+            guard_binding.get("digest")
+        );
+
+        let mut security_relevant_changes = Vec::new();
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["guard_id"] =
+            json!("approved-secret-provider");
+        security_relevant_changes.push(changed);
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["control_ids"] = json!(["SB-OPS-02"]);
+        security_relevant_changes.push(changed);
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["document_id"] =
+            json!("package-exit-receipt:test-guard-other");
+        security_relevant_changes.push(changed);
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["document_version"] =
+            json!(2);
+        security_relevant_changes.push(changed);
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["artifact_locator"] =
+            json!("catalog/security-contracts/v1/package-exit-receipts/test-guard-other.json");
+        security_relevant_changes.push(changed);
+        for changed in security_relevant_changes {
+            let changed_binding =
+                deployment_profile_binding(&changed).expect("changed guard binding");
+            assert_ne!(changed_binding.get("digest"), guard_binding.get("digest"));
+        }
+
+        let mut overlay_bound = profile.clone();
+        overlay_bound["migration_overlay"] = json!({
+            "overlay_id": "migration-overlay:test",
+            "overlay_version": 1,
+            "security_profile": "test",
+            "authority_source": "legacy_auth_mode",
+            "legacy_selector_present": true,
+            "provider_registry_present": true,
+            "retirement_deadline": "2026-08-01T00:00:00Z",
+            "conflict_telemetry_name": "security.migration.conflict",
+            "grants_authority": false,
+            "live_execution_allowed": false,
+            "zero_consumer_receipt_ref": {
+                "artifact_kind": "package-exit-receipt",
+                "document_id": "package-exit-receipt:zero-consumer",
+                "document_version": 1,
+                "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/zero-consumer.json"
+            }
+        });
+        let overlay_binding =
+            deployment_profile_binding(&overlay_bound).expect("overlay-bound profile");
+        let mut changed_overlay_digest = overlay_bound.clone();
+        changed_overlay_digest["migration_overlay"]["zero_consumer_receipt_ref"]
+            ["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let changed_overlay_digest_binding =
+            deployment_profile_binding(&changed_overlay_digest).expect("changed overlay digest");
+        assert_eq!(
+            changed_overlay_digest_binding.get("digest"),
+            overlay_binding.get("digest")
+        );
+        for (field, replacement) in [
+            (
+                "document_id",
+                json!("package-exit-receipt:zero-consumer-other"),
+            ),
+            ("document_version", json!(2)),
+            (
+                "artifact_locator",
+                json!(
+                    "catalog/security-contracts/v1/package-exit-receipts/zero-consumer-other.json"
+                ),
+            ),
+        ] {
+            let mut changed = overlay_bound.clone();
+            changed["migration_overlay"]["zero_consumer_receipt_ref"][field] = replacement;
+            let changed_binding =
+                deployment_profile_binding(&changed).expect("changed overlay binding");
+            assert_ne!(changed_binding.get("digest"), overlay_binding.get("digest"));
+        }
+
+        let mut tampered = profile;
+        tampered["policy_version"] = json!(999);
+        let tampered_binding = deployment_profile_binding(&tampered).expect("tampered profile");
+        assert_ne!(tampered_binding.get("digest"), binding.get("digest"));
     }
 
     #[test]
@@ -5784,6 +6807,27 @@ mod tests {
             "{}",
             errors.join("\n")
         );
+
+        let mut registry = trust_registry_fixture();
+        let mut predecessor = registry["keys"][0].clone();
+        predecessor["key_id"] = json!("conformance-key:test-predecessor");
+        predecessor["public_key_base64"] = json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+        predecessor["public_key_fingerprint"] =
+            json!("sha256:75877bb41d393b5fb8455ce60ecd8dda001d06316496b14dfa7f895656eeca4a");
+        predecessor["valid_from"] = json!("2026-07-16T00:00:00-10:00");
+        predecessor["lifecycle"] = json!("overlap");
+        registry["keys"][0]["valid_from"] = json!("2026-07-16T05:00:00+10:00");
+        registry["keys"][0]["supersedes_key_id"] = json!("conformance-key:test-predecessor");
+        registry["keys"]
+            .as_array_mut()
+            .expect("keys")
+            .push(predecessor);
+
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&registry, closure_test_now(), &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must have a later valid_from")));
     }
 
     #[test]
@@ -6071,7 +7115,48 @@ mod tests {
             .any(|error| error.contains("keys exceeds the maximum")));
         assert!(errors
             .iter()
-            .any(|error| error.contains("deployment_ids exceeds 256 items")));
+            .any(|error| error.contains("deployment_ids exceeds the maximum of 256 items")));
+
+        let mut scoped = trust_registry_fixture();
+        scoped["applicability"]["security_profiles"] =
+            Value::Array(vec![json!("test"); MAX_TRUST_REGISTRY_PROFILES + 1]);
+        scoped["keys"][0]["allowed_purposes"] = Value::Array(vec![
+            json!("conformance_bundle");
+            MAX_TRUST_KEY_PURPOSES + 1
+        ]);
+        scoped["keys"][0]["allowed_evidence_tiers"] = Value::Array(vec![
+            json!("repository_local");
+            MAX_TRUST_KEY_EVIDENCE_TIERS
+                + 1
+        ]);
+        scoped["keys"][0]["allowed_package_ids"] =
+            Value::Array(vec![json!("SB-0"); MAX_TRUST_KEY_PACKAGES + 1]);
+        let over_scope = (0..=MAX_TRUST_REGISTRY_SCOPE_ITEMS)
+            .map(|index| json!(format!("deployment:test-{index}")))
+            .collect::<Vec<_>>();
+        scoped["applicability"]["deployment_ids"] = Value::Array(over_scope.clone());
+        scoped["keys"][0]["deployment_ids"] = Value::Array(over_scope);
+        let over_domains = (0..=MAX_TRUST_REGISTRY_SCOPE_ITEMS)
+            .map(|index| json!(format!("trust-domain:test-{index}")))
+            .collect::<Vec<_>>();
+        scoped["applicability"]["trust_domain_ids"] = Value::Array(over_domains.clone());
+        scoped["keys"][0]["trust_domain_ids"] = Value::Array(over_domains);
+        let mut errors = Vec::new();
+        validate_conformance_trust_root_registry_at(&scoped, closure_test_now(), &mut errors);
+        for expected in [
+            "security_profiles exceeds the maximum of 3 items",
+            "allowed_purposes exceeds the maximum of 2 items",
+            "allowed_evidence_tiers exceeds the maximum of 3 items",
+            "allowed_package_ids exceeds the maximum of 10 items",
+            "deployment_ids exceeds the maximum of 256 items",
+            "trust_domain_ids exceeds the maximum of 256 items",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected}: {}",
+                errors.join("\n")
+            );
+        }
 
         let mut oversized_lineage = Vec::new();
         for version in 1..=MAX_TRUST_REGISTRY_LINEAGE + 1 {
@@ -6093,6 +7178,30 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("lineage exceeds 16 documents")));
+    }
+
+    #[test]
+    fn trust_registry_collection_bounds_accept_exact_limit_and_reject_next_item() {
+        for maximum in [
+            MAX_TRUST_REGISTRY_KEYS,
+            MAX_TRUST_REGISTRY_TOMBSTONES,
+            MAX_TRUST_REGISTRY_SCOPE_ITEMS,
+            MAX_TRUST_REGISTRY_PROFILES,
+            MAX_TRUST_KEY_PURPOSES,
+            MAX_TRUST_KEY_EVIDENCE_TIERS,
+            MAX_TRUST_KEY_PACKAGES,
+        ] {
+            let at_limit = json!({"items": vec![Value::Null; maximum]});
+            let mut errors = Vec::new();
+            enforce_array_bound(&at_limit, "items", maximum, "test:bound", &mut errors);
+            assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+            let over_limit = json!({"items": vec![Value::Null; maximum + 1]});
+            let mut errors = Vec::new();
+            enforce_array_bound(&over_limit, "items", maximum, "test:bound", &mut errors);
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains(&format!("maximum of {maximum} items")));
+        }
     }
 
     #[test]
@@ -6232,7 +7341,8 @@ mod tests {
                 "verified_at": "2026-07-15T00:05:00Z",
                 "accepted_at": "2026-07-15T00:10:00Z",
                 "expires_at": "2026-07-17T00:00:00Z",
-                "supersedes_evidence_instance_id": null
+                "supersedes_evidence_instance_id": null,
+                "supersedes_evidence_ref": null
             }),
         };
         let ledger_bytes = fs::read(
@@ -6284,7 +7394,8 @@ mod tests {
                 "receipt_lifecycle": "produced",
                 "created_at": "2026-07-15T01:00:00Z",
                 "expires_at": "2026-07-17T00:00:00Z",
-                "supersedes_receipt_id": null
+                "supersedes_receipt_id": null,
+                "supersedes_receipt_ref": null
             }),
         };
         (ledger, bundle, receipt)
@@ -6418,6 +7529,67 @@ mod tests {
         }
     }
 
+    fn successor_bundle(
+        predecessor: &LoadedDocument,
+        bundle_id: &str,
+        evidence_id: &str,
+        digest: &str,
+    ) -> LoadedDocument {
+        let mut successor = predecessor.clone();
+        successor.label = format!("test:{bundle_id}");
+        successor.digest = digest.to_string();
+        successor.value["bundle_id"] = json!(bundle_id);
+        successor.value["evidence_instance_id"] = json!(evidence_id);
+        successor.value["document_version"] = json!(
+            predecessor
+                .value
+                .get("document_version")
+                .and_then(Value::as_u64)
+                .expect("predecessor document version")
+                + 1
+        );
+        successor.value["supersedes_evidence_instance_id"] =
+            predecessor.value["evidence_instance_id"].clone();
+        successor.value["supersedes_evidence_ref"] = json!({
+            "artifact_kind": "conformance-bundle",
+            "bundle_id": predecessor.value["bundle_id"].clone(),
+            "document_version": predecessor.value["document_version"].clone(),
+            "artifact_locator": predecessor.label.clone(),
+            "evidence_instance_id": predecessor.value["evidence_instance_id"].clone(),
+            "bundle_digest": predecessor.digest.clone()
+        });
+        successor
+    }
+
+    fn successor_receipt(
+        predecessor: &LoadedDocument,
+        receipt_id: &str,
+        digest: &str,
+    ) -> LoadedDocument {
+        let mut successor = predecessor.clone();
+        successor.label = format!("test:{receipt_id}");
+        successor.digest = digest.to_string();
+        successor.value["receipt_id"] = json!(receipt_id);
+        successor.value["document_version"] = json!(
+            predecessor
+                .value
+                .get("document_version")
+                .and_then(Value::as_u64)
+                .expect("predecessor document version")
+                + 1
+        );
+        successor.value["supersedes_receipt_id"] = predecessor.value["receipt_id"].clone();
+        successor.value["supersedes_receipt_ref"] = json!({
+            "artifact_kind": "package-exit-receipt",
+            "receipt_id": predecessor.value["receipt_id"].clone(),
+            "document_version": predecessor.value["document_version"].clone(),
+            "artifact_locator": predecessor.label.clone(),
+            "package_id": predecessor.value["package_id"].clone(),
+            "receipt_digest": predecessor.digest.clone()
+        });
+        successor
+    }
+
     fn make_bundle_production_accepted(bundle: &mut LoadedDocument) {
         bundle.value["acceptance_status"] = json!("production_accepted");
         bundle.value["production_accepted"] = json!(true);
@@ -6476,7 +7648,8 @@ mod tests {
                 "verified_at": null,
                 "accepted_at": null,
                 "expires_at": "2099-01-01T00:00:00Z",
-                "supersedes_evidence_instance_id": null
+                "supersedes_evidence_instance_id": null,
+                "supersedes_evidence_ref": null
             }),
         }
     }
@@ -6564,7 +7737,8 @@ mod tests {
                 "receipt_lifecycle": "produced",
                 "created_at": "2026-01-01T00:00:00Z",
                 "expires_at": "2099-01-01T00:00:00Z",
-                "supersedes_receipt_id": null
+                "supersedes_receipt_id": null,
+                "supersedes_receipt_ref": null
             }),
         }
     }

@@ -44,7 +44,7 @@
       "$ref": "#/$defs/nonce"
     },
     "request_digest": {
-      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes, including its unique lexicographically sorted requested_document_digests list of at most 64 complete raw-document SHA-256 digests.",
+      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes, including its unique lexicographically sorted requested_document_digests list of at most 4096 complete raw-document SHA-256 digests.",
       "$ref": "#/$defs/digest"
     },
     "namespace": {
@@ -76,7 +76,7 @@
     "acceptance_records": {
       "description": "Bounded, exact accepted-document records observed in the same linearizable namespace history as the trust head. The response must contain exactly one record for every digest in the request's unique lexicographically sorted requested_document_digests list and no others; unsolicited, duplicate, or omitted records fail. Semantic verification requires acceptance_record_id, complete_document_digest, and authority_sequence each to be unique within the response. Empty is valid only for an empty lookup and cannot satisfy a production closure that requires accepted documents.",
       "type": "array",
-      "maxItems": 64,
+      "maxItems": 4096,
       "uniqueItems": true,
       "items": {
         "$ref": "#/$defs/acceptanceRecord"
@@ -373,7 +373,7 @@
         "document_id": {
           "type": "string",
           "minLength": 3,
-          "maxLength": 128,
+          "maxLength": 160,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
         },
         "document_version": {

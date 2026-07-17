@@ -14,7 +14,8 @@
     "control_trace_ref", "provider_registry_ref",
     "provider_lifecycle_snapshot_ref", "action_resource_registry_ref",
     "security_limit_profile_ref", "control_plane_topology_ref",
-    "egress_policy_ref", "retention_policy_ref", "enabled_features",
+    "egress_policy_ref", "retention_policy_ref",
+    "production_acceptance_receipt_ref", "enabled_features",
     "runtime_guard_evidence"
   ],
   "properties": {
@@ -81,6 +82,13 @@
         { "properties": { "artifact_kind": { "const": "retention-policy" } } }
       ]
     },
+    "production_acceptance_receipt_ref": {
+      "description": "Exact externally accepted SB-9 package-exit receipt that recursively closes SB-0 through SB-8. It is mandatory only for production and cannot be inferred from the referenced receipt graph.",
+      "oneOf": [
+        { "$ref": "#/$defs/productionAcceptanceReceiptReference" },
+        { "type": "null" }
+      ]
+    },
     "migration_overlay": { "$ref": "#/$defs/migrationOverlay" },
     "enabled_features": {
       "type": "array",
@@ -94,6 +102,9 @@
       "if": { "properties": { "security_profile": { "const": "production" } }, "required": ["security_profile"] },
       "then": {
         "properties": {
+          "production_acceptance_receipt_ref": {
+            "$ref": "#/$defs/productionAcceptanceReceiptReference"
+          },
           "runtime_guard_evidence": {
             "allOf": [
               { "$ref": "#/$defs/runtimeGuardEvidence" },
@@ -122,6 +133,7 @@
       },
       "else": {
         "properties": {
+          "production_acceptance_receipt_ref": { "type": "null" },
           "runtime_guard_evidence": {
             "allOf": [
               { "$ref": "#/$defs/runtimeGuardEvidence" },
@@ -186,14 +198,39 @@
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
+    "nonzeroDigest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" },
+        { "not": { "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000" } }
+      ]
+    },
     "deploymentId": { "type": "string", "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$" },
     "securityProfile": { "enum": ["development", "test", "production"] },
     "artifactLocator": {
       "type": "string",
       "minLength": 3,
       "maxLength": 512,
-      "pattern": "^(?:[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|json-pointer:#/[A-Za-z0-9_./-]+)$",
+      "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
       "not": { "pattern": "(?:^|/)\\.\\.?(?:/|$)" }
+    },
+    "productionAcceptanceReceiptLocator": {
+      "description": "Normalized repository-relative JSON locator. JSON Pointer locators, absolute paths, empty segments, dot segments, traversal, and backslashes are not permitted.",
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 512,
+      "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._-]*/)+[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+    },
+    "productionAcceptanceReceiptReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "document_id", "document_version", "content_digest", "artifact_locator"],
+      "properties": {
+        "artifact_kind": { "const": "package-exit-receipt" },
+        "document_id": { "type": "string", "pattern": "^package-exit-receipt:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "document_version": { "$ref": "#/$defs/positiveVersion" },
+        "content_digest": { "$ref": "#/$defs/nonzeroDigest" },
+        "artifact_locator": { "$ref": "#/$defs/productionAcceptanceReceiptLocator" }
+      }
     },
     "versionedContentReference": {
       "type": "object",
@@ -211,7 +248,7 @@
         },
         "document_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]{2,126}$" },
         "document_version": { "$ref": "#/$defs/positiveVersion" },
-        "content_digest": { "$ref": "#/$defs/digest" },
+        "content_digest": { "$ref": "#/$defs/nonzeroDigest" },
         "artifact_locator": { "$ref": "#/$defs/artifactLocator" }
       },
       "allOf": [
@@ -232,7 +269,7 @@
         "artifact_kind": { "const": "provider-registry" },
         "document_id": { "type": "string", "pattern": "^provider-registry:[a-z0-9][a-z0-9._-]{2,126}$" },
         "document_version": { "$ref": "#/$defs/positiveVersion" },
-        "content_digest": { "$ref": "#/$defs/digest" },
+        "content_digest": { "$ref": "#/$defs/nonzeroDigest" },
         "artifact_locator": { "$ref": "#/$defs/artifactLocator" },
         "projection": { "const": "provider_lifecycle" },
         "required_states": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "const": "active" } }
@@ -301,12 +338,7 @@
         "conflict_telemetry_name": { "type": "string", "pattern": "^[a-z][a-z0-9_.]{2,126}$" },
         "grants_authority": { "const": false },
         "live_execution_allowed": { "const": false },
-        "zero_consumer_receipt_ref": {
-          "allOf": [
-            { "$ref": "#/$defs/versionedContentReference" },
-            { "properties": { "artifact_kind": { "const": "package-exit-receipt" } } }
-          ]
-        }
+        "zero_consumer_receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" }
       }
     },
     "guardEvidence": {
@@ -316,12 +348,7 @@
       "properties": {
         "guard_id": { "enum": ["durable-postgresql", "approved-secret-provider", "https-public-urls", "secure-cookies", "non-development-authenticator", "external-signing-key-material", "mock-dependencies-disabled", "first-owner-path-closed"] },
         "control_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^SB-[A-Z0-9]+-[0-9]{2}[A-Z]?$" } },
-        "receipt_ref": {
-          "allOf": [
-            { "$ref": "#/$defs/versionedContentReference" },
-            { "properties": { "artifact_kind": { "const": "package-exit-receipt" } } }
-          ]
-        }
+        "receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" }
       }
     },
     "runtimeGuardEvidence": {

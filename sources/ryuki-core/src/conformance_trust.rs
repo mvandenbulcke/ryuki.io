@@ -39,9 +39,9 @@ const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_KEYS_PER_REGISTRY: usize = 256;
 const MAX_TOMBSTONES_PER_REGISTRY: usize = 4096;
 const MAX_SCOPE_ITEMS: usize = 256;
-const MAX_RECONCILIATION_RESPONSE_BYTES: usize = 256 * 1024;
-const MAX_RECONCILIATION_REQUEST_BYTES: usize = 16 * 1024;
-const MAX_ACCEPTANCE_RECORDS: usize = 64;
+const MAX_RECONCILIATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RECONCILIATION_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_ACCEPTANCE_RECORDS: usize = 4096;
 const MAX_CHECKPOINT_STRING_BYTES: usize = 1024;
 const MAX_RECONCILIATION_LIFETIME_SECONDS: i64 = 300;
 const MAX_CONFORMANCE_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -1032,7 +1032,7 @@ impl ValidatedConformanceRegistryLineage {
                 .any(|pair| pair[0] >= pair[1])
         {
             return Err(invalid_checkpoint(
-                "requested document digests must be valid, unique, sorted, and bounded to 64",
+                "requested document digests must be valid, unique, sorted, and bounded to 4096",
             ));
         }
         let snapshot = self
@@ -1077,7 +1077,7 @@ impl ValidatedConformanceRegistryLineage {
         });
         let canonical_bytes = canonical_json_bytes(&value)?;
         if canonical_bytes.len() > MAX_RECONCILIATION_REQUEST_BYTES {
-            return Err(invalid_checkpoint("request exceeds 16 KiB"));
+            return Err(invalid_checkpoint("request exceeds 512 KiB"));
         }
         let digest = sha256_digest(&canonical_bytes);
         Ok(ConformanceCheckpointRequest {
@@ -1122,7 +1122,7 @@ impl ValidatedConformanceRegistryLineage {
             ));
         }
         if raw_response.is_empty() || raw_response.len() > MAX_RECONCILIATION_RESPONSE_BYTES {
-            return Err(invalid_checkpoint("response is empty or exceeds 256 KiB"));
+            return Err(invalid_checkpoint("response is empty or exceeds 32 MiB"));
         }
 
         let value = parse_json_strict(raw_response)?;
@@ -1189,7 +1189,7 @@ impl ValidatedConformanceRegistryLineage {
         }
         if response.acceptance_records.len() > MAX_ACCEPTANCE_RECORDS {
             return Err(invalid_checkpoint(
-                "response has more than 64 acceptance records",
+                "response has more than 4096 acceptance records",
             ));
         }
         validate_acceptance_record_set(
@@ -1788,7 +1788,7 @@ fn authorize_key_at_acceptance(
 }
 
 fn valid_document_id(value: &str) -> bool {
-    (3..=128).contains(&value.len())
+    (3..=160).contains(&value.len())
         && value
             .as_bytes()
             .first()
@@ -3306,6 +3306,50 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_request_covers_the_complete_bounded_contract_inventory() {
+        let key = SigningKey::from_bytes(&[74; 32]);
+        let (first, second, _, second_digest) = two_version_chain(&key);
+        let lineage = lineage_for_chain(&first, &second, &second_digest).unwrap();
+        let authority = AuthorityFixture::new(108);
+        let complete_inventory = (1..=MAX_ACCEPTANCE_RECORDS)
+            .map(|index| format!("sha256:{index:064x}"))
+            .collect::<Vec<_>>();
+
+        let request = lineage
+            .reconciliation_request(
+                ConformanceTrustScope {
+                    deployment_id: "deployment:test",
+                    trust_domain_id: "trust-domain:test",
+                },
+                authority.anchor(7),
+                [1; 32],
+                at("2026-07-16T09:59:59Z"),
+                &complete_inventory,
+            )
+            .expect("the complete bounded contract inventory must fit one reconciliation");
+        assert!(request.as_bytes().len() <= MAX_RECONCILIATION_REQUEST_BYTES);
+
+        let mut oversized = complete_inventory;
+        oversized.push(format!("sha256:{:064x}", MAX_ACCEPTANCE_RECORDS + 1));
+        assert!(
+            lineage
+                .reconciliation_request(
+                    ConformanceTrustScope {
+                        deployment_id: "deployment:test",
+                        trust_domain_id: "trust-domain:test",
+                    },
+                    authority.anchor(7),
+                    [1; 32],
+                    at("2026-07-16T09:59:59Z"),
+                    &oversized,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("bounded to 4096")
+        );
+    }
+
+    #[test]
     fn lookup_request_and_response_reject_missing_unsolicited_and_reused_events() {
         let key = SigningKey::from_bytes(&[71; 32]);
         let (first, second, first_digest, second_digest) = two_version_chain(&key);
@@ -4150,5 +4194,15 @@ mod tests {
         assert!(!valid_artifact_locator("registry/bad name.json"));
         assert!(!valid_artifact_locator("registry/bad:name.json"));
         assert!(!valid_artifact_locator("registry/café.json"));
+    }
+
+    #[test]
+    fn accepted_document_id_length_matches_checkpoint_schema_boundary() {
+        let accepted = format!("d{}", "a".repeat(159));
+        let rejected = format!("d{}", "a".repeat(160));
+        assert_eq!(accepted.len(), 160);
+        assert_eq!(rejected.len(), 161);
+        assert!(valid_document_id(&accepted));
+        assert!(!valid_document_id(&rejected));
     }
 }

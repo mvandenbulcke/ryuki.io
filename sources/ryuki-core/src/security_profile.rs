@@ -52,6 +52,7 @@ pub struct DeploymentSecurityProfile {
     pub control_plane_topology_ref: VersionedContentReference,
     pub egress_policy_ref: VersionedContentReference,
     pub retention_policy_ref: VersionedContentReference,
+    pub production_acceptance_receipt_ref: Option<VersionedContentReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_overlay: Option<MigrationOverlay>,
     pub enabled_features: Vec<String>,
@@ -356,6 +357,7 @@ impl DeploymentSecurityProfile {
 
         self.validate_trust_topology(&mut errors);
         self.validate_references(&mut errors);
+        self.validate_production_acceptance_reference(&mut errors);
         self.validate_runtime_guards(&mut errors);
 
         if let Some(overlay) = &self.migration_overlay {
@@ -622,6 +624,28 @@ impl DeploymentSecurityProfile {
         }
     }
 
+    fn validate_production_acceptance_reference(&self, errors: &mut Vec<String>) {
+        match (
+            self.security_profile.is_production(),
+            &self.production_acceptance_receipt_ref,
+        ) {
+            (true, Some(reference)) => validate_reference(
+                "production_acceptance_receipt_ref",
+                reference,
+                ArtifactKind::PackageExitReceipt,
+                "package-exit-receipt:",
+                errors,
+            ),
+            (true, None) => errors.push(
+                "production requires an authoritative production_acceptance_receipt_ref".into(),
+            ),
+            (false, Some(_)) => errors.push(
+                "non-production profiles must not carry a production acceptance receipt".into(),
+            ),
+            (false, None) => {}
+        }
+    }
+
     fn validate_overlay(
         &self,
         overlay: &MigrationOverlay,
@@ -702,6 +726,38 @@ fn validate_reference(
         &reference.artifact_locator,
         errors,
     );
+    if expected_kind == ArtifactKind::PackageExitReceipt
+        && !is_normalized_package_receipt_locator(&reference.artifact_locator)
+    {
+        errors.push(format!(
+            "{label}.artifact_locator must be a normalized repository-relative JSON file"
+        ));
+    }
+}
+
+fn is_normalized_package_receipt_locator(value: &str) -> bool {
+    if value.starts_with("json-pointer:") || value.contains('\\') {
+        return false;
+    }
+    let path = Path::new(value);
+    let components = path.components().collect::<Vec<_>>();
+    components.len() >= 2
+        && path.extension().and_then(|extension| extension.to_str()) == Some("json")
+        && components.iter().all(|component| {
+            let Component::Normal(component) = component else {
+                return false;
+            };
+            let Some(component) = component.to_str() else {
+                return false;
+            };
+            let mut characters = component.chars();
+            characters
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+                && characters.all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
 }
 
 fn validate_id(value: &str, prefix: &str, label: &str, errors: &mut Vec<String>) {
@@ -743,11 +799,9 @@ fn validate_digest(label: &str, value: &str, errors: &mut Vec<String>) {
 }
 
 fn validate_locator(label: &str, value: &str, errors: &mut Vec<String>) {
-    if value.starts_with("json-pointer:#/") {
-        return;
-    }
     let path = Path::new(value);
-    if path.is_absolute()
+    if value.starts_with("json-pointer:")
+        || path.is_absolute()
         || value.is_empty()
         || path
             .components()
@@ -812,6 +866,14 @@ mod tests {
         profile.tenancy_mode = TenancyMode::SingleTenant;
         profile.lifecycle.state = DocumentLifecycleState::Active;
         profile.lifecycle.effective_at = "2026-07-16T00:00:00Z".into();
+        profile.production_acceptance_receipt_ref = Some(VersionedContentReference {
+            artifact_kind: ArtifactKind::PackageExitReceipt,
+            document_id: "package-exit-receipt:sb-9-production-acceptance".into(),
+            document_version: 1,
+            content_digest:
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            artifact_locator: "receipts/sb-9-production-acceptance.json".into(),
+        });
         profile.runtime_guard_evidence.mode = RuntimeGuardMode::ReceiptBound;
         profile.runtime_guard_evidence.guards = REQUIRED_PRODUCTION_GUARDS
             .into_iter()
@@ -957,6 +1019,47 @@ mod tests {
             fixed_now(),
         );
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn production_acceptance_receipt_is_required_only_for_production() {
+        let mut production = structurally_complete_production_profile();
+        production.production_acceptance_receipt_ref = None;
+        assert!(
+            production
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("production_acceptance_receipt_ref"))
+        );
+
+        let mut pointer_root = structurally_complete_production_profile();
+        pointer_root
+            .production_acceptance_receipt_ref
+            .as_mut()
+            .expect("production root")
+            .artifact_locator = "json-pointer:#/receipts/sb-9".into();
+        assert!(
+            pointer_root
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("normalized repository-relative JSON file"))
+        );
+
+        let mut non_production = fixture();
+        non_production.production_acceptance_receipt_ref = Some(VersionedContentReference {
+            artifact_kind: ArtifactKind::PackageExitReceipt,
+            document_id: "package-exit-receipt:forbidden-test-authority".into(),
+            document_version: 1,
+            content_digest:
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+            artifact_locator: "receipts/forbidden-test-authority.json".into(),
+        });
+        assert!(
+            non_production
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("must not carry"))
+        );
     }
 
     #[test]

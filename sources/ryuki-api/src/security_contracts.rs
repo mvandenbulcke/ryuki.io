@@ -63,15 +63,17 @@ pub(crate) const SECURITY_PROFILE_ENV: &str = "RYUKI_SECURITY_PROFILE";
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_DOCUMENTS: usize = 256;
-const MAX_REFERENCE_DEPTH: usize = 16;
-const MAX_REFERENCE_BINDINGS: usize = 256;
+// Allows the complete 4,096-document conformance set plus bounded supporting
+// profile, registry, policy, topology, and evidence-index artifacts.
+const MAX_DOCUMENTS: usize = 8192;
+const MAX_REFERENCE_DEPTH: usize = 32;
+const MAX_REFERENCE_BINDINGS: usize = 16_384;
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_JSON_NODES: usize = 100_000;
 const MAX_JSON_ARRAY_ITEMS: usize = 4_096;
 const MAX_JSON_OBJECT_MEMBERS: usize = 4_096;
 const CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
-const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 64;
+const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 4096;
 const CHECKPOINT_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 
 const PROFILE_SCHEMA: &str =
@@ -4009,7 +4011,9 @@ mod tests {
             &reference_document_digests(&oversized_bytes),
         )
         .unwrap_err()
-        .contains("bounded maximum of 64"));
+        .contains(&format!(
+            "bounded maximum of {MAX_CHECKPOINT_DOCUMENT_DIGESTS}"
+        )));
     }
 
     #[cfg(unix)]
@@ -4403,13 +4407,13 @@ mod tests {
     }
 
     #[test]
-    fn trust_registry_lineage_is_bounded_to_sixteen_documents() {
+    fn trust_registry_lineage_is_bounded_to_the_reference_depth_limit() {
         let mut fixture = ActiveFixture::build();
         fixture.install_trust_registry_lineage((MAX_REFERENCE_DEPTH + 1) as u64, |_, _| {});
         assert!(fixture
             .load()
             .unwrap_err()
-            .contains("lineage exceeds 16 documents"));
+            .contains(&format!("lineage exceeds {MAX_REFERENCE_DEPTH} documents")));
     }
 
     #[test]
@@ -5069,10 +5073,10 @@ mod tests {
     }
 
     #[test]
-    fn wide_reference_bindings_are_globally_bounded() {
+    fn wide_unique_references_are_bounded_by_loaded_documents() {
         let temp = TempDir::new().unwrap();
         let mut bindings = Vec::new();
-        for index in 0..=MAX_REFERENCE_BINDINGS {
+        for index in 0..=MAX_DOCUMENTS {
             let identity = format!("transition-receipt:wide-{index}");
             let locator = format!("evidence/wide-{index}.json");
             let receipt = json!({
@@ -5099,7 +5103,7 @@ mod tests {
         assert!(verifier
             .verify_value(&Value::Array(bindings), 0)
             .unwrap_err()
-            .contains("total reference bindings"));
+            .contains("referenced documents"));
     }
 
     #[test]
