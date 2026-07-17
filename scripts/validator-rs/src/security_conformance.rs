@@ -41,8 +41,14 @@ const MAX_TRUST_REGISTRY_PROFILES: usize = 3;
 const MAX_TRUST_KEY_PURPOSES: usize = 2;
 const MAX_TRUST_KEY_EVIDENCE_TIERS: usize = 3;
 const MAX_TRUST_KEY_PACKAGES: usize = 10;
+const MAX_PRODUCTION_BUILD_ADAPTERS: usize = 256;
+const MAX_PRODUCTION_BUILD_CAPABILITIES_PER_ADAPTER: usize = 256;
+const MAX_PRODUCTION_BUILD_BASELINE_TRACES_PER_ADAPTER: usize = 4096;
+const MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS: usize = 1024;
+const MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES: usize = 16_384;
+const MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS: usize = 1024;
 
-const SCHEMAS: [(&str, &str); 9] = [
+const SCHEMAS: [(&str, &str); 10] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -74,6 +80,10 @@ const SCHEMAS: [(&str, &str); 9] = [
     (
         "provider-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
+    ),
+    (
+        "production-build-manifest.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json",
     ),
     (
         "security-limit-profile.schema.json",
@@ -397,6 +407,12 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
             validate_instance(file_name, schema_name, schema, &instance, &mut errors);
         }
         validate_declared_schema(file_name, schema_name, &instance, &mut errors);
+        // The manifest is detached and therefore not an INSTANCES entry today.
+        // Keep dispatch here so a future checked-in instance cannot silently
+        // bypass the semantic layer when it is added to the inventory.
+        if schema_name == "production-build-manifest.schema.json" {
+            validate_production_build_manifest_semantics(file_name, &instance, &mut errors);
+        }
         validate_recursive_content_references(root, file_name, &instance, "", &mut errors);
         instances.insert(file_name, instance);
     }
@@ -777,6 +793,432 @@ fn validate_declared_schema(
         errors.push(format!(
             "{file_name}: $schema must reference the canonical {schema_name} URI"
         ));
+    }
+}
+
+/// Validate bounded, document-internal inventory closure. Exact trace
+/// membership and full active-trace coverage require the independently pinned
+/// ControlTrace bytes and are enforced by the runtime loader, not by this
+/// schema-only repository gate.
+fn validate_production_build_manifest_semantics(
+    file_name: &str,
+    manifest: &Value,
+    errors: &mut Vec<String>,
+) {
+    let error_start = errors.len();
+    if let Some(source) = manifest.get("source") {
+        let revision_algorithm = string_field(source, "revision_algorithm");
+        let revision = string_field(source, "revision");
+        let expected_length = match revision_algorithm {
+            Some("git_sha1") => Some(40),
+            Some("git_sha256") => Some(64),
+            _ => None,
+        };
+        if let (Some(expected_length), Some(revision)) = (expected_length, revision) {
+            if revision.len() != expected_length
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{file_name}:/source/revision: {revision_algorithm:?} requires exactly {expected_length} lowercase hexadecimal characters"
+                    ),
+                );
+            }
+        }
+    }
+
+    let shipped_adapters = manifest
+        .get("shipped_adapters")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if shipped_adapters.is_empty() || shipped_adapters.len() > MAX_PRODUCTION_BUILD_ADAPTERS {
+        push_production_build_error(
+            errors,
+            error_start,
+            format!(
+                "{file_name}:/shipped_adapters: inventory must contain 1..={MAX_PRODUCTION_BUILD_ADAPTERS} entries"
+            ),
+        );
+    }
+
+    let mut adapters = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
+    let mut previous_adapter_kind: Option<String> = None;
+    for (index, adapter) in shipped_adapters
+        .iter()
+        .take(MAX_PRODUCTION_BUILD_ADAPTERS)
+        .enumerate()
+    {
+        let path = format!("{file_name}:/shipped_adapters/{index}");
+        let Some(adapter_kind) = string_field(adapter, "adapter_kind") else {
+            continue;
+        };
+        if previous_adapter_kind
+            .as_deref()
+            .is_some_and(|previous| previous >= adapter_kind)
+        {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{file_name}:/shipped_adapters: entries must be strictly sorted and unique by adapter_kind; {adapter_kind} is out of order at index {index}"
+                ),
+            );
+        }
+        previous_adapter_kind = Some(adapter_kind.to_string());
+
+        if adapter.get("production_eligible").and_then(Value::as_bool) != Some(false) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{path}/production_eligible: v1 build manifests require false until production adapter admission is implemented"
+                ),
+            );
+        }
+
+        let capabilities = validate_sorted_bounded_string_inventory(
+            adapter,
+            "capability_ids",
+            1,
+            MAX_PRODUCTION_BUILD_CAPABILITIES_PER_ADAPTER,
+            &path,
+            error_start,
+            errors,
+        );
+        let required_trace_ids = adapter
+            .get("mandatory_baseline")
+            .map(|baseline| {
+                validate_sorted_bounded_string_inventory(
+                    baseline,
+                    "required_trace_ids",
+                    1,
+                    MAX_PRODUCTION_BUILD_BASELINE_TRACES_PER_ADAPTER,
+                    &format!("{path}/mandatory_baseline"),
+                    error_start,
+                    errors,
+                )
+            })
+            .unwrap_or_default();
+        if adapters
+            .insert(adapter_kind.to_string(), (capabilities, required_trace_ids))
+            .is_some()
+        {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{file_name}:/shipped_adapters/{index}/adapter_kind: duplicate shipped adapter {adapter_kind}"
+                ),
+            );
+        }
+    }
+
+    let selectors = manifest
+        .get("selector_dispositions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if selectors.is_empty() || selectors.len() > MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS {
+        push_production_build_error(
+            errors,
+            error_start,
+            format!(
+                "{file_name}:/selector_dispositions: inventory must contain 1..={MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS} entries"
+            ),
+        );
+    }
+    let mut previous_selector: Option<(String, String)> = None;
+    let mut selector_keys = BTreeSet::new();
+    let mut implemented_adapter_kinds = BTreeSet::new();
+    for (index, selector) in selectors
+        .iter()
+        .take(MAX_PRODUCTION_BUILD_SELECTOR_DISPOSITIONS)
+        .enumerate()
+    {
+        let path = format!("{file_name}:/selector_dispositions/{index}");
+        let (Some(domain), Some(name)) = (
+            string_field(selector, "selector_domain"),
+            string_field(selector, "selector"),
+        ) else {
+            continue;
+        };
+        let key = (domain.to_string(), name.to_string());
+        if previous_selector
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{file_name}:/selector_dispositions: entries must be strictly sorted and unique by (selector_domain, selector); ({domain}, {name}) is out of order at index {index}"
+                ),
+            );
+        }
+        previous_selector = Some(key.clone());
+        if !selector_keys.insert(key) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!("{path}: duplicate selector disposition ({domain}, {name})"),
+            );
+        }
+
+        let disposition = string_field(selector, "disposition");
+        let adapter_kind = selector.get("adapter_kind").and_then(Value::as_str);
+        match disposition {
+            Some("implemented") => match adapter_kind {
+                Some(adapter_kind) if adapters.contains_key(adapter_kind) => {
+                    implemented_adapter_kinds.insert(adapter_kind.to_string());
+                }
+                Some(adapter_kind) => push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{path}/adapter_kind: implemented selector references unshipped adapter {adapter_kind}"
+                    ),
+                ),
+                None => push_production_build_error(
+                    errors,
+                    error_start,
+                    format!("{path}/adapter_kind: implemented selector requires an adapter_kind"),
+                ),
+            },
+            Some("catalog_only") => match adapter_kind {
+                Some(adapter_kind) if !adapters.contains_key(adapter_kind) => {}
+                Some(adapter_kind) => push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{path}/adapter_kind: catalog_only selector must reference an adapter absent from shipped_adapters, but {adapter_kind} is shipped"
+                    ),
+                ),
+                None => push_production_build_error(
+                    errors,
+                    error_start,
+                    format!("{path}/adapter_kind: catalog_only selector requires an adapter_kind"),
+                ),
+            },
+            Some("unsupported") | Some("sentinel") if adapter_kind.is_some() => {
+                push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{path}/adapter_kind: {disposition:?} selector requires a null adapter_kind"
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    for adapter_kind in adapters.keys() {
+        if !implemented_adapter_kinds.contains(adapter_kind) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{file_name}:/selector_dispositions: shipped adapter {adapter_kind} has no implemented selector"
+                ),
+            );
+        }
+    }
+
+    let expected_instances = manifest
+        .get("expected_trace_instances")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if expected_instances.is_empty()
+        || expected_instances.len() > MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES
+    {
+        push_production_build_error(
+            errors,
+            error_start,
+            format!(
+                "{file_name}:/expected_trace_instances: inventory must contain 1..={MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES} entries"
+            ),
+        );
+    }
+    let component_id = manifest
+        .pointer("/component/component_id")
+        .and_then(Value::as_str);
+    let mut previous_expected_key: Option<(String, String)> = None;
+    let mut expected_keys = BTreeSet::new();
+    let mut instance_ids = BTreeSet::new();
+    let mut traces_by_subject = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut component_subject_present = false;
+    for (index, expected) in expected_instances
+        .iter()
+        .take(MAX_PRODUCTION_BUILD_EXPECTED_TRACE_INSTANCES)
+        .enumerate()
+    {
+        let path = format!("{file_name}:/expected_trace_instances/{index}");
+        let (Some(trace_id), Some(subject_id)) = (
+            string_field(expected, "trace_id"),
+            string_field(expected, "subject_id"),
+        ) else {
+            continue;
+        };
+        let key = (trace_id.to_string(), subject_id.to_string());
+        if previous_expected_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{file_name}:/expected_trace_instances: entries must be strictly sorted and unique by (trace_id, subject_id); ({trace_id}, {subject_id}) is out of order at index {index}"
+                ),
+            );
+        }
+        previous_expected_key = Some(key.clone());
+        if !expected_keys.insert(key) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!("{path}: duplicate expected (trace_id, subject_id) pair"),
+            );
+        }
+        if let Some(instance_id) = string_field(expected, "applicability_instance_id") {
+            if !instance_ids.insert(instance_id.to_string()) {
+                push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{path}/applicability_instance_id: duplicate instance ID {instance_id}"
+                    ),
+                );
+            }
+        }
+
+        let is_component_subject = component_id == Some(subject_id);
+        if is_component_subject {
+            component_subject_present = true;
+        }
+        let known_subject = is_component_subject
+            || parse_adapter_capability_subject(subject_id).is_some_and(
+                |(adapter_kind, capability_id)| {
+                    adapters
+                        .get(adapter_kind)
+                        .is_some_and(|(capabilities, _)| capabilities.contains(capability_id))
+                },
+            );
+        if !known_subject {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!("{path}/subject_id: unknown build subject {subject_id}"),
+            );
+            continue;
+        }
+        traces_by_subject
+            .entry(subject_id.to_string())
+            .or_default()
+            .insert(trace_id.to_string());
+    }
+    if !component_subject_present {
+        push_production_build_error(
+            errors,
+            error_start,
+            format!(
+                "{file_name}:/expected_trace_instances: inventory omits the build component subject"
+            ),
+        );
+    }
+
+    for (adapter_kind, (capabilities, required_trace_ids)) in &adapters {
+        for capability_id in capabilities {
+            let subject_id = format!("adapter-capability:{adapter_kind}:{capability_id}");
+            let Some(actual_traces) = traces_by_subject.get(&subject_id) else {
+                push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{file_name}:/expected_trace_instances: missing subject {subject_id} for shipped adapter capability"
+                    ),
+                );
+                continue;
+            };
+            if let Some(missing_trace_id) = required_trace_ids
+                .iter()
+                .find(|trace_id| !actual_traces.contains(*trace_id))
+            {
+                push_production_build_error(
+                    errors,
+                    error_start,
+                    format!(
+                        "{file_name}:/expected_trace_instances: subject {subject_id} is missing mandatory baseline trace {missing_trace_id}"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn validate_sorted_bounded_string_inventory(
+    value: &Value,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+    path: &str,
+    error_start: usize,
+    errors: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let values = value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if values.len() < minimum || values.len() > maximum {
+        push_production_build_error(
+            errors,
+            error_start,
+            format!("{path}/{field}: inventory must contain {minimum}..={maximum} entries"),
+        );
+    }
+    let mut result = BTreeSet::new();
+    let mut previous: Option<String> = None;
+    for (index, item) in values.iter().take(maximum).enumerate() {
+        let Some(item) = item.as_str() else {
+            continue;
+        };
+        if previous.as_deref().is_some_and(|previous| previous >= item) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!(
+                    "{path}/{field}: values must be strictly sorted and unique; {item} is out of order at index {index}"
+                ),
+            );
+        }
+        previous = Some(item.to_string());
+        if !result.insert(item.to_string()) {
+            push_production_build_error(
+                errors,
+                error_start,
+                format!("{path}/{field}/{index}: duplicate value {item}"),
+            );
+        }
+    }
+    result
+}
+
+fn parse_adapter_capability_subject(subject_id: &str) -> Option<(&str, &str)> {
+    let remainder = subject_id.strip_prefix("adapter-capability:")?;
+    let (adapter_kind, capability_id) = remainder.split_once(':')?;
+    (!adapter_kind.is_empty() && !capability_id.is_empty() && !capability_id.contains(':'))
+        .then_some((adapter_kind, capability_id))
+}
+
+fn push_production_build_error(errors: &mut Vec<String>, error_start: usize, error: String) {
+    if errors.len().saturating_sub(error_start) < MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS {
+        errors.push(error);
     }
 }
 
@@ -5316,6 +5758,79 @@ mod tests {
         profile
     }
 
+    fn production_build_manifest_fixture() -> Value {
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "production-build-manifest",
+            "document_id": "production-build-manifest:ryuki-api-linux-amd64",
+            "document_version": 1,
+            "component": {
+                "component_id": "component:ryuki-api",
+                "component_version": "1.0.0",
+                "executable_name": "ryuki-api",
+                "target": {
+                    "architecture": "x86_64",
+                    "operating_system": "linux",
+                    "family": "unix",
+                    "pointer_width_bits": 64,
+                    "endian": "little"
+                }
+            },
+            "source": {
+                "revision_algorithm": "git_sha1",
+                "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "runtime_executable": {
+                "content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "byte_length": 1234567
+            },
+            "oci_subject": {
+                "subject_kind": "oci_image_manifest",
+                "repository": "ghcr.io/ryuki-platform/ryuki-api",
+                "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "control_trace_ref": {
+                "artifact_kind": "control-trace",
+                "document_id": "control-trace:ryuki-security-boundary-v1",
+                "document_version": 1,
+                "content_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "artifact_locator": "catalog/security-contracts/v1/control-trace.implementation.json"
+            },
+            "shipped_adapters": [{
+                "adapter_kind": "mock-adapter",
+                "adapter_version": "1.0.0",
+                "production_eligible": false,
+                "capability_ids": ["resource-read"],
+                "mandatory_baseline": {
+                    "document_id": "baseline:mock-adapter",
+                    "document_version": 1,
+                    "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "artifact_locator": "catalog/security-contracts/v1/adapter-baselines/mock-adapter.json",
+                    "required_trace_ids": ["TRACE-SB-EXT-01-AC-017"]
+                }
+            }],
+            "selector_dispositions": [{
+                "selector_domain": "integration_adapter",
+                "selector": "mock-adapter",
+                "disposition": "implemented",
+                "adapter_kind": "mock-adapter"
+            }],
+            "expected_trace_instances": [
+                {
+                    "trace_id": "TRACE-SB-EXT-01-AC-017",
+                    "applicability_instance_id": "applicability:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "subject_id": "adapter-capability:mock-adapter:resource-read"
+                },
+                {
+                    "trace_id": "TRACE-SB-EXT-01-AC-017",
+                    "applicability_instance_id": "applicability:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "subject_id": "component:ryuki-api"
+                }
+            ]
+        })
+    }
+
     fn add_production_migration_overlay(profile: &mut Value) {
         profile["migration_overlay"] = json!({
             "overlay_id": "migration-overlay:production-test",
@@ -5452,6 +5967,215 @@ mod tests {
     fn repository_security_contracts_pass_the_real_gate() {
         let errors = validate_repository(&root()).expect("repository validation should run");
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn production_build_manifest_schema_accepts_complete_closed_instance() {
+        let schema = load("catalog/security-contracts/v1/production-build-manifest.schema.json");
+        let manifest = production_build_manifest_fixture();
+        let mut errors = Vec::new();
+
+        validate_instance(
+            "test:production-build-manifest",
+            "production-build-manifest.schema.json",
+            &schema,
+            &manifest,
+            &mut errors,
+        );
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest",
+            &manifest,
+            &mut errors,
+        );
+
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn production_build_manifest_schema_rejects_unknown_fields_and_invalid_identity() {
+        let schema = load("catalog/security-contracts/v1/production-build-manifest.schema.json");
+        let fixture = production_build_manifest_fixture();
+
+        let mut unknown_field = fixture.clone();
+        unknown_field["runtime_executable"]["self_attested"] = json!(true);
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:production-build-manifest-unknown-field",
+            "production-build-manifest.schema.json",
+            &schema,
+            &unknown_field,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("at /runtime_executable") && error.contains("additionalProperties")
+            }),
+            "missing closed-object error: {}",
+            errors.join("\n")
+        );
+
+        let mut zero_digest = fixture.clone();
+        zero_digest["runtime_executable"]["content_digest"] = json!(ZERO_SHA256_DIGEST);
+        errors.clear();
+        validate_instance(
+            "test:production-build-manifest-zero-digest",
+            "production-build-manifest.schema.json",
+            &schema,
+            &zero_digest,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.contains("at /runtime_executable/content_digest") }),
+            "missing nonzero digest error: {}",
+            errors.join("\n")
+        );
+
+        let mut bad_revision = fixture;
+        bad_revision["source"]["revision"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        errors.clear();
+        validate_instance(
+            "test:production-build-manifest-bad-revision",
+            "production-build-manifest.schema.json",
+            &schema,
+            &bad_revision,
+            &mut errors,
+        );
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-bad-revision",
+            &bad_revision,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("/source/revision") && error.contains("exactly 40")),
+            "missing revision binding error: {}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn production_build_manifest_rejects_duplicate_and_unsorted_inventory() {
+        let schema = load("catalog/security-contracts/v1/production-build-manifest.schema.json");
+        let fixture = production_build_manifest_fixture();
+
+        let mut duplicate = fixture.clone();
+        duplicate["shipped_adapters"][0]["capability_ids"] =
+            json!(["resource-read", "resource-read"]);
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:production-build-manifest-duplicate-inventory",
+            "production-build-manifest.schema.json",
+            &schema,
+            &duplicate,
+            &mut errors,
+        );
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-duplicate-inventory",
+            &duplicate,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("/shipped_adapters/0/capability_ids") && error.contains("duplicate")
+            }),
+            "missing duplicate inventory error: {}",
+            errors.join("\n")
+        );
+
+        let mut unsorted = fixture;
+        unsorted["shipped_adapters"][0]["capability_ids"] =
+            json!(["resource-write", "resource-read"]);
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-unsorted-inventory",
+            &unsorted,
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("/shipped_adapters/0/capability_ids")
+                    && error.contains("strictly sorted")
+            }),
+            "missing canonical-order error: {}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn production_build_manifest_rejects_cross_field_inventory_gaps() {
+        let fixture = production_build_manifest_fixture();
+
+        let mut missing_component = fixture.clone();
+        missing_component["expected_trace_instances"]
+            .as_array_mut()
+            .expect("expected trace inventory")
+            .pop();
+        let mut errors = Vec::new();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-missing-component",
+            &missing_component,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("omits the build component subject")),
+            "missing component closure error: {}",
+            errors.join("\n")
+        );
+
+        let mut unshipped_selector = fixture.clone();
+        unshipped_selector["selector_dispositions"][0]["adapter_kind"] = json!("catalog-adapter");
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-unshipped-selector",
+            &unshipped_selector,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("implemented selector references unshipped adapter")),
+            "missing selector closure error: {}",
+            errors.join("\n")
+        );
+
+        let mut unknown_subject = fixture.clone();
+        unknown_subject["expected_trace_instances"][0]["subject_id"] =
+            json!("adapter-capability:mock-adapter:resource-delete");
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-unknown-subject",
+            &unknown_subject,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown build subject")),
+            "missing subject closure error: {}",
+            errors.join("\n")
+        );
+
+        let mut missing_baseline_trace = fixture;
+        missing_baseline_trace["shipped_adapters"][0]["mandatory_baseline"]["required_trace_ids"] =
+            json!(["TRACE-SB-EXT-02-AC-017"]);
+        errors.clear();
+        validate_production_build_manifest_semantics(
+            "test:production-build-manifest-missing-baseline-trace",
+            &missing_baseline_trace,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("missing mandatory baseline trace")),
+            "missing baseline closure error: {}",
+            errors.join("\n")
+        );
     }
 
     #[test]

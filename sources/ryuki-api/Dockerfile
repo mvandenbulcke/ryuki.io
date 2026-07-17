@@ -31,7 +31,7 @@ FROM chef AS build
 
 # Dependency layer: cached until the workspace dependency set changes
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --package ryuki-api
+RUN cargo chef cook --locked --release --recipe-path recipe.json --package ryuki-api
 
 # Source layer: same full workspace COPY set as the planner stage
 COPY Cargo.toml Cargo.lock ./
@@ -42,7 +42,27 @@ COPY tests/ tests/
 COPY migrations/ migrations/
 COPY catalog/ catalog/
 
-RUN cargo build --release -p ryuki-api
+# Release builds pass the already validated tag commit. Keep the argument
+# optional so ordinary local builds do not define option_env!("RYUKI_SOURCE_REVISION").
+ARG RYUKI_SOURCE_REVISION
+RUN set -eu; \
+    if [ -n "${RYUKI_SOURCE_REVISION:-}" ]; then \
+        case "${RYUKI_SOURCE_REVISION}" in \
+            *[!0-9a-f]*) \
+                echo "RYUKI_SOURCE_REVISION must be exactly 40 or 64 lowercase hexadecimal characters" >&2; \
+                exit 1; \
+                ;; \
+        esac; \
+        revision_length="${#RYUKI_SOURCE_REVISION}"; \
+        if [ "${revision_length}" -ne 40 ] && [ "${revision_length}" -ne 64 ]; then \
+            echo "RYUKI_SOURCE_REVISION must be exactly 40 or 64 lowercase hexadecimal characters" >&2; \
+            exit 1; \
+        fi; \
+        export RYUKI_SOURCE_REVISION; \
+    else \
+        unset RYUKI_SOURCE_REVISION; \
+    fi; \
+    cargo build --locked --release -p ryuki-api
 
 # debian:bookworm-slim, pinned to the reviewed multi-platform index.
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
@@ -63,7 +83,7 @@ WORKDIR /app
 
 ENV RYUKI_API_EXECUTION_MODE=static-dry-run
 
-COPY --from=build --chown=10001:10001 /app/target/release/ryuki-api /app/ryuki-api
+COPY --from=build --chown=0:0 --chmod=0555 /app/target/release/ryuki-api /app/ryuki-api
 COPY --chown=0:0 catalog/security-contracts/ /app/security-contract/catalog/security-contracts/
 COPY --chown=0:0 --chmod=0444 docs/architecture/platform-security-boundary.md /app/security-contract/docs/architecture/platform-security-boundary.md
 COPY --chown=0:0 --chmod=0444 sources/ryuki-api/src/main.rs sources/ryuki-api/src/contracts.rs sources/ryuki-api/src/scheduler.rs sources/ryuki-api/src/agents.rs /app/security-contract/sources/ryuki-api/src/

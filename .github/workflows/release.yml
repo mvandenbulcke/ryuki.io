@@ -249,6 +249,8 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
+          build-args: |
+            RYUKI_SOURCE_REVISION=${{ needs.release-source.outputs.commit-sha }}
           # Both Dockerfiles build from the repository root context (see the
           # Dockerfile headers); release_image_builds enforces this.
           tags: |

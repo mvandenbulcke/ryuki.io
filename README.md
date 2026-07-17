@@ -140,11 +140,16 @@ API startup also requires `RYUKI_SECURITY_CONTRACT_ROOT`,
 `RYUKI_EXPECTED_DEPLOYMENT_ID`, and `RYUKI_SECURITY_PROFILE` to have been
 exported for a reviewed active contract and independently approved trust-root
 registry.
-Production additionally requires the external conformance trust-checkpoint
-socket, authority id, Ed25519 key id/public key/fingerprint, and minimum
-authority epoch described below. Those bindings must be delivered through a
-separately governed workload/deployment trust channel, never through the
-rollbackable security-contract root.
+Production additionally requires `RYUKI_PRODUCTION_BUILD_MANIFEST_PATH` and
+`RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST` as one complete binding. The path must
+be a normalized absolute `.json` path detached from the rollbackable
+security-contract root, and the digest must be a nonzero
+`sha256:<64 lowercase hex>` value over the manifest's exact raw bytes. A
+partial pair always fails closed. Production also requires the external
+conformance trust-checkpoint socket, authority id, Ed25519 key id/public
+key/fingerprint, and minimum authority epoch described below. Those checkpoint
+bindings must be delivered through a separately governed workload/deployment
+trust channel, never through the rollbackable security-contract root.
 The checked-in `implementation_only` fixtures are validation inputs and cannot
 start the runtime. See [Configuration](docs/configuration.md#deployment-security-startup-admission)
 before using the API command above; no runnable digest is inferred from Git.
@@ -234,6 +239,8 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_DEPLOYMENT_SECURITY_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the exact raw profile bytes |
 | `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH` | Normalized `.json` path of the current trust-registry lineage head, relative to the immutable contract root |
 | `RYUKI_CONFORMANCE_TRUST_ROOT_REGISTRY_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of that head's exact raw bytes |
+| `RYUKI_PRODUCTION_BUILD_MANIFEST_PATH` | Production-only normalized absolute `.json` path to the independently pinned build manifest, detached from the rollbackable contract root; configure only with its digest |
+| `RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the manifest's exact raw bytes; configure only with its path |
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_AUTHORITY_ID` | Independently pinned id beginning `conformance-trust-checkpoint-authority:` |
 | `RYUKI_CONFORMANCE_TRUST_CHECKPOINT_KEY_ID` | Independently pinned Ed25519 key id beginning `conformance-trust-checkpoint-key:` |
@@ -271,8 +278,12 @@ relocates, or advances the checkpoint. Exact compare-and-swap administration,
 authority recovery, and key/epoch rotation remain separately authorized
 operator workflows, not admission fallbacks.
 This checkpoint is only one production prerequisite. Production remains
-blocked until trusted closure receipts, live runtime facts, and the remaining
-normative boundary work packages are implemented and verified.
+blocked even with a valid build-manifest binding: that binding pins build
+identity and a declared applicability candidate, but does not independently
+derive that universe, authenticate deployed OCI provenance, prove semantic
+conformance closure, or verify live runtime facts. Those blockers, plus the
+remaining normative boundary work packages, must be implemented and verified
+before production admission.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

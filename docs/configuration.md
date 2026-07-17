@@ -29,6 +29,21 @@ default and empty values fail closed:
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independent canonical `deployment:` pin that must equal the document's deployment identity |
 | `RYUKI_SECURITY_PROFILE` | Independent profile-class pin, exactly `development`, `test`, or `production`, that must equal the document |
 
+Production also requires this independently pinned build-manifest pair:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_PRODUCTION_BUILD_MANIFEST_PATH` | Normalized absolute `.json` path detached from the rollbackable security-contract root |
+| `RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST` | Nonzero `sha256:<64 lowercase hex>` digest computed over the manifest's exact raw bytes |
+
+The two variables form one complete binding: setting only one fails closed,
+and both are mandatory when `RYUKI_SECURITY_PROFILE=production`. Development
+and test deployments must leave both unset. The manifest independently pins
+the expected build identity and a declared applicability candidate, but it does
+not independently derive that universe or authenticate deployed OCI provenance.
+Semantic conformance closure and verification of live runtime facts remain
+unconditional production blockers.
+
 Production additionally requires these external checkpoint bindings:
 
 | Variable | Required value |
@@ -84,9 +99,10 @@ operator workflows.
 
 Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
-authority, and cannot start the API or migration runner. Production remains
-blocked until trusted conformance receipts and live runtime facts can be
-verified. The proving ground likewise requires a separately reviewed active
+authority, and cannot start the API or migration runner. A valid external
+build-manifest binding still cannot start production until trusted semantic
+conformance closure and live runtime facts can be verified. The proving ground
+likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.
 

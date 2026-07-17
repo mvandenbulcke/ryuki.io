@@ -10,7 +10,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -26,6 +26,9 @@ use ryuki_core::conformance_trust::{
     ConformanceTrustScope, ConformanceTrustedTimeWindow, ConformanceVerificationContext,
     EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
     VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
+};
+use ryuki_core::production_build::{
+    BuildComponent, BuildSelectorDisposition, ProductionBuildManifest, ShippedAdapter,
 };
 use ryuki_core::security_profile::{
     ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, SecurityProfile,
@@ -59,10 +62,15 @@ pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_PUBLIC_KEY_FINGERPRINT";
 pub(crate) const CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH_ENV: &str =
     "RYUKI_CONFORMANCE_TRUST_CHECKPOINT_MIN_AUTHORITY_EPOCH";
+pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
+pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
+    "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
 pub(crate) const EXPECTED_DEPLOYMENT_ID_ENV: &str = "RYUKI_EXPECTED_DEPLOYMENT_ID";
 pub(crate) const SECURITY_PROFILE_ENV: &str = "RYUKI_SECURITY_PROFILE";
 
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
+const MAX_PRODUCTION_BUILD_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RUNTIME_EXECUTABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 // Allows the complete 4,096-document conformance set plus bounded supporting
@@ -71,8 +79,11 @@ const MAX_DOCUMENTS: usize = 8192;
 const MAX_REFERENCE_DEPTH: usize = 32;
 const MAX_REFERENCE_BINDINGS: usize = 16_384;
 const MAX_JSON_DEPTH: usize = 64;
-const MAX_JSON_NODES: usize = 100_000;
-const MAX_JSON_ARRAY_ITEMS: usize = 4_096;
+// A complete applicability projection can legitimately exceed 4,096 rows
+// (for example 135 active traces across roughly 95 shipped subjects). Raw-byte
+// and schema limits remain the primary allocation bounds.
+const MAX_JSON_NODES: usize = 262_144;
+const MAX_JSON_ARRAY_ITEMS: usize = 16_384;
 const MAX_JSON_OBJECT_MEMBERS: usize = 4_096;
 const CHECKPOINT_AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
 const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 4096;
@@ -95,6 +106,8 @@ const LIMIT_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/security-limit-profile.schema.json");
 const PACKAGE_EXIT_RECEIPT_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/package-exit-receipt.schema.json");
+const PRODUCTION_BUILD_MANIFEST_SCHEMA: &str =
+    include_str!("../../../catalog/security-contracts/v1/production-build-manifest.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartupTrustCheckpointAuthorityPins {
@@ -106,6 +119,15 @@ pub(crate) struct StartupTrustCheckpointAuthorityPins {
     pub(crate) minimum_authority_epoch: u64,
 }
 
+/// Detached build identity selected by independently governed deployment
+/// configuration. The manifest deliberately lives outside the rollbackable
+/// security-contract root and is bound by the digest supplied here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupProductionBuildManifestPins {
+    pub(crate) path: PathBuf,
+    pub(crate) digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartupSecurityPins {
     pub(crate) contract_root: PathBuf,
@@ -114,6 +136,7 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) conformance_trust_root_registry_path: PathBuf,
     pub(crate) conformance_trust_root_registry_digest: String,
     pub(crate) conformance_trust_checkpoint_authority: Option<StartupTrustCheckpointAuthorityPins>,
+    pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
 }
@@ -158,6 +181,7 @@ impl StartupSecurityPins {
         )?;
 
         let conformance_trust_checkpoint_authority = optional_trust_checkpoint_authority(&mut get)?;
+        let production_build_manifest = optional_production_build_manifest(&mut get)?;
 
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
         validate_namespaced_id(EXPECTED_DEPLOYMENT_ID_ENV, &deployment_id, "deployment:")?;
@@ -178,6 +202,16 @@ impl StartupSecurityPins {
                 "production {SECURITY_PROFILE_ENV} requires the complete independently governed conformance trust-checkpoint authority binding beginning with {CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV}"
             ));
         }
+        if security_profile.is_production() && production_build_manifest.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently pinned build-manifest binding beginning with {PRODUCTION_BUILD_MANIFEST_PATH_ENV}"
+            ));
+        }
+        if !security_profile.is_production() && production_build_manifest.is_some() {
+            return Err(format!(
+                "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} and {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} are production-only and must be unset for {profile_raw}"
+            ));
+        }
 
         Ok(Self {
             contract_root,
@@ -186,6 +220,7 @@ impl StartupSecurityPins {
             conformance_trust_root_registry_path,
             conformance_trust_root_registry_digest,
             conformance_trust_checkpoint_authority,
+            production_build_manifest,
             deployment_id,
             security_profile,
         })
@@ -286,6 +321,65 @@ pub(crate) struct ActiveProviderConfiguration {
 }
 
 #[derive(Debug)]
+struct RuntimeBuildIdentity {
+    source_revision: String,
+    component: BuildComponent,
+    executable_digest: String,
+    executable_byte_length: u64,
+    shipped_adapters: Vec<ShippedAdapter>,
+    selector_dispositions: Vec<BuildSelectorDisposition>,
+}
+
+struct ProductionBuildManifestCandidate {
+    source_path: PathBuf,
+    raw_bytes: Box<[u8]>,
+    raw_digest: String,
+    document: ProductionBuildManifest,
+}
+
+impl fmt::Debug for ProductionBuildManifestCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionBuildManifestCandidate")
+            .field("source_path", &self.source_path)
+            .field("raw_digest", &self.raw_digest)
+            .field("document_id", &self.document.document_id)
+            .field("document_version", &self.document.document_version)
+            .field("byte_len", &self.raw_bytes.len())
+            .finish()
+    }
+}
+
+/// Opaque non-cloneable aggregate binding the detached manifest's exact raw
+/// bytes to deployment pins, the running executable, the compiled selector
+/// inventory, and exact coverage of the active ControlTrace trace-ID set.
+///
+/// This capability closes build identity only. It is intentionally insufficient
+/// for independently derived applicability, semantic conformance closure, OCI
+/// deployment provenance, or production runtime admission. The manifest's OCI
+/// subject remains a pinned external declaration until a later deployment proof
+/// binds it to the running workload.
+pub(crate) struct PinnedProductionBuildManifest {
+    source_path: PathBuf,
+    raw_bytes: Box<[u8]>,
+    raw_digest: String,
+    document: ProductionBuildManifest,
+}
+
+impl fmt::Debug for PinnedProductionBuildManifest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedProductionBuildManifest")
+            .field("source_path", &self.source_path)
+            .field("raw_digest", &self.raw_digest)
+            .field("document_id", &self.document.document_id)
+            .field("document_version", &self.document.document_version)
+            .field("byte_len", &self.raw_bytes.len())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SecurityContractContext {
     pub(crate) profile: DeploymentSecurityProfile,
     pub(crate) profile_digest: String,
@@ -299,11 +393,15 @@ pub(crate) struct SecurityContractContext {
     /// Opaque binding between the exact profile-selected SB-9 receipt and the
     /// independently asserted current root in the same checkpoint snapshot.
     pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
+    /// Exact build identity plus a detached, independently pinned applicability
+    /// declaration. Present only for production; it is not yet an authoritative
+    /// applicability derivation or deployed-OCI proof.
+    pub(crate) production_build_manifest: Option<PinnedProductionBuildManifest>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreparedSecurityContract {
     profile: DeploymentSecurityProfile,
     profile_digest: String,
@@ -314,6 +412,7 @@ struct PreparedSecurityContract {
     reference_document_digests: BTreeMap<String, String>,
     active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     conformance_registry_lineage: Option<ValidatedConformanceRegistryLineage>,
+    production_build_manifest: Option<PinnedProductionBuildManifest>,
 }
 
 impl SecurityContractContext {
@@ -376,10 +475,23 @@ impl SecurityContractContext {
                     )
                 })
                 .unwrap_or_else(|| "no externally current SB-9 root proof".into());
+            let build_manifest = self
+                .production_build_manifest
+                .as_ref()
+                .map(|manifest| {
+                    format!(
+                        "build manifest {} version {} digest {}",
+                        manifest.document.document_id,
+                        manifest.document.document_version,
+                        manifest.raw_digest,
+                    )
+                })
+                .unwrap_or_else(|| "no pinned production build manifest".into());
             return Err(format!(
-                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {} signed closure documents authenticated; semantic closure remains unavailable)",
+                "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {}; {} signed closure documents authenticated; semantic closure remains unavailable)",
                 checkpoint,
                 production_root,
+                build_manifest,
                 verified_document_count,
             ));
         }
@@ -654,6 +766,18 @@ fn prepare_startup_security_contract(
         ));
     }
 
+    let production_build_manifest_candidate = if profile.security_profile.is_production() {
+        let runtime_identity = current_runtime_build_identity()?;
+        Some(load_production_build_manifest_candidate(
+            pins,
+            &store.root,
+            &profile,
+            &runtime_identity,
+        )?)
+    } else {
+        None
+    };
+
     let conformance_registry_lineage =
         load_pinned_conformance_trust_root_registry(&mut store, pins, &profile, now)?;
 
@@ -666,7 +790,13 @@ fn prepare_startup_security_contract(
             .enabled_features
             .iter()
             .any(|feature| feature == "static-dry-run");
-    let (documents, raw_document_bytes, reference_document_digests, active_providers) = {
+    let (
+        documents,
+        raw_document_bytes,
+        reference_document_digests,
+        active_providers,
+        production_build_manifest,
+    ) = {
         let mut verifier = ReferenceVerifier::new(&mut store, allow_repository_fixture_evidence);
         verifier.verify_value(&profile_value, 0)?;
 
@@ -703,11 +833,26 @@ fn prepare_startup_security_contract(
             validate_active_deployment_document(label, document, &profile, now)?;
         }
 
+        let production_build_manifest = match production_build_manifest_candidate {
+            Some(candidate) => {
+                let control_trace = verifier
+                    .documents
+                    .get(&profile.control_trace_ref.artifact_locator)
+                    .ok_or_else(|| {
+                        "production build manifest control-trace reference did not resolve"
+                            .to_string()
+                    })?;
+                Some(candidate.seal(control_trace)?)
+            }
+            None => None,
+        };
+
         (
             verifier.documents,
             verifier.document_bytes,
             verifier.visited,
             active_providers,
+            production_build_manifest,
         )
     };
 
@@ -721,7 +866,219 @@ fn prepare_startup_security_contract(
         reference_document_digests,
         active_providers,
         conformance_registry_lineage,
+        production_build_manifest,
     })
+}
+
+fn current_runtime_build_identity() -> Result<RuntimeBuildIdentity, String> {
+    let source_revision = crate::build_identity::embedded_source_revision()
+        .filter(|revision| !revision.is_empty())
+        .ok_or_else(|| {
+            "production build admission requires an embedded RYUKI_SOURCE_REVISION from the validated release build"
+                .to_string()
+        })?;
+    let (executable_digest, executable_byte_length) = measure_current_executable()?;
+    Ok(RuntimeBuildIdentity {
+        source_revision: source_revision.into(),
+        component: crate::build_identity::current_component(),
+        executable_digest,
+        executable_byte_length,
+        shipped_adapters: crate::build_identity::compiled_shipped_adapters(),
+        selector_dispositions: crate::build_identity::compiled_selector_dispositions(),
+    })
+}
+
+fn measure_current_executable() -> Result<(String, u64), String> {
+    let mut file = open_current_executable_image()?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("running executable metadata cannot be read: {error}"))?;
+    if !metadata.is_file() {
+        return Err("running executable image handle must reference a regular file".into());
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_RUNTIME_EXECUTABLE_BYTES {
+        return Err(format!(
+            "running executable must be non-empty and no larger than {MAX_RUNTIME_EXECUTABLE_BYTES} bytes"
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("running executable read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| "running executable byte accounting overflow".to_string())?;
+        if total > MAX_RUNTIME_EXECUTABLE_BYTES {
+            return Err(format!(
+                "running executable exceeds {MAX_RUNTIME_EXECUTABLE_BYTES} bytes"
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+    if total != metadata.len() {
+        return Err("running executable changed while being measured".into());
+    }
+    Ok((format!("sha256:{:x}", digest.finalize()), total))
+}
+
+#[cfg(target_os = "linux")]
+fn open_current_executable_image() -> Result<fs::File, String> {
+    // `/proc/self/exe` is a kernel-provided handle to the inode backing the
+    // executing image. Opening it avoids re-resolving a replaceable deployment
+    // pathname returned by `current_exe()`.
+    fs::File::open("/proc/self/exe")
+        .map_err(|error| format!("running executable image handle is unavailable: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_current_executable_image() -> Result<fs::File, String> {
+    Err(
+        "production executable identity requires a platform executing-image handle; authoritative measurement is currently supported only on Linux"
+            .into(),
+    )
+}
+
+fn load_production_build_manifest_candidate(
+    pins: &StartupSecurityPins,
+    contract_root: &Path,
+    profile: &DeploymentSecurityProfile,
+    runtime: &RuntimeBuildIdentity,
+) -> Result<ProductionBuildManifestCandidate, String> {
+    let binding = pins.production_build_manifest.as_ref().ok_or_else(|| {
+        "production startup has no independently pinned build-manifest binding".to_string()
+    })?;
+    if binding.path.starts_with(contract_root) {
+        return Err(
+            "production build manifest must be detached from the rollbackable security-contract root"
+                .into(),
+        );
+    }
+    let bytes = read_pinned_absolute_regular_file(
+        "production build manifest",
+        &binding.path,
+        &binding.digest,
+        MAX_PRODUCTION_BUILD_MANIFEST_BYTES,
+    )?;
+    let value = parse_json_strict(&bytes)
+        .map_err(|error| format!("production build manifest JSON is invalid: {error}"))?;
+    validate_against_schema(
+        "production build manifest",
+        PRODUCTION_BUILD_MANIFEST_SCHEMA,
+        &value,
+    )?;
+    let document: ProductionBuildManifest = serde_json::from_value(value)
+        .map_err(|error| format!("production build manifest is not losslessly typed: {error}"))?;
+    let errors = document.validate_semantics();
+    if !errors.is_empty() {
+        return Err(format!(
+            "production build manifest failed semantic validation: {}",
+            errors.join("; ")
+        ));
+    }
+    if document.component != runtime.component {
+        return Err(
+            "production build manifest component does not match the executing build target".into(),
+        );
+    }
+    if document.source.revision != runtime.source_revision {
+        return Err(
+            "production build manifest source revision does not match the embedded release revision"
+                .into(),
+        );
+    }
+    if document.runtime_executable.content_digest != runtime.executable_digest
+        || document.runtime_executable.byte_length != runtime.executable_byte_length
+    {
+        return Err(
+            "production build manifest executable identity does not match the measured running executable"
+                .into(),
+        );
+    }
+    if document.shipped_adapters != runtime.shipped_adapters {
+        return Err(
+            "production build manifest shipped-adapter inventory does not match the compiled build surface"
+                .into(),
+        );
+    }
+    if document.selector_dispositions != runtime.selector_dispositions {
+        return Err(
+            "production build manifest selector inventory does not match the compiled build surface"
+                .into(),
+        );
+    }
+    if document.control_trace_ref != profile.control_trace_ref {
+        return Err(
+            "production build manifest does not bind the exact profile-selected ControlTrace"
+                .into(),
+        );
+    }
+    Ok(ProductionBuildManifestCandidate {
+        source_path: binding.path.clone(),
+        raw_digest: binding.digest.clone(),
+        raw_bytes: bytes.into_boxed_slice(),
+        document,
+    })
+}
+
+impl ProductionBuildManifestCandidate {
+    fn seal(self, control_trace: &Value) -> Result<PinnedProductionBuildManifest, String> {
+        validate_manifest_trace_inventory(&self.document, control_trace)?;
+        Ok(PinnedProductionBuildManifest {
+            source_path: self.source_path,
+            raw_bytes: self.raw_bytes,
+            raw_digest: self.raw_digest,
+            document: self.document,
+        })
+    }
+}
+
+fn validate_manifest_trace_inventory(
+    manifest: &ProductionBuildManifest,
+    control_trace: &Value,
+) -> Result<(), String> {
+    let traces = control_trace
+        .get("traces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "profile-selected ControlTrace omits traces".to_string())?;
+    let mut active_trace_ids = BTreeSet::new();
+    for trace in traces {
+        if trace.get("trace_lifecycle").and_then(Value::as_str) != Some("active") {
+            continue;
+        }
+        let trace_id = required_str(trace, "trace_id", "ControlTrace row")?;
+        if !active_trace_ids.insert(trace_id) {
+            return Err(format!(
+                "profile-selected ControlTrace has duplicate active trace {trace_id}"
+            ));
+        }
+    }
+    let expected_trace_ids = manifest
+        .expected_trace_instances
+        .iter()
+        .map(|instance| instance.trace_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_trace_ids != active_trace_ids {
+        let missing = active_trace_ids
+            .difference(&expected_trace_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let unknown = expected_trace_ids
+            .difference(&active_trace_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "production build manifest trace-ID coverage is not the exact active ControlTrace set ({} missing, {} unknown)",
+            missing.len(),
+            unknown.len()
+        ));
+    }
+    Ok(())
 }
 
 async fn reconcile_external_conformance_checkpoint(
@@ -981,6 +1338,7 @@ fn finalize_startup_security_contract(
         verified_conformance_trust_checkpoint,
         verified_conformance_documents,
         verified_conformance_production_root,
+        production_build_manifest: prepared.production_build_manifest,
         active_providers: prepared.active_providers,
     })
 }
@@ -1657,6 +2015,32 @@ fn optional_trust_checkpoint_authority(
     }))
 }
 
+fn optional_production_build_manifest(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupProductionBuildManifestPins>, String> {
+    let path = optional_unicode(get, PRODUCTION_BUILD_MANIFEST_PATH_ENV)?;
+    let digest = optional_unicode(get, PRODUCTION_BUILD_MANIFEST_DIGEST_ENV)?;
+    if path.is_none() && digest.is_none() {
+        return Ok(None);
+    }
+    let path = path.ok_or_else(|| {
+        format!(
+            "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} is required when {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} is configured"
+        )
+    })?;
+    let digest = digest.ok_or_else(|| {
+        format!(
+            "{PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} is required when {PRODUCTION_BUILD_MANIFEST_PATH_ENV} is configured"
+        )
+    })?;
+    validate_json_absolute_path(PRODUCTION_BUILD_MANIFEST_PATH_ENV, &path)?;
+    validate_digest_pin(PRODUCTION_BUILD_MANIFEST_DIGEST_ENV, &digest)?;
+    Ok(Some(StartupProductionBuildManifestPins {
+        path: PathBuf::from(path),
+        digest,
+    }))
+}
+
 fn validate_absolute_socket_path(name: &str, raw: &str) -> Result<(), String> {
     let path = Path::new(raw);
     if raw.len() > 1024
@@ -1671,6 +2055,85 @@ fn validate_absolute_socket_path(name: &str, raw: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_json_absolute_path(name: &str, raw: &str) -> Result<(), String> {
+    let path = Path::new(raw);
+    let components_are_lexically_normal = raw.strip_prefix('/').is_some_and(|suffix| {
+        !suffix.is_empty()
+            && !suffix
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    });
+    if raw.len() > 4096
+        || !path.is_absolute()
+        || raw.contains('\\')
+        || !components_are_lexically_normal
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(format!(
+            "{name} must be a normalized absolute .json file path"
+        ));
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return Err(format!(
+            "{name} must be a normalized absolute .json file path"
+        ));
+    }
+    Ok(())
+}
+
+fn read_pinned_absolute_regular_file(
+    label: &str,
+    path: &Path,
+    expected_digest: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let raw_path = path
+        .to_str()
+        .ok_or_else(|| format!("{label} path must contain valid UTF-8"))?;
+    validate_json_absolute_path(label, raw_path)?;
+
+    let components = path.components().collect::<Vec<_>>();
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::RootDir) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("{label} is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{label} path contains a symlink"));
+        }
+        let final_component = index + 1 == components.len();
+        if (final_component && !metadata.is_file()) || (!final_component && !metadata.is_dir()) {
+            return Err(format!(
+                "{label} path must resolve through regular directories to a regular file"
+            ));
+        }
+    }
+
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("{label} metadata is unavailable: {error}"))?;
+    if metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} must be non-empty and no larger than {max_bytes} bytes"
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("{label} read failed: {error}"))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(format!("{label} changed while being read"));
+    }
+    let actual_digest = raw_digest(&bytes);
+    if actual_digest != expected_digest {
+        return Err(format!(
+            "{label} digest mismatch: expected {expected_digest}, got {actual_digest}"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate_namespaced_id(name: &str, value: &str, prefix: &str) -> Result<(), String> {
@@ -3110,6 +3573,12 @@ mod tests {
         SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
         TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
+    use ryuki_core::production_build::{
+        BuildEndian, BuildSource, BuildTarget, ExpectedTraceInstance, MandatoryCapabilityBaseline,
+        OciSubject, OciSubjectKind, RuntimeExecutable, SelectorDisposition, SelectorDomain,
+        SourceRevisionAlgorithm, PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND,
+        PRODUCTION_BUILD_MANIFEST_SCHEMA_URI, PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION,
+    };
     use ryuki_core::security_profile::{ArtifactKind, MigrationOverlay, VersionedContentReference};
     use serde_json::json;
     #[cfg(unix)]
@@ -3131,6 +3600,88 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
+    }
+
+    fn test_runtime_build_identity() -> RuntimeBuildIdentity {
+        let adapter = ShippedAdapter {
+            adapter_kind: "auth.test".into(),
+            adapter_version: "0.1.0".into(),
+            production_eligible: false,
+            capability_ids: vec!["authenticate".into()],
+            mandatory_baseline: MandatoryCapabilityBaseline {
+                document_id: "baseline:test".into(),
+                document_version: 1,
+                content_digest: format!("sha256:{}", "d".repeat(64)),
+                artifact_locator: "docs/architecture/test-baseline.md".into(),
+                required_trace_ids: vec!["TRACE-SB-BOUND-01-AC-040".into()],
+            },
+        };
+        RuntimeBuildIdentity {
+            source_revision: "a".repeat(40),
+            component: BuildComponent {
+                component_id: "component:ryuki-api".into(),
+                component_version: "0.1.0".into(),
+                executable_name: "ryuki-api".into(),
+                target: BuildTarget {
+                    architecture: "x86_64".into(),
+                    operating_system: "linux".into(),
+                    family: "unix".into(),
+                    pointer_width_bits: 64,
+                    endian: BuildEndian::Little,
+                },
+            },
+            executable_digest: format!("sha256:{}", "b".repeat(64)),
+            executable_byte_length: 1234,
+            shipped_adapters: vec![adapter],
+            selector_dispositions: vec![BuildSelectorDisposition {
+                selector_domain: SelectorDomain::AuthMode,
+                selector: "test-auth".into(),
+                disposition: SelectorDisposition::Implemented,
+                adapter_kind: Some("auth.test".into()),
+            }],
+        }
+    }
+
+    fn test_production_build_manifest(
+        runtime: &RuntimeBuildIdentity,
+        profile: &DeploymentSecurityProfile,
+    ) -> ProductionBuildManifest {
+        ProductionBuildManifest {
+            schema_uri: PRODUCTION_BUILD_MANIFEST_SCHEMA_URI.into(),
+            schema_version: PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION.into(),
+            contract_kind: PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND.into(),
+            document_id: "production-build-manifest:runtime-test".into(),
+            document_version: 1,
+            component: runtime.component.clone(),
+            source: BuildSource {
+                revision_algorithm: SourceRevisionAlgorithm::GitSha1,
+                revision: runtime.source_revision.clone(),
+            },
+            runtime_executable: RuntimeExecutable {
+                content_digest: runtime.executable_digest.clone(),
+                byte_length: runtime.executable_byte_length,
+            },
+            oci_subject: OciSubject {
+                subject_kind: OciSubjectKind::OciImageManifest,
+                repository: "ghcr.io/example/ryuki-platform-api".into(),
+                content_digest: format!("sha256:{}", "c".repeat(64)),
+            },
+            control_trace_ref: profile.control_trace_ref.clone(),
+            shipped_adapters: runtime.shipped_adapters.clone(),
+            selector_dispositions: runtime.selector_dispositions.clone(),
+            expected_trace_instances: vec![
+                ExpectedTraceInstance {
+                    trace_id: "TRACE-SB-BOUND-01-AC-040".into(),
+                    applicability_instance_id: format!("applicability:sha256:{}", "1".repeat(64)),
+                    subject_id: "adapter-capability:auth.test:authenticate".into(),
+                },
+                ExpectedTraceInstance {
+                    trace_id: "TRACE-SB-BOUND-01-AC-040".into(),
+                    applicability_instance_id: format!("applicability:sha256:{}", "2".repeat(64)),
+                    subject_id: "component:ryuki-api".into(),
+                },
+            ],
+        }
     }
 
     fn production_trust_registry(key: &SigningKey, profile: &DeploymentSecurityProfile) -> Value {
@@ -3491,6 +4042,24 @@ mod tests {
             .expect("repository root")
     }
 
+    fn clone_unsealed_test_prepared(
+        prepared: &PreparedSecurityContract,
+    ) -> PreparedSecurityContract {
+        assert!(prepared.production_build_manifest.is_none());
+        PreparedSecurityContract {
+            profile: prepared.profile.clone(),
+            profile_digest: prepared.profile_digest.clone(),
+            contract_root: prepared.contract_root.clone(),
+            profile_path: prepared.profile_path.clone(),
+            documents: prepared.documents.clone(),
+            raw_document_bytes: prepared.raw_document_bytes.clone(),
+            reference_document_digests: prepared.reference_document_digests.clone(),
+            active_providers: prepared.active_providers.clone(),
+            conformance_registry_lineage: prepared.conformance_registry_lineage.clone(),
+            production_build_manifest: None,
+        }
+    }
+
     struct ActiveFixture {
         _temp: TempDir,
         root: PathBuf,
@@ -3712,6 +4281,7 @@ mod tests {
                 conformance_trust_root_registry_path: PathBuf::from(TRUST_ROOT_REGISTRY_PATH),
                 conformance_trust_root_registry_digest: trust_root_registry_digest,
                 conformance_trust_checkpoint_authority: None,
+                production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
             };
@@ -3926,6 +4496,7 @@ mod tests {
         ]);
         let pins = StartupSecurityPins::from_source(|name| values.get(name).cloned()).unwrap();
         assert_eq!(pins.security_profile, SecurityProfile::Test);
+        assert!(pins.production_build_manifest.is_none());
 
         for missing in [
             SECURITY_CONTRACT_ROOT_ENV,
@@ -4060,6 +4631,89 @@ mod tests {
         .unwrap_err()
         .contains("independently governed"));
 
+        let mut production_without_build_manifest = complete_checkpoint.clone();
+        production_without_build_manifest
+            .insert(SECURITY_PROFILE_ENV.into(), OsString::from("production"));
+        assert!(StartupSecurityPins::from_source(|name| {
+            production_without_build_manifest.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains(PRODUCTION_BUILD_MANIFEST_PATH_ENV));
+
+        let build_manifest_path = "/run/ryuki/build/production-build-manifest.json";
+        let mut production_complete = production_without_build_manifest.clone();
+        production_complete.insert(
+            PRODUCTION_BUILD_MANIFEST_PATH_ENV.into(),
+            OsString::from(build_manifest_path),
+        );
+        production_complete.insert(
+            PRODUCTION_BUILD_MANIFEST_DIGEST_ENV.into(),
+            OsString::from(&digest),
+        );
+        let production_pins =
+            StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
+                .expect("production pins are complete");
+        let build_pins = production_pins
+            .production_build_manifest
+            .expect("production build manifest binding");
+        assert_eq!(build_pins.path, PathBuf::from(build_manifest_path));
+        assert_eq!(build_pins.digest, digest);
+
+        let mut nonproduction_with_build_manifest = values.clone();
+        nonproduction_with_build_manifest.insert(
+            PRODUCTION_BUILD_MANIFEST_PATH_ENV.into(),
+            OsString::from(build_manifest_path),
+        );
+        nonproduction_with_build_manifest.insert(
+            PRODUCTION_BUILD_MANIFEST_DIGEST_ENV.into(),
+            OsString::from(&digest),
+        );
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_build_manifest.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("production-only"));
+
+        for missing in [
+            PRODUCTION_BUILD_MANIFEST_PATH_ENV,
+            PRODUCTION_BUILD_MANIFEST_DIGEST_ENV,
+        ] {
+            assert!(StartupSecurityPins::from_source(|name| {
+                (name != missing)
+                    .then(|| production_complete.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err()
+            .contains(missing));
+        }
+        for invalid_path in [
+            "relative/production-build-manifest.json",
+            "/run/ryuki/build/../production-build-manifest.json",
+            "/run/ryuki/build/production-build-manifest.txt",
+            "/run//ryuki/build/production-build-manifest.json",
+        ] {
+            let mut invalid = production_complete.clone();
+            invalid.insert(
+                PRODUCTION_BUILD_MANIFEST_PATH_ENV.into(),
+                OsString::from(invalid_path),
+            );
+            assert!(
+                StartupSecurityPins::from_source(|name| invalid.get(name).cloned())
+                    .unwrap_err()
+                    .contains("normalized absolute .json")
+            );
+        }
+        let mut zero_build_digest = production_complete;
+        zero_build_digest.insert(
+            PRODUCTION_BUILD_MANIFEST_DIGEST_ENV.into(),
+            OsString::from(format!("sha256:{}", "0".repeat(64))),
+        );
+        assert!(
+            StartupSecurityPins::from_source(|name| zero_build_digest.get(name).cloned())
+                .unwrap_err()
+                .contains("nonzero")
+        );
+
         let mut relative_socket = complete_checkpoint.clone();
         relative_socket.insert(
             CONFORMANCE_TRUST_CHECKPOINT_SOCKET_ENV.into(),
@@ -4092,6 +4746,203 @@ mod tests {
         })
         .unwrap_err()
         .contains("nonzero"));
+    }
+
+    #[test]
+    fn detached_build_manifest_read_is_exact_bounded_and_regular() {
+        let temp = TempDir::new().expect("temporary build-manifest root");
+        let root = fs::canonicalize(temp.path()).expect("canonical temporary root");
+        let path = root.join("production-build-manifest.json");
+        let bytes = br#"{"contract_kind":"production-build-manifest"}"#;
+        fs::write(&path, bytes).unwrap();
+        let digest = raw_digest(bytes);
+
+        assert_eq!(
+            read_pinned_absolute_regular_file(
+                "production build manifest",
+                &path,
+                &digest,
+                MAX_PRODUCTION_BUILD_MANIFEST_BYTES,
+            )
+            .unwrap(),
+            bytes
+        );
+        assert!(read_pinned_absolute_regular_file(
+            "production build manifest",
+            &path,
+            &format!("sha256:{}", "b".repeat(64)),
+            MAX_PRODUCTION_BUILD_MANIFEST_BYTES,
+        )
+        .unwrap_err()
+        .contains("digest mismatch"));
+        assert!(read_pinned_absolute_regular_file(
+            "production build manifest",
+            &path,
+            &digest,
+            (bytes.len() - 1) as u64,
+        )
+        .unwrap_err()
+        .contains("no larger"));
+
+        let directory = root.join("directory.json");
+        fs::create_dir(&directory).unwrap();
+        assert!(read_pinned_absolute_regular_file(
+            "production build manifest",
+            &directory,
+            &digest,
+            MAX_PRODUCTION_BUILD_MANIFEST_BYTES,
+        )
+        .unwrap_err()
+        .contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_build_manifest_read_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temporary build-manifest root");
+        let root = fs::canonicalize(temp.path()).expect("canonical temporary root");
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let manifest = real.join("production-build-manifest.json");
+        let bytes = b"{}";
+        fs::write(&manifest, bytes).unwrap();
+        let link = root.join("linked");
+        symlink(&real, &link).unwrap();
+
+        assert!(read_pinned_absolute_regular_file(
+            "production build manifest",
+            &link.join("production-build-manifest.json"),
+            &raw_digest(bytes),
+            MAX_PRODUCTION_BUILD_MANIFEST_BYTES,
+        )
+        .unwrap_err()
+        .contains("symlink"));
+    }
+
+    #[test]
+    fn detached_build_manifest_is_bound_to_runtime_surface_and_exact_trace_set() {
+        let fixture = ActiveFixture::build();
+        let profile: DeploymentSecurityProfile = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        let runtime = test_runtime_build_identity();
+        let manifest = test_production_build_manifest(&runtime, &profile);
+        let detached = TempDir::new().expect("detached build-manifest root");
+        let detached_root = fs::canonicalize(detached.path()).unwrap();
+        let path = detached_root.join("production-build-manifest.json");
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut pins = fixture.pins.clone();
+        pins.production_build_manifest = Some(StartupProductionBuildManifestPins {
+            path: path.clone(),
+            digest: raw_digest(&bytes),
+        });
+
+        let candidate =
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime)
+                .expect("exact detached manifest must bind the runtime build surface");
+        fs::write(&path, b"{}").unwrap();
+        let proof = candidate
+            .seal(&json!({
+                "traces": [{
+                    "trace_id": "TRACE-SB-BOUND-01-AC-040",
+                    "trace_lifecycle": "active"
+                }]
+            }))
+            .expect("sealing consumes the already loaded bytes without rereading the path");
+        let debug = format!("{proof:?}");
+        assert!(debug.contains("production-build-manifest:runtime-test"));
+        assert!(debug.contains(&raw_digest(&bytes)));
+
+        assert!(
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime,)
+                .unwrap_err()
+                .contains("digest mismatch")
+        );
+    }
+
+    #[test]
+    fn detached_build_manifest_rejects_identity_swaps_before_checkpoint_io() {
+        let fixture = ActiveFixture::build();
+        let profile: DeploymentSecurityProfile = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        let runtime = test_runtime_build_identity();
+        let detached = TempDir::new().expect("detached build-manifest root");
+        let detached_root = fs::canonicalize(detached.path()).unwrap();
+        let path = detached_root.join("production-build-manifest.json");
+
+        let mut manifest = test_production_build_manifest(&runtime, &profile);
+        manifest.source.revision = "f".repeat(40);
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut pins = fixture.pins.clone();
+        pins.production_build_manifest = Some(StartupProductionBuildManifestPins {
+            path: path.clone(),
+            digest: raw_digest(&bytes),
+        });
+        assert!(
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime,)
+                .unwrap_err()
+                .contains("embedded release revision")
+        );
+
+        let mut manifest = test_production_build_manifest(&runtime, &profile);
+        manifest.shipped_adapters[0].adapter_version = "0.2.0".into();
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        pins.production_build_manifest.as_mut().unwrap().digest = raw_digest(&bytes);
+        assert!(
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime,)
+                .unwrap_err()
+                .contains("compiled build surface")
+        );
+
+        let manifest = test_production_build_manifest(&runtime, &profile);
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        pins.production_build_manifest.as_mut().unwrap().digest = raw_digest(&bytes);
+        let candidate =
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime)
+                .unwrap();
+        assert!(candidate
+            .seal(&json!({
+                "traces": [{
+                    "trace_id": "TRACE-SB-OTHER-01-AC-001",
+                    "trace_lifecycle": "active"
+                }]
+            }))
+            .unwrap_err()
+            .contains("exact active ControlTrace set"));
+    }
+
+    #[test]
+    fn build_manifest_cannot_reside_under_the_security_contract_root() {
+        let fixture = ActiveFixture::build();
+        let profile: DeploymentSecurityProfile = serde_json::from_slice(
+            &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+        )
+        .unwrap();
+        let runtime = test_runtime_build_identity();
+        let manifest = test_production_build_manifest(&runtime, &profile);
+        let path = fixture.root.join("production-build-manifest.json");
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut pins = fixture.pins.clone();
+        pins.production_build_manifest = Some(StartupProductionBuildManifestPins {
+            path,
+            digest: raw_digest(&bytes),
+        });
+
+        assert!(
+            load_production_build_manifest_candidate(&pins, &fixture.root, &profile, &runtime,)
+                .unwrap_err()
+                .contains("detached from the rollbackable security-contract root")
+        );
     }
 
     #[test]
@@ -4299,8 +5150,9 @@ mod tests {
             reference_document_digests: reference_digests.clone(),
             active_providers: BTreeMap::new(),
             conformance_registry_lineage: Some(lineage),
+            production_build_manifest: None,
         };
-        let mut missing_socket_prepared = prepared.clone();
+        let mut missing_socket_prepared = clone_unsealed_test_prepared(&prepared);
 
         let server_documents = documents.clone();
         let server_document_bytes = document_bytes.clone();
@@ -4375,6 +5227,7 @@ mod tests {
             verified_conformance_trust_checkpoint: Some(checkpoint),
             verified_conformance_documents: verified,
             verified_conformance_production_root: Some(verified_root),
+            production_build_manifest: None,
             active_providers: BTreeMap::new(),
         };
         context
@@ -4409,6 +5262,7 @@ mod tests {
             reference_document_digests: reference_digests,
             active_providers: BTreeMap::new(),
             conformance_registry_lineage: None,
+            production_build_manifest: None,
         };
         let mut time_sample = 0usize;
         let error = finalize_startup_security_contract(
@@ -5395,6 +6249,12 @@ mod tests {
 
     #[test]
     fn json_shape_limits_apply_before_schema_validation() {
+        let above_legacy_limit = Value::Array(vec![Value::Null; 4_097]);
+        assert!(parse_json_strict(&serde_json::to_vec(&above_legacy_limit).unwrap()).is_ok());
+
+        let maximum = Value::Array(vec![Value::Null; MAX_JSON_ARRAY_ITEMS]);
+        assert!(parse_json_strict(&serde_json::to_vec(&maximum).unwrap()).is_ok());
+
         let oversized = Value::Array(vec![Value::Null; MAX_JSON_ARRAY_ITEMS + 1]);
         let bytes = serde_json::to_vec(&oversized).unwrap();
         assert!(parse_json_strict(&bytes)

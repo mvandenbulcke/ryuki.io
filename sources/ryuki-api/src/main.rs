@@ -4,6 +4,7 @@ mod agents;
 mod audit;
 mod background;
 mod boundary;
+mod build_identity;
 mod config;
 mod config_store;
 mod contracts;
