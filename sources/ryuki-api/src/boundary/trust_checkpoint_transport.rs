@@ -11,17 +11,14 @@ use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(unix)]
+use super::authority_transport::{
+    AuthorityDeadlinePhase, AuthorityReadPhase, AuthorityTransportBounds,
+    AuthorityTransportDeadlines, AuthorityTransportError, AuthorityTransportHardLimits,
+    UnixAuthorityTransport,
+};
+
+#[cfg(unix)]
 use std::io;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::path::{Component, Path};
-#[cfg(unix)]
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-#[cfg(unix)]
-use tokio::time::timeout;
 
 /// Conservative cross-Unix pathname limit, excluding the terminating NUL byte.
 ///
@@ -34,7 +31,7 @@ pub(crate) const MAX_CHECKPOINT_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(unix)]
 pub(crate) const MAX_CHECKPOINT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 const FRAME_HEADER_BYTES: usize = std::mem::size_of::<u32>();
 
 #[cfg(unix)]
@@ -244,9 +241,7 @@ pub(crate) enum TrustCheckpointTransportError {
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 pub(crate) struct UnixTrustCheckpointTransport {
-    socket_path: PathBuf,
-    deadlines: TrustCheckpointTransportDeadlines,
-    bounds: TrustCheckpointTransportBounds,
+    inner: UnixAuthorityTransport,
 }
 
 /// Uninhabited transport on targets that cannot provide the required Unix socket boundary.
@@ -281,15 +276,26 @@ impl UnixTrustCheckpointTransport {
 
         #[cfg(unix)]
         {
-            validate_socket_path(&socket_path)?;
-            validate_deadlines(deadlines)?;
-            validate_bounds(bounds)?;
-
-            Ok(Self {
+            let inner = UnixAuthorityTransport::new(
                 socket_path,
-                deadlines,
-                bounds,
-            })
+                AuthorityTransportDeadlines {
+                    connect: deadlines.connect,
+                    write: deadlines.write,
+                    read: deadlines.read,
+                },
+                AuthorityTransportBounds {
+                    max_request_bytes: bounds.max_request_bytes,
+                    max_response_bytes: bounds.max_response_bytes,
+                },
+                AuthorityTransportHardLimits {
+                    max_socket_path_bytes: MAX_UNIX_SOCKET_PATH_BYTES,
+                    max_phase_deadline: MAX_CHECKPOINT_PHASE_DEADLINE,
+                    max_request_bytes: MAX_CHECKPOINT_REQUEST_BYTES,
+                    max_response_bytes: MAX_CHECKPOINT_RESPONSE_BYTES,
+                },
+            )
+            .map_err(map_authority_transport_error)?;
+            Ok(Self { inner })
         }
     }
 
@@ -311,212 +317,112 @@ impl UnixTrustCheckpointTransport {
 
         #[cfg(unix)]
         {
-            if request_bytes.is_empty() {
-                return Err(TrustCheckpointTransportError::EmptyRequest);
-            }
-            if request_bytes.len() > self.bounds.max_request_bytes {
-                return Err(TrustCheckpointTransportError::RequestTooLarge {
-                    actual: request_bytes.len(),
-                    limit: self.bounds.max_request_bytes,
-                });
-            }
-
-            let request_length = u32::try_from(request_bytes.len()).map_err(|_| {
-                TrustCheckpointTransportError::RequestTooLarge {
-                    actual: request_bytes.len(),
-                    limit: self.bounds.max_request_bytes,
-                }
-            })?;
-
-            let mut stream = timeout(
-                self.deadlines.connect,
-                UnixStream::connect(&self.socket_path),
-            )
-            .await
-            .map_err(|_| TrustCheckpointTransportError::ConnectTimedOut {
-                deadline: self.deadlines.connect,
-            })?
-            .map_err(|source| TrustCheckpointTransportError::ConnectFailed { source })?;
-
-            timeout(self.deadlines.write, async {
-                stream.write_all(&request_length.to_be_bytes()).await?;
-                stream.write_all(request_bytes).await?;
-                stream.shutdown().await
-            })
-            .await
-            .map_err(|_| TrustCheckpointTransportError::WriteTimedOut {
-                deadline: self.deadlines.write,
-            })?
-            .map_err(|source| TrustCheckpointTransportError::WriteFailed { source })?;
-
-            timeout(
-                self.deadlines.read,
-                read_single_response_frame(&mut stream, self.bounds.max_response_bytes),
-            )
-            .await
-            .map_err(|_| TrustCheckpointTransportError::ReadTimedOut {
-                deadline: self.deadlines.read,
-            })?
+            self.inner
+                .exchange(request_bytes)
+                .await
+                .map_err(map_authority_transport_error)
         }
     }
 }
 
 #[cfg(unix)]
-fn validate_socket_path(path: &Path) -> Result<(), TrustCheckpointTransportError> {
-    if !path.is_absolute() {
-        return Err(TrustCheckpointTransportError::SocketPathNotAbsolute);
-    }
-    if path.file_name().is_none() {
-        return Err(TrustCheckpointTransportError::SocketPathMissingFileName);
-    }
-
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                return Err(TrustCheckpointTransportError::SocketPathNotNormalized);
+fn map_authority_transport_error(error: AuthorityTransportError) -> TrustCheckpointTransportError {
+    match error {
+        AuthorityTransportError::SocketPathNotAbsolute => {
+            TrustCheckpointTransportError::SocketPathNotAbsolute
+        }
+        AuthorityTransportError::SocketPathMissingFileName => {
+            TrustCheckpointTransportError::SocketPathMissingFileName
+        }
+        AuthorityTransportError::SocketPathNotNormalized => {
+            TrustCheckpointTransportError::SocketPathNotNormalized
+        }
+        AuthorityTransportError::SocketPathContainsNul => {
+            TrustCheckpointTransportError::SocketPathContainsNul
+        }
+        AuthorityTransportError::SocketPathTooLong { actual, limit } => {
+            TrustCheckpointTransportError::SocketPathTooLong { actual, limit }
+        }
+        AuthorityTransportError::InvalidDeadline { phase } => {
+            TrustCheckpointTransportError::InvalidDeadline {
+                phase: map_deadline_phase(phase),
             }
         }
-    }
-
-    let path_bytes = path.as_os_str().as_bytes();
-    if path_bytes.contains(&0) {
-        return Err(TrustCheckpointTransportError::SocketPathContainsNul);
-    }
-    if normalized.as_os_str().as_bytes() != path_bytes {
-        return Err(TrustCheckpointTransportError::SocketPathNotNormalized);
-    }
-    if path_bytes.len() > MAX_UNIX_SOCKET_PATH_BYTES {
-        return Err(TrustCheckpointTransportError::SocketPathTooLong {
-            actual: path_bytes.len(),
-            limit: MAX_UNIX_SOCKET_PATH_BYTES,
-        });
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_deadlines(
-    deadlines: TrustCheckpointTransportDeadlines,
-) -> Result<(), TrustCheckpointTransportError> {
-    for (phase, deadline) in [
-        (TrustCheckpointDeadlinePhase::Connect, deadlines.connect),
-        (TrustCheckpointDeadlinePhase::Write, deadlines.write),
-        (TrustCheckpointDeadlinePhase::Read, deadlines.read),
-    ] {
-        if deadline.is_zero() {
-            return Err(TrustCheckpointTransportError::InvalidDeadline { phase });
+        AuthorityTransportError::DeadlineTooLong {
+            phase,
+            configured,
+            hard_limit,
+        } => TrustCheckpointTransportError::DeadlineTooLong {
+            phase: map_deadline_phase(phase),
+            configured,
+            hard_limit,
+        },
+        AuthorityTransportError::InvalidBound {
+            bound,
+            configured,
+            hard_limit,
+        } => TrustCheckpointTransportError::InvalidBound {
+            bound,
+            configured,
+            hard_limit,
+        },
+        AuthorityTransportError::EmptyRequest => TrustCheckpointTransportError::EmptyRequest,
+        AuthorityTransportError::RequestTooLarge { actual, limit } => {
+            TrustCheckpointTransportError::RequestTooLarge { actual, limit }
         }
-        if deadline > MAX_CHECKPOINT_PHASE_DEADLINE {
-            return Err(TrustCheckpointTransportError::DeadlineTooLong {
-                phase,
-                configured: deadline,
-                hard_limit: MAX_CHECKPOINT_PHASE_DEADLINE,
-            });
+        AuthorityTransportError::ConnectTimedOut { deadline } => {
+            TrustCheckpointTransportError::ConnectTimedOut { deadline }
         }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_bounds(
-    bounds: TrustCheckpointTransportBounds,
-) -> Result<(), TrustCheckpointTransportError> {
-    for (bound, configured, hard_limit) in [
-        (
-            "request",
-            bounds.max_request_bytes,
-            MAX_CHECKPOINT_REQUEST_BYTES,
-        ),
-        (
-            "response",
-            bounds.max_response_bytes,
-            MAX_CHECKPOINT_RESPONSE_BYTES,
-        ),
-    ] {
-        if configured == 0 || configured > hard_limit {
-            return Err(TrustCheckpointTransportError::InvalidBound {
-                bound,
-                configured,
-                hard_limit,
-            });
+        AuthorityTransportError::ConnectFailed { source } => {
+            TrustCheckpointTransportError::ConnectFailed { source }
         }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn read_single_response_frame(
-    stream: &mut UnixStream,
-    max_response_bytes: usize,
-) -> Result<Vec<u8>, TrustCheckpointTransportError> {
-    let mut header = [0_u8; FRAME_HEADER_BYTES];
-    let header_bytes = read_exact_count(stream, &mut header)
-        .await
-        .map_err(|source| TrustCheckpointTransportError::ReadFailed {
-            phase: TrustCheckpointReadPhase::Header,
-            source,
-        })?;
-    if header_bytes != FRAME_HEADER_BYTES {
-        return Err(TrustCheckpointTransportError::TruncatedHeader {
-            expected: FRAME_HEADER_BYTES,
-            received: header_bytes,
-        });
-    }
-
-    let declared = u32::from_be_bytes(header) as usize;
-    if declared == 0 {
-        return Err(TrustCheckpointTransportError::EmptyResponse);
-    }
-    if declared > max_response_bytes {
-        return Err(TrustCheckpointTransportError::ResponseTooLarge {
-            declared,
-            limit: max_response_bytes,
-        });
-    }
-
-    let mut response = vec![0_u8; declared];
-    let body_bytes = read_exact_count(stream, &mut response)
-        .await
-        .map_err(|source| TrustCheckpointTransportError::ReadFailed {
-            phase: TrustCheckpointReadPhase::Body,
-            source,
-        })?;
-    if body_bytes != declared {
-        return Err(TrustCheckpointTransportError::TruncatedResponse {
-            declared,
-            received: body_bytes,
-        });
-    }
-
-    let mut trailing = [0_u8; 1];
-    match stream.read(&mut trailing).await {
-        Ok(0) => Ok(response),
-        Ok(_) => Err(TrustCheckpointTransportError::TrailingResponseBytes),
-        Err(source) => Err(TrustCheckpointTransportError::ReadFailed {
-            phase: TrustCheckpointReadPhase::EndOfFrame,
-            source,
-        }),
+        AuthorityTransportError::WriteTimedOut { deadline } => {
+            TrustCheckpointTransportError::WriteTimedOut { deadline }
+        }
+        AuthorityTransportError::WriteFailed { source } => {
+            TrustCheckpointTransportError::WriteFailed { source }
+        }
+        AuthorityTransportError::ReadTimedOut { deadline } => {
+            TrustCheckpointTransportError::ReadTimedOut { deadline }
+        }
+        AuthorityTransportError::ReadFailed { phase, source } => {
+            TrustCheckpointTransportError::ReadFailed {
+                phase: map_read_phase(phase),
+                source,
+            }
+        }
+        AuthorityTransportError::TruncatedHeader { expected, received } => {
+            TrustCheckpointTransportError::TruncatedHeader { expected, received }
+        }
+        AuthorityTransportError::EmptyResponse => TrustCheckpointTransportError::EmptyResponse,
+        AuthorityTransportError::ResponseTooLarge { declared, limit } => {
+            TrustCheckpointTransportError::ResponseTooLarge { declared, limit }
+        }
+        AuthorityTransportError::TruncatedResponse { declared, received } => {
+            TrustCheckpointTransportError::TruncatedResponse { declared, received }
+        }
+        AuthorityTransportError::TrailingResponseBytes => {
+            TrustCheckpointTransportError::TrailingResponseBytes
+        }
     }
 }
 
 #[cfg(unix)]
-async fn read_exact_count<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    destination: &mut [u8],
-) -> io::Result<usize> {
-    let mut received = 0;
-    while received < destination.len() {
-        let read = reader.read(&mut destination[received..]).await?;
-        if read == 0 {
-            break;
-        }
-        received += read;
+const fn map_deadline_phase(phase: AuthorityDeadlinePhase) -> TrustCheckpointDeadlinePhase {
+    match phase {
+        AuthorityDeadlinePhase::Connect => TrustCheckpointDeadlinePhase::Connect,
+        AuthorityDeadlinePhase::Write => TrustCheckpointDeadlinePhase::Write,
+        AuthorityDeadlinePhase::Read => TrustCheckpointDeadlinePhase::Read,
     }
-    Ok(received)
+}
+
+#[cfg(unix)]
+const fn map_read_phase(phase: AuthorityReadPhase) -> TrustCheckpointReadPhase {
+    match phase {
+        AuthorityReadPhase::Header => TrustCheckpointReadPhase::Header,
+        AuthorityReadPhase::Body => TrustCheckpointReadPhase::Body,
+        AuthorityReadPhase::EndOfFrame => TrustCheckpointReadPhase::EndOfFrame,
+    }
 }
 
 #[cfg(all(test, not(unix)))]
@@ -540,7 +446,8 @@ mod non_unix_tests {
 mod tests {
     use super::*;
     use tempfile::{Builder, TempDir};
-    use tokio::net::UnixListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinHandle;
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);

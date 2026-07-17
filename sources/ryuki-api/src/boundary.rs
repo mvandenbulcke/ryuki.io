@@ -1,6 +1,7 @@
 use axum::{routing::get, Json, Router};
 use ryuki_core::types::BoundaryStatus;
 
+pub(crate) mod authority_transport;
 pub(crate) mod trust_checkpoint_transport;
 
 pub fn routes() -> Router {

@@ -3460,17 +3460,58 @@ fn reject_cycles(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use ed25519_dalek::{Signer, SigningKey};
 
     use crate::conformance_applicability::{
         APPLICABILITY_IDENTITY_CONTRACT, APPLICABILITY_INVENTORY_CONTRACT,
         compare_applicability_instances, recompute_applicability_instance_id,
         recompute_applicability_inventory_binding,
     };
+    use crate::conformance_trust::{
+        CANONICALIZATION_PROFILE, CONFORMANCE_BUNDLE_DOMAIN, ConformanceArtifactCandidate,
+        ConformanceCheckpointAuthorityAnchor, ConformanceProductionRootRef,
+        ConformanceRegistryArtifact, ConformanceTrustAnchor, ConformanceTrustScope,
+        ConformanceVerificationContext, PACKAGE_EXIT_RECEIPT_DOMAIN, SIGNATURE_ALGORITHM,
+        SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
+        TRUST_RECONCILIATION_RESPONSE_DOMAIN, TRUST_RECONCILIATION_RESPONSE_KIND,
+        TRUST_REGISTRY_CONTRACT_KIND, TRUST_REGISTRY_SCHEMA_URI, TRUST_REGISTRY_SCHEMA_VERSION,
+        ValidatedConformanceRegistryLineage, conformance_signed_subject_digest,
+        conformance_signing_bytes,
+    };
+    use crate::production_applicability::derive_implementation_applicability;
+    use crate::production_deployment_applicability::{
+        ActiveProviderApplicabilityClaim, ActiveProviderRegistryApplicabilityClaim,
+        DeployedArtifactApplicabilityClaim, DeploymentCheckpointApplicabilityClaim,
+        ProviderMandatoryBaselineClaim, SecurityLimitApplicabilityClaim,
+    };
+    use crate::security_profile::ProviderLifecycleState;
 
     const PROFILE_JSON: &str = include_str!(
         "../../../catalog/security-contracts/v1/deployment-security-profile.implementation.json"
     );
+
+    static PUBLIC_FIXTURE_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn public_fixture_entropy(label: &[u8]) -> [u8; 32] {
+        let counter = PUBLIC_FIXTURE_ENTROPY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ryuki public closure fixture entropy");
+        hasher.update(label);
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(counter.to_le_bytes());
+        hasher.update(elapsed.to_le_bytes());
+        hasher.finalize().into()
+    }
 
     fn test_digest(label: &str) -> String {
         digest_bytes(label.as_bytes())
@@ -4188,6 +4229,1019 @@ mod tests {
             outputs.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
             (target_digest, successor_digest)
         }
+    }
+
+    const FIXTURE_REGISTRY_ID: &str = "conformance-trust-root-registry:closure-fixture";
+    const FIXTURE_REGISTRY_LOCATOR: &str = "fixtures/trust/conformance-registry.json";
+    const FIXTURE_SIGNER_ID: &str = "signer:closure-fixture";
+    const FIXTURE_SIGNING_KEY_ID: &str = "conformance-key:closure-fixture";
+    const FIXTURE_AUTHORITY_ID: &str = "conformance-trust-checkpoint-authority:closure-fixture";
+    const FIXTURE_AUTHORITY_KEY_ID: &str = "conformance-trust-checkpoint-key:closure-fixture";
+    const FIXTURE_AUTHORITY_EPOCH: u64 = 7;
+    const FIXTURE_AUTHORITY_REVISION: u64 = 11;
+    const FIXTURE_CHECKPOINT_SEQUENCE: u64 = 1_000;
+
+    #[derive(Debug)]
+    struct SignedFixtureDocument {
+        kind: ConformanceDocumentKind,
+        package_id: String,
+        artifact_locator: String,
+        value: Value,
+        raw_bytes: Vec<u8>,
+        raw_digest: String,
+        acceptance_record_id: String,
+        acceptance_sequence: u64,
+    }
+
+    fn fixture_registry(signing_key: &SigningKey) -> (Vec<u8>, String, String) {
+        let public_key = signing_key.verifying_key().to_bytes();
+        let fingerprint = digest_bytes(&public_key);
+        let registry = json!({
+            "$schema": TRUST_REGISTRY_SCHEMA_URI,
+            "schema_version": TRUST_REGISTRY_SCHEMA_VERSION,
+            "contract_kind": TRUST_REGISTRY_CONTRACT_KIND,
+            "document_id": FIXTURE_REGISTRY_ID,
+            "document_version": 1,
+            "predecessor_registry_ref": null,
+            "acceptance_status": "production_accepted",
+            "production_accepted": true,
+            "lifecycle": {
+                "state": "active",
+                "effective_at": "2026-01-01T00:00:00Z"
+            },
+            "applicability": {
+                "evaluation_scope": "deployment",
+                "security_profiles": ["production"],
+                "deployment_ids": [DEPLOYMENT_ID],
+                "trust_domain_ids": [TRUST_DOMAIN_ID]
+            },
+            "trust_policy_version": 1,
+            "canonicalization_profiles": [CANONICALIZATION_PROFILE],
+            "signature_algorithms": [SIGNATURE_ALGORITHM],
+            "keys": [{
+                "key_id": FIXTURE_SIGNING_KEY_ID,
+                "signer_identity": FIXTURE_SIGNER_ID,
+                "algorithm": SIGNATURE_ALGORITHM,
+                "public_key_base64": BASE64_STANDARD.encode(public_key),
+                "public_key_fingerprint": fingerprint,
+                "allowed_purposes": ["conformance_bundle", "package_exit_receipt"],
+                "allowed_evidence_tiers": ["externally_attested"],
+                "allowed_package_ids": PACKAGES,
+                "deployment_ids": [DEPLOYMENT_ID],
+                "trust_domain_ids": [TRUST_DOMAIN_ID],
+                "valid_from": "2026-01-01T00:00:00Z",
+                "valid_until": "2028-01-01T00:00:00Z",
+                "lifecycle": "active",
+                "supersedes_key_id": null
+            }],
+            "key_tombstones": []
+        });
+        let raw_bytes = canonical_json_bytes(&registry).unwrap();
+        let raw_digest = digest_bytes(&raw_bytes);
+        (raw_bytes, raw_digest, fingerprint)
+    }
+
+    fn sign_fixture_document(
+        mut value: Value,
+        kind: ConformanceDocumentKind,
+        package_id: &str,
+        artifact_locator: String,
+        acceptance_sequence: u64,
+        signing_key: &SigningKey,
+        registry_digest: &str,
+    ) -> SignedFixtureDocument {
+        let (purpose, domain) = match kind {
+            ConformanceDocumentKind::ConformanceBundle => {
+                ("conformance_bundle", CONFORMANCE_BUNDLE_DOMAIN)
+            }
+            ConformanceDocumentKind::PackageExitReceipt => {
+                ("package_exit_receipt", PACKAGE_EXIT_RECEIPT_DOMAIN)
+            }
+        };
+        value["schema_version"] = json!(TRUST_REGISTRY_SCHEMA_VERSION);
+        value["signer"] = json!({
+            "signature_version": SIGNATURE_VERSION,
+            "identity": FIXTURE_SIGNER_ID,
+            "key_id": FIXTURE_SIGNING_KEY_ID,
+            "algorithm": SIGNATURE_ALGORITHM,
+            "canonicalization": CANONICALIZATION_PROFILE,
+            "purpose": purpose,
+            "domain": domain,
+            "trust_registry_id": FIXTURE_REGISTRY_ID,
+            "trust_registry_version": 1,
+            "trust_registry_digest": registry_digest,
+            "signed_at": "2026-07-15T05:30:00Z",
+            "signed_subject_digest": test_digest("placeholder-signed-subject"),
+            "signature_base64": BASE64_STANDARD.encode([0_u8; 64]),
+        });
+        let subject_digest = conformance_signed_subject_digest(&value).unwrap();
+        value["signer"]["signed_subject_digest"] = json!(subject_digest);
+        let signature = signing_key.sign(&conformance_signing_bytes(&value).unwrap());
+        value["signer"]["signature_base64"] = json!(BASE64_STANDARD.encode(signature.to_bytes()));
+        let raw_bytes = canonical_json_bytes(&value).unwrap();
+        let raw_digest = digest_bytes(&raw_bytes);
+        SignedFixtureDocument {
+            kind,
+            package_id: package_id.to_owned(),
+            artifact_locator,
+            value,
+            raw_bytes,
+            raw_digest,
+            acceptance_record_id: format!(
+                "conformance-acceptance:closure-fixture-{acceptance_sequence:04}"
+            ),
+            acceptance_sequence,
+        }
+    }
+
+    fn fixture_acceptance_record(
+        document: &SignedFixtureDocument,
+        signing_key_fingerprint: &str,
+        registry_digest: &str,
+    ) -> Value {
+        let (document_id_field, purpose) = match document.kind {
+            ConformanceDocumentKind::ConformanceBundle => ("bundle_id", "conformance_bundle"),
+            ConformanceDocumentKind::PackageExitReceipt => ("receipt_id", "package_exit_receipt"),
+        };
+        let signature = BASE64_STANDARD
+            .decode(
+                document.value["signer"]["signature_base64"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        json!({
+            "acceptance_record_id": document.acceptance_record_id,
+            "document": {
+                "contract_kind": document.kind.as_str(),
+                "document_id": document.value[document_id_field].clone(),
+                "document_version": document.value["document_version"].clone(),
+                "complete_document_digest": document.raw_digest,
+                "signature_digest": digest_bytes(&signature),
+                "signed_subject_digest": document.value["signer"]["signed_subject_digest"].clone(),
+            },
+            "signer": {
+                "key_id": FIXTURE_SIGNING_KEY_ID,
+                "public_key_fingerprint": signing_key_fingerprint,
+            },
+            "registry": {
+                "registry_id": FIXTURE_REGISTRY_ID,
+                "registry_version": 1,
+                "registry_digest": registry_digest,
+                "artifact_locator": FIXTURE_REGISTRY_LOCATOR,
+                "head_sequence": 1,
+                "head_authority_revision": 1,
+            },
+            "deployment_id": DEPLOYMENT_ID,
+            "trust_domain_id": TRUST_DOMAIN_ID,
+            "work_package_id": document.package_id,
+            "purpose": purpose,
+            "evidence_tier": "externally_attested",
+            "authority_sequence": document.acceptance_sequence,
+            "authority_epoch": FIXTURE_AUTHORITY_EPOCH,
+            "accepted_at": {
+                "not_before": "2026-07-15T06:00:00Z",
+                "not_after": "2026-07-15T07:00:00Z",
+            },
+            "lifecycle": "accepted",
+        })
+    }
+
+    fn write_fixture_frame(output: &mut Vec<u8>, bytes: &[u8]) {
+        output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        output.extend_from_slice(bytes);
+    }
+
+    fn signed_fixture_response(
+        request: &crate::conformance_trust::ConformanceCheckpointRequest,
+        acceptance_records: Vec<Value>,
+        root_acceptance_record_id: &str,
+        authority_key: &SigningKey,
+        authority_fingerprint: &str,
+    ) -> Vec<u8> {
+        let request_value: Value = serde_json::from_slice(request.as_bytes()).unwrap();
+        let mut response = json!({
+            "schema_version": TRUST_RECONCILIATION_PROTOCOL_VERSION,
+            "contract_kind": TRUST_RECONCILIATION_RESPONSE_KIND,
+            "canonicalization": CANONICALIZATION_PROFILE,
+            "signature_algorithm": SIGNATURE_ALGORITHM,
+            "authority": {
+                "authority_id": FIXTURE_AUTHORITY_ID,
+                "key_id": FIXTURE_AUTHORITY_KEY_ID,
+                "public_key_fingerprint": authority_fingerprint,
+            },
+            "request_nonce": request_value["request_nonce"].clone(),
+            "request_digest": request.digest(),
+            "namespace": request_value["namespace"].clone(),
+            "candidate_head": request_value["candidate_head"].clone(),
+            "current_head": request_value["candidate_head"].clone(),
+            "candidate_production_root": request_value["candidate_production_root"].clone(),
+            "current_production_root": {
+                "receipt_ref": request_value["candidate_production_root"].clone(),
+                "acceptance_record_id": root_acceptance_record_id,
+            },
+            "validated_lineage_digest": request_value["validated_lineage_digest"].clone(),
+            "state": "external_strongly_consistent",
+            "outcome": "matched",
+            "reconciliation": {
+                "candidate_matches_current": true,
+                "candidate_production_root_matches_current": true,
+                "restored_state_reconciled": true,
+                "no_auto_advance": true,
+            },
+            "checkpoint": {
+                "sequence": FIXTURE_CHECKPOINT_SEQUENCE,
+                "authority_epoch": FIXTURE_AUTHORITY_EPOCH,
+                "authority_revision": FIXTURE_AUTHORITY_REVISION,
+                "observed_at": {
+                    "not_before": "2026-07-16T11:59:58Z",
+                    "not_after": "2026-07-16T11:59:59Z",
+                },
+                "valid_until": "2026-07-16T12:04:00Z",
+            },
+            "acceptance_records": acceptance_records,
+            "signature_base64": BASE64_STANDARD.encode([0_u8; 64]),
+        });
+        let mut subject = response.clone();
+        subject.as_object_mut().unwrap().remove("signature_base64");
+        let canonical = canonical_json_bytes(&subject).unwrap();
+        let mut signing_bytes = Vec::new();
+        write_fixture_frame(
+            &mut signing_bytes,
+            TRUST_RECONCILIATION_RESPONSE_DOMAIN.as_bytes(),
+        );
+        write_fixture_frame(&mut signing_bytes, &canonical);
+        let signature = authority_key.sign(&signing_bytes);
+        response["signature_base64"] = json!(BASE64_STANDARD.encode(signature.to_bytes()));
+        canonical_json_bytes(&response).unwrap()
+    }
+
+    fn fixture_manifest(
+        ledger: &Value,
+        control_trace_ref: &VersionedContentReference,
+    ) -> ProductionBuildManifest {
+        let baseline_digest = test_digest("fixture-adapter-baseline");
+        let mut manifest: ProductionBuildManifest = serde_json::from_value(json!({
+            "$schema": crate::production_build::PRODUCTION_BUILD_MANIFEST_SCHEMA_URI,
+            "schema_version": crate::production_build::PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION,
+            "contract_kind": crate::production_build::PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND,
+            "document_id": "production-build-manifest:closure-fixture",
+            "document_version": 1,
+            "component": {
+                "component_id": "component:ryuki-api",
+                "component_version": "1.0.0",
+                "executable_name": "ryuki-api",
+                "target": {
+                    "architecture": "x86_64",
+                    "operating_system": "linux",
+                    "family": "unix",
+                    "pointer_width_bits": 64,
+                    "endian": "little",
+                },
+            },
+            "source": {
+                "revision_algorithm": "git_sha1",
+                "revision": SOURCE_REVISION,
+            },
+            "runtime_executable": {
+                "content_digest": test_digest("fixture-runtime-executable"),
+                "byte_length": 42,
+            },
+            "oci_subject": {
+                "subject_kind": "oci_image_manifest",
+                "repository": "ghcr.io/ryuki/ryuki-api",
+                "content_digest": ARTIFACT_DIGEST,
+            },
+            "control_trace_ref": control_trace_ref,
+            "shipped_adapters": [{
+                "adapter_kind": "auth.fixture",
+                "adapter_version": "1.0.0",
+                "production_eligible": true,
+                "capability_ids": ["authenticate"],
+                "mandatory_baseline": {
+                    "document_id": "provider-capability-baseline:closure-fixture",
+                    "document_version": 1,
+                    "content_digest": baseline_digest,
+                    "artifact_locator": "fixtures/providers/closure-baseline.json",
+                    "required_trace_ids": ["TRACE-SB-CONF-05-AC-055"],
+                },
+            }],
+            "selector_dispositions": [{
+                "selector_domain": "auth_mode",
+                "selector": "fixture",
+                "disposition": "implemented",
+                "adapter_kind": "auth.fixture",
+            }],
+            "implementation_applicability": {
+                "identity_contract": APPLICABILITY_IDENTITY_CONTRACT,
+                "inventory_contract": APPLICABILITY_INVENTORY_CONTRACT,
+                "instance_count": 1,
+                "content_digest": test_digest("placeholder-implementation-applicability"),
+            },
+            "implementation_applicability_instances": [],
+        }))
+        .unwrap();
+        let implementation = derive_implementation_applicability(ledger, &manifest).unwrap();
+        manifest.implementation_applicability = implementation.binding;
+        manifest.implementation_applicability_instances = implementation.instances;
+        manifest
+    }
+
+    fn fixture_deployment_claims(
+        profile: &DeploymentSecurityProfile,
+        manifest: &ProductionBuildManifest,
+    ) -> ProductionDeploymentApplicabilityClaims {
+        let adapter = &manifest.shipped_adapters[0];
+        ProductionDeploymentApplicabilityClaims {
+            checkpoints: vec![DeploymentCheckpointApplicabilityClaim {
+                trust_domain_id: TRUST_DOMAIN_ID.into(),
+                authority_id: FIXTURE_AUTHORITY_ID.into(),
+                authority_epoch: FIXTURE_AUTHORITY_EPOCH,
+                sequence: FIXTURE_CHECKPOINT_SEQUENCE,
+                trust_registry_digest: profile
+                    .conformance_trust_root_registry_ref
+                    .content_digest
+                    .clone(),
+                trust_registry_locator: profile
+                    .conformance_trust_root_registry_ref
+                    .artifact_locator
+                    .clone(),
+            }],
+            provider_registry: ActiveProviderRegistryApplicabilityClaim {
+                document_id: profile.provider_registry_ref.document_id.clone(),
+                document_version: profile.provider_registry_ref.document_version,
+                content_digest: profile.provider_registry_ref.content_digest.clone(),
+                artifact_locator: profile.provider_registry_ref.artifact_locator.clone(),
+                registry_version: 1,
+                active_providers: vec![ActiveProviderApplicabilityClaim {
+                    provider_id: "provider:closure-fixture".into(),
+                    provider_kind: "oidc".into(),
+                    configuration_version: 1,
+                    configuration_payload_digest: test_digest("fixture-provider-configuration"),
+                    lifecycle_record_version: 1,
+                    lifecycle_state: ProviderLifecycleState::Active,
+                    trust_domain_id: TRUST_DOMAIN_ID.into(),
+                    descriptor_id: "capability-descriptor:closure-fixture".into(),
+                    descriptor_version: 1,
+                    adapter_kind: adapter.adapter_kind.clone(),
+                    adapter_version: adapter.adapter_version.clone(),
+                    advertised_capability_ids: adapter.capability_ids.clone(),
+                    production_eligible: true,
+                    mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                        document_id: adapter.mandatory_baseline.document_id.clone(),
+                        document_version: adapter.mandatory_baseline.document_version,
+                        content_digest: adapter.mandatory_baseline.content_digest.clone(),
+                        artifact_locator: adapter.mandatory_baseline.artifact_locator.clone(),
+                    },
+                }],
+            },
+            security_limit_profile: SecurityLimitApplicabilityClaim {
+                document_id: profile.security_limit_profile_ref.document_id.clone(),
+                document_version: profile.security_limit_profile_ref.document_version,
+                content_digest: profile.security_limit_profile_ref.content_digest.clone(),
+                artifact_locator: profile.security_limit_profile_ref.artifact_locator.clone(),
+                profile_version: 1,
+            },
+            deployed_artifact: DeployedArtifactApplicabilityClaim {
+                subject_kind: manifest.oci_subject.subject_kind,
+                repository: manifest.oci_subject.repository.clone(),
+                subject_digest: manifest.oci_subject.content_digest.clone(),
+            },
+        }
+    }
+
+    fn fixture_version_context(
+        profile: &DeploymentSecurityProfile,
+        manifest: &ProductionBuildManifest,
+        claims: &ProductionDeploymentApplicabilityClaims,
+        profile_document: &Value,
+    ) -> (Value, Value, Value, Value, Value, Value) {
+        let deployment_profile = json!({
+            "id": profile.document_id,
+            "version": profile.document_version.to_string(),
+            "deployment_id": profile.deployment_id,
+            "digest_contract": DEPLOYMENT_PROFILE_CONFORMANCE_BINDING_DIGEST_CONTRACT,
+            "digest": deployment_profile_conformance_binding_digest(profile_document).unwrap(),
+        });
+        let policy_versions = Value::Array(profile_policy_version_bindings(profile));
+        let configuration_versions = Value::Array(profile_configuration_version_bindings(profile));
+        let mut provider_versions = claims
+            .provider_registry
+            .active_providers
+            .iter()
+            .map(|provider| {
+                json!({
+                    "id": provider.provider_id,
+                    "version": provider.configuration_version.to_string(),
+                    "digest": provider.configuration_payload_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        provider_versions.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        let mut adapter_versions = manifest
+            .shipped_adapters
+            .iter()
+            .map(|adapter| {
+                json!({
+                    "id": adapter.adapter_kind,
+                    "version": adapter.adapter_version,
+                    "digest": adapter.mandatory_baseline.content_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        adapter_versions.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        let limit = &claims.security_limit_profile;
+        let security_limit_profile = json!({
+            "id": limit.document_id,
+            "version": limit.profile_version.to_string(),
+            "digest": limit.content_digest,
+        });
+        (
+            deployment_profile,
+            policy_versions,
+            configuration_versions,
+            Value::Array(provider_versions),
+            Value::Array(adapter_versions),
+            security_limit_profile,
+        )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PublicFixtureMutation {
+        None,
+        WrongTypedProfile,
+    }
+
+    fn verify_public_fixture(
+        mutation: PublicFixtureMutation,
+    ) -> Result<VerifiedConformanceClosure, String> {
+        let signing_key = SigningKey::from_bytes(&public_fixture_entropy(b"document signer"));
+        let authority_key = SigningKey::from_bytes(&public_fixture_entropy(b"authority signer"));
+        let (registry_raw, registry_digest, signing_key_fingerprint) =
+            fixture_registry(&signing_key);
+
+        let mut ledger: Value = serde_json::from_str(CONTROL_TRACE_JSON).unwrap();
+        ledger["acceptance_status"] = json!("production_accepted");
+        ledger["production_accepted"] = json!(true);
+        let ledger_raw = canonical_json_bytes(&ledger).unwrap();
+        let ledger_digest = digest_bytes(&ledger_raw);
+        let ledger_locator =
+            "catalog/security-contracts/v1/control-trace.implementation.json".to_owned();
+        let traces = ledger["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|trace| trace["trace_lifecycle"] == "active")
+            .map(|trace| {
+                (
+                    trace["trace_id"].as_str().unwrap().to_owned(),
+                    trace.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut first_control_by_package = BTreeMap::new();
+        for trace in traces.values() {
+            first_control_by_package
+                .entry(trace["owning_work_package"].as_str().unwrap().to_owned())
+                .or_insert_with(|| trace["control_id"].as_str().unwrap().to_owned());
+        }
+
+        let mut profile: Value = serde_json::from_str(PROFILE_JSON).unwrap();
+        profile["security_profile"] = json!("production");
+        profile["deployment_id"] = json!(DEPLOYMENT_ID);
+        profile["tenancy_mode"] = json!("single_tenant");
+        profile["applicability"]["security_profiles"] = json!(["production"]);
+        profile["applicability"]["deployment_ids"] = json!([DEPLOYMENT_ID]);
+        profile["lifecycle"]["state"] = json!("active");
+        profile["lifecycle"]["effective_at"] = json!("2026-07-15T00:00:00Z");
+        profile["trust_topology"]["trust_domain_ids"] = json!([TRUST_DOMAIN_ID]);
+        profile["control_trace_ref"] = json!({
+            "artifact_kind": "control-trace",
+            "document_id": ledger["document_id"].clone(),
+            "document_version": ledger["document_version"].clone(),
+            "content_digest": ledger_digest,
+            "artifact_locator": ledger_locator,
+        });
+        profile["conformance_trust_root_registry_ref"] = json!({
+            "artifact_kind": "conformance-trust-root-registry",
+            "document_id": FIXTURE_REGISTRY_ID,
+            "document_version": 1,
+            "content_digest": registry_digest,
+            "artifact_locator": FIXTURE_REGISTRY_LOCATOR,
+        });
+        let mut root_ref = VersionedContentReference {
+            artifact_kind: ArtifactKind::PackageExitReceipt,
+            document_id: receipt_id("SB-9"),
+            document_version: 1,
+            content_digest: test_digest("placeholder-public-root"),
+            artifact_locator: receipt_locator("SB-9"),
+        };
+        profile["production_acceptance_receipt_ref"] = serde_json::to_value(&root_ref).unwrap();
+        let guard_packages = &PACKAGES[..8];
+        profile["runtime_guard_evidence"] = json!({
+            "mode": "receipt_bound",
+            "runtime_cross_check_required": true,
+            "guards": guard_packages
+                .iter()
+                .enumerate()
+                .map(|(index, package_id)| json!({
+                    "guard_id": guard_id(index),
+                    "control_ids": [first_control_by_package[*package_id].clone()],
+                    "receipt_ref": {
+                        "artifact_kind": "package-exit-receipt",
+                        "document_id": receipt_id(package_id),
+                        "document_version": 1,
+                        "content_digest": test_digest(&format!("placeholder-public-{package_id}")),
+                        "artifact_locator": receipt_locator(package_id),
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        let preliminary_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile.clone()).unwrap();
+        let mut manifest = fixture_manifest(&ledger, &preliminary_profile.control_trace_ref);
+        let claims = fixture_deployment_claims(&preliminary_profile, &manifest);
+        let applicability = derive_complete_production_applicability(
+            &ledger,
+            &manifest,
+            &preliminary_profile,
+            &claims,
+        )
+        .unwrap();
+        assert_eq!(applicability.instances.len(), 139);
+        let implementation_count = applicability
+            .instances
+            .iter()
+            .filter(|instance| instance.scope == ApplicabilityScope::Implementation)
+            .count();
+        assert_eq!(implementation_count, 136);
+        manifest.implementation_applicability = recompute_applicability_inventory_binding(
+            &crate::conformance_applicability::ApplicabilityControlTraceBinding {
+                document_id: preliminary_profile.control_trace_ref.document_id.clone(),
+                document_version: preliminary_profile.control_trace_ref.document_version,
+                content_digest: preliminary_profile.control_trace_ref.content_digest.clone(),
+            },
+            &manifest.implementation_applicability_instances,
+        )
+        .unwrap();
+        let (
+            deployment_profile,
+            policy_versions,
+            configuration_versions,
+            provider_versions,
+            adapter_versions,
+            security_limit_profile,
+        ) = fixture_version_context(&preliminary_profile, &manifest, &claims, &profile);
+
+        let mut bundles = Vec::with_capacity(applicability.instances.len());
+        let mut bundle_index_by_instance = BTreeMap::new();
+        for (index, instance) in applicability.instances.iter().enumerate() {
+            let trace = &traces[&instance.trace_id];
+            let evidence_id = format!("evidence:{index:03}");
+            let bundle_id = format!("conformance-bundle:{index:03}");
+            let dimensions = serde_json::to_value(&instance.dimensions).unwrap();
+            let (implementation_applicable, implementation_dimensions) =
+                if instance.scope == ApplicabilityScope::Implementation {
+                    (true, dimensions.clone())
+                } else {
+                    (false, json!([]))
+                };
+            let (deployment_applicable, deployment_dimensions) =
+                if instance.scope == ApplicabilityScope::Deployment {
+                    (true, dimensions)
+                } else {
+                    (false, json!([]))
+                };
+            let value = json!({
+                "$schema": "https://ryuki.io/schemas/security-contracts/v1/conformance-bundle.schema.json",
+                "contract_kind": "conformance-bundle",
+                "document_version": 1,
+                "bundle_id": bundle_id,
+                "acceptance_status": "production_accepted",
+                "production_accepted": true,
+                "trace_id": instance.trace_id,
+                "evidence_instance_id": evidence_id,
+                "applicability_instance_id": instance.applicability_instance_id,
+                "control_id": trace["control_id"].clone(),
+                "acceptance_case_id": trace["acceptance_case_id"].clone(),
+                "evaluated_applicability": {
+                    "implementation": {
+                        "applicable": implementation_applicable,
+                        "dimensions": implementation_dimensions,
+                    },
+                    "deployment": {
+                        "applicable": deployment_applicable,
+                        "dimensions": deployment_dimensions,
+                    },
+                },
+                "source_revision": SOURCE_REVISION,
+                "artifact": {"digest": ARTIFACT_DIGEST},
+                "bindings": {
+                    "deployment_profile": deployment_profile.clone(),
+                    "policy_versions": policy_versions.clone(),
+                    "configuration_versions": configuration_versions.clone(),
+                    "provider_versions": provider_versions.clone(),
+                    "adapter_versions": adapter_versions.clone(),
+                    "security_limit_profile": security_limit_profile.clone(),
+                },
+                "normalized_result": "pass",
+                "contains_secrets": false,
+                "provenance": {"evidence_tier": tier_value(3)},
+                "production_observation": {
+                    "required": true,
+                    "observation": {
+                        "deployment_id": DEPLOYMENT_ID,
+                        "normalized_result": "pass",
+                        "observed_at": "2026-07-15T01:00:00Z",
+                        "artifact_hashes": [ARTIFACT_DIGEST],
+                    },
+                },
+                "evidence_lifecycle": "accepted",
+                "produced_at": "2026-07-15T00:00:00Z",
+                "verified_at": "2026-07-15T02:00:00Z",
+                "accepted_at": "2026-07-15T03:00:00Z",
+                "expires_at": EXPIRES_AT,
+                "supersedes_evidence_instance_id": null,
+                "supersedes_evidence_ref": null,
+            });
+            let signed = sign_fixture_document(
+                value,
+                ConformanceDocumentKind::ConformanceBundle,
+                &instance.owning_work_package,
+                format!("fixtures/bundles/{index:03}.json"),
+                u64::try_from(index).unwrap() + 1,
+                &signing_key,
+                &registry_digest,
+            );
+            bundle_index_by_instance
+                .insert(instance.applicability_instance_id.clone(), bundles.len());
+            bundles.push(signed);
+        }
+
+        let mut receipts: Vec<SignedFixtureDocument> = Vec::with_capacity(PACKAGES.len());
+        let mut receipt_index_by_package: BTreeMap<String, usize> = BTreeMap::new();
+        for (package_index, package_id) in PACKAGES.iter().enumerate() {
+            let trace_ids = traces
+                .iter()
+                .filter(|(_, trace)| trace["owning_work_package"] == *package_id)
+                .map(|(trace_id, _)| trace_id.clone())
+                .collect::<BTreeSet<_>>();
+            let control_ids = trace_ids
+                .iter()
+                .map(|trace_id| traces[trace_id]["control_id"].as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>();
+            let acceptance_case_ids = trace_ids
+                .iter()
+                .map(|trace_id| {
+                    traces[trace_id]["acceptance_case_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<BTreeSet<_>>();
+            let package_instances = applicability
+                .instances
+                .iter()
+                .filter(|instance| instance.owning_work_package == *package_id)
+                .collect::<Vec<_>>();
+            let applicability_instances = package_instances
+                .iter()
+                .map(|instance| {
+                    let dimensions = serde_json::to_value(&instance.dimensions).unwrap();
+                    let (implementation_dimensions, deployment_dimensions) = match instance.scope {
+                        ApplicabilityScope::Implementation => (dimensions, json!([])),
+                        ApplicabilityScope::Deployment => (json!([]), dimensions),
+                    };
+                    json!({
+                        "instance_id": instance.applicability_instance_id,
+                        "implementation_dimensions": implementation_dimensions,
+                        "deployment_dimensions": deployment_dimensions,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let evidence_bindings = package_instances
+                .iter()
+                .map(|instance| {
+                    let bundle =
+                        &bundles[bundle_index_by_instance[&instance.applicability_instance_id]];
+                    json!({
+                        "artifact_kind": "conformance-bundle",
+                        "artifact_locator": bundle.artifact_locator,
+                        "bundle_id": bundle.value["bundle_id"].clone(),
+                        "document_version": 1,
+                        "evidence_instance_id": bundle.value["evidence_instance_id"].clone(),
+                        "bundle_digest": bundle.raw_digest,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let prerequisite_receipts = required_prerequisite_packages(package_id)
+                .into_iter()
+                .map(|prerequisite_package| {
+                    let prerequisite = &receipts[receipt_index_by_package[&prerequisite_package]];
+                    json!({
+                        "artifact_kind": "package-exit-receipt",
+                        "artifact_locator": prerequisite.artifact_locator,
+                        "receipt_id": prerequisite.value["receipt_id"].clone(),
+                        "document_version": 1,
+                        "receipt_digest": prerequisite.raw_digest,
+                        "package_id": prerequisite.value["package_id"].clone(),
+                        "acceptance_status": prerequisite.value["acceptance_status"].clone(),
+                        "production_accepted": prerequisite.value["production_accepted"].clone(),
+                        "evidence_tier": prerequisite.value["evidence_tier"].clone(),
+                        "result": prerequisite.value["result"].clone(),
+                        "receipt_lifecycle": prerequisite.value["receipt_lifecycle"].clone(),
+                        "expires_at": prerequisite.value["expires_at"].clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut input_digests = BTreeSet::from([
+                ledger_digest.clone(),
+                ARTIFACT_DIGEST.to_owned(),
+                deployment_profile["digest"].as_str().unwrap().to_owned(),
+                security_limit_profile["digest"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ]);
+            for bindings in [
+                &policy_versions,
+                &configuration_versions,
+                &provider_versions,
+                &adapter_versions,
+            ] {
+                for binding in bindings.as_array().unwrap() {
+                    input_digests.insert(binding["digest"].as_str().unwrap().to_owned());
+                }
+            }
+            for prerequisite in &prerequisite_receipts {
+                input_digests.insert(prerequisite["receipt_digest"].as_str().unwrap().to_owned());
+            }
+            let output_digests = evidence_bindings
+                .iter()
+                .map(|binding| binding["bundle_digest"].as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>();
+            let retirement_closure = if *package_id == "SB-9" {
+                let evidence_ids = evidence_bindings
+                    .iter()
+                    .map(|binding| binding["evidence_instance_id"].as_str().unwrap().to_owned())
+                    .collect::<BTreeSet<_>>();
+                json!({
+                    "zero_consumer_evidence_instance_ids": evidence_ids,
+                    "zero_live_authority_evidence_instance_ids": evidence_ids,
+                    "retired_bypass_evidence_instance_ids": evidence_ids,
+                })
+            } else {
+                Value::Null
+            };
+            let value = json!({
+                "$schema": "https://ryuki.io/schemas/security-contracts/v1/package-exit-receipt.schema.json",
+                "contract_kind": "package-exit-receipt",
+                "document_version": 1,
+                "receipt_id": receipt_id(package_id),
+                "package_id": package_id,
+                "acceptance_status": "production_accepted",
+                "production_accepted": true,
+                "ledger_binding": {
+                    "artifact_kind": "control-trace",
+                    "artifact_locator": ledger_locator,
+                    "document_id": ledger["document_id"].clone(),
+                    "document_version": ledger["document_version"].clone(),
+                    "ledger_id": ledger["ledger_id"].clone(),
+                    "ledger_version": ledger["ledger_version"].clone(),
+                    "ledger_digest": ledger_digest,
+                },
+                "evaluated_sets": {
+                    "trace_ids": trace_ids,
+                    "control_ids": control_ids,
+                    "acceptance_case_ids": acceptance_case_ids,
+                    "evidence_bindings": evidence_bindings,
+                },
+                "applicability_instances": applicability_instances,
+                "closure_context": {
+                    "source_revision": SOURCE_REVISION,
+                    "artifact_digest": ARTIFACT_DIGEST,
+                    "deployment_profile": deployment_profile.clone(),
+                    "policy_versions": policy_versions.clone(),
+                    "configuration_versions": configuration_versions.clone(),
+                    "provider_versions": provider_versions.clone(),
+                    "adapter_versions": adapter_versions.clone(),
+                    "security_limit_profile": security_limit_profile.clone(),
+                },
+                "prerequisite_receipts": prerequisite_receipts,
+                "input_digests": input_digests,
+                "output_digests": output_digests,
+                "evidence_tier": tier_value(3),
+                "result": "pass",
+                "receipt_lifecycle": "accepted",
+                "waivers": [],
+                "retirement_closure": retirement_closure,
+                "created_at": "2026-07-15T05:00:00Z",
+                "expires_at": EXPIRES_AT,
+                "supersedes_receipt_id": null,
+                "supersedes_receipt_ref": null,
+            });
+            let signed = sign_fixture_document(
+                value,
+                ConformanceDocumentKind::PackageExitReceipt,
+                package_id,
+                receipt_locator(package_id),
+                200 + u64::try_from(package_index).unwrap(),
+                &signing_key,
+                &registry_digest,
+            );
+            receipt_index_by_package.insert((*package_id).to_owned(), receipts.len());
+            receipts.push(signed);
+        }
+
+        let root_index = receipt_index_by_package["SB-9"];
+        root_ref.content_digest = receipts[root_index].raw_digest.clone();
+        profile["production_acceptance_receipt_ref"] = serde_json::to_value(&root_ref).unwrap();
+        for (guard_index, package_id) in guard_packages.iter().enumerate() {
+            let receipt_index = receipt_index_by_package[*package_id];
+            profile["runtime_guard_evidence"]["guards"][guard_index]["receipt_ref"]["content_digest"] =
+                json!(receipts[receipt_index].raw_digest);
+        }
+        assert_eq!(
+            deployment_profile["digest"].as_str().unwrap(),
+            deployment_profile_conformance_binding_digest(&profile).unwrap()
+        );
+        let exact_profile: DeploymentSecurityProfile =
+            serde_json::from_value(profile.clone()).unwrap();
+        assert!(
+            exact_profile
+                .validate_structure_at(timestamp("2026-07-16T12:00:02Z"))
+                .is_empty()
+        );
+
+        let lineage = ValidatedConformanceRegistryLineage::from_registry_chain(
+            &[ConformanceRegistryArtifact {
+                artifact_locator: FIXTURE_REGISTRY_LOCATOR,
+                raw_bytes: &registry_raw,
+            }],
+            ConformanceTrustAnchor {
+                artifact_locator: FIXTURE_REGISTRY_LOCATOR,
+                document_id: FIXTURE_REGISTRY_ID,
+                document_version: 1,
+                content_digest: &registry_digest,
+            },
+            timestamp("2026-07-16T11:59:56Z"),
+        )
+        .map_err(|error| error.to_string())?;
+        let authority_public_key = authority_key.verifying_key().to_bytes();
+        let authority_fingerprint = digest_bytes(&authority_public_key);
+        let authority_anchor = ConformanceCheckpointAuthorityAnchor {
+            authority_id: FIXTURE_AUTHORITY_ID,
+            key_id: FIXTURE_AUTHORITY_KEY_ID,
+            public_key: &authority_public_key,
+            public_key_fingerprint: &authority_fingerprint,
+            minimum_authority_epoch: FIXTURE_AUTHORITY_EPOCH,
+        };
+        let mut requested_document_digests = bundles
+            .iter()
+            .chain(&receipts)
+            .map(|document| document.raw_digest.clone())
+            .collect::<Vec<_>>();
+        requested_document_digests.sort();
+        assert!(
+            requested_document_digests
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        let request = lineage
+            .reconciliation_request(
+                ConformanceTrustScope {
+                    deployment_id: DEPLOYMENT_ID,
+                    trust_domain_id: TRUST_DOMAIN_ID,
+                },
+                ConformanceProductionRootRef {
+                    document_id: &root_ref.document_id,
+                    document_version: root_ref.document_version,
+                    content_digest: &root_ref.content_digest,
+                    artifact_locator: &root_ref.artifact_locator,
+                },
+                authority_anchor,
+                public_fixture_entropy(b"reconciliation nonce"),
+                timestamp("2026-07-16T11:59:57Z"),
+                &requested_document_digests,
+            )
+            .map_err(|error| error.to_string())?;
+        let acceptance_records = bundles
+            .iter()
+            .chain(&receipts)
+            .map(|document| {
+                fixture_acceptance_record(document, &signing_key_fingerprint, &registry_digest)
+            })
+            .collect::<Vec<_>>();
+        let raw_response = signed_fixture_response(
+            &request,
+            acceptance_records,
+            &receipts[root_index].acceptance_record_id,
+            &authority_key,
+            &authority_fingerprint,
+        );
+        let trusted_now = ConformanceTrustedTimeWindow {
+            not_before: timestamp("2026-07-16T12:00:02Z"),
+            not_after: timestamp("2026-07-16T12:00:03Z"),
+        };
+        let checkpoint = lineage
+            .verify_reconciliation_response(&request, &raw_response, authority_anchor, trusted_now)
+            .map_err(|error| error.to_string())?;
+
+        let mut root_artifact = None;
+        let mut artifacts = Vec::with_capacity(bundles.len() + receipts.len() - 1);
+        for document in bundles.iter().chain(&receipts) {
+            let artifact = checkpoint
+                .verify_artifact(
+                    ConformanceArtifactCandidate::new(
+                        document.artifact_locator.clone(),
+                        document.raw_digest.clone(),
+                        document.raw_bytes.clone(),
+                    ),
+                    ConformanceVerificationContext {
+                        deployment_id: DEPLOYMENT_ID,
+                        trust_domain_id: TRUST_DOMAIN_ID,
+                        package_id: &document.package_id,
+                        evidence_tier: EvidenceTier::ExternallyAttested,
+                    },
+                    trusted_now,
+                )
+                .map_err(|error| error.to_string())?;
+            if document.kind == ConformanceDocumentKind::PackageExitReceipt
+                && document.package_id == "SB-9"
+            {
+                root_artifact = Some(artifact);
+            } else {
+                artifacts.push(artifact);
+            }
+        }
+        let current_root = checkpoint
+            .verify_current_production_root(root_artifact.unwrap())
+            .map_err(|error| error.to_string())?;
+        let control_trace =
+            verify_control_trace_artifact(&exact_profile.control_trace_ref, ledger_raw)
+                .map_err(|error| error.to_string())?;
+        let mut supplied_profile = exact_profile.clone();
+        if matches!(mutation, PublicFixtureMutation::WrongTypedProfile) {
+            supplied_profile.policy_version += 1;
+        }
+        let production_acceptance_receipt_ref = exact_profile
+            .production_acceptance_receipt_ref
+            .as_ref()
+            .unwrap();
+        verify_production_conformance_closure(
+            checkpoint,
+            current_root,
+            artifacts,
+            control_trace,
+            ProductionConformanceClosureInputs {
+                manifest: &manifest,
+                profile: &supplied_profile,
+                deployment_claims: &claims,
+                context: ConformanceClosureContext {
+                    deployment_id: DEPLOYMENT_ID,
+                    trust_domain_id: TRUST_DOMAIN_ID,
+                    source_revision: SOURCE_REVISION,
+                    artifact_digest: ARTIFACT_DIGEST,
+                    deployment_profile: &deployment_profile,
+                    policy_versions: &policy_versions,
+                    configuration_versions: &configuration_versions,
+                    provider_versions: &provider_versions,
+                    adapter_versions: &adapter_versions,
+                    security_limit_profile: &security_limit_profile,
+                    deployment_profile_document: &profile,
+                    production_acceptance_receipt_ref,
+                },
+            },
+            trusted_now,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn public_entrypoint_accepts_one_genuine_opaque_139_instance_closure() {
+        let closure = verify_public_fixture(PublicFixtureMutation::None)
+            .expect("the public closure boundary must accept one exact authenticated fixture");
+        assert_eq!(closure.package_count(), 10);
+        assert_eq!(closure.evidence_count(), 139);
+        assert_eq!(closure.applicability_instances().len(), 139);
+        assert_eq!(closure.runtime_guard_requirements().len(), 8);
+        closure
+            .ensure_fresh(ConformanceTrustedTimeWindow {
+                not_before: timestamp("2026-07-16T12:00:04Z"),
+                not_after: timestamp("2026-07-16T12:00:05Z"),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_typed_profile_different_from_exact_document() {
+        let error = verify_public_fixture(PublicFixtureMutation::WrongTypedProfile).unwrap_err();
+        assert!(
+            error
+                .contains("typed deployment profile differs from the exact bound profile document")
+        );
     }
 
     fn assert_rejected(fixture: &SyntheticClosure) {

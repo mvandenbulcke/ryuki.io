@@ -1113,11 +1113,18 @@ and verifies their exact measured-build binding for later closure.
 This derivation deliberately requires `deployment.artifact_digest` from a
 separately verified deployed-OCI/workload claim and merely checks that claim
 against the manifest's OCI subject; the manifest declaration cannot prove its
-own deployment. No such opaque workload proof exists yet. The checked-in
-provider is development-only, every compiled adapter remains production-
-ineligible, and its build-owned baseline traces currently have null deployment
-tiers, so present artifacts still fail closed before a deployment inventory can
-be sealed. Package receipts and bundles also retain their legacy applicability
+own deployment. The core verifier now defines a non-cloneable, nonce-bound,
+short-lived deployed-workload capability. It accepts only an exact peer
+measurement signed by an independently pinned Ed25519 authority, binds the
+deployment/trust-domain/workload namespace and measurement profile, and matches
+the OCI subject, resolved image manifest, and executable digest/length exactly.
+The semantic-neutral one-shot Unix transport prerequisite is also available,
+but the API has not yet pinned a live workload authority, invoked the protocol,
+or consumed the capability during startup. The checked-in provider is
+development-only, every compiled adapter remains production-ineligible, and
+its build-owned baseline traces currently have null deployment tiers, so
+present artifacts still fail closed before a deployment inventory can be
+sealed. Package receipts and bundles also retain their legacy applicability
 shape. Consequently semantic receipt closure must still consume the opaque
 current-root proof against the complete independently derived universe, and the
 runtime admission boundary must still verify every live guard fact. Production

@@ -48,7 +48,7 @@ const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
 const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 const MAX_RECEIPT_DIGESTS: usize = 4096;
 
-const SCHEMAS: [(&str, &str); 10] = [
+const SCHEMAS: [(&str, &str); 11] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -60,6 +60,10 @@ const SCHEMAS: [(&str, &str); 10] = [
     (
         "conformance-trust-checkpoint-envelope.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/conformance-trust-checkpoint-envelope.schema.json",
+    ),
+    (
+        "deployed-workload-attestation-envelope.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/deployed-workload-attestation-envelope.schema.json",
     ),
     (
         "conformance-trust-root-registry.schema.json",

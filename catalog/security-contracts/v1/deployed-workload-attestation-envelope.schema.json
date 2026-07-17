@@ -1,0 +1,349 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/deployed-workload-attestation-envelope.schema.json",
+  "title": "Ryuki deployed-workload attestation response",
+  "description": "Closed response envelope returned by an independently pinned deployed-workload measurement authority. Schema validity never grants trust: the verifier must use separately provisioned authority, key, fingerprint, minimum-epoch, measurement-profile, namespace, OCI-subject, runtime-executable, and transport bindings; verify the domain-separated Ed25519 signature and exact request nonce and digest echoes; require a running, reconciled peer measurement; enforce trusted-time freshness; and validate OCI index-or-manifest resolution semantics. The response is bounded to 64 KiB by the protocol verifier.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_kind",
+    "canonicalization",
+    "signature_algorithm",
+    "authority",
+    "request_nonce",
+    "request_digest",
+    "namespace",
+    "measurement_profile",
+    "outcome",
+    "measurement",
+    "signature_base64"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "contract_kind": {
+      "const": "deployed-workload-attestation-response"
+    },
+    "canonicalization": {
+      "const": "ryuki-canonical-json-v1"
+    },
+    "signature_algorithm": {
+      "const": "ed25519"
+    },
+    "authority": {
+      "$ref": "#/$defs/authority"
+    },
+    "request_nonce": {
+      "$ref": "#/$defs/nonce"
+    },
+    "request_digest": {
+      "description": "SHA-256 of the exact unframed ryuki-canonical-json-v1 request bytes. The semantic verifier requires an exact echo of its consumed one-shot request.",
+      "$ref": "#/$defs/digest"
+    },
+    "namespace": {
+      "$ref": "#/$defs/namespace"
+    },
+    "measurement_profile": {
+      "$ref": "#/$defs/measurementProfile"
+    },
+    "outcome": {
+      "const": "matched"
+    },
+    "measurement": {
+      "$ref": "#/$defs/measurement"
+    },
+    "signature_base64": {
+      "description": "Canonical Base64 encoding of the 64-byte Ed25519 signature. Signing bytes are two consecutive frames: each frame is an unsigned u64 little-endian byte length followed by those bytes; the first frame contains the fixed UTF-8 domain ryuki-v1/deployed-workload-attestation-response and the second contains ryuki-canonical-json-v1 bytes of the response object with signature_base64 removed.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
+    }
+  },
+  "$defs": {
+    "positiveCounter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "nonce": {
+      "description": "Canonical Base64 encoding of exactly 32 unpredictable request bytes.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "not": {
+        "const": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "maxLength": 35,
+      "format": "date-time"
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "workloadId": {
+      "type": "string",
+      "pattern": "^workload:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_id",
+        "key_id",
+        "public_key_fingerprint",
+        "authority_epoch",
+        "authority_revision"
+      ],
+      "properties": {
+        "authority_id": {
+          "type": "string",
+          "pattern": "^deployed-workload-attestation-authority:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^deployed-workload-attestation-key:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "public_key_fingerprint": {
+          "description": "SHA-256 of the decoded raw 32-byte Ed25519 public key. The value must equal the independently configured fingerprint; it is never a self-authenticating key declaration.",
+          "$ref": "#/$defs/digest"
+        },
+        "authority_epoch": {
+          "description": "Fencing epoch that must meet the independently configured minimum authority epoch.",
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "authority_revision": {
+          "$ref": "#/$defs/positiveCounter"
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_id",
+        "trust_domain_id",
+        "workload_id"
+      ],
+      "properties": {
+        "deployment_id": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "trust_domain_id": {
+          "$ref": "#/$defs/trustDomainId"
+        },
+        "workload_id": {
+          "$ref": "#/$defs/workloadId"
+        }
+      }
+    },
+    "measurementProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "profile_version",
+        "content_digest"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^deployed-workload-measurement-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "profile_version": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "measurement": {
+      "description": "One short-lived measurement of the exact authenticated peer. Cross-field semantics are enforced by the protocol verifier: the observation interval must be ordered and no later than trusted now; valid_until is exclusive, strictly later than observed_at.not_after, strictly later than trusted now, and at most 300 seconds after observed_at.not_before; the request time must be no later than observed_at.not_before; the measured OCI subject and executable must exactly equal the request; and OCI manifest subjects resolve directly to the same digest while OCI indexes resolve through index_member to a distinct manifest digest.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "method",
+        "observed_at",
+        "valid_until",
+        "workload_instance_binding_digest",
+        "runtime_state",
+        "restored_state_reconciled",
+        "deployed_oci_subject",
+        "subject_resolution",
+        "resolved_image_manifest_digest",
+        "peer_executable"
+      ],
+      "properties": {
+        "sequence": {
+          "$ref": "#/$defs/positiveCounter"
+        },
+        "method": {
+          "const": "authenticated-peer-runtime-v1"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/trustedTimeInterval"
+        },
+        "valid_until": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "workload_instance_binding_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "runtime_state": {
+          "const": "running"
+        },
+        "restored_state_reconciled": {
+          "const": true
+        },
+        "deployed_oci_subject": {
+          "$ref": "#/$defs/ociSubject"
+        },
+        "subject_resolution": {
+          "enum": [
+            "direct_manifest",
+            "index_member"
+          ]
+        },
+        "resolved_image_manifest_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "peer_executable": {
+          "$ref": "#/$defs/runtimeExecutable"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "deployed_oci_subject": {
+                "properties": {
+                  "subject_kind": {
+                    "const": "oci_image_manifest"
+                  }
+                },
+                "required": [
+                  "subject_kind"
+                ]
+              }
+            },
+            "required": [
+              "deployed_oci_subject"
+            ]
+          },
+          "then": {
+            "properties": {
+              "subject_resolution": {
+                "const": "direct_manifest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deployed_oci_subject": {
+                "properties": {
+                  "subject_kind": {
+                    "const": "oci_image_index"
+                  }
+                },
+                "required": [
+                  "subject_kind"
+                ]
+              }
+            },
+            "required": [
+              "deployed_oci_subject"
+            ]
+          },
+          "then": {
+            "properties": {
+              "subject_resolution": {
+                "const": "index_member"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "trustedTimeInterval": {
+      "description": "Inclusive trusted-time uncertainty interval. The semantic verifier rejects inverted, future, or stale intervals.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "not_before",
+        "not_after"
+      ],
+      "properties": {
+        "not_before": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "not_after": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "ociSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject_kind",
+        "repository",
+        "content_digest"
+      ],
+      "properties": {
+        "subject_kind": {
+          "enum": [
+            "oci_image_index",
+            "oci_image_manifest"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 256,
+          "pattern": "^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*$",
+          "not": {
+            "pattern": "(?:@|:|//|(?:^|/)\\.\\.?(?:/|$))"
+          }
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "runtimeExecutable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_digest",
+        "byte_length"
+      ],
+      "properties": {
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648
+        }
+      }
+    }
+  }
+}
