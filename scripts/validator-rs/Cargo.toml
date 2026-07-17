@@ -11,7 +11,7 @@ ryuki-core = { workspace = true }
 serde_yaml = { workspace = true }
 figment = { workspace = true }
 rayon = "1"
-toml = "0.8"
+toml = "1.1"
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 jsonschema = { workspace = true }
