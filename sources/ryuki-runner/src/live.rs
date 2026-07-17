@@ -626,12 +626,14 @@ fn backend_redaction_values(
     let username = direct_attribute_value(&tokens, open, close, "username");
     let password = direct_attribute_value(&tokens, open, close, "password"); // secret-scan-allow: parsed credential reference, not a literal
     if username.is_some() || password.is_some() {
-        let username = username.unwrap_or("");
-        let password = password.unwrap_or(""); // secret-scan-allow: parsed credential reference, not a literal
         append_basic_auth_variants(&mut values, username, password);
-        let decoded_username = decode_backend_quoted_value(username);
-        let decoded_password = decode_backend_quoted_value(password); // secret-scan-allow: decoded credential reference, not a literal
-        append_basic_auth_variants(&mut values, &decoded_username, &decoded_password);
+        let decoded_username = username.map(decode_backend_quoted_value);
+        let decoded_password = password.map(decode_backend_quoted_value); // secret-scan-allow: parsed credential reference, not a literal
+        append_basic_auth_variants(
+            &mut values,
+            decoded_username.as_deref(),
+            decoded_password.as_deref(),
+        );
     }
     validate_backend_credential_authority(backend_type, &tokens, open, close)?;
     values.sort_unstable();
@@ -919,7 +921,7 @@ fn append_backend_secret_components(
     }
     if secret_kind == BackendSecretKind::BasicAuth {
         if let Some((username, password)) = value.split_once(':') {
-            append_basic_auth_variants(values, username, password);
+            append_basic_auth_variants(values, Some(username), Some(password));
         }
     }
 }
@@ -944,15 +946,18 @@ fn append_connection_string_components(values: &mut Vec<Vec<u8>>, connection_str
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         let raw_username = parsed.username();
-        let password = parsed.password().unwrap_or(""); // secret-scan-allow: parsed credential reference, not a literal
-        append_basic_auth_variants(values, raw_username, password);
+        let raw_password = parsed.password(); // secret-scan-allow: parsed credential reference, not a literal
+        append_basic_auth_variants(values, Some(raw_username), raw_password);
         let decoded_username = percent_decode_url_component(raw_username);
-        let decoded_password = percent_decode_url_component(password); // secret-scan-allow: decoded credential reference, not a literal
+        let decoded_password = raw_password.map(percent_decode_url_component); // secret-scan-allow: parsed credential reference, not a literal
         if let (Ok(decoded_username), Ok(decoded_password)) = (
             std::str::from_utf8(&decoded_username),
-            std::str::from_utf8(&decoded_password),
+            decoded_password
+                .as_deref()
+                .map(std::str::from_utf8)
+                .transpose(),
         ) {
-            append_basic_auth_variants(values, decoded_username, decoded_password);
+            append_basic_auth_variants(values, Some(decoded_username), decoded_password);
         }
     }
     if let Some(query) = parsed.query() {
@@ -987,7 +992,13 @@ fn append_query_string_components(values: &mut Vec<Vec<u8>>, query: &str) {
     }
 }
 
-fn append_basic_auth_variants(values: &mut Vec<Vec<u8>>, username: &str, password: &str) {
+fn append_basic_auth_variants(
+    values: &mut Vec<Vec<u8>>,
+    username: Option<&str>,
+    password_value: Option<&str>,
+) {
+    let username = username.unwrap_or_default();
+    let password = password_value.unwrap_or_default(); // secret-scan-allow: parsed credential reference, not a literal
     if username.is_empty() && password.is_empty() {
         return;
     }

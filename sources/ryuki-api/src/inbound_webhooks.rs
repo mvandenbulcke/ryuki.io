@@ -1050,7 +1050,7 @@ mod inbound_webhook_db_tests {
     #[test]
     fn admission_client_store_cardinality_is_bounded() {
         let mut admission = WebhookAdmission::new(1, 1, 100, 100, 10, Vec::new());
-        admission.bucket_salt = [0x5a; 32];
+        admission.bucket_salt = rand::random();
 
         for index in 0..(u32::from(crate::RATE_LIMIT_CLIENT_BUCKETS) * 2) {
             let client_key = format!("rotating-source-{index}");
@@ -1089,7 +1089,7 @@ mod inbound_webhook_db_tests {
     #[test]
     fn client_rejection_does_not_spend_the_shared_budget() {
         let mut admission = WebhookAdmission::new(1, 1, 1, 1, 10, Vec::new());
-        admission.bucket_salt = [0x3c; 32];
+        admission.bucket_salt = rand::random();
         admission.per_client = Arc::new(RateLimiter::keyed(
             Quota::per_hour(NonZeroU32::MIN).allow_burst(NonZeroU32::MIN),
         ));

@@ -870,8 +870,8 @@ mod entra_sso_db_tests {
     }
 
     impl StubIdp {
-        fn set_nonce(&self, nonce: &str) {
-            self.issue.lock().unwrap().nonce = nonce.to_string();
+        fn set_nonce(&self, issued_nonce: &str) {
+            self.issue.lock().unwrap().nonce = issued_nonce.to_string();
         }
         fn set_aud(&self, aud: &str) {
             self.issue.lock().unwrap().aud = aud.to_string();

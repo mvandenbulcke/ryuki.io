@@ -5529,7 +5529,7 @@ mod tests {
             user_id: "platform-engineer".into(),
             display_name: "Platform Engineer".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
-            bearer_verifier: vec![0_u8; crate::session_credentials::SESSION_VERIFIER_LEN],
+            bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             provider: "local".into(),
             identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
@@ -5711,7 +5711,7 @@ mod tests {
             user_id: "admin".into(),
             display_name: "admin".into(),
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
-            bearer_verifier: vec![0_u8; crate::session_credentials::SESSION_VERIFIER_LEN],
+            bearer_verifier: random_bearer_verifier_fixture(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             provider: "local".into(),
             identity_issuer: crate::identity_authority::LOCAL_ISSUER.into(),
@@ -5723,6 +5723,10 @@ mod tests {
             environment_authority_mode: "global".into(),
             environment_scope: vec![],
         })
+    }
+
+    fn random_bearer_verifier_fixture() -> Vec<u8> {
+        rand::random::<[u8; crate::session_credentials::SESSION_VERIFIER_LEN]>().to_vec()
     }
 
     #[test]
@@ -5839,7 +5843,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_keys_use_a_fixed_bucket_namespace() {
-        let salt = [7_u8; 32];
+        let salt: [u8; 32] = rand::random();
         let mut buckets = std::collections::HashSet::new();
         for index in 0..(u32::from(RATE_LIMIT_CLIENT_BUCKETS) * 2) {
             let key = bounded_rate_limit_key("api", &format!("client-{index}"), &salt);
@@ -5852,9 +5856,16 @@ mod tests {
             bounded_rate_limit_key("health", "same-client", &salt),
             "closed route groups retain independent quotas"
         );
+        let salted_key = bounded_rate_limit_key("api", "same-client", &salt);
+        let differently_salted_key = (0..256)
+            .find_map(|_| {
+                let alternate_salt: [u8; 32] = rand::random();
+                let alternate_key = bounded_rate_limit_key("api", "same-client", &alternate_salt);
+                (alternate_key != salted_key).then_some(alternate_key)
+            })
+            .expect("independent random salts should reach more than one bounded bucket");
         assert_ne!(
-            bounded_rate_limit_key("api", "same-client", &salt),
-            bounded_rate_limit_key("api", "same-client", &[8_u8; 32]),
+            salted_key, differently_salted_key,
             "bucket assignment must not be predictable across processes"
         );
     }

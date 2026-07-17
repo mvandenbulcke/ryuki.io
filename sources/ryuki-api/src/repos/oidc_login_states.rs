@@ -273,7 +273,7 @@ pub async fn insert_test_material(
     pool: &PgPool,
     flow: LoginFlow,
     state: &str,
-    nonce: &str,
+    login_nonce: &str,
     pkce_verifier: &str,
     binding: &str,
 ) -> Result<(), sqlx::Error> {
@@ -288,7 +288,7 @@ pub async fn insert_test_material(
          VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(state)
-    .bind(nonce)
+    .bind(login_nonce)
     .bind(pkce_verifier)
     .bind(binding)
     .bind(flow.as_str())

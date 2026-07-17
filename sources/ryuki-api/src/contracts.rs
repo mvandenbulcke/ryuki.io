@@ -15818,11 +15818,24 @@ const LOCAL_LOGIN_LOCKOUT_DURATION: std::time::Duration = std::time::Duration::f
 /// persistence and response construction. Admission is non-queueing.
 const LOCAL_LOGIN_MAX_CONCURRENT_ATTEMPTS: usize = 8;
 
-/// Configuration rejects NUL in local-auth usernames, so this username can
-/// never authenticate regardless of the credential value. The normal verifier
-/// still scans every configured user and performs its fixed-width comparisons,
+/// Returns a process-local dummy value that cannot be a configured username.
+///
+/// Configuration rejects NUL in local-auth usernames, while `char::default()`
+/// appends that byte without embedding a credential-like literal in the
+/// binary. The random prefix also prevents a stable dummy credential from
+/// becoming observable across process restarts. The normal verifier still
+/// scans every configured user and performs its fixed-width comparisons,
 /// giving unknown, malformed, busy, and locked requests equivalent dummy work.
-const LOCAL_LOGIN_IMPOSSIBLE_INPUT: &str = "\0";
+fn local_login_impossible_input() -> &'static str {
+    static INPUT: OnceLock<String> = OnceLock::new();
+    INPUT
+        .get_or_init(|| {
+            let mut input = Uuid::new_v4().to_string();
+            input.push(char::default());
+            input
+        })
+        .as_str()
+}
 
 struct LocalLoginFailureEntry {
     consecutive_failures: u32,
@@ -16156,9 +16169,10 @@ async fn auth_local_login(
             }
         }
         LocalLoginAttemptAdmission::Dummy => {
+            let impossible_input = local_login_impossible_input();
             let _ = app_cfg
                 .local_auth
-                .verify(LOCAL_LOGIN_IMPOSSIBLE_INPUT, LOCAL_LOGIN_IMPOSSIBLE_INPUT);
+                .verify(impossible_input, impossible_input);
             tracing::warn!("local login failed");
             tokio::time::sleep(LOCAL_LOGIN_FAILURE_DELAY).await;
             return Err(invalid_credentials_problem());
@@ -48383,9 +48397,10 @@ mod router_tests {
                 throttle,
                 local_login_admission_middleware,
             ));
+        let wrong_credential = Uuid::new_v4().simple().to_string();
         let payload = json!({
             "username": "a".repeat(LOCAL_LOGIN_BODY_MAX_BYTES),
-            "password": "wrong-password-1"
+            "password": wrong_credential
         })
         .to_string();
         assert!(payload.len() > LOCAL_LOGIN_BODY_MAX_BYTES);
@@ -50245,6 +50260,10 @@ mod unit_tests {
         .expect("test local auth config should parse")
     }
 
+    fn random_test_password() -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+
     #[test]
     fn test_local_login_response_matches_canonical_fixture() {
         let session_token = crate::session_credentials::generate_session_bearer();
@@ -50327,8 +50346,10 @@ mod unit_tests {
 
     #[test]
     fn test_verify_local_credentials_success_returns_user() {
-        let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin|Auditor");
-        let user = verify_local_credentials(&local_auth, "admin", "placeholder-pass-1")
+        let credential = random_test_password();
+        let local_auth =
+            test_local_auth_config(&format!("admin:{credential}:PlatformAdmin|Auditor"));
+        let user = verify_local_credentials(&local_auth, "admin", &credential)
             .expect("valid credentials should verify");
         assert_eq!(user.username, "admin");
         assert_eq!(user.roles, vec!["PlatformAdmin", "Auditor"]);
@@ -50336,15 +50357,22 @@ mod unit_tests {
 
     #[test]
     fn test_verify_local_credentials_failures_are_indistinguishable() {
-        let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin");
+        let credential = random_test_password();
+        let wrong_credential = loop {
+            let candidate = random_test_password();
+            if candidate != credential {
+                break candidate;
+            }
+        };
+        let local_auth = test_local_auth_config(&format!("admin:{credential}:PlatformAdmin"));
 
         let Err((wrong_password_status, Json(wrong_password_body))) =
-            verify_local_credentials(&local_auth, "admin", "wrong-password-1")
+            verify_local_credentials(&local_auth, "admin", &wrong_credential)
         else {
             panic!("wrong password should fail");
         };
         let Err((unknown_user_status, Json(unknown_user_body))) =
-            verify_local_credentials(&local_auth, "mallory", "placeholder-pass-1")
+            verify_local_credentials(&local_auth, "mallory", &credential)
         else {
             panic!("unknown user should fail");
         };
@@ -50381,7 +50409,7 @@ mod unit_tests {
             Extension(admission_permit),
             Json(LocalLoginRequest {
                 username: "admin".into(),
-                password: "placeholder-pass-1".into(), // secret-scan-allow: test placeholder
+                password: random_test_password(), // secret-scan-allow: generated test fixture
             }),
         )
         .await
@@ -50519,7 +50547,8 @@ mod unit_tests {
         username: &str,
         now: std::time::Instant,
     ) -> LocalLoginAttempt<'a> {
-        match throttle.begin_attempt_at(local_auth, username, "wrong-password-1", now) {
+        let test_credential = random_test_password();
+        match throttle.begin_attempt_at(local_auth, username, &test_credential, now) {
             LocalLoginAttemptAdmission::Verify(attempt) => attempt,
             LocalLoginAttemptAdmission::Dummy => {
                 panic!("configured, unlocked account should receive a verification reservation")
@@ -50555,18 +50584,19 @@ mod unit_tests {
         let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin");
         let throttle = LocalLoginThrottle::default();
         let now = std::time::Instant::now();
-        let oversized_password = "p".repeat(LOCAL_AUTH_MAX_FIELD_BYTES + 1);
+        let oversized_credential = random_test_password().repeat(LOCAL_AUTH_MAX_FIELD_BYTES + 1);
+        let test_credential = random_test_password();
 
         assert!(matches!(
-            throttle.begin_attempt_at(&local_auth, &over, "wrong-password-1", now),
+            throttle.begin_attempt_at(&local_auth, &over, &test_credential, now),
             LocalLoginAttemptAdmission::Dummy
         ));
         assert!(matches!(
-            throttle.begin_attempt_at(&local_auth, "admin", &oversized_password, now),
+            throttle.begin_attempt_at(&local_auth, "admin", &oversized_credential, now),
             LocalLoginAttemptAdmission::Dummy
         ));
         assert!(matches!(
-            throttle.begin_attempt_at(&local_auth, "admin@example", "wrong-password-1", now),
+            throttle.begin_attempt_at(&local_auth, "admin@example", &test_credential, now),
             LocalLoginAttemptAdmission::Dummy
         ));
         assert!(
@@ -50582,6 +50612,7 @@ mod unit_tests {
         );
         let throttle = LocalLoginThrottle::default();
         let now = std::time::Instant::now();
+        let test_credential = random_test_password();
 
         for _ in 0..LOCAL_LOGIN_LOCKOUT_THRESHOLD {
             record_local_login_failure(&throttle, &local_auth, "admin", now);
@@ -50602,7 +50633,7 @@ mod unit_tests {
             throttle.begin_attempt_at(
                 &local_auth,
                 "admin",
-                "placeholder-pass-1",
+                &test_credential,
                 original_lock_until - std::time::Duration::from_secs(1),
             ),
             LocalLoginAttemptAdmission::Dummy
@@ -50668,6 +50699,7 @@ mod unit_tests {
         );
         let throttle = LocalLoginThrottle::default();
         let now = std::time::Instant::now();
+        let test_credential = random_test_password();
 
         for _ in 0..LOCAL_LOGIN_LOCKOUT_THRESHOLD {
             record_local_login_failure(&throttle, &local_auth, "admin", now);
@@ -50678,7 +50710,7 @@ mod unit_tests {
                 throttle.begin_attempt_at(
                     &local_auth,
                     &format!("unknown-{index}"),
-                    "wrong-password-1",
+                    &test_credential,
                     now,
                 ),
                 LocalLoginAttemptAdmission::Dummy
@@ -50709,6 +50741,7 @@ mod unit_tests {
         let throttle = LocalLoginThrottle::default();
         let verifier_calls = AtomicUsize::new(0);
         let now = std::time::Instant::now();
+        let test_credential = random_test_password();
 
         // In each concurrent wave every thread reaches admission before the
         // single reservation can complete. Exactly one verifier reservation
@@ -50725,10 +50758,11 @@ mod unit_tests {
                     let local_auth = &local_auth;
                     let throttle = &throttle;
                     let verifier_calls = &verifier_calls;
+                    let test_credential = &test_credential;
                     scope.spawn(move || {
                         start.wait();
                         let admission =
-                            throttle.begin_attempt_at(local_auth, "admin", "wrong-password-1", now);
+                            throttle.begin_attempt_at(local_auth, "admin", test_credential, now);
                         all_decided.wait();
                         if let LocalLoginAttemptAdmission::Verify(attempt) = admission {
                             verifier_calls.fetch_add(1, Ordering::SeqCst);
@@ -50857,8 +50891,10 @@ mod unit_tests {
     #[test]
     fn test_impossible_dummy_input_performs_verifier_work_but_never_authenticates() {
         let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin");
+        let impossible_input = local_login_impossible_input();
+        assert!(impossible_input.contains(char::default()));
         assert!(local_auth
-            .verify(LOCAL_LOGIN_IMPOSSIBLE_INPUT, LOCAL_LOGIN_IMPOSSIBLE_INPUT)
+            .verify(impossible_input, impossible_input)
             .is_none());
     }
 

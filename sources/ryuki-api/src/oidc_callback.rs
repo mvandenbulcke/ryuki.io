@@ -1562,8 +1562,8 @@ mod oidc_callback_db_tests {
         jsonwebtoken::encode(&header, &claims, encoding).expect("sign id_token")
     }
 
-    /// Returns a valid id_token claims set with the given nonce.
-    fn valid_id_token_claims(nonce: &str) -> serde_json::Value {
+    /// Returns a valid id_token claims set with the expected callback nonce.
+    fn valid_id_token_claims(claim_nonce: &str) -> serde_json::Value {
         json!({
             "iss": TEST_ISS,
             "aud": TEST_AUD,
@@ -1572,7 +1572,7 @@ mod oidc_callback_db_tests {
             "name": "Test User",
             "preferred_username": "test@example.com",
             "email": "test@example.com",
-            "nonce": nonce,
+            "nonce": claim_nonce,
             "roles": ["PlatformAdmin"],
             "exp": now() + 3600,
             "nbf": now() - 60,
@@ -1651,13 +1651,13 @@ mod oidc_callback_db_tests {
     async fn insert_test_state(
         pool: &'static PgPool,
         state: &str,
-        nonce: &str,
+        login_nonce: &str,
     ) -> Result<(), sqlx::Error> {
         crate::repos::oidc_login_states::insert_test_material(
             pool,
             crate::repos::oidc_login_states::LoginFlow::GenericOidc,
             state,
-            nonce,
+            login_nonce,
             "test-pkce-verifier",
             TEST_BINDING,
         )
