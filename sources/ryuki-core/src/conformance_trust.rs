@@ -606,41 +606,45 @@ pub struct VerifiedConformanceTrustCheckpoint {
 
 /// Opaque proof that an authenticated SB-9 receipt is the exact current root
 /// named by the external checkpoint snapshot.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<ryuki_core::conformance_trust::VerifiedConformanceProductionRoot>();
+/// ```
 #[derive(Debug)]
 pub struct VerifiedConformanceProductionRoot {
-    document_id: String,
-    document_version: u64,
-    content_digest: String,
-    artifact_locator: String,
-    acceptance_record_id: String,
-    acceptance_sequence: u64,
+    artifact: VerifiedConformanceArtifact,
     checkpoint_sequence: u64,
     authority_revision: u64,
 }
 
 impl VerifiedConformanceProductionRoot {
+    pub fn artifact(&self) -> &VerifiedConformanceArtifact {
+        &self.artifact
+    }
+
     pub fn document_id(&self) -> &str {
-        &self.document_id
+        self.artifact.document_id()
     }
 
     pub fn document_version(&self) -> u64 {
-        self.document_version
+        self.artifact.document_version()
     }
 
     pub fn content_digest(&self) -> &str {
-        &self.content_digest
+        self.artifact.complete_document_digest()
     }
 
     pub fn artifact_locator(&self) -> &str {
-        &self.artifact_locator
+        self.artifact.source_locator()
     }
 
     pub fn acceptance_record_id(&self) -> &str {
-        &self.acceptance_record_id
+        self.artifact.acceptance_record_id()
     }
 
     pub fn acceptance_sequence(&self) -> u64 {
-        self.acceptance_sequence
+        self.artifact.acceptance_sequence()
     }
 
     pub fn checkpoint_sequence(&self) -> u64 {
@@ -652,11 +656,49 @@ impl VerifiedConformanceProductionRoot {
     }
 }
 
-/// Proof that one exact conformance document passed registry, scope, lifetime,
-/// subject-digest, and strict Ed25519 verification. Its fields are private so
-/// callers cannot manufacture trusted closure authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedConformanceDocument {
+/// Owned, untrusted candidate presented to the checkpoint verifier.
+///
+/// The verifier recomputes the digest from `raw_bytes`, strict-parses those
+/// exact bytes, and retains them in the resulting opaque artifact. Private
+/// fields prevent callers from changing one component after construction.
+pub struct ConformanceArtifactCandidate {
+    source_locator: String,
+    expected_content_digest: String,
+    raw_bytes: Vec<u8>,
+}
+
+impl ConformanceArtifactCandidate {
+    pub fn new(
+        source_locator: String,
+        expected_content_digest: String,
+        raw_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            source_locator,
+            expected_content_digest,
+            raw_bytes,
+        }
+    }
+}
+
+impl fmt::Debug for ConformanceArtifactCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConformanceArtifactCandidate")
+            .field("source_locator", &self.source_locator)
+            .field("expected_content_digest", &self.expected_content_digest)
+            .field("byte_len", &self.raw_bytes.len())
+            .finish()
+    }
+}
+
+/// Cryptographic and externally accepted facts for one exact document.
+///
+/// This proof is deliberately private and non-cloneable. It never exists
+/// outside the artifact that owns the raw bytes and parsed JSON from which the
+/// proof was derived.
+#[derive(Debug, PartialEq, Eq)]
+struct ConformanceDocumentProof {
     kind: ConformanceDocumentKind,
     document_id: String,
     document_version: u64,
@@ -682,75 +724,117 @@ pub struct VerifiedConformanceDocument {
     evidence_tier: EvidenceTier,
 }
 
-impl VerifiedConformanceDocument {
+/// Opaque, non-cloneable aggregate binding exact raw bytes, their strict JSON
+/// parse, source locator, traversal digest, and authenticated acceptance proof.
+/// Future semantic closure must consume this aggregate instead of parallel
+/// `(Value, digest, proof)` inputs.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<ryuki_core::conformance_trust::VerifiedConformanceArtifact>();
+/// ```
+pub struct VerifiedConformanceArtifact {
+    source_locator: String,
+    raw_bytes: Box<[u8]>,
+    document: Value,
+    proof: ConformanceDocumentProof,
+}
+
+impl fmt::Debug for VerifiedConformanceArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedConformanceArtifact")
+            .field("source_locator", &self.source_locator)
+            .field(
+                "complete_document_digest",
+                &self.proof.complete_document_digest,
+            )
+            .field("document_id", &self.proof.document_id)
+            .field("document_version", &self.proof.document_version)
+            .field("kind", &self.proof.kind)
+            .field("byte_len", &self.raw_bytes.len())
+            .finish()
+    }
+}
+
+impl VerifiedConformanceArtifact {
+    pub fn source_locator(&self) -> &str {
+        &self.source_locator
+    }
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.raw_bytes
+    }
+    pub fn document(&self) -> &Value {
+        &self.document
+    }
     pub fn kind(&self) -> ConformanceDocumentKind {
-        self.kind
+        self.proof.kind
     }
     pub fn document_id(&self) -> &str {
-        &self.document_id
+        &self.proof.document_id
     }
     pub fn document_version(&self) -> u64 {
-        self.document_version
+        self.proof.document_version
     }
     pub fn key_id(&self) -> &str {
-        &self.key_id
+        &self.proof.key_id
     }
     pub fn registry_id(&self) -> &str {
-        &self.registry_id
+        &self.proof.registry_id
     }
     pub fn registry_version(&self) -> u64 {
-        self.registry_version
+        self.proof.registry_version
     }
     pub fn registry_digest(&self) -> &str {
-        &self.registry_digest
+        &self.proof.registry_digest
     }
     pub fn signed_subject_digest(&self) -> &str {
-        &self.signed_subject_digest
+        &self.proof.signed_subject_digest
     }
     pub fn complete_document_digest(&self) -> &str {
-        &self.complete_document_digest
+        &self.proof.complete_document_digest
     }
     pub fn signature_digest(&self) -> &str {
-        &self.signature_digest
+        &self.proof.signature_digest
     }
     pub fn claimed_signed_at(&self) -> DateTime<Utc> {
-        self.claimed_signed_at
+        self.proof.claimed_signed_at
     }
     pub fn accepted_at_not_before(&self) -> DateTime<Utc> {
-        self.accepted_at_not_before
+        self.proof.accepted_at_not_before
     }
     pub fn accepted_at_not_after(&self) -> DateTime<Utc> {
-        self.accepted_at_not_after
+        self.proof.accepted_at_not_after
     }
     pub fn acceptance_record_id(&self) -> &str {
-        &self.acceptance_record_id
+        &self.proof.acceptance_record_id
     }
     pub fn acceptance_sequence(&self) -> u64 {
-        self.acceptance_sequence
+        self.proof.acceptance_sequence
     }
     pub fn authority_id(&self) -> &str {
-        &self.authority_id
+        &self.proof.authority_id
     }
     pub fn authority_epoch(&self) -> u64 {
-        self.authority_epoch
+        self.proof.authority_epoch
     }
     pub fn authority_revision(&self) -> u64 {
-        self.authority_revision
+        self.proof.authority_revision
     }
     pub fn checkpoint_sequence(&self) -> u64 {
-        self.checkpoint_sequence
+        self.proof.checkpoint_sequence
     }
     pub fn deployment_id(&self) -> &str {
-        &self.deployment_id
+        &self.proof.deployment_id
     }
     pub fn trust_domain_id(&self) -> &str {
-        &self.trust_domain_id
+        &self.proof.trust_domain_id
     }
     pub fn package_id(&self) -> &str {
-        &self.package_id
+        &self.proof.package_id
     }
     pub fn evidence_tier(&self) -> EvidenceTier {
-        self.evidence_tier
+        self.proof.evidence_tier
     }
 }
 
@@ -1365,10 +1449,12 @@ impl VerifiedConformanceTrustCheckpoint {
     /// current SB-9 root selected in this checkpoint snapshot.
     pub fn verify_current_production_root(
         &self,
-        document: &VerifiedConformanceDocument,
+        artifact: VerifiedConformanceArtifact,
     ) -> Result<VerifiedConformanceProductionRoot, ConformanceTrustError> {
         let root = &self.current_production_root;
-        if document.kind != ConformanceDocumentKind::PackageExitReceipt
+        let document = &artifact.proof;
+        if artifact.source_locator != root.receipt_ref.artifact_locator
+            || document.kind != ConformanceDocumentKind::PackageExitReceipt
             || document.document_id != root.receipt_ref.document_id
             || document.document_version != root.receipt_ref.document_version
             || document.complete_document_digest != root.receipt_ref.content_digest
@@ -1388,12 +1474,7 @@ impl VerifiedConformanceTrustCheckpoint {
         }
 
         Ok(VerifiedConformanceProductionRoot {
-            document_id: root.receipt_ref.document_id.clone(),
-            document_version: root.receipt_ref.document_version,
-            content_digest: root.receipt_ref.content_digest.clone(),
-            artifact_locator: root.receipt_ref.artifact_locator.clone(),
-            acceptance_record_id: root.acceptance_record_id.clone(),
-            acceptance_sequence: document.acceptance_sequence,
+            artifact,
             checkpoint_sequence: self.checkpoint_sequence,
             authority_revision: self.authority_revision,
         })
@@ -1417,23 +1498,40 @@ impl VerifiedConformanceTrustCheckpoint {
         Ok(())
     }
 
-    /// Verifies one exact raw document digest against a pre-existing acceptance
-    /// record returned by the reconciled authority. This operation is lookup
-    /// only and cannot create acceptance on first sight.
-    pub fn verify_document(
+    /// Verifies and seals one exact raw document against a pre-existing
+    /// acceptance record returned by the reconciled authority. This operation
+    /// is lookup only and cannot create acceptance on first sight. The source
+    /// locator, raw bytes, parsed JSON, and proof never detach after success.
+    pub fn verify_artifact(
         &self,
-        raw_document: &[u8],
+        candidate: ConformanceArtifactCandidate,
         context: ConformanceVerificationContext<'_>,
         trusted_now: ConformanceTrustedTimeWindow,
-    ) -> Result<VerifiedConformanceDocument, ConformanceTrustError> {
+    ) -> Result<VerifiedConformanceArtifact, ConformanceTrustError> {
         self.ensure_fresh(trusted_now)?;
+        let ConformanceArtifactCandidate {
+            source_locator,
+            expected_content_digest,
+            raw_bytes,
+        } = candidate;
+        if !valid_artifact_locator(&source_locator) || !is_digest(&expected_content_digest) {
+            return Err(invalid(
+                "conformance artifact requires a normalized JSON locator and nonzero expected digest",
+            ));
+        }
+        let raw_document = raw_bytes.as_slice();
         if raw_document.is_empty() || raw_document.len() > MAX_CONFORMANCE_DOCUMENT_BYTES {
             return Err(invalid("conformance document is empty or exceeds 16 MiB"));
+        }
+        let complete_document_digest = sha256_digest(raw_document);
+        if complete_document_digest != expected_content_digest {
+            return Err(invalid(
+                "conformance artifact raw bytes do not match the verified reference digest",
+            ));
         }
         let document = parse_json_strict(raw_document)?;
         validate_json_shape(&document, 0)?;
         canonical_json_bytes(&document)?;
-        let complete_document_digest = sha256_digest(raw_document);
         if context.deployment_id != self.namespace.deployment_id
             || context.trust_domain_id != self.namespace.trust_domain_id
         {
@@ -1527,7 +1625,7 @@ impl VerifiedConformanceTrustCheckpoint {
             .verify_strict(&prepared.signing_bytes, &signature)
             .map_err(|_| ConformanceTrustError::InvalidSignature)?;
 
-        Ok(VerifiedConformanceDocument {
+        let proof = ConformanceDocumentProof {
             kind: identity.kind,
             document_id: identity.id,
             document_version: identity.version,
@@ -1551,6 +1649,12 @@ impl VerifiedConformanceTrustCheckpoint {
             trust_domain_id: context.trust_domain_id.to_owned(),
             package_id: context.package_id.to_owned(),
             evidence_tier: context.evidence_tier,
+        };
+        Ok(VerifiedConformanceArtifact {
+            source_locator,
+            raw_bytes: raw_bytes.into_boxed_slice(),
+            document,
+            proof,
         })
     }
 }
@@ -3036,6 +3140,14 @@ mod tests {
         }
     }
 
+    fn candidate(raw: &[u8]) -> ConformanceArtifactCandidate {
+        ConformanceArtifactCandidate::new(
+            "evidence/test-document.json".to_string(),
+            sha256_digest(raw),
+            raw.to_vec(),
+        )
+    }
+
     struct AuthorityFixture {
         signing_key: SigningKey,
         public_key: [u8; 32],
@@ -4060,8 +4172,8 @@ mod tests {
             .unwrap();
 
         let current_verified = checkpoint
-            .verify_document(
-                &serde_json::to_vec(&current).unwrap(),
+            .verify_artifact(
+                candidate(&serde_json::to_vec(&current).unwrap()),
                 context(),
                 trusted_now(),
             )
@@ -4072,8 +4184,8 @@ mod tests {
         assert_eq!(current_verified.authority_epoch(), 7);
 
         let historic_verified = checkpoint
-            .verify_document(
-                &serde_json::to_vec(&historic).unwrap(),
+            .verify_artifact(
+                candidate(&serde_json::to_vec(&historic).unwrap()),
                 context(),
                 trusted_now(),
             )
@@ -4112,9 +4224,13 @@ mod tests {
             .clone()
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
-        checkpoint
-            .verify_document(&raw, context(), trusted_now())
+        let sealed = checkpoint
+            .verify_artifact(candidate(&raw), context(), trusted_now())
             .unwrap();
+        assert_eq!(sealed.source_locator(), "evidence/test-document.json");
+        assert_eq!(sealed.raw_bytes(), raw);
+        assert_eq!(sealed.document(), &document);
+        assert_eq!(sealed.complete_document_digest(), digest);
         let expires_exactly = ConformanceTrustedTimeWindow {
             not_before: at("2026-07-16T10:03:59Z"),
             not_after: at("2026-07-16T10:04:00Z"),
@@ -4122,14 +4238,27 @@ mod tests {
         assert!(checkpoint.ensure_fresh(expires_exactly).is_err());
         assert!(
             checkpoint
-                .verify_document(&raw, context(), expires_exactly)
+                .verify_artifact(candidate(&raw), context(), expires_exactly)
                 .is_err()
         );
 
         let semantically_equal_but_different_raw = serde_json::to_vec_pretty(&document).unwrap();
         assert!(matches!(
-            checkpoint.verify_document(
-                &semantically_equal_but_different_raw,
+            checkpoint.verify_artifact(
+                ConformanceArtifactCandidate::new(
+                    "evidence/test-document.json".to_string(),
+                    digest.clone(),
+                    semantically_equal_but_different_raw.clone(),
+                ),
+                context(),
+                trusted_now(),
+            ),
+            Err(ConformanceTrustError::InvalidContract(message))
+                if message.contains("raw bytes do not match")
+        ));
+        assert!(matches!(
+            checkpoint.verify_artifact(
+                candidate(&semantically_equal_but_different_raw),
                 context(),
                 trusted_now(),
             ),
@@ -4161,7 +4290,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         assert!(matches!(
-            checkpoint.verify_document(&inconsistent_raw, context(), trusted_now()),
+            checkpoint.verify_artifact(candidate(&inconsistent_raw), context(), trusted_now()),
             Err(ConformanceTrustError::KeyNotAuthorized(message))
                 if message.contains("signed_at")
         ));
@@ -4248,7 +4377,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         assert!(matches!(
-            checkpoint.verify_document(&raw, context(), trusted_now()),
+            checkpoint.verify_artifact(candidate(&raw), context(), trusted_now()),
             Err(ConformanceTrustError::KeyNotAuthorized(_))
         ));
     }
@@ -4346,7 +4475,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         checkpoint
-            .verify_document(&historic_raw, context(), trusted_now())
+            .verify_artifact(candidate(&historic_raw), context(), trusted_now())
             .unwrap();
 
         let retired_lineage = lineage_for_chain(&first, &second, &second_digest).unwrap();
@@ -4372,7 +4501,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         assert!(matches!(
-            checkpoint.verify_document(&historic_raw, context(), trusted_now()),
+            checkpoint.verify_artifact(candidate(&historic_raw), context(), trusted_now()),
             Err(ConformanceTrustError::KeyNotAuthorized(message))
                 if message.contains("retirement cutoff")
         ));
@@ -4397,7 +4526,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         assert!(matches!(
-            checkpoint.verify_document(&historic_raw, context(), trusted_now()),
+            checkpoint.verify_artifact(candidate(&historic_raw), context(), trusted_now()),
             Err(ConformanceTrustError::KeyNotAuthorized(message))
                 if message.contains("direct revocation")
         ));
@@ -4459,7 +4588,7 @@ mod tests {
             .verify_reconciliation_response(&request, &response, authority.anchor(7), trusted_now())
             .unwrap();
         assert!(matches!(
-            checkpoint.verify_document(&historic_raw, context(), trusted_now()),
+            checkpoint.verify_artifact(candidate(&historic_raw), context(), trusted_now()),
             Err(ConformanceTrustError::KeyNotAuthorized(message))
                 if message.contains("subsequent revocation")
         ));

@@ -21,10 +21,10 @@ use jsonschema::{Retrieve, Uri};
 use rand::{rngs::OsRng, RngCore};
 use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::conformance_trust::{
-    ConformanceCheckpointAuthorityAnchor, ConformanceProductionRootRef,
-    ConformanceRegistryArtifact, ConformanceTrustAnchor, ConformanceTrustScope,
-    ConformanceTrustedTimeWindow, ConformanceVerificationContext, EvidenceTier,
-    ValidatedConformanceRegistryLineage, VerifiedConformanceDocument,
+    ConformanceArtifactCandidate, ConformanceCheckpointAuthorityAnchor,
+    ConformanceProductionRootRef, ConformanceRegistryArtifact, ConformanceTrustAnchor,
+    ConformanceTrustScope, ConformanceTrustedTimeWindow, ConformanceVerificationContext,
+    EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
     VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
 };
 use ryuki_core::security_profile::{
@@ -295,7 +295,7 @@ pub(crate) struct SecurityContractContext {
     /// lineage against the independently governed monotonic authority. This is
     /// never constructed from local contract/configuration state.
     pub(crate) verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
-    pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceDocument>,
+    pub(crate) verified_conformance_documents: BTreeMap<String, VerifiedConformanceArtifact>,
     /// Opaque binding between the exact profile-selected SB-9 receipt and the
     /// independently asserted current root in the same checkpoint snapshot.
     pub(crate) verified_conformance_production_root: Option<VerifiedConformanceProductionRoot>,
@@ -345,6 +345,8 @@ impl SecurityContractContext {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         if self.profile.security_profile.is_production() {
+            let verified_document_count = self.verified_conformance_documents.len()
+                + usize::from(self.verified_conformance_production_root.is_some());
             let checkpoint = self
                 .verified_conformance_trust_checkpoint
                 .as_ref()
@@ -378,7 +380,7 @@ impl SecurityContractContext {
                 "production startup is blocked until trusted conformance receipts and runtime facts are verified ({}; {}; {} signed closure documents authenticated; semantic closure remains unavailable)",
                 checkpoint,
                 production_root,
-                self.verified_conformance_documents.len(),
+                verified_document_count,
             ));
         }
 
@@ -933,17 +935,19 @@ fn conformance_document_digests(
 }
 
 fn finalize_startup_security_contract(
-    prepared: PreparedSecurityContract,
+    mut prepared: PreparedSecurityContract,
     verified_conformance_trust_checkpoint: Option<VerifiedConformanceTrustCheckpoint>,
     mut trusted_now: impl FnMut() -> DateTime<Utc>,
 ) -> Result<SecurityContractContext, String> {
-    let verified_conformance_documents = verify_loaded_conformance_documents(
+    let mut verified_conformance_documents = verify_loaded_conformance_documents(
         &prepared.documents,
-        &prepared.raw_document_bytes,
+        &mut prepared.raw_document_bytes,
+        &prepared.reference_document_digests,
         verified_conformance_trust_checkpoint.as_ref(),
         &prepared.profile,
         trusted_now(),
     )?;
+    let verified_document_count = verified_conformance_documents.len();
     let verified_conformance_production_root = if prepared.profile.security_profile.is_production()
     {
         let checkpoint = verified_conformance_trust_checkpoint
@@ -962,12 +966,12 @@ fn finalize_startup_security_contract(
         Some(verify_current_production_root_binding(
             checkpoint,
             &prepared.profile,
-            &verified_conformance_documents,
+            &mut verified_conformance_documents,
         )?)
     } else {
         None
     };
-    reject_incomplete_production_startup(&prepared.profile, verified_conformance_documents.len())?;
+    reject_incomplete_production_startup(&prepared.profile, verified_document_count)?;
 
     Ok(SecurityContractContext {
         profile: prepared.profile,
@@ -984,17 +988,19 @@ fn finalize_startup_security_contract(
 fn verify_current_production_root_binding(
     checkpoint: &VerifiedConformanceTrustCheckpoint,
     profile: &DeploymentSecurityProfile,
-    documents: &BTreeMap<String, VerifiedConformanceDocument>,
+    documents: &mut BTreeMap<String, VerifiedConformanceArtifact>,
 ) -> Result<VerifiedConformanceProductionRoot, String> {
     let reference = profile
         .production_acceptance_receipt_ref
         .as_ref()
         .ok_or_else(|| "production profile has no selected SB-9 receipt".to_string())?;
-    let document = documents.get(&reference.artifact_locator).ok_or_else(|| {
-        "profile-selected SB-9 receipt has no authenticated document proof".to_string()
-    })?;
+    let artifact = documents
+        .remove(&reference.artifact_locator)
+        .ok_or_else(|| {
+            "profile-selected SB-9 receipt has no authenticated document proof".to_string()
+        })?;
     let root = checkpoint
-        .verify_current_production_root(document)
+        .verify_current_production_root(artifact)
         .map_err(|error| format!("production root assertion is untrusted: {error}"))?;
     if root.document_id() != reference.document_id
         || root.document_version() != reference.document_version
@@ -1354,11 +1360,12 @@ fn validate_conformance_trust_root_registry_lifecycle(
 
 fn verify_loaded_conformance_documents(
     documents: &BTreeMap<String, Value>,
-    raw_document_bytes: &BTreeMap<String, Vec<u8>>,
+    raw_document_bytes: &mut BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
     trust_checkpoint: Option<&VerifiedConformanceTrustCheckpoint>,
     profile: &DeploymentSecurityProfile,
     trusted_now: DateTime<Utc>,
-) -> Result<BTreeMap<String, VerifiedConformanceDocument>, String> {
+) -> Result<BTreeMap<String, VerifiedConformanceArtifact>, String> {
     let conformance_documents = documents
         .iter()
         .filter(|(_, document)| is_conformance_document(document))
@@ -1450,22 +1457,23 @@ fn verify_loaded_conformance_documents(
                 ));
             }
         };
-        let raw_document = raw_document_bytes.get(locator).ok_or_else(|| {
+        let raw_document = raw_document_bytes.remove(locator).ok_or_else(|| {
             format!(
                 "conformance document {locator} has no exact raw bytes from reference traversal"
             )
         })?;
-        let parsed_raw_document = parse_json_strict(raw_document).map_err(|error| {
-            format!("conformance document {locator} exact raw bytes are invalid: {error}")
+        let reference_digest = reference_document_digests.get(locator).ok_or_else(|| {
+            format!(
+                "conformance document {locator} has no verified digest from reference traversal"
+            )
         })?;
-        if &parsed_raw_document != document {
-            return Err(format!(
-                "conformance document {locator} is untrusted: parsed document does not match its exact raw bytes"
-            ));
-        }
-        let proof = trust_checkpoint
-            .verify_document(
-                raw_document,
+        let artifact = trust_checkpoint
+            .verify_artifact(
+                ConformanceArtifactCandidate::new(
+                    (*locator).clone(),
+                    reference_digest.clone(),
+                    raw_document,
+                ),
                 ConformanceVerificationContext {
                     deployment_id: &profile.deployment_id,
                     trust_domain_id,
@@ -1475,7 +1483,12 @@ fn verify_loaded_conformance_documents(
                 trusted_time_point(trusted_now),
             )
             .map_err(|error| format!("conformance document {locator} is untrusted: {error}"))?;
-        verified.insert((*locator).clone(), proof);
+        if artifact.document() != document {
+            return Err(format!(
+                "conformance document {locator} is untrusted: sealed document does not match the validated traversal value"
+            ));
+        }
+        verified.insert((*locator).clone(), artifact);
     }
     Ok(verified)
 }
@@ -4336,9 +4349,11 @@ mod tests {
         );
         assert_eq!(checkpoint.authority_epoch(), 7);
         assert_eq!(checkpoint.checkpoint_sequence(), 20);
-        let verified = verify_loaded_conformance_documents(
+        let mut verification_bytes = document_bytes.clone();
+        let mut verified = verify_loaded_conformance_documents(
             &documents,
-            &document_bytes,
+            &mut verification_bytes,
+            &reference_digests,
             Some(&checkpoint),
             &profile,
             fixed_now(),
@@ -4346,7 +4361,7 @@ mod tests {
         .expect("the returned proof must authenticate the exact requested bytes");
         assert_eq!(verified.len(), 2);
         let verified_root =
-            verify_current_production_root_binding(&checkpoint, &profile, &verified)
+            verify_current_production_root_binding(&checkpoint, &profile, &mut verified)
                 .expect("the external checkpoint must bind the exact profile-selected SB-9 root");
         assert_eq!(
             verified_root.document_id(),
@@ -4365,6 +4380,10 @@ mod tests {
         context
             .validate_serving_checkpoint_freshness(fixed_now())
             .expect("fresh proof must survive the final listener fence");
+        let runtime_block = context
+            .validate_runtime_bindings(&RyukiConfig::default(), false, fixed_now())
+            .expect_err("runtime binding remains blocked after current-root verification");
+        assert!(runtime_block.contains("2 signed closure documents authenticated"));
         assert!(context
             .validate_serving_checkpoint_freshness(
                 Utc.with_ymd_and_hms(2026, 7, 16, 12, 4, 1).unwrap()
@@ -4738,6 +4757,7 @@ mod tests {
             (production_root_locator.into(), receipt),
         ]);
         let document_bytes = raw_document_bytes(&documents);
+        let reference_digests = reference_document_digests(&document_bytes);
         let checkpoint = verified_checkpoint_for_documents(
             lineage,
             &profile,
@@ -4746,15 +4766,18 @@ mod tests {
             &document_bytes,
             TRUST_ROOT_REGISTRY_PATH,
         );
-        let verified = verify_loaded_conformance_documents(
+        let mut verification_bytes = document_bytes.clone();
+        let mut verified = verify_loaded_conformance_documents(
             &documents,
-            &document_bytes,
+            &mut verification_bytes,
+            &reference_digests,
             Some(&checkpoint),
             &profile,
             fixed_now(),
         )
         .expect("valid signatures must authenticate");
         assert_eq!(verified.len(), 2);
+        let verified_document_count = verified.len();
         let expected_trust_domain = profile.trust_topology.trust_domain_ids[0].as_str();
         assert!(verified.values().all(|proof| {
             proof.deployment_id() == DEPLOYMENT_ID
@@ -4762,20 +4785,68 @@ mod tests {
                 && matches!(proof.package_id(), "SB-0" | "SB-9")
                 && proof.evidence_tier() == EvidenceTier::ExternallyAttested
         }));
-        verify_current_production_root_binding(&checkpoint, &profile, &verified)
+        verify_current_production_root_binding(&checkpoint, &profile, &mut verified)
             .expect("the accepted SB-9 receipt must match the external current root");
-        let final_block = reject_incomplete_production_startup(&profile, verified.len())
+        assert_eq!(
+            verified.len(),
+            1,
+            "the SB-9 artifact is owned by the root proof"
+        );
+        let wrong_locator_root = checkpoint
+            .verify_artifact(
+                ConformanceArtifactCandidate::new(
+                    "receipts/wrong-sb9.json".into(),
+                    reference_digests[production_root_locator].clone(),
+                    document_bytes[production_root_locator].clone(),
+                ),
+                ConformanceVerificationContext {
+                    deployment_id: &profile.deployment_id,
+                    trust_domain_id: expected_trust_domain,
+                    package_id: "SB-9",
+                    evidence_tier: EvidenceTier::ExternallyAttested,
+                },
+                trusted_time_point(fixed_now()),
+            )
+            .expect("the signed receipt remains accepted independently of its source locator");
+        assert!(checkpoint
+            .verify_current_production_root(wrong_locator_root)
+            .unwrap_err()
+            .to_string()
+            .contains("exact current SB-9"));
+        let final_block = reject_incomplete_production_startup(&profile, verified_document_count)
             .expect_err("cryptographic verification alone cannot authorize production");
         assert!(final_block.contains("2 signed closure documents authenticated"));
         assert!(final_block.contains("semantic closure and live runtime facts remain unavailable"));
 
+        let mut swapped_bytes = document_bytes.clone();
+        let bundle_bytes = swapped_bytes
+            .remove("evidence/runtime-bundle.json")
+            .expect("bundle bytes");
+        let receipt_bytes = swapped_bytes
+            .remove(production_root_locator)
+            .expect("receipt bytes");
+        swapped_bytes.insert("evidence/runtime-bundle.json".into(), receipt_bytes);
+        swapped_bytes.insert(production_root_locator.into(), bundle_bytes);
+        let swapped_error = verify_loaded_conformance_documents(
+            &documents,
+            &mut swapped_bytes,
+            &reference_digests,
+            Some(&checkpoint),
+            &profile,
+            fixed_now(),
+        )
+        .expect_err("raw bytes cannot be paired with another artifact's traversal digest");
+        assert!(swapped_error.contains("raw bytes do not match"));
+
         let mut tampered = documents.clone();
         tampered.get_mut("evidence/runtime-bundle.json").unwrap()["signer"]["signature_base64"] =
             BASE64_STANDARD.encode([0u8; 64]).into();
-        let tampered_bytes = raw_document_bytes(&tampered);
+        let mut tampered_bytes = raw_document_bytes(&tampered);
+        let tampered_digests = reference_document_digests(&tampered_bytes);
         let error = verify_loaded_conformance_documents(
             &tampered,
-            &tampered_bytes,
+            &mut tampered_bytes,
+            &tampered_digests,
             Some(&checkpoint),
             &profile,
             fixed_now(),
@@ -4804,10 +4875,12 @@ mod tests {
                 .unwrap()
                 .pointer_mut(pointer)
                 .unwrap() = replacement;
-            let scoped_tamper_bytes = raw_document_bytes(&scoped_tamper);
+            let mut scoped_tamper_bytes = raw_document_bytes(&scoped_tamper);
+            let scoped_tamper_digests = reference_document_digests(&scoped_tamper_bytes);
             assert!(verify_loaded_conformance_documents(
                 &scoped_tamper,
-                &scoped_tamper_bytes,
+                &mut scoped_tamper_bytes,
+                &scoped_tamper_digests,
                 Some(&checkpoint),
                 &profile,
                 fixed_now(),
@@ -4817,10 +4890,12 @@ mod tests {
 
         let mut package_tamper = documents.clone();
         package_tamper.get_mut(production_root_locator).unwrap()["package_id"] = json!("SB-8");
-        let package_tamper_bytes = raw_document_bytes(&package_tamper);
+        let mut package_tamper_bytes = raw_document_bytes(&package_tamper);
+        let package_tamper_digests = reference_document_digests(&package_tamper_bytes);
         assert!(verify_loaded_conformance_documents(
             &package_tamper,
-            &package_tamper_bytes,
+            &mut package_tamper_bytes,
+            &package_tamper_digests,
             Some(&checkpoint),
             &profile,
             fixed_now(),
@@ -4829,9 +4904,11 @@ mod tests {
 
         let mut wrong_domain_profile = profile.clone();
         wrong_domain_profile.trust_topology.trust_domain_ids = vec!["trust-domain:other".into()];
+        let mut wrong_domain_bytes = document_bytes.clone();
         assert!(verify_loaded_conformance_documents(
             &documents,
-            &document_bytes,
+            &mut wrong_domain_bytes,
+            &reference_digests,
             Some(&checkpoint),
             &wrong_domain_profile,
             fixed_now(),
@@ -4916,6 +4993,7 @@ mod tests {
             (production_root_locator.into(), production_root),
         ]);
         let document_bytes = raw_document_bytes(&documents);
+        let reference_digests = reference_document_digests(&document_bytes);
         let checkpoint = verified_checkpoint_for_documents(
             lineage,
             &profile,
@@ -4924,19 +5002,22 @@ mod tests {
             &document_bytes,
             TRUST_ROOT_REGISTRY_PATH,
         );
-        let verified = verify_loaded_conformance_documents(
+        let mut verification_bytes = document_bytes.clone();
+        let mut verified = verify_loaded_conformance_documents(
             &documents,
-            &document_bytes,
+            &mut verification_bytes,
+            &reference_digests,
             Some(&checkpoint),
             &profile,
             fixed_now(),
         )
         .expect("the current lineage head must authenticate its exact signed document");
         assert_eq!(verified.len(), 2);
-        verify_current_production_root_binding(&checkpoint, &profile, &verified)
+        let verified_document_count = verified.len();
+        verify_current_production_root_binding(&checkpoint, &profile, &mut verified)
             .expect("the v2 lineage checkpoint must bind its exact current SB-9 root");
         assert!(
-            reject_incomplete_production_startup(&profile, verified.len())
+            reject_incomplete_production_startup(&profile, verified_document_count)
                 .unwrap_err()
                 .contains("2 signed closure documents authenticated")
         );
