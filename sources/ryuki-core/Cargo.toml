@@ -17,3 +17,7 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 ed25519-dalek = "2"
 thiserror = "2"
+url = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }

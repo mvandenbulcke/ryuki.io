@@ -1,0 +1,397 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ryuki.io/schemas/security-contracts/v1/public-ingress-attestation-envelope.schema.json",
+  "title": "Ryuki public-ingress attestation response",
+  "description": "Closed response returned by an independently pinned DNS, TLS, and ingress authority. Schema validity never grants trust. The runtime verifier consumes one nonce-bound request, verifies the domain-separated Ed25519 signature and exact request/workload/guard/profile echoes, recomputes both canonical ingress digests from the typed preimages, and enforces a 300-second freshness ceiling.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_kind",
+    "canonicalization",
+    "signature_algorithm",
+    "authority",
+    "request_nonce",
+    "request_digest",
+    "namespace",
+    "workload",
+    "guard",
+    "attestation_profile",
+    "outcome",
+    "measurement",
+    "signature_base64"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "contract_kind": { "const": "public-ingress-attestation-response" },
+    "canonicalization": { "const": "ryuki-canonical-json-v1" },
+    "signature_algorithm": { "const": "ed25519" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "request_nonce": { "$ref": "#/$defs/nonce" },
+    "request_digest": { "$ref": "#/$defs/digest" },
+    "namespace": { "$ref": "#/$defs/namespace" },
+    "workload": { "$ref": "#/$defs/workload" },
+    "guard": { "$ref": "#/$defs/guard" },
+    "attestation_profile": { "$ref": "#/$defs/attestationProfile" },
+    "outcome": { "const": "matched" },
+    "measurement": { "$ref": "#/$defs/measurement" },
+    "signature_base64": {
+      "description": "Canonical Base64 of a 64-byte Ed25519 signature. Signing bytes are a little-endian u64 length frame for ryuki-v1/public-ingress-attestation-response followed by a frame for canonical response bytes with signature_base64 removed.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{85}[AQgw]==$"
+    }
+  },
+  "$defs": {
+    "positiveCounter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "not": { "const": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }
+    },
+    "timestamp": {
+      "type": "string",
+      "maxLength": 35,
+      "format": "date-time"
+    },
+    "deploymentId": {
+      "type": "string",
+      "pattern": "^deployment:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "trustDomainId": {
+      "type": "string",
+      "pattern": "^trust-domain:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "workloadId": {
+      "type": "string",
+      "pattern": "^workload:[a-z0-9][a-z0-9._-]{2,126}$"
+    },
+    "componentId": {
+      "type": "string",
+      "enum": ["component:ryuki-api", "component:ryuki-portal-ui"]
+    },
+    "hostname": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 253,
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "originRole": {
+      "enum": ["platform-api", "portal-ui"]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_id",
+        "key_id",
+        "public_key_fingerprint",
+        "authority_epoch",
+        "authority_revision"
+      ],
+      "properties": {
+        "authority_id": {
+          "type": "string",
+          "pattern": "^public-ingress-attestation-authority:[a-z0-9][a-z0-9._:/-]{2,190}$"
+        },
+        "key_id": {
+          "type": "string",
+          "pattern": "^public-ingress-attestation-key:[a-z0-9][a-z0-9._:/-]{2,190}$"
+        },
+        "public_key_fingerprint": { "$ref": "#/$defs/digest" },
+        "authority_epoch": { "$ref": "#/$defs/positiveCounter" },
+        "authority_revision": { "$ref": "#/$defs/positiveCounter" }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment_id", "trust_domain_id", "workload_id"],
+      "properties": {
+        "deployment_id": { "$ref": "#/$defs/deploymentId" },
+        "trust_domain_id": { "$ref": "#/$defs/trustDomainId" },
+        "workload_id": { "$ref": "#/$defs/workloadId" }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "artifact_digest",
+        "workload_instance_binding_digest"
+      ],
+      "properties": {
+        "source_revision": {
+          "type": "string",
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+          "not": {
+            "enum": [
+              "0000000000000000000000000000000000000000",
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            ]
+          }
+        },
+        "artifact_digest": { "$ref": "#/$defs/digest" },
+        "workload_instance_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guard_id", "requirement_digest", "challenge_binding_digest"],
+      "properties": {
+        "guard_id": { "const": "https-public-urls" },
+        "requirement_digest": { "$ref": "#/$defs/digest" },
+        "challenge_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "attestationProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_version", "content_digest"],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^ingress-attestation-profile:[a-z0-9][a-z0-9._-]{2,126}$"
+        },
+        "profile_version": { "$ref": "#/$defs/positiveCounter" },
+        "content_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "trustedTimeInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["not_before", "not_after"],
+      "properties": {
+        "not_before": { "$ref": "#/$defs/timestamp" },
+        "not_after": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "publicOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "canonical_origin"],
+      "properties": {
+        "role": { "$ref": "#/$defs/originRole" },
+        "canonical_origin": {
+          "type": "string",
+          "maxLength": 261,
+          "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        }
+      }
+    },
+    "dnsBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin_role",
+        "hostname",
+        "authoritative_rrset_digest",
+        "dns_generation_digest"
+      ],
+      "properties": {
+        "origin_role": { "$ref": "#/$defs/originRole" },
+        "hostname": { "$ref": "#/$defs/hostname" },
+        "authoritative_rrset_digest": { "$ref": "#/$defs/digest" },
+        "dns_generation_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "tlsBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin_role",
+        "server_name",
+        "leaf_spki_digest",
+        "certificate_chain_digest",
+        "san_dns_names",
+        "certificate_not_before",
+        "certificate_not_after",
+        "minimum_protocol",
+        "verification_method"
+      ],
+      "properties": {
+        "origin_role": { "$ref": "#/$defs/originRole" },
+        "server_name": { "$ref": "#/$defs/hostname" },
+        "leaf_spki_digest": { "$ref": "#/$defs/digest" },
+        "certificate_chain_digest": { "$ref": "#/$defs/digest" },
+        "san_dns_names": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/hostname" }
+        },
+        "certificate_not_before": { "$ref": "#/$defs/timestamp" },
+        "certificate_not_after": { "$ref": "#/$defs/timestamp" },
+        "minimum_protocol": { "enum": ["tls-1.2", "tls-1.3"] },
+        "verification_method": { "const": "webpki-hostname-and-chain" }
+      }
+    },
+    "routeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin_role",
+        "path_prefix",
+        "path_type",
+        "route_generation_digest",
+        "backend_workload_id",
+        "backend_component_id",
+        "backend_artifact_digest",
+        "backend_binding_digest"
+      ],
+      "properties": {
+        "origin_role": { "$ref": "#/$defs/originRole" },
+        "path_prefix": { "enum": ["/", "/api"] },
+        "path_type": { "const": "prefix" },
+        "route_generation_digest": { "$ref": "#/$defs/digest" },
+        "backend_workload_id": { "$ref": "#/$defs/workloadId" },
+        "backend_component_id": { "$ref": "#/$defs/componentId" },
+        "backend_artifact_digest": { "$ref": "#/$defs/digest" },
+        "backend_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ingress_generation_digest",
+        "dns_bindings",
+        "tls_bindings",
+        "routes"
+      ],
+      "properties": {
+        "ingress_generation_digest": { "$ref": "#/$defs/digest" },
+        "dns_bindings": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/dnsBinding" },
+                { "properties": { "origin_role": { "const": "platform-api" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/dnsBinding" },
+                { "properties": { "origin_role": { "const": "portal-ui" } } }
+              ]
+            }
+          ],
+          "items": false
+        },
+        "tls_bindings": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/tlsBinding" },
+                { "properties": { "origin_role": { "const": "platform-api" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/tlsBinding" },
+                { "properties": { "origin_role": { "const": "portal-ui" } } }
+              ]
+            }
+          ],
+          "items": false
+        },
+        "routes": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/routeBinding" },
+                {
+                  "properties": {
+                    "origin_role": { "const": "platform-api" },
+                    "path_prefix": { "const": "/api" },
+                    "backend_component_id": { "const": "component:ryuki-api" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/routeBinding" },
+                {
+                  "properties": {
+                    "origin_role": { "const": "portal-ui" },
+                    "path_prefix": { "const": "/" },
+                    "backend_component_id": { "const": "component:ryuki-portal-ui" }
+                  }
+                }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "method",
+        "observed_at",
+        "valid_until",
+        "restored_state_reconciled",
+        "public_origins",
+        "public_origin_set_digest",
+        "ingress",
+        "ingress_binding_digest"
+      ],
+      "properties": {
+        "sequence": { "$ref": "#/$defs/positiveCounter" },
+        "method": { "const": "external-dns-tls-ingress-observation-v1" },
+        "observed_at": { "$ref": "#/$defs/trustedTimeInterval" },
+        "valid_until": { "$ref": "#/$defs/timestamp" },
+        "restored_state_reconciled": { "const": true },
+        "public_origins": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/publicOrigin" },
+                { "properties": { "role": { "const": "platform-api" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/publicOrigin" },
+                { "properties": { "role": { "const": "portal-ui" } } }
+              ]
+            }
+          ],
+          "items": false
+        },
+        "public_origin_set_digest": { "$ref": "#/$defs/digest" },
+        "ingress": { "$ref": "#/$defs/ingress" },
+        "ingress_binding_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

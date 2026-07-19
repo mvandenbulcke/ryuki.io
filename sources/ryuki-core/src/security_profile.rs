@@ -325,6 +325,10 @@ pub enum RuntimeGuardExpectedValue {
     },
 }
 
+/// Canonical namespace shared by the deployment profile and the independently
+/// verified public-ingress attestation protocol.
+pub const INGRESS_ATTESTATION_PROFILE_ID_PREFIX: &str = "ingress-attestation-profile:";
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CookieSameSitePolicy {
@@ -1149,7 +1153,7 @@ fn validate_signing_purpose_set(purposes: &[ExpectedSigningPurpose], errors: &mu
     }
 }
 
-fn validate_runtime_guard_expected_value(
+pub(crate) fn validate_runtime_guard_expected_value(
     value: &RuntimeGuardExpectedValue,
     errors: &mut Vec<String>,
 ) {
@@ -1221,7 +1225,7 @@ fn validate_runtime_guard_expected_value(
             );
             validate_id(
                 attestation_profile_id,
-                "ingress-attestation-profile:",
+                INGRESS_ATTESTATION_PROFILE_ID_PREFIX,
                 "https-public-urls attestation_profile_id",
                 errors,
             );
@@ -1336,21 +1340,27 @@ fn validate_runtime_guard_expected_value(
 }
 
 fn validate_id(value: &str, prefix: &str, label: &str, errors: &mut Vec<String>) {
-    let Some(suffix) = value.strip_prefix(prefix) else {
+    if !value.starts_with(prefix) {
         errors.push(format!("{label} must use the {prefix} namespace"));
         return;
+    }
+    if !valid_canonical_scoped_id(value, prefix) {
+        errors.push(format!("{label} is not a canonical lowercase identifier"));
+    }
+}
+
+pub(crate) fn valid_canonical_scoped_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
     };
     let bytes = suffix.as_bytes();
-    let valid = (3..=127).contains(&bytes.len())
+    (3..=127).contains(&bytes.len())
         && bytes
             .first()
             .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         && bytes.iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        });
-    if !valid {
-        errors.push(format!("{label} is not a canonical lowercase identifier"));
-    }
+        })
 }
 
 fn validate_digest(label: &str, value: &str, errors: &mut Vec<String>) {

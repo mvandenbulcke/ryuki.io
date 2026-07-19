@@ -48,7 +48,7 @@ const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
 const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 const MAX_RECEIPT_DIGESTS: usize = 4096;
 
-const SCHEMAS: [(&str, &str); 11] = [
+const SCHEMAS: [(&str, &str); 12] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -88,6 +88,10 @@ const SCHEMAS: [(&str, &str); 11] = [
     (
         "production-build-manifest.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/production-build-manifest.schema.json",
+    ),
+    (
+        "public-ingress-attestation-envelope.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/public-ingress-attestation-envelope.schema.json",
     ),
     (
         "security-limit-profile.schema.json",

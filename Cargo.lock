@@ -3127,11 +3127,13 @@ dependencies = [
  "ed25519-dalek",
  "figment",
  "hmac",
+ "jsonschema",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

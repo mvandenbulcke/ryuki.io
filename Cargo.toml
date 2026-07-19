@@ -61,6 +61,7 @@ tower = { version = "0.5", features = ["limit"] }
 hmac = "0.12"
 sha2 = "0.10"
 jsonschema = { version = "=0.47.0", default-features = false }
+url = "2"
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 ryuki-runner = { path = "sources/ryuki-runner" }
