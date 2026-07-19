@@ -1108,7 +1108,7 @@ def _interactive_admin_only(route) -> bool:
 def _auth_callback_cookie(route):
     path = str(route.get("path") or "")
     if path == "/api/auth/oidc/callback":
-        return "oidc_login_csrf"
+        return "__Host-oidc_login_csrf"
     if path == "/api/auth/entra/callback":
         return "__Host-entra_login_csrf"
     return None

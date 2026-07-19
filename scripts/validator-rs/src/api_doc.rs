@@ -1752,22 +1752,17 @@ fn request_headers_for(
         ));
     }
     let callback_cookie = match path {
-        "/api/auth/oidc/callback" => Some("oidc_login_csrf"),
-        "/api/auth/entra/callback" => Some("__Host-entra_login_csrf"),
+        "/api/auth/oidc/callback" => Some(("__Host-oidc_login_csrf", "oidc_login_csrf")),
+        "/api/auth/entra/callback" => Some(("__Host-entra_login_csrf", "entra_login_csrf")),
         _ => None,
     };
-    if let Some(cookie) = callback_cookie {
-        let loopback_note = if path == "/api/auth/entra/callback" {
-            " Explicit loopback HTTP uses the compatibility name `entra_login_csrf`."
-        } else {
-            ""
-        };
+    if let Some((cookie, loopback_cookie)) = callback_cookie {
         headers.push(api_header(
             "Cookie",
             "string",
             false,
             &format!(
-                "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `{cookie}` binding cookie set by login initiation. The provider-error redirect path does not require it.{loopback_note}"
+                "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `{cookie}` binding cookie set by login initiation. The provider-error redirect path does not require it. Explicit loopback HTTP uses the compatibility name `{loopback_cookie}`."
             ),
         ));
     }

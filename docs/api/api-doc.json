@@ -7748,7 +7748,7 @@
               "name": "Cookie",
               "type": "string",
               "required": false,
-              "description": "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `oidc_login_csrf` binding cookie set by login initiation. The provider-error redirect path does not require it."
+              "description": "Required on the successful `code` + `state` callback path: the browser must return the HttpOnly `__Host-oidc_login_csrf` binding cookie set by login initiation. The provider-error redirect path does not require it. Explicit loopback HTTP uses the compatibility name `oidc_login_csrf`."
             }
           ],
           "request_body_state": "none",
@@ -7771,6 +7771,12 @@
                   "type": "string",
                   "required": true,
                   "description": "Redirect target selected by the authentication flow."
+                },
+                {
+                  "name": "Set-Cookie",
+                  "type": "string",
+                  "required": false,
+                  "description": "Authentication/session cookie emitted on the successful branch that establishes or clears browser state."
                 }
               ]
             }

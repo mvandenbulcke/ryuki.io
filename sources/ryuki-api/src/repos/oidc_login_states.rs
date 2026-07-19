@@ -401,9 +401,11 @@ async fn create_with_limits(
 /// return `None`, enforcing single-use without a separate SELECT.
 ///
 /// `binding` is the per-browser CSRF token: the callback handler must compare it
-/// to the `oidc_login_csrf` cookie that the login-initiation handler set on the
-/// initiating browser, so a state stolen/forged by an attacker cannot be
-/// redeemed in a victim's browser (login-CSRF / session-swapping defense).
+/// to the mode-selected login-binding cookie that the login-initiation handler
+/// set on the initiating browser, so a state stolen/forged by an attacker
+/// cannot be redeemed in a victim's browser (login-CSRF / session-swapping
+/// defense). HTTPS uses `__Host-oidc_login_csrf`; explicit loopback HTTP uses
+/// the unprefixed compatibility name.
 pub async fn take(
     pool: &PgPool,
     state: &str,

@@ -44,6 +44,39 @@ use uuid::Uuid;
 const IDENTITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Host-prefixed browser binding required for HTTPS generic OIDC callbacks.
+/// The browser enforces Secure, Path=/, and absence of Domain for this name.
+pub(crate) const SECURE_OIDC_BINDING_COOKIE: &str = "__Host-oidc_login_csrf";
+/// Compatibility name admitted only by validated plain-HTTP loopback
+/// development and tests.
+pub(crate) const LOOPBACK_OIDC_BINDING_COOKIE: &str = "oidc_login_csrf";
+
+pub(crate) fn oidc_binding_cookie_name(cookie_secure: bool) -> &'static str {
+    if cookie_secure {
+        SECURE_OIDC_BINDING_COOKIE
+    } else {
+        LOOPBACK_OIDC_BINDING_COOKIE
+    }
+}
+
+/// Builds the per-browser login-CSRF binding cookie. SameSite=Lax is required
+/// for the top-level cross-site redirect from the identity provider.
+pub(crate) fn oidc_binding_cookie_header(binding: &str, cookie_secure: bool) -> String {
+    let name = oidc_binding_cookie_name(cookie_secure);
+    format!(
+        "{name}={binding}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
+        if cookie_secure { "; Secure" } else { "" }
+    )
+}
+
+fn oidc_binding_cookie_clear_header(cookie_secure: bool) -> String {
+    let name = oidc_binding_cookie_name(cookie_secure);
+    format!(
+        "{name}=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax{}",
+        if cookie_secure { "; Secure" } else { "" }
+    )
+}
+
 /// Upper bound on a token-endpoint response. ID tokens are normally only a few
 /// KiB; one MiB leaves ample interoperability headroom without allowing a
 /// chunked response to grow the callback process's buffer without bound.
@@ -727,17 +760,43 @@ pub(crate) struct OidcCallbackQuery {
     pub error_description: Option<String>,
 }
 
-/// Extract a single cookie value by exact name from the request `Cookie` header.
-/// Returns `None` if the header is absent/non-UTF-8 or the named cookie is not
-/// present. Matches `{name}=` exactly (a longer cookie name is not a match).
-fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|pair| {
-        pair.trim()
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|val| val.to_string())
-    })
+/// Extract the only exact-name binding cookie across every `Cookie` field.
+/// Opaque header bytes, malformed pairs, and duplicate matching cookies fail
+/// closed independently of field or pair ordering.
+fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let mut binding = None;
+    for raw in headers.get_all(axum::http::header::COOKIE).iter() {
+        let raw = raw.to_str().map_err(|_| ())?;
+        for pair in raw.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (cookie_name, value) = pair.split_once('=').ok_or(())?;
+            let cookie_name = cookie_name.trim();
+            if cookie_name.is_empty() {
+                return Err(());
+            }
+            if cookie_name != name {
+                continue;
+            }
+            if binding.is_some() {
+                return Err(());
+            }
+            binding = Some(value.trim().to_string());
+        }
+    }
+    Ok(binding)
+}
+
+fn invalid_state_problem() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "OIDC_INVALID_STATE",
+            "message": "Login state is missing, expired, or already used"
+        })),
+    )
 }
 
 /// OIDC authorization-code callback handler.
@@ -808,33 +867,26 @@ pub(crate) async fn oidc_callback(
         {
             Some(row) => row,
             None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "OIDC_INVALID_STATE",
-                        "message": "Login state is missing, expired, or already used"
-                    })),
-                ));
+                return Err(invalid_state_problem());
             }
         };
 
     // Step 5b: login-CSRF / session-swapping defense. The state is redeemable
     // only by the SAME browser that initiated the login: that browser holds the
-    // `oidc_login_csrf` cookie whose value equals the binding stored with the
-    // state. A `state` obtained from an attacker's own flow carries a different
-    // binding, so a victim's browser (with a different/absent cookie) cannot
-    // redeem it. Constant-time compare not needed: both are single-use,
-    // server-generated 256-bit values.
-    let cookie_binding = cookie_value(&headers, "oidc_login_csrf").unwrap_or_default();
+    // mode-selected login-CSRF cookie whose value equals the binding stored
+    // with the state. HTTPS uses a browser-enforced `__Host-` name. A `state`
+    // obtained from an attacker's own flow carries a different binding, so a
+    // victim's browser cannot redeem it. Constant-time compare is unnecessary:
+    // both values are single-use, server-generated 256-bit values.
+    let cookie_binding = cookie_value(
+        &headers,
+        oidc_binding_cookie_name(cfg.session.cookie_secure),
+    )
+    .map_err(|_| invalid_state_problem())?
+    .unwrap_or_default();
     if binding.is_empty() || cookie_binding.is_empty() || cookie_binding != binding {
         tracing::warn!("oidc callback: login-state browser binding mismatch");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "OIDC_INVALID_STATE",
-                "message": "Login state is missing, expired, or already used"
-            })),
-        ));
+        return Err(invalid_state_problem());
     }
 
     // Step 6: token exchange.
@@ -937,6 +989,18 @@ pub(crate) async fn oidc_callback(
             Json(serde_json::json!({"error": "cookie header encoding failed"})),
         )
     })?;
+    let binding_clear = axum::http::HeaderValue::from_str(&oidc_binding_cookie_clear_header(
+        cfg.session.cookie_secure,
+    ))
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "cookie header encoding failed"})),
+        )
+    })?;
+    response
+        .headers_mut()
+        .append(axum::http::header::SET_COOKIE, binding_clear);
     Ok(response)
 }
 
@@ -988,6 +1052,90 @@ mod oidc_callback_db_tests {
     const TEST_ISS: &str = "https://idp.example.com";
     const TEST_AUD: &str = "oidc-client-test";
     const TEST_BINDING: &str = "test-csrf-binding-value";
+
+    #[test]
+    fn binding_cookie_header_uses_host_prefix_for_secure_mode() {
+        assert_eq!(
+            oidc_binding_cookie_header("abc", false),
+            "oidc_login_csrf=abc; Path=/; HttpOnly; Max-Age=600; SameSite=Lax"
+        );
+        let secure = oidc_binding_cookie_header("abc", true);
+        assert!(secure.starts_with("__Host-oidc_login_csrf=abc;"));
+        assert!(secure.ends_with("; Secure"));
+        assert!(!secure.contains("Domain="));
+        assert_eq!(
+            oidc_binding_cookie_clear_header(true),
+            "__Host-oidc_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
+        );
+        assert_eq!(
+            oidc_binding_cookie_clear_header(false),
+            "oidc_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn binding_cookie_parser_rejects_malformed_and_duplicate_evidence() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("__Host-oidc_login_csrf=first"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("other=value; __Host-oidc_login_csrf=second"),
+        );
+        assert_eq!(cookie_value(&headers, SECURE_OIDC_BINDING_COOKIE), Err(()));
+
+        let mut same_field = axum::http::HeaderMap::new();
+        same_field.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "__Host-oidc_login_csrf=first; __Host-oidc_login_csrf=second",
+            ),
+        );
+        assert_eq!(
+            cookie_value(&same_field, SECURE_OIDC_BINDING_COOKIE),
+            Err(())
+        );
+
+        let mut malformed = axum::http::HeaderMap::new();
+        malformed.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "other=value; malformed; __Host-oidc_login_csrf=binding",
+            ),
+        );
+        assert_eq!(
+            cookie_value(&malformed, SECURE_OIDC_BINDING_COOKIE),
+            Err(())
+        );
+
+        let mut opaque = axum::http::HeaderMap::new();
+        opaque.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"\xff").expect("opaque header fixture"),
+        );
+        assert_eq!(cookie_value(&opaque, SECURE_OIDC_BINDING_COOKIE), Err(()));
+    }
+
+    #[test]
+    fn binding_cookie_parser_selects_only_the_validated_transport_name() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static(
+                "oidc_login_csrf=parent-domain-plant; __Host-oidc_login_csrf=host-only",
+            ),
+        );
+        assert_eq!(
+            cookie_value(&headers, oidc_binding_cookie_name(true)),
+            Ok(Some("host-only".into()))
+        );
+        assert_eq!(
+            cookie_value(&headers, oidc_binding_cookie_name(false)),
+            Ok(Some("parent-domain-plant".into()))
+        );
+    }
 
     async fn read_test_http_request(stream: &mut TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
@@ -1527,15 +1675,14 @@ mod oidc_callback_db_tests {
         server.await.expect("oversized-response test server task");
     }
 
-    /// Build a callback GET request carrying the matching `oidc_login_csrf`
-    /// cookie (the per-browser binding the login handler sets). Tests that should
-    /// proceed PAST the browser-binding check use this.
+    /// Build a callback GET request carrying the matching secure binding cookie.
+    /// Tests that should proceed past the browser-binding check use this.
     fn callback_req(uri: String) -> Request<Body> {
         Request::builder()
             .uri(uri)
             .header(
                 axum::http::header::COOKIE,
-                format!("oidc_login_csrf={TEST_BINDING}"),
+                format!("{SECURE_OIDC_BINDING_COOKIE}={TEST_BINDING}"),
             )
             .body(Body::empty())
             .unwrap()
@@ -1726,7 +1873,7 @@ mod oidc_callback_db_tests {
             state
         ));
 
-        let resp = app.oneshot(req).await.expect("request");
+        let resp = app.clone().oneshot(req).await.expect("request");
         assert_eq!(
             resp.status(),
             StatusCode::FOUND,
@@ -1746,7 +1893,7 @@ mod oidc_callback_db_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             cookie_fields.len(),
-            2,
+            3,
             "Set-Cookie fields must stay separate"
         );
         let cookie = cookie_fields[0];
@@ -1759,6 +1906,10 @@ mod oidc_callback_db_tests {
         assert_eq!(
             cookie_fields[1],
             "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
+        );
+        assert_eq!(
+            cookie_fields[2],
+            "__Host-oidc_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
         );
 
         let session_bearer = cookie
@@ -1806,7 +1957,7 @@ mod oidc_callback_db_tests {
 
     /// Login-CSRF / session-swapping defense: a VALID, unused state plus a fully
     /// valid id_token are STILL rejected when the browser does not present the
-    /// matching `oidc_login_csrf` cookie. This blocks the attack where a victim's
+    /// matching `__Host-oidc_login_csrf` cookie. This blocks the attack where a victim's
     /// browser is fed a `state` obtained from the attacker's own OIDC flow.
     #[tokio::test]
     async fn test_callback_browser_binding_mismatch_returns_400() {
@@ -1841,12 +1992,12 @@ mod oidc_callback_db_tests {
             ))
             .header(
                 axum::http::header::COOKIE,
-                "oidc_login_csrf=attacker-different-binding",
+                "__Host-oidc_login_csrf=attacker-different-binding",
             )
             .body(Body::empty())
             .unwrap();
 
-        let resp = app.oneshot(req).await.expect("request");
+        let resp = app.clone().oneshot(req).await.expect("request");
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
@@ -1855,6 +2006,18 @@ mod oidc_callback_db_tests {
         assert!(
             !resp.headers().contains_key("set-cookie"),
             "no session cookie may be set on a binding mismatch"
+        );
+
+        let retry = app
+            .oneshot(callback_req(format!(
+                "/api/auth/oidc/callback?code=test-code&state={state}"
+            )))
+            .await
+            .expect("retry request");
+        assert_eq!(
+            retry.status(),
+            StatusCode::BAD_REQUEST,
+            "binding failure must consume the single-use state before retry"
         );
     }
 

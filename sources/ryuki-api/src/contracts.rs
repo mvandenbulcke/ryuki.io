@@ -16661,15 +16661,8 @@ async fn oidc_login_initiate(request: Request) -> Result<Response, (StatusCode, 
     // browser sends it on the top-level redirect BACK from the IdP to the
     // callback (a cross-site navigation); Secure follows the session policy.
     // Short-lived to match the state TTL. The value is base64url (cookie-safe).
-    let binding_cookie = format!(
-        "oidc_login_csrf={}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
-        binding,
-        if cfg.session.cookie_secure {
-            "; Secure"
-        } else {
-            ""
-        }
-    );
+    let binding_cookie =
+        crate::oidc_callback::oidc_binding_cookie_header(binding, cfg.session.cookie_secure);
     let cookie_hv = axum::http::HeaderValue::from_str(&binding_cookie).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
