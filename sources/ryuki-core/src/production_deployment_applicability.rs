@@ -583,12 +583,9 @@ fn validate_provider_inventory<'a>(
             "provider lifecycle_record_version",
             provider.lifecycle_record_version,
         )?;
-        if provider.provider_kind.trim() != provider.provider_kind
-            || provider.provider_kind.is_empty()
-            || provider.provider_kind.len() > 96
-        {
+        if !production_provider_kind(&provider.provider_kind) {
             return Err(invalid(format!(
-                "provider {} has a noncanonical provider kind",
+                "provider {} does not select a closed production provider kind",
                 provider.provider_id
             )));
         }
@@ -656,6 +653,21 @@ fn validate_provider_inventory<'a>(
         }
     }
     Ok(shipped)
+}
+
+fn production_provider_kind(provider_kind: &str) -> bool {
+    matches!(
+        provider_kind,
+        "oidc"
+            | "oidc-broker"
+            | "local-webauthn"
+            | "secret-service"
+            | "key-custody"
+            | "certificate-authority"
+            | "oauth-service"
+            | "api-token"
+            | "workload"
+    )
 }
 
 fn push_bounded_instance(
@@ -1719,6 +1731,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("must both be production eligible"));
+    }
+
+    #[test]
+    fn development_or_unknown_provider_kinds_cannot_claim_production_eligibility() {
+        let manifest = manifest();
+        let profile = profile(&manifest);
+        for provider_kind in ["development-fixture", "mock-provider"] {
+            let mut claims = claims(&profile);
+            claims.provider_registry.active_providers[0].provider_kind = provider_kind.into();
+            let error = derive_production_deployment_applicability(
+                &trace_fixture(),
+                &manifest,
+                &profile,
+                &claims,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("closed production provider kind"));
+        }
     }
 
     #[test]

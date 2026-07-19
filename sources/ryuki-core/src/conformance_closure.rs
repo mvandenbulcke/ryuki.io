@@ -25,17 +25,23 @@ use crate::conformance_trust::{
 };
 use crate::production_build::ProductionBuildManifest;
 use crate::production_deployment_applicability::{
-    DerivedProductionApplicability, ProductionDeploymentApplicabilityClaims,
-    derive_complete_production_applicability,
+    ActiveProviderApplicabilityClaim, DerivedProductionApplicability,
+    ProductionDeploymentApplicabilityClaims, derive_complete_production_applicability,
 };
 use crate::security_profile::{
-    ArtifactKind, DeploymentSecurityProfile, GuardId, RuntimeGuardMode, VersionedContentReference,
+    ArtifactKind, DeploymentSecurityProfile, ExpectedProviderBinding, GuardId,
+    ProductionAuthenticatorKind, RuntimeGuardExpectedValue, RuntimeGuardMode,
+    VersionedContentReference,
 };
 
 pub const DEPLOYMENT_PROFILE_CONFORMANCE_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-deployment-profile-conformance-binding-v1";
 pub const DEPLOYMENT_PROFILE_CONFORMANCE_RECEIPT_DIGEST_SENTINEL: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub const RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-runtime-guard-requirement-binding-v1";
+pub const RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-runtime-guard-semantic-challenge-binding-v1";
 
 const CONTROL_TRACE_SCHEMA: &str =
     "https://ryuki.io/schemas/security-contracts/v1/control-trace.schema.json";
@@ -396,6 +402,9 @@ pub struct VerifiedRuntimeGuardRequirement {
     receipt_version: u64,
     receipt_digest: String,
     receipt_locator: String,
+    expected_value: RuntimeGuardExpectedValue,
+    requirement_digest: String,
+    semantic_challenge_binding_digest: String,
 }
 
 impl VerifiedRuntimeGuardRequirement {
@@ -421,6 +430,18 @@ impl VerifiedRuntimeGuardRequirement {
 
     pub fn receipt_locator(&self) -> &str {
         &self.receipt_locator
+    }
+
+    pub fn expected_value(&self) -> &RuntimeGuardExpectedValue {
+        &self.expected_value
+    }
+
+    pub fn requirement_digest(&self) -> &str {
+        &self.requirement_digest
+    }
+
+    pub fn semantic_challenge_binding_digest(&self) -> &str {
+        &self.semantic_challenge_binding_digest
     }
 }
 
@@ -757,6 +778,10 @@ pub fn verify_production_conformance_closure(
             "production applicability derivation failed: {error}"
         ))
     })?;
+    validate_runtime_guard_provider_bindings(
+        inputs.profile,
+        &inputs.deployment_claims.provider_registry.active_providers,
+    )?;
 
     let root_artifact = current_root.artifact();
     let mut bundles = Vec::new();
@@ -796,6 +821,7 @@ pub fn verify_production_conformance_closure(
         &applicability,
         trusted_now,
         migration_overlay_retirement_deadline,
+        &inputs.context.deployment_profile_raw_digest,
         current_root.artifact().complete_document_digest(),
         current_root.artifact().acceptance_record_id(),
     )?;
@@ -936,6 +962,161 @@ fn validate_claim_context_bindings(
         ));
     }
     Ok(())
+}
+
+fn validate_runtime_guard_provider_bindings(
+    profile: &DeploymentSecurityProfile,
+    active_providers: &[ActiveProviderApplicabilityClaim],
+) -> Result<(), ConformanceClosureError> {
+    let [trust_domain_id] = profile.trust_topology.trust_domain_ids.as_slice() else {
+        return Err(invalid(
+            "runtime guard provider binding requires exactly one production trust domain",
+        ));
+    };
+    let claims_by_id = active_providers
+        .iter()
+        .map(|claim| (claim.provider_id.as_str(), claim))
+        .collect::<BTreeMap<_, _>>();
+    if claims_by_id.len() != active_providers.len() {
+        return Err(invalid(
+            "runtime guard provider binding received duplicate active provider ids",
+        ));
+    }
+
+    for guard in &profile.runtime_guard_evidence.guards {
+        match &guard.expected_value {
+            RuntimeGuardExpectedValue::ApprovedSecretProvider {
+                providers,
+                required_capability_ids,
+            } => {
+                let expected_ids = providers
+                    .iter()
+                    .map(|provider| provider.provider_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let active_secret_ids = active_providers
+                    .iter()
+                    .filter(|claim| claim.provider_kind == "secret-service")
+                    .map(|claim| claim.provider_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if expected_ids != active_secret_ids {
+                    return Err(invalid(
+                        "approved-secret-provider expectation is not the exact active secret-service provider inventory",
+                    ));
+                }
+                for expected in providers {
+                    let claim = exact_guard_provider_claim(
+                        "approved-secret-provider",
+                        expected,
+                        &claims_by_id,
+                        trust_domain_id,
+                    )?;
+                    if claim.provider_kind != "secret-service"
+                        || required_capability_ids.iter().any(|capability_id| {
+                            claim
+                                .advertised_capability_ids
+                                .binary_search(capability_id)
+                                .is_err()
+                        })
+                    {
+                        return Err(invalid(format!(
+                            "approved-secret-provider {} is not a secret-service provider advertising every required capability",
+                            expected.provider_id
+                        )));
+                    }
+                }
+            }
+            RuntimeGuardExpectedValue::NonDevelopmentAuthenticator { authenticators, .. } => {
+                let expected_ids = authenticators
+                    .iter()
+                    .map(|authenticator| authenticator.provider.provider_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let active_authenticator_ids = active_providers
+                    .iter()
+                    .filter(|claim| production_authenticator_provider_kind(&claim.provider_kind))
+                    .map(|claim| claim.provider_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if expected_ids != active_authenticator_ids {
+                    return Err(invalid(
+                        "non-development-authenticator expectation is not the exact active authenticator provider inventory",
+                    ));
+                }
+                for authenticator in authenticators {
+                    let claim = exact_guard_provider_claim(
+                        "non-development-authenticator",
+                        &authenticator.provider,
+                        &claims_by_id,
+                        trust_domain_id,
+                    )?;
+                    if !provider_kind_supports_authenticator(
+                        &claim.provider_kind,
+                        authenticator.authenticator_kind,
+                    ) {
+                        return Err(invalid(format!(
+                            "non-development-authenticator {} provider kind does not match its typed authenticator kind",
+                            authenticator.provider.provider_id
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn exact_guard_provider_claim<'a>(
+    guard_label: &str,
+    expected: &ExpectedProviderBinding,
+    claims_by_id: &BTreeMap<&str, &'a ActiveProviderApplicabilityClaim>,
+    trust_domain_id: &str,
+) -> Result<&'a ActiveProviderApplicabilityClaim, ConformanceClosureError> {
+    let claim = claims_by_id
+        .get(expected.provider_id.as_str())
+        .copied()
+        .ok_or_else(|| {
+            invalid(format!(
+                "{guard_label} expected provider {} is absent from the exact active provider inventory",
+                expected.provider_id
+            ))
+        })?;
+    if !claim.production_eligible
+        || claim.trust_domain_id != trust_domain_id
+        || expected.configuration_version != claim.configuration_version
+        || expected.configuration_payload_digest != claim.configuration_payload_digest
+        || expected.lifecycle_record_version != claim.lifecycle_record_version
+        || expected.lifecycle_state != claim.lifecycle_state
+        || expected.capability_descriptor_id != claim.descriptor_id
+        || expected.capability_descriptor_version != claim.descriptor_version
+        || expected.adapter_kind != claim.adapter_kind
+        || expected.adapter_version != claim.adapter_version
+    {
+        return Err(invalid(format!(
+            "{guard_label} expected provider {} does not exactly match its production-eligible active provider claim",
+            expected.provider_id
+        )));
+    }
+    Ok(claim)
+}
+
+fn production_authenticator_provider_kind(provider_kind: &str) -> bool {
+    matches!(
+        provider_kind,
+        "oidc" | "oidc-broker" | "local-webauthn" | "workload" | "oauth-service"
+    )
+}
+
+fn provider_kind_supports_authenticator(
+    provider_kind: &str,
+    authenticator_kind: ProductionAuthenticatorKind,
+) -> bool {
+    match authenticator_kind {
+        ProductionAuthenticatorKind::Oidc => matches!(provider_kind, "oidc" | "oidc-broker"),
+        ProductionAuthenticatorKind::Passkey => provider_kind == "local-webauthn",
+        ProductionAuthenticatorKind::MutualTls => provider_kind == "workload",
+        ProductionAuthenticatorKind::Composite => {
+            matches!(provider_kind, "oidc-broker" | "workload" | "oauth-service")
+        }
+    }
 }
 
 fn profile_policy_version_bindings(profile: &DeploymentSecurityProfile) -> Vec<Value> {
@@ -1110,6 +1291,7 @@ fn verify_with_proof_facts(
     applicability: &DerivedProductionApplicability,
     trusted_now: ConformanceTrustedTimeWindow,
     semantic_validity_ceiling: Option<DateTime<Utc>>,
+    deployment_profile_raw_digest: &str,
     current_root_digest: &str,
     current_root_acceptance_record_id: &str,
 ) -> Result<ClosureProjection, ConformanceClosureError> {
@@ -1301,7 +1483,7 @@ fn verify_with_proof_facts(
                 .to_owned()
         })
         .collect::<BTreeSet<_>>();
-    let runtime_guard_requirements = validate_runtime_guard_requirements(
+    let mut runtime_guard_requirements = validate_runtime_guard_requirements(
         context.deployment_profile_document,
         &current_receipts,
         &traces,
@@ -1358,6 +1540,17 @@ fn verify_with_proof_facts(
                 "cannot canonicalize verified closure projection: {error}"
             ))
         })?);
+    for requirement in &mut runtime_guard_requirements {
+        requirement.semantic_challenge_binding_digest =
+            runtime_guard_semantic_challenge_binding_digest(
+                &closure_digest,
+                &context_digest,
+                deployment_profile_raw_digest,
+                context,
+                authority,
+                requirement,
+            )?;
+    }
 
     Ok(ClosureProjection {
         closure_digest,
@@ -2609,6 +2802,15 @@ fn validate_runtime_guard_requirements(
                 receipt.id
             )));
         }
+        let requirement_digest = runtime_guard_requirement_digest(
+            guard.guard_id,
+            &control_ids,
+            receipt.id,
+            receipt.version,
+            receipt.input.raw_digest,
+            receipt.input.artifact_locator,
+            &guard.expected_value,
+        )?;
         requirements.push(VerifiedRuntimeGuardRequirement {
             guard_id: guard.guard_id,
             control_ids,
@@ -2616,6 +2818,9 @@ fn validate_runtime_guard_requirements(
             receipt_version: receipt.version,
             receipt_digest: receipt.input.raw_digest.to_owned(),
             receipt_locator: receipt.input.artifact_locator.to_owned(),
+            expected_value: guard.expected_value,
+            requirement_digest,
+            semantic_challenge_binding_digest: String::new(),
         });
     }
     let expected = [
@@ -2676,10 +2881,84 @@ fn runtime_guard_projection(requirements: &[VerifiedRuntimeGuardRequirement]) ->
                     "receipt_version": requirement.receipt_version,
                     "receipt_digest": requirement.receipt_digest.as_str(),
                     "receipt_locator": requirement.receipt_locator.as_str(),
+                    "expected_value": &requirement.expected_value,
+                    "requirement_digest": requirement.requirement_digest.as_str(),
                 })
             })
             .collect(),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_guard_requirement_digest(
+    guard_id: GuardId,
+    control_ids: &BTreeSet<String>,
+    receipt_id: &str,
+    receipt_version: u64,
+    receipt_digest: &str,
+    receipt_locator: &str,
+    expected_value: &RuntimeGuardExpectedValue,
+) -> Result<String, ConformanceClosureError> {
+    let projection = json!({
+        "digest_contract": RUNTIME_GUARD_REQUIREMENT_BINDING_DIGEST_CONTRACT,
+        "guard_id": guard_key(guard_id),
+        "control_ids": control_ids,
+        "receipt": {
+            "artifact_kind": "package-exit-receipt",
+            "document_id": receipt_id,
+            "document_version": receipt_version,
+            "content_digest": receipt_digest,
+            "artifact_locator": receipt_locator,
+        },
+        "expected_value": expected_value,
+    });
+    canonical_projection_digest(&projection, "runtime guard requirement")
+}
+
+fn runtime_guard_semantic_challenge_binding_digest(
+    closure_digest: &str,
+    context_digest: &str,
+    deployment_profile_raw_digest: &str,
+    context: ConformanceClosureContext<'_>,
+    authority: &ProofFacts,
+    requirement: &VerifiedRuntimeGuardRequirement,
+) -> Result<String, ConformanceClosureError> {
+    let root = context.production_acceptance_receipt_ref;
+    let projection = json!({
+        "digest_contract": RUNTIME_GUARD_SEMANTIC_CHALLENGE_BINDING_DIGEST_CONTRACT,
+        "closure_digest": closure_digest,
+        "context_digest": context_digest,
+        "deployment_profile_raw_digest": deployment_profile_raw_digest,
+        "deployment_id": context.deployment_id,
+        "trust_domain_id": context.trust_domain_id,
+        "source_revision": context.source_revision,
+        "artifact_digest": context.artifact_digest,
+        "authority": {
+            "authority_id": authority.authority_id,
+            "authority_epoch": authority.authority_epoch,
+            "authority_revision": authority.authority_revision,
+            "checkpoint_sequence": authority.checkpoint_sequence,
+            "snapshot_binding_digest": authority.snapshot_binding_digest,
+        },
+        "root_receipt": {
+            "artifact_kind": "package-exit-receipt",
+            "document_id": root.document_id,
+            "document_version": root.document_version,
+            "content_digest": root.content_digest,
+            "artifact_locator": root.artifact_locator,
+        },
+        "requirement_digest": requirement.requirement_digest,
+    });
+    canonical_projection_digest(&projection, "runtime guard challenge")
+}
+
+fn canonical_projection_digest(
+    projection: &Value,
+    label: &str,
+) -> Result<String, ConformanceClosureError> {
+    canonical_json_bytes(projection)
+        .map(|bytes| digest_bytes(&bytes))
+        .map_err(|error| invalid(format!("cannot canonicalize {label} projection: {error}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3810,6 +4089,108 @@ pub mod tests {
         ][index]
     }
 
+    fn guard_expected_value(index: usize) -> Value {
+        let provider = |provider_id: &str| {
+            let provider_name = provider_id
+                .strip_prefix("provider:")
+                .expect("fixture provider ids are canonical");
+            let adapter_kind = match provider_id {
+                "provider:closure-oidc" => "auth.oidc",
+                "provider:closure-secrets" => "secrets.service",
+                _ => panic!("unknown guard fixture provider {provider_id}"),
+            };
+            json!({
+                "provider_id": provider_id,
+                "configuration_version": 1,
+                "configuration_payload_digest": test_digest(&format!("{provider_id}-configuration")),
+                "lifecycle_record_version": 1,
+                "lifecycle_state": "active",
+                "capability_descriptor_id": format!("capability-descriptor:{provider_name}"),
+                "capability_descriptor_version": 1,
+                "adapter_kind": adapter_kind,
+                "adapter_version": "1.0.0",
+            })
+        };
+        match index {
+            0 => json!({
+                "kind": "durable-postgresql",
+                "database_provider": "cloudnativepg",
+                "server_major_version": 18,
+                "database_identity_digest": test_digest("guard-database-identity"),
+                "storage_binding_digest": test_digest("guard-storage-binding"),
+                "migration_inventory_digest": test_digest("guard-migration-inventory"),
+                "application_role": "ryuki_application",
+                "migration_role": "ryuki_migrator",
+            }),
+            1 => json!({
+                "kind": "approved-secret-provider",
+                "providers": [provider("provider:closure-secrets")],
+                "required_capability_ids": ["secret-read", "secret-renew"],
+            }),
+            2 => json!({
+                "kind": "https-public-urls",
+                "public_origin_set_digest": test_digest("guard-public-origins"),
+                "ingress_binding_digest": test_digest("guard-ingress-binding"),
+                "attestation_profile_id": "ingress-attestation-profile:closure-fixture",
+                "attestation_profile_version": 1,
+                "attestation_profile_digest": test_digest("guard-ingress-profile"),
+            }),
+            3 => json!({
+                "kind": "secure-cookies",
+                "policies": [{
+                    "policy_id": "cookie-policy:api-session",
+                    "cookie_name": "__Host-ryuki_session",
+                    "secure": true,
+                    "http_only": true,
+                    "path": "/",
+                    "domain": null,
+                    "same_site": "lax",
+                    "policy_digest": test_digest("guard-cookie-policy"),
+                }],
+                "policy_inventory_digest": test_digest("guard-cookie-inventory"),
+            }),
+            4 => json!({
+                "kind": "non-development-authenticator",
+                "authenticator_inventory_digest": test_digest("guard-authenticator-inventory"),
+                "authenticators": [{
+                    "provider": provider("provider:closure-oidc"),
+                    "authenticator_kind": "oidc",
+                }],
+            }),
+            5 => json!({
+                "kind": "external-signing-key-material",
+                "signing_inventory_digest": test_digest("guard-signing-inventory"),
+                "purposes": [{
+                    "purpose_id": "signing-purpose:control-plane-grants",
+                    "algorithm": "ed25519",
+                    "custody_kind": "kms",
+                    "key_identity_digest": test_digest("guard-control-plane-key"),
+                }, {
+                    "purpose_id": "signing-purpose:session-credentials",
+                    "algorithm": "hmac-sha256",
+                    "custody_kind": "hsm",
+                    "key_identity_digest": test_digest("guard-session-key"),
+                }],
+            }),
+            6 => json!({
+                "kind": "mock-dependencies-disabled",
+                "dependency_inventory_digest": test_digest("guard-dependency-inventory"),
+                "required_component_ids": [
+                    "runtime-component:database",
+                    "runtime-component:secret-provider",
+                ],
+            }),
+            7 => json!({
+                "kind": "first-owner-path-closed",
+                "deployment_id": DEPLOYMENT_ID,
+                "state_contract_version": 1,
+                "authority_namespace_digest": test_digest("guard-authority-namespace"),
+                "closure_record_digest": test_digest("guard-first-owner-closure"),
+            }),
+            _ => unreachable!("there are exactly eight guards"),
+        }
+    }
+
     fn receipt_id(package_id: &str) -> String {
         format!("package-exit-receipt:{}", package_id.to_ascii_lowercase())
     }
@@ -3899,7 +4280,8 @@ pub mod tests {
                         "document_version":1,
                         "content_digest":test_digest(&format!("placeholder-{package_id}")),
                         "artifact_locator":receipt_locator(package_id),
-                    }
+                    },
+                    "expected_value":guard_expected_value(index),
                 })).collect::<Vec<_>>()
             });
 
@@ -4337,6 +4719,7 @@ pub mod tests {
                 &self.applicability,
                 self.trusted_now,
                 None,
+                &digest_bytes(&canonical_json_bytes(&self.profile).unwrap()),
                 &self.root_ref.content_digest,
                 &self.current_root_acceptance_record_id,
             )
@@ -4688,7 +5071,8 @@ pub mod tests {
         ledger: &Value,
         control_trace_ref: &VersionedContentReference,
     ) -> ProductionBuildManifest {
-        let baseline_digest = test_digest("fixture-adapter-baseline");
+        let oidc_baseline_digest = test_digest("fixture-oidc-adapter-baseline");
+        let secret_baseline_digest = test_digest("fixture-secret-adapter-baseline");
         let mut manifest: ProductionBuildManifest = serde_json::from_value(json!({
             "$schema": crate::production_build::PRODUCTION_BUILD_MANIFEST_SCHEMA_URI,
             "schema_version": crate::production_build::PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION,
@@ -4721,24 +5105,39 @@ pub mod tests {
                 "content_digest": ARTIFACT_DIGEST,
             },
             "control_trace_ref": control_trace_ref,
-            "shipped_adapters": [{
-                "adapter_kind": "auth.fixture",
-                "adapter_version": "1.0.0",
-                "production_eligible": true,
-                "capability_ids": ["authenticate"],
-                "mandatory_baseline": {
-                    "document_id": "provider-capability-baseline:closure-fixture",
-                    "document_version": 1,
-                    "content_digest": baseline_digest,
-                    "artifact_locator": "fixtures/providers/closure-baseline.json",
-                    "required_trace_ids": ["TRACE-SB-CONF-05-AC-055"],
+            "shipped_adapters": [
+                {
+                    "adapter_kind": "auth.oidc",
+                    "adapter_version": "1.0.0",
+                    "production_eligible": true,
+                    "capability_ids": ["authenticate"],
+                    "mandatory_baseline": {
+                        "document_id": "provider-capability-baseline:closure-oidc",
+                        "document_version": 1,
+                        "content_digest": oidc_baseline_digest,
+                        "artifact_locator": "fixtures/providers/closure-oidc-baseline.json",
+                        "required_trace_ids": ["TRACE-SB-CONF-05-AC-055"],
+                    },
                 },
-            }],
+                {
+                    "adapter_kind": "secrets.service",
+                    "adapter_version": "1.0.0",
+                    "production_eligible": true,
+                    "capability_ids": ["secret-read", "secret-renew"],
+                    "mandatory_baseline": {
+                        "document_id": "provider-capability-baseline:closure-secrets",
+                        "document_version": 1,
+                        "content_digest": secret_baseline_digest,
+                        "artifact_locator": "fixtures/providers/closure-secrets-baseline.json",
+                        "required_trace_ids": ["TRACE-SB-CONF-05-AC-055"],
+                    },
+                }
+            ],
             "selector_dispositions": [{
                 "selector_domain": "auth_mode",
                 "selector": "fixture",
                 "disposition": "implemented",
-                "adapter_kind": "auth.fixture",
+                "adapter_kind": "auth.oidc",
             }],
             "implementation_applicability": {
                 "identity_contract": APPLICABILITY_IDENTITY_CONTRACT,
@@ -4759,7 +5158,47 @@ pub mod tests {
         profile: &DeploymentSecurityProfile,
         manifest: &ProductionBuildManifest,
     ) -> ProductionDeploymentApplicabilityClaims {
-        let adapter = &manifest.shipped_adapters[0];
+        let provider_claim =
+            |provider_id: &str,
+             provider_kind: &str,
+             adapter: &crate::production_build::ShippedAdapter| {
+                let provider_name = provider_id
+                    .strip_prefix("provider:")
+                    .expect("fixture provider ids are canonical");
+                ActiveProviderApplicabilityClaim {
+                    provider_id: provider_id.into(),
+                    provider_kind: provider_kind.into(),
+                    configuration_version: 1,
+                    configuration_payload_digest: test_digest(&format!(
+                        "{provider_id}-configuration"
+                    )),
+                    lifecycle_record_version: 1,
+                    lifecycle_state: ProviderLifecycleState::Active,
+                    trust_domain_id: TRUST_DOMAIN_ID.into(),
+                    descriptor_id: format!("capability-descriptor:{provider_name}"),
+                    descriptor_version: 1,
+                    adapter_kind: adapter.adapter_kind.clone(),
+                    adapter_version: adapter.adapter_version.clone(),
+                    advertised_capability_ids: adapter.capability_ids.clone(),
+                    production_eligible: true,
+                    mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                        document_id: adapter.mandatory_baseline.document_id.clone(),
+                        document_version: adapter.mandatory_baseline.document_version,
+                        content_digest: adapter.mandatory_baseline.content_digest.clone(),
+                        artifact_locator: adapter.mandatory_baseline.artifact_locator.clone(),
+                    },
+                }
+            };
+        let oidc_adapter = manifest
+            .shipped_adapters
+            .iter()
+            .find(|adapter| adapter.adapter_kind == "auth.oidc")
+            .expect("fixture manifest contains the OIDC adapter");
+        let secret_adapter = manifest
+            .shipped_adapters
+            .iter()
+            .find(|adapter| adapter.adapter_kind == "secrets.service")
+            .expect("fixture manifest contains the secret-service adapter");
         ProductionDeploymentApplicabilityClaims {
             checkpoints: vec![DeploymentCheckpointApplicabilityClaim {
                 trust_domain_id: TRUST_DOMAIN_ID.into(),
@@ -4781,27 +5220,10 @@ pub mod tests {
                 content_digest: profile.provider_registry_ref.content_digest.clone(),
                 artifact_locator: profile.provider_registry_ref.artifact_locator.clone(),
                 registry_version: 1,
-                active_providers: vec![ActiveProviderApplicabilityClaim {
-                    provider_id: "provider:closure-fixture".into(),
-                    provider_kind: "oidc".into(),
-                    configuration_version: 1,
-                    configuration_payload_digest: test_digest("fixture-provider-configuration"),
-                    lifecycle_record_version: 1,
-                    lifecycle_state: ProviderLifecycleState::Active,
-                    trust_domain_id: TRUST_DOMAIN_ID.into(),
-                    descriptor_id: "capability-descriptor:closure-fixture".into(),
-                    descriptor_version: 1,
-                    adapter_kind: adapter.adapter_kind.clone(),
-                    adapter_version: adapter.adapter_version.clone(),
-                    advertised_capability_ids: adapter.capability_ids.clone(),
-                    production_eligible: true,
-                    mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
-                        document_id: adapter.mandatory_baseline.document_id.clone(),
-                        document_version: adapter.mandatory_baseline.document_version,
-                        content_digest: adapter.mandatory_baseline.content_digest.clone(),
-                        artifact_locator: adapter.mandatory_baseline.artifact_locator.clone(),
-                    },
-                }],
+                active_providers: vec![
+                    provider_claim("provider:closure-oidc", "oidc", oidc_adapter),
+                    provider_claim("provider:closure-secrets", "secret-service", secret_adapter),
+                ],
             },
             security_limit_profile: SecurityLimitApplicabilityClaim {
                 document_id: profile.security_limit_profile_ref.document_id.clone(),
@@ -4881,6 +5303,12 @@ pub mod tests {
         OverlayWithEarlierSemanticExpiry,
         WrongDerivedProfile,
         WrongTypedProfile,
+        WrongGuardExpectedValue,
+        UnknownGuardProvider,
+        MismatchedGuardProviderProjection,
+        MissingSecretCapability,
+        AuthenticatorProviderKindMismatch,
+        DevelopmentProviderClaim,
     }
 
     fn verify_public_fixture(
@@ -4992,28 +5420,53 @@ pub mod tests {
                         "content_digest": test_digest(&format!("placeholder-public-{package_id}")),
                         "artifact_locator": receipt_locator(package_id),
                     },
+                    "expected_value": guard_expected_value(index),
                 }))
                 .collect::<Vec<_>>(),
         });
+        match mutation {
+            PublicFixtureMutation::UnknownGuardProvider => {
+                profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"][0]
+                    ["provider_id"] = json!("provider:closure-unknown");
+            }
+            PublicFixtureMutation::MissingSecretCapability => {
+                profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["required_capability_ids"] =
+                    json!(["secret-admin"]);
+            }
+            PublicFixtureMutation::MismatchedGuardProviderProjection => {
+                profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"][0]
+                    ["configuration_payload_digest"] =
+                    json!(test_digest("cross-wired-secret-provider-configuration"));
+            }
+            PublicFixtureMutation::AuthenticatorProviderKindMismatch => {
+                profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
+                    [0]["authenticator_kind"] = json!("passkey");
+            }
+            _ => {}
+        }
 
         let preliminary_profile: DeploymentSecurityProfile =
             serde_json::from_value(profile.clone()).unwrap();
         let mut manifest = fixture_manifest(&ledger, &preliminary_profile.control_trace_ref);
-        let claims = fixture_deployment_claims(&preliminary_profile, &manifest);
+        let mut claims = fixture_deployment_claims(&preliminary_profile, &manifest);
+        if matches!(mutation, PublicFixtureMutation::DevelopmentProviderClaim) {
+            claims.provider_registry.active_providers[0].provider_kind =
+                "development-fixture".into();
+        }
         let applicability = derive_complete_production_applicability(
             &ledger,
             &manifest,
             &preliminary_profile,
             &claims,
         )
-        .unwrap();
-        assert_eq!(applicability.instances.len(), 139);
+        .map_err(|error| error.to_string())?;
+        assert_eq!(applicability.instances.len(), 143);
         let implementation_count = applicability
             .instances
             .iter()
             .filter(|instance| instance.scope == ApplicabilityScope::Implementation)
             .count();
-        assert_eq!(implementation_count, 136);
+        assert_eq!(implementation_count, 138);
         manifest.implementation_applicability = recompute_applicability_inventory_binding(
             &crate::conformance_applicability::ApplicabilityControlTraceBinding {
                 document_id: preliminary_profile.control_trace_ref.document_id.clone(),
@@ -5430,6 +5883,22 @@ pub mod tests {
         ) {
             supplied_profile.policy_version += 1;
         }
+        if matches!(mutation, PublicFixtureMutation::WrongGuardExpectedValue) {
+            let durable_postgresql = supplied_profile
+                .runtime_guard_evidence
+                .guards
+                .iter_mut()
+                .find(|guard| guard.guard_id == GuardId::DurablePostgresql)
+                .expect("the genuine fixture must contain the durable PostgreSQL guard");
+            let RuntimeGuardExpectedValue::DurablePostgresql {
+                storage_binding_digest,
+                ..
+            } = &mut durable_postgresql.expected_value
+            else {
+                unreachable!("the guard identifier and expected-value kind are fixture-bound")
+            };
+            *storage_binding_digest = test_digest("cross-wired-storage-binding");
+        }
         let context_profile = if matches!(mutation, PublicFixtureMutation::WrongDerivedProfile) {
             &supplied_profile
         } else {
@@ -5459,7 +5928,7 @@ pub mod tests {
         .map_err(|error| error.to_string())
     }
 
-    /// Builds the same genuinely signed 139-instance closure used by the core
+    /// Builds the same genuinely signed 143-instance closure used by the core
     /// acceptance test and returns its exact bound profile representation.
     ///
     /// This is feature-gated test support so downstream startup-composition
@@ -5474,13 +5943,29 @@ pub mod tests {
     }
 
     #[test]
-    fn public_entrypoint_accepts_one_genuine_opaque_139_instance_closure() {
+    fn public_entrypoint_accepts_one_genuine_opaque_143_instance_closure() {
         let closure = verify_public_fixture(PublicFixtureMutation::None)
             .expect("the public closure boundary must accept one exact authenticated fixture");
         assert_eq!(closure.package_count(), 10);
-        assert_eq!(closure.evidence_count(), 139);
-        assert_eq!(closure.applicability_instances().len(), 139);
+        assert_eq!(closure.evidence_count(), 143);
+        assert_eq!(closure.applicability_instances().len(), 143);
         assert_eq!(closure.runtime_guard_requirements().len(), 8);
+        for requirement in closure.runtime_guard_requirements() {
+            assert_eq!(
+                requirement.guard_id(),
+                requirement.expected_value().guard_id()
+            );
+            assert!(requirement.requirement_digest().starts_with("sha256:"));
+            assert!(
+                requirement
+                    .semantic_challenge_binding_digest()
+                    .starts_with("sha256:")
+            );
+            assert_ne!(
+                requirement.requirement_digest(),
+                requirement.semantic_challenge_binding_digest()
+            );
+        }
         assert_eq!(
             closure.production_build_manifest().source.revision,
             SOURCE_REVISION
@@ -5495,12 +5980,77 @@ pub mod tests {
     }
 
     #[test]
+    fn runtime_guard_challenges_cannot_replay_across_verified_closures() {
+        let first = verify_public_fixture(PublicFixtureMutation::None).unwrap();
+        let second = verify_public_fixture(PublicFixtureMutation::None).unwrap();
+        for (first_requirement, second_requirement) in first
+            .runtime_guard_requirements()
+            .iter()
+            .zip(second.runtime_guard_requirements())
+        {
+            assert_eq!(first_requirement.guard_id(), second_requirement.guard_id());
+            assert_ne!(
+                first_requirement.semantic_challenge_binding_digest(),
+                second_requirement.semantic_challenge_binding_digest()
+            );
+        }
+    }
+
+    #[test]
     fn public_entrypoint_rejects_typed_profile_different_from_exact_document() {
         let error = verify_public_fixture(PublicFixtureMutation::WrongTypedProfile).unwrap_err();
         assert!(
             error
                 .contains("typed deployment profile differs from the exact bound profile document")
         );
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_guard_expectation_different_from_authenticated_profile() {
+        let error =
+            verify_public_fixture(PublicFixtureMutation::WrongGuardExpectedValue).unwrap_err();
+        assert!(
+            error
+                .contains("typed deployment profile differs from the exact bound profile document")
+        );
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_guard_provider_absent_from_active_inventory() {
+        let error = verify_public_fixture(PublicFixtureMutation::UnknownGuardProvider).unwrap_err();
+        assert!(error.contains(
+            "approved-secret-provider expectation is not the exact active secret-service provider inventory"
+        ));
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_guard_provider_projection_mismatch() {
+        let error = verify_public_fixture(PublicFixtureMutation::MismatchedGuardProviderProjection)
+            .unwrap_err();
+        assert!(
+            error.contains("does not exactly match its production-eligible active provider claim")
+        );
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_secret_provider_without_required_capability() {
+        let error =
+            verify_public_fixture(PublicFixtureMutation::MissingSecretCapability).unwrap_err();
+        assert!(error.contains("advertising every required capability"));
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_authenticator_provider_kind_mismatch() {
+        let error = verify_public_fixture(PublicFixtureMutation::AuthenticatorProviderKindMismatch)
+            .unwrap_err();
+        assert!(error.contains("provider kind does not match its typed authenticator kind"));
+    }
+
+    #[test]
+    fn public_entrypoint_rejects_development_provider_claims() {
+        let error =
+            verify_public_fixture(PublicFixtureMutation::DevelopmentProviderClaim).unwrap_err();
+        assert!(error.contains("closed production provider kind"));
     }
 
     #[test]
@@ -5641,7 +6191,8 @@ pub mod tests {
                     "document_version":4,
                     "content_digest":test_digest("guard-a"),
                     "artifact_locator":"catalog/security-contracts/v1/package-exit-receipts/guard.json"
-                }
+                },
+                "expected_value":guard_expected_value(0)
             }]
         });
         let guarded_digest = deployment_profile_conformance_binding_digest(&guarded).unwrap();
@@ -5651,6 +6202,13 @@ pub mod tests {
         assert_eq!(
             guarded_digest,
             deployment_profile_conformance_binding_digest(&changed_guard_digest).unwrap()
+        );
+        let mut changed_guard_expected_value = guarded.clone();
+        changed_guard_expected_value["runtime_guard_evidence"]["guards"][0]["expected_value"]["storage_binding_digest"] =
+            json!(test_digest("changed-guard-storage-binding"));
+        assert_ne!(
+            guarded_digest,
+            deployment_profile_conformance_binding_digest(&changed_guard_expected_value).unwrap()
         );
         let mut changed_guard_identity = guarded;
         changed_guard_identity["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["document_version"] =

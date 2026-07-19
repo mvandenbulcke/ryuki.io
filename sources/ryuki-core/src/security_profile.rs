@@ -257,6 +257,7 @@ pub struct GuardEvidence {
     pub guard_id: GuardId,
     pub control_ids: Vec<String>,
     pub receipt_ref: VersionedContentReference,
+    pub expected_value: RuntimeGuardExpectedValue,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -270,6 +271,160 @@ pub enum GuardId {
     ExternalSigningKeyMaterial,
     MockDependenciesDisabled,
     FirstOwnerPathClosed,
+}
+
+/// Closed receipt-bound value that one live runtime measurement must equal.
+///
+/// Digests name non-secret canonical projections. They never stand in for a
+/// live measurement: the API must construct a typed witness from the actual
+/// retained runtime handle and compare that witness with this exact value.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeGuardExpectedValue {
+    DurablePostgresql {
+        database_provider: ProductionDatabaseProvider,
+        server_major_version: u16,
+        database_identity_digest: String,
+        storage_binding_digest: String,
+        migration_inventory_digest: String,
+        application_role: String,
+        migration_role: String,
+    },
+    ApprovedSecretProvider {
+        providers: Vec<ExpectedProviderBinding>,
+        required_capability_ids: Vec<String>,
+    },
+    HttpsPublicUrls {
+        public_origin_set_digest: String,
+        ingress_binding_digest: String,
+        attestation_profile_id: String,
+        attestation_profile_version: u64,
+        attestation_profile_digest: String,
+    },
+    SecureCookies {
+        policies: Vec<ExpectedCookiePolicy>,
+        policy_inventory_digest: String,
+    },
+    NonDevelopmentAuthenticator {
+        authenticator_inventory_digest: String,
+        authenticators: Vec<ExpectedAuthenticatorBinding>,
+    },
+    ExternalSigningKeyMaterial {
+        signing_inventory_digest: String,
+        purposes: Vec<ExpectedSigningPurpose>,
+    },
+    MockDependenciesDisabled {
+        dependency_inventory_digest: String,
+        required_component_ids: Vec<String>,
+    },
+    FirstOwnerPathClosed {
+        deployment_id: String,
+        state_contract_version: u64,
+        authority_namespace_digest: String,
+        closure_record_digest: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CookieSameSitePolicy {
+    Strict,
+    Lax,
+    None,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionAuthenticatorKind {
+    Oidc,
+    Passkey,
+    MutualTls,
+    Composite,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedProviderBinding {
+    pub provider_id: String,
+    pub configuration_version: u64,
+    pub configuration_payload_digest: String,
+    pub lifecycle_record_version: u64,
+    pub lifecycle_state: ProviderLifecycleState,
+    pub capability_descriptor_id: String,
+    pub capability_descriptor_version: u64,
+    pub adapter_kind: String,
+    pub adapter_version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedAuthenticatorBinding {
+    pub provider: ExpectedProviderBinding,
+    pub authenticator_kind: ProductionAuthenticatorKind,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedCookiePolicy {
+    pub policy_id: String,
+    pub cookie_name: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub path: String,
+    pub domain: Option<String>,
+    pub same_site: CookieSameSitePolicy,
+    pub policy_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedSigningPurpose {
+    pub purpose_id: String,
+    pub algorithm: SigningAlgorithm,
+    pub custody_kind: ExternalKeyCustodyKind,
+    pub key_identity_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SigningAlgorithm {
+    Ed25519,
+    HmacSha256,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalKeyCustodyKind {
+    SecretProvider,
+    Kms,
+    Hsm,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionDatabaseProvider {
+    #[serde(rename = "cloudnativepg")]
+    CloudNativePg,
+    #[serde(rename = "aws-rds")]
+    AwsRds,
+    #[serde(rename = "azure-postgresql")]
+    AzurePostgresql,
+    #[serde(rename = "gcp-cloud-sql")]
+    GcpCloudSql,
+}
+
+impl RuntimeGuardExpectedValue {
+    pub fn guard_id(&self) -> GuardId {
+        match self {
+            Self::DurablePostgresql { .. } => GuardId::DurablePostgresql,
+            Self::ApprovedSecretProvider { .. } => GuardId::ApprovedSecretProvider,
+            Self::HttpsPublicUrls { .. } => GuardId::HttpsPublicUrls,
+            Self::SecureCookies { .. } => GuardId::SecureCookies,
+            Self::NonDevelopmentAuthenticator { .. } => GuardId::NonDevelopmentAuthenticator,
+            Self::ExternalSigningKeyMaterial { .. } => GuardId::ExternalSigningKeyMaterial,
+            Self::MockDependenciesDisabled { .. } => GuardId::MockDependenciesDisabled,
+            Self::FirstOwnerPathClosed { .. } => GuardId::FirstOwnerPathClosed,
+        }
+    }
 }
 
 impl DeploymentSecurityProfile {
@@ -611,6 +766,22 @@ impl DeploymentSecurityProfile {
                     "package-exit-receipt:",
                     errors,
                 );
+                if guard.expected_value.guard_id() != guard.guard_id {
+                    errors.push(format!(
+                        "runtime guard {:?} carries the wrong typed expected value",
+                        guard.guard_id
+                    ));
+                }
+                validate_runtime_guard_expected_value(&guard.expected_value, errors);
+                if let RuntimeGuardExpectedValue::FirstOwnerPathClosed { deployment_id, .. } =
+                    &guard.expected_value
+                    && deployment_id != &self.deployment_id
+                {
+                    errors.push(
+                        "first-owner-path-closed deployment_id must equal the root deployment profile"
+                            .into(),
+                    );
+                }
             }
         } else {
             if self.runtime_guard_evidence.mode != RuntimeGuardMode::NotApplicable {
@@ -760,6 +931,410 @@ fn is_normalized_package_receipt_locator(value: &str) -> bool {
         })
 }
 
+fn require_positive_version(label: &str, value: u64, errors: &mut Vec<String>) {
+    if value == 0 {
+        errors.push(format!("{label} must be greater than zero"));
+    }
+}
+
+fn valid_postgresql_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn validate_canonical_token_set(label: &str, values: &[String], errors: &mut Vec<String>) {
+    if values.is_empty() {
+        errors.push(format!("{label} must not be empty"));
+        return;
+    }
+    if !values.windows(2).all(|pair| pair[0] < pair[1]) {
+        errors.push(format!("{label} must be strictly sorted and unique"));
+    }
+    if values.iter().any(|value| {
+        let bytes = value.as_bytes();
+        !(3..=127).contains(&bytes.len())
+            || !bytes
+                .first()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    }) {
+        errors.push(format!("{label} contains a non-canonical token"));
+    }
+}
+
+fn validate_namespaced_id_set(
+    label: &str,
+    values: &[String],
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if values.is_empty() {
+        errors.push(format!("{label} must not be empty"));
+        return;
+    }
+    if !values.windows(2).all(|pair| pair[0] < pair[1]) {
+        errors.push(format!("{label} must be strictly sorted and unique"));
+    }
+    for value in values {
+        validate_id(value, prefix, label, errors);
+    }
+}
+
+fn validate_provider_binding_set(
+    label: &str,
+    providers: &[ExpectedProviderBinding],
+    errors: &mut Vec<String>,
+) {
+    if providers.is_empty() {
+        errors.push(format!("{label} must not be empty"));
+        return;
+    }
+    if !providers
+        .windows(2)
+        .all(|pair| pair[0].provider_id < pair[1].provider_id)
+    {
+        errors.push(format!(
+            "{label} must be strictly sorted and unique by provider_id"
+        ));
+    }
+    for provider in providers {
+        validate_provider_binding(label, provider, errors);
+    }
+}
+
+fn validate_provider_binding(
+    label: &str,
+    provider: &ExpectedProviderBinding,
+    errors: &mut Vec<String>,
+) {
+    validate_id(
+        &provider.provider_id,
+        "provider:",
+        &format!("{label} provider_id"),
+        errors,
+    );
+    require_positive_version(
+        &format!("{label} configuration_version"),
+        provider.configuration_version,
+        errors,
+    );
+    validate_digest(
+        &format!("{label} configuration_payload_digest"),
+        &provider.configuration_payload_digest,
+        errors,
+    );
+    require_positive_version(
+        &format!("{label} lifecycle_record_version"),
+        provider.lifecycle_record_version,
+        errors,
+    );
+    if provider.lifecycle_state != ProviderLifecycleState::Active {
+        errors.push(format!("{label} lifecycle_state must be active"));
+    }
+    validate_id(
+        &provider.capability_descriptor_id,
+        "capability-descriptor:",
+        &format!("{label} capability_descriptor_id"),
+        errors,
+    );
+    require_positive_version(
+        &format!("{label} capability_descriptor_version"),
+        provider.capability_descriptor_version,
+        errors,
+    );
+    for (field, value) in [
+        ("adapter_kind", provider.adapter_kind.as_str()),
+        ("adapter_version", provider.adapter_version.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > 127
+            || !value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            errors.push(format!("{label} {field} is not canonical"));
+        }
+    }
+}
+
+fn validate_cookie_policy_set(policies: &[ExpectedCookiePolicy], errors: &mut Vec<String>) {
+    if policies.is_empty() {
+        errors.push("secure-cookies policies must not be empty".into());
+        return;
+    }
+    if !policies
+        .windows(2)
+        .all(|pair| pair[0].policy_id < pair[1].policy_id)
+    {
+        errors
+            .push("secure-cookies policies must be strictly sorted and unique by policy_id".into());
+    }
+    for policy in policies {
+        validate_id(
+            &policy.policy_id,
+            "cookie-policy:",
+            "secure-cookies policy_id",
+            errors,
+        );
+        if !valid_host_cookie_name(&policy.cookie_name)
+            || !policy.secure
+            || !policy.http_only
+            || policy.path != "/"
+            || policy.domain.is_some()
+        {
+            errors.push(
+                "secure-cookies policies must use a canonical __Host- name with Secure, HttpOnly, Path=/, and no Domain"
+                    .into(),
+            );
+        }
+        validate_digest(
+            "secure-cookies policy_digest",
+            &policy.policy_digest,
+            errors,
+        );
+    }
+}
+
+fn valid_host_cookie_name(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("__Host-") else {
+        return false;
+    };
+    (3..=120).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_signing_purpose_set(purposes: &[ExpectedSigningPurpose], errors: &mut Vec<String>) {
+    if purposes.is_empty() {
+        errors.push("external-signing-key-material purposes must not be empty".into());
+        return;
+    }
+    if !purposes
+        .windows(2)
+        .all(|pair| pair[0].purpose_id < pair[1].purpose_id)
+    {
+        errors.push(
+            "external-signing-key-material purposes must be strictly sorted and unique by purpose_id"
+                .into(),
+        );
+    }
+    for purpose in purposes {
+        validate_id(
+            &purpose.purpose_id,
+            "signing-purpose:",
+            "external-signing-key-material purpose_id",
+            errors,
+        );
+        validate_digest(
+            "external-signing-key-material key_identity_digest",
+            &purpose.key_identity_digest,
+            errors,
+        );
+    }
+}
+
+fn validate_runtime_guard_expected_value(
+    value: &RuntimeGuardExpectedValue,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        RuntimeGuardExpectedValue::DurablePostgresql {
+            server_major_version,
+            database_identity_digest,
+            storage_binding_digest,
+            migration_inventory_digest,
+            application_role,
+            migration_role,
+            ..
+        } => {
+            if *server_major_version != 18 {
+                errors
+                    .push("durable-postgresql expected server_major_version must equal 18".into());
+            }
+            for (label, digest) in [
+                ("database_identity_digest", database_identity_digest),
+                ("storage_binding_digest", storage_binding_digest),
+                ("migration_inventory_digest", migration_inventory_digest),
+            ] {
+                validate_digest(&format!("durable-postgresql {label}"), digest, errors);
+            }
+            for (label, role) in [
+                ("application_role", application_role),
+                ("migration_role", migration_role),
+            ] {
+                if !valid_postgresql_identifier(role) || role == "postgres" {
+                    errors.push(format!(
+                        "durable-postgresql {label} must be a non-superuser canonical PostgreSQL identifier"
+                    ));
+                }
+            }
+            if application_role == migration_role {
+                errors.push(
+                    "durable-postgresql application_role and migration_role must be distinct"
+                        .into(),
+                );
+            }
+        }
+        RuntimeGuardExpectedValue::ApprovedSecretProvider {
+            providers,
+            required_capability_ids,
+        } => {
+            validate_provider_binding_set("approved-secret-provider providers", providers, errors);
+            validate_canonical_token_set(
+                "approved-secret-provider required_capability_ids",
+                required_capability_ids,
+                errors,
+            );
+        }
+        RuntimeGuardExpectedValue::HttpsPublicUrls {
+            public_origin_set_digest,
+            ingress_binding_digest,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+        } => {
+            validate_digest(
+                "https-public-urls public_origin_set_digest",
+                public_origin_set_digest,
+                errors,
+            );
+            validate_digest(
+                "https-public-urls ingress_binding_digest",
+                ingress_binding_digest,
+                errors,
+            );
+            validate_id(
+                attestation_profile_id,
+                "ingress-attestation-profile:",
+                "https-public-urls attestation_profile_id",
+                errors,
+            );
+            require_positive_version(
+                "https-public-urls attestation_profile_version",
+                *attestation_profile_version,
+                errors,
+            );
+            validate_digest(
+                "https-public-urls attestation_profile_digest",
+                attestation_profile_digest,
+                errors,
+            );
+        }
+        RuntimeGuardExpectedValue::SecureCookies {
+            policies,
+            policy_inventory_digest,
+        } => {
+            validate_cookie_policy_set(policies, errors);
+            validate_digest(
+                "secure-cookies policy_inventory_digest",
+                policy_inventory_digest,
+                errors,
+            );
+        }
+        RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+            authenticator_inventory_digest,
+            authenticators,
+        } => {
+            validate_digest(
+                "non-development-authenticator authenticator_inventory_digest",
+                authenticator_inventory_digest,
+                errors,
+            );
+            if authenticators.is_empty() {
+                errors
+                    .push("non-development-authenticator authenticators must not be empty".into());
+            }
+            if !authenticators
+                .windows(2)
+                .all(|pair| pair[0].provider.provider_id < pair[1].provider.provider_id)
+            {
+                errors.push(
+                    "non-development-authenticator authenticators must be strictly sorted and unique by provider_id"
+                        .into(),
+                );
+            }
+            for authenticator in authenticators {
+                validate_provider_binding(
+                    "non-development-authenticator provider",
+                    &authenticator.provider,
+                    errors,
+                );
+            }
+        }
+        RuntimeGuardExpectedValue::ExternalSigningKeyMaterial {
+            signing_inventory_digest,
+            purposes,
+        } => {
+            validate_digest(
+                "external-signing-key-material signing_inventory_digest",
+                signing_inventory_digest,
+                errors,
+            );
+            validate_signing_purpose_set(purposes, errors);
+        }
+        RuntimeGuardExpectedValue::MockDependenciesDisabled {
+            dependency_inventory_digest,
+            required_component_ids,
+        } => {
+            validate_digest(
+                "mock-dependencies-disabled dependency_inventory_digest",
+                dependency_inventory_digest,
+                errors,
+            );
+            validate_namespaced_id_set(
+                "mock-dependencies-disabled required_component_ids",
+                required_component_ids,
+                "runtime-component:",
+                errors,
+            );
+        }
+        RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+            deployment_id,
+            state_contract_version,
+            authority_namespace_digest,
+            closure_record_digest,
+        } => {
+            validate_id(
+                deployment_id,
+                "deployment:",
+                "first-owner-path-closed deployment_id",
+                errors,
+            );
+            require_positive_version(
+                "first-owner-path-closed state_contract_version",
+                *state_contract_version,
+                errors,
+            );
+            validate_digest(
+                "first-owner-path-closed authority_namespace_digest",
+                authority_namespace_digest,
+                errors,
+            );
+            validate_digest(
+                "first-owner-path-closed closure_record_digest",
+                closure_record_digest,
+                errors,
+            );
+        }
+    }
+}
+
 fn validate_id(value: &str, prefix: &str, label: &str, errors: &mut Vec<String>) {
     let Some(suffix) = value.strip_prefix(prefix) else {
         errors.push(format!("{label} must use the {prefix} namespace"));
@@ -859,6 +1434,105 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
     }
 
+    fn fixture_digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn expected_provider_binding(provider_id: &str) -> ExpectedProviderBinding {
+        ExpectedProviderBinding {
+            provider_id: provider_id.into(),
+            configuration_version: 1,
+            configuration_payload_digest: fixture_digest('1'),
+            lifecycle_record_version: 1,
+            lifecycle_state: ProviderLifecycleState::Active,
+            capability_descriptor_id: "capability-descriptor:fixture-provider".into(),
+            capability_descriptor_version: 1,
+            adapter_kind: "fixture.provider".into(),
+            adapter_version: "1.0.0".into(),
+        }
+    }
+
+    fn expected_guard_value(guard_id: GuardId, deployment_id: &str) -> RuntimeGuardExpectedValue {
+        match guard_id {
+            GuardId::DurablePostgresql => RuntimeGuardExpectedValue::DurablePostgresql {
+                database_provider: ProductionDatabaseProvider::CloudNativePg,
+                server_major_version: 18,
+                database_identity_digest: fixture_digest('2'),
+                storage_binding_digest: fixture_digest('3'),
+                migration_inventory_digest: fixture_digest('4'),
+                application_role: "ryuki_application".into(),
+                migration_role: "ryuki_migrator".into(),
+            },
+            GuardId::ApprovedSecretProvider => RuntimeGuardExpectedValue::ApprovedSecretProvider {
+                providers: vec![expected_provider_binding("provider:fixture-secrets")],
+                required_capability_ids: vec!["secret-read".into(), "secret-renew".into()],
+            },
+            GuardId::HttpsPublicUrls => RuntimeGuardExpectedValue::HttpsPublicUrls {
+                public_origin_set_digest: fixture_digest('5'),
+                ingress_binding_digest: fixture_digest('6'),
+                attestation_profile_id: "ingress-attestation-profile:fixture".into(),
+                attestation_profile_version: 1,
+                attestation_profile_digest: fixture_digest('7'),
+            },
+            GuardId::SecureCookies => RuntimeGuardExpectedValue::SecureCookies {
+                policies: vec![ExpectedCookiePolicy {
+                    policy_id: "cookie-policy:api-session".into(),
+                    cookie_name: "__Host-ryuki_session".into(),
+                    secure: true,
+                    http_only: true,
+                    path: "/".into(),
+                    domain: None,
+                    same_site: CookieSameSitePolicy::Lax,
+                    policy_digest: fixture_digest('8'),
+                }],
+                policy_inventory_digest: fixture_digest('9'),
+            },
+            GuardId::NonDevelopmentAuthenticator => {
+                RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+                    authenticator_inventory_digest: fixture_digest('a'),
+                    authenticators: vec![ExpectedAuthenticatorBinding {
+                        provider: expected_provider_binding("provider:fixture-oidc"),
+                        authenticator_kind: ProductionAuthenticatorKind::Oidc,
+                    }],
+                }
+            }
+            GuardId::ExternalSigningKeyMaterial => {
+                RuntimeGuardExpectedValue::ExternalSigningKeyMaterial {
+                    signing_inventory_digest: fixture_digest('b'),
+                    purposes: vec![
+                        ExpectedSigningPurpose {
+                            purpose_id: "signing-purpose:control-plane-grants".into(),
+                            algorithm: SigningAlgorithm::Ed25519,
+                            custody_kind: ExternalKeyCustodyKind::Kms,
+                            key_identity_digest: fixture_digest('c'),
+                        },
+                        ExpectedSigningPurpose {
+                            purpose_id: "signing-purpose:session-credentials".into(),
+                            algorithm: SigningAlgorithm::HmacSha256,
+                            custody_kind: ExternalKeyCustodyKind::Hsm,
+                            key_identity_digest: fixture_digest('d'),
+                        },
+                    ],
+                }
+            }
+            GuardId::MockDependenciesDisabled => {
+                RuntimeGuardExpectedValue::MockDependenciesDisabled {
+                    dependency_inventory_digest: fixture_digest('e'),
+                    required_component_ids: vec![
+                        "runtime-component:database".into(),
+                        "runtime-component:secret-provider".into(),
+                    ],
+                }
+            }
+            GuardId::FirstOwnerPathClosed => RuntimeGuardExpectedValue::FirstOwnerPathClosed {
+                deployment_id: deployment_id.into(),
+                state_contract_version: 1,
+                authority_namespace_digest: fixture_digest('f'),
+                closure_record_digest: fixture_digest('1'),
+            },
+        }
+    }
+
     fn structurally_complete_production_profile() -> DeploymentSecurityProfile {
         let mut profile = fixture();
         profile.security_profile = SecurityProfile::Production;
@@ -875,6 +1549,7 @@ mod tests {
             artifact_locator: "receipts/sb-9-production-acceptance.json".into(),
         });
         profile.runtime_guard_evidence.mode = RuntimeGuardMode::ReceiptBound;
+        let deployment_id = profile.deployment_id.clone();
         profile.runtime_guard_evidence.guards = REQUIRED_PRODUCTION_GUARDS
             .into_iter()
             .enumerate()
@@ -888,6 +1563,7 @@ mod tests {
                     content_digest: format!("sha256:{:064x}", index + 1),
                     artifact_locator: format!("receipts/fixture-{index}.json"),
                 },
+                expected_value: expected_guard_value(guard_id, &deployment_id),
             })
             .collect();
         profile
@@ -931,6 +1607,103 @@ mod tests {
         let errors = profile.validate_structure_at(fixed_now());
         assert!(errors.iter().any(|error| error.contains("multi_tenant")));
         assert!(errors.iter().any(|error| error.contains("receipt_bound")));
+    }
+
+    #[test]
+    fn production_guard_expected_values_are_closed_typed_and_non_downgradable() {
+        let profile = structurally_complete_production_profile();
+        assert!(
+            profile.validate_structure_at(fixed_now()).is_empty(),
+            "the complete typed guard fixture must be structurally valid"
+        );
+
+        let mut wrong_kind = profile.clone();
+        wrong_kind.runtime_guard_evidence.guards[0].expected_value =
+            expected_guard_value(GuardId::ApprovedSecretProvider, &wrong_kind.deployment_id);
+        assert!(
+            wrong_kind
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("wrong typed expected value"))
+        );
+
+        let mut insecure_cookie = profile.clone();
+        let cookie = insecure_cookie
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::SecureCookies)
+            .unwrap();
+        let RuntimeGuardExpectedValue::SecureCookies { policies, .. } = &mut cookie.expected_value
+        else {
+            unreachable!()
+        };
+        policies[0].secure = false;
+        assert!(
+            insecure_cookie
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("Secure, HttpOnly"))
+        );
+
+        let mut malformed_cookie_name = profile.clone();
+        let cookie = malformed_cookie_name
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::SecureCookies)
+            .unwrap();
+        let RuntimeGuardExpectedValue::SecureCookies { policies, .. } = &mut cookie.expected_value
+        else {
+            unreachable!()
+        };
+        policies[0].cookie_name = "__Host-bad?name".into();
+        assert!(
+            malformed_cookie_name
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("canonical __Host- name"))
+        );
+
+        let mut malformed_adapter = profile.clone();
+        let secret_provider = malformed_adapter
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::ApprovedSecretProvider)
+            .unwrap();
+        let RuntimeGuardExpectedValue::ApprovedSecretProvider { providers, .. } =
+            &mut secret_provider.expected_value
+        else {
+            unreachable!()
+        };
+        providers[0].adapter_kind = ".fixture".into();
+        assert!(
+            malformed_adapter
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("adapter_kind is not canonical"))
+        );
+
+        let mut wrong_deployment = profile;
+        let first_owner = wrong_deployment
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::FirstOwnerPathClosed)
+            .unwrap();
+        let RuntimeGuardExpectedValue::FirstOwnerPathClosed { deployment_id, .. } =
+            &mut first_owner.expected_value
+        else {
+            unreachable!()
+        };
+        *deployment_id = "deployment:cross-wired-fixture".into();
+        assert!(
+            wrong_deployment
+                .validate_structure_at(fixed_now())
+                .iter()
+                .any(|error| error.contains("must equal the root deployment profile"))
+        );
     }
 
     #[test]

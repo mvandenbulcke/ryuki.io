@@ -393,6 +393,14 @@ impl VerifiedDeployedWorkload {
         &self.workload_instance_binding_digest
     }
 
+    pub fn observed_at_not_before(&self) -> DateTime<Utc> {
+        self.observed_at.not_before
+    }
+
+    pub fn observed_at_not_after(&self) -> DateTime<Utc> {
+        self.observed_at.not_after
+    }
+
     pub fn response_digest(&self) -> &str {
         &self.response_digest
     }

@@ -3455,6 +3455,16 @@ fn validate_runtime_guard_control_ownership(deployment: &Value, errors: &mut Vec
         let guard_id = string_field(guard, "guard_id")
             .map(str::to_string)
             .unwrap_or_else(|| format!("guard-index-{guard_index}"));
+        if let Some(expected_kind) = guard
+            .pointer("/expected_value/kind")
+            .and_then(Value::as_str)
+        {
+            if expected_kind != guard_id {
+                errors.push(format!(
+                    "deployment-security-profile.implementation.json:/runtime_guard_evidence/guards/{guard_index}/expected_value/kind: {expected_kind} does not match guard_id {guard_id}"
+                ));
+            }
+        }
         for (control_index, control) in array(guard, "control_ids").iter().enumerate() {
             let Some(control_id) = control.as_str() else {
                 continue;
@@ -5917,6 +5927,101 @@ mod tests {
         load("catalog/security-contracts/v1/control-trace.implementation.json")
     }
 
+    fn runtime_guard_expected_value(index: usize, deployment_id: &str) -> Value {
+        let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        let provider = |provider_id: &str| {
+            json!({
+                "provider_id": provider_id,
+                "configuration_version": 1,
+                "configuration_payload_digest": digest('1'),
+                "lifecycle_record_version": 1,
+                "lifecycle_state": "active",
+                "capability_descriptor_id": "capability-descriptor:validator-fixture",
+                "capability_descriptor_version": 1,
+                "adapter_kind": "fixture.provider",
+                "adapter_version": "1.0.0"
+            })
+        };
+        match index {
+            0 => json!({
+                "kind": "durable-postgresql",
+                "database_provider": "cloudnativepg",
+                "server_major_version": 18,
+                "database_identity_digest": digest('2'),
+                "storage_binding_digest": digest('3'),
+                "migration_inventory_digest": digest('4'),
+                "application_role": "ryuki_application",
+                "migration_role": "ryuki_migrator"
+            }),
+            1 => json!({
+                "kind": "approved-secret-provider",
+                "providers": [provider("provider:validator-secrets")],
+                "required_capability_ids": ["secret-read", "secret-renew"]
+            }),
+            2 => json!({
+                "kind": "https-public-urls",
+                "public_origin_set_digest": digest('5'),
+                "ingress_binding_digest": digest('6'),
+                "attestation_profile_id": "ingress-attestation-profile:validator",
+                "attestation_profile_version": 1,
+                "attestation_profile_digest": digest('7')
+            }),
+            3 => json!({
+                "kind": "secure-cookies",
+                "policies": [{
+                    "policy_id": "cookie-policy:api-session",
+                    "cookie_name": "__Host-ryuki_session",
+                    "secure": true,
+                    "http_only": true,
+                    "path": "/",
+                    "domain": null,
+                    "same_site": "lax",
+                    "policy_digest": digest('8')
+                }],
+                "policy_inventory_digest": digest('9')
+            }),
+            4 => json!({
+                "kind": "non-development-authenticator",
+                "authenticator_inventory_digest": digest('a'),
+                "authenticators": [{
+                    "provider": provider("provider:validator-oidc"),
+                    "authenticator_kind": "oidc"
+                }]
+            }),
+            5 => json!({
+                "kind": "external-signing-key-material",
+                "signing_inventory_digest": digest('b'),
+                "purposes": [{
+                    "purpose_id": "signing-purpose:control-plane-grants",
+                    "algorithm": "ed25519",
+                    "custody_kind": "kms",
+                    "key_identity_digest": digest('c')
+                }, {
+                    "purpose_id": "signing-purpose:session-credentials",
+                    "algorithm": "hmac-sha256",
+                    "custody_kind": "hsm",
+                    "key_identity_digest": digest('d')
+                }]
+            }),
+            6 => json!({
+                "kind": "mock-dependencies-disabled",
+                "dependency_inventory_digest": digest('e'),
+                "required_component_ids": [
+                    "runtime-component:database",
+                    "runtime-component:secret-provider"
+                ]
+            }),
+            7 => json!({
+                "kind": "first-owner-path-closed",
+                "deployment_id": deployment_id,
+                "state_contract_version": 1,
+                "authority_namespace_digest": digest('f'),
+                "closure_record_digest": digest('1')
+            }),
+            _ => unreachable!("there are exactly eight runtime guards"),
+        }
+    }
+
     fn production_deployment_profile_fixture() -> Value {
         let mut profile =
             load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
@@ -5950,7 +6055,8 @@ mod tests {
                     "document_version": 1,
                     "content_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     "artifact_locator": format!("catalog/security-contracts/v1/package-exit-receipts/production-guard-{index}.json")
-                }
+                },
+                "expected_value": runtime_guard_expected_value(index, "deployment:repository-conformance-fixture")
             })).collect::<Vec<_>>(),
             "runtime_cross_check_required": true
         });
@@ -6909,6 +7015,62 @@ mod tests {
             !errors.is_empty(),
             "non-production must not carry production acceptance authority"
         );
+    }
+
+    #[test]
+    fn deployment_profile_requires_matching_non_downgradable_guard_expectations() {
+        let schema = load("catalog/security-contracts/v1/deployment-security-profile.schema.json");
+        let production = production_deployment_profile_fixture();
+        let mut errors = Vec::new();
+        validate_instance(
+            "test:valid-typed-runtime-guard-expectations",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &production,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let mut missing = production.clone();
+        missing["runtime_guard_evidence"]["guards"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_value");
+        errors.clear();
+        validate_instance(
+            "test:runtime-guard-missing-expected-value",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &missing,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut wrong_kind = production.clone();
+        wrong_kind["runtime_guard_evidence"]["guards"][0]["expected_value"] =
+            runtime_guard_expected_value(1, "deployment:repository-conformance-fixture");
+        errors.clear();
+        validate_instance(
+            "test:runtime-guard-wrong-expected-kind",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &wrong_kind,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut insecure_cookie = production;
+        insecure_cookie["runtime_guard_evidence"]["guards"][3]["expected_value"]["policies"][0]
+            ["secure"] = json!(false);
+        errors.clear();
+        validate_instance(
+            "test:runtime-guard-insecure-cookie-expectation",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &insecure_cookie,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
     }
 
     #[test]
@@ -8063,7 +8225,11 @@ mod tests {
                 "document_version": 1,
                 "content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 "artifact_locator": "catalog/security-contracts/v1/package-exit-receipts/test-guard.json"
-            }
+            },
+            "expected_value": runtime_guard_expected_value(
+                0,
+                "deployment:repository-conformance-fixture"
+            )
         });
         let mut guard_bound = profile.clone();
         guard_bound["runtime_guard_evidence"] = json!({
@@ -8090,6 +8256,11 @@ mod tests {
         security_relevant_changes.push(changed);
         let mut changed = guard_bound.clone();
         changed["runtime_guard_evidence"]["guards"][0]["control_ids"] = json!(["SB-OPS-02"]);
+        security_relevant_changes.push(changed);
+        let mut changed = guard_bound.clone();
+        changed["runtime_guard_evidence"]["guards"][0]["expected_value"]
+            ["storage_binding_digest"] =
+            json!("sha256:abababababababababababababababababababababababababababababababab");
         security_relevant_changes.push(changed);
         let mut changed = guard_bound.clone();
         changed["runtime_guard_evidence"]["guards"][0]["receipt_ref"]["document_id"] =

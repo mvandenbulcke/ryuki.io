@@ -115,14 +115,14 @@
                     "minItems": 8,
                     "maxItems": 8,
                     "allOf": [
-                      { "contains": { "properties": { "guard_id": { "const": "durable-postgresql" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "approved-secret-provider" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "https-public-urls" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "secure-cookies" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "non-development-authenticator" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "external-signing-key-material" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "mock-dependencies-disabled" } }, "required": ["guard_id"] } },
-                      { "contains": { "properties": { "guard_id": { "const": "first-owner-path-closed" } }, "required": ["guard_id"] } }
+                      { "contains": { "properties": { "guard_id": { "const": "durable-postgresql" }, "expected_value": { "properties": { "kind": { "const": "durable-postgresql" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "approved-secret-provider" }, "expected_value": { "properties": { "kind": { "const": "approved-secret-provider" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "https-public-urls" }, "expected_value": { "properties": { "kind": { "const": "https-public-urls" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "secure-cookies" }, "expected_value": { "properties": { "kind": { "const": "secure-cookies" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "non-development-authenticator" }, "expected_value": { "properties": { "kind": { "const": "non-development-authenticator" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "external-signing-key-material" }, "expected_value": { "properties": { "kind": { "const": "external-signing-key-material" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "mock-dependencies-disabled" }, "expected_value": { "properties": { "kind": { "const": "mock-dependencies-disabled" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } },
+                      { "contains": { "properties": { "guard_id": { "const": "first-owner-path-closed" }, "expected_value": { "properties": { "kind": { "const": "first-owner-path-closed" } }, "required": ["kind"] } }, "required": ["guard_id", "expected_value"] } }
                     ]
                   }
                 }
@@ -341,14 +341,161 @@
         "zero_consumer_receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" }
       }
     },
+    "expectedProviderBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "configuration_version", "configuration_payload_digest", "lifecycle_record_version", "lifecycle_state", "capability_descriptor_id", "capability_descriptor_version", "adapter_kind", "adapter_version"],
+      "properties": {
+        "provider_id": { "type": "string", "pattern": "^provider:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "configuration_version": { "$ref": "#/$defs/positiveVersion" },
+        "configuration_payload_digest": { "$ref": "#/$defs/nonzeroDigest" },
+        "lifecycle_record_version": { "$ref": "#/$defs/positiveVersion" },
+        "lifecycle_state": { "const": "active" },
+        "capability_descriptor_id": { "type": "string", "pattern": "^capability-descriptor:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "capability_descriptor_version": { "$ref": "#/$defs/positiveVersion" },
+        "adapter_kind": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$" },
+        "adapter_version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$" }
+      }
+    },
+    "expectedAuthenticatorBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "authenticator_kind"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/expectedProviderBinding" },
+        "authenticator_kind": { "enum": ["oidc", "passkey", "mutual-tls", "composite"] }
+      }
+    },
+    "expectedCookiePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "cookie_name", "secure", "http_only", "path", "domain", "same_site", "policy_digest"],
+      "properties": {
+        "policy_id": { "type": "string", "pattern": "^cookie-policy:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "cookie_name": { "type": "string", "pattern": "^__Host-[A-Za-z0-9._-]{3,120}$" },
+        "secure": { "const": true },
+        "http_only": { "const": true },
+        "path": { "const": "/" },
+        "domain": { "type": "null" },
+        "same_site": { "enum": ["strict", "lax", "none"] },
+        "policy_digest": { "description": "ryuki-cookie-policy-binding-v1 digest of the exact non-secret issuer/parser policy projection.", "$ref": "#/$defs/nonzeroDigest" }
+      }
+    },
+    "expectedSigningPurpose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose_id", "algorithm", "custody_kind", "key_identity_digest"],
+      "properties": {
+        "purpose_id": { "type": "string", "pattern": "^signing-purpose:[a-z0-9][a-z0-9._-]{2,126}$" },
+        "algorithm": { "enum": ["ed25519", "hmac-sha256"] },
+        "custody_kind": { "enum": ["secret-provider", "kms", "hsm"] },
+        "key_identity_digest": { "description": "ryuki-external-signing-key-identity-v1 digest of the non-secret provider, key, version, algorithm, purpose, and custody projection.", "$ref": "#/$defs/nonzeroDigest" }
+      }
+    },
+    "runtimeGuardExpectedValue": {
+      "description": "Closed receipt-bound value. Every set-like array is nonempty, unique, and must also be strictly sorted by the Rust semantic verifier. Digest preimages use the named v1 contracts in each field description.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "database_provider", "server_major_version", "database_identity_digest", "storage_binding_digest", "migration_inventory_digest", "application_role", "migration_role"],
+          "properties": {
+            "kind": { "const": "durable-postgresql" },
+            "database_provider": { "enum": ["cloudnativepg", "aws-rds", "azure-postgresql", "gcp-cloud-sql"] },
+            "server_major_version": { "const": 18 },
+            "database_identity_digest": { "description": "ryuki-postgresql-database-identity-v1 digest.", "$ref": "#/$defs/nonzeroDigest" },
+            "storage_binding_digest": { "description": "ryuki-postgresql-storage-binding-v1 digest of independently authenticated durable storage identity.", "$ref": "#/$defs/nonzeroDigest" },
+            "migration_inventory_digest": { "description": "ryuki-postgresql-migration-inventory-v1 digest of the exact ordered version/checksum set.", "$ref": "#/$defs/nonzeroDigest" },
+            "application_role": { "type": "string", "pattern": "^(?!postgres$)[a-z_][a-z0-9_]{0,62}$" },
+            "migration_role": { "type": "string", "pattern": "^(?!postgres$)[a-z_][a-z0-9_]{0,62}$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "providers", "required_capability_ids"],
+          "properties": {
+            "kind": { "const": "approved-secret-provider" },
+            "providers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedProviderBinding" } },
+            "required_capability_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,126}$" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "public_origin_set_digest", "ingress_binding_digest", "attestation_profile_id", "attestation_profile_version", "attestation_profile_digest"],
+          "properties": {
+            "kind": { "const": "https-public-urls" },
+            "public_origin_set_digest": { "description": "ryuki-public-origin-set-binding-v1 digest of the exact sorted role-tagged canonical HTTPS origins.", "$ref": "#/$defs/nonzeroDigest" },
+            "ingress_binding_digest": { "description": "ryuki-public-ingress-binding-v1 digest of the independently observed ingress generation, TLS identity, routes, and workload backends.", "$ref": "#/$defs/nonzeroDigest" },
+            "attestation_profile_id": { "type": "string", "pattern": "^ingress-attestation-profile:[a-z0-9][a-z0-9._-]{2,126}$" },
+            "attestation_profile_version": { "$ref": "#/$defs/positiveVersion" },
+            "attestation_profile_digest": { "$ref": "#/$defs/nonzeroDigest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "policies", "policy_inventory_digest"],
+          "properties": {
+            "kind": { "const": "secure-cookies" },
+            "policies": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedCookiePolicy" } },
+            "policy_inventory_digest": { "description": "ryuki-cookie-policy-inventory-v1 digest of the exact sorted cookie-purpose policies and issuer/parser consumers.", "$ref": "#/$defs/nonzeroDigest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "authenticator_inventory_digest", "authenticators"],
+          "properties": {
+            "kind": { "const": "non-development-authenticator" },
+            "authenticator_inventory_digest": { "description": "ryuki-authenticator-inventory-v1 digest of the exact initialized verifier inventory.", "$ref": "#/$defs/nonzeroDigest" },
+            "authenticators": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedAuthenticatorBinding" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "signing_inventory_digest", "purposes"],
+          "properties": {
+            "kind": { "const": "external-signing-key-material" },
+            "signing_inventory_digest": { "description": "ryuki-external-signing-inventory-v1 digest of the exact sorted purpose/key identities.", "$ref": "#/$defs/nonzeroDigest" },
+            "purposes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedSigningPurpose" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "dependency_inventory_digest", "required_component_ids"],
+          "properties": {
+            "kind": { "const": "mock-dependencies-disabled" },
+            "dependency_inventory_digest": { "description": "ryuki-production-dependency-inventory-v1 digest of the exact authority-bearing implementation and retained-handle inventory.", "$ref": "#/$defs/nonzeroDigest" },
+            "required_component_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^runtime-component:[a-z0-9][a-z0-9._-]{2,126}$" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "deployment_id", "state_contract_version", "authority_namespace_digest", "closure_record_digest"],
+          "properties": {
+            "kind": { "const": "first-owner-path-closed" },
+            "deployment_id": { "$ref": "#/$defs/deploymentId" },
+            "state_contract_version": { "$ref": "#/$defs/positiveVersion" },
+            "authority_namespace_digest": { "description": "ryuki-first-owner-authority-namespace-v1 digest.", "$ref": "#/$defs/nonzeroDigest" },
+            "closure_record_digest": { "description": "ryuki-first-owner-closure-record-v1 digest of the immutable consumed ceremony record.", "$ref": "#/$defs/nonzeroDigest" }
+          }
+        }
+      ]
+    },
     "guardEvidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["guard_id", "control_ids", "receipt_ref"],
+      "required": ["guard_id", "control_ids", "receipt_ref", "expected_value"],
       "properties": {
         "guard_id": { "enum": ["durable-postgresql", "approved-secret-provider", "https-public-urls", "secure-cookies", "non-development-authenticator", "external-signing-key-material", "mock-dependencies-disabled", "first-owner-path-closed"] },
         "control_ids": { "description": "Nonempty controls covered by the exact current receipt. Semantic closure also requires global uniqueness across all eight guards.", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^SB-[A-Z0-9]+-[0-9]{2}[A-Z]?$" } },
-        "receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" }
+        "receipt_ref": { "$ref": "#/$defs/productionAcceptanceReceiptReference" },
+        "expected_value": { "$ref": "#/$defs/runtimeGuardExpectedValue" }
       }
     },
     "runtimeGuardEvidence": {

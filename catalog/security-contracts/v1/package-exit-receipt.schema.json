@@ -668,7 +668,7 @@
           "$ref": "#/$defs/identifier"
         },
         "digest_contract": {
-          "description": "SHA-256 over ryuki-canonical-json-v1 after removing top-level production_acceptance_receipt_ref and replacing each runtime guard receipt_ref.content_digest plus any migration overlay zero-consumer receipt content_digest with the canonical all-zero SHA-256 sentinel; all receipt identities, versions, locators, guard identities, and controls remain bound.",
+          "description": "SHA-256 over ryuki-canonical-json-v1 after removing top-level production_acceptance_receipt_ref and replacing each runtime guard receipt_ref.content_digest plus any migration overlay zero-consumer receipt content_digest with the canonical all-zero SHA-256 sentinel; all receipt identities, versions, locators, guard identities, controls, and typed expected values remain bound.",
           "const": "ryuki-deployment-profile-conformance-binding-v1"
         },
         "digest": {

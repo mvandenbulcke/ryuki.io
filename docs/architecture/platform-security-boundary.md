@@ -1211,7 +1211,58 @@ startup digest pin. Production carries each of the eight runtime guard ids
 exactly once. Guard control ids are nonempty and globally unique across guards,
 map to active ControlTrace rows, and are covered by the exact current receipt
 reference in the selected SB-9 graph; that receipt's external acceptance event
-precedes the root. Receipt closure only establishes the evidence requirement.
+precedes the root. Each guard also carries one closed `expected_value` variant
+whose kind equals the guard id. The variants bind the exact PostgreSQL and
+migration identity, approved secret-provider inventory, public-ingress
+attestation, complete cookie-policy inventory, authenticator inventory,
+purpose-specific external signing inventory, authority-bearing dependency
+inventory, or permanent first-owner closure record. Set-valued inventories are
+nonempty, strictly sorted, and unique; insecure cookie values, development
+providers, zero digests, zero versions, role collapse, and cross-deployment
+first-owner values are invalid expectations rather than satisfiable policy.
+Every expected secret or authenticator provider must exactly match one
+production-eligible active-provider claim for provider id, configuration
+version and payload digest, lifecycle version and state, capability descriptor,
+and shipped adapter kind/version. The secret expectation equals the complete
+active `secret-service` inventory and every required capability is advertised;
+the authenticator expectation equals the complete active authenticator-provider
+inventory and its typed authenticator kind matches the provider kind. Unknown,
+development, under-capable, cross-trust-domain, or partially projected provider
+expectations fail semantic closure.
+
+`ryuki-runtime-guard-requirement-binding-v1` hashes the canonical guard id,
+sorted control ids, exact receipt kind/id/version/raw digest/locator, and exact
+typed expected value. After the semantic closure digest exists,
+`ryuki-runtime-guard-semantic-challenge-binding-v1` hashes that closure digest,
+semantic context digest, exact raw-profile digest,
+deployment/trust/source/artifact identity, external authority
+epoch/revision/checkpoint/snapshot identity, exact SB-9 root, and the
+requirement digest. This two-stage semantic construction avoids a hash cycle
+and prevents a valid requirement from replaying across closures. It is not yet
+a live runtime challenge. Only after the non-cloneable production boundary has
+sealed the semantic closure to the independently verified workload proof does
+`ryuki-production-runtime-guard-challenge-v1` hash the semantic challenge plus
+the exact workload response digest, deployment/trust/workload namespace,
+authority key/epoch/revision, measurement profile and sequence, workload
+instance binding, observation and expiry interval, resolved OCI identity, and
+peer executable identity. Live witnesses bind this final challenge, so they
+cannot replay across workload instances or later attestations of the same
+artifact.
+Digest-valued expectations use the named canonical contracts
+`ryuki-postgresql-database-identity-v1`,
+`ryuki-postgresql-storage-binding-v1`,
+`ryuki-postgresql-migration-inventory-v1`,
+`ryuki-public-origin-set-binding-v1`, `ryuki-public-ingress-binding-v1`,
+`ryuki-cookie-policy-binding-v1`, `ryuki-cookie-policy-inventory-v1`,
+`ryuki-authenticator-inventory-v1`,
+`ryuki-external-signing-key-identity-v1`,
+`ryuki-external-signing-inventory-v1`,
+`ryuki-production-dependency-inventory-v1`,
+`ryuki-first-owner-authority-namespace-v1`, and
+`ryuki-first-owner-closure-record-v1`; each preimage is the exact sorted,
+non-secret typed projection named by that field.
+
+Receipt closure only establishes the evidence requirement.
 Before any worker, router, or listener starts, a separate typed runtime witness
 for each guard must measure the live fact and equal the receipt-bound expected
 value; a passing receipt or boolean alone cannot authorize runtime admission.

@@ -42,14 +42,14 @@
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:b99c33f461e86caab69d9479b8dec9a1480cccf9270dff93f525237df1f4dea5",
+    "content_digest": "sha256:b4f8e40647e40e031a13ca97eefaeb7477f4d6ca6f6f632d0418fbe81cd5124f",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json"
   },
   "provider_lifecycle_snapshot_ref": {
     "artifact_kind": "provider-registry",
     "document_id": "provider-registry:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:b99c33f461e86caab69d9479b8dec9a1480cccf9270dff93f525237df1f4dea5",
+    "content_digest": "sha256:b4f8e40647e40e031a13ca97eefaeb7477f4d6ca6f6f632d0418fbe81cd5124f",
     "artifact_locator": "catalog/security-contracts/v1/provider-registry.implementation.json",
     "projection": "provider_lifecycle",
     "required_states": ["active"]
@@ -65,28 +65,28 @@
     "artifact_kind": "security-limit-profile",
     "document_id": "security-limit-profile:repository-implementation-v1",
     "document_version": 1,
-    "content_digest": "sha256:d6246618038e97eebf6a749adcfbfa05f6e64dc32a5f3146ac86339c561c749d",
+    "content_digest": "sha256:a1e997ea584578fe489bf4367126cd988398afa554f2b4cafc68db7abd2f4596",
     "artifact_locator": "catalog/security-contracts/v1/security-limit-profile.implementation.json"
   },
   "control_plane_topology_ref": {
     "artifact_kind": "control-plane-topology",
     "document_id": "control-plane-topology:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:44cef28be96bdd4885d8490848164d3a47d5e6942e39554d44e9e8fe061ffc99",
+    "content_digest": "sha256:d645a7c1598a4d6556cfd383d18fc40df32254252b1ca6b848786191768ebea2",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "egress_policy_ref": {
     "artifact_kind": "egress-policy",
     "document_id": "egress-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:44cef28be96bdd4885d8490848164d3a47d5e6942e39554d44e9e8fe061ffc99",
+    "content_digest": "sha256:d645a7c1598a4d6556cfd383d18fc40df32254252b1ca6b848786191768ebea2",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "retention_policy_ref": {
     "artifact_kind": "retention-policy",
     "document_id": "retention-policy:repository-specification-v1",
     "document_version": 1,
-    "content_digest": "sha256:44cef28be96bdd4885d8490848164d3a47d5e6942e39554d44e9e8fe061ffc99",
+    "content_digest": "sha256:d645a7c1598a4d6556cfd383d18fc40df32254252b1ca6b848786191768ebea2",
     "artifact_locator": "docs/architecture/platform-security-boundary.md"
   },
   "production_acceptance_receipt_ref": null,

@@ -23,10 +23,10 @@ use ryuki_core::config::{AuthMode, RyukiConfig};
 use ryuki_core::conformance_closure::{
     derive_production_conformance_closure_context, verify_control_trace_artifact,
     verify_production_conformance_closure, ProductionConformanceClosureInputs,
-    VerifiedConformanceClosure,
+    VerifiedConformanceClosure, VerifiedRuntimeGuardRequirement,
 };
 use ryuki_core::conformance_trust::{
-    ConformanceArtifactCandidate, ConformanceCheckpointAuthorityAnchor,
+    canonical_json_bytes, ConformanceArtifactCandidate, ConformanceCheckpointAuthorityAnchor,
     ConformanceProductionRootRef, ConformanceRegistryArtifact, ConformanceTrustAnchor,
     ConformanceTrustScope, ConformanceTrustedTimeWindow, ConformanceVerificationContext,
     EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
@@ -47,8 +47,9 @@ use ryuki_core::production_deployment_applicability::{
     ProviderMandatoryBaselineClaim, SecurityLimitApplicabilityClaim,
 };
 use ryuki_core::security_profile::{
-    ArtifactKind, DeploymentSecurityProfile, MigrationAuthoritySource, ProviderLifecycleState,
-    SecurityProfile, StartupAdmissionContext, VersionedContentReference,
+    ArtifactKind, DeploymentSecurityProfile, GuardId, MigrationAuthoritySource,
+    ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
+    VersionedContentReference,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -62,6 +63,9 @@ use crate::boundary::authority_transport::{
 use crate::boundary::trust_checkpoint_transport::{
     TrustCheckpointTransportBounds, UnixTrustCheckpointTransport,
 };
+
+const PRODUCTION_RUNTIME_GUARD_CHALLENGE_DIGEST_CONTRACT: &str =
+    "ryuki-production-runtime-guard-challenge-v1";
 
 pub(crate) const SECURITY_CONTRACT_ROOT_ENV: &str = "RYUKI_SECURITY_CONTRACT_ROOT";
 pub(crate) const SECURITY_PROFILE_PATH_ENV: &str = "RYUKI_DEPLOYMENT_SECURITY_PROFILE_PATH";
@@ -498,6 +502,30 @@ pub(crate) struct VerifiedProductionBoundary {
     pinned_build: PinnedProductionBuildManifest,
     profile_raw_bytes: Box<[u8]>,
     profile_raw_digest: String,
+    runtime_guard_challenge_digests: Box<[String]>,
+}
+
+pub(crate) struct VerifiedProductionRuntimeGuardChallenge<'a> {
+    requirement: &'a VerifiedRuntimeGuardRequirement,
+    challenge_binding_digest: &'a str,
+}
+
+impl VerifiedProductionRuntimeGuardChallenge<'_> {
+    pub(crate) fn guard_id(&self) -> GuardId {
+        self.requirement.guard_id()
+    }
+
+    pub(crate) fn expected_value(&self) -> &RuntimeGuardExpectedValue {
+        self.requirement.expected_value()
+    }
+
+    pub(crate) fn requirement_digest(&self) -> &str {
+        self.requirement.requirement_digest()
+    }
+
+    pub(crate) fn challenge_binding_digest(&self) -> &str {
+        self.challenge_binding_digest
+    }
 }
 
 impl fmt::Debug for VerifiedProductionBoundary {
@@ -512,6 +540,10 @@ impl fmt::Debug for VerifiedProductionBoundary {
             .field("build_manifest_raw_digest", &self.pinned_build.raw_digest)
             .field("profile_raw_digest", &self.profile_raw_digest)
             .field("profile_byte_len", &self.profile_raw_bytes.len())
+            .field(
+                "runtime_guard_challenge_count",
+                &self.runtime_guard_challenge_digests.len(),
+            )
             .field(
                 "workload_response_digest",
                 &self.deployed_workload.response_digest(),
@@ -589,12 +621,27 @@ impl VerifiedProductionBoundary {
         deployed_workload
             .ensure_fresh(trusted_now)
             .map_err(|error| format!("production deployed-workload proof is stale: {error}"))?;
+        if conformance.runtime_guard_requirements().len() != 8 {
+            return Err(
+                "production semantic closure lost the exact eight runtime guard requirements"
+                    .into(),
+            );
+        }
+        let runtime_guard_challenge_digests = conformance
+            .runtime_guard_requirements()
+            .iter()
+            .map(|requirement| {
+                production_runtime_guard_challenge_digest(requirement, &deployed_workload)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
         Ok(Self {
             conformance,
             deployed_workload,
             pinned_build,
             profile_raw_bytes,
             profile_raw_digest,
+            runtime_guard_challenge_digests,
         })
     }
 
@@ -608,6 +655,71 @@ impl VerifiedProductionBoundary {
                 format!("production deployed-workload proof is no longer fresh: {error}")
             })
     }
+
+    pub(crate) fn runtime_guard_challenges(
+        &self,
+    ) -> impl ExactSizeIterator<Item = VerifiedProductionRuntimeGuardChallenge<'_>> + '_ {
+        self.conformance
+            .runtime_guard_requirements()
+            .iter()
+            .zip(self.runtime_guard_challenge_digests.iter())
+            .map(|(requirement, challenge_binding_digest)| {
+                VerifiedProductionRuntimeGuardChallenge {
+                    requirement,
+                    challenge_binding_digest,
+                }
+            })
+    }
+}
+
+fn production_runtime_guard_challenge_digest(
+    requirement: &VerifiedRuntimeGuardRequirement,
+    deployed_workload: &VerifiedDeployedWorkload,
+) -> Result<String, String> {
+    let projection = serde_json::json!({
+        "digest_contract": PRODUCTION_RUNTIME_GUARD_CHALLENGE_DIGEST_CONTRACT,
+        "semantic_challenge_binding_digest": requirement.semantic_challenge_binding_digest(),
+        "requirement_digest": requirement.requirement_digest(),
+        "workload": {
+            "response_digest": deployed_workload.response_digest(),
+            "deployment_id": deployed_workload.deployment_id(),
+            "trust_domain_id": deployed_workload.trust_domain_id(),
+            "workload_id": deployed_workload.workload_id(),
+            "authority": {
+                "authority_id": deployed_workload.authority_id(),
+                "key_id": deployed_workload.authority_key_id(),
+                "public_key_fingerprint": deployed_workload.authority_public_key_fingerprint(),
+                "authority_epoch": deployed_workload.authority_epoch(),
+                "authority_revision": deployed_workload.authority_revision(),
+            },
+            "measurement_profile": {
+                "profile_id": deployed_workload.measurement_profile_id(),
+                "profile_version": deployed_workload.measurement_profile_version(),
+                "content_digest": deployed_workload.measurement_profile_digest(),
+            },
+            "measurement_sequence": deployed_workload.measurement_sequence(),
+            "workload_instance_binding_digest": deployed_workload.workload_instance_binding_digest(),
+            "observed_at": {
+                "not_before": deployed_workload.observed_at_not_before(),
+                "not_after": deployed_workload.observed_at_not_after(),
+            },
+            "valid_until": deployed_workload.valid_until(),
+            "deployed_oci_subject": {
+                "subject_kind": deployed_workload.oci_subject_kind(),
+                "repository": deployed_workload.oci_repository(),
+                "content_digest": deployed_workload.oci_subject_digest(),
+            },
+            "resolved_image_manifest_digest": deployed_workload.resolved_manifest_digest(),
+            "peer_executable": {
+                "content_digest": deployed_workload.runtime_executable_digest(),
+                "byte_length": deployed_workload.runtime_executable_byte_length(),
+            },
+        },
+    });
+    let canonical = canonical_json_bytes(&projection).map_err(|error| {
+        format!("cannot canonicalize production runtime guard challenge: {error}")
+    })?;
+    Ok(raw_digest(&canonical))
 }
 
 #[derive(Debug)]
@@ -1850,6 +1962,23 @@ fn reject_incomplete_runtime_guard_admission(
     let ConformanceState::Production(boundary) = conformance_state else {
         return Ok(());
     };
+    let mut challenges = boundary.runtime_guard_challenges();
+    if challenges.len() != 8 {
+        return Err(
+            "production semantic closure lost the exact eight runtime guard requirements".into(),
+        );
+    }
+    if challenges.any(|challenge| {
+        challenge.guard_id() != challenge.expected_value().guard_id()
+            || !challenge.requirement_digest().starts_with("sha256:")
+            || !challenge.challenge_binding_digest().starts_with("sha256:")
+            || challenge.requirement_digest() == challenge.challenge_binding_digest()
+    }) {
+        return Err(
+            "production runtime guard challenges lost their typed semantic or workload binding"
+                .into(),
+        );
+    }
     Err(format!(
         "production semantic closure {} is verified and sealed to the pinned build and deployed workload, but startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified",
         boundary.conformance.closure_digest(),
@@ -4570,6 +4699,69 @@ mod tests {
         assert!(error.contains(
             "startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified"
         ));
+    }
+
+    #[test]
+    fn runtime_guard_challenge_is_bound_to_the_exact_workload_instance_proof() {
+        let (conformance, profile_raw_bytes) = genuine_production_closure_fixture()
+            .expect("the genuine signed closure fixture must verify");
+        let manifest = conformance.production_build_manifest().clone();
+        let first_workload = genuine_deployed_workload_fixture(
+            conformance.deployment_id(),
+            conformance.trust_domain_id(),
+            "workload:ryuki-api-fixture",
+            &manifest.oci_subject,
+            &manifest.runtime_executable,
+            240,
+        )
+        .expect("the first genuine signed workload fixture must verify");
+        let second_workload = genuine_deployed_workload_fixture(
+            conformance.deployment_id(),
+            conformance.trust_domain_id(),
+            "workload:ryuki-api-fixture",
+            &manifest.oci_subject,
+            &manifest.runtime_executable,
+            240,
+        )
+        .expect("the second genuine signed workload fixture must verify");
+        assert_ne!(
+            first_workload.workload_instance_binding_digest(),
+            second_workload.workload_instance_binding_digest()
+        );
+        let first_requirement = &conformance.runtime_guard_requirements()[0];
+        let expected_first =
+            production_runtime_guard_challenge_digest(first_requirement, &first_workload).unwrap();
+        assert_eq!(
+            expected_first,
+            production_runtime_guard_challenge_digest(first_requirement, &first_workload).unwrap()
+        );
+        assert_ne!(
+            expected_first,
+            production_runtime_guard_challenge_digest(first_requirement, &second_workload).unwrap()
+        );
+
+        let profile_raw_digest = raw_digest(&profile_raw_bytes);
+        let boundary = VerifiedProductionBoundary::seal(
+            conformance,
+            first_workload,
+            pinned_fixture_build(manifest),
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .expect("one exact signed production identity must seal");
+        let challenges = boundary.runtime_guard_challenges().collect::<Vec<_>>();
+        assert_eq!(challenges.len(), 8);
+        assert_eq!(challenges[0].challenge_binding_digest(), expected_first);
+        for challenge in challenges {
+            assert_eq!(challenge.guard_id(), challenge.expected_value().guard_id());
+            assert!(challenge.requirement_digest().starts_with("sha256:"));
+            assert!(challenge.challenge_binding_digest().starts_with("sha256:"));
+            assert_ne!(
+                challenge.requirement_digest(),
+                challenge.challenge_binding_digest()
+            );
+        }
     }
 
     #[test]
