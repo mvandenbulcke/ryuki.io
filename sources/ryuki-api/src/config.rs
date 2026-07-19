@@ -32,6 +32,8 @@ fn validate_loaded_config_with_secret_validation(
         ));
     }
 
+    validate_cookie_listener(&config)?;
+
     // Provider credentials and endpoints are process-owned configuration, not
     // ordinary request data. Reject partial, mismatched, or unsafe transport
     // state before any listener is opened; dependent operations still fail
@@ -49,6 +51,27 @@ fn validate_loaded_config_with_secret_validation(
     }
 
     Ok(config)
+}
+
+fn validate_cookie_listener(config: &RyukiConfig) -> Result<(), String> {
+    if config.session.cookie_secure {
+        return Ok(());
+    }
+    let listener = config
+        .server
+        .bind_address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| {
+            "server.bind_address must be a literal socket address when session.cookie_secure=false"
+                .to_string()
+        })?;
+    if !listener.ip().is_loopback() {
+        return Err(
+            "server.bind_address must use a literal loopback address when session.cookie_secure=false"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_identity_endpoint(label: &str, raw: &str) -> Result<url::Url, String> {
@@ -259,15 +282,22 @@ mod startup_validation_tests {
             "http://[::1]:18080",
         ] {
             let mut config = configured_local(platform_url, false);
-            // Container processes commonly bind the bridge interface while
-            // the published browser origin remains loopback-only.
-            config.server.bind_address = "0.0.0.0:8080".into();
+            config.server.bind_address = "127.0.0.1:8080".into();
 
             assert!(
                 validate_test_config(config).is_ok(),
                 "loopback development origin should be admitted: {platform_url}"
             );
         }
+    }
+
+    #[test]
+    fn startup_rejects_insecure_cookie_mode_on_non_loopback_listener() {
+        let mut config = configured_local("http://127.0.0.1:18080", false);
+        config.server.bind_address = "0.0.0.0:8080".into();
+        let error = validate_test_config(config).unwrap_err();
+        assert!(error.contains("server.bind_address"));
+        assert!(error.contains("loopback"));
     }
 
     #[test]

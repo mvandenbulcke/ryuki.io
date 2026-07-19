@@ -51,8 +51,8 @@
 //!   (login-CSRF defense — same design as the generic OIDC flow).
 //! - Public client: the token exchange sends NO `client_secret` field.
 //!   Confidential-client deployments are served by the generic `oidc.*` flow.
-//! - Session cookie flags come from `session_cookie_set_header` — identical to
-//!   the local-login cookie.
+//! - Session cookies are emitted only through the retained Entra issuer
+//!   capability; no weaker Entra-specific policy exists.
 //! - No token material, code, verifier, or session id is ever logged; id_token
 //!   failures log only the validator's safe reason string.
 
@@ -572,9 +572,19 @@ pub(crate) async fn entra_callback(
     // Never log the bearer, verifier, or management UUID.
     tracing::info!("entra login session created");
 
-    // Session cookie flags and legacy-name retirement are identical to local
-    // login; the redirect target is hardcoded.
-    let cookies = crate::contracts::session_cookie_set_headers(credential.bearer(), &deps.session);
+    // The issuer handle retains the exact startup cookie authority; the
+    // redirect target is hardcoded.
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookies = cookie_runtime
+        .entra_session_issuer()
+        .issue(credential.bearer())
+        .map_err(|error| {
+            tracing::error!(error = %error, "Entra session cookie field creation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "ENTRA_COOKIE_ENCODING_FAILED"})),
+            )
+        })?;
     let location = axum::http::HeaderValue::from_static("/");
 
     let mut response = (
@@ -588,12 +598,7 @@ pub(crate) async fn entra_callback(
         ],
     )
         .into_response();
-    crate::contracts::append_session_cookie_headers(&mut response, &cookies).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "ENTRA_COOKIE_ENCODING_FAILED"})),
-        )
-    })?;
+    cookies.append_to(&mut response);
     Ok(response)
 }
 

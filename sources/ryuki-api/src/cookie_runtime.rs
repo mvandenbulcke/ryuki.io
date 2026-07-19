@@ -5,15 +5,23 @@
 //! separately typed mode that can never satisfy production admission.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::http::header::SET_COOKIE;
+use axum::http::{header::InvalidHeaderValue, HeaderValue};
+use axum::response::Response;
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::cookie_policy::{
-    CookiePolicyError, ProductionApiCookiePolicyConfig, RetainedCookiePolicySet,
+    CookiePolicyConsumer, CookiePolicyError, ProductionApiCookiePolicyConfig,
+    RetainedCookiePolicySet,
 };
 use ryuki_core::security_profile::{CookieSameSitePolicy, RuntimeGuardExpectedValue};
 use thiserror::Error;
+
+const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
+const LOOPBACK_SESSION_COOKIE_NAME: &str = "ryuki_session";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum ApiCookieRuntimeError {
@@ -21,6 +29,142 @@ pub(crate) enum ApiCookieRuntimeError {
     Invalid(&'static str),
     #[error(transparent)]
     Policy(#[from] CookiePolicyError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CookieEmissionError {
+    #[error("cookie consumer is not present in the retained policy inventory")]
+    ConsumerBinding,
+    #[error("session cookie value does not match the opaque bearer profile")]
+    InvalidSessionValue,
+    #[error("cookie response field could not be encoded")]
+    Encoding(#[source] InvalidHeaderValue),
+}
+
+/// Validated independent `Set-Cookie` fields. The inner values are private and
+/// the type deliberately implements neither `Debug` nor `Clone` because a
+/// session-issuance field contains bearer material.
+pub(crate) struct SetCookieFields {
+    values: Vec<HeaderValue>,
+}
+
+impl SetCookieFields {
+    fn from_strings(values: Vec<String>) -> Result<Self, CookieEmissionError> {
+        Ok(Self {
+            values: values
+                .into_iter()
+                .map(|value| HeaderValue::from_str(&value).map_err(CookieEmissionError::Encoding))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Append each cookie as its own HTTP field. `Set-Cookie` is not a list
+    /// header and must never be comma-joined.
+    pub(crate) fn append_to(self, response: &mut Response) {
+        for value in self.values {
+            response.headers_mut().append(SET_COOKIE, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn field_values(&self) -> Vec<&str> {
+        self.values
+            .iter()
+            .map(|value| value.to_str().expect("test cookie field must be text"))
+            .collect()
+    }
+}
+
+mod consumer {
+    pub(crate) enum LocalSessionIssuer {}
+    pub(crate) enum EntraSessionIssuer {}
+    pub(crate) enum OidcSessionIssuer {}
+    pub(crate) enum SessionLogoutRetirer {}
+}
+
+pub(crate) trait SessionIssuerConsumer {
+    const ID: CookiePolicyConsumer;
+}
+
+impl SessionIssuerConsumer for consumer::LocalSessionIssuer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiLocalSessionIssuer;
+}
+
+impl SessionIssuerConsumer for consumer::EntraSessionIssuer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiEntraSessionIssuer;
+}
+
+impl SessionIssuerConsumer for consumer::OidcSessionIssuer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiOidcSessionIssuer;
+}
+
+pub(crate) trait SessionRetirerConsumer {
+    const ID: CookiePolicyConsumer;
+}
+
+impl SessionRetirerConsumer for consumer::SessionLogoutRetirer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionLogoutRetirer;
+}
+
+/// A non-forgeable capability for one declared session-cookie issuer. Its
+/// private constructor always retains the exact process-lifetime runtime Arc.
+pub(crate) struct SessionCookieIssuer<C> {
+    runtime: Arc<ApiCookieRuntime>,
+    _consumer: PhantomData<fn() -> C>,
+}
+
+pub(crate) type ApiLocalSessionIssuer = SessionCookieIssuer<consumer::LocalSessionIssuer>;
+pub(crate) type ApiEntraSessionIssuer = SessionCookieIssuer<consumer::EntraSessionIssuer>;
+pub(crate) type ApiOidcSessionIssuer = SessionCookieIssuer<consumer::OidcSessionIssuer>;
+
+impl<C> SessionCookieIssuer<C> {
+    fn new(runtime: Arc<ApiCookieRuntime>) -> Self {
+        Self {
+            runtime,
+            _consumer: PhantomData,
+        }
+    }
+}
+
+impl<C: SessionIssuerConsumer> SessionCookieIssuer<C> {
+    pub(crate) fn issue(
+        &self,
+        session_bearer: &str,
+    ) -> Result<SetCookieFields, CookieEmissionError> {
+        if !self.runtime.session_issuer_is_bound(C::ID) {
+            return Err(CookieEmissionError::ConsumerBinding);
+        }
+        if !crate::session_credentials::is_well_formed_session_bearer(session_bearer) {
+            return Err(CookieEmissionError::InvalidSessionValue);
+        }
+        self.runtime.session_cookie_fields(session_bearer, false)
+    }
+}
+
+/// A separate capability for logout retirement; it cannot issue a bearer.
+pub(crate) struct SessionCookieRetirer<C> {
+    runtime: Arc<ApiCookieRuntime>,
+    _consumer: PhantomData<fn() -> C>,
+}
+
+pub(crate) type ApiSessionLogoutRetirer = SessionCookieRetirer<consumer::SessionLogoutRetirer>;
+
+impl<C> SessionCookieRetirer<C> {
+    fn new(runtime: Arc<ApiCookieRuntime>) -> Self {
+        Self {
+            runtime,
+            _consumer: PhantomData,
+        }
+    }
+}
+
+impl<C: SessionRetirerConsumer> SessionCookieRetirer<C> {
+    pub(crate) fn retire(&self) -> Result<SetCookieFields, CookieEmissionError> {
+        if !self.runtime.session_issuer_is_bound(C::ID) {
+            return Err(CookieEmissionError::ConsumerBinding);
+        }
+        self.runtime.session_cookie_fields("", true)
+    }
 }
 
 enum ApiCookieRuntimeMode {
@@ -118,6 +262,22 @@ impl ApiCookieRuntime {
         Ok(Arc::new(Self { production, mode }))
     }
 
+    pub(crate) fn local_session_issuer(self: &Arc<Self>) -> ApiLocalSessionIssuer {
+        SessionCookieIssuer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn entra_session_issuer(self: &Arc<Self>) -> ApiEntraSessionIssuer {
+        SessionCookieIssuer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn oidc_session_issuer(self: &Arc<Self>) -> ApiOidcSessionIssuer {
+        SessionCookieIssuer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn session_logout_retirer(self: &Arc<Self>) -> ApiSessionLogoutRetirer {
+        SessionCookieRetirer::new(Arc::clone(self))
+    }
+
     /// The exact retained allocation to move into the secure-cookie witness.
     /// Loopback development has no witness-capable projection.
     pub(crate) fn secure_policy_set(&self) -> Option<&Arc<RetainedCookiePolicySet>> {
@@ -197,6 +357,101 @@ impl ApiCookieRuntime {
                 session_same_site, ..
             } => *session_same_site,
         }
+    }
+
+    fn session_cookie_fields(
+        &self,
+        value: &str,
+        retire: bool,
+    ) -> Result<SetCookieFields, CookieEmissionError> {
+        let mut fields = Vec::with_capacity(2);
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { policies } => {
+                let policy = policies.api_session();
+                debug_assert_eq!(policy.cookie_name(), SECURE_SESSION_COOKIE_NAME);
+                fields.push(render_cookie_field(
+                    policy.cookie_name(),
+                    value,
+                    if retire { 0 } else { policy.max_age_secs() },
+                    policy.path(),
+                    policy.http_only(),
+                    policy.secure(),
+                    policy.same_site(),
+                ));
+                for retired_name in policy.retired_cookie_names() {
+                    fields.push(render_cookie_field(
+                        retired_name,
+                        "",
+                        0,
+                        policy.path(),
+                        policy.http_only(),
+                        policy.secure(),
+                        policy.same_site(),
+                    ));
+                }
+            }
+            ApiCookieRuntimeMode::LoopbackDevelopment {
+                session_max_age_secs,
+                session_same_site,
+                ..
+            } => fields.push(render_cookie_field(
+                LOOPBACK_SESSION_COOKIE_NAME,
+                value,
+                if retire { 0 } else { *session_max_age_secs },
+                "/",
+                true,
+                false,
+                *session_same_site,
+            )),
+        }
+        SetCookieFields::from_strings(fields)
+    }
+
+    fn session_issuer_is_bound(&self, consumer: CookiePolicyConsumer) -> bool {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { policies } => policies
+                .api_session()
+                .issuer_consumers()
+                .contains(&consumer),
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => matches!(
+                consumer,
+                CookiePolicyConsumer::ApiLocalSessionIssuer
+                    | CookiePolicyConsumer::ApiEntraSessionIssuer
+                    | CookiePolicyConsumer::ApiOidcSessionIssuer
+                    | CookiePolicyConsumer::ApiSessionLogoutRetirer
+            ),
+        }
+    }
+}
+
+fn render_cookie_field(
+    name: &str,
+    value: &str,
+    max_age_secs: u64,
+    path: &str,
+    http_only: bool,
+    secure: bool,
+    same_site: CookieSameSitePolicy,
+) -> String {
+    let mut field = format!("{name}={value}; Path={path}");
+    if http_only {
+        field.push_str("; HttpOnly");
+    }
+    field.push_str(&format!(
+        "; Max-Age={max_age_secs}; SameSite={}",
+        same_site_attribute(same_site)
+    ));
+    if secure {
+        field.push_str("; Secure");
+    }
+    field
+}
+
+fn same_site_attribute(value: CookieSameSitePolicy) -> &'static str {
+    match value {
+        CookieSameSitePolicy::Strict => "Strict",
+        CookieSameSitePolicy::Lax => "Lax",
+        CookieSameSitePolicy::None => "None",
     }
 }
 
@@ -309,6 +564,78 @@ mod tests {
         assert!(loopback_runtime
             .validate_config_binding(&loopback_config, false)
             .is_err());
+    }
+
+    #[test]
+    fn session_issuer_handles_retain_exact_runtime_and_emit_closed_fields() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let local = runtime.local_session_issuer();
+        let entra = runtime.entra_session_issuer();
+        let oidc = runtime.oidc_session_issuer();
+        assert!(Arc::ptr_eq(&runtime, &local.runtime));
+        assert!(Arc::ptr_eq(&runtime, &entra.runtime));
+        assert!(Arc::ptr_eq(&runtime, &oidc.runtime));
+
+        let session_value = crate::session_credentials::generate_session_bearer();
+        let fields = local.issue(session_value.as_str()).unwrap();
+        assert_eq!(
+            fields.field_values(),
+            vec![
+                format!(
+                    "__Host-ryuki_session={}; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax; Secure",
+                    session_value.as_str()
+                ),
+                "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure".into(),
+            ]
+        );
+
+        let mut response = Response::new(axum::body::Body::empty());
+        fields.append_to(&mut response);
+        assert_eq!(response.headers().get_all(SET_COOKIE).iter().count(), 2);
+        assert!(local.issue("not-a-session-bearer").is_err());
+    }
+
+    #[test]
+    fn session_logout_retirer_clears_every_secure_name() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let retirer = runtime.session_logout_retirer();
+        assert!(Arc::ptr_eq(&runtime, &retirer.runtime));
+        assert_eq!(
+            retirer.retire().unwrap().field_values(),
+            vec![
+                "__Host-ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure",
+                "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure",
+            ]
+        );
+    }
+
+    #[test]
+    fn loopback_session_handles_emit_only_the_unprefixed_cookie() {
+        let mut config = secure_config();
+        config.session.cookie_secure = false;
+        config.session.cookie_same_site = "strict".into();
+        config.server.bind_address = "127.0.0.1:8080".into();
+        let runtime = ApiCookieRuntime::from_admitted_config(&config, false).unwrap();
+        let session_value = crate::session_credentials::generate_session_bearer();
+        assert_eq!(
+            runtime
+                .local_session_issuer()
+                .issue(session_value.as_str())
+                .unwrap()
+                .field_values(),
+            vec![format!(
+                "ryuki_session={}; Path=/; HttpOnly; Max-Age=86400; SameSite=Strict",
+                session_value.as_str()
+            )]
+        );
+        assert_eq!(
+            runtime
+                .session_logout_retirer()
+                .retire()
+                .unwrap()
+                .field_values(),
+            vec!["ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Strict"]
+        );
     }
 
     #[test]

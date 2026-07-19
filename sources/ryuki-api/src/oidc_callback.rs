@@ -965,11 +965,20 @@ pub(crate) async fn oidc_callback(
     // Do not log the bearer, verifier, or management UUID.
     tracing::info!("oidc login session created");
 
-    // Step 9: set the session cookie and redirect to the portal root.
-    // Cookie attributes and legacy-name retirement come from the shared
-    // session-cookie helpers. The redirect target is hardcoded — no
-    // open-redirect risk.
-    let cookies = crate::contracts::session_cookie_set_headers(credential.bearer(), &cfg.session);
+    // Step 9: set the session cookie and redirect to the portal root. The
+    // issuer handle retains the exact startup cookie authority. The redirect
+    // target is hardcoded, so there is no open-redirect risk.
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookies = cookie_runtime
+        .oidc_session_issuer()
+        .issue(credential.bearer())
+        .map_err(|error| {
+            tracing::error!(error = %error, "OIDC session cookie field creation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "cookie header encoding failed"})),
+            )
+        })?;
     let location = axum::http::HeaderValue::from_static("/");
 
     let mut response = (
@@ -983,12 +992,7 @@ pub(crate) async fn oidc_callback(
         ],
     )
         .into_response();
-    crate::contracts::append_session_cookie_headers(&mut response, &cookies).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "cookie header encoding failed"})),
-        )
-    })?;
+    cookies.append_to(&mut response);
     let binding_clear = axum::http::HeaderValue::from_str(&oidc_binding_cookie_clear_header(
         cfg.session.cookie_secure,
     ))

@@ -1,6 +1,8 @@
+#[cfg(test)]
+use axum::http::header::SET_COOKIE;
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::delete,
@@ -15630,99 +15632,6 @@ struct LocalLoginRequest {
     password: String,
 }
 
-fn cookie_same_site_attribute(cookie_same_site: &str) -> &'static str {
-    match cookie_same_site {
-        "strict" => "Strict",
-        "none" => "None",
-        _ => "Lax",
-    }
-}
-
-/// Builds the `Set-Cookie` value for the API-origin session cookie. HTTPS uses
-/// the browser-enforced `__Host-` name; explicit non-Secure loopback
-/// development/test configuration retains the unprefixed compatibility name.
-/// The cookie is ALWAYS HttpOnly regardless of `session.cookie_http_only`.
-pub(crate) fn session_cookie_set_header(
-    session_token: &str,
-    session: &ryuki_core::config::SessionConfig,
-) -> String {
-    let name = crate::session_cookie_name(session);
-    named_session_cookie_header(
-        name,
-        session_token,
-        session.cookie_max_age_secs,
-        session,
-        session.cookie_secure,
-    )
-}
-
-/// Builds every session-cookie field required after successful login. Secure
-/// mode sets the `__Host-` credential and independently expires the old
-/// host-only name; the legacy name is never admitted for authentication.
-pub(crate) fn session_cookie_set_headers(
-    session_token: &str,
-    session: &ryuki_core::config::SessionConfig,
-) -> Vec<String> {
-    let mut headers = vec![session_cookie_set_header(session_token, session)];
-    if session.cookie_secure {
-        headers.push(legacy_session_cookie_retirement_header(session));
-    }
-    headers
-}
-
-/// Builds the `Set-Cookie` value that clears the session cookie on logout.
-fn session_cookie_clear_header(session: &ryuki_core::config::SessionConfig) -> String {
-    let name = crate::session_cookie_name(session);
-    named_session_cookie_header(name, "", 0, session, session.cookie_secure)
-}
-
-/// Builds every independent Set-Cookie field required on logout. Secure mode
-/// clears both the current `__Host-` name and the former host-only name.
-fn session_cookie_clear_headers(session: &ryuki_core::config::SessionConfig) -> Vec<String> {
-    let mut headers = vec![session_cookie_clear_header(session)];
-    if session.cookie_secure {
-        headers.push(legacy_session_cookie_retirement_header(session));
-    }
-    headers
-}
-
-fn legacy_session_cookie_retirement_header(session: &ryuki_core::config::SessionConfig) -> String {
-    named_session_cookie_header(crate::LOOPBACK_SESSION_COOKIE_NAME, "", 0, session, true)
-}
-
-fn named_session_cookie_header(
-    name: &str,
-    value: &str,
-    max_age_secs: u64,
-    session: &ryuki_core::config::SessionConfig,
-    secure: bool,
-) -> String {
-    let mut header = format!(
-        "{name}={value}; Path=/; HttpOnly; Max-Age={max_age_secs}; SameSite={}",
-        cookie_same_site_attribute(&session.cookie_same_site)
-    );
-    if secure {
-        header.push_str("; Secure");
-    }
-    header
-}
-
-/// Appends one HTTP field per Set-Cookie value. Cookie values must never be
-/// comma-joined because user agents do not define Set-Cookie as a list header.
-pub(crate) fn append_session_cookie_headers(
-    response: &mut Response,
-    cookie_headers: &[String],
-) -> Result<(), axum::http::header::InvalidHeaderValue> {
-    let values = cookie_headers
-        .iter()
-        .map(|cookie| axum::http::HeaderValue::from_str(cookie))
-        .collect::<Result<Vec<_>, _>>()?;
-    for value in values {
-        response.headers_mut().append(SET_COOKIE, value);
-    }
-    Ok(())
-}
-
 fn session_cookie_encoding_problem() -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -16217,7 +16126,14 @@ async fn auth_local_login(
         &created.roles,
         &created.expires_at,
     );
-    let cookies = session_cookie_set_headers(credential.bearer(), &app_cfg.session);
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookies = cookie_runtime
+        .local_session_issuer()
+        .issue(credential.bearer())
+        .map_err(|error| {
+            tracing::error!(error = %error, "local session cookie field creation failed");
+            session_cookie_encoding_problem()
+        })?;
     let mut response = (
         [(
             axum::http::header::CACHE_CONTROL,
@@ -16226,10 +16142,7 @@ async fn auth_local_login(
         Json(response_body),
     )
         .into_response();
-    append_session_cookie_headers(&mut response, &cookies).map_err(|error| {
-        tracing::error!(error = %error, "local session cookie header encoding failed");
-        session_cookie_encoding_problem()
-    })?;
+    cookies.append_to(&mut response);
     // The exact-route admission permit intentionally spans every successful
     // database/session await and response-construction step. Error paths also
     // retain it until their handler future returns through normal drop scope.
@@ -16325,8 +16238,14 @@ async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure>
 }
 
 fn logout_http_response(result: Result<(), LogoutFailure>) -> Response {
-    let app_cfg = crate::config_store::get_app_config();
-    let cookies = session_cookie_clear_headers(&app_cfg.session);
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookies = match cookie_runtime.session_logout_retirer().retire() {
+        Ok(cookies) => cookies,
+        Err(error) => {
+            tracing::error!(error = %error, "logout session cookie field creation failed");
+            return session_cookie_encoding_problem().into_response();
+        }
+    };
     let mut response = match result {
         Ok(()) => (
             StatusCode::OK,
@@ -16369,10 +16288,7 @@ fn logout_http_response(result: Result<(), LogoutFailure>) -> Response {
                 .into_response()
         }
     };
-    if let Err(error) = append_session_cookie_headers(&mut response, &cookies) {
-        tracing::error!(error = %error, "logout session cookie header encoding failed");
-        return session_cookie_encoding_problem().into_response();
-    }
+    cookies.append_to(&mut response);
     response
 }
 
@@ -50970,92 +50886,6 @@ mod unit_tests {
         };
         assert_eq!(body["provider_mode"], "static-dry-run");
         assert_eq!(body["token_valid"], false);
-    }
-
-    #[test]
-    fn test_session_cookie_set_header_flags_from_config() {
-        let mut session = ryuki_core::config::SessionConfig {
-            cookie_max_age_secs: 3600,
-            cookie_secure: true,
-            cookie_same_site: "lax".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            session_cookie_set_header("abc-123", &session),
-            "__Host-ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax; Secure"
-        );
-        let secure_headers = session_cookie_set_headers("abc-123", &session);
-        assert_eq!(
-            secure_headers,
-            vec![
-                "__Host-ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax; Secure".to_string(),
-                "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure".to_string(),
-            ]
-        );
-        let mut response = StatusCode::OK.into_response();
-        append_session_cookie_headers(&mut response, &secure_headers).unwrap();
-        let set_cookie_fields = response
-            .headers()
-            .get_all(SET_COOKIE)
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            set_cookie_fields,
-            secure_headers
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        );
-
-        session.cookie_secure = false;
-        session.cookie_same_site = "strict".into();
-        assert_eq!(
-            session_cookie_set_header("abc-123", &session),
-            "ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict"
-        );
-        assert_eq!(
-            session_cookie_set_headers("abc-123", &session),
-            vec![
-                "ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict"
-                    .to_string()
-            ]
-        );
-
-        // cookie_http_only=false is ignored: the API session cookie is
-        // always HttpOnly.
-        session.cookie_http_only = false;
-        assert!(session_cookie_set_header("abc-123", &session).contains("HttpOnly"));
-    }
-
-    #[test]
-    fn test_session_cookie_clear_header_expires_cookie() {
-        let mut session = ryuki_core::config::SessionConfig {
-            cookie_secure: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            session_cookie_clear_header(&session),
-            "__Host-ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
-        );
-        assert_eq!(
-            session_cookie_clear_headers(&session),
-            vec![
-                "__Host-ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
-                    .to_string(),
-                "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure".to_string(),
-            ]
-        );
-
-        session.cookie_secure = false;
-        assert_eq!(
-            session_cookie_clear_header(&session),
-            "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax"
-        );
-        assert_eq!(
-            session_cookie_clear_headers(&session),
-            vec!["ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax".to_string()]
-        );
     }
 
     #[test]
