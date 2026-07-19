@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -32,6 +33,7 @@ use ryuki_core::conformance_trust::{
     EvidenceTier, ValidatedConformanceRegistryLineage, VerifiedConformanceArtifact,
     VerifiedConformanceProductionRoot, VerifiedConformanceTrustCheckpoint,
 };
+use ryuki_core::cookie_policy::RetainedCookiePolicySet;
 use ryuki_core::deployed_workload::{
     build_deployed_workload_attestation_request, verify_deployed_workload_attestation,
     DeployedWorkloadAuthorityAnchor, ExpectedDeployedWorkload, VerifiedDeployedWorkload,
@@ -722,10 +724,9 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-// This module is deliberately unreachable from production startup until each
-// guard-specific live verifier exists. Keeping the temporary dead-code scope
-// here lets the type-safe aggregate land without weakening the explicit
-// fail-closed blocker below.
+// SecureCookies has a live production verifier. The remaining nominal witness
+// types and the final eight-witness aggregate stay under this temporary
+// dead-code allowance until their guard-specific verifiers are implemented.
 #[allow(dead_code)]
 mod runtime_admission {
     use super::*;
@@ -766,6 +767,8 @@ mod runtime_admission {
         InvalidObservationWindow { guard_id: GuardId },
         #[error("production runtime guard witness is stale for {guard_id:?}")]
         WitnessStale { guard_id: GuardId },
+        #[error("production runtime guard live measurement failed for {guard_id:?}")]
+        GuardMeasurementFailed { guard_id: GuardId },
     }
 
     /// Private output of one guard-specific live verifier. Future production
@@ -975,7 +978,7 @@ mod runtime_admission {
                     self.0.recheck(boundary, $guard_id, trusted_now)
                 }
 
-                fn handle(&self) -> &H {
+                pub(super) fn handle(&self) -> &H {
                     self.0.handle()
                 }
 
@@ -1040,6 +1043,147 @@ mod runtime_admission {
         VerifiedFirstOwnerPathClosedGuardWitness,
         GuardId::FirstOwnerPathClosed
     );
+
+    pub(super) struct VerifiedSecureCookieRuntimeHandle {
+        runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+        policies: Arc<RetainedCookiePolicySet>,
+    }
+
+    impl VerifiedSecureCookieRuntimeHandle {
+        pub(super) fn runtime(&self) -> &Arc<crate::cookie_runtime::ApiCookieRuntime> {
+            &self.runtime
+        }
+
+        pub(super) fn policies(&self) -> &Arc<RetainedCookiePolicySet> {
+            &self.policies
+        }
+    }
+
+    pub(super) type VerifiedSecureCookieRuntimeWitness =
+        VerifiedSecureCookiesGuardWitness<VerifiedSecureCookieRuntimeHandle>;
+
+    /// Measure the immutable cookie authority owned by the active API runtime.
+    /// Neither expected values, binding digests, nor observation times are
+    /// accepted from the caller: all authority comes from the sealed boundary
+    /// and all live facts come from the exact retained runtime allocation.
+    pub(super) fn verify_secure_cookie_guard(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    ) -> Result<VerifiedSecureCookieRuntimeWitness, ProductionRuntimeAdmissionError> {
+        verify_secure_cookie_guard_with_clock(boundary, runtime, Utc::now)
+    }
+
+    fn verify_secure_cookie_guard_with_clock(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+        mut trusted_now: impl FnMut() -> DateTime<Utc>,
+    ) -> Result<VerifiedSecureCookieRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let measurement_failed = || ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::SecureCookies,
+        };
+        let observed_at_not_before = trusted_now();
+        let policies = Arc::clone(runtime.secure_policy_set().ok_or_else(measurement_failed)?);
+        policies
+            .verify_integrity()
+            .map_err(|_| measurement_failed())?;
+        let observed_value = policies
+            .measured_expected_value()
+            .map_err(|_| measurement_failed())?;
+        if runtime
+            .measured_production_value()
+            .map_err(|_| measurement_failed())?
+            != observed_value
+        {
+            return Err(measurement_failed());
+        }
+        let observed_at_not_after = trusted_now();
+        let valid_until = observed_at_not_before
+            .checked_add_signed(chrono::TimeDelta::seconds(
+                MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS,
+            ))
+            .ok_or(ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                guard_id: GuardId::SecureCookies,
+            })?;
+
+        let challenge = exact_challenge(boundary, GuardId::SecureCookies)?;
+        let requirement_digest = challenge.requirement_digest().to_owned();
+        let challenge_binding_digest = challenge.challenge_binding_digest().to_owned();
+        let verification_now = ConformanceTrustedTimeWindow {
+            not_before: trusted_now(),
+            not_after: trusted_now(),
+        };
+        VerifiedSecureCookiesGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::SecureCookies,
+                observed_value,
+                requirement_digest,
+                challenge_binding_digest,
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle: VerifiedSecureCookieRuntimeHandle {
+                    runtime: Arc::clone(runtime),
+                    policies,
+                },
+            },
+            verification_now,
+        )
+    }
+
+    pub(super) fn recheck_secure_cookie_guard(
+        boundary: &VerifiedProductionBoundary,
+        witness: &VerifiedSecureCookieRuntimeWitness,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        let handle = witness.handle();
+        let retained_runtime_policy = handle.runtime.secure_policy_set().ok_or(
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            },
+        )?;
+        if !Arc::ptr_eq(retained_runtime_policy, &handle.policies) {
+            return Err(ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            });
+        }
+        handle.policies.verify_integrity().map_err(|_| {
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            }
+        })?;
+        let remeasured = handle.policies.measured_expected_value().map_err(|_| {
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            }
+        })?;
+        if handle.runtime.measured_production_value().map_err(|_| {
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            }
+        })? != remeasured
+            || witness.0.observed_value != remeasured
+        {
+            return Err(ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            });
+        }
+        witness.recheck(
+            boundary,
+            ConformanceTrustedTimeWindow {
+                not_before: Utc::now(),
+                not_after: Utc::now(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_secure_cookie_guard_with_test_clock(
+        boundary: &VerifiedProductionBoundary,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+        trusted_now: impl FnMut() -> DateTime<Utc>,
+    ) -> Result<VerifiedSecureCookieRuntimeWitness, ProductionRuntimeAdmissionError> {
+        verify_secure_cookie_guard_with_clock(boundary, runtime, trusted_now)
+    }
 
     /// Exactly one nominal witness for every production guard. Named fields
     /// make omission, duplication, and cross-kind substitution compile-time
@@ -1358,6 +1502,11 @@ pub(crate) struct SecurityContractContext {
     /// Production owns one indivisible proof aggregate. Non-production cannot
     /// retain detached production proof parts.
     pub(crate) conformance_state: ConformanceState,
+    /// The first live production guard witness. It owns an Arc clone of the
+    /// exact retained policy allocation shared with every API cookie consumer.
+    /// The field remains `None` for non-production and until serving startup
+    /// has loaded and validated the immutable application configuration.
+    verified_secure_cookie_guard: Option<runtime_admission::VerifiedSecureCookieRuntimeWitness>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     /// Lossless, non-authoritative projection retained for independent
@@ -1402,6 +1551,44 @@ impl SecurityContractContext {
         boundary.ensure_fresh(trusted_time_point(now))
     }
 
+    /// Preserve the current all-guards production blocker for startup modes
+    /// that deliberately do not load the API runtime (notably apply-only
+    /// migration processes). Non-production remains unaffected.
+    pub(crate) fn reject_unverified_production_runtime_guards(&self) -> Result<(), String> {
+        reject_incomplete_runtime_guard_admission(&self.conformance_state)
+    }
+
+    /// Seal the live SecureCookies witness from the exact API cookie runtime.
+    /// The verifier itself owns policy measurement, challenge binding, and
+    /// trusted-time sampling; callers cannot supply any of those facts.
+    pub(crate) fn verify_secure_cookie_runtime_guard(
+        &mut self,
+        runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_secure_cookie_guard.is_some() {
+                return Err(
+                    "non-production startup retained a production secure-cookie witness".into(),
+                );
+            }
+            return Ok(());
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        if self.verified_secure_cookie_guard.is_some() {
+            return Err(
+                "production secure-cookie runtime guard was verified more than once".into(),
+            );
+        }
+        self.verified_secure_cookie_guard = Some(
+            runtime_admission::verify_secure_cookie_guard(boundary, runtime).map_err(|error| {
+                format!("secure-cookie runtime guard verification failed: {error}")
+            })?,
+        );
+        Ok(())
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
@@ -1412,13 +1599,20 @@ impl SecurityContractContext {
             let ConformanceState::Production(boundary) = &self.conformance_state else {
                 return Err("production startup has no sealed production-boundary proof".into());
             };
+            let secure_cookie_guard =
+                self.verified_secure_cookie_guard.as_ref().ok_or_else(|| {
+                    "production startup has no verified secure-cookie runtime guard".to_string()
+                })?;
+            runtime_admission::recheck_secure_cookie_guard(boundary, secure_cookie_guard).map_err(
+                |error| format!("secure-cookie runtime guard freshness recheck failed: {error}"),
+            )?;
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}); startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and the exact retained SecureCookies policy has a live workload-bound witness; startup remains blocked until the remaining seven runtime guards are verified: durable-postgresql, approved-secret-provider, https-public-urls, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
@@ -1644,11 +1838,13 @@ pub(crate) fn load_startup_security_contract(
     finalize_startup_security_contract(prepared, None, None, || now)
 }
 
-/// Performs the complete serving-time admission before database, application
+/// Performs static production-boundary admission before database, application
 /// configuration, signing-key, worker, router, or listener initialization.
-/// Non-production profiles remain local-only. Production performs exactly one
-/// read/reconcile exchange with the independently pinned authority and cannot
-/// bootstrap, accept, or advance external state.
+/// This is not serving authority: main must next measure every live runtime
+/// guard and retain the complete typed witness set. Non-production profiles
+/// remain local-only. Production performs exactly one read/reconcile exchange
+/// with the independently pinned authority and cannot bootstrap, accept, or
+/// advance external state.
 pub(crate) async fn load_startup_security_contract_for_serving(
     pins: &StartupSecurityPins,
 ) -> Result<SecurityContractContext, String> {
@@ -2475,7 +2671,7 @@ fn finalize_startup_security_contract(
         ConformanceState::NonProduction
     };
 
-    reject_incomplete_runtime_guard_admission(&conformance_state)?;
+    validate_runtime_guard_challenge_set(&conformance_state)?;
 
     Ok(SecurityContractContext {
         profile: prepared.profile,
@@ -2483,6 +2679,7 @@ fn finalize_startup_security_contract(
         contract_root: prepared.contract_root,
         profile_path: prepared.profile_path,
         conformance_state,
+        verified_secure_cookie_guard: None,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
     })
@@ -2581,22 +2778,51 @@ fn semantic_verification_window(
     })
 }
 
-fn reject_incomplete_runtime_guard_admission(
+fn validate_runtime_guard_challenge_set(
     conformance_state: &ConformanceState,
 ) -> Result<(), String> {
     let ConformanceState::Production(boundary) = conformance_state else {
         return Ok(());
     };
-    let mut challenges = boundary.runtime_guard_challenges();
+    let challenges = boundary.runtime_guard_challenges().collect::<Vec<_>>();
     if challenges.len() != 8 {
         return Err(
             "production semantic closure lost the exact eight runtime guard requirements".into(),
         );
     }
-    if challenges.any(|challenge| {
+    let required_guard_ids = [
+        GuardId::DurablePostgresql,
+        GuardId::ApprovedSecretProvider,
+        GuardId::HttpsPublicUrls,
+        GuardId::SecureCookies,
+        GuardId::NonDevelopmentAuthenticator,
+        GuardId::ExternalSigningKeyMaterial,
+        GuardId::MockDependenciesDisabled,
+        GuardId::FirstOwnerPathClosed,
+    ];
+    if required_guard_ids.iter().any(|required| {
+        challenges
+            .iter()
+            .filter(|challenge| challenge.guard_id() == *required)
+            .count()
+            != 1
+    }) {
+        return Err(
+            "production semantic closure lost the unique complete runtime guard set".into(),
+        );
+    }
+    if challenges.iter().any(|challenge| {
         challenge.guard_id() != challenge.expected_value().guard_id()
-            || !challenge.requirement_digest().starts_with("sha256:")
-            || !challenge.challenge_binding_digest().starts_with("sha256:")
+            || validate_digest_pin(
+                "production runtime guard requirement digest",
+                challenge.requirement_digest(),
+            )
+            .is_err()
+            || validate_digest_pin(
+                "production runtime guard challenge binding digest",
+                challenge.challenge_binding_digest(),
+            )
+            .is_err()
             || challenge.requirement_digest() == challenge.challenge_binding_digest()
     }) {
         return Err(
@@ -2604,6 +2830,16 @@ fn reject_incomplete_runtime_guard_admission(
                 .into(),
         );
     }
+    Ok(())
+}
+
+fn reject_incomplete_runtime_guard_admission(
+    conformance_state: &ConformanceState,
+) -> Result<(), String> {
+    validate_runtime_guard_challenge_set(conformance_state)?;
+    let ConformanceState::Production(boundary) = conformance_state else {
+        return Ok(());
+    };
     Err(format!(
         "production semantic closure {} is verified and sealed to the pinned build and deployed workload, but startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified",
         boundary.conformance.closure_digest(),
@@ -5635,10 +5871,100 @@ mod tests {
         )
         .expect("one exact signed production identity must seal");
         let state = ConformanceState::Production(Box::new(boundary));
+        validate_runtime_guard_challenge_set(&state)
+            .expect("finalization must preserve the exact typed eight-guard challenge set");
         let error = reject_incomplete_runtime_guard_admission(&state).unwrap_err();
         assert!(error.contains(
             "startup remains blocked until all eight receipt-bound live runtime guard witnesses are verified"
         ));
+    }
+
+    #[test]
+    fn secure_cookie_live_witness_retains_the_exact_runtime_policy_arc() {
+        let boundary = genuine_production_boundary(240);
+        let config = RyukiConfig::default();
+        let runtime = crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, true)
+            .expect("production cookie runtime");
+        let retained_policy = Arc::clone(
+            runtime
+                .secure_policy_set()
+                .expect("production retains a secure policy"),
+        );
+        let mut samples = [
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(9, 9).not_before,
+            production_composition_time(10, 10).not_before,
+        ]
+        .into_iter();
+        let witness = verify_secure_cookie_guard_with_test_clock(&boundary, &runtime, || {
+            samples.next().expect("secure-cookie verifier time sample")
+        })
+        .expect("the exact live cookie policy must satisfy its workload-bound challenge");
+
+        assert!(Arc::ptr_eq(witness.handle().runtime(), &runtime));
+        assert!(Arc::ptr_eq(witness.handle().policies(), &retained_policy));
+        assert_eq!(
+            retained_policy.measured_expected_value().unwrap(),
+            runtime.measured_production_value().unwrap()
+        );
+        let debug = format!("{witness:?}");
+        assert!(debug.contains("[RETAINED]"));
+        assert!(!debug.contains("__Host-"));
+    }
+
+    #[test]
+    fn secure_cookie_live_witness_rejects_policy_drift_and_nonproduction_modes() {
+        let boundary = genuine_production_boundary(240);
+        let verify = |runtime: &Arc<crate::cookie_runtime::ApiCookieRuntime>| {
+            let mut samples = [
+                production_composition_time(7, 7).not_before,
+                production_composition_time(8, 8).not_before,
+                production_composition_time(9, 9).not_before,
+                production_composition_time(10, 10).not_before,
+            ]
+            .into_iter();
+            verify_secure_cookie_guard_with_test_clock(&boundary, runtime, || {
+                samples.next().expect("secure-cookie verifier time sample")
+            })
+        };
+
+        let mut drifted = RyukiConfig::default();
+        drifted.session.cookie_max_age_secs += 1;
+        let drifted_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&drifted, true)
+                .expect("drifted production cookie runtime still constructs");
+        assert_eq!(
+            verify(&drifted_runtime).unwrap_err(),
+            ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::SecureCookies,
+            }
+        );
+
+        let secure_nonproduction = crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(
+            &RyukiConfig::default(),
+            false,
+        )
+        .expect("secure non-production cookie runtime");
+        assert_eq!(
+            verify(&secure_nonproduction).unwrap_err(),
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            }
+        );
+
+        let mut loopback = RyukiConfig::default();
+        loopback.session.cookie_secure = false;
+        loopback.server.bind_address = "127.0.0.1:8080".into();
+        let loopback_runtime =
+            crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(&loopback, false)
+                .expect("loopback development cookie runtime");
+        assert_eq!(
+            verify(&loopback_runtime).unwrap_err(),
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::SecureCookies,
+            }
+        );
     }
 
     #[test]

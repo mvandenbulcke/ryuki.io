@@ -3,7 +3,7 @@
 - Status: **proposed normative production boundary**
 - Owner: platform and security engineering
 - Evidence revision: `8212748308372e92d9cf794907d85fe103afd1da`
-- Last updated: 2026-07-17
+- Last updated: 2026-07-19
 - Production gate: **blocking until the required invariants are implemented and verified**
 
 This specification defines one security boundary for every Ryuki caller and
@@ -1129,9 +1129,11 @@ receipt closure, and seals all static proof ownership into one non-cloneable
 production-boundary capability. The checked-in provider remains development-
 only, every compiled adapter remains production-ineligible, and the checked-in
 documents are implementation fixtures rather than active signed production
-authority. The runtime admission boundary also still lacks the eight typed
-live guard witnesses. Production therefore remains fail-closed before
-migrations, workers, routing, or listeners.
+authority. The runtime admission boundary now measures `SecureCookies` through
+a typed live witness that retains the exact API cookie-runtime and policy
+allocations used by every declared API cookie consumer. The other seven typed
+live guard witnesses are not yet implemented. Production therefore remains
+fail-closed before migrations, workers, routing, or listeners.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,

@@ -4138,6 +4138,24 @@ pub mod tests {
             3 => json!({
                 "kind": "secure-cookies",
                 "policies": [{
+                    "policy_id": "cookie-policy:api-entra-login-binding",
+                    "cookie_name": "__Host-entra_login_csrf",
+                    "secure": true,
+                    "http_only": true,
+                    "path": "/",
+                    "domain": null,
+                    "same_site": "lax",
+                    "policy_digest": "sha256:dd2524c0de18cc5e6af3f6f917b3d9084d5ee8e0348a9197bad15d8c4f35aa70",
+                }, {
+                    "policy_id": "cookie-policy:api-oidc-login-binding",
+                    "cookie_name": "__Host-oidc_login_csrf",
+                    "secure": true,
+                    "http_only": true,
+                    "path": "/",
+                    "domain": null,
+                    "same_site": "lax",
+                    "policy_digest": "sha256:58daba94f8a546b3ecb66ef47d68d373d031a9aeb86a5b3a3a60c722917dbbb9",
+                }, {
                     "policy_id": "cookie-policy:api-session",
                     "cookie_name": "__Host-ryuki_session",
                     "secure": true,
@@ -4145,9 +4163,9 @@ pub mod tests {
                     "path": "/",
                     "domain": null,
                     "same_site": "lax",
-                    "policy_digest": test_digest("guard-cookie-policy"),
+                    "policy_digest": "sha256:f64e6fef4fa12a22a0e15fb87ca3f10bb9d1212b76d129dd1cfb91f00ac043e1",
                 }],
-                "policy_inventory_digest": test_digest("guard-cookie-inventory"),
+                "policy_inventory_digest": "sha256:5d41f46cb07894ac33d14824daeccdc7e466577383fc0a463f9a919949a0bbc7",
             }),
             4 => json!({
                 "kind": "non-development-authenticator",

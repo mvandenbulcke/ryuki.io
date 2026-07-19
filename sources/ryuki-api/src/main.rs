@@ -2916,7 +2916,7 @@ async fn main() {
             eprintln!("security contract preflight failed: {error}");
             std::process::exit(1);
         });
-    let security_contract =
+    let mut security_contract =
         security_contracts::load_startup_security_contract_for_serving(&security_pins)
             .await
             .unwrap_or_else(|error| {
@@ -2929,6 +2929,16 @@ async fn main() {
         std::process::exit(1);
     });
     if !migration_mode.serves_http() {
+        // Apply-only intentionally does not load the API configuration needed
+        // by live runtime guards. Production must therefore remain behind the
+        // complete eight-guard blocker before migration credentials or any
+        // database side effect are touched.
+        security_contract
+            .reject_unverified_production_runtime_guards()
+            .unwrap_or_else(|error| {
+                eprintln!("production migration runtime admission failed: {error}");
+                std::process::exit(1);
+            });
         // The one-shot runner intentionally stops here: it does not load
         // application/auth/provider configuration, initialize the normal pool,
         // reconcile identity state, spawn background work, or bind a listener.
@@ -2988,6 +2998,12 @@ async fn main() {
         .validate_config_binding(&app_config, security_contract.is_production())
         .unwrap_or_else(|error| {
             eprintln!("API cookie runtime binding failed: {error}");
+            std::process::exit(1);
+        });
+    security_contract
+        .verify_secure_cookie_runtime_guard(&api_cookie_runtime)
+        .unwrap_or_else(|error| {
+            eprintln!("secure-cookie runtime guard failed: {error}");
             std::process::exit(1);
         });
     security_contract
