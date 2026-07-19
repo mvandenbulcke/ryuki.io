@@ -21,6 +21,7 @@ struct ImmutableStartupConfig {
     app_config: RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
 }
 
 // Existing unit tests initialize only the application configuration. Keep
@@ -31,6 +32,7 @@ struct ImmutableStartupConfig {
     app_config: RyukiConfig,
     security_contract: Option<crate::security_contracts::SecurityContractContext>,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    api_authenticator_runtime: Option<Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>>,
 }
 
 #[cfg(test)]
@@ -121,12 +123,14 @@ pub fn init_with_security_contract(
     app_cfg: &RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
 ) {
     STARTUP_CONFIG
         .set(ImmutableStartupConfig {
             app_config: app_cfg.clone(),
             security_contract,
             api_cookie_runtime,
+            api_authenticator_runtime,
         })
         .unwrap_or_else(|_| panic!("startup config already initialized"));
     let store = ConfigStore::new(path);
@@ -141,12 +145,14 @@ pub fn init_with_security_contract(
     app_cfg: &RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
+    api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
 ) {
     TEST_STARTUP_CONFIG.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
             app_config: app_cfg.clone(),
             security_contract: Some(security_contract),
             api_cookie_runtime,
+            api_authenticator_runtime: Some(api_authenticator_runtime),
         })));
     });
     TEST_STORE.with(|slot| {
@@ -166,6 +172,7 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
             app_config: app_cfg.clone(),
             security_contract: None,
             api_cookie_runtime,
+            api_authenticator_runtime: None,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -182,6 +189,28 @@ pub fn get_api_cookie_runtime() -> Arc<crate::cookie_runtime::ApiCookieRuntime> 
         &startup_config_if_initialized()
             .expect("startup config not initialized")
             .api_cookie_runtime,
+    )
+}
+
+#[cfg(not(test))]
+pub fn get_api_authenticator_runtime() -> Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>
+{
+    Arc::clone(
+        &startup_config_if_initialized()
+            .expect("startup config not initialized")
+            .api_authenticator_runtime,
+    )
+}
+
+#[cfg(test)]
+pub fn get_api_authenticator_runtime() -> Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>
+{
+    Arc::clone(
+        startup_config_if_initialized()
+            .expect("startup config not initialized")
+            .api_authenticator_runtime
+            .as_ref()
+            .expect("authenticator runtime not initialized"),
     )
 }
 
@@ -283,5 +312,13 @@ mod tests {
         init_with_config("test-only-config.json", &RyukiConfig::default());
 
         let _ = get_security_contract_context();
+    }
+
+    #[test]
+    #[should_panic(expected = "authenticator runtime not initialized")]
+    fn compatibility_initializer_never_fabricates_authenticator_runtime() {
+        init_with_config("test-only-config.json", &RyukiConfig::default());
+
+        let _ = get_api_authenticator_runtime();
     }
 }

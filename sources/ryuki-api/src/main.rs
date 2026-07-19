@@ -2,6 +2,7 @@
 
 mod agents;
 mod audit;
+mod authenticator_runtime;
 mod background;
 mod boundary;
 mod build_identity;
@@ -1719,7 +1720,7 @@ fn find_unknown_local_auth_role(
 /// reads and infra probes so the portal bootstrap and liveness/readiness checks
 /// are never gated.
 async fn auth_middleware(
-    State(validator): State<Arc<EntraTokenValidator>>,
+    State(authenticator_runtime): State<Arc<authenticator_runtime::ApiAuthenticatorRuntime>>,
     headers: HeaderMap,
     mut request: HttpRequest<Body>,
     next: middleware::Next,
@@ -1730,7 +1731,7 @@ async fn auth_middleware(
     let app_config = crate::config_store::get_app_config();
     let cookie_runtime = crate::config_store::get_api_cookie_runtime();
     let session_auth_parser = cookie_runtime.session_auth_parser();
-    let auth_mode = app_config.auth_mode.clone();
+    let auth_mode = authenticator_runtime.auth_mode().clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
     let lookup_admission = crate::session_lookup_admission::global_admission();
     let lookup_proof = request
@@ -1766,8 +1767,12 @@ async fn auth_middleware(
         {
             Some((session, source, authority)) => (session, Some(source), None, authority),
             None => {
-                let (validated, reason) =
-                    resolve_request_session(auth_mode.clone(), auth_header, &validator).await;
+                let (validated, reason) = resolve_request_session(
+                    auth_mode.clone(),
+                    auth_header,
+                    &authenticator_runtime.entra_bearer_validator(),
+                )
+                .await;
                 if auth_mode == AuthMode::EntraId
                     && validated.token_valid
                     && !validated.is_verified_human()
@@ -3008,6 +3013,16 @@ async fn main() {
             eprintln!("API cookie runtime binding failed: {error}");
             std::process::exit(1);
         });
+    let api_authenticator_runtime =
+        authenticator_runtime::ApiAuthenticatorRuntime::from_admitted_config(
+            &app_config,
+            Arc::clone(&api_cookie_runtime),
+            security_contract.is_production(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("API authenticator runtime admission failed: {error}");
+            std::process::exit(1);
+        });
     security_contract
         .verify_secure_cookie_runtime_guard(&api_cookie_runtime)
         .unwrap_or_else(|error| {
@@ -3026,17 +3041,28 @@ async fn main() {
         });
     START_TIME.set(Instant::now()).ok();
     let api_cookie_runtime_identity = Arc::clone(&api_cookie_runtime);
+    let api_authenticator_runtime_identity = Arc::clone(&api_authenticator_runtime);
     config_store::init_with_security_contract(
         "platform-config.json",
         &app_config,
         security_contract,
         api_cookie_runtime,
+        Arc::clone(&api_authenticator_runtime),
     );
     if !Arc::ptr_eq(
         &api_cookie_runtime_identity,
         &config_store::get_api_cookie_runtime(),
     ) {
         eprintln!("API cookie runtime identity changed during startup retention");
+        std::process::exit(1);
+    }
+    if !Arc::ptr_eq(
+        &api_authenticator_runtime_identity,
+        &config_store::get_api_authenticator_runtime(),
+    ) || !api_authenticator_runtime_identity
+        .retains_cookie_runtime(&config_store::get_api_cookie_runtime())
+    {
+        eprintln!("API authenticator runtime identity changed during startup retention");
         std::process::exit(1);
     }
     let session_lookup_admission =
@@ -3447,21 +3473,10 @@ async fn main() {
     webhook_admission.spawn_maintenance();
     let agent_registration_admission =
         agents::AgentRegistrationAdmission::production(anonymous_admission_trusted_proxies);
-    // Per-username failed-login throttle for POST /api/auth/local/login,
-    // shared with the handler through an Extension (no global mutable state).
-    let local_login_throttle = Arc::new(contracts::LocalLoginThrottle::default());
-
-    // Entra ID token validator, built ONCE at startup from the live config.
-    // issuer/audience are fixed for the process lifetime (a settings change
-    // takes effect on the next restart, like every other entra_* consumer);
-    // only the JWKS keyset refreshes live, behind its own lock inside the Arc.
-    let entra_validator = Arc::new(EntraTokenValidator::from_app_config(
-        &app_config.entra_tenant_id,
-        &app_config.entra_client_id,
-        &app_config.entra_authority,
-        app_config.entra_jwks_ttl_secs,
-        app_config.entra_leeway_secs,
-    ));
+    // The exact human-authenticator allocations were built and retained before
+    // the general production runtime-binding fence. Router consumers receive
+    // only Arc clones originating from that immutable owner.
+    let local_login_throttle = api_authenticator_runtime.local_login_throttle();
 
     let cors_origins: Vec<_> = app_config
         .cors
@@ -3521,7 +3536,7 @@ async fn main() {
         // Idempotency-Key header; no header / no DB → pass-through (unchanged).
         .layer(middleware::from_fn(idempotency::idempotency_middleware))
         .layer(middleware::from_fn_with_state(
-            entra_validator.clone(),
+            Arc::clone(&api_authenticator_runtime),
             auth_middleware,
         ));
 
@@ -3543,50 +3558,15 @@ async fn main() {
         .fallback(not_found)
         .layer(Extension(local_login_throttle.clone()))
         .layer(Extension(
-            // OidcCallbackDeps: built once at startup.  When OIDC is disabled
-            // the handler gates on `oidc.enabled` before touching these deps, so
-            // a placeholder with a dummy exchanger and validator is fine.
-            if app_config.oidc.enabled {
-                let exchanger: std::sync::Arc<dyn oidc_callback::TokenExchanger + Send + Sync> =
-                    std::sync::Arc::new(oidc_callback::ReqwestTokenExchanger::new(
-                        app_config.oidc.token_endpoint.clone(),
-                    ));
-                let validator = std::sync::Arc::new(oidc_callback::OidcIdTokenValidator::new(
-                    app_config.oidc.jwks_uri.clone(),
-                    app_config.oidc.issuer.clone(),
-                    app_config.oidc.client_id.clone(),
-                    60, // 60-second leeway
-                ));
-                std::sync::Arc::new(oidc_callback::OidcCallbackDeps {
-                    exchanger,
-                    validator,
-                })
-            } else {
-                // Disabled placeholder: handler gates on oidc.enabled → 404
-                // before these are touched.
-                let exchanger: std::sync::Arc<dyn oidc_callback::TokenExchanger + Send + Sync> =
-                    std::sync::Arc::new(oidc_callback::ReqwestTokenExchanger::new(
-                        "https://disabled.invalid/token".to_string(),
-                    ));
-                let validator = std::sync::Arc::new(oidc_callback::OidcIdTokenValidator::new(
-                    "https://disabled.invalid/jwks".to_string(),
-                    "https://disabled.invalid/issuer".to_string(),
-                    "disabled".to_string(),
-                    60,
-                ));
-                std::sync::Arc::new(oidc_callback::OidcCallbackDeps {
-                    exchanger,
-                    validator,
-                })
-            },
+            api_authenticator_runtime.oidc_callback_dependencies(),
         ))
         // EntraSsoDeps: built once at startup. The handlers gate on
         // auth_mode == entra-id (and on a complete tenant/client/redirect-uri
         // config) before touching the exchanger/validator, so a non-Entra
         // deployment never dereferences these network deps.
-        .layer(Extension(entra_sso::EntraSsoDeps::from_app_config(
-            &app_config,
-        )))
+        .layer(Extension(
+            api_authenticator_runtime.entra_sso_dependencies(),
+        ))
         .layer(middleware::from_fn_with_state(
             GlobalConcurrencyAdmission::new(app_config.server.max_concurrent_connections),
             global_concurrency_middleware,
