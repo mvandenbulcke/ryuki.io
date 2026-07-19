@@ -2982,6 +2982,14 @@ async fn main() {
         }
     }
 
+    security_contract
+        .verify_https_public_urls_runtime_guard(&security_pins)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("https-public-urls runtime guard failed: {error}");
+            std::process::exit(1);
+        });
+
     let app_config = config::load_config().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);

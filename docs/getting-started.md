@@ -93,6 +93,22 @@ request containing a fresh nonce to the pinned Unix-socket authority, computes
 the digest of the exact canonical request bytes, and accepts only a short-lived
 Ed25519 response that echoes both values, so the proof cannot be replayed as a
 later admission.
+Production also requires the complete nine-value public-ingress binding:
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID`,
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION`, and
+`RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST`. These independently pinned
+production-only values select one external Ed25519 authority and approved
+measurement profile. HTTP startup performs one fresh nonce-bound, no-retry
+exchange and accepts only a short-lived observation of the receipt-bound HTTPS
+origins, DNS/TLS state, ingress generation, and exact API backend workload.
+The receipt therefore precommits a stable provisioned workload-instance
+binding; it cannot be satisfied by a newly randomized identity.
 The build manifest pins expected build identity and claims an implementation-
 applicability inventory; startup independently derives that build-side
 inventory from the authenticated ControlTrace and measured build facts and
@@ -102,9 +118,10 @@ child-manifest resolution must also be internally consistent. Startup now
 derives the complete implementation-plus-deployment applicability inventory,
 verifies exact semantic closure, and consumes the checkpoint, current SB-9
 root, authenticated documents, pinned profile/build, and workload proof into
-one non-cloneable production-boundary proof. It still exits before migrations,
-workers, routing, or listeners until all eight receipt-bound live runtime guard
-witnesses are verified; that witness verifier is not yet implemented.
+one non-cloneable production-boundary proof. It now retains verified
+`HttpsPublicUrls` and `SecureCookies` witnesses, but still exits before
+migrations, workers, routing, or listeners until the remaining six
+receipt-bound live runtime guards are implemented and verified.
 The checked-in `implementation_only` fixtures cannot start the runtime, so this
 quick start intentionally has no fabricated profile or digest.
 

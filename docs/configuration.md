@@ -48,10 +48,10 @@ workload attestation below supplies the deployed-OCI and executable facts.
 Startup now derives the complete implementation-plus-deployment applicability
 inventory, verifies the exact semantic receipt closure, and consumes the
 checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
-and workload proof into one non-cloneable production-boundary proof. It still
-exits before migrations, workers, routing, or listeners until all eight
-receipt-bound live runtime guard witnesses are verified; that witness verifier
-is not yet implemented.
+and workload proof into one non-cloneable production-boundary proof. Production
+now retains verified `HttpsPublicUrls` and `SecureCookies` witnesses, but still
+exits before migrations, workers, routing, or listeners until the remaining six
+receipt-bound live runtime guards are implemented and verified.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -97,12 +97,38 @@ nonce, sends it in one bounded request, and computes the digest of the request's
 exact canonical bytes. It accepts only a corresponding domain-separated
 Ed25519 response that exactly echoes that nonce and digest; matches the pinned
 deployment and workload, the checkpoint-bound trust domain, and the pinned
-authority, key, epoch floor, and measurement profile; and prove a current,
+authority, key, epoch floor, and measurement profile; and proves a current,
 running, reconciled peer whose deployed OCI subject and executable match the
 measured build facts. For an OCI index, the authority-signed child-manifest
 resolution must be internally consistent. The short-lived proof remains bound
 to that one admission and cannot be replayed or reused as authority for a later
 startup.
+
+Production also requires this independently pinned public-ingress attestation
+binding:
+
+| Variable | Required value |
+|---|---|
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET` | Absolute, lexically normalized Unix-socket path with a file name, no NUL, and at most 103 path bytes |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID` | Independently pinned canonical id beginning `public-ingress-attestation-authority:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID` | Independently pinned canonical Ed25519 key id beginning `public-ingress-attestation-key:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64` | Canonical Base64 of exactly 32 raw Ed25519 public-key bytes |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Nonzero `sha256:<64 lowercase hex>` digest of those decoded public-key bytes |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH` | Canonical positive base-10 independently held minimum authority fencing epoch |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID` | Independently pinned canonical id beginning `ingress-attestation-profile:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION` | Canonical positive base-10 independently pinned profile version |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST` | Independently pinned nonzero `sha256:<64 lowercase hex>` digest of the approved attestation profile |
+
+These nine variables are complete-or-none, mandatory in production, and
+forbidden in development/test. Startup sends exactly one fresh nonce-bound
+request without retry and accepts only a short-lived domain-separated Ed25519
+response from the pinned authority. The response must measure the exact API and
+portal HTTPS origins, authoritative DNS sets, certificate chains, ingress route
+generation, and API backend workload/artifact/instance binding selected by the
+signed `HttpsPublicUrls` expectation. Because the expected ingress digest is
+receipt-bound, its workload-instance binding is a stable provisioned deployment
+identity known when that receipt is issued; a newly randomized identity cannot
+satisfy a pre-existing receipt.
 
 The deployment, profile, and trust-root-registry pins come from process
 configuration, not from the documents being admitted. Preflight verifies the
@@ -146,8 +172,8 @@ Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
 authority, and cannot start the API or migration runner. Even a valid sealed
 semantic closure, build manifest, and deployed-workload proof cannot start
-production until all eight receipt-bound live runtime guard witnesses are
-verified; that witness verifier is not yet implemented. The proving ground
+production until the remaining six receipt-bound live runtime guards are
+implemented and verified. The proving ground
 likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
 runnable profile digest.

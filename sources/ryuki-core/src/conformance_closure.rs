@@ -4129,8 +4129,11 @@ pub mod tests {
             }),
             2 => json!({
                 "kind": "https-public-urls",
-                "public_origin_set_digest": test_digest("guard-public-origins"),
-                "ingress_binding_digest": test_digest("guard-ingress-binding"),
+                // Independent goldens for the deterministic, genuinely signed
+                // ingress composition fixture. These intentionally do not
+                // call the fixture's digest constructor.
+                "public_origin_set_digest": "sha256:bbecce0b5f74832b9e6cd285a60e3d0df2edd97f4aab88da09cd0300398589b5",
+                "ingress_binding_digest": "sha256:2982c5fad2f24909662f88025ee5049f1a4d4c0a9d21109b9a216c7dba688064",
                 "attestation_profile_id": "ingress-attestation-profile:closure-fixture",
                 "attestation_profile_version": 1,
                 "attestation_profile_digest": test_digest("guard-ingress-profile"),

@@ -487,6 +487,14 @@ impl VerifiedHttpsPublicUrlsWitness {
         self.measurement_sequence
     }
 
+    pub fn observed_at_not_before(&self) -> DateTime<Utc> {
+        self.observed_at.not_before
+    }
+
+    pub fn observed_at_not_after(&self) -> DateTime<Utc> {
+        self.observed_at.not_after
+    }
+
     pub fn valid_until(&self) -> DateTime<Utc> {
         self.valid_until
     }
@@ -1126,8 +1134,10 @@ fn invalid(message: impl Into<String>) -> PublicIngressError {
     PublicIngressError::Invalid(message.into())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "security-test-support"))]
+pub mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1146,6 +1156,8 @@ mod tests {
         signing_key: SigningKey,
         public_key: [u8; 32],
         public_key_fingerprint: String,
+        profile_id: String,
+        profile_version: u64,
         profile_digest: String,
         origins: Vec<PublicOriginBinding>,
         ingress: PublicIngressBinding,
@@ -1246,6 +1258,8 @@ mod tests {
                 signing_key,
                 public_key,
                 public_key_fingerprint,
+                profile_id: "ingress-attestation-profile:test".into(),
+                profile_version: 3,
                 profile_digest,
                 origins,
                 ingress,
@@ -1264,8 +1278,8 @@ mod tests {
                 public_key: &self.public_key,
                 public_key_fingerprint: &self.public_key_fingerprint,
                 minimum_authority_epoch: 7,
-                attestation_profile_id: "ingress-attestation-profile:test",
-                attestation_profile_version: 3,
+                attestation_profile_id: &self.profile_id,
+                attestation_profile_version: self.profile_version,
                 attestation_profile_digest: &self.profile_digest,
             }
         }
@@ -1393,6 +1407,212 @@ mod tests {
                 Value::String(BASE64_STANDARD.encode(signature.to_bytes())),
             );
         canonical_json_bytes(&response).expect("signed fixture response canonicalizes")
+    }
+
+    /// Independent golden for the exact role-tagged production-composition
+    /// origins below. Keep the closure fixture's copy separate so changing a
+    /// fixture constructor cannot silently bless a new expected value.
+    #[cfg(feature = "security-test-support")]
+    pub const GENUINE_PUBLIC_ORIGIN_SET_DIGEST: &str =
+        "sha256:bbecce0b5f74832b9e6cd285a60e3d0df2edd97f4aab88da09cd0300398589b5";
+
+    /// Independent golden for the complete deterministic DNS, TLS, route,
+    /// artifact, and workload-instance projection below.
+    #[cfg(feature = "security-test-support")]
+    pub const GENUINE_PUBLIC_INGRESS_BINDING_DIGEST: &str =
+        "sha256:2982c5fad2f24909662f88025ee5049f1a4d4c0a9d21109b9a216c7dba688064";
+
+    #[cfg(feature = "security-test-support")]
+    pub struct GenuinePublicIngressFixtureInput<'a> {
+        pub deployment_id: &'a str,
+        pub trust_domain_id: &'a str,
+        pub workload_id: &'a str,
+        pub source_revision: &'a str,
+        pub artifact_digest: &'a str,
+        pub workload_instance_binding_digest: &'a str,
+        pub requirement_digest: &'a str,
+        pub challenge_binding_digest: &'a str,
+        pub attestation_profile_id: &'a str,
+        pub attestation_profile_version: u64,
+        pub attestation_profile_digest: &'a str,
+        pub valid_for_seconds: i64,
+    }
+
+    #[cfg(feature = "security-test-support")]
+    fn genuine_public_origins() -> Vec<PublicOriginBinding> {
+        vec![
+            PublicOriginBinding {
+                role: PublicOriginRole::PlatformApi,
+                canonical_origin: "https://api.ryuki.example.test".into(),
+            },
+            PublicOriginBinding {
+                role: PublicOriginRole::PortalUi,
+                canonical_origin: "https://portal.ryuki.example.test".into(),
+            },
+        ]
+    }
+
+    #[cfg(feature = "security-test-support")]
+    fn genuine_public_ingress(
+        workload_id: &str,
+        artifact_digest: &str,
+        workload_instance_binding_digest: &str,
+        composition_base: DateTime<Utc>,
+    ) -> PublicIngressBinding {
+        PublicIngressBinding {
+            ingress_generation_digest: sha256_digest(b"ryuki genuine public ingress generation v1"),
+            dns_bindings: vec![
+                DnsBinding {
+                    origin_role: PublicOriginRole::PlatformApi,
+                    hostname: "api.ryuki.example.test".into(),
+                    authoritative_rrset_digest: sha256_digest(
+                        b"ryuki genuine API authoritative RRset v1",
+                    ),
+                    dns_generation_digest: sha256_digest(b"ryuki genuine API DNS generation v1"),
+                },
+                DnsBinding {
+                    origin_role: PublicOriginRole::PortalUi,
+                    hostname: "portal.ryuki.example.test".into(),
+                    authoritative_rrset_digest: sha256_digest(
+                        b"ryuki genuine portal authoritative RRset v1",
+                    ),
+                    dns_generation_digest: sha256_digest(b"ryuki genuine portal DNS generation v1"),
+                },
+            ],
+            tls_bindings: vec![
+                TlsEndpointBinding {
+                    origin_role: PublicOriginRole::PlatformApi,
+                    server_name: "api.ryuki.example.test".into(),
+                    leaf_spki_digest: sha256_digest(b"ryuki genuine API TLS leaf SPKI v1"),
+                    certificate_chain_digest: sha256_digest(
+                        b"ryuki genuine API TLS certificate chain v1",
+                    ),
+                    san_dns_names: vec!["api.ryuki.example.test".into()],
+                    certificate_not_before: composition_base - TimeDelta::days(1),
+                    certificate_not_after: composition_base + TimeDelta::days(1),
+                    minimum_protocol: MinimumTlsProtocol::Tls13,
+                    verification_method: TlsVerificationMethod::WebpkiHostnameAndChain,
+                },
+                TlsEndpointBinding {
+                    origin_role: PublicOriginRole::PortalUi,
+                    server_name: "portal.ryuki.example.test".into(),
+                    leaf_spki_digest: sha256_digest(b"ryuki genuine portal TLS leaf SPKI v1"),
+                    certificate_chain_digest: sha256_digest(
+                        b"ryuki genuine portal TLS certificate chain v1",
+                    ),
+                    san_dns_names: vec!["portal.ryuki.example.test".into()],
+                    certificate_not_before: composition_base - TimeDelta::days(1),
+                    certificate_not_after: composition_base + TimeDelta::days(1),
+                    minimum_protocol: MinimumTlsProtocol::Tls13,
+                    verification_method: TlsVerificationMethod::WebpkiHostnameAndChain,
+                },
+            ],
+            routes: vec![
+                IngressRouteBinding {
+                    origin_role: PublicOriginRole::PlatformApi,
+                    path_prefix: "/api".into(),
+                    path_type: IngressPathType::Prefix,
+                    route_generation_digest: sha256_digest(
+                        b"ryuki genuine API route generation v1",
+                    ),
+                    backend_workload_id: workload_id.into(),
+                    backend_component_id: "component:ryuki-api".into(),
+                    backend_artifact_digest: artifact_digest.into(),
+                    backend_binding_digest: workload_instance_binding_digest.into(),
+                },
+                IngressRouteBinding {
+                    origin_role: PublicOriginRole::PortalUi,
+                    path_prefix: "/".into(),
+                    path_type: IngressPathType::Prefix,
+                    route_generation_digest: sha256_digest(
+                        b"ryuki genuine portal route generation v1",
+                    ),
+                    backend_workload_id: "workload:ryuki-portal-fixture".into(),
+                    backend_component_id: "component:ryuki-portal-ui".into(),
+                    backend_artifact_digest: sha256_digest(b"ryuki genuine portal artifact v1"),
+                    backend_binding_digest: sha256_digest(
+                        b"ryuki genuine portal workload binding v1",
+                    ),
+                },
+            ],
+        }
+    }
+
+    /// Produces one genuinely signed deterministic ingress measurement for
+    /// API admission composition tests. The production verifier remains the
+    /// only constructor of the returned opaque witness.
+    #[cfg(feature = "security-test-support")]
+    pub fn genuine_public_ingress_fixture(
+        input: GenuinePublicIngressFixtureInput<'_>,
+    ) -> Result<VerifiedHttpsPublicUrlsWitness, PublicIngressError> {
+        let composition_base = Utc
+            .with_ymd_and_hms(2026, 7, 16, 12, 0, 0)
+            .single()
+            .expect("composition fixture instant is valid");
+        let mut fixture = Fixture::new();
+        fixture.profile_id = input.attestation_profile_id.into();
+        fixture.profile_version = input.attestation_profile_version;
+        fixture.profile_digest = input.attestation_profile_digest.into();
+        fixture.workload_instance_binding_digest = input.workload_instance_binding_digest.into();
+        fixture.requirement_digest = input.requirement_digest.into();
+        fixture.challenge_binding_digest = input.challenge_binding_digest.into();
+        fixture.origins = genuine_public_origins();
+        fixture.ingress = genuine_public_ingress(
+            input.workload_id,
+            input.artifact_digest,
+            input.workload_instance_binding_digest,
+            composition_base,
+        );
+        fixture.origin_digest = public_origin_set_digest(&fixture.origins)?;
+        fixture.ingress_digest = public_ingress_binding_digest(&fixture.ingress)?;
+        if fixture.origin_digest != GENUINE_PUBLIC_ORIGIN_SET_DIGEST
+            || fixture.ingress_digest != GENUINE_PUBLIC_INGRESS_BINDING_DIGEST
+        {
+            return Err(invalid(format!(
+                "genuine public-ingress preimage drifted from its independent golden digests (origin {}, ingress {})",
+                fixture.origin_digest, fixture.ingress_digest
+            )));
+        }
+
+        let authority = fixture.authority();
+        let request = build_public_ingress_attestation_request(
+            ExpectedPublicIngress {
+                deployment_id: input.deployment_id,
+                trust_domain_id: input.trust_domain_id,
+                workload_id: input.workload_id,
+                source_revision: input.source_revision,
+                artifact_digest: input.artifact_digest,
+                workload_instance_binding_digest: input.workload_instance_binding_digest,
+                requirement_digest: input.requirement_digest,
+                challenge_binding_digest: input.challenge_binding_digest,
+                public_origin_set_digest: &fixture.origin_digest,
+                ingress_binding_digest: &fixture.ingress_digest,
+            },
+            authority,
+            test_entropy(b"genuine public-ingress composition request nonce"),
+            composition_base + TimeDelta::seconds(6),
+        )?;
+        let mut response = fixture.unsigned_response(&request);
+        response["measurement"]["observed_at"]["not_before"] =
+            json!(composition_base + TimeDelta::seconds(7));
+        response["measurement"]["observed_at"]["not_after"] =
+            json!(composition_base + TimeDelta::seconds(8));
+        response["measurement"]["valid_until"] =
+            json!(composition_base + TimeDelta::seconds(input.valid_for_seconds));
+        let response = sign_response(
+            response,
+            &fixture.signing_key,
+            PUBLIC_INGRESS_RESPONSE_DOMAIN,
+        );
+        verify_public_ingress_attestation(
+            request,
+            &response,
+            authority,
+            ConformanceTrustedTimeWindow {
+                not_before: composition_base + TimeDelta::seconds(9),
+                not_after: composition_base + TimeDelta::seconds(10),
+            },
+        )
     }
 
     #[test]

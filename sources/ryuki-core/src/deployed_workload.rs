@@ -811,6 +811,14 @@ pub mod tests {
 
     static TEST_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    /// Stable, non-secret workload identity used only by genuine downstream
+    /// composition fixtures that must bind an independently signed proof to a
+    /// deterministic ingress preimage.
+    #[cfg(feature = "security-test-support")]
+    pub fn genuine_workload_instance_binding_digest() -> String {
+        sha256_digest(b"ryuki genuine production composition workload instance v1")
+    }
+
     struct Fixture {
         signing_key: SigningKey,
         public_key: [u8; 32],
@@ -1061,6 +1069,53 @@ pub mod tests {
         runtime_executable: &RuntimeExecutable,
         valid_for_seconds: i64,
     ) -> Result<VerifiedDeployedWorkload, DeployedWorkloadError> {
+        genuine_deployed_workload_fixture_with_optional_instance_binding(
+            deployment_id,
+            trust_domain_id,
+            workload_id,
+            oci_subject,
+            runtime_executable,
+            None,
+            valid_for_seconds,
+        )
+    }
+
+    /// Produces the same genuinely signed workload proof as
+    /// [`genuine_deployed_workload_fixture`], but with an explicit stable
+    /// workload-instance binding for deterministic cross-module composition
+    /// tests. The original helper deliberately retains its independently
+    /// randomized binding semantics.
+    #[cfg(feature = "security-test-support")]
+    pub fn genuine_deployed_workload_fixture_with_instance_binding(
+        deployment_id: &str,
+        trust_domain_id: &str,
+        workload_id: &str,
+        oci_subject: &OciSubject,
+        runtime_executable: &RuntimeExecutable,
+        workload_instance_binding_digest: &str,
+        valid_for_seconds: i64,
+    ) -> Result<VerifiedDeployedWorkload, DeployedWorkloadError> {
+        genuine_deployed_workload_fixture_with_optional_instance_binding(
+            deployment_id,
+            trust_domain_id,
+            workload_id,
+            oci_subject,
+            runtime_executable,
+            Some(workload_instance_binding_digest),
+            valid_for_seconds,
+        )
+    }
+
+    #[cfg(feature = "security-test-support")]
+    fn genuine_deployed_workload_fixture_with_optional_instance_binding(
+        deployment_id: &str,
+        trust_domain_id: &str,
+        workload_id: &str,
+        oci_subject: &OciSubject,
+        runtime_executable: &RuntimeExecutable,
+        workload_instance_binding_digest: Option<&str>,
+        valid_for_seconds: i64,
+    ) -> Result<VerifiedDeployedWorkload, DeployedWorkloadError> {
         let composition_base = Utc
             .with_ymd_and_hms(2026, 7, 16, 12, 0, 0)
             .single()
@@ -1091,6 +1146,10 @@ pub mod tests {
                 json!(composition_base - TimeDelta::seconds(1));
             response["measurement"]["valid_until"] =
                 json!(composition_base + TimeDelta::seconds(valid_for_seconds));
+            if let Some(workload_instance_binding_digest) = workload_instance_binding_digest {
+                response["measurement"]["workload_instance_binding_digest"] =
+                    json!(workload_instance_binding_digest);
+            }
         });
         verify_deployed_workload_attestation(
             request,

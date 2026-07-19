@@ -48,6 +48,12 @@ use ryuki_core::production_deployment_applicability::{
     DeploymentCheckpointApplicabilityClaim, ProductionDeploymentApplicabilityClaims,
     ProviderMandatoryBaselineClaim, SecurityLimitApplicabilityClaim,
 };
+use ryuki_core::public_ingress::{
+    build_public_ingress_attestation_request, verify_public_ingress_attestation,
+    ExpectedPublicIngress, PublicIngressAuthorityAnchor,
+    VerifiedHttpsPublicUrlsWitness as VerifiedPublicIngressAttestation,
+    MAX_PUBLIC_INGRESS_REQUEST_BYTES, MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
+};
 use ryuki_core::security_profile::{
     ArtifactKind, DeploymentSecurityProfile, GuardId, MigrationAuthoritySource,
     ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
@@ -107,6 +113,24 @@ pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION_ENV: 
 pub(crate) const DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST_ENV: &str =
     "RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST";
 pub(crate) const EXPECTED_WORKLOAD_ID_ENV: &str = "RYUKI_EXPECTED_WORKLOAD_ID";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_KEY_ID_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_PROFILE_ID_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION";
+pub(crate) const PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV: &str =
+    "RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_PATH_ENV: &str = "RYUKI_PRODUCTION_BUILD_MANIFEST_PATH";
 pub(crate) const PRODUCTION_BUILD_MANIFEST_DIGEST_ENV: &str =
     "RYUKI_PRODUCTION_BUILD_MANIFEST_DIGEST";
@@ -137,6 +161,8 @@ const MAX_CHECKPOINT_DOCUMENT_DIGESTS: usize = 4096;
 const CHECKPOINT_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 const DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_DEPLOYED_WORKLOAD_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
+const PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE: Duration = Duration::from_secs(30);
 
 const PROFILE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/deployment-security-profile.schema.json");
@@ -182,6 +208,19 @@ pub(crate) struct StartupDeployedWorkloadAttestationPins {
     pub(crate) workload_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupPublicIngressAttestationPins {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) authority_id: String,
+    pub(crate) key_id: String,
+    pub(crate) public_key_base64: String,
+    pub(crate) public_key_fingerprint: String,
+    pub(crate) minimum_authority_epoch: u64,
+    pub(crate) attestation_profile_id: String,
+    pub(crate) attestation_profile_version: u64,
+    pub(crate) attestation_profile_digest: String,
+}
+
 /// Detached build identity selected by independently governed deployment
 /// configuration. The manifest deliberately lives outside the rollbackable
 /// security-contract root and is bound by the digest supplied here.
@@ -200,6 +239,7 @@ pub(crate) struct StartupSecurityPins {
     pub(crate) conformance_trust_root_registry_digest: String,
     pub(crate) conformance_trust_checkpoint_authority: Option<StartupTrustCheckpointAuthorityPins>,
     pub(crate) deployed_workload_attestation: Option<StartupDeployedWorkloadAttestationPins>,
+    pub(crate) public_ingress_attestation: Option<StartupPublicIngressAttestationPins>,
     pub(crate) production_build_manifest: Option<StartupProductionBuildManifestPins>,
     pub(crate) deployment_id: String,
     pub(crate) security_profile: SecurityProfile,
@@ -246,6 +286,7 @@ impl StartupSecurityPins {
 
         let conformance_trust_checkpoint_authority = optional_trust_checkpoint_authority(&mut get)?;
         let deployed_workload_attestation = optional_deployed_workload_attestation(&mut get)?;
+        let public_ingress_attestation = optional_public_ingress_attestation(&mut get)?;
         let production_build_manifest = optional_production_build_manifest(&mut get)?;
 
         let deployment_id = required_unicode(&mut get, EXPECTED_DEPLOYMENT_ID_ENV)?;
@@ -277,6 +318,11 @@ impl StartupSecurityPins {
                 "production {SECURITY_PROFILE_ENV} requires the complete independently pinned deployed-workload attestation binding beginning with {DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV}"
             ));
         }
+        if security_profile.is_production() && public_ingress_attestation.is_none() {
+            return Err(format!(
+                "production {SECURITY_PROFILE_ENV} requires the complete independently pinned public-ingress attestation binding beginning with {PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV}"
+            ));
+        }
         if !security_profile.is_production() && production_build_manifest.is_some() {
             return Err(format!(
                 "{PRODUCTION_BUILD_MANIFEST_PATH_ENV} and {PRODUCTION_BUILD_MANIFEST_DIGEST_ENV} are production-only and must be unset for {profile_raw}"
@@ -285,6 +331,11 @@ impl StartupSecurityPins {
         if !security_profile.is_production() && deployed_workload_attestation.is_some() {
             return Err(format!(
                 "the deployed-workload attestation binding beginning with {DEPLOYED_WORKLOAD_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
+            ));
+        }
+        if !security_profile.is_production() && public_ingress_attestation.is_some() {
+            return Err(format!(
+                "the public-ingress attestation binding beginning with {PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV} is production-only and must be unset for {profile_raw}"
             ));
         }
 
@@ -296,6 +347,7 @@ impl StartupSecurityPins {
             conformance_trust_root_registry_digest,
             conformance_trust_checkpoint_authority,
             deployed_workload_attestation,
+            public_ingress_attestation,
             production_build_manifest,
             deployment_id,
             security_profile,
@@ -724,9 +776,10 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-// SecureCookies has a live production verifier. The remaining nominal witness
-// types and the final eight-witness aggregate stay under this temporary
-// dead-code allowance until their guard-specific verifiers are implemented.
+// HttpsPublicUrls and SecureCookies have live production verifiers. The
+// remaining nominal witness types and the final eight-witness aggregate stay
+// under this temporary dead-code allowance until their guard-specific
+// verifiers are implemented.
 #[allow(dead_code)]
 mod runtime_admission {
     use super::*;
@@ -926,7 +979,7 @@ mod runtime_admission {
         }
     }
 
-    fn exact_challenge(
+    pub(super) fn exact_challenge(
         boundary: &VerifiedProductionBoundary,
         guard_id: GuardId,
     ) -> Result<VerifiedProductionRuntimeGuardChallenge<'_>, ProductionRuntimeAdmissionError> {
@@ -1044,6 +1097,184 @@ mod runtime_admission {
         GuardId::FirstOwnerPathClosed
     );
 
+    pub(super) type VerifiedHttpsPublicUrlsRuntimeWitness =
+        VerifiedHttpsPublicUrlsGuardWitness<VerifiedPublicIngressAttestation>;
+
+    fn measured_public_ingress_value(
+        attestation: &VerifiedPublicIngressAttestation,
+    ) -> RuntimeGuardExpectedValue {
+        RuntimeGuardExpectedValue::HttpsPublicUrls {
+            public_origin_set_digest: attestation.public_origin_set_digest().to_owned(),
+            ingress_binding_digest: attestation.ingress_binding_digest().to_owned(),
+            attestation_profile_id: attestation.attestation_profile_id().to_owned(),
+            attestation_profile_version: attestation.attestation_profile_version(),
+            attestation_profile_digest: attestation.attestation_profile_digest().to_owned(),
+        }
+    }
+
+    pub(super) async fn verify_https_public_urls_guard(
+        boundary: &VerifiedProductionBoundary,
+        pins: &StartupPublicIngressAttestationPins,
+    ) -> Result<VerifiedHttpsPublicUrlsRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let measurement_failed = || ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::HttpsPublicUrls,
+        };
+        let challenge = exact_challenge(boundary, GuardId::HttpsPublicUrls)?;
+        let RuntimeGuardExpectedValue::HttpsPublicUrls {
+            public_origin_set_digest,
+            ingress_binding_digest,
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+        } = challenge.expected_value()
+        else {
+            return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                expected: GuardId::HttpsPublicUrls,
+                observed: challenge.expected_value().guard_id(),
+            });
+        };
+        if pins.attestation_profile_id != *attestation_profile_id
+            || pins.attestation_profile_version != *attestation_profile_version
+            || pins.attestation_profile_digest != *attestation_profile_digest
+        {
+            return Err(measurement_failed());
+        }
+        let public_key =
+            decode_public_ingress_authority_public_key(pins).map_err(|_| measurement_failed())?;
+        let authority = PublicIngressAuthorityAnchor {
+            authority_id: &pins.authority_id,
+            key_id: &pins.key_id,
+            public_key: &public_key,
+            public_key_fingerprint: &pins.public_key_fingerprint,
+            minimum_authority_epoch: pins.minimum_authority_epoch,
+            attestation_profile_id: &pins.attestation_profile_id,
+            attestation_profile_version: pins.attestation_profile_version,
+            attestation_profile_digest: &pins.attestation_profile_digest,
+        };
+
+        let requested_at = Utc::now();
+        boundary
+            .ensure_fresh(trusted_time_point(requested_at))
+            .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+        let mut request_nonce = [0u8; 32];
+        OsRng
+            .try_fill_bytes(&mut request_nonce)
+            .map_err(|_| measurement_failed())?;
+        let request = build_public_ingress_attestation_request(
+            ExpectedPublicIngress {
+                deployment_id: boundary.deployed_workload.deployment_id(),
+                trust_domain_id: boundary.deployed_workload.trust_domain_id(),
+                workload_id: boundary.deployed_workload.workload_id(),
+                source_revision: boundary.conformance.source_revision(),
+                artifact_digest: boundary.deployed_workload.oci_subject_digest(),
+                workload_instance_binding_digest: boundary
+                    .deployed_workload
+                    .workload_instance_binding_digest(),
+                requirement_digest: challenge.requirement_digest(),
+                challenge_binding_digest: challenge.challenge_binding_digest(),
+                public_origin_set_digest,
+                ingress_binding_digest,
+            },
+            authority,
+            request_nonce,
+            requested_at,
+        )
+        .map_err(|_| measurement_failed())?;
+        let transport = UnixAuthorityTransport::new(
+            pins.socket_path.clone(),
+            AuthorityTransportDeadlines {
+                connect: PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE,
+                write: PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE,
+                read: PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE,
+            },
+            AuthorityTransportBounds {
+                max_request_bytes: MAX_PUBLIC_INGRESS_REQUEST_BYTES,
+                max_response_bytes: MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
+            },
+            AuthorityTransportHardLimits {
+                max_socket_path_bytes: MAX_AUTHORITY_SOCKET_PATH_BYTES,
+                max_phase_deadline: MAX_PUBLIC_INGRESS_TRANSPORT_PHASE_DEADLINE,
+                max_request_bytes: MAX_PUBLIC_INGRESS_REQUEST_BYTES,
+                max_response_bytes: MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
+            },
+        )
+        .map_err(|_| measurement_failed())?;
+        let raw_response = transport
+            .exchange(request.as_bytes())
+            .await
+            .map_err(|_| measurement_failed())?;
+        let verified_at = Utc::now();
+        let attestation = verify_public_ingress_attestation(
+            request,
+            &raw_response,
+            authority,
+            trusted_time_point(verified_at),
+        )
+        .map_err(|_| measurement_failed())?;
+        let observed_value = measured_public_ingress_value(&attestation);
+        let observed_at_not_before = attestation.observed_at_not_before();
+        let observed_at_not_after = attestation.observed_at_not_after();
+        let valid_until = attestation.valid_until();
+        VerifiedHttpsPublicUrlsGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::HttpsPublicUrls,
+                observed_value,
+                requirement_digest: attestation.requirement_digest().to_owned(),
+                challenge_binding_digest: attestation.challenge_binding_digest().to_owned(),
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle: attestation,
+            },
+            trusted_time_point(verified_at),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn seal_verified_https_public_urls_guard(
+        boundary: &VerifiedProductionBoundary,
+        attestation: VerifiedPublicIngressAttestation,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<VerifiedHttpsPublicUrlsRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let observed_value = measured_public_ingress_value(&attestation);
+        let observed_at_not_before = attestation.observed_at_not_before();
+        let observed_at_not_after = attestation.observed_at_not_after();
+        let valid_until = attestation.valid_until();
+        VerifiedHttpsPublicUrlsGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::HttpsPublicUrls,
+                observed_value,
+                requirement_digest: attestation.requirement_digest().to_owned(),
+                challenge_binding_digest: attestation.challenge_binding_digest().to_owned(),
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle: attestation,
+            },
+            trusted_now,
+        )
+    }
+
+    pub(super) fn recheck_https_public_urls_guard(
+        boundary: &VerifiedProductionBoundary,
+        witness: &VerifiedHttpsPublicUrlsRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        witness.handle().ensure_fresh(trusted_now).map_err(|_| {
+            ProductionRuntimeAdmissionError::WitnessStale {
+                guard_id: GuardId::HttpsPublicUrls,
+            }
+        })?;
+        if witness.0.observed_value != measured_public_ingress_value(witness.handle()) {
+            return Err(ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::HttpsPublicUrls,
+            });
+        }
+        witness.recheck(boundary, trusted_now)
+    }
+
     pub(super) struct VerifiedSecureCookieRuntimeHandle {
         runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
         policies: Arc<RetainedCookiePolicySet>,
@@ -1134,6 +1365,7 @@ mod runtime_admission {
     pub(super) fn recheck_secure_cookie_guard(
         boundary: &VerifiedProductionBoundary,
         witness: &VerifiedSecureCookieRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
     ) -> Result<(), ProductionRuntimeAdmissionError> {
         let handle = witness.handle();
         let retained_runtime_policy = handle.runtime.secure_policy_set().ok_or(
@@ -1167,13 +1399,7 @@ mod runtime_admission {
                 guard_id: GuardId::SecureCookies,
             });
         }
-        witness.recheck(
-            boundary,
-            ConformanceTrustedTimeWindow {
-                not_before: Utc::now(),
-                not_after: Utc::now(),
-            },
-        )
+        witness.recheck(boundary, trusted_now)
     }
 
     #[cfg(test)]
@@ -1502,11 +1728,15 @@ pub(crate) struct SecurityContractContext {
     /// Production owns one indivisible proof aggregate. Non-production cannot
     /// retain detached production proof parts.
     pub(crate) conformance_state: ConformanceState,
-    /// The first live production guard witness. It owns an Arc clone of the
+    /// The secure-cookie production guard witness. It owns an Arc clone of the
     /// exact retained policy allocation shared with every API cookie consumer.
     /// The field remains `None` for non-production and until serving startup
     /// has loaded and validated the immutable application configuration.
     verified_secure_cookie_guard: Option<runtime_admission::VerifiedSecureCookieRuntimeWitness>,
+    /// Independently signed public DNS/TLS/ingress observation for the exact
+    /// workload instance sealed into the production boundary.
+    verified_https_public_urls_guard:
+        Option<runtime_admission::VerifiedHttpsPublicUrlsRuntimeWitness>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     /// Lossless, non-authoritative projection retained for independent
@@ -1548,7 +1778,21 @@ impl SecurityContractContext {
                 "production serving startup has no sealed production-boundary proof".into(),
             );
         };
-        boundary.ensure_fresh(trusted_time_point(now))
+        let trusted_now = trusted_time_point(now);
+        boundary.ensure_fresh(trusted_now)?;
+        if let Some(witness) = &self.verified_https_public_urls_guard {
+            runtime_admission::recheck_https_public_urls_guard(boundary, witness, trusted_now)
+                .map_err(|error| {
+                    format!("https-public-urls runtime guard freshness recheck failed: {error}")
+                })?;
+        }
+        if let Some(witness) = &self.verified_secure_cookie_guard {
+            runtime_admission::recheck_secure_cookie_guard(boundary, witness, trusted_now)
+                .map_err(|error| {
+                    format!("secure-cookie runtime guard freshness recheck failed: {error}")
+                })?;
+        }
+        Ok(())
     }
 
     /// Preserve the current all-guards production blocker for startup modes
@@ -1556,6 +1800,44 @@ impl SecurityContractContext {
     /// migration processes). Non-production remains unaffected.
     pub(crate) fn reject_unverified_production_runtime_guards(&self) -> Result<(), String> {
         reject_incomplete_runtime_guard_admission(&self.conformance_state)
+    }
+
+    /// Perform one nonce-bound exchange with the independently pinned public
+    /// ingress authority and retain its exact non-cloneable proof. The caller
+    /// supplies only the closed startup pin set; expected values, workload
+    /// bindings, challenge digests, and time are derived internally.
+    pub(crate) async fn verify_https_public_urls_runtime_guard(
+        &mut self,
+        pins: &StartupSecurityPins,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_https_public_urls_guard.is_some()
+                || pins.public_ingress_attestation.is_some()
+            {
+                return Err(
+                    "non-production startup retained public-ingress production authority".into(),
+                );
+            }
+            return Ok(());
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        if self.verified_https_public_urls_guard.is_some() {
+            return Err(
+                "production https-public-urls runtime guard was verified more than once".into(),
+            );
+        }
+        let authority = pins.public_ingress_attestation.as_ref().ok_or_else(|| {
+            "production startup has no independently pinned public-ingress authority".to_string()
+        })?;
+        let witness = runtime_admission::verify_https_public_urls_guard(boundary, authority)
+            .await
+            .map_err(|error| {
+                format!("https-public-urls runtime guard verification failed: {error}")
+            })?;
+        self.verified_https_public_urls_guard = Some(witness);
+        Ok(())
     }
 
     /// Seal the live SecureCookies witness from the exact API cookie runtime.
@@ -1603,16 +1885,36 @@ impl SecurityContractContext {
                 self.verified_secure_cookie_guard.as_ref().ok_or_else(|| {
                     "production startup has no verified secure-cookie runtime guard".to_string()
                 })?;
-            runtime_admission::recheck_secure_cookie_guard(boundary, secure_cookie_guard).map_err(
-                |error| format!("secure-cookie runtime guard freshness recheck failed: {error}"),
-            )?;
+            let https_public_urls_guard = self
+                .verified_https_public_urls_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified https-public-urls runtime guard".to_string()
+                })?;
+            let trusted_now = trusted_time_point(now);
+            runtime_admission::recheck_https_public_urls_guard(
+                boundary,
+                https_public_urls_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("https-public-urls runtime guard freshness recheck failed: {error}")
+            })?;
+            runtime_admission::recheck_secure_cookie_guard(
+                boundary,
+                secure_cookie_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("secure-cookie runtime guard freshness recheck failed: {error}")
+            })?;
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and the exact retained SecureCookies policy has a live workload-bound witness; startup remains blocked until the remaining seven runtime guards are verified: durable-postgresql, approved-secret-provider, https-public-urls, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls plus the exact retained SecureCookies policy have live workload-bound witnesses; startup remains blocked until the remaining six runtime guards are verified: durable-postgresql, approved-secret-provider, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
@@ -2508,6 +2810,27 @@ fn decode_deployed_workload_authority_public_key(
     })
 }
 
+fn decode_public_ingress_authority_public_key(
+    pins: &StartupPublicIngressAttestationPins,
+) -> Result<[u8; ED25519_AUTHORITY_PUBLIC_KEY_BYTES], String> {
+    let decoded = BASE64_STANDARD
+        .decode(&pins.public_key_base64)
+        .map_err(|_| {
+            "configured public-ingress authority public key is not canonical base64".to_string()
+        })?;
+    if BASE64_STANDARD.encode(&decoded) != pins.public_key_base64
+        || raw_digest(&decoded) != pins.public_key_fingerprint
+    {
+        return Err(
+            "configured public-ingress authority public key does not match its canonical independent fingerprint pin"
+                .into(),
+        );
+    }
+    decoded
+        .try_into()
+        .map_err(|_| "configured public-ingress authority public key is not 32 bytes".to_string())
+}
+
 fn conformance_document_digests(
     documents: &BTreeMap<String, Value>,
     raw_document_bytes: &BTreeMap<String, Vec<u8>>,
@@ -2680,6 +3003,7 @@ fn finalize_startup_security_contract(
         profile_path: prepared.profile_path,
         conformance_state,
         verified_secure_cookie_guard: None,
+        verified_https_public_urls_guard: None,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
     })
@@ -3608,6 +3932,137 @@ fn optional_deployed_workload_attestation(
         measurement_profile_version,
         measurement_profile_digest,
         workload_id,
+    }))
+}
+
+fn optional_public_ingress_attestation(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<StartupPublicIngressAttestationPins>, String> {
+    let socket_path = optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV)?;
+    let authority_id = optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID_ENV)?;
+    let key_id = optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 =
+        optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV)?;
+    let public_key_fingerprint =
+        optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV)?;
+    let minimum_authority_epoch =
+        optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV)?;
+    let attestation_profile_id = optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_PROFILE_ID_ENV)?;
+    let attestation_profile_version =
+        optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV)?;
+    let attestation_profile_digest =
+        optional_unicode(get, PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV)?;
+
+    let any_present = [
+        socket_path.as_ref(),
+        authority_id.as_ref(),
+        key_id.as_ref(),
+        public_key_base64.as_ref(),
+        public_key_fingerprint.as_ref(),
+        minimum_authority_epoch.as_ref(),
+        attestation_profile_id.as_ref(),
+        attestation_profile_version.as_ref(),
+        attestation_profile_digest.as_ref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    if !any_present {
+        return Ok(None);
+    }
+
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| {
+            format!("{name} is required when any public-ingress attestation binding is configured")
+        })
+    };
+    let socket_path = required(socket_path, PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV)?;
+    let authority_id = required(authority_id, PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID_ENV)?;
+    let key_id = required(key_id, PUBLIC_INGRESS_ATTESTATION_KEY_ID_ENV)?;
+    let public_key_base64 = required(
+        public_key_base64,
+        PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+    )?;
+    let public_key_fingerprint = required(
+        public_key_fingerprint,
+        PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+    )?;
+    let minimum_authority_epoch = required(
+        minimum_authority_epoch,
+        PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+    )?;
+    let attestation_profile_id = required(
+        attestation_profile_id,
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_ID_ENV,
+    )?;
+    let attestation_profile_version = required(
+        attestation_profile_version,
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV,
+    )?;
+    let attestation_profile_digest = required(
+        attestation_profile_digest,
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV,
+    )?;
+
+    validate_absolute_socket_path(PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV, &socket_path)?;
+    validate_namespaced_id(
+        PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID_ENV,
+        &authority_id,
+        "public-ingress-attestation-authority:",
+    )?;
+    validate_namespaced_id(
+        PUBLIC_INGRESS_ATTESTATION_KEY_ID_ENV,
+        &key_id,
+        "public-ingress-attestation-key:",
+    )?;
+    validate_namespaced_id(
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_ID_ENV,
+        &attestation_profile_id,
+        "ingress-attestation-profile:",
+    )?;
+    validate_digest_pin(
+        PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+        &public_key_fingerprint,
+    )?;
+    validate_digest_pin(
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV,
+        &attestation_profile_digest,
+    )?;
+    let public_key = BASE64_STANDARD.decode(&public_key_base64).map_err(|_| {
+        format!(
+            "{PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        )
+    })?;
+    if public_key.len() != ED25519_AUTHORITY_PUBLIC_KEY_BYTES
+        || BASE64_STANDARD.encode(&public_key) != public_key_base64
+    {
+        return Err(format!(
+            "{PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV} must be canonical base64 for a 32-byte Ed25519 public key"
+        ));
+    }
+    if raw_digest(&public_key) != public_key_fingerprint {
+        return Err(format!(
+            "{PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV} does not match the decoded authority public key"
+        ));
+    }
+    let minimum_authority_epoch = parse_positive_exact_json_integer(
+        PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+        &minimum_authority_epoch,
+    )?;
+    let attestation_profile_version = parse_positive_exact_json_integer(
+        PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV,
+        &attestation_profile_version,
+    )?;
+
+    Ok(Some(StartupPublicIngressAttestationPins {
+        socket_path: PathBuf::from(socket_path),
+        authority_id,
+        key_id,
+        public_key_base64,
+        public_key_fingerprint,
+        minimum_authority_epoch,
+        attestation_profile_id,
+        attestation_profile_version,
+        attestation_profile_digest,
     }))
 }
 
@@ -5463,13 +5918,20 @@ mod tests {
         SIGNATURE_ALGORITHM, SIGNATURE_VERSION, TRUST_RECONCILIATION_PROTOCOL_VERSION,
         TRUST_RECONCILIATION_RESPONSE_DOMAIN,
     };
-    use ryuki_core::deployed_workload::tests::genuine_deployed_workload_fixture;
+    use ryuki_core::deployed_workload::tests::{
+        genuine_deployed_workload_fixture, genuine_deployed_workload_fixture_with_instance_binding,
+        genuine_workload_instance_binding_digest,
+    };
     use ryuki_core::production_applicability::derive_implementation_applicability;
     use ryuki_core::production_build::{
         BuildEndian, BuildSource, BuildTarget, MandatoryCapabilityBaseline, OciSubject,
         OciSubjectKind, RuntimeExecutable, SelectorDisposition, SelectorDomain,
         SourceRevisionAlgorithm, PRODUCTION_BUILD_MANIFEST_CONTRACT_KIND,
         PRODUCTION_BUILD_MANIFEST_SCHEMA_URI, PRODUCTION_BUILD_MANIFEST_SCHEMA_VERSION,
+    };
+    use ryuki_core::public_ingress::tests::{
+        genuine_public_ingress_fixture, GenuinePublicIngressFixtureInput,
+        GENUINE_PUBLIC_INGRESS_BINDING_DIGEST, GENUINE_PUBLIC_ORIGIN_SET_DIGEST,
     };
     use ryuki_core::security_profile::{ArtifactKind, MigrationOverlay, VersionedContentReference};
     use serde_json::json;
@@ -5527,12 +5989,14 @@ mod tests {
         let (conformance, profile_raw_bytes) = genuine_production_closure_fixture()
             .expect("the genuine signed closure fixture must verify");
         let manifest = conformance.production_build_manifest().clone();
-        let deployed_workload = genuine_deployed_workload_fixture(
+        let workload_instance_binding_digest = genuine_workload_instance_binding_digest();
+        let deployed_workload = genuine_deployed_workload_fixture_with_instance_binding(
             workload_deployment_id.unwrap_or(conformance.deployment_id()),
             conformance.trust_domain_id(),
             "workload:ryuki-api-fixture",
             &manifest.oci_subject,
             &manifest.runtime_executable,
+            &workload_instance_binding_digest,
             workload_valid_for_seconds,
         )
         .expect("the genuine signed workload fixture must verify");
@@ -5559,6 +6023,124 @@ mod tests {
             production_composition_time(5, 6),
         )
         .expect("one exact signed production identity must seal")
+    }
+
+    fn genuine_public_ingress_attestation(
+        boundary: &VerifiedProductionBoundary,
+        profile_override: Option<(&str, u64, &str)>,
+        valid_for_seconds: i64,
+    ) -> VerifiedPublicIngressAttestation {
+        let challenge = exact_challenge(boundary, GuardId::HttpsPublicUrls)
+            .expect("the genuine boundary has one HTTPS public-URLs challenge");
+        let RuntimeGuardExpectedValue::HttpsPublicUrls {
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            ..
+        } = challenge.expected_value()
+        else {
+            panic!("the genuine HTTPS public-URLs challenge changed kind");
+        };
+        let (attestation_profile_id, attestation_profile_version, attestation_profile_digest) =
+            profile_override.unwrap_or((
+                attestation_profile_id.as_str(),
+                *attestation_profile_version,
+                attestation_profile_digest.as_str(),
+            ));
+        genuine_public_ingress_fixture(GenuinePublicIngressFixtureInput {
+            deployment_id: boundary.deployed_workload.deployment_id(),
+            trust_domain_id: boundary.deployed_workload.trust_domain_id(),
+            workload_id: boundary.deployed_workload.workload_id(),
+            source_revision: boundary.conformance.source_revision(),
+            artifact_digest: boundary.deployed_workload.oci_subject_digest(),
+            workload_instance_binding_digest: boundary
+                .deployed_workload
+                .workload_instance_binding_digest(),
+            requirement_digest: challenge.requirement_digest(),
+            challenge_binding_digest: challenge.challenge_binding_digest(),
+            attestation_profile_id,
+            attestation_profile_version,
+            attestation_profile_digest,
+            valid_for_seconds,
+        })
+        .expect("the deterministic signed public-ingress fixture must verify")
+    }
+
+    #[test]
+    fn genuine_https_public_urls_measurement_seals_the_nominal_guard() {
+        let boundary = genuine_production_boundary(240);
+        let attestation = genuine_public_ingress_attestation(&boundary, None, 180);
+        assert_eq!(
+            attestation.public_origin_set_digest(),
+            GENUINE_PUBLIC_ORIGIN_SET_DIGEST
+        );
+        assert_eq!(
+            attestation.ingress_binding_digest(),
+            GENUINE_PUBLIC_INGRESS_BINDING_DIGEST
+        );
+        assert_eq!(
+            attestation.ingress().routes[0].backend_binding_digest,
+            boundary
+                .deployed_workload
+                .workload_instance_binding_digest()
+        );
+
+        let witness = seal_verified_https_public_urls_guard(
+            &boundary,
+            attestation,
+            production_composition_time(9, 10),
+        )
+        .expect("the genuinely verified ingress witness must seal the nominal guard");
+        recheck_https_public_urls_guard(&boundary, &witness, production_composition_time(11, 12))
+            .expect("the genuinely verified ingress witness remains fresh");
+        let debug = format!("{witness:?}");
+        assert!(debug.contains("[RETAINED]"));
+        assert!(!debug.contains("api.ryuki.example.test"));
+    }
+
+    #[test]
+    fn genuine_https_public_urls_measurement_rejects_profile_substitution() {
+        let boundary = genuine_production_boundary(240);
+        let substituted_profile_digest = raw_digest(b"substituted ingress profile fixture");
+        let attestation = genuine_public_ingress_attestation(
+            &boundary,
+            Some((
+                "ingress-attestation-profile:substituted-fixture",
+                1,
+                &substituted_profile_digest,
+            )),
+            180,
+        );
+        let error = seal_verified_https_public_urls_guard(
+            &boundary,
+            attestation,
+            production_composition_time(9, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::HttpsPublicUrls,
+            }
+        );
+    }
+
+    #[test]
+    fn genuine_https_public_urls_measurement_rejects_expired_evidence() {
+        let boundary = genuine_production_boundary(240);
+        let attestation = genuine_public_ingress_attestation(&boundary, None, 12);
+        let error = seal_verified_https_public_urls_guard(
+            &boundary,
+            attestation,
+            production_composition_time(11, 12),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::WitnessStale {
+                guard_id: GuardId::HttpsPublicUrls,
+            }
+        );
     }
 
     struct TestRetainedRuntimeHandle {
@@ -6795,6 +7377,7 @@ mod tests {
                 conformance_trust_root_registry_digest: trust_root_registry_digest,
                 conformance_trust_checkpoint_authority: None,
                 deployed_workload_attestation: None,
+                public_ingress_attestation: None,
                 production_build_manifest: None,
                 deployment_id: DEPLOYMENT_ID.into(),
                 security_profile: SecurityProfile::Test,
@@ -7215,6 +7798,56 @@ mod tests {
         for (name, value) in &workload_group {
             production_complete.insert((*name).into(), OsString::from(value));
         }
+        assert!(
+            StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
+                .unwrap_err()
+                .contains(PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV)
+        );
+
+        let ingress_key = SigningKey::from_bytes(&rand::random());
+        let ingress_public_key = BASE64_STANDARD.encode(ingress_key.verifying_key().to_bytes());
+        let ingress_fingerprint = raw_digest(&ingress_key.verifying_key().to_bytes());
+        let ingress_group = [
+            (
+                PUBLIC_INGRESS_ATTESTATION_SOCKET_ENV,
+                "/run/ryuki/public-ingress/authority.sock".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID_ENV,
+                "public-ingress-attestation-authority:runtime-test".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_KEY_ID_ENV,
+                "public-ingress-attestation-key:runtime-test".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64_ENV,
+                ingress_public_key,
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT_ENV,
+                ingress_fingerprint,
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH_ENV,
+                "13".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_PROFILE_ID_ENV,
+                "ingress-attestation-profile:runtime-test".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION_ENV,
+                "5".to_string(),
+            ),
+            (
+                PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST_ENV,
+                digest.clone(),
+            ),
+        ];
+        for (name, value) in &ingress_group {
+            production_complete.insert((*name).into(), OsString::from(value));
+        }
         let production_pins =
             StartupSecurityPins::from_source(|name| production_complete.get(name).cloned())
                 .expect("production pins are complete");
@@ -7225,6 +7858,12 @@ mod tests {
         assert_eq!(workload_pins.minimum_authority_epoch, 11);
         assert_eq!(workload_pins.measurement_profile_version, 3);
         assert_eq!(workload_pins.workload_id, "workload:ryuki-api");
+        let ingress_pins = production_pins
+            .public_ingress_attestation
+            .as_ref()
+            .expect("production public-ingress attestation binding");
+        assert_eq!(ingress_pins.minimum_authority_epoch, 13);
+        assert_eq!(ingress_pins.attestation_profile_version, 5);
         let build_pins = production_pins
             .production_build_manifest
             .expect("production build manifest binding");
@@ -7256,7 +7895,27 @@ mod tests {
         .unwrap_err()
         .contains("production-only"));
 
+        let mut nonproduction_with_ingress = values.clone();
+        for (name, value) in &ingress_group {
+            nonproduction_with_ingress.insert((*name).into(), OsString::from(value));
+        }
+        assert!(StartupSecurityPins::from_source(|name| {
+            nonproduction_with_ingress.get(name).cloned()
+        })
+        .unwrap_err()
+        .contains("production-only"));
+
         for (missing, _) in &workload_group {
+            assert!(StartupSecurityPins::from_source(|name| {
+                (name != *missing)
+                    .then(|| production_complete.get(name).cloned())
+                    .flatten()
+            })
+            .unwrap_err()
+            .contains(*missing));
+        }
+
+        for (missing, _) in &ingress_group {
             assert!(StartupSecurityPins::from_source(|name| {
                 (name != *missing)
                     .then(|| production_complete.get(name).cloned())

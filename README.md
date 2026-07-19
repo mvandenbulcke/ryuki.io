@@ -265,6 +265,15 @@ compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
 | `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned measurement-profile version, at most 9,007,199,254,740,991 |
 | `RYUKI_DEPLOYED_WORKLOAD_ATTESTATION_MEASUREMENT_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved measurement profile |
 | `RYUKI_EXPECTED_WORKLOAD_ID` | Production-only independently pinned `workload:` identity; part of the complete deployed-workload attestation binding |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_SOCKET` | Production-only normalized absolute Unix-socket path; configure with the complete nine-value public-ingress authority binding |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_AUTHORITY_ID` | Production-only independently pinned id beginning `public-ingress-attestation-authority:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_KEY_ID` | Production-only independently pinned Ed25519 key id beginning `public-ingress-attestation-key:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_BASE64` | Production-only canonical Base64 of exactly 32 raw Ed25519 authority public-key bytes |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PUBLIC_KEY_FINGERPRINT` | Production-only nonzero `sha256:<64 lowercase hex>` fingerprint of those decoded public-key bytes |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_MIN_AUTHORITY_EPOCH` | Production-only canonical positive base-10 independently accepted authority fencing epoch |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_ID` | Production-only independently pinned id beginning `ingress-attestation-profile:` |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_VERSION` | Production-only canonical positive base-10 independently pinned attestation-profile version |
+| `RYUKI_PUBLIC_INGRESS_ATTESTATION_PROFILE_DIGEST` | Production-only nonzero `sha256:<64 lowercase hex>` digest of the independently approved attestation profile |
 | `RYUKI_EXPECTED_DEPLOYMENT_ID` | Independently pinned `deployment:` identity expected in the profile |
 | `RYUKI_SECURITY_PROFILE` | Independently pinned `development`, `test`, or `production` profile class |
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
@@ -308,10 +317,11 @@ SB-9 root, authenticated receipts and evidence, ControlTrace, pinned profile
 bytes, provider and security-limit claims, and build manifest. It independently
 derives the complete implementation-plus-deployment applicability inventory,
 verifies semantic closure, and seals the result into one non-cloneable
-production-boundary proof. Startup still exits before migrations, workers,
-routing, or listeners until all eight receipt-bound live runtime guard
-witnesses are verified. Those witnesses and the remaining normative boundary
-work packages must be implemented and verified before production admission.
+production-boundary proof. Startup now retains independently verified
+`HttpsPublicUrls` and exact-runtime `SecureCookies` witnesses, but still exits
+before migrations, workers, routing, or listeners until the remaining six
+receipt-bound live runtime guards and normative boundary work packages are
+implemented and verified.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

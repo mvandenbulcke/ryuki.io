@@ -1129,11 +1129,15 @@ receipt closure, and seals all static proof ownership into one non-cloneable
 production-boundary capability. The checked-in provider remains development-
 only, every compiled adapter remains production-ineligible, and the checked-in
 documents are implementation fixtures rather than active signed production
-authority. The runtime admission boundary now measures `SecureCookies` through
-a typed live witness that retains the exact API cookie-runtime and policy
-allocations used by every declared API cookie consumer. The other seven typed
-live guard witnesses are not yet implemented. Production therefore remains
-fail-closed before migrations, workers, routing, or listeners.
+authority. The runtime admission boundary now measures `HttpsPublicUrls`
+through one nonce-bound, no-retry exchange with an independently pinned
+Ed25519 ingress authority and retains its exact signed DNS/TLS/route/backend
+observation. It also measures `SecureCookies` through a typed live witness that
+retains the exact API cookie-runtime and policy allocations used by every
+declared API cookie consumer. Both witnesses are rechecked at the pre-database,
+pre-worker, and final-listener freshness fences. The other six typed live guard
+witnesses are not yet implemented. Production therefore remains fail-closed
+before migrations, workers, routing, or listeners.
 
 Each package exit receipt is a signed or provenance-bound projection of this
 ledger and its accepted bundles containing the package id, evaluated trace,
@@ -1250,6 +1254,12 @@ instance binding, observation and expiry interval, resolved OCI identity, and
 peer executable identity. Live witnesses bind this final challenge, so they
 cannot replay across workload instances or later attestations of the same
 artifact.
+The `HttpsPublicUrls` witness additionally binds the independently measured API
+route to that workload id, OCI artifact, and workload-instance binding. Because
+the public-ingress expectation is signed before startup, that instance binding
+is a stable provisioned deployment identity known when the receipt is issued;
+a newly randomized per-start identity cannot satisfy the precommitted ingress
+digest.
 Digest-valued expectations use the named canonical contracts
 `ryuki-postgresql-database-identity-v1`,
 `ryuki-postgresql-storage-binding-v1`,
