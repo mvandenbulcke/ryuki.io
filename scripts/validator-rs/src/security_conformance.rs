@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use jsonschema::{Retrieve, Uri};
 use ryuki_core::production_build::ProductionBuildManifest;
+use ryuki_core::security_profile::DeploymentSecurityProfile;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
@@ -418,8 +419,19 @@ pub(crate) fn validate_repository(root: &Path) -> Result<Vec<String>, String> {
         // The manifest is detached and therefore not an INSTANCES entry today.
         // Keep dispatch here so a future checked-in instance cannot silently
         // bypass the semantic layer when it is added to the inventory.
-        if schema_name == "production-build-manifest.schema.json" {
-            validate_production_build_manifest_semantics(file_name, &instance, &mut errors);
+        match schema_name {
+            "production-build-manifest.schema.json" => {
+                validate_production_build_manifest_semantics(file_name, &instance, &mut errors);
+            }
+            "deployment-security-profile.schema.json" => {
+                validate_deployment_security_profile_semantics(
+                    file_name,
+                    &instance,
+                    Utc::now(),
+                    &mut errors,
+                );
+            }
+            _ => {}
         }
         validate_recursive_content_references(root, file_name, &instance, "", &mut errors);
         instances.insert(file_name, instance);
@@ -835,6 +847,37 @@ fn validate_production_build_manifest_semantics(
         }
         errors.push(format!(
             "{file_name}: production build manifest semantic error: {error}"
+        ));
+    }
+}
+
+/// Validate the typed deployment-profile contract after JSON Schema has closed
+/// its wire shape. This semantic layer is required for canonical digest
+/// equality, nested provider-id uniqueness, ordering, and cross-field rules
+/// that JSON Schema cannot express.
+fn validate_deployment_security_profile_semantics(
+    file_name: &str,
+    profile: &Value,
+    now: DateTime<Utc>,
+    errors: &mut Vec<String>,
+) {
+    let profile = match serde_json::from_value::<DeploymentSecurityProfile>(profile.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            errors.push(format!(
+                "{file_name}: deployment security profile typed decode failed: {error}"
+            ));
+            return;
+        }
+    };
+
+    for error in profile
+        .validate_structure_at(now)
+        .into_iter()
+        .take(MAX_PRODUCTION_BUILD_SEMANTIC_ERRORS)
+    {
+        errors.push(format!(
+            "{file_name}: deployment security profile semantic error: {error}"
         ));
     }
 }
@@ -5959,7 +6002,11 @@ mod tests {
             }),
             1 => json!({
                 "kind": "approved-secret-provider",
-                "providers": [provider("provider:validator-secrets")],
+                "provider_inventory_digest": "sha256:9f933b33141102fa18b5feae9ba1927658bc901805d92907e1d4003bba602ada",
+                "providers": [{
+                    "provider": provider("provider:validator-secrets"),
+                    "runtime_binding_digest": digest('a')
+                }],
                 "required_capability_ids": ["secret-read", "secret-renew"]
             }),
             2 => json!({
@@ -6066,6 +6113,35 @@ mod tests {
             "runtime_cross_check_required": true
         });
         profile
+    }
+
+    #[test]
+    fn secret_provider_inventory_fixture_has_an_independent_canonical_golden() {
+        let expected = runtime_guard_expected_value(1, "deployment:repository-conformance-fixture");
+        let projection = json!({
+            "digest_contract": "ryuki-secret-provider-inventory-v1",
+            "providers": expected["providers"].clone(),
+            "required_capability_ids": expected["required_capability_ids"].clone()
+        });
+        let expected_canonical = concat!(
+            "{\"digest_contract\":\"ryuki-secret-provider-inventory-v1\",",
+            "\"providers\":[{\"provider\":{\"adapter_kind\":\"fixture.provider\",",
+            "\"adapter_version\":\"1.0.0\",",
+            "\"capability_descriptor_id\":\"capability-descriptor:validator-fixture\",",
+            "\"capability_descriptor_version\":1,",
+            "\"configuration_payload_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"configuration_version\":1,\"lifecycle_record_version\":1,",
+            "\"lifecycle_state\":\"active\",",
+            "\"provider_id\":\"provider:validator-secrets\"},",
+            "\"runtime_binding_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],",
+            "\"required_capability_ids\":[\"secret-read\",\"secret-renew\"]}"
+        );
+        let canonical = canonical_json(&projection);
+        assert_eq!(canonical, expected_canonical);
+        assert_eq!(
+            format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())),
+            expected["provider_inventory_digest"]
+        );
     }
 
     fn production_build_manifest_fixture() -> Value {
@@ -7064,6 +7140,103 @@ mod tests {
         );
         assert!(!errors.is_empty());
 
+        let mut missing_secret_inventory_digest = production_deployment_profile_fixture();
+        missing_secret_inventory_digest["runtime_guard_evidence"]["guards"][1]["expected_value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_inventory_digest");
+        errors.clear();
+        validate_instance(
+            "test:secret-provider-missing-inventory-digest",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &missing_secret_inventory_digest,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut missing_secret_runtime_binding = production_deployment_profile_fixture();
+        missing_secret_runtime_binding["runtime_guard_evidence"]["guards"][1]["expected_value"]
+            ["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_binding_digest");
+        errors.clear();
+        validate_instance(
+            "test:secret-provider-missing-runtime-binding",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &missing_secret_runtime_binding,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut flattened_secret_provider = production_deployment_profile_fixture();
+        let flattened_row = flattened_secret_provider["runtime_guard_evidence"]["guards"][1]
+            ["expected_value"]["providers"][0]["provider"]
+            .clone();
+        flattened_secret_provider["runtime_guard_evidence"]["guards"][1]["expected_value"]
+            ["providers"][0] = flattened_row;
+        errors.clear();
+        validate_instance(
+            "test:secret-provider-legacy-flattened-binding",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &flattened_secret_provider,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        for (label, field_path) in [
+            (
+                "secret-provider-zero-inventory-digest",
+                ["provider_inventory_digest", ""],
+            ),
+            (
+                "secret-provider-zero-runtime-binding",
+                ["providers", "runtime_binding_digest"],
+            ),
+        ] {
+            let mut zero_digest = production_deployment_profile_fixture();
+            let expected_value =
+                &mut zero_digest["runtime_guard_evidence"]["guards"][1]["expected_value"];
+            if field_path[1].is_empty() {
+                expected_value[field_path[0]] = json!(ZERO_SHA256_DIGEST);
+            } else {
+                expected_value[field_path[0]][0][field_path[1]] = json!(ZERO_SHA256_DIGEST);
+            }
+            errors.clear();
+            validate_instance(
+                &format!("test:{label}"),
+                "deployment-security-profile.schema.json",
+                &schema,
+                &zero_digest,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "{label} must fail schema validation");
+        }
+
+        for (label, field) in [
+            ("secret-provider-empty-providers", "providers"),
+            (
+                "secret-provider-empty-required-capabilities",
+                "required_capability_ids",
+            ),
+        ] {
+            let mut empty_inventory = production_deployment_profile_fixture();
+            empty_inventory["runtime_guard_evidence"]["guards"][1]["expected_value"][field] =
+                json!([]);
+            errors.clear();
+            validate_instance(
+                &format!("test:{label}"),
+                "deployment-security-profile.schema.json",
+                &schema,
+                &empty_inventory,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "{label} must fail schema validation");
+        }
+
         let mut insecure_cookie = production;
         insecure_cookie["runtime_guard_evidence"]["guards"][3]["expected_value"]["policies"][0]
             ["secure"] = json!(false);
@@ -7125,6 +7298,83 @@ mod tests {
             &mut errors,
         );
         assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn deployment_profile_public_semantics_reject_secret_inventory_drift_and_ordering() {
+        let schema = load("catalog/security-contracts/v1/deployment-security-profile.schema.json");
+        let now = DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let assert_semantic_error = |profile: Value, needle: &str| {
+            let mut schema_errors = Vec::new();
+            validate_instance(
+                "test:schema-valid-secret-inventory-semantic-negative",
+                "deployment-security-profile.schema.json",
+                &schema,
+                &profile,
+                &mut schema_errors,
+            );
+            assert!(
+                schema_errors.is_empty(),
+                "fixture must remain schema-valid: {}",
+                schema_errors.join("\n")
+            );
+
+            let mut semantic_errors = Vec::new();
+            validate_deployment_security_profile_semantics(
+                "test:semantic-secret-inventory",
+                &profile,
+                now,
+                &mut semantic_errors,
+            );
+            assert!(
+                semantic_errors.iter().any(|error| error.contains(needle)),
+                "expected {needle:?} in {semantic_errors:?}"
+            );
+        };
+
+        let mut digest_drift = production_deployment_profile_fixture();
+        digest_drift["runtime_guard_evidence"]["guards"][1]["expected_value"]
+            ["provider_inventory_digest"] =
+            json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_semantic_error(digest_drift, "does not equal the canonical");
+
+        let mut provider_order = production_deployment_profile_fixture();
+        let mut earlier_provider = provider_order["runtime_guard_evidence"]["guards"][1]
+            ["expected_value"]["providers"][0]
+            .clone();
+        earlier_provider["provider"]["provider_id"] = json!("provider:aaa-validator-secrets");
+        earlier_provider["runtime_binding_digest"] =
+            json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        provider_order["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(earlier_provider);
+        assert_semantic_error(provider_order, "strictly sorted and unique by provider_id");
+
+        let mut duplicate_provider_id = production_deployment_profile_fixture();
+        let mut different_row = duplicate_provider_id["runtime_guard_evidence"]["guards"][1]
+            ["expected_value"]["providers"][0]
+            .clone();
+        different_row["runtime_binding_digest"] =
+            json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        duplicate_provider_id["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(different_row);
+        assert_semantic_error(
+            duplicate_provider_id,
+            "strictly sorted and unique by provider_id",
+        );
+
+        let mut capability_order = production_deployment_profile_fixture();
+        capability_order["runtime_guard_evidence"]["guards"][1]["expected_value"]
+            ["required_capability_ids"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert_semantic_error(capability_order, "strictly sorted and unique");
     }
 
     #[test]

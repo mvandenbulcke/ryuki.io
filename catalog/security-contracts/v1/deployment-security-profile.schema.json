@@ -357,6 +357,18 @@
         "adapter_version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$" }
       }
     },
+    "expectedSecretProviderBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "runtime_binding_digest"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/expectedProviderBinding" },
+        "runtime_binding_digest": {
+          "description": "ryuki-secret-provider-runtime-binding-v1 digest of the exact non-secret initialized provider, authenticated transport, credential source, and retained-consumer projection.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
+      }
+    },
     "expectedAuthenticatorBinding": {
       "type": "object",
       "additionalProperties": false,
@@ -420,10 +432,11 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "providers", "required_capability_ids"],
+          "required": ["kind", "provider_inventory_digest", "providers", "required_capability_ids"],
           "properties": {
             "kind": { "const": "approved-secret-provider" },
-            "providers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedProviderBinding" } },
+            "provider_inventory_digest": { "description": "ryuki-secret-provider-inventory-v1 digest of the exact sorted provider runtime bindings and required capability ids.", "$ref": "#/$defs/nonzeroDigest" },
+            "providers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedSecretProviderBinding" } },
             "required_capability_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,126}$" } }
           }
         },

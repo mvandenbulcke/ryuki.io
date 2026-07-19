@@ -30,8 +30,9 @@ use crate::production_deployment_applicability::{
 };
 use crate::security_profile::{
     ArtifactKind, DeploymentSecurityProfile, ExpectedAuthenticatorBinding, ExpectedProviderBinding,
-    GuardId, ProductionAuthenticatorKind, RuntimeGuardExpectedValue, RuntimeGuardMode,
-    VersionedContentReference, authenticator_inventory_digest,
+    ExpectedSecretProviderBinding, GuardId, ProductionAuthenticatorKind, RuntimeGuardExpectedValue,
+    RuntimeGuardMode, VersionedContentReference, authenticator_inventory_digest,
+    secret_provider_inventory_digest,
 };
 
 pub const DEPLOYMENT_PROFILE_CONFORMANCE_BINDING_DIGEST_CONTRACT: &str =
@@ -986,45 +987,17 @@ fn validate_runtime_guard_provider_bindings(
     for guard in &profile.runtime_guard_evidence.guards {
         match &guard.expected_value {
             RuntimeGuardExpectedValue::ApprovedSecretProvider {
+                provider_inventory_digest,
                 providers,
                 required_capability_ids,
-            } => {
-                let expected_ids = providers
-                    .iter()
-                    .map(|provider| provider.provider_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                let active_secret_ids = active_providers
-                    .iter()
-                    .filter(|claim| claim.provider_kind == "secret-service")
-                    .map(|claim| claim.provider_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                if expected_ids != active_secret_ids {
-                    return Err(invalid(
-                        "approved-secret-provider expectation is not the exact active secret-service provider inventory",
-                    ));
-                }
-                for expected in providers {
-                    let claim = exact_guard_provider_claim(
-                        "approved-secret-provider",
-                        expected,
-                        &claims_by_id,
-                        trust_domain_id,
-                    )?;
-                    if claim.provider_kind != "secret-service"
-                        || required_capability_ids.iter().any(|capability_id| {
-                            claim
-                                .advertised_capability_ids
-                                .binary_search(capability_id)
-                                .is_err()
-                        })
-                    {
-                        return Err(invalid(format!(
-                            "approved-secret-provider {} is not a secret-service provider advertising every required capability",
-                            expected.provider_id
-                        )));
-                    }
-                }
-            }
+            } => validate_secret_provider_bindings(
+                provider_inventory_digest,
+                providers,
+                required_capability_ids,
+                active_providers,
+                &claims_by_id,
+                trust_domain_id,
+            )?,
             RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
                 authenticator_inventory_digest,
                 authenticators,
@@ -1036,6 +1009,89 @@ fn validate_runtime_guard_provider_bindings(
                 trust_domain_id,
             )?,
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_provider_bindings(
+    expected_inventory_digest: &str,
+    providers: &[ExpectedSecretProviderBinding],
+    required_capability_ids: &[String],
+    active_providers: &[ActiveProviderApplicabilityClaim],
+    claims_by_id: &BTreeMap<&str, &ActiveProviderApplicabilityClaim>,
+    trust_domain_id: &str,
+) -> Result<(), ConformanceClosureError> {
+    validate_digest(
+        expected_inventory_digest,
+        "approved-secret-provider provider inventory digest",
+    )?;
+    if providers.is_empty()
+        || !providers
+            .windows(2)
+            .all(|pair| pair[0].provider.provider_id < pair[1].provider.provider_id)
+    {
+        return Err(invalid(
+            "approved-secret-provider providers must be nonempty, strictly sorted, and unique by provider_id",
+        ));
+    }
+    if required_capability_ids.is_empty()
+        || !required_capability_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(invalid(
+            "approved-secret-provider required capability ids must be nonempty, strictly sorted, and unique",
+        ));
+    }
+    for provider in providers {
+        validate_digest(
+            &provider.runtime_binding_digest,
+            "approved-secret-provider runtime binding digest",
+        )?;
+    }
+    let recomputed_inventory_digest =
+        secret_provider_inventory_digest(providers, required_capability_ids)
+            .map_err(|_| invalid("approved-secret-provider inventory cannot be canonicalized"))?;
+    if expected_inventory_digest != recomputed_inventory_digest {
+        return Err(invalid(
+            "approved-secret-provider inventory digest does not equal its canonical binding and capability inventory",
+        ));
+    }
+
+    let expected_ids = providers
+        .iter()
+        .map(|provider| provider.provider.provider_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let active_secret_ids = active_providers
+        .iter()
+        .filter(|claim| claim.provider_kind == "secret-service")
+        .map(|claim| claim.provider_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_ids != active_secret_ids {
+        return Err(invalid(
+            "approved-secret-provider expectation is not the exact active secret-service provider inventory",
+        ));
+    }
+    for expected in providers {
+        let claim = exact_guard_provider_claim(
+            "approved-secret-provider",
+            &expected.provider,
+            claims_by_id,
+            trust_domain_id,
+        )?;
+        if claim.provider_kind != "secret-service"
+            || required_capability_ids.iter().any(|capability_id| {
+                claim
+                    .advertised_capability_ids
+                    .binary_search(capability_id)
+                    .is_err()
+            })
+        {
+            return Err(invalid(format!(
+                "approved-secret-provider {} is not a secret-service provider advertising every required capability",
+                expected.provider.provider_id
+            )));
         }
     }
     Ok(())
@@ -4163,7 +4219,14 @@ pub mod tests {
             }),
             1 => json!({
                 "kind": "approved-secret-provider",
-                "providers": [provider("provider:closure-secrets")],
+                // Independent golden for this exact provider/capability
+                // projection; never derive an authority expectation from the
+                // rows it is meant to constrain.
+                "provider_inventory_digest": "sha256:2ffee450df4ff1c6d7bc351ca8f742c2f62d6992cd12bf37eb1cb03ab4f91a2a",
+                "providers": [{
+                    "provider": provider("provider:closure-secrets"),
+                    "runtime_binding_digest": test_digest("guard-secret-provider-runtime-binding"),
+                }],
                 "required_capability_ids": ["secret-read", "secret-renew"],
             }),
             2 => json!({
@@ -4267,6 +4330,18 @@ pub mod tests {
         profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticator_inventory_digest"] = json!(
             authenticator_inventory_digest(&typed)
                 .expect("fixture authenticator inventory must canonicalize")
+        );
+    }
+
+    fn refresh_secret_provider_inventory_digest(profile: &mut Value) {
+        let expected_value = &profile["runtime_guard_evidence"]["guards"][1]["expected_value"];
+        let providers: Vec<ExpectedSecretProviderBinding> =
+            serde_json::from_value(expected_value["providers"].clone()).unwrap();
+        let required_capability_ids: Vec<String> =
+            serde_json::from_value(expected_value["required_capability_ids"].clone()).unwrap();
+        profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["provider_inventory_digest"] = json!(
+            secret_provider_inventory_digest(&providers, &required_capability_ids)
+                .expect("fixture secret-provider inventory must canonicalize")
         );
     }
 
@@ -5454,6 +5529,79 @@ pub mod tests {
         )
     }
 
+    fn focused_secret_binding(provider_id: &str) -> ExpectedSecretProviderBinding {
+        let provider_name = provider_id
+            .strip_prefix("provider:")
+            .expect("focused fixture provider id is canonical");
+        ExpectedSecretProviderBinding {
+            provider: ExpectedProviderBinding {
+                provider_id: provider_id.into(),
+                configuration_version: 1,
+                configuration_payload_digest: test_digest(&format!("{provider_id}-configuration")),
+                lifecycle_record_version: 1,
+                lifecycle_state: ProviderLifecycleState::Active,
+                capability_descriptor_id: format!("capability-descriptor:{provider_name}"),
+                capability_descriptor_version: 1,
+                adapter_kind: "secrets.service".into(),
+                adapter_version: "1.0.0".into(),
+            },
+            runtime_binding_digest: test_digest(&format!("{provider_id}-runtime-binding")),
+        }
+    }
+
+    fn focused_secret_claim(
+        binding: &ExpectedSecretProviderBinding,
+    ) -> ActiveProviderApplicabilityClaim {
+        let provider = &binding.provider;
+        ActiveProviderApplicabilityClaim {
+            provider_id: provider.provider_id.clone(),
+            provider_kind: "secret-service".into(),
+            configuration_version: provider.configuration_version,
+            configuration_payload_digest: provider.configuration_payload_digest.clone(),
+            lifecycle_record_version: provider.lifecycle_record_version,
+            lifecycle_state: provider.lifecycle_state,
+            trust_domain_id: TRUST_DOMAIN_ID.into(),
+            descriptor_id: provider.capability_descriptor_id.clone(),
+            descriptor_version: provider.capability_descriptor_version,
+            adapter_kind: provider.adapter_kind.clone(),
+            adapter_version: provider.adapter_version.clone(),
+            advertised_capability_ids: vec!["secret-read".into(), "secret-renew".into()],
+            production_eligible: true,
+            mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                document_id: format!(
+                    "provider-capability-baseline:{}",
+                    provider.provider_id.strip_prefix("provider:").unwrap()
+                ),
+                document_version: 1,
+                content_digest: test_digest(&format!("{}-baseline", provider.provider_id)),
+                artifact_locator: format!(
+                    "fixtures/providers/{}-baseline.json",
+                    provider.provider_id.strip_prefix("provider:").unwrap()
+                ),
+            },
+        }
+    }
+
+    fn validate_focused_secret_inventory(
+        providers: &[ExpectedSecretProviderBinding],
+        required_capability_ids: &[String],
+        active_providers: &[ActiveProviderApplicabilityClaim],
+        inventory_digest: &str,
+    ) -> Result<(), ConformanceClosureError> {
+        let claims_by_id = active_providers
+            .iter()
+            .map(|claim| (claim.provider_id.as_str(), claim))
+            .collect::<BTreeMap<_, _>>();
+        validate_secret_provider_bindings(
+            inventory_digest,
+            providers,
+            required_capability_ids,
+            active_providers,
+            &claims_by_id,
+            TRUST_DOMAIN_ID,
+        )
+    }
+
     fn fixture_version_context(
         profile: &DeploymentSecurityProfile,
         manifest: &ProductionBuildManifest,
@@ -5641,16 +5789,19 @@ pub mod tests {
         match mutation {
             PublicFixtureMutation::UnknownGuardProvider => {
                 profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"][0]
-                    ["provider_id"] = json!("provider:closure-unknown");
+                    ["provider"]["provider_id"] = json!("provider:closure-unknown");
+                refresh_secret_provider_inventory_digest(&mut profile);
             }
             PublicFixtureMutation::MissingSecretCapability => {
                 profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["required_capability_ids"] =
                     json!(["secret-admin"]);
+                refresh_secret_provider_inventory_digest(&mut profile);
             }
             PublicFixtureMutation::MismatchedGuardProviderProjection => {
                 profile["runtime_guard_evidence"]["guards"][1]["expected_value"]["providers"][0]
-                    ["configuration_payload_digest"] =
+                    ["provider"]["configuration_payload_digest"] =
                     json!(test_digest("cross-wired-secret-provider-configuration"));
+                refresh_secret_provider_inventory_digest(&mut profile);
             }
             PublicFixtureMutation::AuthenticatorProviderKindMismatch => {
                 profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
@@ -6252,6 +6403,148 @@ pub mod tests {
         let error =
             verify_public_fixture(PublicFixtureMutation::MissingSecretCapability).unwrap_err();
         assert!(error.contains("advertising every required capability"));
+    }
+
+    #[test]
+    fn secret_provider_guard_requires_exact_sorted_runtime_bound_inventory() {
+        let providers = vec![
+            focused_secret_binding("provider:focused-secrets-primary"),
+            focused_secret_binding("provider:focused-secrets-secondary"),
+        ];
+        let active_providers = providers
+            .iter()
+            .map(focused_secret_claim)
+            .collect::<Vec<_>>();
+        let capabilities = vec!["secret-read".into(), "secret-renew".into()];
+        let inventory_digest = secret_provider_inventory_digest(&providers, &capabilities).unwrap();
+        validate_focused_secret_inventory(
+            &providers,
+            &capabilities,
+            &active_providers,
+            &inventory_digest,
+        )
+        .expect("the exact runtime-bound secret-provider inventory must close");
+
+        let omitted = vec![providers[1].clone()];
+        let omitted_digest = secret_provider_inventory_digest(&omitted, &capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &omitted,
+            &capabilities,
+            &active_providers,
+            &omitted_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact active secret-service"));
+
+        let mut extra = providers.clone();
+        extra.push(focused_secret_binding("provider:focused-secrets-tertiary"));
+        let extra_digest = secret_provider_inventory_digest(&extra, &capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &extra,
+            &capabilities,
+            &active_providers,
+            &extra_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact active secret-service"));
+
+        let mut reordered = providers.clone();
+        reordered.swap(0, 1);
+        let reordered_digest = secret_provider_inventory_digest(&reordered, &capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &reordered,
+            &capabilities,
+            &active_providers,
+            &reordered_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("strictly sorted"));
+
+        let mut duplicate = providers.clone();
+        duplicate[1].provider = duplicate[0].provider.clone();
+        let duplicate_digest = secret_provider_inventory_digest(&duplicate, &capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &duplicate,
+            &capabilities,
+            &active_providers,
+            &duplicate_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("strictly sorted"));
+
+        let mut runtime_drift = providers.clone();
+        runtime_drift[0].runtime_binding_digest = test_digest("runtime-substitution");
+        let error = validate_focused_secret_inventory(
+            &runtime_drift,
+            &capabilities,
+            &active_providers,
+            &inventory_digest,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical binding and capability")
+        );
+
+        let error = validate_focused_secret_inventory(
+            &providers,
+            &capabilities,
+            &active_providers,
+            &test_digest("inventory-substitution"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("canonical binding and capability")
+        );
+    }
+
+    #[test]
+    fn secret_provider_guard_rejects_capability_and_provider_binding_substitution() {
+        let providers = vec![focused_secret_binding("provider:focused-secrets-primary")];
+        let active_providers = vec![focused_secret_claim(&providers[0])];
+        let capabilities = vec!["secret-read".into(), "secret-renew".into()];
+
+        let substituted_capabilities = vec!["secret-admin".into(), "secret-read".into()];
+        let digest =
+            secret_provider_inventory_digest(&providers, &substituted_capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &providers,
+            &substituted_capabilities,
+            &active_providers,
+            &digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("advertising every required"));
+
+        let mut unsorted_capabilities = capabilities.clone();
+        unsorted_capabilities.swap(0, 1);
+        let digest = secret_provider_inventory_digest(&providers, &unsorted_capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &providers,
+            &unsorted_capabilities,
+            &active_providers,
+            &digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("strictly sorted"));
+
+        let mut substituted_provider = providers;
+        substituted_provider[0]
+            .provider
+            .configuration_payload_digest = test_digest("provider-binding-substitution");
+        let digest =
+            secret_provider_inventory_digest(&substituted_provider, &capabilities).unwrap();
+        let error = validate_focused_secret_inventory(
+            &substituted_provider,
+            &capabilities,
+            &active_providers,
+            &digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exactly match"));
     }
 
     #[test]

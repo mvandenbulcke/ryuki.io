@@ -13,6 +13,9 @@ pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json";
 pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_VERSION: &str = "1.0.0";
 pub const DEPLOYMENT_SECURITY_PROFILE_CONTRACT_KIND: &str = "deployment-security-profile";
+pub const SECRET_PROVIDER_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-secret-provider-inventory-v1";
+pub const SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-secret-provider-runtime-binding-v1";
 pub const AUTHENTICATOR_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-authenticator-inventory-v1";
 pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-runtime-binding-v1";
@@ -299,7 +302,8 @@ pub enum RuntimeGuardExpectedValue {
         migration_role: String,
     },
     ApprovedSecretProvider {
-        providers: Vec<ExpectedProviderBinding>,
+        provider_inventory_digest: String,
+        providers: Vec<ExpectedSecretProviderBinding>,
         required_capability_ids: Vec<String>,
     },
     HttpsPublicUrls {
@@ -384,6 +388,54 @@ pub struct ExpectedProviderBinding {
     pub capability_descriptor_version: u64,
     pub adapter_kind: String,
     pub adapter_version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedSecretProviderBinding {
+    pub provider: ExpectedProviderBinding,
+    /// Digest of the exact non-secret initialized provider, authenticated
+    /// transport, credential source, and retained-consumer projection.
+    pub runtime_binding_digest: String,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum SecretProviderInventoryDigestError {
+    #[error("secret-provider inventory could not be projected as canonical JSON")]
+    Projection,
+}
+
+#[derive(Serialize)]
+struct SecretProviderInventoryProjection<'a> {
+    digest_contract: &'static str,
+    providers: &'a [ExpectedSecretProviderBinding],
+    required_capability_ids: &'a [String],
+}
+
+/// Independently encode the exact sorted non-secret secret-provider bindings
+/// and required capability inventory using `ryuki-canonical-json-v1`.
+pub fn secret_provider_inventory_canonical_bytes(
+    providers: &[ExpectedSecretProviderBinding],
+    required_capability_ids: &[String],
+) -> Result<Vec<u8>, SecretProviderInventoryDigestError> {
+    let projection = SecretProviderInventoryProjection {
+        digest_contract: SECRET_PROVIDER_INVENTORY_DIGEST_CONTRACT,
+        providers,
+        required_capability_ids,
+    };
+    let value: Value = serde_json::to_value(projection)
+        .map_err(|_| SecretProviderInventoryDigestError::Projection)?;
+    canonical_json_bytes(&value).map_err(|_| SecretProviderInventoryDigestError::Projection)
+}
+
+/// Independently recompute the receipt/runtime digest for the exact sorted
+/// non-secret secret-provider and required-capability inventory.
+pub fn secret_provider_inventory_digest(
+    providers: &[ExpectedSecretProviderBinding],
+    required_capability_ids: &[String],
+) -> Result<String, SecretProviderInventoryDigestError> {
+    let canonical = secret_provider_inventory_canonical_bytes(providers, required_capability_ids)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1059,9 +1111,9 @@ fn validate_namespaced_id_set(
     }
 }
 
-fn validate_provider_binding_set(
+fn validate_secret_provider_binding_set(
     label: &str,
-    providers: &[ExpectedProviderBinding],
+    providers: &[ExpectedSecretProviderBinding],
     errors: &mut Vec<String>,
 ) {
     if providers.is_empty() {
@@ -1070,14 +1122,19 @@ fn validate_provider_binding_set(
     }
     if !providers
         .windows(2)
-        .all(|pair| pair[0].provider_id < pair[1].provider_id)
+        .all(|pair| pair[0].provider.provider_id < pair[1].provider.provider_id)
     {
         errors.push(format!(
             "{label} must be strictly sorted and unique by provider_id"
         ));
     }
     for provider in providers {
-        validate_provider_binding(label, provider, errors);
+        validate_provider_binding(label, &provider.provider, errors);
+        validate_digest(
+            &format!("{label} runtime_binding_digest"),
+            &provider.runtime_binding_digest,
+            errors,
+        );
     }
 }
 
@@ -1260,15 +1317,35 @@ pub(crate) fn validate_runtime_guard_expected_value(
             }
         }
         RuntimeGuardExpectedValue::ApprovedSecretProvider {
+            provider_inventory_digest,
             providers,
             required_capability_ids,
         } => {
-            validate_provider_binding_set("approved-secret-provider providers", providers, errors);
+            validate_digest(
+                "approved-secret-provider provider_inventory_digest",
+                provider_inventory_digest,
+                errors,
+            );
+            validate_secret_provider_binding_set(
+                "approved-secret-provider providers",
+                providers,
+                errors,
+            );
             validate_canonical_token_set(
                 "approved-secret-provider required_capability_ids",
                 required_capability_ids,
                 errors,
             );
+            match secret_provider_inventory_digest(providers, required_capability_ids) {
+                Ok(recomputed) if &recomputed != provider_inventory_digest => errors.push(
+                    "approved-secret-provider provider_inventory_digest does not equal the canonical ryuki-secret-provider-inventory-v1 projection"
+                        .into(),
+                ),
+                Err(_) => errors.push(
+                    "approved-secret-provider inventory could not be canonically projected".into(),
+                ),
+                Ok(_) => {}
+            }
         }
         RuntimeGuardExpectedValue::HttpsPublicUrls {
             public_origin_set_digest,
@@ -1557,6 +1634,21 @@ mod tests {
         }
     }
 
+    fn all_secret_provider_bindings() -> Vec<ExpectedSecretProviderBinding> {
+        [
+            ("provider:fixture-secrets-primary", '2'),
+            ("provider:fixture-secrets-secondary", '3'),
+        ]
+        .into_iter()
+        .map(
+            |(provider_id, runtime_digest_character)| ExpectedSecretProviderBinding {
+                provider: expected_provider_binding(provider_id),
+                runtime_binding_digest: fixture_digest(runtime_digest_character),
+            },
+        )
+        .collect()
+    }
+
     fn all_authenticator_classes() -> Vec<ExpectedAuthenticatorBinding> {
         [
             (
@@ -1615,7 +1707,11 @@ mod tests {
                 migration_role: "ryuki_migrator".into(),
             },
             GuardId::ApprovedSecretProvider => RuntimeGuardExpectedValue::ApprovedSecretProvider {
-                providers: vec![expected_provider_binding("provider:fixture-secrets")],
+                // Independent golden for the exact canonical positive fixture;
+                // never derive an authority expectation from the rows it constrains.
+                provider_inventory_digest:
+                    "sha256:5212c7a278cf058f0dcda4cc4f9232a869460fba6ab3a8f431b52bdd77b7fa02".into(),
+                providers: all_secret_provider_bindings(),
                 required_capability_ids: vec!["secret-read".into(), "secret-renew".into()],
             },
             GuardId::HttpsPublicUrls => RuntimeGuardExpectedValue::HttpsPublicUrls {
@@ -1721,6 +1817,34 @@ mod tests {
             })
             .collect();
         profile
+    }
+
+    fn secret_guard_parts(
+        profile: &mut DeploymentSecurityProfile,
+    ) -> (
+        &mut String,
+        &mut Vec<ExpectedSecretProviderBinding>,
+        &mut Vec<String>,
+    ) {
+        let guard = profile
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::ApprovedSecretProvider)
+            .unwrap();
+        let RuntimeGuardExpectedValue::ApprovedSecretProvider {
+            provider_inventory_digest,
+            providers,
+            required_capability_ids,
+        } = &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+        (
+            provider_inventory_digest,
+            providers,
+            required_capability_ids,
+        )
     }
 
     #[test]
@@ -1831,7 +1955,7 @@ mod tests {
         else {
             unreachable!()
         };
-        providers[0].adapter_kind = ".fixture".into();
+        providers[0].provider.adapter_kind = ".fixture".into();
         assert!(
             malformed_adapter
                 .validate_structure_at(fixed_now())
@@ -1858,6 +1982,134 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("must equal the root deployment profile"))
         );
+    }
+
+    #[test]
+    fn secret_provider_inventory_canonical_bytes_and_digest_match_independent_goldens() {
+        let providers = all_secret_provider_bindings();
+        let required_capability_ids = vec!["secret-read".into(), "secret-renew".into()];
+        let canonical =
+            secret_provider_inventory_canonical_bytes(&providers, &required_capability_ids)
+                .unwrap();
+        let expected = concat!(
+            "{\"digest_contract\":\"ryuki-secret-provider-inventory-v1\",\"providers\":[",
+            "{\"provider\":{\"adapter_kind\":\"fixture.provider\",",
+            "\"adapter_version\":\"1.0.0\",",
+            "\"capability_descriptor_id\":\"capability-descriptor:fixture-provider\",",
+            "\"capability_descriptor_version\":1,",
+            "\"configuration_payload_digest\":\"sha256:",
+            "1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"configuration_version\":1,\"lifecycle_record_version\":1,",
+            "\"lifecycle_state\":\"active\",",
+            "\"provider_id\":\"provider:fixture-secrets-primary\"},",
+            "\"runtime_binding_digest\":\"sha256:",
+            "2222222222222222222222222222222222222222222222222222222222222222\"},",
+            "{\"provider\":{\"adapter_kind\":\"fixture.provider\",",
+            "\"adapter_version\":\"1.0.0\",",
+            "\"capability_descriptor_id\":\"capability-descriptor:fixture-provider\",",
+            "\"capability_descriptor_version\":1,",
+            "\"configuration_payload_digest\":\"sha256:",
+            "1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"configuration_version\":1,\"lifecycle_record_version\":1,",
+            "\"lifecycle_state\":\"active\",",
+            "\"provider_id\":\"provider:fixture-secrets-secondary\"},",
+            "\"runtime_binding_digest\":\"sha256:",
+            "3333333333333333333333333333333333333333333333333333333333333333\"}],",
+            "\"required_capability_ids\":[\"secret-read\",\"secret-renew\"]}"
+        );
+
+        assert_eq!(canonical, expected.as_bytes());
+        assert_eq!(
+            secret_provider_inventory_digest(&providers, &required_capability_ids).unwrap(),
+            "sha256:5212c7a278cf058f0dcda4cc4f9232a869460fba6ab3a8f431b52bdd77b7fa02"
+        );
+    }
+
+    #[test]
+    fn secret_provider_guard_rejects_inventory_membership_order_and_digest_drift() {
+        let assert_invalid = |profile: DeploymentSecurityProfile, needle: &str| {
+            let errors = profile.validate_structure_at(fixed_now());
+            assert!(
+                errors.iter().any(|error| error.contains(needle)),
+                "expected {needle:?} in {errors:?}"
+            );
+        };
+
+        let mut missing = structurally_complete_production_profile();
+        secret_guard_parts(&mut missing).1.remove(0);
+        assert_invalid(missing, "does not equal the canonical");
+
+        let mut empty = structurally_complete_production_profile();
+        secret_guard_parts(&mut empty).1.clear();
+        assert_invalid(empty, "providers must not be empty");
+
+        let mut extra = structurally_complete_production_profile();
+        let extra_binding = ExpectedSecretProviderBinding {
+            provider: expected_provider_binding("provider:fixture-secrets-tertiary"),
+            runtime_binding_digest: fixture_digest('4'),
+        };
+        secret_guard_parts(&mut extra).1.push(extra_binding);
+        assert_invalid(extra, "does not equal the canonical");
+
+        let mut reordered = structurally_complete_production_profile();
+        secret_guard_parts(&mut reordered).1.swap(0, 1);
+        assert_invalid(reordered, "strictly sorted and unique by provider_id");
+
+        let mut duplicate = structurally_complete_production_profile();
+        let (_, providers, _) = secret_guard_parts(&mut duplicate);
+        providers[1].provider = providers[0].provider.clone();
+        assert_invalid(duplicate, "strictly sorted and unique by provider_id");
+
+        let mut runtime_drift = structurally_complete_production_profile();
+        secret_guard_parts(&mut runtime_drift).1[0].runtime_binding_digest = fixture_digest('9');
+        assert_invalid(runtime_drift, "does not equal the canonical");
+
+        let mut zero_runtime = structurally_complete_production_profile();
+        secret_guard_parts(&mut zero_runtime).1[0].runtime_binding_digest = fixture_digest('0');
+        assert_invalid(zero_runtime, "unresolved all-zero digest");
+
+        let mut inventory_drift = structurally_complete_production_profile();
+        *secret_guard_parts(&mut inventory_drift).0 = fixture_digest('f');
+        assert_invalid(inventory_drift, "does not equal the canonical");
+
+        let mut capability_drift = structurally_complete_production_profile();
+        secret_guard_parts(&mut capability_drift).2[0] = "secret-admin".into();
+        assert_invalid(capability_drift, "does not equal the canonical");
+
+        let mut capability_reordered = structurally_complete_production_profile();
+        secret_guard_parts(&mut capability_reordered).2.swap(0, 1);
+        assert_invalid(capability_reordered, "strictly sorted and unique");
+
+        let mut provider_substitution = structurally_complete_production_profile();
+        secret_guard_parts(&mut provider_substitution).1[0]
+            .provider
+            .configuration_payload_digest = fixture_digest('8');
+        assert_invalid(provider_substitution, "does not equal the canonical");
+    }
+
+    #[test]
+    fn secret_provider_binding_requires_runtime_and_inventory_digests() {
+        let provider = serde_json::to_value(expected_provider_binding(
+            "provider:fixture-secrets-primary",
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_value::<ExpectedSecretProviderBinding>(json!({
+                "provider": provider
+            }))
+            .is_err()
+        );
+
+        let mut expected_value = serde_json::to_value(expected_guard_value(
+            GuardId::ApprovedSecretProvider,
+            "unused",
+        ))
+        .unwrap();
+        expected_value
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_inventory_digest");
+        assert!(serde_json::from_value::<RuntimeGuardExpectedValue>(expected_value).is_err());
     }
 
     #[test]
