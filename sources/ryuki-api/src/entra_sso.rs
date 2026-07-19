@@ -60,7 +60,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Query, Request};
-use axum::http::header::{LOCATION, SET_COOKIE};
+use axum::http::header::LOCATION;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -79,22 +79,6 @@ const ENTRA_ROLES_CLAIM: &str = "roles";
 /// Scopes requested for the browser sign-in. `openid` is mandatory for an
 /// id_token; profile/email populate display identity claims.
 const ENTRA_SCOPES: &str = "openid profile email";
-
-/// Host-prefixed browser binding used for every HTTPS Entra callback. Browsers
-/// enforce `Secure`, `Path=/`, and no `Domain` for this name, so a sibling host
-/// cannot plant a parent-domain competitor.
-pub(crate) const SECURE_ENTRA_BINDING_COOKIE: &str = "__Host-entra_login_csrf";
-/// Compatibility name used only by validated plain-HTTP loopback development
-/// and tests, where a `__Host-` cookie cannot be set.
-pub(crate) const LOOPBACK_ENTRA_BINDING_COOKIE: &str = "entra_login_csrf";
-
-fn entra_binding_cookie_name(cookie_secure: bool) -> &'static str {
-    if cookie_secure {
-        SECURE_ENTRA_BINDING_COOKIE
-    } else {
-        LOOPBACK_ENTRA_BINDING_COOKIE
-    }
-}
 
 /// Derived per-tenant endpoints (see module docs for the fixed URL patterns).
 struct EntraEndpoints {
@@ -263,19 +247,6 @@ fn entra_sso_gate(deps: &EntraSsoDeps) -> Result<(), (StatusCode, Json<Value>)> 
     Ok(())
 }
 
-/// Builds the `Set-Cookie` value for the per-browser CSRF-binding cookie.
-/// SameSite=Lax is REQUIRED so the browser sends it on the top-level redirect
-/// BACK from the IdP to the callback (a cross-site navigation); HttpOnly
-/// always; Secure follows the session cookie policy; Max-Age matches the
-/// 10-minute state TTL.
-fn entra_binding_cookie_header(binding: &str, cookie_secure: bool) -> String {
-    let name = entra_binding_cookie_name(cookie_secure);
-    format!(
-        "{name}={binding}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
-        if cookie_secure { "; Secure" } else { "" }
-    )
-}
-
 /// GET /api/auth/entra/authorize-url — begins a browser sign-in.
 ///
 /// Persists `(state, nonce, pkce_verifier, binding)` via the single-use
@@ -361,55 +332,34 @@ pub(crate) async fn entra_authorize_url(
         )
     })?;
 
-    let cookie = entra_binding_cookie_header(binding, deps.session.cookie_secure);
-    let cookie_hv = axum::http::HeaderValue::from_str(&cookie).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                json!({"error": "ENTRA_AUTHORIZE_URL_FAILED", "message": "cookie encoding failed"}),
-            ),
-        )
-    })?;
+    // Only the retained Entra binding issuer can project this cookie policy.
+    // The capability validates the generated 256-bit binding profile before
+    // any credential-bearing response field is emitted.
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let binding_cookie = cookie_runtime
+        .entra_binding_issuer()
+        .issue(binding)
+        .map_err(|error| {
+            tracing::error!(error = %error, "Entra binding cookie field creation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "ENTRA_AUTHORIZE_URL_FAILED",
+                    "message": "cookie encoding failed"
+                })),
+            )
+        })?;
 
-    Ok((
+    let mut response = (
         StatusCode::OK,
-        [(SET_COOKIE, cookie_hv)],
         Json(json!({
             "authorize_url": authorize_url.as_str(),
             "binding": binding,
         })),
     )
-        .into_response())
-}
-
-/// Extract the only exact-name binding cookie across every `Cookie` header
-/// field. Duplicate matching pairs, malformed matching pairs, and opaque
-/// header bytes fail closed independently of browser/header ordering.
-fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Result<Option<String>, ()> {
-    let mut binding = None;
-    for raw in headers.get_all(axum::http::header::COOKIE).iter() {
-        let raw = raw.to_str().map_err(|_| ())?;
-        for pair in raw.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            let Some((cookie_name, value)) = pair.split_once('=') else {
-                if pair == name {
-                    return Err(());
-                }
-                continue;
-            };
-            if cookie_name.trim() != name {
-                continue;
-            }
-            if binding.is_some() {
-                return Err(());
-            }
-            binding = Some(value.trim().to_string());
-        }
-    }
-    Ok(binding)
+        .into_response();
+    binding_cookie.append_to(&mut response);
+    Ok(response)
 }
 
 fn invalid_state_problem() -> (StatusCode, Json<Value>) {
@@ -487,13 +437,13 @@ pub(crate) async fn entra_callback(
     // the browser that initiated the login (it holds the matching
     // mode-selected binding cookie). Both values are single-use,
     // server-generated 256-bit strings, so a simple compare suffices.
-    let cookie_binding = cookie_value(
-        &headers,
-        entra_binding_cookie_name(deps.session.cookie_secure),
-    )
-    .map_err(|_| invalid_state_problem())?
-    .unwrap_or_default();
-    if binding.is_empty() || cookie_binding.is_empty() || cookie_binding != binding {
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let cookie_binding = match cookie_runtime.entra_binding_parser().parse(&headers) {
+        crate::cookie_runtime::CookieEvidence::Value(value) => value,
+        crate::cookie_runtime::CookieEvidence::Absent
+        | crate::cookie_runtime::CookieEvidence::Invalid => return Err(invalid_state_problem()),
+    };
+    if binding.is_empty() || cookie_binding != binding {
         tracing::warn!("entra callback: login-state browser binding mismatch");
         return Err(invalid_state_problem());
     }
@@ -574,12 +524,21 @@ pub(crate) async fn entra_callback(
 
     // The issuer handle retains the exact startup cookie authority; the
     // redirect target is hardcoded.
-    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
     let cookies = cookie_runtime
         .entra_session_issuer()
         .issue(credential.bearer())
         .map_err(|error| {
             tracing::error!(error = %error, "Entra session cookie field creation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "ENTRA_COOKIE_ENCODING_FAILED"})),
+            )
+        })?;
+    let binding_retirement = cookie_runtime
+        .entra_binding_issuer()
+        .retire()
+        .map_err(|error| {
+            tracing::error!(error = %error, "Entra binding cookie retirement failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "ENTRA_COOKIE_ENCODING_FAILED"})),
@@ -599,6 +558,7 @@ pub(crate) async fn entra_callback(
     )
         .into_response();
     cookies.append_to(&mut response);
+    binding_retirement.append_to(&mut response);
     Ok(response)
 }
 
@@ -712,68 +672,6 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "LOGIN_ADMISSION_CONTEXT_UNAVAILABLE");
     }
-
-    #[test]
-    fn test_binding_cookie_header_flags() {
-        let plain = entra_binding_cookie_header("abc", false);
-        assert_eq!(
-            plain,
-            "entra_login_csrf=abc; Path=/; HttpOnly; Max-Age=600; SameSite=Lax"
-        );
-        let secure = entra_binding_cookie_header("abc", true);
-        assert!(secure.starts_with("__Host-entra_login_csrf=abc;"));
-        assert!(secure.ends_with("; Secure"));
-        assert!(!secure.contains("Domain="));
-    }
-
-    #[test]
-    fn binding_cookie_parser_rejects_duplicates_across_all_cookie_fields() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.append(
-            axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_static("__Host-entra_login_csrf=attacker"),
-        );
-        headers.append(
-            axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_static("other=value; __Host-entra_login_csrf=victim"),
-        );
-        assert_eq!(
-            cookie_value(&headers, SECURE_ENTRA_BINDING_COOKIE),
-            Err(()),
-            "matching cookies split across fields must be ambiguous"
-        );
-
-        let mut same_field = axum::http::HeaderMap::new();
-        same_field.insert(
-            axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_static(
-                "__Host-entra_login_csrf=victim; __Host-entra_login_csrf=attacker",
-            ),
-        );
-        assert_eq!(
-            cookie_value(&same_field, SECURE_ENTRA_BINDING_COOKIE),
-            Err(())
-        );
-    }
-
-    #[test]
-    fn binding_cookie_parser_selects_only_the_validated_transport_name() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_static(
-                "entra_login_csrf=parent-domain-plant; __Host-entra_login_csrf=host-only",
-            ),
-        );
-        assert_eq!(
-            cookie_value(&headers, entra_binding_cookie_name(true)),
-            Ok(Some("host-only".to_string()))
-        );
-        assert_eq!(
-            cookie_value(&headers, entra_binding_cookie_name(false)),
-            Ok(Some("parent-domain-plant".to_string()))
-        );
-    }
 }
 
 // ─── DB tests — full flow against a LOCAL stub OIDC IdP ─────────────────────
@@ -809,6 +707,7 @@ mod entra_sso_db_tests {
     const TEST_CLIENT: &str = "entra-sso-client-test";
     const TEST_REDIRECT: &str = "http://127.0.0.1:9/api/auth/entra/callback";
     const TEST_KID: &str = "entra-sso-test-kid";
+    const OTHER_TEST_BINDING: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
     fn authorize_request() -> Request<Body> {
         Request::builder()
@@ -1112,7 +1011,7 @@ mod entra_sso_db_tests {
             ))
             .header(
                 axum::http::header::COOKIE,
-                format!("{}={binding}", entra_binding_cookie_name(true)),
+                format!("__Host-entra_login_csrf={binding}"),
             )
             .body(Body::empty())
             .unwrap()
@@ -1236,7 +1135,7 @@ mod entra_sso_db_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             cookie_fields.len(),
-            2,
+            3,
             "Set-Cookie fields must stay separate"
         );
         let cookie = cookie_fields[0];
@@ -1245,6 +1144,10 @@ mod entra_sso_db_tests {
         assert_eq!(
             cookie_fields[1],
             "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
+        );
+        assert_eq!(
+            cookie_fields[2],
+            "__Host-entra_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
         );
 
         // The minted session row: provider entra-id, identity from the id_token.
@@ -1375,13 +1278,13 @@ mod entra_sso_db_tests {
         let stub = start_stub_idp().await;
         let app = test_router(stub_deps(&stub));
 
-        let (state, nonce, _challenge, _binding) = begin_login(&app).await;
+        let (state, nonce, _challenge, binding) = begin_login(&app).await;
         stub.set_nonce(&nonce);
 
         // A DIFFERENT browser (wrong binding cookie) presents a valid state.
         let resp = app
             .clone()
-            .oneshot(callback_req(&state, "attacker-different-binding"))
+            .oneshot(callback_req(&state, OTHER_TEST_BINDING))
             .await
             .expect("callback");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1389,6 +1292,17 @@ mod entra_sso_db_tests {
             !resp.headers().contains_key("set-cookie"),
             "no session cookie may be set on a binding mismatch"
         );
+
+        let retry = app
+            .oneshot(callback_req(&state, &binding))
+            .await
+            .expect("retry callback");
+        assert_eq!(
+            retry.status(),
+            StatusCode::BAD_REQUEST,
+            "binding rejection must still consume the single-use state"
+        );
+        assert!(!retry.headers().contains_key("set-cookie"));
     }
 
     #[tokio::test]

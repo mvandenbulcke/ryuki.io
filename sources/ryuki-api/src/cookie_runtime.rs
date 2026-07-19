@@ -12,9 +12,10 @@ use std::sync::Arc;
 use axum::http::header::SET_COOKIE;
 use axum::http::{header::InvalidHeaderValue, HeaderMap, HeaderValue};
 use axum::response::Response;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::cookie_policy::{
-    CookiePolicyConsumer, CookiePolicyError, ProductionApiCookiePolicyConfig,
+    CookiePolicyConsumer, CookiePolicyError, ProductionApiCookiePolicyConfig, RetainedCookiePolicy,
     RetainedCookiePolicySet,
 };
 use ryuki_core::security_profile::{CookieSameSitePolicy, RuntimeGuardExpectedValue};
@@ -22,6 +23,9 @@ use thiserror::Error;
 
 const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
 const LOOPBACK_SESSION_COOKIE_NAME: &str = "ryuki_session";
+const LOOPBACK_ENTRA_BINDING_COOKIE_NAME: &str = "entra_login_csrf";
+const LOOPBACK_OIDC_BINDING_COOKIE_NAME: &str = "oidc_login_csrf";
+const LOGIN_BINDING_MAX_AGE_SECS: u64 = 600;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum ApiCookieRuntimeError {
@@ -37,6 +41,8 @@ pub(crate) enum CookieEmissionError {
     ConsumerBinding,
     #[error("session cookie value does not match the opaque bearer profile")]
     InvalidSessionValue,
+    #[error("login-binding cookie value does not match the canonical base64url-256 profile")]
+    InvalidBindingValue,
     #[error("cookie response field could not be encoded")]
     Encoding(#[source] InvalidHeaderValue),
 }
@@ -83,6 +89,10 @@ mod consumer {
     pub(crate) enum SessionAuthParser {}
     pub(crate) enum SessionLookupAdmissionParser {}
     pub(crate) enum SessionLogoutParser {}
+    pub(crate) enum EntraBindingIssuer {}
+    pub(crate) enum EntraBindingParser {}
+    pub(crate) enum OidcBindingIssuer {}
+    pub(crate) enum OidcBindingParser {}
 }
 
 pub(crate) trait SessionIssuerConsumer {
@@ -123,6 +133,42 @@ impl SessionParserConsumer for consumer::SessionLookupAdmissionParser {
 
 impl SessionParserConsumer for consumer::SessionLogoutParser {
     const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionLogoutParser;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LoginBindingKind {
+    Entra,
+    Oidc,
+}
+
+pub(crate) trait BindingIssuerConsumer {
+    const ID: CookiePolicyConsumer;
+    const KIND: LoginBindingKind;
+}
+
+impl BindingIssuerConsumer for consumer::EntraBindingIssuer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiEntraBindingIssuer;
+    const KIND: LoginBindingKind = LoginBindingKind::Entra;
+}
+
+impl BindingIssuerConsumer for consumer::OidcBindingIssuer {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiOidcBindingIssuer;
+    const KIND: LoginBindingKind = LoginBindingKind::Oidc;
+}
+
+pub(crate) trait BindingParserConsumer {
+    const ID: CookiePolicyConsumer;
+    const KIND: LoginBindingKind;
+}
+
+impl BindingParserConsumer for consumer::EntraBindingParser {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiEntraBindingParser;
+    const KIND: LoginBindingKind = LoginBindingKind::Entra;
+}
+
+impl BindingParserConsumer for consumer::OidcBindingParser {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiOidcBindingParser;
+    const KIND: LoginBindingKind = LoginBindingKind::Oidc;
 }
 
 /// A non-forgeable capability for one declared session-cookie issuer. Its
@@ -224,6 +270,81 @@ impl<C: SessionParserConsumer> SessionCookieParser<C> {
             CookieEvidence::Value(value)
                 if !crate::session_credentials::is_well_formed_session_bearer(value) =>
             {
+                CookieEvidence::Invalid
+            }
+            evidence => evidence,
+        }
+    }
+}
+
+/// A non-forgeable capability for one declared login-binding cookie issuer.
+/// Issuance and retirement deliberately share the same closed issuer identity.
+pub(crate) struct BindingCookieIssuer<C> {
+    runtime: Arc<ApiCookieRuntime>,
+    _consumer: PhantomData<fn() -> C>,
+}
+
+pub(crate) type ApiEntraBindingIssuer = BindingCookieIssuer<consumer::EntraBindingIssuer>;
+pub(crate) type ApiOidcBindingIssuer = BindingCookieIssuer<consumer::OidcBindingIssuer>;
+
+impl<C> BindingCookieIssuer<C> {
+    fn new(runtime: Arc<ApiCookieRuntime>) -> Self {
+        Self {
+            runtime,
+            _consumer: PhantomData,
+        }
+    }
+}
+
+impl<C: BindingIssuerConsumer> BindingCookieIssuer<C> {
+    pub(crate) fn issue(
+        &self,
+        binding_value: &str,
+    ) -> Result<SetCookieFields, CookieEmissionError> {
+        if !self.runtime.binding_issuer_is_bound(C::KIND, C::ID) {
+            return Err(CookieEmissionError::ConsumerBinding);
+        }
+        if !is_canonical_login_binding(binding_value) {
+            return Err(CookieEmissionError::InvalidBindingValue);
+        }
+        self.runtime
+            .binding_cookie_fields(C::KIND, binding_value, false)
+    }
+
+    pub(crate) fn retire(&self) -> Result<SetCookieFields, CookieEmissionError> {
+        if !self.runtime.binding_issuer_is_bound(C::KIND, C::ID) {
+            return Err(CookieEmissionError::ConsumerBinding);
+        }
+        self.runtime.binding_cookie_fields(C::KIND, "", true)
+    }
+}
+
+/// A non-forgeable capability for one declared login-binding cookie parser.
+/// Every handle retains the exact process-lifetime runtime Arc.
+pub(crate) struct BindingCookieParser<C> {
+    runtime: Arc<ApiCookieRuntime>,
+    _consumer: PhantomData<fn() -> C>,
+}
+
+pub(crate) type ApiEntraBindingParser = BindingCookieParser<consumer::EntraBindingParser>;
+pub(crate) type ApiOidcBindingParser = BindingCookieParser<consumer::OidcBindingParser>;
+
+impl<C> BindingCookieParser<C> {
+    fn new(runtime: Arc<ApiCookieRuntime>) -> Self {
+        Self {
+            runtime,
+            _consumer: PhantomData,
+        }
+    }
+}
+
+impl<C: BindingParserConsumer> BindingCookieParser<C> {
+    pub(crate) fn parse<'a>(&self, headers: &'a HeaderMap) -> CookieEvidence<'a> {
+        if !self.runtime.binding_parser_is_bound(C::KIND, C::ID) {
+            return CookieEvidence::Invalid;
+        }
+        match self.runtime.binding_cookie_evidence(C::KIND, headers) {
+            CookieEvidence::Value(value) if !is_canonical_login_binding(value) => {
                 CookieEvidence::Invalid
             }
             evidence => evidence,
@@ -356,6 +477,22 @@ impl ApiCookieRuntime {
         SessionCookieParser::new(Arc::clone(self))
     }
 
+    pub(crate) fn entra_binding_issuer(self: &Arc<Self>) -> ApiEntraBindingIssuer {
+        BindingCookieIssuer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn entra_binding_parser(self: &Arc<Self>) -> ApiEntraBindingParser {
+        BindingCookieParser::new(Arc::clone(self))
+    }
+
+    pub(crate) fn oidc_binding_issuer(self: &Arc<Self>) -> ApiOidcBindingIssuer {
+        BindingCookieIssuer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn oidc_binding_parser(self: &Arc<Self>) -> ApiOidcBindingParser {
+        BindingCookieParser::new(Arc::clone(self))
+    }
+
     /// The exact retained allocation to move into the secure-cookie witness.
     /// Loopback development has no witness-capable projection.
     pub(crate) fn secure_policy_set(&self) -> Option<&Arc<RetainedCookiePolicySet>> {
@@ -435,6 +572,140 @@ impl ApiCookieRuntime {
                 session_same_site, ..
             } => *session_same_site,
         }
+    }
+
+    fn secure_binding_policy(&self, kind: LoginBindingKind) -> Option<&RetainedCookiePolicy> {
+        let ApiCookieRuntimeMode::Secure { policies } = &self.mode else {
+            return None;
+        };
+        Some(match kind {
+            LoginBindingKind::Entra => policies.api_entra_login_binding(),
+            LoginBindingKind::Oidc => policies.api_oidc_login_binding(),
+        })
+    }
+
+    fn binding_cookie_fields(
+        &self,
+        kind: LoginBindingKind,
+        value: &str,
+        retire: bool,
+    ) -> Result<SetCookieFields, CookieEmissionError> {
+        let field = match &self.mode {
+            ApiCookieRuntimeMode::Secure { .. } => {
+                let policy = self
+                    .secure_binding_policy(kind)
+                    .expect("secure mode must retain every binding policy");
+                render_cookie_field(
+                    policy.cookie_name(),
+                    value,
+                    if retire { 0 } else { policy.max_age_secs() },
+                    policy.path(),
+                    policy.http_only(),
+                    policy.secure(),
+                    policy.same_site(),
+                )
+            }
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => render_cookie_field(
+                loopback_binding_cookie_name(kind),
+                value,
+                if retire {
+                    0
+                } else {
+                    LOGIN_BINDING_MAX_AGE_SECS
+                },
+                "/",
+                true,
+                false,
+                CookieSameSitePolicy::Lax,
+            ),
+        };
+        SetCookieFields::from_strings(vec![field])
+    }
+
+    fn binding_issuer_is_bound(
+        &self,
+        kind: LoginBindingKind,
+        consumer: CookiePolicyConsumer,
+    ) -> bool {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { .. } => self
+                .secure_binding_policy(kind)
+                .is_some_and(|policy| policy.issuer_consumers().contains(&consumer)),
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => matches!(
+                (kind, consumer),
+                (
+                    LoginBindingKind::Entra,
+                    CookiePolicyConsumer::ApiEntraBindingIssuer
+                ) | (
+                    LoginBindingKind::Oidc,
+                    CookiePolicyConsumer::ApiOidcBindingIssuer
+                )
+            ),
+        }
+    }
+
+    fn binding_parser_is_bound(
+        &self,
+        kind: LoginBindingKind,
+        consumer: CookiePolicyConsumer,
+    ) -> bool {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { .. } => self
+                .secure_binding_policy(kind)
+                .is_some_and(|policy| policy.parser_consumers().contains(&consumer)),
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => matches!(
+                (kind, consumer),
+                (
+                    LoginBindingKind::Entra,
+                    CookiePolicyConsumer::ApiEntraBindingParser
+                ) | (
+                    LoginBindingKind::Oidc,
+                    CookiePolicyConsumer::ApiOidcBindingParser
+                )
+            ),
+        }
+    }
+
+    fn binding_cookie_evidence<'a>(
+        &self,
+        kind: LoginBindingKind,
+        headers: &'a HeaderMap,
+    ) -> CookieEvidence<'a> {
+        let selected_name = self.selected_binding_cookie_name(kind);
+        let mut binding = None;
+        for raw_cookie_header in headers.get_all(axum::http::header::COOKIE).iter() {
+            let cookie_header = match raw_cookie_header.to_str() {
+                Ok(value) => value,
+                Err(_) => return CookieEvidence::Invalid,
+            };
+            for raw_pair in cookie_header.split(';') {
+                if raw_pair.trim().is_empty() {
+                    continue;
+                }
+                let Some((name, value)) = raw_pair.split_once('=') else {
+                    return CookieEvidence::Invalid;
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    return CookieEvidence::Invalid;
+                }
+                if name != selected_name {
+                    continue;
+                }
+                if binding.is_some() {
+                    return CookieEvidence::Invalid;
+                }
+                binding = Some(value);
+            }
+        }
+        binding.map_or(CookieEvidence::Absent, CookieEvidence::Value)
+    }
+
+    fn selected_binding_cookie_name(&self, kind: LoginBindingKind) -> &str {
+        self.secure_binding_policy(kind).map_or_else(
+            || loopback_binding_cookie_name(kind),
+            |policy| policy.cookie_name(),
+        )
     }
 
     fn session_cookie_fields(
@@ -599,6 +870,23 @@ fn render_cookie_field(
         field.push_str("; Secure");
     }
     field
+}
+
+fn loopback_binding_cookie_name(kind: LoginBindingKind) -> &'static str {
+    match kind {
+        LoginBindingKind::Entra => LOOPBACK_ENTRA_BINDING_COOKIE_NAME,
+        LoginBindingKind::Oidc => LOOPBACK_OIDC_BINDING_COOKIE_NAME,
+    }
+}
+
+fn is_canonical_login_binding(value: &str) -> bool {
+    if value.len() != 43 {
+        return false;
+    }
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(value) else {
+        return false;
+    };
+    decoded.len() == 32 && URL_SAFE_NO_PAD.encode(decoded) == value
 }
 
 fn same_site_attribute(value: CookieSameSitePolicy) -> &'static str {
@@ -819,6 +1107,217 @@ mod tests {
             };
             assert_eq!(value, session_value.as_str());
         }
+    }
+
+    fn binding_value(byte: u8) -> String {
+        URL_SAFE_NO_PAD.encode([byte; 32])
+    }
+
+    #[test]
+    fn binding_handles_retain_the_exact_runtime_arc() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let entra_issuer = runtime.entra_binding_issuer();
+        let entra_parser = runtime.entra_binding_parser();
+        let oidc_issuer = runtime.oidc_binding_issuer();
+        let oidc_parser = runtime.oidc_binding_parser();
+
+        assert!(Arc::ptr_eq(&runtime, &entra_issuer.runtime));
+        assert!(Arc::ptr_eq(&runtime, &entra_parser.runtime));
+        assert!(Arc::ptr_eq(&runtime, &oidc_issuer.runtime));
+        assert!(Arc::ptr_eq(&runtime, &oidc_parser.runtime));
+    }
+
+    #[test]
+    fn secure_binding_issuers_derive_issue_and_retirement_fields_from_core_policy() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let entra = runtime.entra_binding_issuer();
+        let oidc = runtime.oidc_binding_issuer();
+        let value = binding_value(0x42);
+
+        assert_eq!(
+            entra.issue(&value).unwrap().field_values(),
+            vec![format!(
+                "__Host-entra_login_csrf={value}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax; Secure"
+            )]
+        );
+        assert_eq!(
+            entra.retire().unwrap().field_values(),
+            vec!["__Host-entra_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"]
+        );
+        assert_eq!(
+            oidc.issue(&value).unwrap().field_values(),
+            vec![format!(
+                "__Host-oidc_login_csrf={value}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax; Secure"
+            )]
+        );
+        assert_eq!(
+            oidc.retire().unwrap().field_values(),
+            vec!["__Host-oidc_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"]
+        );
+    }
+
+    #[test]
+    fn loopback_binding_issuers_use_the_closed_development_policy() {
+        let mut config = secure_config();
+        config.session.cookie_secure = false;
+        config.session.cookie_same_site = "strict".into();
+        config.server.bind_address = "127.0.0.1:8080".into();
+        let runtime = ApiCookieRuntime::from_admitted_config(&config, false).unwrap();
+        let value = binding_value(0x24);
+
+        assert_eq!(
+            runtime
+                .entra_binding_issuer()
+                .issue(&value)
+                .unwrap()
+                .field_values(),
+            vec![format!(
+                "entra_login_csrf={value}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax"
+            )]
+        );
+        assert_eq!(
+            runtime
+                .oidc_binding_issuer()
+                .retire()
+                .unwrap()
+                .field_values(),
+            vec!["oidc_login_csrf=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax"]
+        );
+    }
+
+    #[test]
+    fn binding_capabilities_reject_noncanonical_value_profiles() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        assert!(matches!(
+            runtime.entra_binding_issuer().issue("not-base64url-256"),
+            Err(CookieEmissionError::InvalidBindingValue)
+        ));
+        assert!(matches!(
+            runtime
+                .oidc_binding_issuer()
+                .issue("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!"),
+            Err(CookieEmissionError::InvalidBindingValue)
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("__Host-entra_login_csrf=short"),
+        );
+        assert!(matches!(
+            runtime.entra_binding_parser().parse(&headers),
+            CookieEvidence::Invalid
+        ));
+
+        let valid = binding_value(0x17);
+        for whitespace_wrapped in [
+            format!("__Host-entra_login_csrf= {valid}"),
+            format!("__Host-entra_login_csrf={valid} "),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                HeaderValue::from_str(&whitespace_wrapped).unwrap(),
+            );
+            assert!(matches!(
+                runtime.entra_binding_parser().parse(&headers),
+                CookieEvidence::Invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn binding_parser_rejects_duplicates_malformed_pairs_and_opaque_fields() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let parser = runtime.entra_binding_parser();
+        let value = binding_value(0x33);
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-entra_login_csrf={value}")).unwrap(),
+        );
+        duplicate.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-entra_login_csrf={value}")).unwrap(),
+        );
+        assert!(matches!(parser.parse(&duplicate), CookieEvidence::Invalid));
+
+        let mut same_field_duplicate = HeaderMap::new();
+        same_field_duplicate.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "__Host-entra_login_csrf={value}; __Host-entra_login_csrf={value}"
+            ))
+            .unwrap(),
+        );
+        assert!(matches!(
+            parser.parse(&same_field_duplicate),
+            CookieEvidence::Invalid
+        ));
+
+        for malformed in ["missing-equals", "=empty-name"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                HeaderValue::from_str(malformed).unwrap(),
+            );
+            assert!(matches!(parser.parse(&headers), CookieEvidence::Invalid));
+        }
+
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value is representable"),
+        );
+        assert!(matches!(parser.parse(&opaque), CookieEvidence::Invalid));
+    }
+
+    #[test]
+    fn binding_parsers_ignore_valid_opposite_mode_names() {
+        let value = binding_value(0x61);
+        let secure = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let mut secure_headers = HeaderMap::new();
+        secure_headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "entra_login_csrf={value}; __Host-entra_login_csrf={value}"
+            ))
+            .unwrap(),
+        );
+        let CookieEvidence::Value(parsed) = secure.entra_binding_parser().parse(&secure_headers)
+        else {
+            panic!("secure parser must ignore the unprefixed sibling cookie");
+        };
+        assert_eq!(parsed, value);
+
+        let mut config = secure_config();
+        config.session.cookie_secure = false;
+        config.server.bind_address = "127.0.0.1:8080".into();
+        let loopback = ApiCookieRuntime::from_admitted_config(&config, false).unwrap();
+        let mut loopback_headers = HeaderMap::new();
+        loopback_headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "__Host-oidc_login_csrf={value}; oidc_login_csrf={value}"
+            ))
+            .unwrap(),
+        );
+        let CookieEvidence::Value(parsed) = loopback.oidc_binding_parser().parse(&loopback_headers)
+        else {
+            panic!("loopback parser must ignore the prefixed sibling cookie");
+        };
+        assert_eq!(parsed, value);
+
+        let mut opposite_only = HeaderMap::new();
+        opposite_only.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("entra_login_csrf={value}")).unwrap(),
+        );
+        assert!(matches!(
+            secure.entra_binding_parser().parse(&opposite_only),
+            CookieEvidence::Absent
+        ));
     }
 
     #[test]

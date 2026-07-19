@@ -16575,26 +16575,27 @@ async fn oidc_login_initiate(request: Request) -> Result<Response, (StatusCode, 
             Json(json!({"error": format!("invalid redirect URL: {e}")})),
         )
     })?;
-    // Set the per-browser CSRF binding cookie. SameSite=Lax is REQUIRED so the
-    // browser sends it on the top-level redirect BACK from the IdP to the
-    // callback (a cross-site navigation); Secure follows the session policy.
-    // Short-lived to match the state TTL. The value is base64url (cookie-safe).
-    let binding_cookie =
-        crate::oidc_callback::oidc_binding_cookie_header(binding, cfg.session.cookie_secure);
-    let cookie_hv = axum::http::HeaderValue::from_str(&binding_cookie).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("cookie encoding failed: {e}")})),
-        )
-    })?;
-    Ok((
+    // The retained OIDC binding issuer owns the exact SameSite=Lax,
+    // HttpOnly, transport-name, lifetime, and Secure policy. It also validates
+    // the generated 256-bit binding profile before emitting the response.
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let binding_cookie = cookie_runtime
+        .oidc_binding_issuer()
+        .issue(binding)
+        .map_err(|error| {
+            tracing::error!(error = %error, "OIDC binding cookie field creation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "cookie encoding failed"})),
+            )
+        })?;
+    let mut response = (
         StatusCode::FOUND,
-        [
-            (axum::http::header::LOCATION, location),
-            (axum::http::header::SET_COOKIE, cookie_hv),
-        ],
+        [(axum::http::header::LOCATION, location)],
     )
-        .into_response())
+        .into_response();
+    binding_cookie.append_to(&mut response);
+    Ok(response)
 }
 
 async fn auth_status() -> Json<Value> {
