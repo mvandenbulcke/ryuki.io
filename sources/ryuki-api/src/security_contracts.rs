@@ -722,6 +722,627 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
+// This module is deliberately unreachable from production startup until each
+// guard-specific live verifier exists. Keeping the temporary dead-code scope
+// here lets the type-safe aggregate land without weakening the explicit
+// fail-closed blocker below.
+#[allow(dead_code)]
+mod runtime_admission {
+    use super::*;
+
+    const MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS: i64 = 300;
+
+    /// Redacted, stable failure categories for the final production runtime
+    /// admission boundary. Values measured from live systems and raw authority
+    /// responses are intentionally absent from every variant.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    pub(super) enum ProductionRuntimeAdmissionError {
+        #[error("production runtime admission received an inverted trusted-time interval")]
+        InvalidTrustedTimeWindow,
+        #[error("production runtime admission rejected a trusted-time rollback")]
+        TrustedTimeRollback,
+        #[error("production runtime admission rejected a stale production boundary")]
+        BoundaryStale,
+        #[error(
+            "production runtime guard challenge set has {observed} entries instead of exactly eight"
+        )]
+        CorruptChallengeCount { observed: usize },
+        #[error("production runtime guard challenge set is corrupt for {guard_id:?}")]
+        CorruptChallengeSet { guard_id: GuardId },
+        #[error(
+            "production runtime guard kind mismatch: expected {expected:?}, observed {observed:?}"
+        )]
+        GuardKindMismatch {
+            expected: GuardId,
+            observed: GuardId,
+        },
+        #[error("production runtime guard requirement binding mismatch for {guard_id:?}")]
+        RequirementBindingMismatch { guard_id: GuardId },
+        #[error("production runtime guard workload challenge mismatch for {guard_id:?}")]
+        ChallengeBindingMismatch { guard_id: GuardId },
+        #[error("production runtime guard expected-value mismatch for {guard_id:?}")]
+        ExpectedValueMismatch { guard_id: GuardId },
+        #[error("production runtime guard observation window is invalid for {guard_id:?}")]
+        InvalidObservationWindow { guard_id: GuardId },
+        #[error("production runtime guard witness is stale for {guard_id:?}")]
+        WitnessStale { guard_id: GuardId },
+    }
+
+    /// Private output of one guard-specific live verifier. Future production
+    /// verifier modules must measure the supplied handle and construct this
+    /// value themselves; there is intentionally no constructor from a boolean,
+    /// caller-authored receipt, or public expected value.
+    struct VerifiedRuntimeGuardObservation<H> {
+        guard_id: GuardId,
+        observed_value: RuntimeGuardExpectedValue,
+        requirement_digest: String,
+        challenge_binding_digest: String,
+        observed_at_not_before: DateTime<Utc>,
+        observed_at_not_after: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        handle: H,
+    }
+
+    /// One non-cloneable witness core. It retains the exact live handle whose
+    /// measured facts matched the receipt-bound expectation and workload-bound
+    /// challenge. Custom Debug deliberately omits both the handle and measured
+    /// value.
+    struct VerifiedProductionRuntimeGuardWitness<H> {
+        guard_id: GuardId,
+        observed_value: RuntimeGuardExpectedValue,
+        requirement_digest: String,
+        challenge_binding_digest: String,
+        observed_at_not_before: DateTime<Utc>,
+        observed_at_not_after: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        handle: H,
+    }
+
+    impl<H> fmt::Debug for VerifiedProductionRuntimeGuardWitness<H> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedProductionRuntimeGuardWitness")
+                .field("guard_id", &self.guard_id)
+                .field("requirement_digest", &self.requirement_digest)
+                .field("challenge_binding_digest", &self.challenge_binding_digest)
+                .field("observed_at_not_before", &self.observed_at_not_before)
+                .field("observed_at_not_after", &self.observed_at_not_after)
+                .field("valid_until", &self.valid_until)
+                .field("handle", &"[RETAINED]")
+                .finish()
+        }
+    }
+
+    impl<H> VerifiedProductionRuntimeGuardWitness<H> {
+        fn seal(
+            boundary: &VerifiedProductionBoundary,
+            expected_guard_id: GuardId,
+            observation: VerifiedRuntimeGuardObservation<H>,
+            trusted_now: ConformanceTrustedTimeWindow,
+        ) -> Result<Self, ProductionRuntimeAdmissionError> {
+            if observation.guard_id != expected_guard_id {
+                return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                    expected: expected_guard_id,
+                    observed: observation.guard_id,
+                });
+            }
+            let observed_kind = observation.observed_value.guard_id();
+            if observed_kind != expected_guard_id {
+                return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                    expected: expected_guard_id,
+                    observed: observed_kind,
+                });
+            }
+            let witness = Self {
+                guard_id: observation.guard_id,
+                observed_value: observation.observed_value,
+                requirement_digest: observation.requirement_digest,
+                challenge_binding_digest: observation.challenge_binding_digest,
+                observed_at_not_before: observation.observed_at_not_before,
+                observed_at_not_after: observation.observed_at_not_after,
+                valid_until: observation.valid_until,
+                handle: observation.handle,
+            };
+            witness.recheck(boundary, expected_guard_id, trusted_now)?;
+            Ok(witness)
+        }
+
+        fn recheck(
+            &self,
+            boundary: &VerifiedProductionBoundary,
+            expected_guard_id: GuardId,
+            trusted_now: ConformanceTrustedTimeWindow,
+        ) -> Result<(), ProductionRuntimeAdmissionError> {
+            validate_trusted_time(trusted_now)?;
+            boundary
+                .ensure_fresh(trusted_now)
+                .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+            if self.guard_id != expected_guard_id {
+                return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                    expected: expected_guard_id,
+                    observed: self.guard_id,
+                });
+            }
+            let observed_kind = self.observed_value.guard_id();
+            if observed_kind != expected_guard_id {
+                return Err(ProductionRuntimeAdmissionError::GuardKindMismatch {
+                    expected: expected_guard_id,
+                    observed: observed_kind,
+                });
+            }
+            let challenge = exact_challenge(boundary, expected_guard_id)?;
+            if self.requirement_digest != challenge.requirement_digest() {
+                return Err(
+                    ProductionRuntimeAdmissionError::RequirementBindingMismatch {
+                        guard_id: expected_guard_id,
+                    },
+                );
+            }
+            if self.challenge_binding_digest != challenge.challenge_binding_digest() {
+                return Err(ProductionRuntimeAdmissionError::ChallengeBindingMismatch {
+                    guard_id: expected_guard_id,
+                });
+            }
+            if &self.observed_value != challenge.expected_value() {
+                return Err(ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                    guard_id: expected_guard_id,
+                });
+            }
+            if self.observed_at_not_before > self.observed_at_not_after
+                || self.observed_at_not_after > trusted_now.not_before
+                || self.valid_until <= self.observed_at_not_after
+                || self
+                    .valid_until
+                    .signed_duration_since(self.observed_at_not_before)
+                    > chrono::TimeDelta::seconds(MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS)
+            {
+                return Err(ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                    guard_id: expected_guard_id,
+                });
+            }
+            if trusted_now.not_after >= self.valid_until {
+                return Err(ProductionRuntimeAdmissionError::WitnessStale {
+                    guard_id: expected_guard_id,
+                });
+            }
+            Ok(())
+        }
+
+        fn handle(&self) -> &H {
+            &self.handle
+        }
+    }
+
+    fn validate_trusted_time(
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        if trusted_now.not_before > trusted_now.not_after {
+            Err(ProductionRuntimeAdmissionError::InvalidTrustedTimeWindow)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn exact_challenge(
+        boundary: &VerifiedProductionBoundary,
+        guard_id: GuardId,
+    ) -> Result<VerifiedProductionRuntimeGuardChallenge<'_>, ProductionRuntimeAdmissionError> {
+        let mut matches = boundary
+            .runtime_guard_challenges()
+            .filter(|challenge| challenge.guard_id() == guard_id);
+        let challenge = matches
+            .next()
+            .ok_or(ProductionRuntimeAdmissionError::CorruptChallengeSet { guard_id })?;
+        if matches.next().is_some() {
+            return Err(ProductionRuntimeAdmissionError::CorruptChallengeSet { guard_id });
+        }
+        Ok(challenge)
+    }
+
+    macro_rules! define_nominal_guard_witness {
+        ($name:ident, $guard_id:expr) => {
+            pub(super) struct $name<H>(VerifiedProductionRuntimeGuardWitness<H>);
+
+            impl<H> fmt::Debug for $name<H> {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter
+                        .debug_tuple(stringify!($name))
+                        .field(&self.0)
+                        .finish()
+                }
+            }
+
+            impl<H> $name<H> {
+                fn from_verified_observation(
+                    boundary: &VerifiedProductionBoundary,
+                    observation: VerifiedRuntimeGuardObservation<H>,
+                    trusted_now: ConformanceTrustedTimeWindow,
+                ) -> Result<Self, ProductionRuntimeAdmissionError> {
+                    VerifiedProductionRuntimeGuardWitness::seal(
+                        boundary,
+                        $guard_id,
+                        observation,
+                        trusted_now,
+                    )
+                    .map(Self)
+                }
+
+                fn recheck(
+                    &self,
+                    boundary: &VerifiedProductionBoundary,
+                    trusted_now: ConformanceTrustedTimeWindow,
+                ) -> Result<(), ProductionRuntimeAdmissionError> {
+                    self.0.recheck(boundary, $guard_id, trusted_now)
+                }
+
+                fn handle(&self) -> &H {
+                    self.0.handle()
+                }
+
+                #[cfg(test)]
+                #[allow(clippy::too_many_arguments)]
+                pub(super) fn seal_test_observation(
+                    boundary: &VerifiedProductionBoundary,
+                    observed_value: RuntimeGuardExpectedValue,
+                    requirement_digest: String,
+                    challenge_binding_digest: String,
+                    observed_at_not_before: DateTime<Utc>,
+                    observed_at_not_after: DateTime<Utc>,
+                    valid_until: DateTime<Utc>,
+                    handle: H,
+                    trusted_now: ConformanceTrustedTimeWindow,
+                ) -> Result<Self, ProductionRuntimeAdmissionError> {
+                    Self::from_verified_observation(
+                        boundary,
+                        VerifiedRuntimeGuardObservation {
+                            guard_id: $guard_id,
+                            observed_value,
+                            requirement_digest,
+                            challenge_binding_digest,
+                            observed_at_not_before,
+                            observed_at_not_after,
+                            valid_until,
+                            handle,
+                        },
+                        trusted_now,
+                    )
+                }
+            }
+        };
+    }
+
+    define_nominal_guard_witness!(
+        VerifiedDurablePostgresqlGuardWitness,
+        GuardId::DurablePostgresql
+    );
+    define_nominal_guard_witness!(
+        VerifiedApprovedSecretProviderGuardWitness,
+        GuardId::ApprovedSecretProvider
+    );
+    define_nominal_guard_witness!(
+        VerifiedHttpsPublicUrlsGuardWitness,
+        GuardId::HttpsPublicUrls
+    );
+    define_nominal_guard_witness!(VerifiedSecureCookiesGuardWitness, GuardId::SecureCookies);
+    define_nominal_guard_witness!(
+        VerifiedNonDevelopmentAuthenticatorGuardWitness,
+        GuardId::NonDevelopmentAuthenticator
+    );
+    define_nominal_guard_witness!(
+        VerifiedExternalSigningKeyMaterialGuardWitness,
+        GuardId::ExternalSigningKeyMaterial
+    );
+    define_nominal_guard_witness!(
+        VerifiedMockDependenciesDisabledGuardWitness,
+        GuardId::MockDependenciesDisabled
+    );
+    define_nominal_guard_witness!(
+        VerifiedFirstOwnerPathClosedGuardWitness,
+        GuardId::FirstOwnerPathClosed
+    );
+
+    /// Exactly one nominal witness for every production guard. Named fields
+    /// make omission, duplication, and cross-kind substitution compile-time
+    /// errors instead of collection-shape checks.
+    pub(super) struct VerifiedProductionRuntimeGuardWitnesses<
+        DatabaseHandle,
+        SecretProviderHandle,
+        PublicIngressHandle,
+        CookieHandle,
+        AuthenticatorHandle,
+        SigningHandle,
+        DependencyHandle,
+        FirstOwnerHandle,
+    > {
+        durable_postgresql: VerifiedDurablePostgresqlGuardWitness<DatabaseHandle>,
+        approved_secret_provider: VerifiedApprovedSecretProviderGuardWitness<SecretProviderHandle>,
+        https_public_urls: VerifiedHttpsPublicUrlsGuardWitness<PublicIngressHandle>,
+        secure_cookies: VerifiedSecureCookiesGuardWitness<CookieHandle>,
+        non_development_authenticator:
+            VerifiedNonDevelopmentAuthenticatorGuardWitness<AuthenticatorHandle>,
+        external_signing_key_material:
+            VerifiedExternalSigningKeyMaterialGuardWitness<SigningHandle>,
+        mock_dependencies_disabled: VerifiedMockDependenciesDisabledGuardWitness<DependencyHandle>,
+        first_owner_path_closed: VerifiedFirstOwnerPathClosedGuardWitness<FirstOwnerHandle>,
+    }
+
+    impl<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        > fmt::Debug
+        for VerifiedProductionRuntimeGuardWitnesses<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+    {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedProductionRuntimeGuardWitnesses")
+                .field("durable_postgresql", &self.durable_postgresql)
+                .field("approved_secret_provider", &self.approved_secret_provider)
+                .field("https_public_urls", &self.https_public_urls)
+                .field("secure_cookies", &self.secure_cookies)
+                .field(
+                    "non_development_authenticator",
+                    &self.non_development_authenticator,
+                )
+                .field(
+                    "external_signing_key_material",
+                    &self.external_signing_key_material,
+                )
+                .field(
+                    "mock_dependencies_disabled",
+                    &self.mock_dependencies_disabled,
+                )
+                .field("first_owner_path_closed", &self.first_owner_path_closed)
+                .finish()
+        }
+    }
+
+    impl<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+        VerifiedProductionRuntimeGuardWitnesses<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+    {
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn new(
+            durable_postgresql: VerifiedDurablePostgresqlGuardWitness<DatabaseHandle>,
+            approved_secret_provider: VerifiedApprovedSecretProviderGuardWitness<
+                SecretProviderHandle,
+            >,
+            https_public_urls: VerifiedHttpsPublicUrlsGuardWitness<PublicIngressHandle>,
+            secure_cookies: VerifiedSecureCookiesGuardWitness<CookieHandle>,
+            non_development_authenticator: VerifiedNonDevelopmentAuthenticatorGuardWitness<
+                AuthenticatorHandle,
+            >,
+            external_signing_key_material: VerifiedExternalSigningKeyMaterialGuardWitness<
+                SigningHandle,
+            >,
+            mock_dependencies_disabled: VerifiedMockDependenciesDisabledGuardWitness<
+                DependencyHandle,
+            >,
+            first_owner_path_closed: VerifiedFirstOwnerPathClosedGuardWitness<FirstOwnerHandle>,
+        ) -> Self {
+            Self {
+                durable_postgresql,
+                approved_secret_provider,
+                https_public_urls,
+                secure_cookies,
+                non_development_authenticator,
+                external_signing_key_material,
+                mock_dependencies_disabled,
+                first_owner_path_closed,
+            }
+        }
+
+        fn recheck(
+            &self,
+            boundary: &VerifiedProductionBoundary,
+            trusted_now: ConformanceTrustedTimeWindow,
+        ) -> Result<(), ProductionRuntimeAdmissionError> {
+            self.durable_postgresql.recheck(boundary, trusted_now)?;
+            self.approved_secret_provider
+                .recheck(boundary, trusted_now)?;
+            self.https_public_urls.recheck(boundary, trusted_now)?;
+            self.secure_cookies.recheck(boundary, trusted_now)?;
+            self.non_development_authenticator
+                .recheck(boundary, trusted_now)?;
+            self.external_signing_key_material
+                .recheck(boundary, trusted_now)?;
+            self.mock_dependencies_disabled
+                .recheck(boundary, trusted_now)?;
+            self.first_owner_path_closed.recheck(boundary, trusted_now)
+        }
+    }
+
+    /// Final non-cloneable serving authority. It owns the static production
+    /// boundary and all eight live witnesses, which in turn retain the exact
+    /// handles measured before admission.
+    pub(super) struct VerifiedProductionRuntimeAdmission<
+        DatabaseHandle,
+        SecretProviderHandle,
+        PublicIngressHandle,
+        CookieHandle,
+        AuthenticatorHandle,
+        SigningHandle,
+        DependencyHandle,
+        FirstOwnerHandle,
+    > {
+        boundary: VerifiedProductionBoundary,
+        witnesses: VerifiedProductionRuntimeGuardWitnesses<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >,
+        last_freshness_fence_not_after: DateTime<Utc>,
+    }
+
+    impl<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        > fmt::Debug
+        for VerifiedProductionRuntimeAdmission<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+    {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedProductionRuntimeAdmission")
+                .field("boundary", &self.boundary)
+                .field("witnesses", &self.witnesses)
+                .finish()
+        }
+    }
+
+    impl<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+        VerifiedProductionRuntimeAdmission<
+            DatabaseHandle,
+            SecretProviderHandle,
+            PublicIngressHandle,
+            CookieHandle,
+            AuthenticatorHandle,
+            SigningHandle,
+            DependencyHandle,
+            FirstOwnerHandle,
+        >
+    {
+        pub(super) fn seal(
+            boundary: VerifiedProductionBoundary,
+            witnesses: VerifiedProductionRuntimeGuardWitnesses<
+                DatabaseHandle,
+                SecretProviderHandle,
+                PublicIngressHandle,
+                CookieHandle,
+                AuthenticatorHandle,
+                SigningHandle,
+                DependencyHandle,
+                FirstOwnerHandle,
+            >,
+            trusted_now: ConformanceTrustedTimeWindow,
+        ) -> Result<Self, ProductionRuntimeAdmissionError> {
+            validate_trusted_time(trusted_now)?;
+            let challenge_count = boundary.runtime_guard_challenges().len();
+            if challenge_count != 8 {
+                return Err(ProductionRuntimeAdmissionError::CorruptChallengeCount {
+                    observed: challenge_count,
+                });
+            }
+            boundary
+                .ensure_fresh(trusted_now)
+                .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+            witnesses.recheck(&boundary, trusted_now)?;
+            Ok(Self {
+                boundary,
+                witnesses,
+                last_freshness_fence_not_after: trusted_now.not_after,
+            })
+        }
+
+        pub(super) fn ensure_fresh(
+            &mut self,
+            trusted_now: ConformanceTrustedTimeWindow,
+        ) -> Result<(), ProductionRuntimeAdmissionError> {
+            validate_trusted_time(trusted_now)?;
+            if trusted_now.not_before < self.last_freshness_fence_not_after {
+                return Err(ProductionRuntimeAdmissionError::TrustedTimeRollback);
+            }
+            self.boundary
+                .ensure_fresh(trusted_now)
+                .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+            self.witnesses.recheck(&self.boundary, trusted_now)?;
+            self.last_freshness_fence_not_after = trusted_now.not_after;
+            Ok(())
+        }
+
+        pub(super) fn durable_postgresql_handle(&self) -> &DatabaseHandle {
+            self.witnesses.durable_postgresql.handle()
+        }
+
+        pub(super) fn approved_secret_provider_handle(&self) -> &SecretProviderHandle {
+            self.witnesses.approved_secret_provider.handle()
+        }
+
+        pub(super) fn public_ingress_handle(&self) -> &PublicIngressHandle {
+            self.witnesses.https_public_urls.handle()
+        }
+
+        pub(super) fn secure_cookie_handle(&self) -> &CookieHandle {
+            self.witnesses.secure_cookies.handle()
+        }
+
+        pub(super) fn authenticator_handle(&self) -> &AuthenticatorHandle {
+            self.witnesses.non_development_authenticator.handle()
+        }
+
+        pub(super) fn external_signing_handle(&self) -> &SigningHandle {
+            self.witnesses.external_signing_key_material.handle()
+        }
+
+        pub(super) fn dependency_handle(&self) -> &DependencyHandle {
+            self.witnesses.mock_dependencies_disabled.handle()
+        }
+
+        pub(super) fn first_owner_handle(&self) -> &FirstOwnerHandle {
+            self.witnesses.first_owner_path_closed.handle()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ConformanceState {
     NonProduction,
@@ -4583,6 +5204,10 @@ fn validate_json_shape(value: &Value, depth: usize, nodes: &mut usize) -> Result
 mod tests {
     use std::ffi::OsString;
     use std::io::Write;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use chrono::{TimeDelta, TimeZone};
@@ -4616,6 +5241,7 @@ mod tests {
     #[cfg(unix)]
     use tokio::net::UnixListener;
 
+    use super::runtime_admission::*;
     use super::*;
 
     const DEPLOYMENT_ID: &str = "deployment:runtime-loader-test";
@@ -4679,6 +5305,316 @@ mod tests {
             profile_raw_bytes,
             profile_raw_digest,
         )
+    }
+
+    fn genuine_production_boundary(workload_valid_for_seconds: i64) -> VerifiedProductionBoundary {
+        let (conformance, deployed_workload, pinned_build, profile_raw_bytes, profile_raw_digest) =
+            genuine_production_boundary_parts(None, workload_valid_for_seconds);
+        VerifiedProductionBoundary::seal(
+            conformance,
+            deployed_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .expect("one exact signed production identity must seal")
+    }
+
+    struct TestRetainedRuntimeHandle {
+        marker: &'static str,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TestRetainedRuntimeHandle {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type TestRuntimeGuardWitnesses = VerifiedProductionRuntimeGuardWitnesses<
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+        TestRetainedRuntimeHandle,
+    >;
+
+    fn runtime_guard_binding(
+        boundary: &VerifiedProductionBoundary,
+        guard_id: GuardId,
+    ) -> (RuntimeGuardExpectedValue, String, String) {
+        let challenge = boundary
+            .runtime_guard_challenges()
+            .find(|challenge| challenge.guard_id() == guard_id)
+            .expect("the genuine boundary has every guard exactly once");
+        (
+            challenge.expected_value().clone(),
+            challenge.requirement_digest().to_owned(),
+            challenge.challenge_binding_digest().to_owned(),
+        )
+    }
+
+    fn test_runtime_guard_witnesses(
+        boundary: &VerifiedProductionBoundary,
+        drops: &Arc<AtomicUsize>,
+    ) -> TestRuntimeGuardWitnesses {
+        let observed_at_not_before = production_composition_time(7, 7).not_before;
+        let observed_at_not_after = production_composition_time(8, 8).not_before;
+        let valid_until = production_composition_time(180, 180).not_before;
+        let trusted_now = production_composition_time(9, 10);
+        macro_rules! witness {
+            ($kind:ty, $guard_id:expr, $marker:expr) => {{
+                let (observed_value, requirement_digest, challenge_binding_digest) =
+                    runtime_guard_binding(boundary, $guard_id);
+                <$kind>::seal_test_observation(
+                    boundary,
+                    observed_value,
+                    requirement_digest,
+                    challenge_binding_digest,
+                    observed_at_not_before,
+                    observed_at_not_after,
+                    valid_until,
+                    TestRetainedRuntimeHandle {
+                        marker: $marker,
+                        drops: Arc::clone(drops),
+                    },
+                    trusted_now,
+                )
+                .expect("the test-only exact observation must seal")
+            }};
+        }
+        VerifiedProductionRuntimeGuardWitnesses::new(
+            witness!(
+                VerifiedDurablePostgresqlGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::DurablePostgresql,
+                "database-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedApprovedSecretProviderGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::ApprovedSecretProvider,
+                "secret-provider-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedHttpsPublicUrlsGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::HttpsPublicUrls,
+                "ingress-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedSecureCookiesGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::SecureCookies,
+                "cookie-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedNonDevelopmentAuthenticatorGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::NonDevelopmentAuthenticator,
+                "authenticator-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedExternalSigningKeyMaterialGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::ExternalSigningKeyMaterial,
+                "signing-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedMockDependenciesDisabledGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::MockDependenciesDisabled,
+                "dependency-handle-secret-marker"
+            ),
+            witness!(
+                VerifiedFirstOwnerPathClosedGuardWitness<TestRetainedRuntimeHandle>,
+                GuardId::FirstOwnerPathClosed,
+                "first-owner-handle-secret-marker"
+            ),
+        )
+    }
+
+    #[test]
+    fn runtime_admission_seals_exact_eight_and_retains_redacted_handles() {
+        let boundary = genuine_production_boundary(240);
+        assert_eq!(boundary.runtime_guard_challenges().len(), 8);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let witnesses = test_runtime_guard_witnesses(&boundary, &drops);
+        let mut admission = VerifiedProductionRuntimeAdmission::seal(
+            boundary,
+            witnesses,
+            production_composition_time(11, 12),
+        )
+        .expect("the exact eight typed test witnesses must seal");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            admission.secure_cookie_handle().marker,
+            "cookie-handle-secret-marker"
+        );
+        admission
+            .ensure_fresh(production_composition_time(13, 14))
+            .expect("the complete admission remains fresh");
+        let rollback_error = admission
+            .ensure_fresh(production_composition_time(12, 13))
+            .unwrap_err();
+        assert_eq!(
+            rollback_error,
+            ProductionRuntimeAdmissionError::TrustedTimeRollback
+        );
+        let debug = format!("{admission:?}");
+        assert!(!debug.contains("secret-marker"));
+        assert!(debug.contains("[RETAINED]"));
+        drop(admission);
+        assert_eq!(drops.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn runtime_admission_rejects_cross_workload_witness_replay() {
+        let (conformance, first_workload, pinned_build, profile_raw_bytes, profile_raw_digest) =
+            genuine_production_boundary_parts(None, 240);
+        let second_workload = genuine_deployed_workload_fixture(
+            conformance.deployment_id(),
+            conformance.trust_domain_id(),
+            "workload:ryuki-api-fixture",
+            &pinned_build.document.oci_subject,
+            &pinned_build.document.runtime_executable,
+            240,
+        )
+        .expect("the second genuine signed workload fixture must verify");
+        assert_ne!(
+            first_workload.workload_instance_binding_digest(),
+            second_workload.workload_instance_binding_digest()
+        );
+        let second_challenge_digests = conformance
+            .runtime_guard_requirements()
+            .iter()
+            .map(|requirement| {
+                production_runtime_guard_challenge_digest(requirement, &second_workload)
+                    .expect("the alternate genuine workload challenge must hash")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let first_boundary = VerifiedProductionBoundary::seal(
+            conformance,
+            first_workload,
+            pinned_build,
+            profile_raw_bytes,
+            profile_raw_digest,
+            production_composition_time(5, 6),
+        )
+        .expect("the first genuine workload boundary must seal");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let witnesses = test_runtime_guard_witnesses(&first_boundary, &drops);
+        let mut second_boundary = first_boundary;
+        second_boundary.deployed_workload = second_workload;
+        second_boundary.runtime_guard_challenge_digests = second_challenge_digests;
+        let error = VerifiedProductionRuntimeAdmission::seal(
+            second_boundary,
+            witnesses,
+            production_composition_time(11, 12),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProductionRuntimeAdmissionError::ChallengeBindingMismatch { .. }
+            ),
+            "unexpected replay rejection: {error:?}"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn runtime_guard_witness_rejects_value_binding_and_freshness_substitution() {
+        let boundary = genuine_production_boundary(240);
+        let (mut observed_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::DurablePostgresql);
+        let RuntimeGuardExpectedValue::DurablePostgresql {
+            server_major_version,
+            ..
+        } = &mut observed_value
+        else {
+            panic!("fixture guard kind changed");
+        };
+        *server_major_version = 17;
+        let error = VerifiedDurablePostgresqlGuardWitness::seal_test_observation(
+            &boundary,
+            observed_value,
+            requirement_digest,
+            challenge_binding_digest,
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(180, 180).not_before,
+            (),
+            production_composition_time(9, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::DurablePostgresql,
+            }
+        );
+
+        let (observed_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::DurablePostgresql);
+        let error = VerifiedDurablePostgresqlGuardWitness::seal_test_observation(
+            &boundary,
+            observed_value,
+            requirement_digest,
+            challenge_binding_digest,
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(10, 10).not_before,
+            (),
+            production_composition_time(9, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::WitnessStale {
+                guard_id: GuardId::DurablePostgresql,
+            }
+        );
+
+        let (observed_value, requirement_digest, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::DurablePostgresql);
+        let error = VerifiedDurablePostgresqlGuardWitness::seal_test_observation(
+            &boundary,
+            observed_value,
+            requirement_digest,
+            challenge_binding_digest,
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(400, 400).not_before,
+            (),
+            production_composition_time(9, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                guard_id: GuardId::DurablePostgresql,
+            }
+        );
+
+        let (observed_value, _, challenge_binding_digest) =
+            runtime_guard_binding(&boundary, GuardId::DurablePostgresql);
+        let error = VerifiedDurablePostgresqlGuardWitness::seal_test_observation(
+            &boundary,
+            observed_value,
+            format!("sha256:{}", "f".repeat(64)),
+            challenge_binding_digest,
+            production_composition_time(7, 7).not_before,
+            production_composition_time(8, 8).not_before,
+            production_composition_time(180, 180).not_before,
+            (),
+            production_composition_time(9, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProductionRuntimeAdmissionError::RequirementBindingMismatch {
+                guard_id: GuardId::DurablePostgresql,
+            }
+        );
     }
 
     #[test]
