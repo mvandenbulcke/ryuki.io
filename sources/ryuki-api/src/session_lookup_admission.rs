@@ -1082,8 +1082,10 @@ pub(crate) async fn session_lookup_admission_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let session_parser = cookie_runtime.session_lookup_admission_parser();
     let Some((Ok(bearer), _source)) =
-        crate::session_credential_from_headers(request.headers(), auth_header, &config.session)
+        crate::session_credential_from_headers(request.headers(), auth_header, &session_parser)
     else {
         // Missing, malformed, conflicting, API-token, and JWT evidence cannot
         // reach the persisted-session SQL lookup from this branch.

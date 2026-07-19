@@ -16182,8 +16182,10 @@ enum LogoutFailure {
 async fn logout_caller_session(headers: &HeaderMap) -> Result<(), LogoutFailure> {
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let app_cfg = crate::config_store::get_app_config();
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let session_parser = cookie_runtime.session_logout_parser();
     let session_bearer =
-        match crate::session_credential_from_headers(headers, auth_header, &app_cfg.session) {
+        match crate::session_credential_from_headers(headers, auth_header, &session_parser) {
             None => return Ok(()),
             Some((Ok(session_bearer), _source)) => session_bearer,
             Some((Err(()), _source)) => return Err(LogoutFailure::CredentialRejected),
@@ -53433,10 +53435,16 @@ mod unit_tests {
             "X-Ryuki-Session-Id",
             axum::http::HeaderValue::from_str(session_token.as_str()).unwrap(),
         );
+        let cookie_runtime = crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(
+            &ryuki_core::config::RyukiConfig::default(),
+            false,
+        )
+        .unwrap();
+        let session_parser = cookie_runtime.session_auth_parser();
         let (parsed, source) = crate::session_credential_from_headers(
             &headers,
             Some("Bearer ryk_bogustoken"),
-            &ryuki_core::config::SessionConfig::default(),
+            &session_parser,
         )
         .expect("session header must be resolvable");
         assert_eq!(parsed, Err(()));

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::header::SET_COOKIE;
-use axum::http::{header::InvalidHeaderValue, HeaderValue};
+use axum::http::{header::InvalidHeaderValue, HeaderMap, HeaderValue};
 use axum::response::Response;
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::cookie_policy::{
@@ -80,6 +80,9 @@ mod consumer {
     pub(crate) enum EntraSessionIssuer {}
     pub(crate) enum OidcSessionIssuer {}
     pub(crate) enum SessionLogoutRetirer {}
+    pub(crate) enum SessionAuthParser {}
+    pub(crate) enum SessionLookupAdmissionParser {}
+    pub(crate) enum SessionLogoutParser {}
 }
 
 pub(crate) trait SessionIssuerConsumer {
@@ -104,6 +107,22 @@ pub(crate) trait SessionRetirerConsumer {
 
 impl SessionRetirerConsumer for consumer::SessionLogoutRetirer {
     const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionLogoutRetirer;
+}
+
+pub(crate) trait SessionParserConsumer {
+    const ID: CookiePolicyConsumer;
+}
+
+impl SessionParserConsumer for consumer::SessionAuthParser {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionAuthParser;
+}
+
+impl SessionParserConsumer for consumer::SessionLookupAdmissionParser {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionLookupAdmissionParser;
+}
+
+impl SessionParserConsumer for consumer::SessionLogoutParser {
+    const ID: CookiePolicyConsumer = CookiePolicyConsumer::ApiSessionLogoutParser;
 }
 
 /// A non-forgeable capability for one declared session-cookie issuer. Its
@@ -164,6 +183,51 @@ impl<C: SessionRetirerConsumer> SessionCookieRetirer<C> {
             return Err(CookieEmissionError::ConsumerBinding);
         }
         self.runtime.session_cookie_fields("", true)
+    }
+}
+
+/// Cookie evidence is explicitly tri-state so malformed or ambiguous browser
+/// input cannot be mistaken for absence and fall through to another carrier.
+pub(crate) enum CookieEvidence<'a> {
+    Absent,
+    Value(&'a str),
+    Invalid,
+}
+
+/// A non-forgeable capability for one declared session-cookie parser. Every
+/// parser handle owns an Arc clone of the exact retained runtime authority.
+pub(crate) struct SessionCookieParser<C> {
+    runtime: Arc<ApiCookieRuntime>,
+    _consumer: PhantomData<fn() -> C>,
+}
+
+pub(crate) type ApiSessionAuthParser = SessionCookieParser<consumer::SessionAuthParser>;
+pub(crate) type ApiSessionLookupAdmissionParser =
+    SessionCookieParser<consumer::SessionLookupAdmissionParser>;
+pub(crate) type ApiSessionLogoutParser = SessionCookieParser<consumer::SessionLogoutParser>;
+
+impl<C> SessionCookieParser<C> {
+    fn new(runtime: Arc<ApiCookieRuntime>) -> Self {
+        Self {
+            runtime,
+            _consumer: PhantomData,
+        }
+    }
+}
+
+impl<C: SessionParserConsumer> SessionCookieParser<C> {
+    pub(crate) fn parse<'a>(&self, headers: &'a HeaderMap) -> CookieEvidence<'a> {
+        if !self.runtime.session_parser_is_bound(C::ID) {
+            return CookieEvidence::Invalid;
+        }
+        match self.runtime.session_cookie_evidence(headers) {
+            CookieEvidence::Value(value)
+                if !crate::session_credentials::is_well_formed_session_bearer(value) =>
+            {
+                CookieEvidence::Invalid
+            }
+            evidence => evidence,
+        }
     }
 }
 
@@ -276,6 +340,20 @@ impl ApiCookieRuntime {
 
     pub(crate) fn session_logout_retirer(self: &Arc<Self>) -> ApiSessionLogoutRetirer {
         SessionCookieRetirer::new(Arc::clone(self))
+    }
+
+    pub(crate) fn session_auth_parser(self: &Arc<Self>) -> ApiSessionAuthParser {
+        SessionCookieParser::new(Arc::clone(self))
+    }
+
+    pub(crate) fn session_lookup_admission_parser(
+        self: &Arc<Self>,
+    ) -> ApiSessionLookupAdmissionParser {
+        SessionCookieParser::new(Arc::clone(self))
+    }
+
+    pub(crate) fn session_logout_parser(self: &Arc<Self>) -> ApiSessionLogoutParser {
+        SessionCookieParser::new(Arc::clone(self))
     }
 
     /// The exact retained allocation to move into the secure-cookie witness.
@@ -420,6 +498,82 @@ impl ApiCookieRuntime {
                     | CookiePolicyConsumer::ApiOidcSessionIssuer
                     | CookiePolicyConsumer::ApiSessionLogoutRetirer
             ),
+        }
+    }
+
+    fn session_parser_is_bound(&self, consumer: CookiePolicyConsumer) -> bool {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { policies } => policies
+                .api_session()
+                .parser_consumers()
+                .contains(&consumer),
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => matches!(
+                consumer,
+                CookiePolicyConsumer::ApiSessionAuthParser
+                    | CookiePolicyConsumer::ApiSessionLookupAdmissionParser
+                    | CookiePolicyConsumer::ApiSessionLogoutParser
+            ),
+        }
+    }
+
+    fn session_cookie_evidence<'a>(&self, headers: &'a HeaderMap) -> CookieEvidence<'a> {
+        let mut credential = None;
+        for raw_cookie_header in headers.get_all(axum::http::header::COOKIE).iter() {
+            let cookie_header = match raw_cookie_header.to_str() {
+                Ok(value) => value,
+                Err(_) => return CookieEvidence::Invalid,
+            };
+            for pair in cookie_header.split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                let Some((name, value)) = pair.split_once('=') else {
+                    return CookieEvidence::Invalid;
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    return CookieEvidence::Invalid;
+                }
+                if !self.is_known_session_cookie_name(name) {
+                    continue;
+                }
+                if credential.is_some() {
+                    return CookieEvidence::Invalid;
+                }
+                credential = Some((name, value.trim()));
+            }
+        }
+
+        let Some((name, value)) = credential else {
+            return CookieEvidence::Absent;
+        };
+        if name != self.selected_session_cookie_name() {
+            return CookieEvidence::Invalid;
+        }
+        CookieEvidence::Value(value)
+    }
+
+    fn selected_session_cookie_name(&self) -> &str {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { policies } => policies.api_session().cookie_name(),
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => LOOPBACK_SESSION_COOKIE_NAME,
+        }
+    }
+
+    fn is_known_session_cookie_name(&self, name: &str) -> bool {
+        match &self.mode {
+            ApiCookieRuntimeMode::Secure { policies } => {
+                let policy = policies.api_session();
+                name == policy.cookie_name()
+                    || policy
+                        .retired_cookie_names()
+                        .iter()
+                        .any(|retired| retired == name)
+            }
+            ApiCookieRuntimeMode::LoopbackDevelopment { .. } => {
+                name == LOOPBACK_SESSION_COOKIE_NAME || name == SECURE_SESSION_COOKIE_NAME
+            }
         }
     }
 }
@@ -636,6 +790,35 @@ mod tests {
                 .field_values(),
             vec!["ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Strict"]
         );
+    }
+
+    #[test]
+    fn session_parser_handles_retain_exact_runtime_and_closed_consumer_binding() {
+        let runtime = ApiCookieRuntime::from_admitted_config(&secure_config(), true).unwrap();
+        let auth = runtime.session_auth_parser();
+        let lookup = runtime.session_lookup_admission_parser();
+        let logout = runtime.session_logout_parser();
+        assert!(Arc::ptr_eq(&runtime, &auth.runtime));
+        assert!(Arc::ptr_eq(&runtime, &lookup.runtime));
+        assert!(Arc::ptr_eq(&runtime, &logout.runtime));
+
+        let session_value = crate::session_credentials::generate_session_bearer();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-ryuki_session={}", session_value.as_str()))
+                .unwrap(),
+        );
+        for evidence in [
+            auth.parse(&headers),
+            lookup.parse(&headers),
+            logout.parse(&headers),
+        ] {
+            let CookieEvidence::Value(value) = evidence else {
+                panic!("declared parser must return the selected session value");
+            };
+            assert_eq!(value, session_value.as_str());
+        }
     }
 
     #[test]

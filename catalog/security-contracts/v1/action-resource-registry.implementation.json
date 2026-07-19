@@ -23,13 +23,13 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:4fd699f6392f3c414c1a30dfae9b4e225c999b55543a7df2a2ff68bc55c8996f",
+        "content_digest": "sha256:74681f45b348e017890f4e6885a4212e7d3afcf45a4245e3d5008567155c9b6b",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
         "document_id": "source:ryuki-api-contracts",
         "document_version": 1,
-        "content_digest": "sha256:fed2cbb98cad693ac3fa8d294486d10adf43f7098d8a7916b0f2fb9af3b9c159",
+        "content_digest": "sha256:38bf4be24fc3cb73e879c1b617dd527f8937054368ef22c320080dedc41a8db0",
         "artifact_locator": "sources/ryuki-api/src/contracts.rs"
       },
       {

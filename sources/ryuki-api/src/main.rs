@@ -59,7 +59,7 @@ use uuid::Uuid;
 
 use crate::database::MigrationStatus;
 use crate::entra_auth::EntraTokenValidator;
-use ryuki_core::config::{AuthMode, RyukiConfig, SessionConfig, TrustedProxyNetwork};
+use ryuki_core::config::{AuthMode, RyukiConfig, TrustedProxyNetwork};
 use ryuki_core::types::{ApiError, ValidationResult};
 use ryuki_engine::auth::{AuthSession, OperationCapability};
 
@@ -209,70 +209,6 @@ fn bearer_value(auth_header: Option<&str>) -> Option<&str> {
     auth_header?.trim().strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Host-only cookie name required whenever `session.cookie_secure` is true.
-pub(crate) const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
-/// Compatibility cookie name admitted only by explicit non-Secure loopback
-/// development/test configuration.
-pub(crate) const LOOPBACK_SESSION_COOKIE_NAME: &str = "ryuki_session";
-
-/// Selects the single session-cookie name for the process-validated startup
-/// configuration. Callers must not infer this policy from request metadata.
-pub(crate) fn session_cookie_name(session: &SessionConfig) -> &'static str {
-    if session.cookie_secure {
-        SECURE_SESSION_COOKIE_NAME
-    } else {
-        LOOPBACK_SESSION_COOKIE_NAME
-    }
-}
-
-fn is_session_cookie_name(name: &str) -> bool {
-    name == SECURE_SESSION_COOKIE_NAME || name == LOOPBACK_SESSION_COOKIE_NAME
-}
-
-/// Parses every Cookie header field and classifies session-cookie evidence.
-/// Exactly one credential-cookie pair may appear and its name must match the
-/// startup configuration. Malformed header encoding, malformed cookie pairs,
-/// same-name duplicates, and mixed old/new names all remain explicit invalid
-/// evidence so authentication cannot fall through to another carrier.
-fn session_cookie_evidence<'a>(
-    headers: &'a HeaderMap,
-    session: &SessionConfig,
-) -> Option<Result<&'a str, ()>> {
-    let mut credential = None;
-    for raw_cookie_header in headers.get_all(axum::http::header::COOKIE).iter() {
-        let cookie_header = match raw_cookie_header.to_str() {
-            Ok(value) => value,
-            Err(_) => return Some(Err(())),
-        };
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            let Some((name, value)) = pair.split_once('=') else {
-                return Some(Err(()));
-            };
-            let name = name.trim();
-            if name.is_empty() {
-                return Some(Err(()));
-            }
-            if !is_session_cookie_name(name) {
-                continue;
-            }
-            if credential.is_some() {
-                return Some(Err(()));
-            }
-            credential = Some((name, value.trim()));
-        }
-    }
-
-    let (name, value) = credential?;
-    if name != session_cookie_name(session) {
-        return Some(Err(()));
-    }
-    Some(Ok(value))
-}
-
 /// Which request surface carried the opaque session bearer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionIdSource {
@@ -289,10 +225,10 @@ pub enum SessionIdSource {
 /// X-Ryuki-Session-Id, Authorization: Bearer rys_..., then the mode-selected
 /// session cookie. Administrative session UUIDs and legacy UUID bearers are
 /// never accepted.
-fn session_credential_from_headers<'a>(
+fn session_credential_from_headers<'a, C: cookie_runtime::SessionParserConsumer>(
     headers: &'a HeaderMap,
     auth_header: Option<&'a str>,
-    session: &SessionConfig,
+    parser: &cookie_runtime::SessionCookieParser<C>,
 ) -> Option<(Result<&'a str, ()>, SessionIdSource)> {
     let raw_header_value = headers.get("X-Ryuki-Session-Id");
     let header_value = raw_header_value.and_then(|value| value.to_str().ok());
@@ -301,7 +237,11 @@ fn session_credential_from_headers<'a>(
     // real request path also carries the raw header, which must count as
     // credential evidence even when it is not valid text.
     let authorization_present = raw_authorization.is_some() || auth_header.is_some();
-    let cookie_evidence = session_cookie_evidence(headers, session);
+    let cookie_evidence = match parser.parse(headers) {
+        cookie_runtime::CookieEvidence::Absent => None,
+        cookie_runtime::CookieEvidence::Value(value) => Some(Ok(value)),
+        cookie_runtime::CookieEvidence::Invalid => Some(Err(())),
+    };
     let evidence_count = usize::from(raw_header_value.is_some())
         + usize::from(authorization_present)
         + usize::from(cookie_evidence.is_some());
@@ -570,15 +510,28 @@ pub(crate) async fn auth_session_from_persisted_session_with_admission(
     admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
     proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
 ) -> Option<(AuthSession, SessionIdSource)> {
+    let cookie_runtime = test_cookie_runtime(config);
+    let session_parser = cookie_runtime.session_auth_parser();
     auth_session_from_persisted_session_with_authority_admission(
         headers,
         auth_header,
         config,
         admission,
         proof,
+        &session_parser,
     )
     .await
     .map(|(session, source, _authority)| (session, source))
+}
+
+#[cfg(test)]
+fn test_cookie_runtime(config: &RyukiConfig) -> Arc<cookie_runtime::ApiCookieRuntime> {
+    let mut config = config.clone();
+    if !config.session.cookie_secure {
+        config.server.bind_address = "127.0.0.1:0".into();
+    }
+    cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, false)
+        .expect("test config must construct a cookie runtime")
 }
 
 async fn auth_session_from_persisted_session_with_authority_admission(
@@ -587,6 +540,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     config: &RyukiConfig,
     admission: &Arc<crate::session_lookup_admission::SessionLookupAdmission>,
     proof: Option<crate::session_lookup_admission::SessionLookupAdmissionProof>,
+    session_parser: &cookie_runtime::ApiSessionAuthParser,
 ) -> Option<(
     AuthSession,
     SessionIdSource,
@@ -597,7 +551,7 @@ async fn auth_session_from_persisted_session_with_authority_admission(
     // Classify all credential evidence once. Any malformed session bearer or
     // simultaneous header/Authorization/cookie evidence fails closed before a
     // credential-specific resolver can fall through to another identity.
-    let session_evidence = session_credential_from_headers(headers, auth_header, session);
+    let session_evidence = session_credential_from_headers(headers, auth_header, session_parser);
     if let Some((Err(()), source)) = session_evidence {
         return Some((
             unverified_session("conflicting-or-invalid-credentials"),
@@ -1774,6 +1728,8 @@ async fn auth_middleware(
     let path = request.uri().path().to_string();
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let app_config = crate::config_store::get_app_config();
+    let cookie_runtime = crate::config_store::get_api_cookie_runtime();
+    let session_auth_parser = cookie_runtime.session_auth_parser();
     let auth_mode = app_config.auth_mode.clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
     let lookup_admission = crate::session_lookup_admission::global_admission();
@@ -1804,6 +1760,7 @@ async fn auth_middleware(
             app_config,
             &lookup_admission,
             lookup_proof,
+            &session_auth_parser,
         )
         .await
         {
@@ -5114,15 +5071,22 @@ mod tests {
         assert!(!session.token_valid);
     }
 
-    fn secure_session_config() -> SessionConfig {
-        SessionConfig::default()
+    const SECURE_SESSION_COOKIE_NAME: &str = "__Host-ryuki_session";
+    const LOOPBACK_SESSION_COOKIE_NAME: &str = "ryuki_session";
+
+    fn secure_session_config() -> cookie_runtime::ApiSessionAuthParser {
+        cookie_runtime::ApiCookieRuntime::from_admitted_config(&RyukiConfig::default(), false)
+            .unwrap()
+            .session_auth_parser()
     }
 
-    fn loopback_session_config() -> SessionConfig {
-        SessionConfig {
-            cookie_secure: false,
-            ..Default::default()
-        }
+    fn loopback_session_config() -> cookie_runtime::ApiSessionAuthParser {
+        let mut config = RyukiConfig::default();
+        config.session.cookie_secure = false;
+        config.server.bind_address = "127.0.0.1:0".into();
+        cookie_runtime::ApiCookieRuntime::from_admitted_config(&config, false)
+            .unwrap()
+            .session_auth_parser()
     }
 
     #[test]
