@@ -2995,7 +2995,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let app_config = config::load_config().unwrap_or_else(|error| {
+    let (app_config, api_secret_provider_runtime) = config::load_config().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
     });
@@ -3042,18 +3042,28 @@ async fn main() {
     START_TIME.set(Instant::now()).ok();
     let api_cookie_runtime_identity = Arc::clone(&api_cookie_runtime);
     let api_authenticator_runtime_identity = Arc::clone(&api_authenticator_runtime);
+    let api_secret_provider_runtime_identity = Arc::clone(&api_secret_provider_runtime);
     config_store::init_with_security_contract(
         "platform-config.json",
         &app_config,
         security_contract,
         api_cookie_runtime,
         Arc::clone(&api_authenticator_runtime),
+        api_secret_provider_runtime,
     );
     if !Arc::ptr_eq(
         &api_cookie_runtime_identity,
         &config_store::get_api_cookie_runtime(),
     ) {
         eprintln!("API cookie runtime identity changed during startup retention");
+        std::process::exit(1);
+    }
+    if !Arc::ptr_eq(
+        &api_secret_provider_runtime_identity,
+        &config_store::get_api_secret_provider_runtime(),
+    ) || !api_secret_provider_runtime_identity.is_bound_to_config(&app_config)
+    {
+        eprintln!("API secret-provider runtime identity changed during startup retention");
         std::process::exit(1);
     }
     if !Arc::ptr_eq(

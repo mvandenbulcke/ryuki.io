@@ -23,6 +23,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::IpAddr;
+use std::sync::Arc;
 use zeroize::Zeroize;
 
 use crate::audit;
@@ -192,7 +193,9 @@ pub enum CredError {
     #[error("env-var credential error: variable '{0}' is not set")]
     EnvVarMissing(String),
     /// FIX-6: env-var key name failed the allow-list check.
-    #[error("env-var key '{0}' is not permitted: must start with 'RYUKI_INTEGRATION__' (not the encryption key or other platform vars)")]
+    #[error(
+        "env-var key '{0}' is not permitted: must start with 'RYUKI_INTEGRATION__' (not the encryption key or other platform vars)"
+    )]
     EnvVarDenied(String),
     /// Vault resolution error — carries the handle / field NAME / HTTP status
     /// only, NEVER secret material (see `VaultKv2Resolver`).
@@ -279,9 +282,9 @@ fn parse_optional_bool_env(name: &str, raw: Option<String>) -> Result<bool, Cred
 /// - `VAULT_ADDR`  — base URL, e.g. `https://vault.internal:8200`
 /// - `VAULT_TOKEN` — the token sent as `X-Vault-Token`
 ///
-/// Both must be non-empty for [`VaultKv2Resolver::from_env`] to return `Ok(Some)`.
+/// Both values are captured exactly once by [`ApiSecretProviderRuntime`].
 /// Missing configuration fails closed except for an explicitly admitted local
-/// static/mock dry-run posture (see [`secret_resolver_from_env`]).
+/// static/mock dry-run posture.
 ///
 /// # Secret handle format (the `credential_ref` of a Vault-sourced connection)
 /// `<mount>/<path>[#<field>]` — e.g. `secret/ryuki/vcenter#password`.
@@ -439,7 +442,7 @@ impl VaultKv2Resolver {
     /// Construct from explicit parts. Both values must be set together and be
     /// non-blank; partial or explicit-blank configuration is invalid even in
     /// development mode. Pure (no env access) — the testable core of
-    /// [`Self::from_env`].
+    /// [`ApiSecretProviderRuntime`] construction.
     fn from_parts(
         addr: Option<String>,
         token: Option<String>,
@@ -490,22 +493,6 @@ impl VaultKv2Resolver {
             token,
             client,
         }))
-    }
-
-    /// Construct from the process environment (`VAULT_ADDR` + `VAULT_TOKEN`).
-    /// Returns `Ok(None)` when Vault is not configured. The caller decides
-    /// whether the explicit local dry-run mock is admitted. Invalid configured
-    /// endpoints return an error instead of silently selecting the mock.
-    pub fn from_env() -> Result<Option<Self>, CredError> {
-        let allow_insecure_loopback = parse_optional_bool_env(
-            Self::ALLOW_INSECURE_LOOPBACK_ENV,
-            read_unicode_env(Self::ALLOW_INSECURE_LOOPBACK_ENV)?,
-        )?;
-        Self::from_parts(
-            read_unicode_env("VAULT_ADDR")?,
-            read_unicode_env("VAULT_TOKEN")?,
-            allow_insecure_loopback,
-        )
     }
 
     /// Split a secret handle `<mount>/<path>[#<field>]` into its parts.
@@ -569,17 +556,17 @@ impl VaultKv2Resolver {
             403 => {
                 return Err(CredError::Vault(format!(
                     "vault denied access to '{handle}' (HTTP 403 — check token policy)"
-                )))
+                )));
             }
             404 => {
                 return Err(CredError::Vault(format!(
                     "no secret at '{handle}' (HTTP 404 — check the mount and path)"
-                )))
+                )));
             }
             status => {
                 return Err(CredError::Vault(format!(
                     "vault returned HTTP {status} for '{handle}'"
-                )))
+                )));
             }
         }
 
@@ -666,19 +653,10 @@ impl SecretResolver for VaultKv2Resolver {
     }
 }
 
-#[derive(Debug)]
-enum SecretResolverSelection {
-    Vault(VaultKv2Resolver),
-    Development(DevelopmentSecretResolver),
-}
-
-impl SecretResolverSelection {
-    fn into_box(self) -> Box<dyn SecretResolver> {
-        match self {
-            Self::Vault(resolver) => Box::new(resolver),
-            Self::Development(resolver) => Box::new(resolver),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretResolverKind {
+    Vault,
+    Development,
 }
 
 /// The mock secret resolver is a local dry-run compatibility feature, not a
@@ -689,26 +667,162 @@ fn mock_secret_resolver_allowed(auth_mode: &AuthMode, execution_mode: &Execution
         && matches!(execution_mode, ExecutionMode::StaticDryRun)
 }
 
-fn select_secret_resolver(
+fn select_secret_resolver_kind(
     provider: &SecretProvider,
-    configured: Option<VaultKv2Resolver>,
+    vault_configured: bool,
     allow_mock: bool,
-) -> Result<SecretResolverSelection, CredError> {
-    match (provider, configured) {
-        (SecretProvider::HashicorpVault, Some(real)) => Ok(SecretResolverSelection::Vault(real)),
-        (_, Some(_)) => Err(CredError::SecretProviderUnavailable(
+) -> Result<SecretResolverKind, CredError> {
+    match (provider, vault_configured) {
+        (SecretProvider::HashicorpVault, true) => Ok(SecretResolverKind::Vault),
+        (_, true) => Err(CredError::SecretProviderUnavailable(
             provider.as_str().to_string(),
         )),
-        (_, None) if allow_mock => Ok(SecretResolverSelection::Development(
-            DevelopmentSecretResolver,
-        )),
-        (SecretProvider::HashicorpVault, None) => Err(CredError::VaultNotConfigured),
-        (_, None) => Err(CredError::SecretProviderUnavailable(
+        (_, false) if allow_mock => Ok(SecretResolverKind::Development),
+        (SecretProvider::HashicorpVault, false) => Err(CredError::VaultNotConfigured),
+        (_, false) => Err(CredError::SecretProviderUnavailable(
             provider.as_str().to_string(),
         )),
     }
 }
 
+/// Process-lifetime owner for the exact external-secret resolver allocations
+/// used by API requests.
+///
+/// The owner deliberately does not implement `Clone`. Startup shares the one
+/// admitted allocation through `Arc<ApiSecretProviderRuntime>`, while request
+/// consumers receive Arc clones of the resolver retained inside it. Resolver
+/// selection is pure after construction: environment variables are read only
+/// by [`Self::from_admitted_config`], never while handling a request.
+pub(crate) struct ApiSecretProviderRuntime {
+    secret_provider: SecretProvider,
+    auth_mode: AuthMode,
+    vault_resolver: Option<Arc<VaultKv2Resolver>>,
+    development_resolver: Option<Arc<DevelopmentSecretResolver>>,
+}
+
+impl ApiSecretProviderRuntime {
+    /// Construct the process-lifetime resolver owner from already admitted
+    /// application configuration and one snapshot of the current Vault
+    /// environment.
+    pub(crate) fn from_admitted_config(config: &RyukiConfig) -> Result<Arc<Self>, String> {
+        let invalid = |error: CredError| format!("secret-provider runtime invalid: {error}");
+
+        // Validate the non-secret development switch before reading the token.
+        // Once token material is captured, `VaultKv2Resolver::from_parts`
+        // immediately takes zeroizing ownership on every subsequent path.
+        let allow_insecure_loopback = parse_optional_bool_env(
+            VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
+            read_unicode_env(VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV).map_err(&invalid)?,
+        )
+        .map_err(&invalid)?;
+        let addr = read_unicode_env("VAULT_ADDR").map_err(&invalid)?;
+        let token = read_unicode_env("VAULT_TOKEN").map_err(&invalid)?;
+
+        Self::from_parts(config, addr, token, allow_insecure_loopback).map_err(invalid)
+    }
+
+    /// Pure construction core used by startup and tests. The supplied values
+    /// are an already captured environment snapshot; this function performs
+    /// no ambient environment access.
+    fn from_parts(
+        config: &RyukiConfig,
+        addr: Option<String>,
+        token: Option<String>,
+        allow_insecure_loopback: bool,
+    ) -> Result<Arc<Self>, CredError> {
+        let vault_resolver =
+            VaultKv2Resolver::from_parts(addr, token, allow_insecure_loopback)?.map(Arc::new);
+        if vault_resolver.is_some()
+            && !matches!(config.secret_provider, SecretProvider::HashicorpVault)
+        {
+            return Err(CredError::Vault(format!(
+                "VAULT_ADDR and VAULT_TOKEN are configured but secret_provider is '{}'",
+                config.secret_provider.as_str()
+            )));
+        }
+        let development_resolver = (vault_resolver.is_none()
+            && config.auth_mode.is_credential_free())
+        .then(|| Arc::new(DevelopmentSecretResolver));
+
+        Ok(Arc::new(Self {
+            secret_provider: config.secret_provider.clone(),
+            auth_mode: config.auth_mode.clone(),
+            vault_resolver,
+            development_resolver,
+        }))
+    }
+
+    /// Return the exact retained resolver admitted for one connection mode.
+    /// This preserves the former fail-closed precedence: a configured Vault
+    /// resolver wins in every posture only for the Vault provider; a provider
+    /// mismatch fails before mock selection; and the development resolver is
+    /// available only when both process and connection select static dry-run.
+    pub(crate) fn resolver_for(
+        &self,
+        execution_mode: &ExecutionMode,
+    ) -> Result<Arc<dyn SecretResolver>, CredError> {
+        let allow_mock = mock_secret_resolver_allowed(&self.auth_mode, execution_mode);
+        match select_secret_resolver_kind(
+            &self.secret_provider,
+            self.vault_resolver.is_some(),
+            allow_mock,
+        )? {
+            SecretResolverKind::Vault => {
+                let resolver: Arc<dyn SecretResolver> = self
+                    .vault_resolver
+                    .as_ref()
+                    .expect("Vault selection requires a retained resolver")
+                    .clone();
+                Ok(resolver)
+            }
+            SecretResolverKind::Development => {
+                let resolver: Arc<dyn SecretResolver> = self
+                    .development_resolver
+                    .as_ref()
+                    .expect("development selection requires a retained resolver")
+                    .clone();
+                Ok(resolver)
+            }
+        }
+    }
+
+    /// Verify that this runtime still represents the admitted configuration
+    /// identity. This intentionally compares only non-secret typed metadata.
+    pub(crate) fn is_bound_to_config(&self, config: &RyukiConfig) -> bool {
+        self.secret_provider == config.secret_provider && self.auth_mode == config.auth_mode
+    }
+
+    /// Whether `resolver` is one of the exact allocations retained here.
+    pub(crate) fn retains_resolver(&self, resolver: &Arc<dyn SecretResolver>) -> bool {
+        self.vault_resolver.as_ref().is_some_and(|retained| {
+            let retained: Arc<dyn SecretResolver> = retained.clone();
+            Arc::ptr_eq(&retained, resolver)
+        }) || self.development_resolver.as_ref().is_some_and(|retained| {
+            let retained: Arc<dyn SecretResolver> = retained.clone();
+            Arc::ptr_eq(&retained, resolver)
+        })
+    }
+}
+
+impl std::fmt::Debug for ApiSecretProviderRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiSecretProviderRuntime")
+            .field("secret_provider", &self.secret_provider.as_str())
+            .field("auth_mode", &self.auth_mode.as_str())
+            .field(
+                "vault_resolver",
+                &self.vault_resolver.as_ref().map(|_| "[RETAINED]"),
+            )
+            .field(
+                "development_resolver",
+                &self.development_resolver.as_ref().map(|_| "[RETAINED]"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
 fn validate_secret_manager_configuration(
     provider: &SecretProvider,
     addr: Option<String>,
@@ -727,45 +841,6 @@ fn validate_secret_manager_configuration(
         )));
     }
     Ok(())
-}
-
-/// Validate process-owned secret-provider environment before the application
-/// begins serving. No secret value is retained or included in an error.
-pub(crate) fn validate_secret_manager_startup(config: &RyukiConfig) -> Result<(), String> {
-    let invalid = |error: CredError| format!("secret-manager configuration invalid: {error}");
-    // Validate the non-secret development switch before reading VAULT_TOKEN so
-    // a typo cannot cause secret material to be loaded and then ordinarily
-    // dropped on this earlier error path.
-    let allow_insecure_loopback =
-        read_unicode_env(VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV).map_err(&invalid)?;
-    parse_optional_bool_env(
-        VaultKv2Resolver::ALLOW_INSECURE_LOOPBACK_ENV,
-        allow_insecure_loopback.clone(),
-    )
-    .map_err(&invalid)?;
-
-    let addr = read_unicode_env("VAULT_ADDR").map_err(&invalid)?;
-    let token = read_unicode_env("VAULT_TOKEN").map_err(&invalid)?;
-    validate_secret_manager_configuration(
-        &config.secret_provider,
-        addr,
-        token,
-        allow_insecure_loopback,
-    )
-    .map_err(invalid)
-}
-
-/// Select the real KV v2 client when `VAULT_ADDR` + `VAULT_TOKEN` are valid.
-/// Missing configuration selects the deterministic mock only when the supplied
-/// process and connection modes establish an explicit local dry-run posture.
-fn secret_resolver_from_env(
-    provider: &SecretProvider,
-    auth_mode: &AuthMode,
-    execution_mode: &ExecutionMode,
-) -> Result<Box<dyn SecretResolver>, CredError> {
-    let allow_mock = mock_secret_resolver_allowed(auth_mode, execution_mode);
-    select_secret_resolver(provider, VaultKv2Resolver::from_env()?, allow_mock)
-        .map(SecretResolverSelection::into_box)
 }
 
 /// Resolve credentials for a connection, dispatching by source.
@@ -2206,15 +2281,14 @@ pub async fn integration_test(
     // when both process and connection explicitly opt into static/mock dry-run.
     let pool_ref = get_db();
     let cred_result = if conn.credential_source == CredentialSource::Vault {
-        let config = crate::config_store::get_app_config();
-        match secret_resolver_from_env(
-            &config.secret_provider,
-            &config.auth_mode,
-            &conn.execution_mode,
-        ) {
-            Ok(secret_resolver) => {
+        let runtime = crate::config_store::get_api_secret_provider_runtime();
+        match runtime.resolver_for(&conn.execution_mode) {
+            Ok(secret_resolver) if runtime.retains_resolver(&secret_resolver) => {
                 resolve_credentials(&conn, Some(secret_resolver.as_ref()), pool_ref).await
             }
+            Ok(_) => Err(CredError::SecretProviderUnavailable(
+                "retained-runtime-identity".to_string(),
+            )),
             Err(error) => Err(error),
         }
     } else {
@@ -6643,47 +6717,148 @@ mod unit_tests {
 
     #[test]
     fn missing_secret_configuration_fails_closed_outside_dry_run() {
-        let error = select_secret_resolver(&SecretProvider::HashicorpVault, None, false)
+        let error = select_secret_resolver_kind(&SecretProvider::HashicorpVault, false, false)
             .expect_err("non-dry-run posture must reject missing Vault configuration");
         assert!(matches!(error, CredError::VaultNotConfigured));
 
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::HashicorpVault, None, true),
-            Ok(SecretResolverSelection::Development(_))
+            select_secret_resolver_kind(&SecretProvider::HashicorpVault, false, true),
+            Ok(SecretResolverKind::Development)
         ));
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::AwsSecretsManager, None, false),
+            select_secret_resolver_kind(&SecretProvider::AwsSecretsManager, false, false),
             Err(CredError::SecretProviderUnavailable(_))
         ));
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::AwsSecretsManager, None, true),
-            Ok(SecretResolverSelection::Development(_))
+            select_secret_resolver_kind(&SecretProvider::AwsSecretsManager, false, true),
+            Ok(SecretResolverKind::Development)
         ));
     }
 
     #[test]
     fn explicit_valid_vault_configuration_wins_in_every_posture() {
-        let configured = || {
-            VaultKv2Resolver::from_parts(
-                Some("https://vault.example:8200".to_string()),
-                Some("fixture-token".to_string()),
-                false,
-            )
-            .expect("valid Vault configuration")
-        };
-
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::HashicorpVault, configured(), false),
-            Ok(SecretResolverSelection::Vault(_))
+            select_secret_resolver_kind(&SecretProvider::HashicorpVault, true, false),
+            Ok(SecretResolverKind::Vault)
         ));
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::HashicorpVault, configured(), true),
-            Ok(SecretResolverSelection::Vault(_))
+            select_secret_resolver_kind(&SecretProvider::HashicorpVault, true, true),
+            Ok(SecretResolverKind::Vault)
         ));
         assert!(matches!(
-            select_secret_resolver(&SecretProvider::AzureKeyVault, configured(), true),
+            select_secret_resolver_kind(&SecretProvider::AzureKeyVault, true, true),
             Err(CredError::SecretProviderUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn secret_provider_runtime_retains_one_real_resolver_allocation() {
+        let config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            secret_provider: SecretProvider::HashicorpVault,
+            ..RyukiConfig::default()
+        };
+
+        let runtime = ApiSecretProviderRuntime::from_parts(
+            &config,
+            Some("https://vault.runtime.test:8200".to_string()),
+            Some("fixture-runtime-token-DO-NOT-LOG".to_string()),
+            false,
+        )
+        .expect("valid retained Vault runtime");
+
+        let live = runtime
+            .resolver_for(&ExecutionMode::Live)
+            .expect("configured Vault must serve live connections");
+        let static_dry_run = runtime
+            .resolver_for(&ExecutionMode::StaticDryRun)
+            .expect("configured Vault must win in every connection posture");
+
+        assert!(Arc::ptr_eq(&live, &static_dry_run));
+        assert!(runtime.retains_resolver(&live));
+        assert!(runtime.is_bound_to_config(&config));
+
+        let rendered = format!("{runtime:?}");
+        assert!(rendered.contains("ApiSecretProviderRuntime"));
+        assert!(rendered.contains("[RETAINED]"));
+        assert!(rendered.contains("development_resolver: None"));
+        assert!(!rendered.contains("vault.runtime.test"));
+        assert!(!rendered.contains("fixture-runtime-token"));
+        assert!(!rendered.contains("DO-NOT-LOG"));
+    }
+
+    #[test]
+    fn secret_provider_runtime_preserves_mock_and_fail_closed_selection() {
+        let dry_run_config = RyukiConfig {
+            auth_mode: AuthMode::MockDryRun,
+            secret_provider: SecretProvider::AwsSecretsManager,
+            ..RyukiConfig::default()
+        };
+        let dry_run_runtime =
+            ApiSecretProviderRuntime::from_parts(&dry_run_config, None, None, false)
+                .expect("unconfigured dry-run runtime");
+
+        let first = dry_run_runtime
+            .resolver_for(&ExecutionMode::StaticDryRun)
+            .expect("explicit local dry-run may select the development resolver");
+        let second = dry_run_runtime
+            .resolver_for(&ExecutionMode::StaticDryRun)
+            .expect("development resolver remains retained");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(dry_run_runtime.retains_resolver(&first));
+        assert!(matches!(
+            dry_run_runtime.resolver_for(&ExecutionMode::Live),
+            Err(CredError::SecretProviderUnavailable(provider))
+                if provider == SecretProvider::AwsSecretsManager.as_str()
+        ));
+
+        let production_config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            secret_provider: SecretProvider::HashicorpVault,
+            ..RyukiConfig::default()
+        };
+        let production_runtime =
+            ApiSecretProviderRuntime::from_parts(&production_config, None, None, false)
+                .expect("missing Vault remains a dependent-operation failure");
+        assert!(matches!(
+            production_runtime.resolver_for(&ExecutionMode::Live),
+            Err(CredError::VaultNotConfigured)
+        ));
+        assert!(matches!(
+            production_runtime.resolver_for(&ExecutionMode::StaticDryRun),
+            Err(CredError::VaultNotConfigured)
+        ));
+    }
+
+    #[test]
+    fn secret_provider_runtime_rejects_provider_mismatch_before_mock_fallback() {
+        let config = RyukiConfig {
+            auth_mode: AuthMode::StaticDryRun,
+            secret_provider: SecretProvider::AzureKeyVault,
+            ..RyukiConfig::default()
+        };
+        let error = ApiSecretProviderRuntime::from_parts(
+            &config,
+            Some("https://vault.runtime.test:8200".to_string()),
+            Some("fixture-runtime-token".to_string()),
+            false,
+        )
+        .expect_err("Vault configuration must not bind another provider");
+        assert!(error.to_string().contains("azure-key-vault"));
+        assert!(!error.to_string().contains("fixture-runtime-token"));
+
+        let runtime = ApiSecretProviderRuntime::from_parts(&config, None, None, false)
+            .expect("unconfigured dry-run runtime");
+
+        let foreign: Arc<dyn SecretResolver> = Arc::new(DevelopmentSecretResolver);
+        assert!(!runtime.retains_resolver(&foreign));
+
+        let mut drifted = config.clone();
+        drifted.auth_mode = AuthMode::EntraId;
+        assert!(!runtime.is_bound_to_config(&drifted));
+        drifted.auth_mode = config.auth_mode.clone();
+        drifted.secret_provider = SecretProvider::HashicorpVault;
+        assert!(!runtime.is_bound_to_config(&drifted));
     }
 
     #[test]

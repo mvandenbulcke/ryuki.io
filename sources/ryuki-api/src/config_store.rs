@@ -22,6 +22,7 @@ struct ImmutableStartupConfig {
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
 }
 
 // Existing unit tests initialize only the application configuration. Keep
@@ -33,6 +34,7 @@ struct ImmutableStartupConfig {
     security_contract: Option<crate::security_contracts::SecurityContractContext>,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Option<Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>>,
+    api_secret_provider_runtime: Option<Arc<crate::integration::ApiSecretProviderRuntime>>,
 }
 
 #[cfg(test)]
@@ -124,6 +126,7 @@ pub fn init_with_security_contract(
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
 ) {
     STARTUP_CONFIG
         .set(ImmutableStartupConfig {
@@ -131,6 +134,7 @@ pub fn init_with_security_contract(
             security_contract,
             api_cookie_runtime,
             api_authenticator_runtime,
+            api_secret_provider_runtime,
         })
         .unwrap_or_else(|_| panic!("startup config already initialized"));
     let store = ConfigStore::new(path);
@@ -146,6 +150,7 @@ pub fn init_with_security_contract(
     security_contract: crate::security_contracts::SecurityContractContext,
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
+    api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
 ) {
     TEST_STARTUP_CONFIG.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
@@ -153,6 +158,7 @@ pub fn init_with_security_contract(
             security_contract: Some(security_contract),
             api_cookie_runtime,
             api_authenticator_runtime: Some(api_authenticator_runtime),
+            api_secret_provider_runtime: Some(api_secret_provider_runtime),
         })));
     });
     TEST_STORE.with(|slot| {
@@ -173,6 +179,7 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
             security_contract: None,
             api_cookie_runtime,
             api_authenticator_runtime: None,
+            api_secret_provider_runtime: None,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -199,6 +206,26 @@ pub fn get_api_authenticator_runtime() -> Arc<crate::authenticator_runtime::ApiA
         &startup_config_if_initialized()
             .expect("startup config not initialized")
             .api_authenticator_runtime,
+    )
+}
+
+#[cfg(not(test))]
+pub fn get_api_secret_provider_runtime() -> Arc<crate::integration::ApiSecretProviderRuntime> {
+    Arc::clone(
+        &startup_config_if_initialized()
+            .expect("startup config not initialized")
+            .api_secret_provider_runtime,
+    )
+}
+
+#[cfg(test)]
+pub fn get_api_secret_provider_runtime() -> Arc<crate::integration::ApiSecretProviderRuntime> {
+    Arc::clone(
+        startup_config_if_initialized()
+            .expect("startup config not initialized")
+            .api_secret_provider_runtime
+            .as_ref()
+            .expect("secret-provider runtime not initialized"),
     )
 }
 
@@ -320,5 +347,13 @@ mod tests {
         init_with_config("test-only-config.json", &RyukiConfig::default());
 
         let _ = get_api_authenticator_runtime();
+    }
+
+    #[test]
+    #[should_panic(expected = "secret-provider runtime not initialized")]
+    fn compatibility_initializer_never_fabricates_secret_provider_runtime() {
+        init_with_config("test-only-config.json", &RyukiConfig::default());
+
+        let _ = get_api_secret_provider_runtime();
     }
 }

@@ -1,23 +1,28 @@
 use ryuki_core::config::{AuthMode, RyukiConfig};
+use std::sync::Arc;
 
 /// Load and validate the startup configuration.
 ///
 /// Configuration is a security boundary: parse and validation failures must
 /// stop startup instead of silently selecting permissive development defaults.
-pub fn load_config() -> Result<RyukiConfig, String> {
+pub fn load_config() -> Result<
+    (
+        RyukiConfig,
+        Arc<crate::integration::ApiSecretProviderRuntime>,
+    ),
+    String,
+> {
     let config =
         RyukiConfig::load().map_err(|error| format!("failed to load configuration: {error}"))?;
-    validate_loaded_config(config)
-}
-
-/// Applies every process-startup validation step to one already parsed
-/// configuration. Keeping this separate from environment/file loading makes
-/// the fail-closed startup boundary directly testable.
-fn validate_loaded_config(config: RyukiConfig) -> Result<RyukiConfig, String> {
-    validate_loaded_config_with_secret_validation(
-        config,
-        crate::integration::validate_secret_manager_startup,
-    )
+    let mut secret_provider_runtime = None;
+    let config = validate_loaded_config_with_secret_validation(config, |config| {
+        secret_provider_runtime =
+            Some(crate::integration::ApiSecretProviderRuntime::from_admitted_config(config)?);
+        Ok(())
+    })?;
+    let secret_provider_runtime = secret_provider_runtime
+        .expect("secret-provider runtime validation must initialize the retained owner");
+    Ok((config, secret_provider_runtime))
 }
 
 fn validate_loaded_config_with_secret_validation(
