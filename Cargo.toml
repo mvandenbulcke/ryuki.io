@@ -54,13 +54,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 proc-macro2 = "1"
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 figment = { version = "0.10", features = ["env", "json", "toml"] }
-governor = { version = "0.7", default-features = false, features = ["std"] }
+governor = { version = "0.10", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["limit"] }
-hmac = "0.12"
-sha2 = "0.10"
-jsonschema = { version = "=0.47.0", default-features = false }
+hmac = "0.13"
+sha2 = "0.11"
+jsonschema = { version = "=0.48.1", default-features = false }
 url = "2"
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
