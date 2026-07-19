@@ -175,6 +175,9 @@ const CONFORMANCE_BUNDLE_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/conformance-bundle.schema.json");
 const PROVIDER_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/provider-registry.schema.json");
+const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
+);
 const ACTION_SCHEMA: &str =
     include_str!("../../../catalog/security-contracts/v1/action-resource-registry.schema.json");
 const LIMIT_SCHEMA: &str =
@@ -355,7 +358,7 @@ impl StartupSecurityPins {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ContentReferenceBinding {
     document_id: String,
@@ -448,11 +451,121 @@ struct CapabilityProviderKindConfig {
     /// kind-specific provider configuration and must exactly match the
     /// capability descriptor's attested adapter identity.
     adapter_kind: String,
-    endpoint_policy_ref: ContentReferenceBinding,
-    authentication_ref: ContentReferenceBinding,
-    capability_policy_ref: ContentReferenceBinding,
-    rotation_policy_ref: ContentReferenceBinding,
-    revocation_policy_ref: ContentReferenceBinding,
+    #[serde(default)]
+    runtime_binding_ref: Option<ContentReferenceBinding>,
+    #[serde(default)]
+    endpoint_policy_ref: Option<ContentReferenceBinding>,
+    #[serde(default)]
+    authentication_ref: Option<ContentReferenceBinding>,
+    #[serde(default)]
+    capability_policy_ref: Option<ContentReferenceBinding>,
+    #[serde(default)]
+    rotation_policy_ref: Option<ContentReferenceBinding>,
+    #[serde(default)]
+    revocation_policy_ref: Option<ContentReferenceBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderBackendCompatibilityProfile {
+    profile_id: String,
+    profile_version: u64,
+    digest_contract: String,
+    binding_digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderTransportBinding {
+    endpoint_base_url_binding_digest: String,
+    ca_trust_binding_digest: String,
+    https_required: bool,
+    redirects_allowed: bool,
+    ambient_proxy_allowed: bool,
+    built_in_roots_allowed: bool,
+    connect_timeout_millis: u64,
+    request_timeout_millis: u64,
+    response_body_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderCredentialSourceBinding {
+    kind: String,
+    identity_binding_digest: String,
+    audience_binding_digest: String,
+    token_path_binding_digest: String,
+    provider_authentication_digest_contract: String,
+    provider_authentication_binding_digest: String,
+    static_bearer_allowed: bool,
+    exported_bearer_allowed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderCapabilityBinding {
+    capability_id: String,
+    semantic_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderRuntimeOwnershipBinding {
+    single_runtime_owner: bool,
+    ambient_reconfiguration_allowed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SecretProviderRuntimeBindingDocument {
+    #[serde(rename = "$schema")]
+    schema_uri: String,
+    schema_version: String,
+    contract_kind: String,
+    document_id: String,
+    document_version: u64,
+    value_free: bool,
+    provider_id: String,
+    provider_configuration_version: u64,
+    deployment_id: String,
+    trust_domain_id: String,
+    capability_descriptor_id: String,
+    capability_descriptor_version: u64,
+    adapter_kind: String,
+    adapter_version: String,
+    protocol_version: String,
+    backend_compatibility_profile: SecretProviderBackendCompatibilityProfile,
+    transport: SecretProviderTransportBinding,
+    credential_source: SecretProviderCredentialSourceBinding,
+    capability_bindings: Vec<SecretProviderCapabilityBinding>,
+    retained_consumer_ids: Vec<String>,
+    ownership: SecretProviderRuntimeOwnershipBinding,
+}
+
+/// Exact value-free secret-provider binding authenticated by the provider
+/// configuration's content reference. This projection deliberately contains
+/// neither secret material nor any runtime/inventory digest that could create
+/// a D -> P -> R -> I hash cycle.
+#[derive(Clone)]
+pub(crate) struct VerifiedSecretProviderRuntimeBinding {
+    reference: ContentReferenceBinding,
+    document: SecretProviderRuntimeBindingDocument,
+}
+
+impl fmt::Debug for VerifiedSecretProviderRuntimeBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedSecretProviderRuntimeBinding")
+            .field("document_id", &self.document.document_id)
+            .field("document_version", &self.document.document_version)
+            .field("content_digest", &self.reference.content_digest)
+            .field("provider_id", &self.document.provider_id)
+            .field(
+                "provider_configuration_version",
+                &self.document.provider_configuration_version,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -460,6 +573,10 @@ enum ActiveProviderKindConfig {
     DevelopmentFixture(Box<DevelopmentFixtureKindConfig>),
     Oidc(Box<OidcKindConfig>),
     LocalWebauthn(Box<LocalWebauthnKindConfig>),
+    SecretService {
+        configuration: Box<CapabilityProviderKindConfig>,
+        verified_runtime_binding: Option<Arc<VerifiedSecretProviderRuntimeBinding>>,
+    },
     CapabilityProvider(Box<CapabilityProviderKindConfig>),
     /// These provider kinds have no kind-specific runtime adapter selector in
     /// the v1 contract. Keeping this variant closed to that exact set prevents
@@ -2092,6 +2209,19 @@ impl ActiveProviderConfiguration {
                 | (AuthMode::Local, ActiveProviderKindConfig::LocalWebauthn(_))
         )
     }
+
+    fn verified_secret_provider_runtime_binding(
+        &self,
+    ) -> Option<&Arc<VerifiedSecretProviderRuntimeBinding>> {
+        let ActiveProviderKindConfig::SecretService {
+            verified_runtime_binding,
+            ..
+        } = &self.kind_config
+        else {
+            return None;
+        };
+        verified_runtime_binding.as_ref()
+    }
 }
 
 fn validate_development_runtime(
@@ -2252,8 +2382,14 @@ fn prepare_startup_security_contract(
             .ok_or_else(|| "provider registry reference did not resolve to JSON".to_string())?;
         let provider_registry_version =
             required_u64(provider_registry, "registry_version", "provider registry")?;
-        let active_providers =
-            validate_provider_registry(provider_registry, &profile, now, &verifier.documents)?;
+        let active_providers = validate_provider_registry(
+            provider_registry,
+            &profile,
+            now,
+            &verifier.documents,
+            &verifier.document_bytes,
+            &verifier.visited,
+        )?;
 
         for (label, reference, expected_schema) in [
             (
@@ -4742,6 +4878,14 @@ fn validate_typed_reference_document(
             "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
             PROVIDER_SCHEMA,
         ),
+        Some("secret-provider-runtime-binding") => require_contract_document(
+            reference,
+            document,
+            schema_uri,
+            "secret-provider-runtime-binding",
+            "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+            SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA,
+        ),
         Some("action-resource-registry") => require_contract_document(
             reference,
             document,
@@ -4828,6 +4972,16 @@ fn validate_typed_reference_document(
             Some(
                 "https://ryuki.io/schemas/security-contracts/v1/provider-registry.schema.json",
             ) => validate_against_schema("provider registry", PROVIDER_SCHEMA, document),
+            Some(
+                "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+            ) => require_contract_document(
+                reference,
+                document,
+                schema_uri,
+                "secret-provider-runtime-binding",
+                "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+                SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA,
+            ),
             Some(
                 "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
             ) => validate_against_schema("action/resource registry", ACTION_SCHEMA, document),
@@ -4992,6 +5146,8 @@ fn validate_provider_registry(
     profile: &DeploymentSecurityProfile,
     now: DateTime<Utc>,
     documents: &BTreeMap<String, Value>,
+    document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, ActiveProviderConfiguration>, String> {
     let configurations = registry
         .get("configurations")
@@ -5033,7 +5189,13 @@ fn validate_provider_registry(
             return Err(format!("tombstoned provider id {provider_id} is reused"));
         }
         validate_provider_payload(configuration)?;
-        let typed_configuration = parse_active_provider_configuration(configuration)?;
+        let typed_configuration = parse_active_provider_configuration(
+            configuration,
+            profile,
+            documents,
+            document_bytes,
+            reference_document_digests,
+        )?;
         typed_configs.insert((provider_id.into(), version), typed_configuration);
     }
 
@@ -5168,6 +5330,16 @@ fn validate_provider_registry(
                 return Err("active development provider is never applicable to production".into());
             }
             if profile.security_profile.is_production()
+                && configuration.kind == "secret-service"
+                && configuration
+                    .verified_secret_provider_runtime_binding()
+                    .is_none()
+            {
+                return Err(format!(
+                    "active production secret-service provider {provider_id}@{config_version} uses the legacy five-reference policy shape; a verified secret-provider runtime binding document is required"
+                ));
+            }
+            if profile.security_profile.is_production()
                 && !configuration.capability_descriptor.production_eligible
             {
                 return Err(format!(
@@ -5217,6 +5389,10 @@ fn lifecycle_effective_at(record: &Value) -> Result<DateTime<Utc>, String> {
 
 fn parse_active_provider_configuration(
     configuration: &Value,
+    profile: &DeploymentSecurityProfile,
+    documents: &BTreeMap<String, Value>,
+    document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
 ) -> Result<ActiveProviderConfiguration, String> {
     let provider_id = required_str(configuration, "provider_id", "provider configuration")?;
     let config_version = required_u64(configuration, "config_version", "provider configuration")?;
@@ -5260,13 +5436,40 @@ fn parse_active_provider_configuration(
             serde_json::from_value(raw_kind_config)
                 .map_err(|error| format!("local WebAuthn kind_config is not typed: {error}"))?,
         )),
-        "secret-service" | "key-custody" | "certificate-authority" => {
-            ActiveProviderKindConfig::CapabilityProvider(Box::new(
-                serde_json::from_value(raw_kind_config).map_err(|error| {
-                    format!("capability provider kind_config is not typed: {error}")
-                })?,
-            ))
+        "secret-service" => {
+            let configuration =
+                serde_json::from_value::<CapabilityProviderKindConfig>(raw_kind_config)
+                    .map_err(|error| format!("secret-service kind_config is not typed: {error}"))?;
+            let verified_runtime_binding = configuration
+                .runtime_binding_ref
+                .as_ref()
+                .map(|reference| {
+                    verify_secret_provider_runtime_binding(
+                        reference,
+                        SecretProviderBindingVerificationContext {
+                            provider_id,
+                            provider_configuration_version: config_version,
+                            trust_domain_id,
+                            capability_descriptor: &capability_descriptor,
+                            deployment_profile: profile,
+                        },
+                        documents,
+                        document_bytes,
+                        reference_document_digests,
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?;
+            ActiveProviderKindConfig::SecretService {
+                configuration: Box::new(configuration),
+                verified_runtime_binding,
+            }
         }
+        "key-custody" | "certificate-authority" => ActiveProviderKindConfig::CapabilityProvider(
+            Box::new(serde_json::from_value(raw_kind_config).map_err(|error| {
+                format!("capability provider kind_config is not typed: {error}")
+            })?),
+        ),
         "oauth-service" | "api-token" | "workload" => {
             ActiveProviderKindConfig::NonAdapterProvider {
                 configuration_kind: raw_kind_config
@@ -5297,6 +5500,257 @@ fn parse_active_provider_configuration(
         credential_refs,
         kind_config,
     })
+}
+
+struct SecretProviderBindingVerificationContext<'a> {
+    provider_id: &'a str,
+    provider_configuration_version: u64,
+    trust_domain_id: &'a str,
+    capability_descriptor: &'a ProviderCapabilityDescriptorBinding,
+    deployment_profile: &'a DeploymentSecurityProfile,
+}
+
+fn verify_secret_provider_runtime_binding(
+    reference: &ContentReferenceBinding,
+    context: SecretProviderBindingVerificationContext<'_>,
+    documents: &BTreeMap<String, Value>,
+    document_bytes: &BTreeMap<String, Vec<u8>>,
+    reference_document_digests: &BTreeMap<String, String>,
+) -> Result<VerifiedSecretProviderRuntimeBinding, String> {
+    reference.validate()?;
+    let locator = &reference.artifact_locator;
+    let traversed_digest = reference_document_digests.get(locator).ok_or_else(|| {
+        format!("secret-provider runtime binding {locator} has no verified traversal digest")
+    })?;
+    let raw_bytes = document_bytes.get(locator).ok_or_else(|| {
+        format!("secret-provider runtime binding {locator} has no exact traversed bytes")
+    })?;
+    let traversed_document = documents.get(locator).ok_or_else(|| {
+        format!("secret-provider runtime binding {locator} did not resolve to typed JSON")
+    })?;
+    let exact_document = parse_json_strict(raw_bytes).map_err(|error| {
+        format!("secret-provider runtime binding {locator} JSON is invalid: {error}")
+    })?;
+    let exact_digest = raw_digest(raw_bytes);
+    if traversed_digest != &reference.content_digest
+        || exact_digest != reference.content_digest
+        || &exact_document != traversed_document
+    {
+        return Err(format!(
+            "secret-provider runtime binding {locator} differs across its reference, exact bytes, and verified traversal"
+        ));
+    }
+    validate_against_schema(
+        "secret-provider runtime binding",
+        SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA,
+        &exact_document,
+    )?;
+    let document = serde_json::from_value::<SecretProviderRuntimeBindingDocument>(exact_document)
+        .map_err(|error| {
+        format!("secret-provider runtime binding {locator} is not losslessly typed: {error}")
+    })?;
+    document.validate()?;
+
+    let descriptor = context.capability_descriptor;
+    if document.document_id != reference.document_id
+        || document.document_version != reference.document_version
+        || document.provider_id != context.provider_id
+        || document.provider_configuration_version != context.provider_configuration_version
+        || document.deployment_id != context.deployment_profile.deployment_id
+        || document.trust_domain_id != context.trust_domain_id
+        || document.capability_descriptor_id != descriptor.descriptor_id
+        || document.capability_descriptor_version != descriptor.descriptor_version
+        || document.adapter_kind != descriptor.adapter_kind
+        || document.adapter_version != descriptor.adapter_version
+    {
+        return Err(format!(
+            "secret-provider runtime binding {locator} does not exactly match its provider, deployment, trust-domain, descriptor, and adapter authority"
+        ));
+    }
+    let capability_ids = document
+        .capability_bindings
+        .iter()
+        .map(|binding| binding.capability_id.as_str())
+        .collect::<Vec<_>>();
+    if capability_ids
+        != descriptor
+            .advertised_capabilities
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return Err(format!(
+            "secret-provider runtime binding {locator} capability inventory does not exactly match its provider descriptor"
+        ));
+    }
+
+    Ok(VerifiedSecretProviderRuntimeBinding {
+        reference: reference.clone(),
+        document,
+    })
+}
+
+impl SecretProviderRuntimeBindingDocument {
+    fn validate(&self) -> Result<(), String> {
+        const SCHEMA_URI: &str = "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json";
+        if self.schema_uri != SCHEMA_URI
+            || self.schema_version != "1.0.0"
+            || self.contract_kind != "secret-provider-runtime-binding"
+            || !self.value_free
+            || self.document_version == 0
+            || self.provider_configuration_version == 0
+            || self.capability_descriptor_version == 0
+        {
+            return Err(
+                "secret-provider runtime binding has an invalid identity, version, contract kind, or value-free marker"
+                    .into(),
+            );
+        }
+        validate_namespaced_id(
+            "secret-provider runtime binding document id",
+            &self.document_id,
+            "secret-provider-runtime-binding:",
+        )?;
+        validate_namespaced_id(
+            "secret-provider runtime binding provider id",
+            &self.provider_id,
+            "provider:",
+        )?;
+        for (label, value) in [
+            ("deployment id", self.deployment_id.as_str()),
+            ("trust domain id", self.trust_domain_id.as_str()),
+            (
+                "capability descriptor id",
+                self.capability_descriptor_id.as_str(),
+            ),
+            ("adapter kind", self.adapter_kind.as_str()),
+            ("adapter version", self.adapter_version.as_str()),
+            ("protocol version", self.protocol_version.as_str()),
+            (
+                "backend compatibility profile id",
+                self.backend_compatibility_profile.profile_id.as_str(),
+            ),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(format!(
+                    "secret-provider runtime binding {label} must be nonempty and canonical"
+                ));
+            }
+        }
+        if self.backend_compatibility_profile.profile_version == 0
+            || self.backend_compatibility_profile.digest_contract
+                != "ryuki-secret-provider-backend-compatibility-profile-v1"
+            || self
+                .credential_source
+                .provider_authentication_digest_contract
+                != "ryuki-secret-provider-authentication-binding-v1"
+        {
+            return Err(
+                "secret-provider runtime binding backend/authentication digest contract or compatibility profile version is invalid"
+                    .into(),
+            );
+        }
+        for (label, digest) in [
+            (
+                "backend compatibility profile digest",
+                self.backend_compatibility_profile.binding_digest.as_str(),
+            ),
+            (
+                "endpoint base URL binding digest",
+                self.transport.endpoint_base_url_binding_digest.as_str(),
+            ),
+            (
+                "CA trust binding digest",
+                self.transport.ca_trust_binding_digest.as_str(),
+            ),
+            (
+                "workload identity binding digest",
+                self.credential_source.identity_binding_digest.as_str(),
+            ),
+            (
+                "workload audience binding digest",
+                self.credential_source.audience_binding_digest.as_str(),
+            ),
+            (
+                "workload token path binding digest",
+                self.credential_source.token_path_binding_digest.as_str(),
+            ),
+            (
+                "provider authentication binding digest",
+                self.credential_source
+                    .provider_authentication_binding_digest
+                    .as_str(),
+            ),
+        ] {
+            validate_digest_pin(label, digest)?;
+        }
+        if !self.transport.https_required
+            || self.transport.redirects_allowed
+            || self.transport.ambient_proxy_allowed
+            || self.transport.built_in_roots_allowed
+            || !(1..=3_000).contains(&self.transport.connect_timeout_millis)
+            || !(1..=10_000).contains(&self.transport.request_timeout_millis)
+            || !(1..=1_048_576).contains(&self.transport.response_body_max_bytes)
+        {
+            return Err(
+                "secret-provider runtime binding transport violates the production hard bounds"
+                    .into(),
+            );
+        }
+        if self.credential_source.kind != "kubernetes-service-account-jwt"
+            || self.credential_source.static_bearer_allowed
+            || self.credential_source.exported_bearer_allowed
+        {
+            return Err(
+                "secret-provider runtime binding requires non-exported Kubernetes workload authentication"
+                    .into(),
+            );
+        }
+        if self.capability_bindings.is_empty()
+            || !self
+                .capability_bindings
+                .windows(2)
+                .all(|pair| pair[0].capability_id < pair[1].capability_id)
+        {
+            return Err(
+                "secret-provider runtime binding capabilities must be nonempty, strictly sorted, and unique"
+                    .into(),
+            );
+        }
+        for capability in &self.capability_bindings {
+            if capability.capability_id.is_empty()
+                || capability.semantic_version.is_empty()
+                || capability.capability_id.trim() != capability.capability_id
+                || capability.semantic_version.trim() != capability.semantic_version
+            {
+                return Err(
+                    "secret-provider runtime binding capability identity/version is invalid".into(),
+                );
+            }
+        }
+        if self.retained_consumer_ids.is_empty()
+            || !self
+                .retained_consumer_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || self
+                .retained_consumer_ids
+                .iter()
+                .any(|consumer| consumer.is_empty() || consumer.trim() != consumer)
+        {
+            return Err(
+                "secret-provider runtime binding retained consumers must be nonempty, strictly sorted, and unique"
+                    .into(),
+            );
+        }
+        if !self.ownership.single_runtime_owner || self.ownership.ambient_reconfiguration_allowed {
+            return Err(
+                "secret-provider runtime binding requires one retained owner and forbids ambient reconfiguration"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn build_provider_registry_applicability_claim(
@@ -5504,13 +5958,21 @@ impl ActiveProviderKindConfig {
             {
                 local.security_binding_summary().map(|_| ())
             }
-            Self::CapabilityProvider(capability)
-                if matches!(
-                    provider_kind,
-                    "secret-service" | "key-custody" | "certificate-authority"
-                ) && capability.configuration_kind == provider_kind =>
+            Self::SecretService { configuration, .. }
+                if provider_kind == "secret-service"
+                    && configuration.configuration_kind == provider_kind =>
             {
-                capability.security_binding_summary().map(|_| ())
+                configuration
+                    .security_binding_summary(provider_kind)
+                    .map(|_| ())
+            }
+            Self::CapabilityProvider(capability)
+                if matches!(provider_kind, "key-custody" | "certificate-authority")
+                    && capability.configuration_kind == provider_kind =>
+            {
+                capability
+                    .security_binding_summary(provider_kind)
+                    .map(|_| ())
             }
             Self::NonAdapterProvider {
                 configuration_kind,
@@ -5532,8 +5994,11 @@ impl ActiveProviderKindConfig {
         provider_kind: &str,
         descriptor_adapter_kind: &str,
     ) -> Result<(), String> {
-        let Self::CapabilityProvider(capability) = self else {
-            return Ok(());
+        let capability = match self {
+            Self::SecretService { configuration, .. } | Self::CapabilityProvider(configuration) => {
+                configuration
+            }
+            _ => return Ok(()),
         };
         if capability.adapter_kind != descriptor_adapter_kind {
             return Err(format!(
@@ -5546,22 +6011,57 @@ impl ActiveProviderKindConfig {
 }
 
 impl CapabilityProviderKindConfig {
-    fn security_binding_summary(&self) -> Result<usize, String> {
+    fn security_binding_summary(&self, provider_kind: &str) -> Result<usize, String> {
         if self.adapter_kind.is_empty() {
             return Err(
                 "capability provider kind_config omits its runtime adapter selector".into(),
             );
         }
-        for reference in [
-            &self.endpoint_policy_ref,
-            &self.authentication_ref,
-            &self.capability_policy_ref,
-            &self.rotation_policy_ref,
-            &self.revocation_policy_ref,
-        ] {
-            reference.validate()?;
+        let legacy_references = [
+            self.endpoint_policy_ref.as_ref(),
+            self.authentication_ref.as_ref(),
+            self.capability_policy_ref.as_ref(),
+            self.rotation_policy_ref.as_ref(),
+            self.revocation_policy_ref.as_ref(),
+        ];
+        let legacy_count = legacy_references
+            .iter()
+            .filter(|reference| reference.is_some())
+            .count();
+        match (
+            provider_kind,
+            self.runtime_binding_ref.as_ref(),
+            legacy_count,
+        ) {
+            ("secret-service", Some(reference), 0) => {
+                reference.validate()?;
+                Ok(1)
+            }
+            ("secret-service", None, 5)
+            | ("key-custody" | "certificate-authority", None, 5) => {
+                for reference in legacy_references.into_iter().flatten() {
+                    reference.validate()?;
+                }
+                Ok(5)
+            }
+            ("secret-service", Some(_), _) => Err(
+                "secret-service kind_config cannot mix runtime_binding_ref with legacy policy references"
+                    .into(),
+            ),
+            ("secret-service", None, _) => Err(
+                "secret-service kind_config requires either runtime_binding_ref or all five legacy policy references"
+                    .into(),
+            ),
+            ("key-custody" | "certificate-authority", Some(_), _) => Err(format!(
+                "{provider_kind} kind_config cannot use a secret-provider runtime binding"
+            )),
+            ("key-custody" | "certificate-authority", None, _) => Err(format!(
+                "{provider_kind} kind_config requires all five policy references"
+            )),
+            _ => Err(format!(
+                "unsupported capability provider configuration kind {provider_kind}"
+            )),
         }
-        Ok(5)
     }
 }
 
@@ -5952,6 +6452,8 @@ mod tests {
         "catalog/security-contracts/v1/conformance-trust-root-registry.runtime-test.json";
     const CONTROL_TRACE_PATH: &str =
         "catalog/security-contracts/v1/control-trace.runtime-test.json";
+    const SECRET_PROVIDER_RUNTIME_BINDING_PATH: &str =
+        "catalog/security-contracts/v1/secret-provider-runtime-binding.runtime-test.json";
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()
@@ -7393,6 +7895,30 @@ mod tests {
             load_startup_security_contract(&self.pins, fixed_now())
         }
 
+        fn install_secret_provider_runtime_binding(&mut self) {
+            let document = genuine_secret_provider_runtime_binding_document();
+            let document_digest =
+                write_json(&self.root, SECRET_PROVIDER_RUNTIME_BINDING_PATH, &document);
+            let root = self.root.clone();
+            self.rewrite_provider(|provider| {
+                provider["applicability"]["provider_kinds"] = json!(["secret-service"]);
+                let configuration = &mut provider["configurations"][0];
+                configuration["kind"] = json!("secret-service");
+                configuration["kind_config"] = json!({
+                    "configuration_kind": "secret-service",
+                    "adapter_kind": "fixture.repository-static-dry-run",
+                    "runtime_binding_ref": {
+                        "document_id": "secret-provider-runtime-binding:runtime-test",
+                        "document_version": 1,
+                        "content_digest": document_digest,
+                        "artifact_locator": SECRET_PROVIDER_RUNTIME_BINDING_PATH
+                    }
+                });
+                refresh_reference_digests(provider, &root);
+                refresh_provider_payload_digests(provider);
+            });
+        }
+
         fn rewrite_profile(&mut self, mutate: impl FnOnce(&mut Value)) {
             let path = self.root.join(PROFILE_PATH);
             let mut profile: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -7517,6 +8043,157 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(value).unwrap();
         fs::write(path, &bytes).unwrap();
         raw_digest(&bytes)
+    }
+
+    fn genuine_secret_provider_runtime_binding_document() -> Value {
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "secret-provider-runtime-binding",
+            "document_id": "secret-provider-runtime-binding:runtime-test",
+            "document_version": 1,
+            "value_free": true,
+            "provider_id": "provider:repository-static-dry-run",
+            "provider_configuration_version": 1,
+            "deployment_id": DEPLOYMENT_ID,
+            "trust_domain_id": "trust-domain:repository-fixture",
+            "capability_descriptor_id": "capability-descriptor:repository-static-dry-run-v1",
+            "capability_descriptor_version": 1,
+            "adapter_kind": "fixture.repository-static-dry-run",
+            "adapter_version": "1.0.0",
+            "protocol_version": "1.0.0",
+            "backend_compatibility_profile": {
+                "profile_id": "backend-profile:vault-kv-v2",
+                "profile_version": 1,
+                "digest_contract": "ryuki-secret-provider-backend-compatibility-profile-v1",
+                "binding_digest": raw_digest(b"runtime-test backend compatibility")
+            },
+            "transport": {
+                "endpoint_base_url_binding_digest": raw_digest(b"runtime-test endpoint"),
+                "ca_trust_binding_digest": raw_digest(b"runtime-test CA trust"),
+                "https_required": true,
+                "redirects_allowed": false,
+                "ambient_proxy_allowed": false,
+                "built_in_roots_allowed": false,
+                "connect_timeout_millis": 3000,
+                "request_timeout_millis": 10000,
+                "response_body_max_bytes": 1048576
+            },
+            "credential_source": {
+                "kind": "kubernetes-service-account-jwt",
+                "identity_binding_digest": raw_digest(b"runtime-test workload identity"),
+                "audience_binding_digest": raw_digest(b"runtime-test workload audience"),
+                "token_path_binding_digest": raw_digest(b"runtime-test projected token path"),
+                "provider_authentication_digest_contract": "ryuki-secret-provider-authentication-binding-v1",
+                "provider_authentication_binding_digest": raw_digest(b"runtime-test provider authentication"),
+                "static_bearer_allowed": false,
+                "exported_bearer_allowed": false
+            },
+            "capability_bindings": [
+                {
+                    "capability_id": "dry-run-only",
+                    "semantic_version": "1.0.0"
+                },
+                {
+                    "capability_id": "static-human-fixture",
+                    "semantic_version": "1.0.0"
+                }
+            ],
+            "retained_consumer_ids": [
+                "consumer:integration-tests",
+                "consumer:secret-resolution"
+            ],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        })
+    }
+
+    struct SecretProviderBindingCase {
+        profile: DeploymentSecurityProfile,
+        capability_descriptor: ProviderCapabilityDescriptorBinding,
+        reference: ContentReferenceBinding,
+        documents: BTreeMap<String, Value>,
+        document_bytes: BTreeMap<String, Vec<u8>>,
+        reference_document_digests: BTreeMap<String, String>,
+    }
+
+    impl SecretProviderBindingCase {
+        fn build() -> Self {
+            let fixture = ActiveFixture::build();
+            let profile = serde_json::from_slice(
+                &fs::read(fixture.root.join(PROFILE_PATH)).expect("profile bytes"),
+            )
+            .expect("typed deployment profile");
+            let registry: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join("catalog/security-contracts/v1/provider-registry.runtime-test.json"),
+                )
+                .expect("provider registry bytes"),
+            )
+            .expect("provider registry JSON");
+            let capability_descriptor = serde_json::from_value(
+                registry["configurations"][0]["capability_descriptor"].clone(),
+            )
+            .expect("typed provider capability descriptor");
+            let mut case = Self {
+                profile,
+                capability_descriptor,
+                reference: ContentReferenceBinding {
+                    document_id: "secret-provider-runtime-binding:runtime-test".into(),
+                    document_version: 1,
+                    content_digest: raw_digest(b"temporary runtime binding digest"),
+                    artifact_locator: SECRET_PROVIDER_RUNTIME_BINDING_PATH.into(),
+                },
+                documents: BTreeMap::new(),
+                document_bytes: BTreeMap::new(),
+                reference_document_digests: BTreeMap::new(),
+            };
+            case.repin_document(genuine_secret_provider_runtime_binding_document());
+            case
+        }
+
+        fn repin_document(&mut self, document: Value) {
+            let bytes = serde_json::to_vec_pretty(&document).expect("runtime binding bytes");
+            let digest = raw_digest(&bytes);
+            self.reference.document_id = document["document_id"]
+                .as_str()
+                .expect("runtime binding document id")
+                .into();
+            self.reference.document_version = document["document_version"]
+                .as_u64()
+                .expect("runtime binding document version");
+            self.reference.content_digest = digest.clone();
+            self.documents
+                .insert(SECRET_PROVIDER_RUNTIME_BINDING_PATH.into(), document);
+            self.document_bytes
+                .insert(SECRET_PROVIDER_RUNTIME_BINDING_PATH.into(), bytes);
+            self.reference_document_digests
+                .insert(SECRET_PROVIDER_RUNTIME_BINDING_PATH.into(), digest);
+        }
+
+        fn document(&self) -> Value {
+            self.documents[SECRET_PROVIDER_RUNTIME_BINDING_PATH].clone()
+        }
+
+        fn verify(&self) -> Result<VerifiedSecretProviderRuntimeBinding, String> {
+            verify_secret_provider_runtime_binding(
+                &self.reference,
+                SecretProviderBindingVerificationContext {
+                    provider_id: "provider:repository-static-dry-run",
+                    provider_configuration_version: 1,
+                    trust_domain_id: "trust-domain:repository-fixture",
+                    capability_descriptor: &self.capability_descriptor,
+                    deployment_profile: &self.profile,
+                },
+                &self.documents,
+                &self.document_bytes,
+                &self.reference_document_digests,
+            )
+        }
     }
 
     fn refresh_reference_digests(value: &mut Value, root: &Path) {
@@ -9352,6 +10029,339 @@ mod tests {
     }
 
     #[test]
+    fn finalized_startup_retains_the_exact_verified_secret_provider_binding_arc() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_secret_provider_runtime_binding();
+
+        let prepared = prepare_startup_security_contract(&fixture.pins, fixed_now())
+            .expect("the runtime binding must survive full reference traversal");
+        let prepared_binding = Arc::clone(
+            prepared.active_providers["provider:repository-static-dry-run"]
+                .verified_secret_provider_runtime_binding()
+                .expect("pre-finalization provider must retain the verified binding"),
+        );
+        let context = finalize_startup_security_contract(prepared, None, None, fixed_now)
+            .expect("non-production finalization must preserve the verified projection");
+        let retained_binding = context.active_providers["provider:repository-static-dry-run"]
+            .verified_secret_provider_runtime_binding()
+            .expect("final context must retain the verified binding");
+
+        assert!(Arc::ptr_eq(&prepared_binding, retained_binding));
+        assert_eq!(
+            retained_binding.reference.artifact_locator,
+            SECRET_PROVIDER_RUNTIME_BINDING_PATH
+        );
+        assert_eq!(
+            retained_binding.document.document_id,
+            "secret-provider-runtime-binding:runtime-test"
+        );
+        assert_eq!(
+            retained_binding.document.provider_id,
+            "provider:repository-static-dry-run"
+        );
+        assert_eq!(
+            retained_binding.document.capability_bindings.len(),
+            context.active_providers["provider:repository-static-dry-run"]
+                .capability_descriptor
+                .advertised_capabilities
+                .len()
+        );
+    }
+
+    #[test]
+    fn secret_provider_binding_requires_exact_reference_traversal_and_raw_bytes() {
+        let valid = SecretProviderBindingCase::build();
+        valid
+            .verify()
+            .expect("the exact three-way binding must verify");
+
+        let mut raw_substitution = SecretProviderBindingCase::build();
+        raw_substitution
+            .document_bytes
+            .get_mut(SECRET_PROVIDER_RUNTIME_BINDING_PATH)
+            .unwrap()
+            .push(b' ');
+        assert!(raw_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut traversal_substitution = SecretProviderBindingCase::build();
+        traversal_substitution.reference_document_digests.insert(
+            SECRET_PROVIDER_RUNTIME_BINDING_PATH.into(),
+            raw_digest(b"substituted traversal digest"),
+        );
+        assert!(traversal_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut reference_substitution = SecretProviderBindingCase::build();
+        reference_substitution.reference.content_digest =
+            raw_digest(b"substituted reference digest");
+        assert!(reference_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+
+        let mut parsed_substitution = SecretProviderBindingCase::build();
+        parsed_substitution
+            .documents
+            .get_mut(SECRET_PROVIDER_RUNTIME_BINDING_PATH)
+            .unwrap()["protocol_version"] = json!("2.0.0");
+        assert!(parsed_substitution
+            .verify()
+            .unwrap_err()
+            .contains("differs across its reference, exact bytes, and verified traversal"));
+    }
+
+    #[test]
+    fn secret_provider_binding_rejects_authority_and_capability_substitution() {
+        for (pointer, substituted) in [
+            ("/provider_id", json!("provider:substituted-runtime")),
+            ("/provider_configuration_version", json!(2)),
+            ("/deployment_id", json!("deployment:substituted-runtime")),
+            (
+                "/trust_domain_id",
+                json!("trust-domain:substituted-runtime"),
+            ),
+            (
+                "/capability_descriptor_id",
+                json!("capability-descriptor:substituted-runtime-v1"),
+            ),
+            ("/capability_descriptor_version", json!(2)),
+            ("/adapter_kind", json!("fixture.substituted-runtime")),
+            ("/adapter_version", json!("2.0.0")),
+        ] {
+            let mut case = SecretProviderBindingCase::build();
+            let mut document = case.document();
+            *document.pointer_mut(pointer).unwrap() = substituted;
+            case.repin_document(document);
+            let error = case
+                .verify()
+                .expect_err("authority substitution must fail closed");
+            assert!(
+                error.contains("does not exactly match its provider, deployment, trust-domain, descriptor, and adapter authority"),
+                "{pointer}: {error}"
+            );
+        }
+
+        let mut capability_substitution = SecretProviderBindingCase::build();
+        let mut document = capability_substitution.document();
+        document["capability_bindings"][1]["capability_id"] = json!("substituted-capability");
+        capability_substitution.repin_document(document);
+        assert!(capability_substitution
+            .verify()
+            .unwrap_err()
+            .contains("capability inventory does not exactly match"));
+    }
+
+    #[test]
+    fn secret_provider_binding_rejects_unsafe_runtime_semantics_and_ordering() {
+        for (pointer, unsafe_value) in [
+            ("/transport/https_required", json!(false)),
+            ("/transport/redirects_allowed", json!(true)),
+            ("/transport/ambient_proxy_allowed", json!(true)),
+            ("/transport/built_in_roots_allowed", json!(true)),
+            ("/transport/connect_timeout_millis", json!(3001)),
+            ("/transport/request_timeout_millis", json!(10001)),
+            ("/transport/response_body_max_bytes", json!(1048577)),
+            ("/credential_source/kind", json!("exported-static-bearer")),
+            ("/credential_source/static_bearer_allowed", json!(true)),
+            ("/credential_source/exported_bearer_allowed", json!(true)),
+            ("/ownership/single_runtime_owner", json!(false)),
+            ("/ownership/ambient_reconfiguration_allowed", json!(true)),
+        ] {
+            let mut case = SecretProviderBindingCase::build();
+            let mut document = case.document();
+            *document.pointer_mut(pointer).unwrap() = unsafe_value;
+            case.repin_document(document);
+            assert!(
+                case.verify().is_err(),
+                "unsafe binding {pointer} was accepted"
+            );
+        }
+
+        for array_pointer in ["/capability_bindings", "/retained_consumer_ids"] {
+            let mut case = SecretProviderBindingCase::build();
+            let mut document = case.document();
+            document
+                .pointer_mut(array_pointer)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+            case.repin_document(document);
+            assert!(
+                case.verify().is_err(),
+                "noncanonical ordering at {array_pointer} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_service_policy_shape_is_new_only_or_complete_legacy_never_mixed() {
+        let reference = SecretProviderBindingCase::build().reference;
+        let new_only = CapabilityProviderKindConfig {
+            configuration_kind: "secret-service".into(),
+            adapter_kind: "fixture.repository-static-dry-run".into(),
+            runtime_binding_ref: Some(reference.clone()),
+            endpoint_policy_ref: None,
+            authentication_ref: None,
+            capability_policy_ref: None,
+            rotation_policy_ref: None,
+            revocation_policy_ref: None,
+        };
+        assert_eq!(new_only.security_binding_summary("secret-service"), Ok(1));
+
+        let mut mixed = new_only.clone();
+        mixed.endpoint_policy_ref = Some(reference.clone());
+        assert!(mixed
+            .security_binding_summary("secret-service")
+            .unwrap_err()
+            .contains("cannot mix"));
+
+        let partial_legacy = CapabilityProviderKindConfig {
+            configuration_kind: "secret-service".into(),
+            adapter_kind: "fixture.repository-static-dry-run".into(),
+            runtime_binding_ref: None,
+            endpoint_policy_ref: Some(reference.clone()),
+            authentication_ref: Some(reference.clone()),
+            capability_policy_ref: Some(reference.clone()),
+            rotation_policy_ref: Some(reference.clone()),
+            revocation_policy_ref: None,
+        };
+        assert!(partial_legacy
+            .security_binding_summary("secret-service")
+            .unwrap_err()
+            .contains("either runtime_binding_ref or all five"));
+
+        let complete_legacy = CapabilityProviderKindConfig {
+            revocation_policy_ref: Some(reference.clone()),
+            ..partial_legacy
+        };
+        assert_eq!(
+            complete_legacy.security_binding_summary("secret-service"),
+            Ok(5)
+        );
+        for provider_kind in ["key-custody", "certificate-authority"] {
+            assert!(new_only
+                .security_binding_summary(provider_kind)
+                .unwrap_err()
+                .contains("cannot use a secret-provider runtime binding"));
+            assert_eq!(
+                complete_legacy.security_binding_summary(provider_kind),
+                Ok(5)
+            );
+        }
+    }
+
+    #[test]
+    fn production_activation_refuses_legacy_secret_service_without_downgrade_fallback() {
+        let fixture = ActiveFixture::build();
+        let prepared = prepare_startup_security_contract(&fixture.pins, fixed_now()).unwrap();
+        let provider_locator = prepared
+            .profile
+            .provider_registry_ref
+            .artifact_locator
+            .clone();
+        let mut registry = prepared.documents[&provider_locator].clone();
+        let reference = registry["configurations"][0]["capability_descriptor"]
+            ["mandatory_baseline_ref"]
+            .clone();
+        registry["applicability"]["provider_kinds"] = json!(["secret-service"]);
+        let configuration = &mut registry["configurations"][0];
+        configuration["kind"] = json!("secret-service");
+        configuration["allowed_security_profiles"] = json!(["production"]);
+        configuration["capability_descriptor"]["production_eligible"] = json!(true);
+        configuration["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": configuration["capability_descriptor"]["adapter_kind"].clone(),
+            "endpoint_policy_ref": reference.clone(),
+            "authentication_ref": reference.clone(),
+            "capability_policy_ref": reference.clone(),
+            "rotation_policy_ref": reference.clone(),
+            "revocation_policy_ref": reference
+        });
+        refresh_provider_payload_digests(&mut registry);
+        let mut profile = prepared.profile.clone();
+        profile.security_profile = SecurityProfile::Production;
+
+        let error = validate_provider_registry(
+            &registry,
+            &profile,
+            fixed_now(),
+            &prepared.documents,
+            &prepared.raw_document_bytes,
+            &prepared.reference_document_digests,
+        )
+        .expect_err("production must not activate the legacy secret-service projection");
+        assert!(
+            error.contains("legacy five-reference policy shape"),
+            "{error}"
+        );
+
+        let mut bound_fixture = ActiveFixture::build();
+        bound_fixture.install_secret_provider_runtime_binding();
+        let prepared = prepare_startup_security_contract(&bound_fixture.pins, fixed_now()).unwrap();
+        let provider_locator = prepared
+            .profile
+            .provider_registry_ref
+            .artifact_locator
+            .clone();
+        let mut registry = prepared.documents[&provider_locator].clone();
+        registry["configurations"][0]["allowed_security_profiles"] = json!(["production"]);
+        registry["configurations"][0]["capability_descriptor"]["production_eligible"] = json!(true);
+        refresh_provider_payload_digests(&mut registry);
+        let mut profile = prepared.profile.clone();
+        profile.security_profile = SecurityProfile::Production;
+        validate_provider_registry(
+            &registry,
+            &profile,
+            fixed_now(),
+            &prepared.documents,
+            &prepared.raw_document_bytes,
+            &prepared.reference_document_digests,
+        )
+        .expect("the exact new binding shape must not be downgraded to legacy diagnostics");
+    }
+
+    #[test]
+    fn secret_provider_binding_rejects_schema_kind_identity_and_version_mismatch() {
+        for (pointer, substituted) in [
+            (
+                "/$schema",
+                json!("https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json"),
+            ),
+            ("/contract_kind", json!("action-resource-registry")),
+        ] {
+            let mut case = SecretProviderBindingCase::build();
+            let mut document = case.document();
+            *document.pointer_mut(pointer).unwrap() = substituted;
+            case.repin_document(document);
+            assert!(
+                case.verify().is_err(),
+                "schema/contract substitution at {pointer} was accepted"
+            );
+        }
+
+        let mut identity_mismatch = SecretProviderBindingCase::build();
+        identity_mismatch.reference.document_id =
+            "secret-provider-runtime-binding:substituted-runtime".into();
+        assert!(identity_mismatch
+            .verify()
+            .unwrap_err()
+            .contains("does not exactly match"));
+
+        let mut version_mismatch = SecretProviderBindingCase::build();
+        version_mismatch.reference.document_version = 2;
+        assert!(version_mismatch
+            .verify()
+            .unwrap_err()
+            .contains("does not exactly match"));
+    }
+
+    #[test]
     fn capability_provider_runtime_adapter_must_match_attested_descriptor() {
         let fixture = ActiveFixture::build();
         let registry: Value = serde_json::from_slice(
@@ -9375,14 +10385,31 @@ mod tests {
             "rotation_policy_ref": reference,
             "revocation_policy_ref": reference
         });
+        let profile: DeploymentSecurityProfile =
+            serde_json::from_slice(&fs::read(fixture.root.join(PROFILE_PATH)).unwrap()).unwrap();
+        let documents = BTreeMap::new();
+        let document_bytes = BTreeMap::new();
+        let reference_document_digests = BTreeMap::new();
 
-        let error = parse_active_provider_configuration(&configuration)
-            .expect_err("a runtime adapter selector cannot diverge from its attestation");
+        let error = parse_active_provider_configuration(
+            &configuration,
+            &profile,
+            &documents,
+            &document_bytes,
+            &reference_document_digests,
+        )
+        .expect_err("a runtime adapter selector cannot diverge from its attestation");
         assert!(error.contains("runtime adapter selector"), "{error}");
 
         configuration["capability_descriptor"]["adapter_kind"] = json!("runtime.secret-service");
-        parse_active_provider_configuration(&configuration)
-            .expect("an exact runtime/descriptor adapter binding must parse");
+        parse_active_provider_configuration(
+            &configuration,
+            &profile,
+            &documents,
+            &document_bytes,
+            &reference_document_digests,
+        )
+        .expect("an exact runtime/descriptor adapter binding must parse");
     }
 
     #[test]

@@ -48,8 +48,11 @@ const MAX_APPLICABILITY_EXPRESSION_DEPTH: usize = 32;
 const MAX_APPLICABILITY_EXPRESSION_NODES: usize = 4096;
 const MAX_APPLICABILITY_EXPRESSION_OPERANDS: usize = 64;
 const MAX_RECEIPT_DIGESTS: usize = 4096;
+const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
+    "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
+);
 
-const SCHEMAS: [(&str, &str); 12] = [
+const SCHEMAS: [(&str, &str); 13] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -97,6 +100,10 @@ const SCHEMAS: [(&str, &str); 12] = [
     (
         "security-limit-profile.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/security-limit-profile.schema.json",
+    ),
+    (
+        "secret-provider-runtime-binding.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
     ),
 ];
 
@@ -3472,6 +3479,7 @@ fn validate_cross_document_semantics(
 
     if let Some(provider) = instances.get("provider-registry.implementation.json") {
         validate_provider_registry(provider, errors);
+        validate_secret_provider_runtime_binding_refs(root, deployment, provider, errors);
     }
     if let Some(registry) = instances.get("action-resource-registry.implementation.json") {
         validate_action_resource_registry(root, registry, errors);
@@ -5277,6 +5285,218 @@ fn validate_provider_registry(registry: &Value, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_secret_provider_runtime_binding_refs(
+    root: &Path,
+    deployment: &Value,
+    registry: &Value,
+    errors: &mut Vec<String>,
+) {
+    let schema = match parse_json_strict(SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA.as_bytes()) {
+        Ok(schema) => schema,
+        Err(error) => {
+            errors.push(format!(
+                "embedded secret-provider runtime-binding schema is invalid: {error}"
+            ));
+            return;
+        }
+    };
+    let mut latest_lifecycle = BTreeMap::<(String, u64), (u64, &str)>::new();
+    for record in array(registry, "provider_lifecycle") {
+        let Some(provider_id) = string_field(record, "provider_id") else {
+            continue;
+        };
+        let Some(configuration_version) = record.get("config_version").and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let Some(record_version) = record
+            .get("lifecycle_record_version")
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let state = string_field(record, "state").unwrap_or("");
+        let entry = latest_lifecycle
+            .entry((provider_id.to_string(), configuration_version))
+            .or_insert((0, ""));
+        if record_version > entry.0 {
+            *entry = (record_version, state);
+        }
+    }
+    let production = string_field(deployment, "security_profile") == Some("production");
+    for (index, configuration) in array(registry, "configurations").iter().enumerate() {
+        if string_field(configuration, "kind") != Some("secret-service") {
+            continue;
+        }
+        let context = format!(
+            "provider-registry.implementation.json:/configurations/{index}/kind_config/runtime_binding_ref"
+        );
+        let Some(reference_value) = configuration.pointer("/kind_config/runtime_binding_ref")
+        else {
+            let provider_id = string_field(configuration, "provider_id").unwrap_or("");
+            let configuration_version = configuration
+                .get("config_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if production
+                && latest_lifecycle
+                    .get(&(provider_id.to_string(), configuration_version))
+                    .is_some_and(|(_, state)| *state == "active")
+            {
+                errors.push(format!(
+                    "{context}: active production secret-service uses the legacy five-reference policy shape; runtime_binding_ref is required"
+                ));
+            }
+            continue;
+        };
+        let Some(reference) = reference_value.as_object() else {
+            errors.push(format!("{context}: runtime_binding_ref must be an object"));
+            continue;
+        };
+        let Some(locator) = reference.get("artifact_locator").and_then(Value::as_str) else {
+            errors.push(format!(
+                "{context}: runtime_binding_ref omits artifact_locator"
+            ));
+            continue;
+        };
+        if Path::new(locator)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("json")
+        {
+            errors.push(format!(
+                "{context}: secret-provider runtime binding artifact_locator must end in lowercase .json"
+            ));
+            continue;
+        }
+        let Some(target) = safe_repository_path(root, locator, &context, errors) else {
+            continue;
+        };
+        let raw_bytes = match fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: cannot read secret-provider runtime binding {locator}: {error}"
+                ));
+                continue;
+            }
+        };
+        let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw_bytes));
+        if reference.get("content_digest").and_then(Value::as_str) != Some(actual_digest.as_str()) {
+            errors.push(format!(
+                "{context}: content_digest does not match exact secret-provider runtime-binding bytes"
+            ));
+        }
+        let document = match parse_json_strict(&raw_bytes) {
+            Ok(document) => document,
+            Err(error) => {
+                errors.push(format!(
+                    "{context}: secret-provider runtime binding {locator} is not strict JSON: {error}"
+                ));
+                continue;
+            }
+        };
+        validate_instance(
+            locator,
+            "secret-provider-runtime-binding.schema.json",
+            &schema,
+            &document,
+            errors,
+        );
+        for (field, expected) in [
+            (
+                "$schema",
+                Some(Value::String(
+                    "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json"
+                        .into(),
+                )),
+            ),
+            (
+                "contract_kind",
+                Some(Value::String("secret-provider-runtime-binding".into())),
+            ),
+            ("document_id", reference.get("document_id").cloned()),
+            (
+                "document_version",
+                reference.get("document_version").cloned(),
+            ),
+            ("provider_id", configuration.get("provider_id").cloned()),
+            (
+                "provider_configuration_version",
+                configuration.get("config_version").cloned(),
+            ),
+            ("deployment_id", deployment.get("deployment_id").cloned()),
+            (
+                "trust_domain_id",
+                configuration.get("trust_domain_id").cloned(),
+            ),
+            (
+                "capability_descriptor_id",
+                configuration
+                    .pointer("/capability_descriptor/descriptor_id")
+                    .cloned(),
+            ),
+            (
+                "capability_descriptor_version",
+                configuration
+                    .pointer("/capability_descriptor/descriptor_version")
+                    .cloned(),
+            ),
+            (
+                "adapter_kind",
+                configuration
+                    .pointer("/capability_descriptor/adapter_kind")
+                    .cloned(),
+            ),
+            (
+                "adapter_version",
+                configuration
+                    .pointer("/capability_descriptor/adapter_version")
+                    .cloned(),
+            ),
+        ] {
+            if expected
+                .as_ref()
+                .is_none_or(|expected| document.get(field) != Some(expected))
+            {
+                errors.push(format!(
+                    "{context}: binding document {field} does not exactly match its reference/provider/deployment authority"
+                ));
+            }
+        }
+        if document.get("adapter_kind") != configuration.pointer("/kind_config/adapter_kind") {
+            errors.push(format!(
+                "{context}: binding document adapter_kind does not match the runtime adapter selector"
+            ));
+        }
+        let bound_capabilities = array(&document, "capability_bindings")
+            .iter()
+            .filter_map(|binding| binding.get("capability_id"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let advertised_capabilities = configuration
+            .pointer("/capability_descriptor/advertised_capabilities")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if bound_capabilities != advertised_capabilities {
+            errors.push(format!(
+                "{context}: binding capability inventory does not exactly match the provider descriptor"
+            ));
+        }
+        let retained_consumers = array(&document, "retained_consumer_ids");
+        if retained_consumers.is_empty()
+            || retained_consumers
+                .windows(2)
+                .any(|pair| pair[0].as_str().unwrap_or("") >= pair[1].as_str().unwrap_or(""))
+        {
+            errors.push(format!(
+                "{context}: retained consumer ids must be nonempty, strictly sorted, and unique"
+            ));
+        }
+    }
+}
+
 fn validate_provider_lifecycle_transition(
     previous: &str,
     next: &str,
@@ -5915,6 +6135,34 @@ mod tests {
         ApplicabilitySubject,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TemporaryRoot(PathBuf);
+
+    impl TemporaryRoot {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ryuki-security-conformance-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create temporary repository root");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -5923,6 +6171,78 @@ mod tests {
     fn load(relative: &str) -> Value {
         serde_json::from_slice(&fs::read(root().join(relative)).expect("read fixture"))
             .expect("parse fixture")
+    }
+
+    fn secret_provider_runtime_binding_document(
+        deployment: &Value,
+        configuration: &Value,
+    ) -> Value {
+        let descriptor = &configuration["capability_descriptor"];
+        let capability_bindings = descriptor["advertised_capabilities"]
+            .as_array()
+            .expect("advertised capability array")
+            .iter()
+            .map(|capability| {
+                json!({
+                    "capability_id": capability,
+                    "semantic_version": "1.0.0"
+                })
+            })
+            .collect::<Vec<_>>();
+        let digest = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        json!({
+            "$schema": "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+            "schema_version": "1.0.0",
+            "contract_kind": "secret-provider-runtime-binding",
+            "document_id": "secret-provider-runtime-binding:validator-fixture",
+            "document_version": 1,
+            "value_free": true,
+            "provider_id": configuration["provider_id"].clone(),
+            "provider_configuration_version": configuration["config_version"].clone(),
+            "deployment_id": deployment["deployment_id"].clone(),
+            "trust_domain_id": configuration["trust_domain_id"].clone(),
+            "capability_descriptor_id": descriptor["descriptor_id"].clone(),
+            "capability_descriptor_version": descriptor["descriptor_version"].clone(),
+            "adapter_kind": descriptor["adapter_kind"].clone(),
+            "adapter_version": descriptor["adapter_version"].clone(),
+            "protocol_version": "1.0.0",
+            "backend_compatibility_profile": {
+                "profile_id": "compatibility-profile:vault-kv-v2",
+                "profile_version": 1,
+                "digest_contract": "ryuki-secret-provider-backend-compatibility-profile-v1",
+                "binding_digest": digest('1')
+            },
+            "transport": {
+                "endpoint_base_url_binding_digest": digest('2'),
+                "ca_trust_binding_digest": digest('3'),
+                "https_required": true,
+                "redirects_allowed": false,
+                "ambient_proxy_allowed": false,
+                "built_in_roots_allowed": false,
+                "connect_timeout_millis": 3000,
+                "request_timeout_millis": 10000,
+                "response_body_max_bytes": 1048576
+            },
+            "credential_source": {
+                "kind": "kubernetes-service-account-jwt",
+                "identity_binding_digest": digest('4'),
+                "audience_binding_digest": digest('5'),
+                "token_path_binding_digest": digest('6'),
+                "provider_authentication_digest_contract": "ryuki-secret-provider-authentication-binding-v1",
+                "provider_authentication_binding_digest": digest('7'),
+                "static_bearer_allowed": false,
+                "exported_bearer_allowed": false
+            },
+            "capability_bindings": capability_bindings,
+            "retained_consumer_ids": [
+                "consumer:integration-resolution",
+                "consumer:provider-readiness"
+            ],
+            "ownership": {
+                "single_runtime_owner": true,
+                "ambient_reconfiguration_allowed": false
+            }
+        })
     }
 
     fn refresh_provider_payload_digest(configuration: &mut Value) {
@@ -8396,6 +8716,300 @@ mod tests {
         assert!(errors.iter().any(|error| {
             error.contains("advertised_capabilities must be non-empty and strictly sorted")
         }));
+    }
+
+    #[test]
+    fn secret_provider_binding_schemas_close_new_and_legacy_migration_shapes() {
+        let provider_schema = load("catalog/security-contracts/v1/provider-registry.schema.json");
+        let binding_schema =
+            load("catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json");
+        let deployment =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        let configuration = &mut registry["configurations"][0];
+        configuration["kind"] = json!("secret-service");
+        configuration["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": configuration["capability_descriptor"]["adapter_kind"].clone(),
+            "runtime_binding_ref": {
+                "document_id": "secret-provider-runtime-binding:validator-fixture",
+                "document_version": 1,
+                "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "artifact_locator": "bindings/secret-provider.json"
+            }
+        });
+        refresh_provider_payload_digest(configuration);
+
+        let mut errors = Vec::new();
+        validate_instance(
+            "provider new binding fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let reference = registry["configurations"][0]["capability_descriptor"]
+            ["mandatory_baseline_ref"]
+            .clone();
+        let mut legacy = registry.clone();
+        legacy["configurations"][0]["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": legacy["configurations"][0]["capability_descriptor"]["adapter_kind"].clone(),
+            "endpoint_policy_ref": reference.clone(),
+            "authentication_ref": reference.clone(),
+            "capability_policy_ref": reference.clone(),
+            "rotation_policy_ref": reference.clone(),
+            "revocation_policy_ref": reference
+        });
+        let mut errors = Vec::new();
+        validate_instance(
+            "provider legacy binding fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &legacy,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut mixed = registry.clone();
+        mixed["configurations"][0]["kind_config"]["endpoint_policy_ref"] =
+            legacy["configurations"][0]["kind_config"]["endpoint_policy_ref"].clone();
+        let mut errors = Vec::new();
+        validate_instance(
+            "provider mixed binding fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &mixed,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut partial = legacy.clone();
+        partial["configurations"][0]["kind_config"]
+            .as_object_mut()
+            .expect("kind config object")
+            .remove("revocation_policy_ref");
+        let mut errors = Vec::new();
+        validate_instance(
+            "provider partial legacy fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &partial,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut key_custody = registry.clone();
+        key_custody["configurations"][0]["kind"] = json!("key-custody");
+        key_custody["configurations"][0]["kind_config"]["configuration_kind"] =
+            json!("key-custody");
+        let mut errors = Vec::new();
+        validate_instance(
+            "key custody runtime-binding fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &key_custody,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut zero_digest = registry.clone();
+        zero_digest["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!(ZERO_SHA256_DIGEST);
+        let mut errors = Vec::new();
+        validate_instance(
+            "zero runtime-binding digest fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &zero_digest,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut non_json_locator = registry.clone();
+        non_json_locator["configurations"][0]["kind_config"]["runtime_binding_ref"]
+            ["artifact_locator"] = json!("bindings/secret-provider.JSON");
+        let mut errors = Vec::new();
+        validate_instance(
+            "non-JSON runtime-binding locator fixture",
+            "provider-registry.schema.json",
+            &provider_schema,
+            &non_json_locator,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let document =
+            secret_provider_runtime_binding_document(&deployment, &registry["configurations"][0]);
+        let mut errors = Vec::new();
+        validate_instance(
+            "secret-provider runtime binding fixture",
+            "secret-provider-runtime-binding.schema.json",
+            &binding_schema,
+            &document,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        for invalid in [
+            {
+                let mut value = document.clone();
+                value["transport"]["redirects_allowed"] = json!(true);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["credential_source"]["static_bearer_allowed"] = json!(true);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["transport"]["endpoint_base_url_binding_digest"] = json!(ZERO_SHA256_DIGEST);
+                value
+            },
+            {
+                let mut value = document.clone();
+                value["secret_value"] = json!("forbidden");
+                value
+            },
+        ] {
+            let mut errors = Vec::new();
+            validate_instance(
+                "invalid secret-provider runtime binding fixture",
+                "secret-provider-runtime-binding.schema.json",
+                &binding_schema,
+                &invalid,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "invalid binding unexpectedly passed");
+        }
+    }
+
+    #[test]
+    fn secret_provider_binding_reference_is_strict_and_cross_document_bound() {
+        let temporary_root = TemporaryRoot::new();
+        let locator = "bindings/secret-provider.json";
+        fs::create_dir_all(temporary_root.path().join("bindings")).unwrap();
+        let mut deployment =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        deployment["security_profile"] = json!("production");
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        registry["provider_lifecycle"][0]["state"] = json!("active");
+        let configuration = &mut registry["configurations"][0];
+        configuration["kind"] = json!("secret-service");
+        let mut document = secret_provider_runtime_binding_document(&deployment, configuration);
+
+        let write_binding = |document: &Value| {
+            let bytes = serde_json::to_vec_pretty(document).unwrap();
+            fs::write(temporary_root.path().join(locator), &bytes).unwrap();
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        };
+        let digest = write_binding(&document);
+        configuration["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": configuration["capability_descriptor"]["adapter_kind"].clone(),
+            "runtime_binding_ref": {
+                "document_id": document["document_id"].clone(),
+                "document_version": document["document_version"].clone(),
+                "content_digest": digest,
+                "artifact_locator": locator
+            }
+        });
+
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        document["provider_id"] = json!("provider:substituted");
+        let digest = write_binding(&document);
+        registry["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!(digest);
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("provider_id")));
+
+        registry["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("content_digest does not match exact")));
+
+        let valid_document =
+            secret_provider_runtime_binding_document(&deployment, &registry["configurations"][0]);
+        let raw = serde_json::to_string_pretty(&valid_document).unwrap();
+        let duplicate = raw.replacen(
+            "\"schema_version\": \"1.0.0\"",
+            "\"schema_version\": \"1.0.0\",\n  \"schema_version\": \"1.0.0\"",
+            1,
+        );
+        fs::write(temporary_root.path().join(locator), duplicate.as_bytes()).unwrap();
+        registry["configurations"][0]["kind_config"]["runtime_binding_ref"]["content_digest"] =
+            json!(format!("sha256:{:x}", Sha256::digest(duplicate.as_bytes())));
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(
+            temporary_root.path(),
+            &deployment,
+            &registry,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate JSON object key")));
+    }
+
+    #[test]
+    fn production_legacy_secret_service_is_rejected_only_while_active() {
+        let mut deployment =
+            load("catalog/security-contracts/v1/deployment-security-profile.implementation.json");
+        deployment["security_profile"] = json!("production");
+        let mut registry =
+            load("catalog/security-contracts/v1/provider-registry.implementation.json");
+        let reference = registry["configurations"][0]["capability_descriptor"]
+            ["mandatory_baseline_ref"]
+            .clone();
+        registry["configurations"][0]["kind"] = json!("secret-service");
+        registry["configurations"][0]["kind_config"] = json!({
+            "configuration_kind": "secret-service",
+            "adapter_kind": registry["configurations"][0]["capability_descriptor"]["adapter_kind"].clone(),
+            "endpoint_policy_ref": reference.clone(),
+            "authentication_ref": reference.clone(),
+            "capability_policy_ref": reference.clone(),
+            "rotation_policy_ref": reference.clone(),
+            "revocation_policy_ref": reference
+        });
+        registry["provider_lifecycle"][0]["state"] = json!("active");
+
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(&root(), &deployment, &registry, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("active production secret-service")));
+
+        registry["provider_lifecycle"][0]["state"] = json!("draining");
+        let mut errors = Vec::new();
+        validate_secret_provider_runtime_binding_refs(&root(), &deployment, &registry, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

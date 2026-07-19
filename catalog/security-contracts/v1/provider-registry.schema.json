@@ -94,6 +94,25 @@
         }
       }
     },
+    "runtimeBindingReference": {
+      "description": "Exact reference to a secret-provider-runtime-binding document. Unlike generic compatibility references, a runtime binding can never use the all-zero digest sentinel.",
+      "allOf": [
+        { "$ref": "#/$defs/contentReference" },
+        {
+          "required": ["content_digest"],
+          "properties": {
+            "content_digest": {
+              "not": {
+                "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            },
+            "artifact_locator": {
+              "pattern": "\\.json$"
+            }
+          }
+        }
+      ]
+    },
     "providerId": {
       "type": "string",
       "pattern": "^provider:[a-z0-9][a-z0-9._-]{2,126}$"
@@ -438,16 +457,59 @@
     "capabilityProviderConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["configuration_kind", "adapter_kind", "endpoint_policy_ref", "authentication_ref", "capability_policy_ref", "rotation_policy_ref", "revocation_policy_ref"],
+      "required": ["configuration_kind", "adapter_kind"],
       "properties": {
         "configuration_kind": { "enum": ["secret-service", "key-custody", "certificate-authority"] },
         "adapter_kind": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" },
+        "runtime_binding_ref": { "$ref": "#/$defs/runtimeBindingReference" },
         "endpoint_policy_ref": { "$ref": "#/$defs/contentReference" },
         "authentication_ref": { "$ref": "#/$defs/contentReference" },
         "capability_policy_ref": { "$ref": "#/$defs/contentReference" },
         "rotation_policy_ref": { "$ref": "#/$defs/contentReference" },
         "revocation_policy_ref": { "$ref": "#/$defs/contentReference" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "configuration_kind": { "const": "secret-service" } },
+            "required": ["configuration_kind"]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "required": ["runtime_binding_ref"],
+                "not": {
+                  "anyOf": [
+                    { "required": ["endpoint_policy_ref"] },
+                    { "required": ["authentication_ref"] },
+                    { "required": ["capability_policy_ref"] },
+                    { "required": ["rotation_policy_ref"] },
+                    { "required": ["revocation_policy_ref"] }
+                  ]
+                }
+              },
+              {
+                "required": ["endpoint_policy_ref", "authentication_ref", "capability_policy_ref", "rotation_policy_ref", "revocation_policy_ref"],
+                "not": { "required": ["runtime_binding_ref"] }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "configuration_kind": {
+                "enum": ["key-custody", "certificate-authority"]
+              }
+            },
+            "required": ["configuration_kind"]
+          },
+          "then": {
+            "required": ["endpoint_policy_ref", "authentication_ref", "capability_policy_ref", "rotation_policy_ref", "revocation_policy_ref"],
+            "not": { "required": ["runtime_binding_ref"] }
+          }
+        }
+      ]
     },
     "developmentFixtureConfig": {
       "type": "object",
