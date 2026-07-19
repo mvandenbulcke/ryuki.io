@@ -30,6 +30,26 @@ data:
   # DML coverage, read-only migration-ledger access, and absence of DDL.
   RYUKI_DATABASE_EXPECTED_ROLE: "ryuki_app_runtime"
   RYUKI_DATABASE_FORBIDDEN_ROLE: "ryuki_schema_migrator"
+  # Exact, value-free retained Vault runtime binding. The projected JWT and CA
+  # paths below are fixed by deployments.yaml; no token or secret value belongs
+  # in this ConfigMap. The direct API identity is intentionally distinct from
+  # every Vault Secrets Operator materializer identity.
+  RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID: "provider:hashicorp-vault-primary"
+  RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION: "1"
+  RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR: "hashicorp-vault-v1"
+  RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT: "https://vault.vault.svc:8200"
+  RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH: "/var/run/secrets/ryuki/vault-tls/ca.crt"
+  RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT: "kubernetes"
+  RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE: "ryuki-platform-api"
+  RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE: "vault"
+  RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH: "/var/run/secrets/ryuki/vault-auth/token"
+  RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE: "ryuki-platform"
+  RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME: "platform-api"
+  RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY: "ryuki-platform-api-runtime"
+  # Non-secret pointer to the dedicated, operator-created fingerprint keyring.
+  # Key material is projected read-only by deployments.yaml and never belongs
+  # in this ConfigMap or a process environment variable.
+  RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH: "/var/run/secrets/ryuki/secret-reference-fingerprint/keyring"
   # Backup retention knobs (days/weeks/months/years).
   RYUKI_RETENTION__DAILY_BACKUPS: "30"
   RYUKI_RETENTION__WEEKLY_BACKUPS: "12"

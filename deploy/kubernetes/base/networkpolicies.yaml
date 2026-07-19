@@ -338,32 +338,35 @@ spec:
         - protocol: TCP
           port: 8000
 
-# Vault egress stub — enabled with the Vault Secrets Operator slice
-# (deploy/kubernetes/vault/vso-secrets.yaml). VSO syncs Vault material into
-# Kubernetes Secrets itself; uncomment only if platform-api pods need to call
-# Vault directly.
-#
-# ---
-# apiVersion: networking.k8s.io/v1
-# kind: NetworkPolicy
-# metadata:
-#   name: allow-platform-api-egress-to-vault
-#   namespace: ryuki-platform
-#   labels:
-#     app.kubernetes.io/part-of: ryuki-infrastructure-platform
-#     app.kubernetes.io/name: platform-api
-# spec:
-#   podSelector:
-#     matchLabels:
-#       app.kubernetes.io/part-of: ryuki-infrastructure-platform
-#       app.kubernetes.io/name: platform-api
-#   policyTypes:
-#     - Egress
-#   egress:
-#     - to:
-#         - namespaceSelector:
-#             matchLabels:
-#               kubernetes.io/metadata.name: vault
-#       ports:
-#         - protocol: TCP
-#           port: 8200
+---
+# Direct secret-provider traffic is admitted only between the exact API pods
+# and HashiCorp Vault server pods. The matching ingress half is maintained in
+# deploy/kubernetes/vault/workload-auth.yaml so neither namespace-only selector
+# can accidentally create a broader path on its own.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-api-egress-to-vault
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ryuki-infrastructure-platform
+      app.kubernetes.io/name: platform-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+              component: server
+      ports:
+        - protocol: TCP
+          port: 8200

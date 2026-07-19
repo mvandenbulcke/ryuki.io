@@ -1,3 +1,4 @@
+use crate::yaml_utils::validate_yaml_duplicate_keys_text;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -5,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 const NAMESPACE: &str = "ryuki-platform";
+const VAULT_NAMESPACE: &str = "vault";
 const PART_OF: &str = "ryuki-infrastructure-platform";
 const APPROVED_HOST: &str = "platform.example.invalid";
 const TLS_SECRET_PLACEHOLDER: &str = "platform-tls-placeholder";
@@ -22,6 +24,32 @@ const CNPG_CA_SECRET_NAME: &str = "ryuki-platform-db-ca";
 const CNPG_CA_VOLUME_NAME: &str = "cnpg-ca";
 const CNPG_CA_SECRET_KEY: &str = "ca.crt";
 const CNPG_CA_MOUNT_PATH: &str = "/var/run/secrets/ryuki/cnpg";
+const VAULT_WORKLOAD_AUTH_MANIFEST_PATH: &str = "deploy/kubernetes/vault/workload-auth.yaml";
+const VAULT_KUBERNETES_AUTH_CONFIG_PATH: &str =
+    "deploy/kubernetes/vault/kubernetes-auth-config.json";
+const VAULT_PLATFORM_API_ROLE_PATH: &str =
+    "deploy/kubernetes/vault/platform-api-kubernetes-role.json";
+const VAULT_PLATFORM_API_POLICY_PATH: &str = "deploy/kubernetes/vault/platform-api-policy.hcl";
+const VAULT_PLATFORM_API_POLICY_NAME: &str = "ryuki-platform-api-runtime";
+const VAULT_WORKLOAD_TOKEN_VOLUME_NAME: &str = "vault-workload-token";
+const VAULT_WORKLOAD_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/ryuki/vault-auth";
+const VAULT_WORKLOAD_TOKEN_FILE_PATH: &str = "/var/run/secrets/ryuki/vault-auth/token";
+const VAULT_CLIENT_CA_VOLUME_NAME: &str = "vault-client-ca";
+const VAULT_CLIENT_CA_SECRET_NAME: &str = "ryuki-vault-client-ca";
+const VAULT_CLIENT_CA_MOUNT_PATH: &str = "/var/run/secrets/ryuki/vault-tls";
+const VAULT_CLIENT_CA_FILE_PATH: &str = "/var/run/secrets/ryuki/vault-tls/ca.crt";
+const SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME: &str =
+    "secret-reference-fingerprint-keyring";
+const SECRET_REFERENCE_FINGERPRINT_KEYRING_SECRET_NAME: &str =
+    "ryuki-secret-reference-fingerprint-keyring";
+const SECRET_REFERENCE_FINGERPRINT_KEYRING_KEY: &str = "keyring";
+const SECRET_REFERENCE_FINGERPRINT_KEYRING_MOUNT_PATH: &str =
+    "/var/run/secrets/ryuki/secret-reference-fingerprint";
+const SECRET_REFERENCE_FINGERPRINT_KEYRING_FILE_PATH: &str =
+    "/var/run/secrets/ryuki/secret-reference-fingerprint/keyring";
+const VAULT_API_EGRESS_POLICY: &str = "allow-platform-api-egress-to-vault";
+const VAULT_API_INGRESS_POLICY: &str = "allow-ingress-to-vault-from-platform-api";
+const VAULT_TOKEN_REVIEW_BINDING: &str = "vault-tokenreview-auth-delegator";
 const EXPECTED_CUTOVER_WORKLOAD_KINDS: &[&str] =
     &["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"];
 const EXPECTED_BASE_WRITER_SELECTORS: &[&str] = &[
@@ -51,6 +79,66 @@ const PLATFORM_API_CONFIG_KEYS: &[&str] = &[
     "RYUKI_RETENTION__WEEKLY_BACKUPS",
     "RYUKI_RETENTION__MONTHLY_BACKUPS",
     "RYUKI_RETENTION__YEARLY_BACKUPS",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY",
+    "RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH",
+];
+const VAULT_RUNTIME_CONFIG_VALUES: &[(&str, &str)] = &[
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID",
+        "provider:hashicorp-vault-primary",
+    ),
+    ("RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION", "1"),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR",
+        "hashicorp-vault-v1",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT",
+        "https://vault.vault.svc:8200",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH",
+        VAULT_CLIENT_CA_FILE_PATH,
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT",
+        "kubernetes",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE",
+        "ryuki-platform-api",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE",
+        "vault",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH",
+        VAULT_WORKLOAD_TOKEN_FILE_PATH,
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE",
+        NAMESPACE,
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME",
+        "platform-api",
+    ),
+    (
+        "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY",
+        VAULT_PLATFORM_API_POLICY_NAME,
+    ),
 ];
 const PLATFORM_API_MIGRATION_CONFIG_KEYS: &[&str] = &[
     "RYUKI_MIGRATION_MODE",
@@ -97,6 +185,7 @@ const ALLOWED_KINDS: &[&str] = &[
     "Ingress",
     "NetworkPolicy",
     "ConfigMap",
+    "ClusterRoleBinding",
 ];
 // The default-deny pair plus the app-tier allow rules, extended with the
 // database-tier policies for the API, one-shot migrator, and CloudNativePG
@@ -112,6 +201,7 @@ const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     "allow-portal-ui-egress-to-dedicated-ingress-https",
     "allow-egress-to-kube-dns",
     "allow-platform-api-egress-to-db",
+    VAULT_API_EGRESS_POLICY,
     "allow-ingress-to-db-from-platform-api",
     "allow-platform-api-migrations-egress-to-db",
     "allow-ingress-to-db-from-platform-api-migrations",
@@ -120,6 +210,7 @@ const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     // Observability scrape access: lets a `monitoring` namespace reach the
     // metrics port under default-deny (deploy/kubernetes/monitoring wiring).
     "allow-monitoring-ingress",
+    VAULT_API_INGRESS_POLICY,
 ];
 const APPROVED_KEYS: &[&str] = &[
     "apiVersion",
@@ -134,6 +225,7 @@ const APPROVED_KEYS: &[&str] = &[
     "app.kubernetes.io/name",
     "app.kubernetes.io/instance",
     "app.kubernetes.io/component",
+    "component",
     "ryuki.io/secret-family",
     "ryuki.io/cutover-contract",
     "ryuki.io/release-image",
@@ -209,12 +301,25 @@ const APPROVED_KEYS: &[&str] = &[
     "k8s-app",
     "kubernetes.io/metadata.name",
     "automountServiceAccountToken",
+    "projected",
+    "defaultMode",
+    "sources",
+    "serviceAccountToken",
+    "audience",
+    "expirationSeconds",
+    "fsGroup",
+    "fsGroupChangePolicy",
+    "apiGroup",
+    "roleRef",
+    "subjects",
     "data",
     "__file",
     "__document",
 ];
 const APPROVED_SCHEMA_VALUES: &[&str] = &[
     "networking.k8s.io/v1",
+    "rbac.authorization.k8s.io/v1",
+    "rbac.authorization.k8s.io",
     "app.kubernetes.io/name",
     "kubernetes.io/metadata.name",
     "IfNotPresent",
@@ -244,7 +349,7 @@ impl MigrationIdentity {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SourceText {
     path: String,
     text: String,
@@ -279,6 +384,7 @@ pub fn validate_context_file(path: &Path) -> Result<Vec<String>, String> {
         .map_err(|error| format!("invalid kubernetes manifest context JSON: {error}"))?;
     let mut errors = validate_documents(&context.manifests);
     validate_cutover_contract(&context.cutover_contract, &context.manifests, &mut errors);
+    validate_vault_external_auth_files(&context.source_texts, &mut errors);
     validate_source_texts(&context.source_texts, &mut errors);
     Ok(errors)
 }
@@ -315,10 +421,12 @@ fn validate_documents(manifests: &[Value]) -> Vec<String> {
     validate_standard_metadata(manifests, &mut errors);
     validate_config_maps(manifests, &mut errors);
     validate_components(manifests, &mut errors);
+    validate_secret_reference_fingerprint_keyring_exposure(manifests, &mut errors);
     validate_migration_job(manifests, &mut errors);
     validate_services(manifests, &mut errors);
     validate_ingress(manifests, &mut errors);
     validate_network_policies(manifests, &mut errors);
+    validate_vault_token_review_binding(manifests, &mut errors);
     validate_no_secret_values(
         &Value::Array(manifests.to_vec()),
         "manifests",
@@ -426,12 +534,28 @@ fn validate_standard_metadata(manifests: &[Value], errors: &mut Vec<String>) {
             errors,
             format!("{} missing part-of label", manifest_path(manifest)),
         );
-        if str_at(manifest, &["kind"]) != Some("Namespace") {
-            expect(
+        match (str_at(manifest, &["kind"]), name) {
+            (Some("Namespace" | "ClusterRoleBinding"), _) => expect(
+                value_at(manifest, &["metadata", "namespace"]).is_none(),
+                errors,
+                format!(
+                    "{} cluster-scoped resource must not set metadata.namespace",
+                    manifest_path(manifest)
+                ),
+            ),
+            (Some("NetworkPolicy"), Some(VAULT_API_INGRESS_POLICY)) => expect(
+                str_at(manifest, &["metadata", "namespace"]) == Some(VAULT_NAMESPACE),
+                errors,
+                format!(
+                    "{} namespace must be {VAULT_NAMESPACE}",
+                    manifest_path(manifest)
+                ),
+            ),
+            _ => expect(
                 str_at(manifest, &["metadata", "namespace"]) == Some(NAMESPACE),
                 errors,
                 format!("{} namespace must be {NAMESPACE}", manifest_path(manifest)),
-            );
+            ),
         }
     }
 }
@@ -463,9 +587,16 @@ fn validate_config_maps(manifests: &[Value], errors: &mut Vec<String>) {
             && str_at(api, &["data", "RYUKI_MIGRATION_MODE"]) == Some("verify-only")
             && str_at(api, &["data", "RYUKI_DATABASE_EXPECTED_ROLE"]) == Some("ryuki_app_runtime")
             && str_at(api, &["data", "RYUKI_DATABASE_FORBIDDEN_ROLE"])
-                == Some("ryuki_schema_migrator"),
+                == Some("ryuki_schema_migrator")
+            && str_at(
+                api,
+                &["data", "RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH"],
+            ) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_FILE_PATH)
+            && VAULT_RUNTIME_CONFIG_VALUES
+                .iter()
+                .all(|(key, expected)| str_at(api, &["data", *key]) == Some(*expected)),
         errors,
-        "platform-api-config must contain only the exact reviewed keys, require the database, use verify-only ryuki_app_runtime, and forbid migrator membership",
+        "platform-api-config must contain only the exact reviewed keys, require the database, use verify-only ryuki_app_runtime, forbid migrator membership, bind the exact value-free Vault workload-auth settings, and point to the exact projected SecretRef fingerprint keyring",
     );
 
     let migration = find("platform-api-migration-config");
@@ -645,7 +776,11 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
         if name == "platform-api" {
             let pod_spec =
                 value_at(deployment, &["spec", "template", "spec"]).unwrap_or(&Value::Null);
-            validate_cnpg_ca_mount("Deployment platform-api", pod_spec, container, errors);
+            validate_cnpg_ca_mount("Deployment platform-api", pod_spec, container, 4, errors);
+            validate_platform_api_vault_workload_auth(
+                manifests, deployment, pod_spec, container, errors,
+            );
+            validate_platform_api_secret_reference_fingerprint_keyring(pod_spec, container, errors);
         }
         validate_target_hardening(name, deployment, errors);
     }
@@ -864,7 +999,7 @@ fn validate_migration_job(manifests: &[Value], errors: &mut Vec<String>) {
         "migration Job must import the exact seven security-admission ConfigMap keys",
     );
 
-    validate_cnpg_ca_mount("migration Job", pod_spec, container, errors);
+    validate_cnpg_ca_mount("migration Job", pod_spec, container, 1, errors);
     validate_migration_job_resources(container, errors);
     validate_migration_job_security(container, errors);
 }
@@ -1326,6 +1461,7 @@ fn validate_cnpg_ca_mount(
     owner: &str,
     pod_spec: &Value,
     container: &Value,
+    expected_volume_count: usize,
     errors: &mut Vec<String>,
 ) {
     let volumes = array_at_path(pod_spec, &["volumes"]);
@@ -1337,7 +1473,7 @@ fn validate_cnpg_ca_mount(
     let items = array_at_path(volume, &["secret", "items"]);
     let item = items.first().copied().unwrap_or(&Value::Null);
     expect(
-        volumes.len() == 1
+        volumes.len() == expected_volume_count
             && object(volume).is_some_and(|map| object_has_exact_keys(map, &["name", "secret"]))
             && str_at(volume, &["name"]) == Some(CNPG_CA_VOLUME_NAME)
             && object_at(volume, &["secret"])
@@ -1358,7 +1494,7 @@ fn validate_cnpg_ca_mount(
         .find(|mount| str_at(mount, &["name"]) == Some(CNPG_CA_VOLUME_NAME))
         .unwrap_or(&Value::Null);
     expect(
-        mounts.len() == 1
+        mounts.len() == expected_volume_count
             && object(mount)
                 .is_some_and(|map| object_has_exact_keys(map, &["name", "mountPath", "readOnly"]))
             && str_at(mount, &["name"]) == Some(CNPG_CA_VOLUME_NAME)
@@ -1367,6 +1503,269 @@ fn validate_cnpg_ca_mount(
         errors,
         format!("{owner} must mount only the CNPG CA read-only"),
     );
+}
+
+fn validate_platform_api_vault_workload_auth(
+    manifests: &[Value],
+    deployment: &Value,
+    pod_spec: &Value,
+    container: &Value,
+    errors: &mut Vec<String>,
+) {
+    const READ_ONLY_MODE: i64 = 0o440;
+
+    let service_account = manifests
+        .iter()
+        .find(|manifest| {
+            str_at(manifest, &["kind"]) == Some("ServiceAccount")
+                && str_at(manifest, &["metadata", "name"]) == Some("platform-api")
+                && str_at(manifest, &["metadata", "namespace"]) == Some(NAMESPACE)
+        })
+        .unwrap_or(&Value::Null);
+    expect(
+        bool_at(service_account, &["automountServiceAccountToken"]) == Some(false)
+            && str_at(pod_spec, &["serviceAccountName"]) == Some("platform-api")
+            && bool_at(pod_spec, &["automountServiceAccountToken"]) == Some(false),
+        errors,
+        "platform-api ServiceAccount and pod must both disable ambient API token automount",
+    );
+
+    let pod_security = object_at(pod_spec, &["securityContext"]);
+    expect(
+        pod_security.is_some_and(|security| {
+            object_has_exact_keys(
+                security,
+                &[
+                    "runAsNonRoot",
+                    "runAsUser",
+                    "runAsGroup",
+                    "fsGroup",
+                    "fsGroupChangePolicy",
+                ],
+            )
+        }) && bool_at(pod_spec, &["securityContext", "runAsNonRoot"]) == Some(true)
+            && int_at(pod_spec, &["securityContext", "runAsUser"]) == Some(10001)
+            && int_at(pod_spec, &["securityContext", "runAsGroup"]) == Some(10001)
+            && int_at(pod_spec, &["securityContext", "fsGroup"]) == Some(10001)
+            && str_at(pod_spec, &["securityContext", "fsGroupChangePolicy"])
+                == Some("OnRootMismatch"),
+        errors,
+        "platform-api pod securityContext must contain only the reviewed non-root identity, fsGroup 10001, and OnRootMismatch policy",
+    );
+
+    let volumes = array_at_path(pod_spec, &["volumes"]);
+    let token_volume = volumes
+        .iter()
+        .copied()
+        .find(|volume| str_at(volume, &["name"]) == Some(VAULT_WORKLOAD_TOKEN_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
+    let token_sources = array_at_path(token_volume, &["projected", "sources"]);
+    let token_source = token_sources.first().copied().unwrap_or(&Value::Null);
+    expect(
+        volumes.len() == 4
+            && object(token_volume)
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "projected"]))
+            && object_at(token_volume, &["projected"])
+                .is_some_and(|map| object_has_exact_keys(map, &["defaultMode", "sources"]))
+            && int_at(token_volume, &["projected", "defaultMode"]) == Some(READ_ONLY_MODE)
+            && token_sources.len() == 1
+            && object(token_source)
+                .is_some_and(|map| object_has_exact_keys(map, &["serviceAccountToken"]))
+            && object_at(token_source, &["serviceAccountToken"]).is_some_and(|map| {
+                object_has_exact_keys(map, &["audience", "expirationSeconds", "path"])
+            })
+            && str_at(token_source, &["serviceAccountToken", "audience"]) == Some("vault")
+            && int_at(token_source, &["serviceAccountToken", "expirationSeconds"]) == Some(600)
+            && str_at(token_source, &["serviceAccountToken", "path"]) == Some("token"),
+        errors,
+        "platform-api must project exactly one mode-0440, 600-second, vault-audience ServiceAccount JWT at token",
+    );
+
+    let ca_volume = volumes
+        .iter()
+        .copied()
+        .find(|volume| str_at(volume, &["name"]) == Some(VAULT_CLIENT_CA_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
+    let ca_items = array_at_path(ca_volume, &["secret", "items"]);
+    let ca_item = ca_items.first().copied().unwrap_or(&Value::Null);
+    expect(
+        object(ca_volume).is_some_and(|map| object_has_exact_keys(map, &["name", "secret"]))
+            && object_at(ca_volume, &["secret"]).is_some_and(|map| {
+                object_has_exact_keys(map, &["secretName", "defaultMode", "items"])
+            })
+            && str_at(ca_volume, &["secret", "secretName"]) == Some(VAULT_CLIENT_CA_SECRET_NAME)
+            && int_at(ca_volume, &["secret", "defaultMode"]) == Some(READ_ONLY_MODE)
+            && ca_items.len() == 1
+            && object(ca_item).is_some_and(|map| object_has_exact_keys(map, &["key", "path"]))
+            && str_at(ca_item, &["key"]) == Some(CNPG_CA_SECRET_KEY)
+            && str_at(ca_item, &["path"]) == Some(CNPG_CA_SECRET_KEY),
+        errors,
+        "platform-api must project only the exact mode-0440 Vault client CA certificate",
+    );
+
+    let mounts = array_at_path(container, &["volumeMounts"]);
+    let token_mount = mounts
+        .iter()
+        .copied()
+        .find(|mount| str_at(mount, &["name"]) == Some(VAULT_WORKLOAD_TOKEN_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
+    let ca_mount = mounts
+        .iter()
+        .copied()
+        .find(|mount| str_at(mount, &["name"]) == Some(VAULT_CLIENT_CA_VOLUME_NAME))
+        .unwrap_or(&Value::Null);
+    let exact_read_only_mount = |mount: &Value, name: &str, mount_path: &str| {
+        object(mount)
+            .is_some_and(|map| object_has_exact_keys(map, &["name", "mountPath", "readOnly"]))
+            && str_at(mount, &["name"]) == Some(name)
+            && str_at(mount, &["mountPath"]) == Some(mount_path)
+            && bool_at(mount, &["readOnly"]) == Some(true)
+    };
+    expect(
+        mounts.len() == 4
+            && exact_read_only_mount(
+                token_mount,
+                VAULT_WORKLOAD_TOKEN_VOLUME_NAME,
+                VAULT_WORKLOAD_TOKEN_MOUNT_PATH,
+            )
+            && exact_read_only_mount(
+                ca_mount,
+                VAULT_CLIENT_CA_VOLUME_NAME,
+                VAULT_CLIENT_CA_MOUNT_PATH,
+            ),
+        errors,
+        "platform-api must mount the reviewed Vault JWT and CA volumes read-only without subPath and without widening the four-volume API projection inventory",
+    );
+
+    let config_map = manifests
+        .iter()
+        .find(|manifest| {
+            str_at(manifest, &["kind"]) == Some("ConfigMap")
+                && str_at(manifest, &["metadata", "name"]) == Some("platform-api-config")
+        })
+        .unwrap_or(&Value::Null);
+    let config_keys = object_at(config_map, &["data"]);
+    let direct_env_names: Vec<&str> = array_at_path(container, &["env"])
+        .iter()
+        .filter_map(|entry| str_at(entry, &["name"]))
+        .collect();
+    expect(
+        config_keys.is_some_and(|data| object_has_exact_keys(data, PLATFORM_API_CONFIG_KEYS))
+            && direct_env_names
+                .iter()
+                .all(|name| !name.starts_with("VAULT_"))
+            && direct_env_names.iter().all(|name| {
+                !matches!(
+                    *name,
+                    "RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK"
+                        | "RYUKI_SECRET_PROVIDER_RUNTIME__TLS_SKIP_VERIFY"
+                        | "RYUKI_SECRET_PROVIDER_RUNTIME__STATIC_TOKEN"
+                )
+            }),
+        errors,
+        "platform-api may receive only the exact reviewed value-free Vault settings; VAULT_TOKEN, legacy VAULT_* variables, static tokens, and TLS bypasses are forbidden",
+    );
+
+    expect(
+        str_at(deployment, &["metadata", "namespace"]) == Some(NAMESPACE),
+        errors,
+        "platform-api workload-auth deployment must remain in ryuki-platform",
+    );
+}
+
+fn validate_platform_api_secret_reference_fingerprint_keyring(
+    pod_spec: &Value,
+    container: &Value,
+    errors: &mut Vec<String>,
+) {
+    const READ_ONLY_MODE: i64 = 0o440;
+
+    let volumes = array_at_path(pod_spec, &["volumes"]);
+    let keyring_volume = volumes
+        .iter()
+        .copied()
+        .find(|volume| {
+            str_at(volume, &["name"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME)
+        })
+        .unwrap_or(&Value::Null);
+    let keyring_items = array_at_path(keyring_volume, &["secret", "items"]);
+    let keyring_item = keyring_items.first().copied().unwrap_or(&Value::Null);
+    expect(
+        volumes.len() == 4
+            && object(keyring_volume)
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "secret"]))
+            && object_at(keyring_volume, &["secret"]).is_some_and(|map| {
+                object_has_exact_keys(map, &["secretName", "defaultMode", "items"])
+            })
+            && str_at(keyring_volume, &["secret", "secretName"])
+                == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_SECRET_NAME)
+            && int_at(keyring_volume, &["secret", "defaultMode"]) == Some(READ_ONLY_MODE)
+            && keyring_items.len() == 1
+            && object(keyring_item).is_some_and(|map| object_has_exact_keys(map, &["key", "path"]))
+            && str_at(keyring_item, &["key"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_KEY)
+            && str_at(keyring_item, &["path"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_KEY),
+        errors,
+        "platform-api must project only the exact mode-0440 SecretRef fingerprint keyring key",
+    );
+
+    let mounts = array_at_path(container, &["volumeMounts"]);
+    let keyring_mount = mounts
+        .iter()
+        .copied()
+        .find(|mount| {
+            str_at(mount, &["name"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME)
+        })
+        .unwrap_or(&Value::Null);
+    expect(
+        mounts.len() == 4
+            && object(keyring_mount)
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "mountPath", "readOnly"]))
+            && str_at(keyring_mount, &["name"])
+                == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME)
+            && str_at(keyring_mount, &["mountPath"])
+                == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_MOUNT_PATH)
+            && bool_at(keyring_mount, &["readOnly"]) == Some(true),
+        errors,
+        "platform-api must mount only the exact SecretRef fingerprint keyring directory read-only without subPath",
+    );
+}
+
+fn validate_secret_reference_fingerprint_keyring_exposure(
+    manifests: &[Value],
+    errors: &mut Vec<String>,
+) {
+    for workload in manifests
+        .iter()
+        .filter(|manifest| matches!(str_at(manifest, &["kind"]), Some("Deployment" | "Job")))
+    {
+        let name = str_at(workload, &["metadata", "name"])
+            .or_else(|| str_at(workload, &["metadata", "generateName"]))
+            .unwrap_or("");
+        if str_at(workload, &["kind"]) == Some("Deployment") && name == "platform-api" {
+            continue;
+        }
+        let pod_spec = value_at(workload, &["spec", "template", "spec"]).unwrap_or(&Value::Null);
+        let exposes_volume = array_at_path(pod_spec, &["volumes"]).iter().any(|volume| {
+            str_at(volume, &["name"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME)
+                || str_at(volume, &["secret", "secretName"])
+                    == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_SECRET_NAME)
+        });
+        let exposes_mount = array_at_path(pod_spec, &["containers"])
+            .iter()
+            .flat_map(|container| array_at_path(container, &["volumeMounts"]))
+            .any(|mount| {
+                str_at(mount, &["name"]) == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME)
+                    || str_at(mount, &["mountPath"])
+                        == Some(SECRET_REFERENCE_FINGERPRINT_KEYRING_MOUNT_PATH)
+            });
+        expect(
+            !exposes_volume && !exposes_mount,
+            errors,
+            format!(
+                "{name} must not receive the platform-api SecretRef fingerprint keyring projection"
+            ),
+        );
+    }
 }
 
 fn validate_target_hardening(name: &str, deployment: &Value, errors: &mut Vec<String>) {
@@ -1757,10 +2156,182 @@ fn validate_network_policies(manifests: &[Value], errors: &mut Vec<String>) {
     validate_platform_api_ingress(&policies, errors);
     validate_portal_ui_egress(&policies, errors);
     validate_platform_api_egress(&policies, errors);
+    validate_vault_workload_auth_network(&policies, errors);
     validate_migration_database_network(&policies, errors);
     validate_worker_egress(&policies, errors);
     validate_dns_egress(&policies, errors);
     validate_egress_graph(&policies, errors);
+}
+
+fn validate_vault_workload_auth_network(policies: &[&Value], errors: &mut Vec<String>) {
+    let egress_policy = find_policy(policies, VAULT_API_EGRESS_POLICY);
+    let egress_rules = array_at_path(egress_policy, &["spec", "egress"]);
+    let egress_rule = egress_rules.first().copied().unwrap_or(&Value::Null);
+    let egress_targets = array_at_path(egress_rule, &["to"]);
+    let egress_target = egress_targets.first().copied().unwrap_or(&Value::Null);
+    expect(
+        str_at(egress_policy, &["metadata", "namespace"]) == Some(NAMESPACE)
+            && object_at(egress_policy, &["spec"]).is_some_and(|spec| {
+                object_has_exact_keys(spec, &["podSelector", "policyTypes", "egress"])
+            })
+            && exact_match_labels_selector(
+                value_at(egress_policy, &["spec", "podSelector"]).unwrap_or(&Value::Null),
+                &[
+                    ("app.kubernetes.io/part-of", PART_OF),
+                    ("app.kubernetes.io/name", "platform-api"),
+                ],
+            )
+            && string_array_at(egress_policy, &["spec", "policyTypes"])
+                == vec!["Egress".to_string()],
+        errors,
+        "Vault egress policy must select only ryuki-platform/platform-api",
+    );
+    expect(
+        egress_rules.len() == 1
+            && object(egress_rule)
+                .is_some_and(|rule| object_has_exact_keys(rule, &["to", "ports"]))
+            && egress_targets.len() == 1
+            && vault_server_peer(egress_target)
+            && exact_single_tcp_port(egress_rule, 8200),
+        errors,
+        "Vault egress must target only vault/vault server pods on TCP 8200",
+    );
+
+    let ingress_policy = find_policy(policies, VAULT_API_INGRESS_POLICY);
+    let ingress_rules = array_at_path(ingress_policy, &["spec", "ingress"]);
+    let ingress_rule = ingress_rules.first().copied().unwrap_or(&Value::Null);
+    let ingress_sources = array_at_path(ingress_rule, &["from"]);
+    let ingress_source = ingress_sources.first().copied().unwrap_or(&Value::Null);
+    expect(
+        str_at(ingress_policy, &["metadata", "namespace"]) == Some(VAULT_NAMESPACE)
+            && object_at(ingress_policy, &["spec"]).is_some_and(|spec| {
+                object_has_exact_keys(spec, &["podSelector", "policyTypes", "ingress"])
+            })
+            && exact_match_labels_selector(
+                value_at(ingress_policy, &["spec", "podSelector"]).unwrap_or(&Value::Null),
+                &[("app.kubernetes.io/name", "vault"), ("component", "server")],
+            )
+            && string_array_at(ingress_policy, &["spec", "policyTypes"])
+                == vec!["Ingress".to_string()],
+        errors,
+        "Vault ingress policy must select only vault/vault server pods",
+    );
+    expect(
+        ingress_rules.len() == 1
+            && object(ingress_rule)
+                .is_some_and(|rule| object_has_exact_keys(rule, &["from", "ports"]))
+            && ingress_sources.len() == 1
+            && exact_namespaced_pod_peer(
+                ingress_source,
+                NAMESPACE,
+                &[
+                    ("app.kubernetes.io/part-of", PART_OF),
+                    ("app.kubernetes.io/name", "platform-api"),
+                ],
+            )
+            && exact_single_tcp_port(ingress_rule, 8200),
+        errors,
+        "Vault ingress must admit only ryuki-platform/platform-api on TCP 8200",
+    );
+}
+
+fn validate_vault_token_review_binding(manifests: &[Value], errors: &mut Vec<String>) {
+    let bindings: Vec<&Value> = manifests
+        .iter()
+        .filter(|manifest| str_at(manifest, &["kind"]) == Some("ClusterRoleBinding"))
+        .collect();
+    expect(
+        bindings.len() == 1,
+        errors,
+        "exactly one Vault TokenReview ClusterRoleBinding is required",
+    );
+    let binding = bindings.first().copied().unwrap_or(&Value::Null);
+    let labels = object_at(binding, &["metadata", "labels"]);
+    let subjects = array_at_path(binding, &["subjects"]);
+    let subject = subjects.first().copied().unwrap_or(&Value::Null);
+    expect(
+        object(binding).is_some_and(|map| {
+            object_has_exact_keys(
+                map,
+                &["apiVersion", "kind", "metadata", "roleRef", "subjects"],
+            )
+        }) && str_at(binding, &["apiVersion"]) == Some("rbac.authorization.k8s.io/v1")
+            && str_at(binding, &["metadata", "name"]) == Some(VAULT_TOKEN_REVIEW_BINDING)
+            && object_at(binding, &["metadata"])
+                .is_some_and(|map| object_has_exact_keys(map, &["name", "labels"]))
+            && labels.is_some_and(|map| {
+                object_has_exact_keys(
+                    map,
+                    &["app.kubernetes.io/part-of", "app.kubernetes.io/name"],
+                )
+            })
+            && str_at(
+                binding,
+                &["metadata", "labels", "app.kubernetes.io/part-of"],
+            ) == Some(PART_OF)
+            && str_at(binding, &["metadata", "labels", "app.kubernetes.io/name"]) == Some("vault")
+            && value_at(binding, &["metadata", "namespace"]).is_none(),
+        errors,
+        "Vault TokenReview binding must retain the exact cluster-scoped identity and labels",
+    );
+    expect(
+        object_at(binding, &["roleRef"])
+            .is_some_and(|map| object_has_exact_keys(map, &["apiGroup", "kind", "name"]))
+            && str_at(binding, &["roleRef", "apiGroup"]) == Some("rbac.authorization.k8s.io")
+            && str_at(binding, &["roleRef", "kind"]) == Some("ClusterRole")
+            && str_at(binding, &["roleRef", "name"]) == Some("system:auth-delegator"),
+        errors,
+        "Vault TokenReview binding must reference only system:auth-delegator and never cluster-admin",
+    );
+    expect(
+        subjects.len() == 1
+            && object(subject)
+                .is_some_and(|map| object_has_exact_keys(map, &["kind", "name", "namespace"]))
+            && str_at(subject, &["kind"]) == Some("ServiceAccount")
+            && str_at(subject, &["name"]) == Some("vault")
+            && str_at(subject, &["namespace"]) == Some(VAULT_NAMESPACE),
+        errors,
+        "Vault TokenReview binding must contain only the vault/vault ServiceAccount subject",
+    );
+}
+
+fn exact_single_tcp_port(rule: &Value, expected_port: i64) -> bool {
+    let ports = array_at_path(rule, &["ports"]);
+    ports.len() == 1
+        && object(ports[0]).is_some_and(|port| object_has_exact_keys(port, &["protocol", "port"]))
+        && str_at(ports[0], &["protocol"]) == Some("TCP")
+        && int_at(ports[0], &["port"]) == Some(expected_port)
+}
+
+fn exact_match_labels_selector(selector: &Value, expected: &[(&str, &str)]) -> bool {
+    object(selector).is_some_and(|map| object_has_exact_keys(map, &["matchLabels"]))
+        && object_at(selector, &["matchLabels"]).is_some_and(|labels| {
+            labels.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(key, value)| labels.get(*key).and_then(Value::as_str) == Some(*value))
+        })
+}
+
+fn exact_namespaced_pod_peer(peer: &Value, namespace: &str, pod_labels: &[(&str, &str)]) -> bool {
+    object(peer)
+        .is_some_and(|map| object_has_exact_keys(map, &["namespaceSelector", "podSelector"]))
+        && exact_match_labels_selector(
+            value_at(peer, &["namespaceSelector"]).unwrap_or(&Value::Null),
+            &[("kubernetes.io/metadata.name", namespace)],
+        )
+        && exact_match_labels_selector(
+            value_at(peer, &["podSelector"]).unwrap_or(&Value::Null),
+            pod_labels,
+        )
+}
+
+fn vault_server_peer(peer: &Value) -> bool {
+    exact_namespaced_pod_peer(
+        peer,
+        VAULT_NAMESPACE,
+        &[("app.kubernetes.io/name", "vault"), ("component", "server")],
+    )
 }
 
 fn validate_platform_api_ingress(policies: &[&Value], errors: &mut Vec<String>) {
@@ -2117,6 +2688,11 @@ fn validate_no_cross_namespace_component_peers(policies: &[&Value], errors: &mut
                 if ingress_controller_peer(peer) {
                     continue;
                 }
+                if vault_server_peer(peer)
+                    && str_at(policy, &["metadata", "name"]) == Some(VAULT_API_EGRESS_POLICY)
+                {
+                    continue;
+                }
                 if object_at(peer, &["namespaceSelector"]).is_none() {
                     continue;
                 }
@@ -2173,7 +2749,12 @@ fn validate_egress_graph(policies: &[&Value], errors: &mut Vec<String>) {
             }
             for source in &sources {
                 for target in &targets {
-                    if !allowed_edges.contains(&(source.clone(), target.clone())) {
+                    let dedicated_vault_edge = source == "platform-api"
+                        && target == "vault"
+                        && str_at(policy, &["metadata", "name"]) == Some(VAULT_API_EGRESS_POLICY);
+                    if !dedicated_vault_edge
+                        && !allowed_edges.contains(&(source.clone(), target.clone()))
+                    {
                         errors.push(format!(
                             "NetworkPolicy {} has unapproved egress edge {source}->{target}",
                             str_at(policy, &["metadata", "name"]).unwrap_or("")
@@ -2233,6 +2814,160 @@ fn validate_source_texts(source_texts: &[SourceText], errors: &mut Vec<String>) 
             }
         }
     }
+}
+
+fn validate_vault_external_auth_files(source_texts: &[SourceText], errors: &mut Vec<String>) {
+    let exact_source = |path: &str| {
+        let matches: Vec<&SourceText> = source_texts
+            .iter()
+            .filter(|source| source.path == path)
+            .collect();
+        (matches.len() == 1).then(|| matches[0].text.as_str())
+    };
+
+    let workload_auth_text = exact_source(VAULT_WORKLOAD_AUTH_MANIFEST_PATH);
+    expect(
+        workload_auth_text.is_some(),
+        errors,
+        format!("{VAULT_WORKLOAD_AUTH_MANIFEST_PATH} must be loaded exactly once"),
+    );
+    if let Some(text) = workload_auth_text {
+        validate_yaml_duplicate_keys_text(text, VAULT_WORKLOAD_AUTH_MANIFEST_PATH, errors);
+    }
+    let workload_auth_documents = workload_auth_text
+        .and_then(|text| {
+            serde_yaml::Deserializer::from_str(text)
+                .map(Value::deserialize)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+        .unwrap_or_default();
+    expect(
+        workload_auth_documents.len() == 2
+            && str_at(&workload_auth_documents[0], &["kind"]) == Some("NetworkPolicy")
+            && str_at(&workload_auth_documents[0], &["metadata", "name"])
+                == Some(VAULT_API_INGRESS_POLICY)
+            && str_at(&workload_auth_documents[1], &["kind"]) == Some("ClusterRoleBinding")
+            && str_at(&workload_auth_documents[1], &["metadata", "name"])
+                == Some(VAULT_TOKEN_REVIEW_BINDING),
+        errors,
+        format!(
+            "{VAULT_WORKLOAD_AUTH_MANIFEST_PATH} must contain only the exact Vault ingress policy and TokenReview binding"
+        ),
+    );
+
+    let auth_config_text = exact_source(VAULT_KUBERNETES_AUTH_CONFIG_PATH);
+    expect(
+        auth_config_text.is_some(),
+        errors,
+        format!("{VAULT_KUBERNETES_AUTH_CONFIG_PATH} must be loaded exactly once"),
+    );
+    let auth_config = auth_config_text
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or(Value::Null);
+    let auth_config_keys = [
+        "disable_local_ca_jwt",
+        "kubernetes_host",
+        "use_annotations_as_alias_metadata",
+    ];
+    expect(
+        object(&auth_config).is_some_and(|map| object_has_exact_keys(map, &auth_config_keys))
+            && auth_config_text.is_some_and(|text| json_keys_appear_once(text, &auth_config_keys))
+            && bool_at(&auth_config, &["disable_local_ca_jwt"]) == Some(false)
+            && str_at(&auth_config, &["kubernetes_host"])
+                == Some("https://kubernetes.default.svc:443")
+            && bool_at(&auth_config, &["use_annotations_as_alias_metadata"]) == Some(false),
+        errors,
+        format!(
+            "{VAULT_KUBERNETES_AUTH_CONFIG_PATH} must use only the in-cluster rotating reviewer identity and exact Kubernetes API endpoint"
+        ),
+    );
+
+    let role_text = exact_source(VAULT_PLATFORM_API_ROLE_PATH);
+    expect(
+        role_text.is_some(),
+        errors,
+        format!("{VAULT_PLATFORM_API_ROLE_PATH} must be loaded exactly once"),
+    );
+    let role = role_text
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or(Value::Null);
+    let role_keys = [
+        "alias_name_source",
+        "audience",
+        "bound_service_account_names",
+        "bound_service_account_namespaces",
+        "token_explicit_max_ttl",
+        "token_max_ttl",
+        "token_no_default_policy",
+        "token_num_uses",
+        "token_period",
+        "token_policies",
+        "token_ttl",
+        "token_type",
+    ];
+    expect(
+        object(&role).is_some_and(|map| object_has_exact_keys(map, &role_keys))
+            && role_text.is_some_and(|text| json_keys_appear_once(text, &role_keys))
+            && str_at(&role, &["alias_name_source"]) == Some("serviceaccount_uid")
+            && str_at(&role, &["audience"]) == Some("vault")
+            && string_array_at(&role, &["bound_service_account_names"])
+                == vec!["platform-api".to_string()]
+            && string_array_at(&role, &["bound_service_account_namespaces"])
+                == vec![NAMESPACE.to_string()]
+            && int_at(&role, &["token_ttl"]) == Some(600)
+            && int_at(&role, &["token_max_ttl"]) == Some(900)
+            && int_at(&role, &["token_explicit_max_ttl"]) == Some(900)
+            && int_at(&role, &["token_num_uses"]) == Some(0)
+            && int_at(&role, &["token_period"]) == Some(0)
+            && bool_at(&role, &["token_no_default_policy"]) == Some(true)
+            && string_array_at(&role, &["token_policies"])
+                == vec![VAULT_PLATFORM_API_POLICY_NAME.to_string()]
+            && str_at(&role, &["token_type"]) == Some("service"),
+        errors,
+        format!(
+            "{VAULT_PLATFORM_API_ROLE_PATH} must bind only the exact API ServiceAccount, vault audience, finite non-periodic service token, and dedicated no-default policy"
+        ),
+    );
+
+    let policy_text = exact_source(VAULT_PLATFORM_API_POLICY_PATH);
+    expect(
+        policy_text.is_some(),
+        errors,
+        format!("{VAULT_PLATFORM_API_POLICY_PATH} must be loaded exactly once"),
+    );
+    let normalized_policy = policy_text
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let expected_policy = [
+        "path \"secret/data/ryuki-platform/platform-api/*\" {",
+        "capabilities = [\"read\"]",
+        "}",
+        "path \"secret/metadata/ryuki-platform/platform-api/*\" {",
+        "capabilities = [\"read\"]",
+        "}",
+    ]
+    .join("\n");
+    expect(
+        normalized_policy == expected_policy,
+        errors,
+        format!(
+            "{VAULT_PLATFORM_API_POLICY_PATH} must grant read only on the exact API KV-v2 data and metadata prefixes"
+        ),
+    );
+}
+
+fn json_keys_appear_once(text: &str, keys: &[&str]) -> bool {
+    keys.iter().all(|key| {
+        let quoted = format!("\"{key}\"");
+        text.matches(quoted.as_str()).count() == 1
+    })
 }
 
 fn validate_no_secret_values(
@@ -2414,11 +3149,24 @@ fn unsafe_manifest_key(key: &str, value: &Value, path: &str, manifest_kind: Opti
         && matches!(manifest_kind, Some("Deployment") | Some("Job"))
         && path.contains(".spec.template.spec.volumes[")
         && path.ends_with(".secret.secretName")
-        && value.as_str() == Some(CNPG_CA_SECRET_NAME)
+        && value.as_str().is_some_and(|name| {
+            name == CNPG_CA_SECRET_NAME
+                || name == VAULT_CLIENT_CA_SECRET_NAME
+                || name == SECRET_REFERENCE_FINGERPRINT_KEYRING_SECRET_NAME
+        })
     {
-        // The CNPG CA certificate is public trust material. Only its exact key
-        // is projected, so the operator-managed Secret's private CA key never
-        // crosses into either database client workload.
+        // The two named CA Secrets are public trust material, while the
+        // fingerprint keyring is a dedicated credential source. Their owning
+        // workload validators require one exact item and read-only mount, so no
+        // unrelated Secret key can cross into the client workload.
+        return false;
+    }
+    if manifest_kind == Some("ConfigMap")
+        && path.contains(".data.")
+        && PLATFORM_API_CONFIG_KEYS.contains(&key)
+    {
+        // The exact ConfigMap key inventory and all security-sensitive values
+        // are checked independently by `validate_config_maps`.
         return false;
     }
     if matches!(key, "host" | "hosts" | "secretName") {
@@ -2468,6 +3216,8 @@ fn safe_manifest_value(path: &str, value: &str) -> bool {
         || APPROVED_SCHEMA_VALUES.contains(&value)
         || value == "0.0.0.0:8080"
         || value == format!("https://{APPROVED_HOST}")
+        || (value == "https://vault.vault.svc:8200"
+            && path.ends_with(".data.RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT"))
         || (value == CNPG_CA_SECRET_KEY
             && path.contains(".spec.template.spec.volumes[")
             && (path.ends_with(".secret.items[0].key") || path.ends_with(".secret.items[0].path")))
@@ -2773,6 +3523,558 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("metadata.labels.note contains prohibited value")));
+    }
+
+    fn vault_manifest_fixture() -> Vec<Value> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        [
+            "deploy/kubernetes/base/serviceaccounts.yaml",
+            "deploy/kubernetes/base/configmap.yaml",
+            "deploy/kubernetes/base/deployments.yaml",
+            "deploy/kubernetes/base/networkpolicies.yaml",
+            VAULT_WORKLOAD_AUTH_MANIFEST_PATH,
+        ]
+        .iter()
+        .flat_map(|path| {
+            let raw = fs::read_to_string(root.join(path))
+                .unwrap_or_else(|error| panic!("{path} must be readable: {error}"));
+            serde_yaml::Deserializer::from_str(&raw)
+                .map(|document| {
+                    Value::deserialize(document)
+                        .unwrap_or_else(|error| panic!("{path} must parse: {error}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+    }
+
+    fn vault_external_source_fixture() -> Vec<SourceText> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        [
+            VAULT_WORKLOAD_AUTH_MANIFEST_PATH,
+            VAULT_KUBERNETES_AUTH_CONFIG_PATH,
+            VAULT_PLATFORM_API_ROLE_PATH,
+            VAULT_PLATFORM_API_POLICY_PATH,
+        ]
+        .iter()
+        .map(|path| SourceText {
+            path: (*path).to_string(),
+            text: fs::read_to_string(root.join(path))
+                .unwrap_or_else(|error| panic!("{path} must be readable: {error}")),
+        })
+        .collect()
+    }
+
+    fn vault_manifest_errors(manifests: &[Value]) -> Vec<String> {
+        let mut errors = Vec::new();
+        validate_config_maps(manifests, &mut errors);
+        let deployment = manifests
+            .iter()
+            .find(|manifest| {
+                str_at(manifest, &["kind"]) == Some("Deployment")
+                    && str_at(manifest, &["metadata", "name"]) == Some("platform-api")
+            })
+            .unwrap_or(&Value::Null);
+        let pod_spec = value_at(deployment, &["spec", "template", "spec"]).unwrap_or(&Value::Null);
+        let container = array_at_path(pod_spec, &["containers"])
+            .first()
+            .copied()
+            .unwrap_or(&Value::Null);
+        validate_cnpg_ca_mount(
+            "Deployment platform-api",
+            pod_spec,
+            container,
+            4,
+            &mut errors,
+        );
+        validate_platform_api_vault_workload_auth(
+            manifests,
+            deployment,
+            pod_spec,
+            container,
+            &mut errors,
+        );
+        validate_platform_api_secret_reference_fingerprint_keyring(
+            pod_spec,
+            container,
+            &mut errors,
+        );
+        validate_secret_reference_fingerprint_keyring_exposure(manifests, &mut errors);
+        let policies: Vec<&Value> = manifests
+            .iter()
+            .filter(|manifest| str_at(manifest, &["kind"]) == Some("NetworkPolicy"))
+            .collect();
+        validate_vault_workload_auth_network(&policies, &mut errors);
+        validate_vault_token_review_binding(manifests, &mut errors);
+        errors
+    }
+
+    #[test]
+    fn checked_in_vault_workload_auth_contract_is_exact() {
+        let manifests = vault_manifest_fixture();
+        let errors = vault_manifest_errors(&manifests);
+        assert!(
+            errors.is_empty(),
+            "checked-in Vault workload-auth manifests must pass: {errors:?}"
+        );
+
+        let sources = vault_external_source_fixture();
+        let mut errors = Vec::new();
+        validate_vault_external_auth_files(&sources, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "checked-in Vault bootstrap inputs must pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn vault_projected_identity_ca_and_safe_env_contract_reject_mutations() {
+        let manifests = vault_manifest_fixture();
+        let api_index = manifests
+            .iter()
+            .position(|manifest| {
+                str_at(manifest, &["kind"]) == Some("Deployment")
+                    && str_at(manifest, &["metadata", "name"]) == Some("platform-api")
+            })
+            .expect("platform-api Deployment");
+
+        for (label, pointer, replacement) in [
+            (
+                "ambient automount",
+                "/spec/template/spec/automountServiceAccountToken",
+                json!(true),
+            ),
+            (
+                "wrong pod group",
+                "/spec/template/spec/securityContext/fsGroup",
+                json!(10002),
+            ),
+            (
+                "writable token mode",
+                "/spec/template/spec/volumes/1/projected/defaultMode",
+                json!(0o660),
+            ),
+            (
+                "wrong audience",
+                "/spec/template/spec/volumes/1/projected/sources/0/serviceAccountToken/audience",
+                json!("kubernetes"),
+            ),
+            (
+                "long token lifetime",
+                "/spec/template/spec/volumes/1/projected/sources/0/serviceAccountToken/expirationSeconds",
+                json!(601),
+            ),
+            (
+                "alternate token path",
+                "/spec/template/spec/volumes/1/projected/sources/0/serviceAccountToken/path",
+                json!("alternate"),
+            ),
+            (
+                "substituted CA",
+                "/spec/template/spec/volumes/2/secret/secretName",
+                json!("unreviewed-ca"),
+            ),
+            (
+                "writable CA mode",
+                "/spec/template/spec/volumes/2/secret/defaultMode",
+                json!(0o660),
+            ),
+            (
+                "writable token mount",
+                "/spec/template/spec/containers/0/volumeMounts/1/readOnly",
+                json!(false),
+            ),
+            (
+                "substituted fingerprint keyring",
+                "/spec/template/spec/volumes/3/secret/secretName",
+                json!("unreviewed-keyring"),
+            ),
+            (
+                "writable fingerprint keyring mode",
+                "/spec/template/spec/volumes/3/secret/defaultMode",
+                json!(0o660),
+            ),
+            (
+                "alternate fingerprint keyring key",
+                "/spec/template/spec/volumes/3/secret/items/0/key",
+                json!("alternate"),
+            ),
+            (
+                "alternate fingerprint keyring item path",
+                "/spec/template/spec/volumes/3/secret/items/0/path",
+                json!("alternate"),
+            ),
+            (
+                "writable fingerprint keyring mount",
+                "/spec/template/spec/containers/0/volumeMounts/3/readOnly",
+                json!(false),
+            ),
+            (
+                "alternate fingerprint keyring mount path",
+                "/spec/template/spec/containers/0/volumeMounts/3/mountPath",
+                json!("/var/run/secrets/alternate"),
+            ),
+        ] {
+            let mut invalid = manifests.clone();
+            *invalid[api_index]
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing mutation pointer {pointer}")) = replacement;
+            let errors = vault_manifest_errors(&invalid);
+            assert!(
+                !errors.is_empty(),
+                "Vault workload-auth mutation {label} must fail closed"
+            );
+        }
+
+        let mut extra_source = manifests.clone();
+        extra_source[api_index]
+            .pointer_mut("/spec/template/spec/volumes/1/projected/sources")
+            .and_then(Value::as_array_mut)
+            .expect("projected token sources")
+            .push(json!({ "serviceAccountToken": {
+                "audience": "vault", "expirationSeconds": 600, "path": "second-token"
+            }}));
+        assert!(!vault_manifest_errors(&extra_source).is_empty());
+
+        let mut sub_path = manifests.clone();
+        sub_path[api_index]
+            .pointer_mut("/spec/template/spec/containers/0/volumeMounts/1")
+            .and_then(Value::as_object_mut)
+            .expect("Vault token mount")
+            .insert("subPath".to_string(), json!("token"));
+        assert!(!vault_manifest_errors(&sub_path).is_empty());
+
+        let mut extra_keyring_item = manifests.clone();
+        extra_keyring_item[api_index]
+            .pointer_mut("/spec/template/spec/volumes/3/secret/items")
+            .and_then(Value::as_array_mut)
+            .expect("fingerprint keyring items")
+            .push(json!({ "key": "additional", "path": "additional" }));
+        assert!(
+            !vault_manifest_errors(&extra_keyring_item).is_empty(),
+            "an additional projected fingerprint keyring key must fail closed"
+        );
+
+        let mut keyring_sub_path = manifests.clone();
+        keyring_sub_path[api_index]
+            .pointer_mut("/spec/template/spec/containers/0/volumeMounts/3")
+            .and_then(Value::as_object_mut)
+            .expect("fingerprint keyring mount")
+            .insert("subPath".to_string(), json!("keyring"));
+        assert!(
+            !vault_manifest_errors(&keyring_sub_path).is_empty(),
+            "a fingerprint keyring subPath mount must fail closed"
+        );
+
+        let portal_index = manifests
+            .iter()
+            .position(|manifest| {
+                str_at(manifest, &["kind"]) == Some("Deployment")
+                    && str_at(manifest, &["metadata", "name"]) == Some("portal-ui")
+            })
+            .expect("portal-ui Deployment");
+        let mut portal_exposure = manifests.clone();
+        portal_exposure[portal_index]["spec"]["template"]["spec"]["volumes"] = json!([{
+            "name": SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME,
+            "secret": {
+                "secretName": SECRET_REFERENCE_FINGERPRINT_KEYRING_SECRET_NAME,
+                "defaultMode": 0o440,
+                "items": [{ "key": "keyring", "path": "keyring" }]
+            }
+        }]);
+        portal_exposure[portal_index]["spec"]["template"]["spec"]["containers"][0]
+            ["volumeMounts"] = json!([{
+            "name": SECRET_REFERENCE_FINGERPRINT_KEYRING_VOLUME_NAME,
+            "mountPath": SECRET_REFERENCE_FINGERPRINT_KEYRING_MOUNT_PATH,
+            "readOnly": true
+        }]);
+        let errors = vault_manifest_errors(&portal_exposure);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("portal-ui") && error.contains("must not receive")),
+            "the fingerprint keyring must remain exposed only to platform-api: {errors:?}"
+        );
+
+        for forbidden_name in [
+            "VAULT_TOKEN",
+            "VAULT_SKIP_VERIFY",
+            "RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK",
+            "RYUKI_SECRET_PROVIDER_RUNTIME__TLS_SKIP_VERIFY",
+        ] {
+            let mut invalid = manifests.clone();
+            invalid[api_index]
+                .pointer_mut("/spec/template/spec/containers/0/env")
+                .and_then(Value::as_array_mut)
+                .expect("platform-api env")
+                .push(json!({ "name": forbidden_name, "value": "forbidden" }));
+            assert!(
+                !vault_manifest_errors(&invalid).is_empty(),
+                "forbidden environment key {forbidden_name} must fail closed"
+            );
+        }
+
+        for mutation in [
+            "remove-policy",
+            "substitute-endpoint",
+            "substitute-fingerprint-keyring-path",
+            "add-static-token",
+        ] {
+            let mut invalid = manifests.clone();
+            let config = invalid
+                .iter_mut()
+                .find(|manifest| {
+                    str_at(manifest, &["kind"]) == Some("ConfigMap")
+                        && str_at(manifest, &["metadata", "name"]) == Some("platform-api-config")
+                })
+                .expect("platform-api ConfigMap");
+            let data = config["data"].as_object_mut().expect("ConfigMap data");
+            match mutation {
+                "remove-policy" => {
+                    data.remove("RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY");
+                }
+                "substitute-endpoint" => {
+                    data.insert(
+                        "RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT".to_string(),
+                        json!("https://alternate.invalid:8200"),
+                    );
+                }
+                "substitute-fingerprint-keyring-path" => {
+                    data.insert(
+                        "RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH".to_string(),
+                        json!("/var/run/secrets/alternate/keyring"),
+                    );
+                }
+                "add-static-token" => {
+                    data.insert("VAULT_TOKEN".to_string(), json!("forbidden"));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !vault_manifest_errors(&invalid).is_empty(),
+                "ConfigMap mutation {mutation} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_network_and_tokenreview_rbac_reject_mutations() {
+        let manifests = vault_manifest_fixture();
+        for (policy_name, pointer, replacement) in [
+            (
+                VAULT_API_EGRESS_POLICY,
+                "/spec/podSelector/matchLabels/app.kubernetes.io~1name",
+                json!("portal-ui"),
+            ),
+            (
+                VAULT_API_EGRESS_POLICY,
+                "/spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name",
+                json!("default"),
+            ),
+            (
+                VAULT_API_EGRESS_POLICY,
+                "/spec/egress/0/to/0/podSelector/matchLabels/component",
+                json!("injector"),
+            ),
+            (
+                VAULT_API_EGRESS_POLICY,
+                "/spec/egress/0/ports/0/port",
+                json!(443),
+            ),
+            (
+                VAULT_API_INGRESS_POLICY,
+                "/metadata/namespace",
+                json!(NAMESPACE),
+            ),
+            (
+                VAULT_API_INGRESS_POLICY,
+                "/spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name",
+                json!("default"),
+            ),
+            (
+                VAULT_API_INGRESS_POLICY,
+                "/spec/ingress/0/from/0/podSelector/matchLabels/app.kubernetes.io~1name",
+                json!("portal-ui"),
+            ),
+            (
+                VAULT_API_INGRESS_POLICY,
+                "/spec/ingress/0/ports/0/port",
+                json!(8201),
+            ),
+        ] {
+            let mut invalid = manifests.clone();
+            let policy = invalid
+                .iter_mut()
+                .find(|manifest| {
+                    str_at(manifest, &["kind"]) == Some("NetworkPolicy")
+                        && str_at(manifest, &["metadata", "name"]) == Some(policy_name)
+                })
+                .unwrap_or_else(|| panic!("missing NetworkPolicy {policy_name}"));
+            *policy
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing mutation pointer {pointer}")) = replacement;
+            let policies: Vec<&Value> = invalid
+                .iter()
+                .filter(|manifest| str_at(manifest, &["kind"]) == Some("NetworkPolicy"))
+                .collect();
+            let mut errors = Vec::new();
+            validate_vault_workload_auth_network(&policies, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "network mutation {policy_name}{pointer} must fail closed"
+            );
+        }
+
+        let mut smuggled_vault_edge = manifests.clone();
+        let database_egress = smuggled_vault_edge
+            .iter_mut()
+            .find(|manifest| {
+                str_at(manifest, &["kind"]) == Some("NetworkPolicy")
+                    && str_at(manifest, &["metadata", "name"])
+                        == Some("allow-platform-api-egress-to-db")
+            })
+            .expect("platform-api database egress policy");
+        database_egress["spec"]["egress"][0]["to"] = json!([{
+            "namespaceSelector": { "matchLabels": {
+                "kubernetes.io/metadata.name": VAULT_NAMESPACE
+            }},
+            "podSelector": { "matchLabels": {
+                "app.kubernetes.io/name": "vault",
+                "component": "server"
+            }}
+        }]);
+        database_egress["spec"]["egress"][0]
+            .as_object_mut()
+            .expect("database egress rule")
+            .remove("ports");
+        let policies: Vec<&Value> = smuggled_vault_edge
+            .iter()
+            .filter(|manifest| str_at(manifest, &["kind"]) == Some("NetworkPolicy"))
+            .collect();
+        let mut errors = Vec::new();
+        validate_no_cross_namespace_component_peers(&policies, &mut errors);
+        validate_egress_graph(&policies, &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "an all-ports Vault edge smuggled into another expected API policy must fail closed"
+        );
+
+        for (label, pointer, replacement) in [
+            ("cluster-admin", "/roleRef/name", json!("cluster-admin")),
+            ("wrong subject", "/subjects/0/name", json!("platform-api")),
+            ("wrong namespace", "/subjects/0/namespace", json!(NAMESPACE)),
+        ] {
+            let mut invalid = manifests.clone();
+            let binding = invalid
+                .iter_mut()
+                .find(|manifest| str_at(manifest, &["kind"]) == Some("ClusterRoleBinding"))
+                .expect("Vault TokenReview binding");
+            *binding
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing RBAC mutation pointer {pointer}")) = replacement;
+            let mut errors = Vec::new();
+            validate_vault_token_review_binding(&invalid, &mut errors);
+            assert!(!errors.is_empty(), "RBAC mutation {label} must fail closed");
+        }
+
+        let mut extra_subject = manifests.clone();
+        extra_subject
+            .iter_mut()
+            .find(|manifest| str_at(manifest, &["kind"]) == Some("ClusterRoleBinding"))
+            .and_then(|binding| binding.pointer_mut("/subjects"))
+            .and_then(Value::as_array_mut)
+            .expect("Vault TokenReview subjects")
+            .push(
+                json!({ "kind": "ServiceAccount", "name": "platform-api", "namespace": NAMESPACE }),
+            );
+        let mut errors = Vec::new();
+        validate_vault_token_review_binding(&extra_subject, &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "additional RBAC subject must fail closed"
+        );
+    }
+
+    #[test]
+    fn vault_auth_role_and_policy_bootstrap_inputs_reject_mutations() {
+        let sources = vault_external_source_fixture();
+
+        for (path, pointer, replacement) in [
+            (
+                VAULT_KUBERNETES_AUTH_CONFIG_PATH,
+                "/disable_local_ca_jwt",
+                json!(true),
+            ),
+            (VAULT_PLATFORM_API_ROLE_PATH, "/audience", json!("other")),
+            (VAULT_PLATFORM_API_ROLE_PATH, "/token_ttl", json!(901)),
+            (
+                VAULT_PLATFORM_API_ROLE_PATH,
+                "/token_no_default_policy",
+                json!(false),
+            ),
+            (
+                VAULT_PLATFORM_API_ROLE_PATH,
+                "/token_policies",
+                json!(["default"]),
+            ),
+        ] {
+            let mut invalid = sources.clone();
+            let source = invalid
+                .iter_mut()
+                .find(|source| source.path == path)
+                .unwrap_or_else(|| panic!("missing source {path}"));
+            let mut document: Value =
+                serde_json::from_str(&source.text).expect("JSON bootstrap input");
+            *document
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing JSON mutation pointer {pointer}")) = replacement;
+            source.text = serde_json::to_string_pretty(&document).expect("serialize mutation");
+            let mut errors = Vec::new();
+            validate_vault_external_auth_files(&invalid, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "bootstrap mutation {path}{pointer} must fail closed"
+            );
+        }
+
+        for (from, to) in [
+            (
+                "capabilities = [\"read\"]",
+                "capabilities = [\"read\", \"update\"]",
+            ),
+            (
+                "secret/data/ryuki-platform/platform-api/*",
+                "secret/data/ryuki-platform/*",
+            ),
+        ] {
+            let mut invalid = sources.clone();
+            let policy = invalid
+                .iter_mut()
+                .find(|source| source.path == VAULT_PLATFORM_API_POLICY_PATH)
+                .expect("Vault policy source");
+            policy.text = policy.text.replacen(from, to, 1);
+            let mut errors = Vec::new();
+            validate_vault_external_auth_files(&invalid, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "broadened Vault policy mutation must fail closed"
+            );
+        }
+
+        let mut duplicate_key = sources.clone();
+        let auth_config = duplicate_key
+            .iter_mut()
+            .find(|source| source.path == VAULT_KUBERNETES_AUTH_CONFIG_PATH)
+            .expect("Vault Kubernetes auth config");
+        auth_config.text = auth_config
+            .text
+            .replacen('{', "{\"disable_local_ca_jwt\": true,", 1);
+        let mut errors = Vec::new();
+        validate_vault_external_auth_files(&duplicate_key, &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "duplicate bootstrap JSON keys must fail closed"
+        );
     }
 
     // ── target hardening helpers ──────────────────────────────────────

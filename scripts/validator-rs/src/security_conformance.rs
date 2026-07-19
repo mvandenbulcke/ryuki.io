@@ -52,7 +52,7 @@ const SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA: &str = include_str!(
     "../../../catalog/security-contracts/v1/secret-provider-runtime-binding.schema.json"
 );
 
-const SCHEMAS: [(&str, &str); 13] = [
+const SCHEMAS: [(&str, &str); 15] = [
     (
         "action-resource-registry.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json",
@@ -102,8 +102,16 @@ const SCHEMAS: [(&str, &str); 13] = [
         "https://ryuki.io/schemas/security-contracts/v1/security-limit-profile.schema.json",
     ),
     (
+        "secret-lease-metadata.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/secret-lease-metadata.schema.json",
+    ),
+    (
         "secret-provider-runtime-binding.schema.json",
         "https://ryuki.io/schemas/security-contracts/v1/secret-provider-runtime-binding.schema.json",
+    ),
+    (
+        "secret-ref.schema.json",
+        "https://ryuki.io/schemas/security-contracts/v1/secret-ref.schema.json",
     ),
 ];
 
@@ -8686,6 +8694,305 @@ mod tests {
             error.contains("authoritative receipt package-exit-receipt:authoritative-candidate")
                 && error.contains("superseded")
         }));
+    }
+
+    #[test]
+    fn secret_wire_schemas_accept_exact_serde_shapes() {
+        let reference_schema = load("catalog/security-contracts/v1/secret-ref.schema.json");
+        let lease_schema = load("catalog/security-contracts/v1/secret-lease-metadata.schema.json");
+        let fingerprint = format!("hmac-sha256:{}", "a".repeat(64));
+
+        let pinned_reference = json!({
+            "schemaVersion": 1,
+            "providerId": "provider:vault-primary",
+            "providerConfigVersion": 7,
+            "deploymentId": "deployment:prod-eu",
+            "trustDomainId": "trust-domain:prod-eu",
+            "tenantId": "tenant:one",
+            "referenceFingerprint": fingerprint,
+            "fingerprintKeyId": "key:secret-ref-fingerprint-v2",
+            "opaqueLocator": "secret/ryuki/vendor",
+            "fieldSelector": "password",
+            "purpose": "purpose:integration-authentication",
+            "versionSelector": {
+                "kind": "pinned",
+                "secretVersion": "42"
+            }
+        });
+        let mut errors = Vec::new();
+        validate_instance(
+            "pinned SecretRef fixture",
+            "secret-ref.schema.json",
+            &reference_schema,
+            &pinned_reference,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut latest_reference = pinned_reference;
+        latest_reference
+            .as_object_mut()
+            .expect("SecretRef object")
+            .remove("tenantId");
+        latest_reference
+            .as_object_mut()
+            .expect("SecretRef object")
+            .remove("fieldSelector");
+        latest_reference["versionSelector"] = json!({"kind": "latest-at-resolve"});
+        let mut errors = Vec::new();
+        validate_instance(
+            "latest-at-resolve SecretRef fixture",
+            "secret-ref.schema.json",
+            &reference_schema,
+            &latest_reference,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let requested = json!({
+            "schemaVersion": 1,
+            "referenceFingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+            "fingerprintKeyId": "key:secret-ref-fingerprint-v2",
+            "providerId": "provider:vault-primary",
+            "providerConfigVersion": 7,
+            "adapterCapabilityVersion": "1.0.0",
+            "deploymentId": "deployment:prod-eu",
+            "trustDomainId": "trust-domain:prod-eu",
+            "tenantId": "tenant:one",
+            "workloadId": "workload:platform-api",
+            "purpose": "purpose:integration-authentication",
+            "resolutionMode": "pinned",
+            "requestedVersion": "42",
+            "revocationOwner": "workload-runtime",
+            "requestId": "request:123",
+            "authorityEpoch": 9,
+            "fencingToken": 11,
+            "lifecycleState": "requested"
+        });
+        let mut errors = Vec::new();
+        validate_instance(
+            "requested SecretLeaseMetadata fixture",
+            "secret-lease-metadata.schema.json",
+            &lease_schema,
+            &requested,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut active = requested.clone();
+        active["lifecycleState"] = json!("active");
+        active["leaseId"] = json!("lease:123");
+        active["resolvedVersion"] = json!("42");
+        active["issuedAt"] = json!("2026-07-19T08:00:00Z");
+        active["expiresAt"] = json!("2026-07-19T09:00:00Z");
+        let mut errors = Vec::new();
+        validate_instance(
+            "active SecretLeaseMetadata fixture",
+            "secret-lease-metadata.schema.json",
+            &lease_schema,
+            &active,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut failed_without_issuance = requested.clone();
+        failed_without_issuance["lifecycleState"] = json!("failed");
+        failed_without_issuance["terminalAt"] = json!("2026-07-19T08:01:00Z");
+        let mut errors = Vec::new();
+        validate_instance(
+            "pre-issuance failed SecretLeaseMetadata fixture",
+            "secret-lease-metadata.schema.json",
+            &lease_schema,
+            &failed_without_issuance,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut failed_after_issuance = active;
+        failed_after_issuance["lifecycleState"] = json!("failed");
+        failed_after_issuance["terminalAt"] = json!("2026-07-19T08:30:00Z");
+        let mut errors = Vec::new();
+        validate_instance(
+            "post-issuance failed SecretLeaseMetadata fixture",
+            "secret-lease-metadata.schema.json",
+            &lease_schema,
+            &failed_after_issuance,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn secret_wire_schemas_reject_noncanonical_and_inconsistent_shapes() {
+        let reference_schema = load("catalog/security-contracts/v1/secret-ref.schema.json");
+        let lease_schema = load("catalog/security-contracts/v1/secret-lease-metadata.schema.json");
+        let reference = json!({
+            "schemaVersion": 1,
+            "providerId": "provider:vault-primary",
+            "providerConfigVersion": 7,
+            "deploymentId": "deployment:prod-eu",
+            "trustDomainId": "trust-domain:prod-eu",
+            "referenceFingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+            "fingerprintKeyId": "key:secret-ref-fingerprint-v2",
+            "opaqueLocator": "secret/ryuki/vendor",
+            "purpose": "purpose:integration-authentication",
+            "versionSelector": {
+                "kind": "pinned",
+                "secretVersion": "42"
+            }
+        });
+        let invalid_references = [
+            {
+                let mut value = reference.clone();
+                value["secretValue"] = json!("forbidden");
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value["referenceFingerprint"] = json!(format!("sha256:{}", "a".repeat(64)));
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value["providerConfigVersion"] = json!(0);
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value["opaqueLocator"] = json!(" secret/ryuki/vendor");
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value["versionSelector"] = json!({"kind": "pinned"});
+                value
+            },
+            {
+                let mut value = reference.clone();
+                value["versionSelector"] = json!({
+                    "kind": "latest-at-resolve",
+                    "secretVersion": "42"
+                });
+                value
+            },
+        ];
+        for invalid in invalid_references {
+            let mut errors = Vec::new();
+            validate_instance(
+                "invalid SecretRef fixture",
+                "secret-ref.schema.json",
+                &reference_schema,
+                &invalid,
+                &mut errors,
+            );
+            assert!(!errors.is_empty(), "invalid SecretRef unexpectedly passed");
+        }
+
+        let requested = json!({
+            "schemaVersion": 1,
+            "referenceFingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+            "fingerprintKeyId": "key:secret-ref-fingerprint-v2",
+            "providerId": "provider:vault-primary",
+            "providerConfigVersion": 7,
+            "adapterCapabilityVersion": "1.0.0",
+            "deploymentId": "deployment:prod-eu",
+            "trustDomainId": "trust-domain:prod-eu",
+            "workloadId": "workload:platform-api",
+            "purpose": "purpose:integration-authentication",
+            "resolutionMode": "pinned",
+            "requestedVersion": "42",
+            "revocationOwner": "workload-runtime",
+            "requestId": "request:123",
+            "authorityEpoch": 9,
+            "fencingToken": 11,
+            "lifecycleState": "requested"
+        });
+        let invalid_leases = [
+            {
+                let mut value = requested.clone();
+                value["leaseId"] = json!("lease:fabricated");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["lifecycleState"] = json!("active");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["lifecycleState"] = json!("issued");
+                value["leaseId"] = json!("lease:123");
+                value["resolvedVersion"] = json!("42");
+                value["issuedAt"] = json!("2026-07-19T08:00:00Z");
+                value["expiresAt"] = json!("2026-07-19T09:00:00Z");
+                value["terminalAt"] = json!("2026-07-19T08:30:00Z");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["lifecycleState"] = json!("revoked");
+                value["leaseId"] = json!("lease:123");
+                value["resolvedVersion"] = json!("42");
+                value["issuedAt"] = json!("2026-07-19T08:00:00Z");
+                value["expiresAt"] = json!("2026-07-19T09:00:00Z");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["lifecycleState"] = json!("failed");
+                value["leaseId"] = json!("lease:partial");
+                value["terminalAt"] = json!("2026-07-19T08:30:00Z");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value
+                    .as_object_mut()
+                    .expect("lease object")
+                    .remove("requestId");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["fencingToken"] = json!(0);
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["lifecycleState"] = json!("failed");
+                value["terminalAt"] = json!("not-a-timestamp");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["rawProviderError"] = json!("forbidden");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["resolutionMode"] = json!("latest-at-resolve");
+                value
+            },
+            {
+                let mut value = requested.clone();
+                value["requestedVersion"] = serde_json::Value::Null;
+                value
+            },
+        ];
+        for invalid in invalid_leases {
+            let mut errors = Vec::new();
+            validate_instance(
+                "invalid SecretLeaseMetadata fixture",
+                "secret-lease-metadata.schema.json",
+                &lease_schema,
+                &invalid,
+                &mut errors,
+            );
+            assert!(
+                !errors.is_empty(),
+                "invalid SecretLeaseMetadata unexpectedly passed"
+            );
+        }
     }
 
     #[test]

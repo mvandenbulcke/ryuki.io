@@ -19,18 +19,29 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::num::NonZeroU64;
+use std::path::Path as FilePath;
+use std::sync::{Arc, OnceLock};
 use zeroize::Zeroize;
 
 use crate::audit;
 use crate::database::get_db;
+use crate::secret_provider_runtime::VaultKubernetesRuntime;
 use ryuki_core::config::{AuthMode, RyukiConfig, SecretProvider};
 use ryuki_engine::integration_connections::{
     test_connection_stub, CredentialSource, ExecutionMode, IntegrationConnection, TestResult,
+};
+use ryuki_engine::secret_material::{
+    IssuedSecretLease, ResolvedSecret, SecretLeaseLifecycleInput, SecretLeaseMetadata,
+    SecretLeaseRevocationOwner, SecretMaterial, SecretRef, SecretResolutionContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -172,7 +183,7 @@ fn decrypt_secret_with_key(
 // ---------------------------------------------------------------------------
 
 /// Errors from credential resolution or encryption operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum CredError {
     #[error("encryption key unavailable: RYUKI_INTEGRATION__ENCRYPTION_KEY not set")]
     KeyUnavailable,
@@ -190,15 +201,13 @@ pub enum CredError {
     Db(String),
     #[error("secret row not found for connection")]
     SecretNotFound,
-    #[error("env-var credential error: variable '{0}' is not set")]
+    #[error("env-var credential is unavailable")]
     EnvVarMissing(String),
     /// FIX-6: env-var key name failed the allow-list check.
-    #[error(
-        "env-var key '{0}' is not permitted: must start with 'RYUKI_INTEGRATION__' (not the encryption key or other platform vars)"
-    )]
+    #[error("env-var credential reference is not permitted")]
     EnvVarDenied(String),
-    /// Vault resolution error — carries the handle / field NAME / HTTP status
-    /// only, NEVER secret material (see `VaultKv2Resolver`).
+    /// Vault resolution error — carries only a bounded operation summary or
+    /// HTTP status, never the locator, selector, URL, token, or secret material.
     #[error("vault resolver error: {0}")]
     Vault(String),
     /// Vault-backed credentials must never silently resolve through a mock in
@@ -210,6 +219,25 @@ pub enum CredError {
     /// never secret material.
     #[error("secret resolver unavailable for selected provider '{0}'")]
     SecretProviderUnavailable(String),
+    #[error("typed secret reference is invalid")]
+    SecretReferenceInvalid,
+    #[error("secret-provider runtime binding is unavailable")]
+    SecretProviderBindingUnavailable,
+    #[error("typed secret reference is outside the admitted resolution scope")]
+    SecretScopeMismatch,
+    #[error("legacy Vault credential references are allowed only in explicit local dry-run")]
+    LegacyVaultReferenceDenied,
+    #[error("typed secret reference generation changed during resolution")]
+    SecretReferenceGenerationChanged,
+}
+
+// Keep error Debug output on the same curated, locator-free surface as
+// Display. In particular, the retained legacy env-key strings inside the two
+// compatibility variants must never be revealed by `{:?}` logging.
+impl std::fmt::Debug for CredError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 /// Resolved credentials — re-exported from `ryuki_engine::runners` so that
@@ -224,16 +252,283 @@ pub use ryuki_engine::runners::ResolvedCredentials;
 
 /// Boxed future returned by [`SecretResolver::resolve`] — keeps the trait
 /// object-safe (`&dyn SecretResolver`) while allowing async provider adapters.
-pub type SecretResolveFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, CredError>> + Send + 'a>>;
+pub type SecretResolveFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ResolvedSecret, CredError>> + Send + 'a>,
+>;
 
 /// Narrow provider-neutral resolution capability. Domain credential dispatch
 /// depends on this interface, never on a concrete Vault/OpenBao/cloud adapter.
 /// Additional provider capabilities remain separate interfaces per SB-SEC-06.
 pub trait SecretResolver: Send + Sync {
-    /// Resolve the secret at `handle`. Returns opaque bytes.
-    /// Must NOT log the returned material or include it in any error.
-    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a>;
+    /// Resolve one provider-qualified reference in an independently derived
+    /// scope. Implementations must validate both before protocol I/O and must
+    /// return typed, value-free version/lease metadata beside zeroizing bytes.
+    fn resolve<'a>(
+        &'a self,
+        secret_ref: &'a SecretRef,
+        context: &'a SecretResolutionContext,
+    ) -> SecretResolveFuture<'a>;
+}
+
+type LegacySecretResolveFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, CredError>> + Send + 'a>>;
+
+type SecretReferenceHmac = Hmac<Sha256>;
+
+/// Dedicated, versioned HMAC keyring for value-free SecretRef fingerprints.
+/// It intentionally cannot be constructed from session, webhook, encryption,
+/// or provider bearer keys. Until startup injects this server-governed keyring,
+/// typed writes and typed resolution fail closed.
+pub(crate) struct SecretReferenceFingerprintKeyring {
+    keys: BTreeMap<String, zeroize::Zeroizing<Vec<u8>>>,
+}
+
+impl SecretReferenceFingerprintKeyring {
+    const MAX_FILE_BYTES: u64 = 32 * 1024;
+    const MAX_KEYS: usize = 8;
+    const MAX_LINE_BYTES: usize = 512;
+
+    fn valid_entry(key_id: &str, material: &[u8]) -> bool {
+        let key_suffix = key_id.strip_prefix("key:");
+        key_suffix.is_some_and(|suffix| !suffix.is_empty())
+            && key_id.len() <= 256
+            && key_id.trim() == key_id
+            && key_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-' | b'/')
+            })
+            && (32..=128).contains(&material.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new(
+        entries: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> Result<Self, CredError> {
+        let entries = entries
+            .into_iter()
+            .map(|(key_id, material)| (key_id, zeroize::Zeroizing::new(material)))
+            .collect::<Vec<_>>();
+        let mut keys = BTreeMap::new();
+        for (key_id, material) in entries {
+            if !Self::valid_entry(&key_id, material.as_slice()) {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+            match keys.entry(key_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(material);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(CredError::SecretProviderBindingUnavailable);
+                }
+            }
+            if keys.len() > Self::MAX_KEYS {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+        }
+        if keys.is_empty() {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        Ok(Self { keys })
+    }
+
+    /// Load a bounded, versioned fingerprint-key overlap set from a regular
+    /// caller-selected file. Kubernetes projected-volume symlinks are allowed
+    /// only when their canonical target remains inside the selected file's
+    /// parent directory. Every line is exactly
+    /// `key:<id>=<canonical padded standard Base64>`; comments, blank lines,
+    /// duplicate ids, non-canonical encodings, and escaping symlinks fail closed.
+    pub(crate) fn from_file(path: &FilePath) -> Result<Arc<Self>, CredError> {
+        let parent = path
+            .parent()
+            .ok_or(CredError::SecretProviderBindingUnavailable)?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        let canonical_path =
+            std::fs::canonicalize(path).map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        if canonical_path == canonical_parent || !canonical_path.starts_with(&canonical_parent) {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+
+        let file = std::fs::File::open(&canonical_path)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > Self::MAX_FILE_BYTES {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        let mut encoded_file = zeroize::Zeroizing::new(Vec::new());
+        file.take(Self::MAX_FILE_BYTES + 1)
+            .read_to_end(&mut encoded_file)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        if encoded_file.is_empty() || encoded_file.len() as u64 > Self::MAX_FILE_BYTES {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        let text = std::str::from_utf8(encoded_file.as_slice())
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        let mut keys = BTreeMap::new();
+        for line in text.lines() {
+            if line.is_empty()
+                || line.len() > Self::MAX_LINE_BYTES
+                || line.trim() != line
+                || line.chars().any(char::is_whitespace)
+                || keys.len() == Self::MAX_KEYS
+            {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+            let (key_id, encoded_material) = line
+                .split_once('=')
+                .ok_or(CredError::SecretProviderBindingUnavailable)?;
+            if encoded_material.is_empty() {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+            let material = zeroize::Zeroizing::new(
+                B64.decode(encoded_material)
+                    .map_err(|_| CredError::SecretProviderBindingUnavailable)?,
+            );
+            if B64.encode(material.as_slice()) != encoded_material
+                || !Self::valid_entry(key_id, material.as_slice())
+                || keys.insert(key_id.to_string(), material).is_some()
+            {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+        }
+        if keys.is_empty() {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        Ok(Arc::new(Self { keys }))
+    }
+
+    fn update_field(mac: &mut SecretReferenceHmac, name: &[u8], value: &[u8]) {
+        mac.update(&(name.len() as u32).to_be_bytes());
+        mac.update(name);
+        mac.update(&(value.len() as u64).to_be_bytes());
+        mac.update(value);
+    }
+
+    fn update_optional_field(mac: &mut SecretReferenceHmac, name: &[u8], value: Option<&str>) {
+        match value {
+            Some(value) => {
+                mac.update(&[1]);
+                Self::update_field(mac, name, value.as_bytes());
+            }
+            None => {
+                mac.update(&[0]);
+                Self::update_field(mac, name, &[]);
+            }
+        }
+    }
+
+    fn mac_for(&self, secret_ref: &SecretRef) -> Result<SecretReferenceHmac, CredError> {
+        let key = self
+            .keys
+            .get(secret_ref.fingerprint_key_id())
+            .ok_or(CredError::SecretProviderBindingUnavailable)?;
+        let mut mac = <SecretReferenceHmac as Mac>::new_from_slice(key.as_slice())
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+        mac.update(b"ryuki-secret-reference-fingerprint-v1\0");
+        Self::update_field(
+            &mut mac,
+            b"provider-id",
+            secret_ref.provider_id().as_bytes(),
+        );
+        Self::update_field(
+            &mut mac,
+            b"provider-config-version",
+            &secret_ref.provider_config_version().to_be_bytes(),
+        );
+        Self::update_field(
+            &mut mac,
+            b"deployment-id",
+            secret_ref.deployment_id().as_bytes(),
+        );
+        Self::update_field(
+            &mut mac,
+            b"trust-domain-id",
+            secret_ref.trust_domain_id().as_bytes(),
+        );
+        Self::update_optional_field(&mut mac, b"tenant-id", secret_ref.tenant_id());
+        Self::update_field(
+            &mut mac,
+            b"fingerprint-key-id",
+            secret_ref.fingerprint_key_id().as_bytes(),
+        );
+        Self::update_field(
+            &mut mac,
+            b"opaque-locator",
+            secret_ref.opaque_locator().as_bytes(),
+        );
+        Self::update_optional_field(&mut mac, b"field-selector", secret_ref.field_selector());
+        Self::update_field(&mut mac, b"purpose", secret_ref.purpose().as_bytes());
+        match secret_ref.version_selector().pinned_version() {
+            Some(version) => {
+                Self::update_field(&mut mac, b"version-selector-kind", b"pinned");
+                Self::update_field(&mut mac, b"secret-version", version.as_bytes());
+            }
+            None => {
+                Self::update_field(&mut mac, b"version-selector-kind", b"latest-at-resolve");
+                Self::update_field(&mut mac, b"secret-version", &[]);
+            }
+        }
+        Ok(mac)
+    }
+
+    fn verify(&self, secret_ref: &SecretRef) -> Result<(), CredError> {
+        let encoded = secret_ref
+            .reference_fingerprint()
+            .strip_prefix("hmac-sha256:")
+            .ok_or(CredError::SecretReferenceInvalid)?;
+        if encoded.len() != 64 {
+            return Err(CredError::SecretReferenceInvalid);
+        }
+        let mut expected = [0_u8; 32];
+        for (index, byte) in expected.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                .map_err(|_| CredError::SecretReferenceInvalid)?;
+        }
+        self.mac_for(secret_ref)?
+            .verify_slice(&expected)
+            .map_err(|_| CredError::SecretReferenceInvalid)
+    }
+}
+
+/// Expand-phase compatibility only. Production typed consumers never receive
+/// this capability and cannot fall back to it after typed decode begins.
+trait LegacySecretResolver: Send + Sync {
+    fn resolve_legacy<'a>(&'a self, handle: &'a str) -> LegacySecretResolveFuture<'a>;
+}
+
+fn resolved_secret_with_local_material_scope(
+    secret_ref: &SecretRef,
+    context: &SecretResolutionContext,
+    material: Vec<u8>,
+    resolved_version: &str,
+    adapter_capability_version: &str,
+) -> Result<ResolvedSecret, CredError> {
+    context
+        .admits(secret_ref)
+        .map_err(|_| CredError::SecretScopeMismatch)?;
+    let issued_at = chrono::Utc::now();
+    // Static KV reads do not create an upstream renewable lease. The bounded
+    // local material scope records how long this returned allocation may live;
+    // it must not be interpreted as provider-side lease authority.
+    let expires_at = issued_at + chrono::Duration::seconds(10);
+    let issued = IssuedSecretLease::try_new(
+        format!("lease:material-scope:{}", uuid::Uuid::new_v4()),
+        resolved_version,
+        issued_at,
+        expires_at,
+    )
+    .map_err(|_| CredError::SecretReferenceInvalid)?;
+    let metadata = SecretLeaseMetadata::try_new(
+        secret_ref,
+        context,
+        adapter_capability_version,
+        SecretLeaseRevocationOwner::WorkloadRuntime,
+        SecretLeaseLifecycleInput::Active(issued),
+    )
+    .map_err(|_| CredError::SecretReferenceInvalid)?;
+    let material = SecretMaterial::new(material).map_err(|_| CredError::SecretReferenceInvalid)?;
+    Ok(ResolvedSecret { material, metadata })
 }
 
 /// Explicit static/mock dry-run secret resolver. Returns a deterministic
@@ -242,10 +537,40 @@ pub trait SecretResolver: Send + Sync {
 #[derive(Debug)]
 struct DevelopmentSecretResolver;
 
+impl DevelopmentSecretResolver {
+    #[cfg(test)]
+    async fn resolve(&self, handle: &str) -> Result<Vec<u8>, CredError> {
+        self.resolve_legacy(handle).await
+    }
+}
+
 impl SecretResolver for DevelopmentSecretResolver {
-    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a> {
-        // Return a deterministic stub — NOT real secret material.
-        Box::pin(async move { Ok(format!("mock-secret-resolved:{handle}").into_bytes()) })
+    fn resolve<'a>(
+        &'a self,
+        secret_ref: &'a SecretRef,
+        context: &'a SecretResolutionContext,
+    ) -> SecretResolveFuture<'a> {
+        Box::pin(async move {
+            // Deterministic non-secret marker keyed only by the approved
+            // fingerprint, never the opaque locator.
+            resolved_secret_with_local_material_scope(
+                secret_ref,
+                context,
+                format!(
+                    "mock-secret-resolved:{}",
+                    secret_ref.reference_fingerprint()
+                )
+                .into_bytes(),
+                "development",
+                "development-secret-resolver.v1",
+            )
+        })
+    }
+}
+
+impl LegacySecretResolver for DevelopmentSecretResolver {
+    fn resolve_legacy<'a>(&'a self, _handle: &'a str) -> LegacySecretResolveFuture<'a> {
+        Box::pin(async move { Ok(b"mock-secret-resolved:legacy".to_vec()) })
     }
 }
 
@@ -301,8 +626,7 @@ fn parse_optional_bool_env(name: &str, raw: Option<String>) -> Result<bool, Cred
 /// - Redirects are disabled, deadlines are finite, and successful response
 ///   bodies are streamed under a one-MiB hard limit.
 /// - Resolved secret material is returned to the caller only; it is never
-///   logged and never included in any error message (errors carry the handle,
-///   field NAME, and HTTP status only).
+///   logged, and errors carry no locator, selector, URL, token, or value.
 #[derive(Clone)]
 struct VaultEndpoint(reqwest::Url);
 
@@ -371,7 +695,12 @@ impl VaultEndpoint {
         self.0.scheme()
     }
 
-    fn kv2_read_url(&self, mount: &str, path: &str) -> Result<reqwest::Url, CredError> {
+    fn kv2_read_url(
+        &self,
+        mount: &str,
+        path: &str,
+        pinned_version: Option<u64>,
+    ) -> Result<reqwest::Url, CredError> {
         let mut url = self.0.clone();
         let mut segments = url.path_segments_mut().map_err(|_| {
             CredError::Vault("VAULT_ADDR cannot be used as a hierarchical endpoint".to_string())
@@ -380,6 +709,11 @@ impl VaultEndpoint {
         segments.extend(["v1", mount, "data"]);
         segments.extend(path.split('/'));
         drop(segments);
+        if let Some(version) = pinned_version {
+            url.query_pairs_mut()
+                .clear()
+                .append_pair("version", &version.to_string());
+        }
         Ok(url)
     }
 }
@@ -495,50 +829,62 @@ impl VaultKv2Resolver {
         }))
     }
 
-    /// Split a secret handle `<mount>/<path>[#<field>]` into its parts.
-    /// The handle is operator-authored metadata (a path, never a secret), so
-    /// error messages may carry it verbatim.
+    /// Split a legacy secret handle `<mount>/<path>[#<field>]` into its parts.
+    /// Provider locators and field selectors are confidential metadata at the
+    /// API boundary, so every rejection uses the same value-free summary.
     fn parse_handle(handle: &str) -> Result<(&str, &str, Option<&str>), CredError> {
         let handle = handle.trim();
         let (path_part, field) = match handle.split_once('#') {
             Some((p, f)) => {
                 if f.is_empty() || f.contains('#') {
-                    return Err(CredError::Vault(format!(
-                        "invalid vault handle '{handle}': the '#<field>' selector must be a \
-                         single non-empty field name"
-                    )));
+                    return Err(CredError::Vault(
+                        "vault secret reference is invalid".to_string(),
+                    ));
                 }
                 (p, Some(f))
             }
             None => (handle, None),
         };
-        let (mount, path) = path_part.split_once('/').ok_or_else(|| {
-            CredError::Vault(format!(
-                "invalid vault handle '{handle}': expected '<mount>/<path>[#<field>]' \
-                 (e.g. 'secret/ryuki/vcenter#password')"
-            ))
-        })?;
+        let (mount, path) = path_part
+            .split_once('/')
+            .ok_or_else(|| CredError::Vault("vault secret reference is invalid".to_string()))?;
         if mount.is_empty() || path.is_empty() || path.ends_with('/') {
-            return Err(CredError::Vault(format!(
-                "invalid vault handle '{handle}': mount and path must be non-empty"
-            )));
+            return Err(CredError::Vault(
+                "vault secret reference is invalid".to_string(),
+            ));
         }
         if std::iter::once(mount)
             .chain(path.split('/'))
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
         {
-            return Err(CredError::Vault(format!(
-                "invalid vault handle '{handle}': path segments must be non-empty and may not be '.' or '..'"
-            )));
+            return Err(CredError::Vault(
+                "vault secret reference is invalid".to_string(),
+            ));
         }
         Ok((mount, path, field))
     }
 
-    /// Perform the KV v2 read. Never logs the returned material; every error
-    /// carries only the handle, the field NAME, and/or the HTTP status.
+    /// Perform the legacy KV v2 read. Errors carry only a bounded operation
+    /// summary or HTTP status, never the locator, selector, URL, or body.
     async fn resolve_kv2(&self, handle: &str) -> Result<Vec<u8>, CredError> {
         let (mount, path, field) = Self::parse_handle(handle)?;
-        let url = self.addr.kv2_read_url(mount, path)?;
+        let (material, _) = self.resolve_kv2_parts(mount, path, field, None).await?;
+        Ok(material)
+    }
+
+    #[cfg(test)]
+    async fn resolve(&self, handle: &str) -> Result<Vec<u8>, CredError> {
+        self.resolve_kv2(handle).await
+    }
+
+    async fn resolve_kv2_parts(
+        &self,
+        mount: &str,
+        path: &str,
+        field: Option<&str>,
+        pinned_version: Option<u64>,
+    ) -> Result<(Vec<u8>, String), CredError> {
+        let url = self.addr.kv2_read_url(mount, path, pinned_version)?;
 
         let resp = self
             .client
@@ -546,27 +892,18 @@ impl VaultKv2Resolver {
             .header("X-Vault-Token", self.token.as_str())
             .send()
             .await
-            .map_err(|e| {
-                // reqwest transport errors carry the URL at most — never a value.
-                CredError::Vault(format!("vault request for '{handle}' failed: {e}"))
-            })?;
+            .map_err(|_| CredError::Vault("vault request failed".to_string()))?;
 
         match resp.status().as_u16() {
             200 => {}
             403 => {
-                return Err(CredError::Vault(format!(
-                    "vault denied access to '{handle}' (HTTP 403 — check token policy)"
-                )));
+                return Err(CredError::Vault("vault returned HTTP 403".to_string()));
             }
             404 => {
-                return Err(CredError::Vault(format!(
-                    "no secret at '{handle}' (HTTP 404 — check the mount and path)"
-                )));
+                return Err(CredError::Vault("vault returned HTTP 404".to_string()));
             }
             status => {
-                return Err(CredError::Vault(format!(
-                    "vault returned HTTP {status} for '{handle}'"
-                )));
+                return Err(CredError::Vault(format!("vault returned HTTP {status}")));
             }
         }
 
@@ -575,80 +912,134 @@ impl VaultKv2Resolver {
             .content_length()
             .is_some_and(|length| length > Self::MAX_RESPONSE_BYTES as u64)
         {
-            return Err(CredError::Vault(format!(
-                "vault response for '{handle}' exceeds the {}-byte limit",
-                Self::MAX_RESPONSE_BYTES
-            )));
+            return Err(CredError::Vault(
+                "vault response exceeds the configured size limit".to_string(),
+            ));
         }
         let mut resp = resp;
         let mut response_body = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = resp.chunk().await.map_err(|_| {
-            CredError::Vault(format!("vault response for '{handle}' could not be read"))
-        })? {
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|_| CredError::Vault("vault response could not be read".to_string()))?
+        {
             let new_len = response_body
                 .len()
                 .checked_add(chunk.len())
                 .ok_or_else(|| {
-                    CredError::Vault(format!(
-                        "vault response for '{handle}' exceeds the {}-byte limit",
-                        Self::MAX_RESPONSE_BYTES
-                    ))
+                    CredError::Vault("vault response exceeds the configured size limit".to_string())
                 })?;
             if new_len > Self::MAX_RESPONSE_BYTES {
-                return Err(CredError::Vault(format!(
-                    "vault response for '{handle}' exceeds the {}-byte limit",
-                    Self::MAX_RESPONSE_BYTES
-                )));
+                return Err(CredError::Vault(
+                    "vault response exceeds the configured size limit".to_string(),
+                ));
             }
             response_body.extend_from_slice(&chunk);
         }
-        let body = ZeroizingSecretJson(serde_json::from_slice(response_body.as_slice()).map_err(
-            |_| CredError::Vault(format!("vault response for '{handle}' is not valid JSON")),
-        )?);
+        let body = ZeroizingSecretJson(
+            serde_json::from_slice(response_body.as_slice())
+                .map_err(|_| CredError::Vault("vault response is invalid".to_string()))?,
+        );
         let data = body
             .0
             .pointer("/data/data")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                CredError::Vault(format!(
-                    "vault response for '{handle}' has no KV v2 'data.data' object — \
-                     is the mount a KV VERSION 2 engine?"
-                ))
-            })?;
+            .ok_or_else(|| CredError::Vault("vault response is invalid".to_string()))?;
+        let metadata = body
+            .0
+            .pointer("/data/metadata")
+            .and_then(Value::as_object)
+            .ok_or_else(|| CredError::Vault("vault response metadata is invalid".to_string()))?;
+        let resolved_version = metadata
+            .get("version")
+            .and_then(Value::as_u64)
+            .filter(|version| *version > 0)
+            .ok_or_else(|| CredError::Vault("vault response metadata is invalid".to_string()))?;
+        if metadata
+            .get("destroyed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || metadata
+                .get("deletion_time")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            || pinned_version.is_some_and(|expected| expected != resolved_version)
+        {
+            return Err(CredError::Vault(
+                "vault response version is unavailable or mismatched".to_string(),
+            ));
+        }
 
-        let (field_name, value) = match field {
-            Some(f) => (
-                f,
-                data.get(f).ok_or_else(|| {
-                    CredError::Vault(format!(
-                        "field '{f}' not present in vault secret '{handle}'"
-                    ))
-                })?,
-            ),
+        let value = match field {
+            Some(f) => data
+                .get(f)
+                .ok_or_else(|| CredError::Vault("vault response is invalid".to_string()))?,
             None => {
                 if data.len() != 1 {
-                    return Err(CredError::Vault(format!(
-                        "vault secret '{handle}' has {} fields — append '#<field>' to the \
-                         handle to select one",
-                        data.len()
-                    )));
+                    return Err(CredError::Vault(
+                        "vault response requires an exact field selector".to_string(),
+                    ));
                 }
-                let (k, v) = data.iter().next().expect("len checked above");
-                (k.as_str(), v)
+                data.values().next().expect("len checked above")
             }
         };
 
-        let material = value.as_str().ok_or_else(|| {
-            CredError::Vault(format!(
-                "field '{field_name}' of vault secret '{handle}' is not a string"
-            ))
-        })?;
-        Ok(material.as_bytes().to_vec())
+        let material = value
+            .as_str()
+            .ok_or_else(|| CredError::Vault("vault response is invalid".to_string()))?;
+        Ok((material.as_bytes().to_vec(), resolved_version.to_string()))
+    }
+
+    async fn resolve_secret_ref(
+        &self,
+        secret_ref: &SecretRef,
+        context: &SecretResolutionContext,
+    ) -> Result<ResolvedSecret, CredError> {
+        context
+            .admits(secret_ref)
+            .map_err(|_| CredError::SecretScopeMismatch)?;
+        if secret_ref.opaque_locator().contains('#') {
+            return Err(CredError::SecretReferenceInvalid);
+        }
+        let (mount, path, embedded_field) = Self::parse_handle(secret_ref.opaque_locator())?;
+        if embedded_field.is_some() {
+            return Err(CredError::SecretReferenceInvalid);
+        }
+        let pinned_version = secret_ref
+            .version_selector()
+            .pinned_version()
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0 && value.to_string() == raw)
+                    .ok_or(CredError::SecretReferenceInvalid)
+            })
+            .transpose()?;
+        let (material, resolved_version) = self
+            .resolve_kv2_parts(mount, path, secret_ref.field_selector(), pinned_version)
+            .await?;
+        resolved_secret_with_local_material_scope(
+            secret_ref,
+            context,
+            material,
+            &resolved_version,
+            "vault-kv-v2-resolver.v1",
+        )
     }
 }
 
 impl SecretResolver for VaultKv2Resolver {
-    fn resolve<'a>(&'a self, handle: &'a str) -> SecretResolveFuture<'a> {
+    fn resolve<'a>(
+        &'a self,
+        secret_ref: &'a SecretRef,
+        context: &'a SecretResolutionContext,
+    ) -> SecretResolveFuture<'a> {
+        Box::pin(self.resolve_secret_ref(secret_ref, context))
+    }
+}
+
+impl LegacySecretResolver for VaultKv2Resolver {
+    fn resolve_legacy<'a>(&'a self, handle: &'a str) -> LegacySecretResolveFuture<'a> {
         Box::pin(self.resolve_kv2(handle))
     }
 }
@@ -659,6 +1050,74 @@ enum SecretResolverKind {
     Development,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SecretProviderRuntimeIdentity {
+    provider_id: String,
+    provider_config_version: u64,
+    deployment_id: String,
+    trust_domain_id: String,
+}
+
+/// Nominal integration-only capability. Its private construction retains both
+/// the exact outer runtime and exact resolver allocation selected at startup.
+pub(crate) struct ApiIntegrationCredentialResolver {
+    runtime: Arc<ApiSecretProviderRuntime>,
+    backend: ApiIntegrationCredentialResolverBackend,
+    fingerprint_keyring: Arc<SecretReferenceFingerprintKeyring>,
+    identity: SecretProviderRuntimeIdentity,
+}
+
+enum ApiIntegrationCredentialResolverBackend {
+    WorkloadVault(Arc<VaultKubernetesRuntime>),
+    Development(Arc<DevelopmentSecretResolver>),
+}
+
+#[allow(
+    dead_code,
+    reason = "pointer-identity checks are consumed by the production guard integration seam"
+)]
+impl ApiIntegrationCredentialResolver {
+    async fn resolve(
+        &self,
+        secret_ref: &SecretRef,
+        context: &SecretResolutionContext,
+    ) -> Result<ResolvedSecret, CredError> {
+        self.fingerprint_keyring.verify(secret_ref)?;
+        context
+            .admits(secret_ref)
+            .map_err(|_| CredError::SecretScopeMismatch)?;
+        if secret_ref.provider_id() != self.identity.provider_id
+            || secret_ref.provider_config_version() != self.identity.provider_config_version
+            || secret_ref.deployment_id() != self.identity.deployment_id
+            || secret_ref.trust_domain_id() != self.identity.trust_domain_id
+        {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        match &self.backend {
+            ApiIntegrationCredentialResolverBackend::WorkloadVault(runtime) => {
+                runtime.resolve_kv2(secret_ref, context).await.map_err(|_| {
+                    CredError::Vault("workload-authenticated vault resolution failed".to_string())
+                })
+            }
+            ApiIntegrationCredentialResolverBackend::Development(resolver) => {
+                SecretResolver::resolve(resolver.as_ref(), secret_ref, context).await
+            }
+        }
+    }
+
+    pub(crate) fn retains_runtime(&self, runtime: &Arc<ApiSecretProviderRuntime>) -> bool {
+        Arc::ptr_eq(&self.runtime, runtime)
+    }
+
+    pub(crate) fn retains_workload_runtime(&self, runtime: &Arc<VaultKubernetesRuntime>) -> bool {
+        matches!(
+            &self.backend,
+            ApiIntegrationCredentialResolverBackend::WorkloadVault(retained)
+                if Arc::ptr_eq(retained, runtime)
+        )
+    }
+}
+
 /// The mock secret resolver is a local dry-run compatibility feature, not a
 /// degraded production mode. Both the process posture and the connection must
 /// independently opt into dry-run behavior.
@@ -667,21 +1126,31 @@ fn mock_secret_resolver_allowed(auth_mode: &AuthMode, execution_mode: &Execution
         && matches!(execution_mode, ExecutionMode::StaticDryRun)
 }
 
+fn canonical_namespaced_identity(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty())
+        && value.len() <= 256
+        && value.trim() == value
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-' | b'/')
+        })
+}
+
 fn select_secret_resolver_kind(
     provider: &SecretProvider,
     vault_configured: bool,
     allow_mock: bool,
 ) -> Result<SecretResolverKind, CredError> {
+    if !allow_mock {
+        return Err(CredError::LegacyVaultReferenceDenied);
+    }
     match (provider, vault_configured) {
         (SecretProvider::HashicorpVault, true) => Ok(SecretResolverKind::Vault),
         (_, true) => Err(CredError::SecretProviderUnavailable(
             provider.as_str().to_string(),
         )),
-        (_, false) if allow_mock => Ok(SecretResolverKind::Development),
-        (SecretProvider::HashicorpVault, false) => Err(CredError::VaultNotConfigured),
-        (_, false) => Err(CredError::SecretProviderUnavailable(
-            provider.as_str().to_string(),
-        )),
+        (_, false) => Ok(SecretResolverKind::Development),
     }
 }
 
@@ -696,16 +1165,35 @@ fn select_secret_resolver_kind(
 pub(crate) struct ApiSecretProviderRuntime {
     secret_provider: SecretProvider,
     auth_mode: AuthMode,
-    vault_resolver: Option<Arc<VaultKv2Resolver>>,
+    legacy_vault_resolver: Option<Arc<VaultKv2Resolver>>,
     development_resolver: Option<Arc<DevelopmentSecretResolver>>,
+    workload_vault_runtime: OnceLock<Arc<VaultKubernetesRuntime>>,
+    admitted_identity: OnceLock<SecretProviderRuntimeIdentity>,
+    reference_fingerprint_keyring: OnceLock<Arc<SecretReferenceFingerprintKeyring>>,
 }
 
 impl ApiSecretProviderRuntime {
     /// Construct the process-lifetime resolver owner from already admitted
     /// application configuration and one snapshot of the current Vault
     /// environment.
+    #[allow(dead_code, reason = "compatibility wrapper for non-production callers")]
     pub(crate) fn from_admitted_config(config: &RyukiConfig) -> Result<Arc<Self>, String> {
+        Self::from_admitted_config_for_posture(config, false)
+    }
+
+    /// Construct the owner for one already-admitted deployment posture.
+    /// Production never reads or retains the legacy `VAULT_*` static-token
+    /// environment. The exact workload-authenticated runtime is injected later
+    /// through [`Self::bind_workload_runtime`].
+    pub(crate) fn from_admitted_config_for_posture(
+        config: &RyukiConfig,
+        production: bool,
+    ) -> Result<Arc<Self>, String> {
         let invalid = |error: CredError| format!("secret-provider runtime invalid: {error}");
+
+        if production || !config.auth_mode.is_credential_free() {
+            return Self::from_parts(config, None, None, false).map_err(invalid);
+        }
 
         // Validate the non-secret development switch before reading the token.
         // Once token material is captured, `VaultKv2Resolver::from_parts`
@@ -730,9 +1218,14 @@ impl ApiSecretProviderRuntime {
         token: Option<String>,
         allow_insecure_loopback: bool,
     ) -> Result<Arc<Self>, CredError> {
-        let vault_resolver =
+        if !config.auth_mode.is_credential_free()
+            && (addr.is_some() || token.is_some() || allow_insecure_loopback)
+        {
+            return Err(CredError::LegacyVaultReferenceDenied);
+        }
+        let legacy_vault_resolver =
             VaultKv2Resolver::from_parts(addr, token, allow_insecure_loopback)?.map(Arc::new);
-        if vault_resolver.is_some()
+        if legacy_vault_resolver.is_some()
             && !matches!(config.secret_provider, SecretProvider::HashicorpVault)
         {
             return Err(CredError::Vault(format!(
@@ -740,38 +1233,225 @@ impl ApiSecretProviderRuntime {
                 config.secret_provider.as_str()
             )));
         }
-        let development_resolver = (vault_resolver.is_none()
-            && config.auth_mode.is_credential_free())
-        .then(|| Arc::new(DevelopmentSecretResolver));
+        let development_resolver = config
+            .auth_mode
+            .is_credential_free()
+            .then(|| Arc::new(DevelopmentSecretResolver));
 
         Ok(Arc::new(Self {
             secret_provider: config.secret_provider.clone(),
             auth_mode: config.auth_mode.clone(),
-            vault_resolver,
+            legacy_vault_resolver,
             development_resolver,
+            workload_vault_runtime: OnceLock::new(),
+            admitted_identity: OnceLock::new(),
+            reference_fingerprint_keyring: OnceLock::new(),
         }))
     }
 
-    /// Return the exact retained resolver admitted for one connection mode.
-    /// This preserves the former fail-closed precedence: a configured Vault
-    /// resolver wins in every posture only for the Vault provider; a provider
-    /// mismatch fails before mock selection; and the development resolver is
-    /// available only when both process and connection select static dry-run.
-    pub(crate) fn resolver_for(
+    /// Inject the dedicated SecretRef fingerprint authority exactly once.
+    /// Startup must source this keyring independently from every session,
+    /// webhook, encryption, and provider-authentication key.
+    pub(crate) fn bind_reference_fingerprint_keyring(
+        &self,
+        keyring: Arc<SecretReferenceFingerprintKeyring>,
+    ) -> Result<(), CredError> {
+        self.reference_fingerprint_keyring
+            .set(keyring)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)
+    }
+
+    pub(crate) fn bind_reference_fingerprint_keyring_from_file(
+        &self,
+        path: &FilePath,
+    ) -> Result<(), CredError> {
+        self.bind_reference_fingerprint_keyring(SecretReferenceFingerprintKeyring::from_file(path)?)
+    }
+
+    fn verify_reference_fingerprint(&self, secret_ref: &SecretRef) -> Result<(), CredError> {
+        self.reference_fingerprint_keyring
+            .get()
+            .ok_or(CredError::SecretProviderBindingUnavailable)?
+            .verify(secret_ref)
+    }
+
+    /// Bind the exact identity projected from the verified runtime-binding
+    /// document. The later startup guard is the sole production caller.
+    pub(crate) fn bind_admitted_provider_identity(
+        &self,
+        provider_id: String,
+        provider_config_version: u64,
+        deployment_id: String,
+        trust_domain_id: String,
+    ) -> Result<(), CredError> {
+        let identity = SecretProviderRuntimeIdentity {
+            provider_id,
+            provider_config_version,
+            deployment_id,
+            trust_domain_id,
+        };
+        if identity.provider_config_version == 0
+            || !canonical_namespaced_identity(&identity.provider_id, "provider:")
+            || !canonical_namespaced_identity(&identity.deployment_id, "deployment:")
+            || !canonical_namespaced_identity(&identity.trust_domain_id, "trust-domain:")
+            || self.workload_vault_runtime.get().is_some_and(|runtime| {
+                let observation = runtime.operational_observation();
+                observation.provider_id != identity.provider_id
+                    || observation.provider_configuration_version
+                        != identity.provider_config_version
+            })
+        {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        self.admitted_identity
+            .set(identity)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)
+    }
+
+    /// Bind the one workload-authenticated Vault runtime used by every live
+    /// integration SecretRef resolution. Duplicate binding, dry-run owners,
+    /// provider mismatch, or drift from an already admitted identity all fail
+    /// before the Arc can become request-visible.
+    pub(crate) fn bind_workload_runtime(
+        &self,
+        runtime: Arc<VaultKubernetesRuntime>,
+    ) -> Result<(), CredError> {
+        if self.auth_mode.is_credential_free()
+            || self.secret_provider != SecretProvider::HashicorpVault
+            || self.legacy_vault_resolver.is_some()
+            || self.admitted_identity.get().is_some_and(|identity| {
+                let observation = runtime.operational_observation();
+                observation.provider_id != identity.provider_id
+                    || observation.provider_configuration_version
+                        != identity.provider_config_version
+            })
+        {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        }
+        self.workload_vault_runtime
+            .set(runtime)
+            .map_err(|_| CredError::SecretProviderBindingUnavailable)
+    }
+
+    pub(crate) fn retains_workload_runtime(&self, runtime: &Arc<VaultKubernetesRuntime>) -> bool {
+        self.workload_vault_runtime
+            .get()
+            .is_some_and(|retained| Arc::ptr_eq(retained, runtime))
+    }
+
+    pub(crate) fn is_live_resolution_ready(&self) -> bool {
+        self.admitted_identity.get().is_some()
+            && self.reference_fingerprint_keyring.get().is_some()
+            && self
+                .workload_vault_runtime
+                .get()
+                .is_some_and(|runtime| runtime.readiness_snapshot().is_ready())
+    }
+
+    pub(crate) fn integration_credential_resolver(
+        self: &Arc<Self>,
+        secret_ref: &SecretRef,
+        context: &SecretResolutionContext,
+        execution_mode: &ExecutionMode,
+    ) -> Result<Arc<ApiIntegrationCredentialResolver>, CredError> {
+        self.verify_reference_fingerprint(secret_ref)?;
+        context
+            .admits(secret_ref)
+            .map_err(|_| CredError::SecretScopeMismatch)?;
+        let identity = self
+            .admitted_identity
+            .get()
+            .filter(|identity| {
+                secret_ref.provider_id() == identity.provider_id
+                    && secret_ref.provider_config_version() == identity.provider_config_version
+                    && secret_ref.deployment_id() == identity.deployment_id
+                    && secret_ref.trust_domain_id() == identity.trust_domain_id
+            })
+            .ok_or(CredError::SecretProviderBindingUnavailable)?
+            .clone();
+        let fingerprint_keyring = Arc::clone(
+            self.reference_fingerprint_keyring
+                .get()
+                .ok_or(CredError::SecretProviderBindingUnavailable)?,
+        );
+        let backend = if mock_secret_resolver_allowed(&self.auth_mode, execution_mode) {
+            ApiIntegrationCredentialResolverBackend::Development(
+                self.development_resolver
+                    .as_ref()
+                    .ok_or(CredError::SecretProviderBindingUnavailable)?
+                    .clone(),
+            )
+        } else if matches!(execution_mode, ExecutionMode::Live)
+            && self.secret_provider == SecretProvider::HashicorpVault
+        {
+            let runtime = self
+                .workload_vault_runtime
+                .get()
+                .ok_or(CredError::SecretProviderBindingUnavailable)?;
+            let observation = runtime.operational_observation();
+            if observation.provider_id != identity.provider_id
+                || observation.provider_configuration_version != identity.provider_config_version
+            {
+                return Err(CredError::SecretProviderBindingUnavailable);
+            }
+            ApiIntegrationCredentialResolverBackend::WorkloadVault(Arc::clone(runtime))
+        } else {
+            return Err(CredError::SecretProviderBindingUnavailable);
+        };
+        Ok(Arc::new(ApiIntegrationCredentialResolver {
+            runtime: Arc::clone(self),
+            backend,
+            fingerprint_keyring,
+            identity,
+        }))
+    }
+
+    async fn resolve_legacy(
         &self,
         execution_mode: &ExecutionMode,
-    ) -> Result<Arc<dyn SecretResolver>, CredError> {
+        handle: &str,
+    ) -> Result<Vec<u8>, CredError> {
         let allow_mock = mock_secret_resolver_allowed(&self.auth_mode, execution_mode);
         match select_secret_resolver_kind(
             &self.secret_provider,
-            self.vault_resolver.is_some(),
+            self.legacy_vault_resolver.is_some(),
             allow_mock,
         )? {
             SecretResolverKind::Vault => {
-                let resolver: Arc<dyn SecretResolver> = self
-                    .vault_resolver
+                self.legacy_vault_resolver
                     .as_ref()
-                    .expect("Vault selection requires a retained resolver")
+                    .expect("legacy Vault selection requires a retained resolver")
+                    .resolve_kv2(handle)
+                    .await
+            }
+            SecretResolverKind::Development => {
+                self.development_resolver
+                    .as_ref()
+                    .expect("development selection requires a retained resolver")
+                    .resolve_legacy(handle)
+                    .await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn resolver_for(
+        &self,
+        execution_mode: &ExecutionMode,
+    ) -> Result<Arc<dyn SecretResolver>, CredError> {
+        if !mock_secret_resolver_allowed(&self.auth_mode, execution_mode) {
+            return Err(CredError::LegacyVaultReferenceDenied);
+        }
+        match select_secret_resolver_kind(
+            &self.secret_provider,
+            self.legacy_vault_resolver.is_some(),
+            true,
+        )? {
+            SecretResolverKind::Vault => {
+                let resolver: Arc<dyn SecretResolver> = self
+                    .legacy_vault_resolver
+                    .as_ref()
+                    .expect("legacy Vault selection requires a retained resolver")
                     .clone();
                 Ok(resolver)
             }
@@ -793,8 +1473,9 @@ impl ApiSecretProviderRuntime {
     }
 
     /// Whether `resolver` is one of the exact allocations retained here.
-    pub(crate) fn retains_resolver(&self, resolver: &Arc<dyn SecretResolver>) -> bool {
-        self.vault_resolver.as_ref().is_some_and(|retained| {
+    #[cfg(test)]
+    fn retains_resolver(&self, resolver: &Arc<dyn SecretResolver>) -> bool {
+        self.legacy_vault_resolver.as_ref().is_some_and(|retained| {
             let retained: Arc<dyn SecretResolver> = retained.clone();
             Arc::ptr_eq(&retained, resolver)
         }) || self.development_resolver.as_ref().is_some_and(|retained| {
@@ -811,8 +1492,12 @@ impl std::fmt::Debug for ApiSecretProviderRuntime {
             .field("secret_provider", &self.secret_provider.as_str())
             .field("auth_mode", &self.auth_mode.as_str())
             .field(
-                "vault_resolver",
-                &self.vault_resolver.as_ref().map(|_| "[RETAINED]"),
+                "legacy_vault_resolver",
+                &self.legacy_vault_resolver.as_ref().map(|_| "[RETAINED]"),
+            )
+            .field(
+                "workload_vault_runtime",
+                &self.workload_vault_runtime.get().map(|_| "[RETAINED]"),
             )
             .field(
                 "development_resolver",
@@ -853,15 +1538,15 @@ fn validate_secret_manager_configuration(
 /// # Security
 /// Returns `ResolvedCredentials` which is zeroized on drop.
 /// Never surfaces the resolved material in error messages.
-pub async fn resolve_credentials(
+async fn resolve_credentials(
     conn: &IntegrationConnection,
-    secret_resolver: Option<&dyn SecretResolver>,
+    secret_resolver: Option<&dyn LegacySecretResolver>,
     pool: Option<&sqlx::PgPool>,
 ) -> Result<ResolvedCredentials, CredError> {
     match &conn.credential_source {
         CredentialSource::Vault => {
             let secret_resolver = secret_resolver.ok_or(CredError::VaultNotConfigured)?;
-            let material = secret_resolver.resolve(&conn.credential_ref).await?;
+            let material = secret_resolver.resolve_legacy(&conn.credential_ref).await?;
             Ok(ResolvedCredentials {
                 material,
                 // This descriptor is Debug-visible in the runner type. Keep it
@@ -907,9 +1592,12 @@ pub async fn resolve_credentials(
             }
             Ok(ResolvedCredentials {
                 material,
-                descriptor: format!("env-var:keys={}", conn.credential_ref),
+                // Environment key names are secret locators. Keep the runner
+                // descriptor value-free and locator-free.
+                descriptor: "env-var:resolved".to_string(),
             })
         }
+        CredentialSource::SecretProviderRef => Err(CredError::SecretProviderBindingUnavailable),
     }
 }
 
@@ -921,13 +1609,40 @@ pub async fn resolve_credentials(
 /// error deliberately value-free so malformed legacy/corrupt rows cannot turn
 /// secret-looking content into logs or API responses.
 #[derive(Debug, thiserror::Error)]
-#[error("persisted integration credential source is invalid")]
+#[error("persisted integration credential binding is invalid")]
 pub(crate) struct PersistedCredentialSourceError;
 
 pub(crate) fn parse_persisted_credential_source(
     raw: &str,
 ) -> Result<CredentialSource, PersistedCredentialSourceError> {
     CredentialSource::parse(raw).map_err(|_| PersistedCredentialSourceError)
+}
+
+pub(crate) fn parse_persisted_credential_binding(
+    source: &str,
+    legacy_ref: &str,
+    typed_ref: Option<Value>,
+    generation: Option<i64>,
+) -> Result<(CredentialSource, Option<SecretRef>), PersistedCredentialSourceError> {
+    let source = parse_persisted_credential_source(source)?;
+    match (source, legacy_ref, typed_ref, generation) {
+        (CredentialSource::SecretProviderRef, "", Some(value), Some(generation))
+            if generation > 0 =>
+        {
+            let reference =
+                serde_json::from_value(value).map_err(|_| PersistedCredentialSourceError)?;
+            Ok((CredentialSource::SecretProviderRef, Some(reference)))
+        }
+        (
+            source @ (CredentialSource::Vault
+            | CredentialSource::DbEncrypted
+            | CredentialSource::EnvVar),
+            _,
+            None,
+            None,
+        ) => Ok((source, None)),
+        _ => Err(PersistedCredentialSourceError),
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -939,6 +1654,8 @@ struct IntegrationConnectionRow {
     site_scope: Option<String>,
     credential_source: String,
     credential_ref: String,
+    credential_secret_ref: Option<Value>,
+    credential_secret_ref_generation: Option<i64>,
     status: String,
     readiness: String,
     execution_mode: String,
@@ -949,10 +1666,71 @@ struct IntegrationConnectionRow {
     updated_at: String,
 }
 
+struct PersistedTypedSecretBinding {
+    secret_ref: SecretRef,
+    generation: NonZeroU64,
+}
+
+fn persisted_typed_binding_matches_exactly(
+    source: &str,
+    legacy_ref: &str,
+    typed_ref: Option<Value>,
+    generation: Option<i64>,
+    expected: &PersistedTypedSecretBinding,
+) -> bool {
+    let Ok((source, secret_ref)) =
+        parse_persisted_credential_binding(source, legacy_ref, typed_ref, generation)
+    else {
+        return false;
+    };
+    let generation = generation
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(NonZeroU64::new);
+    source == CredentialSource::SecretProviderRef
+        && secret_ref.as_ref() == Some(&expected.secret_ref)
+        && generation == Some(expected.generation)
+}
+
 impl IntegrationConnectionRow {
     fn try_into_connection(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
-        let credential_source = parse_persisted_credential_source(&self.credential_source)?;
-        Ok(IntegrationConnection {
+        self.try_into_connection_with_typed_binding()
+            .map(|(connection, _)| connection)
+    }
+
+    fn try_into_connection_with_secret_ref(
+        self,
+    ) -> Result<
+        (IntegrationConnection, Option<SecretRef>, Option<i64>),
+        PersistedCredentialSourceError,
+    > {
+        let (connection, binding) = self.try_into_connection_with_typed_binding()?;
+        let (secret_ref, generation) = match binding {
+            Some(binding) => (
+                Some(binding.secret_ref),
+                Some(
+                    i64::try_from(binding.generation.get())
+                        .map_err(|_| PersistedCredentialSourceError)?,
+                ),
+            ),
+            None => (None, None),
+        };
+        Ok((connection, secret_ref, generation))
+    }
+
+    fn try_into_connection_with_typed_binding(
+        self,
+    ) -> Result<
+        (IntegrationConnection, Option<PersistedTypedSecretBinding>),
+        PersistedCredentialSourceError,
+    > {
+        let generation = self.credential_secret_ref_generation;
+        let (credential_source, secret_ref) = parse_persisted_credential_binding(
+            &self.credential_source,
+            &self.credential_ref,
+            self.credential_secret_ref,
+            generation,
+        )?;
+        let connection = IntegrationConnection {
             id: self.id,
             vendor_type: self.vendor_type,
             name: self.name,
@@ -969,11 +1747,24 @@ impl IntegrationConnectionRow {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
-        })
+        };
+        let binding = match (secret_ref, generation) {
+            (Some(secret_ref), Some(generation)) => Some(PersistedTypedSecretBinding {
+                secret_ref,
+                generation: NonZeroU64::new(
+                    u64::try_from(generation).map_err(|_| PersistedCredentialSourceError)?,
+                )
+                .ok_or(PersistedCredentialSourceError)?,
+            }),
+            (None, None) => None,
+            _ => return Err(PersistedCredentialSourceError),
+        };
+        Ok((connection, binding))
     }
 
-    /// Serialize to JSON for API responses. NEVER includes secret material —
-    /// credential_ref is safe (vault path / env key names / secret row FK).
+    /// Serialize the locator-free administrative projection. References are
+    /// write-only at the API boundary: callers learn only whether a credential
+    /// binding is configured, never its locator or custody-row identifier.
     fn to_json(conn: &IntegrationConnection) -> Value {
         json!({
             "id": conn.id,
@@ -982,7 +1773,8 @@ impl IntegrationConnectionRow {
             "endpoint_url": conn.endpoint_url,
             "site_scope": conn.site_scope,
             "credential_source": conn.credential_source.as_str(),
-            "credential_ref": conn.credential_ref,
+            "credential_configured": conn.credential_source == CredentialSource::SecretProviderRef
+                || !conn.credential_ref.is_empty(),
             "status": conn.status,
             "readiness": conn.readiness,
             "execution_mode": conn.execution_mode.as_str(),
@@ -995,10 +1787,16 @@ impl IntegrationConnectionRow {
     }
 }
 
+#[cfg(test)]
 const CONN_COLUMNS: &str =
     "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
      status, readiness, execution_mode, last_test_at, last_test_result, created_by, \
      created_at, updated_at";
+
+const TYPED_CONN_COLUMNS: &str =
+    "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
+     credential_secret_ref, credential_secret_ref_generation, status, readiness, execution_mode, \
+     last_test_at, last_test_result, created_by, created_at, updated_at";
 
 // ---------------------------------------------------------------------------
 // Request / response shapes
@@ -1017,6 +1815,9 @@ pub struct CreateConnectionRequest {
     /// For DbEncrypted: omit or leave empty — `inline_secret` is used instead.
     #[serde(default)]
     pub credential_ref: String,
+    /// Provider-qualified, value-free reference. Write-only; never projected.
+    #[serde(default)]
+    pub credential_secret_ref: Option<SecretRef>,
     /// For DbEncrypted source ONLY: the plaintext secret to encrypt server-side.
     /// After encryption, this value is DISCARDED and never stored or returned.
     #[serde(default)]
@@ -1031,7 +1832,8 @@ impl std::fmt::Debug for CreateConnectionRequest {
             .field("endpoint_url", &self.endpoint_url)
             .field("site_scope", &self.site_scope)
             .field("credential_source", &self.credential_source)
-            .field("credential_ref", &self.credential_ref)
+            .field("credential_secret_ref", &"[REDACTED]")
+            .field("credential_ref", &"[REDACTED]")
             .field("inline_secret", &"[REDACTED]")
             .finish()
     }
@@ -1046,6 +1848,8 @@ pub struct UpdateConnectionRequest {
     pub site_scope: Option<String>,
     pub credential_source: Option<String>,
     pub credential_ref: Option<String>,
+    #[serde(default)]
+    pub credential_secret_ref: Option<SecretRef>,
     /// Supply to re-encrypt the secret (db-encrypted source only).
     #[serde(default)]
     pub inline_secret: String,
@@ -1059,7 +1863,8 @@ impl std::fmt::Debug for UpdateConnectionRequest {
             .field("endpoint_url", &self.endpoint_url)
             .field("site_scope", &self.site_scope)
             .field("credential_source", &self.credential_source)
-            .field("credential_ref", &self.credential_ref)
+            .field("credential_secret_ref", &"[REDACTED]")
+            .field("credential_ref", &"[REDACTED]")
             .field("inline_secret", &"[REDACTED]")
             .finish()
     }
@@ -1122,6 +1927,25 @@ fn integration_500(msg: &str) -> (axum::http::StatusCode, axum::Json<Value>) {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(json!({"error": msg})),
     )
+}
+
+fn verify_secret_reference_for_write(
+    secret_ref: &SecretRef,
+) -> Result<(), (axum::http::StatusCode, axum::Json<Value>)> {
+    match crate::config_store::get_api_secret_provider_runtime()
+        .verify_reference_fingerprint(secret_ref)
+    {
+        Ok(()) => Ok(()),
+        Err(CredError::SecretReferenceInvalid) => Err(integration_400(
+            "credential_secret_ref failed server fingerprint verification",
+        )),
+        Err(_) => Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "error": "typed secret reference verification is unavailable"
+            })),
+        )),
+    }
 }
 
 fn db_err(e: impl std::fmt::Display) -> (axum::http::StatusCode, axum::Json<Value>) {
@@ -1290,6 +2114,32 @@ pub async fn integration_create(
 
     let source =
         CredentialSource::parse(&body.credential_source).map_err(|e| integration_400(&e))?;
+    let (credential_secret_ref, credential_secret_ref_generation) = match &source {
+        CredentialSource::SecretProviderRef => {
+            if !body.credential_ref.is_empty()
+                || !body.inline_secret.is_empty()
+                || body.credential_secret_ref.is_none()
+            {
+                return Err(integration_400(
+                    "secret-provider-ref requires exactly credential_secret_ref",
+                ));
+            }
+            let secret_ref = body
+                .credential_secret_ref
+                .as_ref()
+                .expect("presence checked");
+            verify_secret_reference_for_write(secret_ref)?;
+            let value = serde_json::to_value(secret_ref)
+                .map_err(|_| integration_400("credential_secret_ref is invalid"))?;
+            (Some(value), Some(1_i64))
+        }
+        _ if body.credential_secret_ref.is_some() => {
+            return Err(integration_400(
+                "legacy credential sources cannot carry credential_secret_ref",
+            ));
+        }
+        _ => (None, None),
+    };
 
     // Validate required fields.
     if body.vendor_type.is_empty() {
@@ -1343,8 +2193,8 @@ pub async fn integration_create(
                 let mut tx = pool.begin().await.map_err(db_err)?;
                 let (ins_vendor, ins_site, ins_source): (String, Option<String>, String) =
                     sqlx::query_as(&format!(
-                        "INSERT INTO integration_connections ({CONN_COLUMNS}) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                        "INSERT INTO integration_connections ({TYPED_CONN_COLUMNS}) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
                          RETURNING vendor_type, site_scope, credential_source"
                     ))
                     .bind(&id)
@@ -1354,6 +2204,8 @@ pub async fn integration_create(
                     .bind(&body.site_scope)
                     .bind(source.as_str())
                     .bind(&secret_id) // FK placeholder — correct server-owned ref
+                    .bind(Option::<Value>::None)
+                    .bind(Option::<i64>::None)
                     .bind("configured")
                     .bind("configured")
                     .bind(ExecutionMode::StaticDryRun.as_str())
@@ -1432,6 +2284,7 @@ pub async fn integration_create(
                 }
                 body.credential_ref.clone()
             }
+            CredentialSource::SecretProviderRef => String::new(),
         };
 
         // INSERT + audit commit atomically (one tx; mirrors DELETE). The audit detail
@@ -1439,8 +2292,8 @@ pub async fn integration_create(
         let mut tx = pool.begin().await.map_err(db_err)?;
         let (ins_vendor, ins_site, ins_source): (String, Option<String>, String) =
             sqlx::query_as(&format!(
-                "INSERT INTO integration_connections ({CONN_COLUMNS}) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                "INSERT INTO integration_connections ({TYPED_CONN_COLUMNS}) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
                  RETURNING vendor_type, site_scope, credential_source"
             ))
             .bind(&id)
@@ -1450,6 +2303,8 @@ pub async fn integration_create(
             .bind(&body.site_scope)
             .bind(source.as_str())
             .bind(&credential_ref)
+            .bind(&credential_secret_ref)
+            .bind(credential_secret_ref_generation)
             .bind("configured")
             .bind("configured")
             .bind(ExecutionMode::StaticDryRun.as_str())
@@ -1516,6 +2371,11 @@ pub async fn integration_create(
             // Without a DB we cannot store ciphertext — reject with a clear message.
             return Err(integration_500(
                 "db-encrypted connections require a database connection",
+            ));
+        }
+        CredentialSource::SecretProviderRef => {
+            return Err(integration_500(
+                "typed secret-provider references require a database connection",
             ));
         }
         _ => body.credential_ref.clone(),
@@ -1607,7 +2467,7 @@ pub async fn integration_list(
         // Binds: $1=vendor_type, $2=site, $3=limit, $4=offset. `count` reuses the
         // SAME two filter binds so the total matches the paged set.
         let rows: Vec<IntegrationConnectionRow> = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections \
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections \
              WHERE ($1 = '' OR vendor_type = $1) AND ($2 = '' OR site_scope = $2) \
              ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
         ))
@@ -1680,7 +2540,7 @@ pub async fn integration_get(
 
     if let Some(pool) = get_db() {
         let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_optional(pool)
@@ -1718,14 +2578,14 @@ pub async fn integration_get(
 pub async fn integration_update(
     Extension(session): Extension<AuthSession>,
     Path(id): Path<String>,
-    Json(body): Json<UpdateConnectionRequest>,
+    Json(mut body): Json<UpdateConnectionRequest>,
 ) -> ApiResult {
     require_admin(&session)?;
 
     if let Some(pool) = get_db() {
         // Fetch the current row.
         let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_optional(pool)
@@ -1736,7 +2596,9 @@ pub async fn integration_update(
         // must be indistinguishable from a missing one.
         let row = row.ok_or_else(|| integration_not_found(&id))?;
         connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
-        let mut conn = row.try_into_connection().map_err(db_err)?;
+        let (mut conn, mut secret_ref, mut secret_ref_generation) =
+            row.try_into_connection_with_secret_ref().map_err(db_err)?;
+        let prior_secret_ref_generation = secret_ref_generation;
 
         // HARDENING-1: forbid changing credential_source on update.
         // Changing source types creates edge cases (e.g. a db-encrypted row
@@ -1750,6 +2612,40 @@ pub async fn integration_update(
                     "credential_source cannot be changed; delete and recreate the connection",
                 ));
             }
+        }
+
+        match &conn.credential_source {
+            CredentialSource::SecretProviderRef => {
+                if body.credential_ref.is_some() || !body.inline_secret.is_empty() {
+                    return Err(integration_400(
+                        "secret-provider-ref updates accept only credential_secret_ref",
+                    ));
+                }
+                if let Some(updated_ref) = body.credential_secret_ref.take() {
+                    secret_ref = Some(updated_ref);
+                    secret_ref_generation = Some(
+                        secret_ref_generation
+                            .ok_or_else(|| {
+                                integration_500("persisted secret reference generation is missing")
+                            })?
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                integration_500("secret reference generation is exhausted")
+                            })?,
+                    );
+                }
+            }
+            CredentialSource::Vault | CredentialSource::DbEncrypted | CredentialSource::EnvVar => {
+                if body.credential_secret_ref.is_some() {
+                    return Err(integration_400(
+                        "legacy credential sources cannot carry credential_secret_ref",
+                    ));
+                }
+            }
+        }
+
+        if let Some(secret_ref) = secret_ref.as_ref() {
+            verify_secret_reference_for_write(secret_ref)?;
         }
 
         // Apply updates.
@@ -1769,7 +2665,10 @@ pub async fn integration_update(
         // caller-supplied value. The secret row id is always minted or preserved
         // server-side. For vault/env-var, credential_ref is a reference (path /
         // key names), so the caller may update it.
-        if conn.credential_source != CredentialSource::DbEncrypted {
+        if matches!(
+            &conn.credential_source,
+            CredentialSource::Vault | CredentialSource::EnvVar
+        ) {
             if let Some(v) = body.credential_ref {
                 // FIX-6: validate env-var key names if source is env-var.
                 if conn.credential_source == CredentialSource::EnvVar {
@@ -1780,6 +2679,12 @@ pub async fn integration_update(
             }
         }
         // For db-encrypted: silently ignore any body.credential_ref — it is discarded.
+
+        let persisted_secret_ref = secret_ref
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| integration_400("credential_secret_ref is invalid"))?;
 
         // #2 (write-side): the RESULTING site_scope must also be within the caller's
         // scope — a scoped caller cannot MOVE a connection out of scope or to NULL
@@ -1843,8 +2748,11 @@ pub async fn integration_update(
             let updated: Option<(String, Option<String>, String)> = sqlx::query_as(
                 "UPDATE integration_connections \
                  SET vendor_type=$1, name=$2, endpoint_url=$3, site_scope=$4, \
-                     credential_source=$5, credential_ref=$6, updated_at=$7 \
-                 WHERE id=$8 RETURNING vendor_type, site_scope, credential_source",
+                     credential_source=$5, credential_ref=$6, credential_secret_ref=$7, \
+                     credential_secret_ref_generation=$8, updated_at=$9 \
+                 WHERE id=$10 \
+                   AND credential_secret_ref_generation IS NOT DISTINCT FROM $11 \
+                 RETURNING vendor_type, site_scope, credential_source",
             )
             .bind(&conn.vendor_type)
             .bind(&conn.name)
@@ -1852,14 +2760,23 @@ pub async fn integration_update(
             .bind(&conn.site_scope)
             .bind(conn.credential_source.as_str())
             .bind(&conn.credential_ref)
+            .bind(&persisted_secret_ref)
+            .bind(secret_ref_generation)
             .bind(&now)
             .bind(&conn.id)
+            .bind(prior_secret_ref_generation)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
             // The connection vanished mid-tx (concurrent delete after the pre-read
             // SELECT) → 404; the whole tx (incl. the secret write) rolls back, no audit.
             let Some((u_vendor, u_site, u_source)) = updated else {
+                if conn.credential_source == CredentialSource::SecretProviderRef {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(json!({"error": "connection changed concurrently; retry"})),
+                    ));
+                }
                 return Err(integration_not_found(&id));
             };
             // Secret was rotated on this path → cred_rotated: true. Redaction-safe keys,
@@ -1898,8 +2815,11 @@ pub async fn integration_update(
         let updated: Option<(String, Option<String>, String)> = sqlx::query_as(
             "UPDATE integration_connections \
              SET vendor_type=$1, name=$2, endpoint_url=$3, site_scope=$4, \
-                 credential_source=$5, credential_ref=$6, updated_at=$7 \
-             WHERE id=$8 RETURNING vendor_type, site_scope, credential_source",
+                 credential_source=$5, credential_ref=$6, credential_secret_ref=$7, \
+                 credential_secret_ref_generation=$8, updated_at=$9 \
+             WHERE id=$10 \
+               AND credential_secret_ref_generation IS NOT DISTINCT FROM $11 \
+             RETURNING vendor_type, site_scope, credential_source",
         )
         .bind(&conn.vendor_type)
         .bind(&conn.name)
@@ -1907,12 +2827,21 @@ pub async fn integration_update(
         .bind(&conn.site_scope)
         .bind(conn.credential_source.as_str())
         .bind(&conn.credential_ref)
+        .bind(&persisted_secret_ref)
+        .bind(secret_ref_generation)
         .bind(&now)
         .bind(&conn.id)
+        .bind(prior_secret_ref_generation)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
         let Some((u_vendor, u_site, u_source)) = updated else {
+            if conn.credential_source == CredentialSource::SecretProviderRef {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "connection changed concurrently; retry"})),
+                ));
+            }
             return Err(integration_not_found(&id));
         };
         // No secret rotation on this path → cred_rotated: false.
@@ -1967,7 +2896,7 @@ pub async fn set_webhook_secret(
 
     // Fetch the current row (for the scope guard and the existing webhook_secret_ref).
     let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
-        "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+        "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
     ))
     .bind(&id)
     .fetch_optional(pool)
@@ -2246,13 +3175,14 @@ pub async fn integration_delete(
 /// NEVER returns resolved credential material.
 pub async fn integration_test(
     Extension(session): Extension<AuthSession>,
+    Extension(request_id): Extension<crate::RequestId>,
     Path(id): Path<String>,
 ) -> ApiResult {
     require_admin(&session)?;
 
-    let conn = if let Some(pool) = get_db() {
+    let (conn, typed_binding) = if let Some(pool) = get_db() {
         let row: Option<IntegrationConnectionRow> = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_optional(pool)
@@ -2262,10 +3192,14 @@ pub async fn integration_test(
         // Preserve the no-oracle boundary even when another persisted field is
         // malformed and row decoding must fail closed.
         connection_scope_guard(&session, row.site_scope.as_deref(), &id)?;
-        row.try_into_connection().map_err(db_err)?
+        row.try_into_connection_with_typed_binding()
+            .map_err(db_err)?
     } else {
-        ryuki_engine::integration_connections::get_connection(&id)
-            .ok_or_else(|| integration_not_found(&id))?
+        (
+            ryuki_engine::integration_connections::get_connection(&id)
+                .ok_or_else(|| integration_not_found(&id))?,
+            None,
+        )
     };
 
     // #2: guard BEFORE resolve_credentials — a scoped admin must never trigger
@@ -2280,32 +3214,103 @@ pub async fn integration_test(
     // selection. Missing configuration selects the development adapter only
     // when both process and connection explicitly opt into static/mock dry-run.
     let pool_ref = get_db();
-    let cred_result = if conn.credential_source == CredentialSource::Vault {
-        let runtime = crate::config_store::get_api_secret_provider_runtime();
-        match runtime.resolver_for(&conn.execution_mode) {
-            Ok(secret_resolver) if runtime.retains_resolver(&secret_resolver) => {
-                resolve_credentials(&conn, Some(secret_resolver.as_ref()), pool_ref).await
+    let cred_result: Result<(), CredError> = match &conn.credential_source {
+        CredentialSource::SecretProviderRef => {
+            async {
+                let binding = typed_binding
+                    .as_ref()
+                    .ok_or(CredError::SecretProviderBindingUnavailable)?;
+                let authority = crate::config_store::get_security_contract_context()
+                    .production_secret_resolution_authority()
+                    .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+                let context = SecretResolutionContext::try_new(
+                    authority.deployment_id(),
+                    authority.trust_domain_id(),
+                    authority.tenant_id().map(str::to_owned),
+                    "purpose:integration-authentication",
+                    authority.workload_id(),
+                    Some(format!("request:{}", request_id.as_str())),
+                    None,
+                    authority.authority_epoch(),
+                    binding.generation.get(),
+                )
+                .map_err(|_| CredError::SecretProviderBindingUnavailable)?;
+                let runtime = crate::config_store::get_api_secret_provider_runtime();
+                let resolver = runtime.integration_credential_resolver(
+                    &binding.secret_ref,
+                    &context,
+                    &conn.execution_mode,
+                )?;
+                let resolved = resolver.resolve(&binding.secret_ref, &context).await?;
+
+                // The locked DB row is the request's authority fence. A
+                // reference replacement, rotation, source change, or delete
+                // during provider I/O invalidates the result before its
+                // material can be consumed. Generation alone is insufficient:
+                // direct database writers are not trusted to increment it.
+                let pool = pool_ref.ok_or_else(|| {
+                    CredError::Db("typed secret resolution lost its database pool".into())
+                })?;
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|error| CredError::Db(error.to_string()))?;
+                let current = sqlx::query_as::<_, (String, String, Option<Value>, Option<i64>)>(
+                    "SELECT credential_source, credential_ref, \
+                            credential_secret_ref, credential_secret_ref_generation \
+                     FROM integration_connections \
+                     WHERE id = $1 \
+                     FOR SHARE",
+                )
+                .bind(&conn.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| CredError::Db(error.to_string()))?;
+                let still_current =
+                    current.is_some_and(|(source, legacy_ref, typed_ref, generation)| {
+                        persisted_typed_binding_matches_exactly(
+                            &source,
+                            &legacy_ref,
+                            typed_ref,
+                            generation,
+                            binding,
+                        )
+                    });
+                if !still_current {
+                    drop(resolved);
+                    return Err(CredError::SecretReferenceGenerationChanged);
+                }
+                drop(resolved);
+                tx.commit()
+                    .await
+                    .map_err(|error| CredError::Db(error.to_string()))?;
+                Ok(())
             }
-            Ok(_) => Err(CredError::SecretProviderUnavailable(
-                "retained-runtime-identity".to_string(),
-            )),
-            Err(error) => Err(error),
+            .await
         }
-    } else {
-        // A non-Vault source does not depend on Vault configuration and cannot
-        // accidentally invoke a mock resolver.
-        resolve_credentials(&conn, None, pool_ref).await
+        CredentialSource::Vault => {
+            let runtime = crate::config_store::get_api_secret_provider_runtime();
+            runtime
+                .resolve_legacy(&conn.execution_mode, &conn.credential_ref)
+                .await
+                .map(drop)
+        }
+        CredentialSource::DbEncrypted | CredentialSource::EnvVar => {
+            // A non-Vault source does not depend on Vault configuration and cannot
+            // accidentally invoke a mock resolver.
+            resolve_credentials(&conn, None, pool_ref).await.map(drop)
+        }
     };
 
     let (cred_status, cred_message) = match cred_result {
-        Ok(_creds) => {
-            // _creds is Zeroizing — dropped here, memory wiped.
+        Ok(()) => {
+            // Every material-bearing result was dropped before this value-free status branch.
             ("resolved", "credentials resolved successfully".to_string())
         }
-        // CredError::Db wraps a RAW sqlx error string whose text can leak
-        // SQL/column/constraint internals — log it server-side and return a
-        // GENERIC message (same discipline as db_err). The other variants carry
-        // curated, secret-free messages that stay actionable for the admin caller.
+        // CredError variants can retain provider diagnostics or legacy locator
+        // inputs for internal control flow. The public integration-test result
+        // is deliberately normalized so none of those values become an API
+        // error oracle.
         Err(CredError::Db(e)) => {
             tracing::error!(
                 error = %e,
@@ -2314,7 +3319,7 @@ pub async fn integration_test(
             );
             ("error", "credential resolution failed".to_string())
         }
-        Err(e) => ("error", e.to_string()),
+        Err(_) => ("error", "credential resolution failed".to_string()),
     };
 
     // Run the generic stub (no live vendor call).
@@ -3283,6 +4288,10 @@ pub mod integration_db_tests {
         })
     }
 
+    fn test_request_id() -> Extension<crate::RequestId> {
+        Extension(crate::RequestId(uuid::Uuid::new_v4().to_string()))
+    }
+
     async fn cleanup_connection(pool: &PgPool, id: &str) {
         // CASCADE deletes integration_secrets rows.
         sqlx::query("DELETE FROM integration_connections WHERE id = $1")
@@ -3875,7 +4884,7 @@ pub mod integration_db_tests {
         .expect("insert vault connection");
 
         let row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_one(&pool)
@@ -3925,7 +4934,7 @@ pub mod integration_db_tests {
         .expect("insert env-var connection");
 
         let row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_one(&pool)
@@ -4013,7 +5022,7 @@ pub mod integration_db_tests {
 
         // ASSERT: plaintext is NOT present anywhere in the connection row.
         let conn_row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&conn_id)
         .fetch_one(&pool)
@@ -4321,7 +5330,7 @@ pub mod integration_db_tests {
 
         // Simulate the GET response — must not contain plaintext.
         let row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&conn_id)
         .fetch_one(&pool)
@@ -4339,11 +5348,13 @@ pub mod integration_db_tests {
             !response_json.contains("grafana-api-key-test-fixture-not-real"),
             "API response must not contain plaintext: {response_json}"
         );
-        // credential_ref (FK to secret row, not the secret) is OK.
+        // Custody row identifiers are locators too: expose only the configured
+        // bit, never the raw FK.
         assert!(
-            response_json.contains(&secret_id),
-            "credential_ref (FK) should be in response for transparency: {response_json}"
+            !response_json.contains(&secret_id),
+            "credential_ref (FK) must not appear in the response: {response_json}"
         );
+        assert!(response_json.contains("\"credential_configured\":true"));
         // But ciphertext must not appear in the connection JSON.
         let ciphertext_b64 = B64.encode(&ciphertext);
         assert!(
@@ -4439,7 +5450,7 @@ pub mod integration_db_tests {
 
         // Read back — credential_ref must be the server-minted FK, NOT the attacker string.
         let row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&conn_id)
         .fetch_one(&pool)
@@ -4913,7 +5924,7 @@ pub mod integration_db_tests {
 
         // Verify the connection row reflects the update (name change committed).
         let row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&conn_id)
         .fetch_one(&pool)
@@ -5001,7 +6012,7 @@ pub mod integration_db_tests {
 
         // ASSERT 1: connection row exists.
         let conn_row: IntegrationConnectionRow = sqlx::query_as(&format!(
-            "SELECT {CONN_COLUMNS} FROM integration_connections WHERE id = $1"
+            "SELECT {TYPED_CONN_COLUMNS} FROM integration_connections WHERE id = $1"
         ))
         .bind(&id)
         .fetch_one(&pool)
@@ -5336,9 +6347,13 @@ pub mod integration_db_tests {
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
         let session = AuthSession::static_dry_run();
-        let _ = integration_test(Extension(session.clone()), Path(conn_id.clone()))
-            .await
-            .expect("integration_test must succeed");
+        let _ = integration_test(
+            Extension(session.clone()),
+            test_request_id(),
+            Path(conn_id.clone()),
+        )
+        .await
+        .expect("integration_test must succeed");
 
         let row: (String, String, String, String, String, Value) = sqlx::query_as(
             "SELECT actor_principal, to_status, to_stage, outcome, action, detail \
@@ -5389,6 +6404,7 @@ pub mod integration_db_tests {
 
         let _ = integration_test(
             Extension(AuthSession::static_dry_run()),
+            test_request_id(),
             Path(conn_id.clone()),
         )
         .await
@@ -5450,6 +6466,7 @@ pub mod integration_db_tests {
 
         let _ = integration_test(
             Extension(AuthSession::static_dry_run()),
+            test_request_id(),
             Path(conn_id.clone()),
         )
         .await
@@ -5506,6 +6523,7 @@ pub mod integration_db_tests {
 
         let _ = integration_test(
             Extension(AuthSession::static_dry_run()),
+            test_request_id(),
             Path(conn_id.clone()),
         )
         .await
@@ -5550,6 +6568,7 @@ pub mod integration_db_tests {
         for _ in 0..2 {
             let _ = integration_test(
                 Extension(AuthSession::static_dry_run()),
+                test_request_id(),
                 Path(conn_id.clone()),
             )
             .await
@@ -5586,7 +6605,7 @@ pub mod integration_db_tests {
         session.user_id = format!("r58-actor-{}", uuid::Uuid::new_v4());
         let expected_actor = session.user_id.clone();
 
-        let _ = integration_test(Extension(session), Path(conn_id.clone()))
+        let _ = integration_test(Extension(session), test_request_id(), Path(conn_id.clone()))
             .await
             .expect("integration_test must succeed");
 
@@ -5627,7 +6646,7 @@ pub mod integration_db_tests {
         seed_env_var_connection(pool, &conn_id, env_key).await;
 
         let session = AuthSession::static_dry_run();
-        let _ = integration_test(Extension(session), Path(conn_id.clone()))
+        let _ = integration_test(Extension(session), test_request_id(), Path(conn_id.clone()))
             .await
             .expect("integration_test must succeed");
 
@@ -5679,6 +6698,7 @@ pub mod integration_db_tests {
             site_scope: Some("dc-fra".to_string()),
             credential_source: source.to_string(),
             credential_ref: cred_ref.to_string(),
+            credential_secret_ref: None,
             inline_secret: inline_secret.to_string(),
         };
         let resp = integration_create(Extension(AuthSession::static_dry_run()), Json(body))
@@ -5811,6 +6831,7 @@ pub mod integration_db_tests {
             site_scope: None,
             credential_source: None,
             credential_ref: None,
+            credential_secret_ref: None,
             inline_secret: new_secret.clone(),
         };
         let _ = integration_update(
@@ -5866,6 +6887,7 @@ pub mod integration_db_tests {
             site_scope: None,
             credential_source: None,
             credential_ref: None,
+            credential_secret_ref: None,
             inline_secret: String::new(),
         };
         let _ = integration_update(
@@ -6103,6 +7125,117 @@ mod unit_tests {
             "expected KeyUnavailable, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn secret_reference_fingerprint_rejects_locator_substitution() {
+        let keyring = SecretReferenceFingerprintKeyring::try_new([(
+            "key:secret-ref-test-v1".to_string(),
+            rand::random::<[u8; 32]>().to_vec(),
+        )])
+        .expect("dedicated test keyring");
+        let make_ref = |locator: &str, fingerprint: &str| {
+            SecretRef::try_new(
+                "provider:vault-primary",
+                7,
+                "deployment:test",
+                "trust-domain:test",
+                None,
+                fingerprint,
+                "key:secret-ref-test-v1",
+                locator,
+                Some("password".to_string()),
+                "purpose:integration-authentication",
+                ryuki_engine::secret_material::SecretVersionSelector::pinned("3")
+                    .expect("pinned version"),
+            )
+            .expect("valid SecretRef")
+        };
+        let provisional = make_ref(
+            "secret/team/service",
+            &format!("hmac-sha256:{}", "0".repeat(64)),
+        );
+        let digest = keyring
+            .mac_for(&provisional)
+            .expect("fingerprint MAC")
+            .finalize()
+            .into_bytes();
+        let fingerprint = format!(
+            "hmac-sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let admitted = make_ref("secret/team/service", &fingerprint);
+        keyring.verify(&admitted).expect("exact locator admitted");
+
+        let substituted = make_ref("secret/team/other-service", &fingerprint);
+        assert!(matches!(
+            keyring.verify(&substituted),
+            Err(CredError::SecretReferenceInvalid)
+        ));
+    }
+
+    #[test]
+    fn fingerprint_keyring_file_requires_canonical_bounded_lines() {
+        use std::io::Write as _;
+
+        let encoded = B64.encode([0x5a_u8; 32]);
+        let mut valid = tempfile::NamedTempFile::new().expect("temporary keyring");
+        writeln!(valid, "key:secret-ref-test-v1={encoded}").expect("write keyring");
+        let keyring =
+            SecretReferenceFingerprintKeyring::from_file(valid.path()).expect("canonical keyring");
+        assert_eq!(keyring.keys.len(), 1);
+
+        let mut whitespace = tempfile::NamedTempFile::new().expect("temporary keyring");
+        writeln!(whitespace, "key:secret-ref-test-v1 = {encoded}").expect("write keyring");
+        assert!(SecretReferenceFingerprintKeyring::from_file(whitespace.path()).is_err());
+
+        let mut duplicate = tempfile::NamedTempFile::new().expect("temporary keyring");
+        writeln!(duplicate, "key:secret-ref-test-v1={encoded}").expect("write keyring");
+        writeln!(duplicate, "key:secret-ref-test-v1={encoded}").expect("write keyring");
+        assert!(SecretReferenceFingerprintKeyring::from_file(duplicate.path()).is_err());
+
+        let mut unpadded = tempfile::NamedTempFile::new().expect("temporary keyring");
+        writeln!(
+            unpadded,
+            "key:secret-ref-test-v1={}",
+            encoded.trim_end_matches('=')
+        )
+        .expect("write keyring");
+        assert!(SecretReferenceFingerprintKeyring::from_file(unpadded.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_keyring_accepts_only_contained_projected_volume_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let encoded = B64.encode([0x5a_u8; 32]);
+        let mount = tempfile::tempdir().expect("temporary projected mount");
+        let revision = mount.path().join("..2026_07_19_00_00_00");
+        std::fs::create_dir(&revision).expect("create projected revision");
+        std::fs::write(
+            revision.join("keyring"),
+            format!("key:secret-ref-test-v1={encoded}\n"),
+        )
+        .expect("write projected keyring");
+        symlink("..2026_07_19_00_00_00", mount.path().join("..data"))
+            .expect("link projected revision");
+        symlink("..data/keyring", mount.path().join("keyring")).expect("link projected keyring");
+        assert!(
+            SecretReferenceFingerprintKeyring::from_file(&mount.path().join("keyring")).is_ok()
+        );
+
+        let outside = tempfile::NamedTempFile::new().expect("outside keyring");
+        let escaping_mount = tempfile::tempdir().expect("escaping projected mount");
+        symlink(outside.path(), escaping_mount.path().join("keyring"))
+            .expect("link escaping keyring");
+        assert!(SecretReferenceFingerprintKeyring::from_file(
+            &escaping_mount.path().join("keyring")
+        )
+        .is_err());
     }
 
     #[test]
@@ -6437,13 +7570,18 @@ mod unit_tests {
             endpoint_url: "https://vcenter.test.example.com".to_string(),
             site_scope: None,
             credential_source: "db-encrypted".to_string(),
-            credential_ref: String::new(),
+            credential_ref: "legacy-locator-that-must-not-appear-in-logs".to_string(),
+            credential_secret_ref: None,
             inline_secret: "super-secret-value-that-must-not-appear-in-logs".to_string(),
         };
         let debug = format!("{:?}", req);
         assert!(
             !debug.contains("super-secret-value-that-must-not-appear-in-logs"),
             "CreateConnectionRequest Debug must redact inline_secret: {debug}"
+        );
+        assert!(
+            !debug.contains("legacy-locator-that-must-not-appear-in-logs"),
+            "CreateConnectionRequest Debug must redact credential_ref: {debug}"
         );
         assert!(
             debug.contains("[REDACTED]"),
@@ -6464,13 +7602,18 @@ mod unit_tests {
             endpoint_url: None,
             site_scope: None,
             credential_source: None,
-            credential_ref: None,
+            credential_ref: Some("legacy-update-locator-must-not-leak".to_string()),
+            credential_secret_ref: None,
             inline_secret: "updated-super-secret-must-not-leak".to_string(),
         };
         let debug = format!("{:?}", req);
         assert!(
             !debug.contains("updated-super-secret-must-not-leak"),
             "UpdateConnectionRequest Debug must redact inline_secret: {debug}"
+        );
+        assert!(
+            !debug.contains("legacy-update-locator-must-not-leak"),
+            "UpdateConnectionRequest Debug must redact credential_ref: {debug}"
         );
         assert!(
             debug.contains("[REDACTED]"),
@@ -6590,6 +7733,8 @@ mod unit_tests {
             site_scope: None,
             credential_source: credential_source.to_string(),
             credential_ref: "RYUKI_INTEGRATION__SHOULD_NOT_BE_READ".to_string(),
+            credential_secret_ref: None,
+            credential_secret_ref_generation: None,
             status: "configured".to_string(),
             readiness: "configured".to_string(),
             execution_mode: "static-dry-run".to_string(),
@@ -6638,7 +7783,7 @@ mod unit_tests {
 
         assert_eq!(
             display,
-            "persisted integration credential source is invalid"
+            "persisted integration credential binding is invalid"
         );
         assert!(!display.contains(raw));
         assert!(!debug.contains(raw));
@@ -6653,8 +7798,89 @@ mod unit_tests {
 
         assert_eq!(
             error.to_string(),
-            "persisted integration credential source is invalid"
+            "persisted integration credential binding is invalid"
         );
+    }
+
+    #[test]
+    fn persisted_typed_binding_requires_exclusive_shape_and_generation() {
+        let reference = SecretRef::try_new(
+            "provider:vault-primary",
+            7,
+            "deployment:test",
+            "trust-domain:test",
+            None,
+            format!("hmac-sha256:{}", "0".repeat(64)),
+            "key:secret-ref-test-v1",
+            "secret/team/service",
+            Some("password".to_string()),
+            "purpose:integration-authentication",
+            ryuki_engine::secret_material::SecretVersionSelector::latest_at_resolve(),
+        )
+        .expect("valid typed reference fixture");
+        let encoded = serde_json::to_value(&reference).expect("serialize fixture");
+
+        let mut valid = persisted_connection_row("secret-provider-ref");
+        valid.credential_ref.clear();
+        valid.credential_secret_ref = Some(encoded.clone());
+        valid.credential_secret_ref_generation = Some(1);
+        assert_eq!(
+            valid
+                .try_into_connection()
+                .expect("exclusive typed row")
+                .credential_source,
+            CredentialSource::SecretProviderRef
+        );
+
+        let mut missing_generation = persisted_connection_row("secret-provider-ref");
+        missing_generation.credential_ref.clear();
+        missing_generation.credential_secret_ref = Some(encoded.clone());
+        assert!(missing_generation.try_into_connection().is_err());
+
+        let mut mixed = persisted_connection_row("vault");
+        mixed.credential_secret_ref = Some(encoded);
+        mixed.credential_secret_ref_generation = Some(1);
+        assert!(mixed.try_into_connection().is_err());
+
+        let expected = PersistedTypedSecretBinding {
+            secret_ref: reference,
+            generation: NonZeroU64::new(1).expect("nonzero generation"),
+        };
+        assert!(persisted_typed_binding_matches_exactly(
+            "secret-provider-ref",
+            "",
+            Some(serde_json::to_value(&expected.secret_ref).expect("serialize exact reference")),
+            Some(1),
+            &expected,
+        ));
+        let substituted = SecretRef::try_new(
+            "provider:vault-primary",
+            7,
+            "deployment:test",
+            "trust-domain:test",
+            None,
+            format!("hmac-sha256:{}", "0".repeat(64)),
+            "key:secret-ref-test-v1",
+            "secret/team/other-service",
+            Some("password".to_string()),
+            "purpose:integration-authentication",
+            ryuki_engine::secret_material::SecretVersionSelector::latest_at_resolve(),
+        )
+        .expect("valid substituted reference fixture");
+        assert!(!persisted_typed_binding_matches_exactly(
+            "secret-provider-ref",
+            "",
+            Some(serde_json::to_value(substituted).expect("serialize substituted reference")),
+            Some(1),
+            &expected,
+        ));
+        assert!(!persisted_typed_binding_matches_exactly(
+            "secret-provider-ref",
+            "",
+            Some(serde_json::to_value(&expected.secret_ref).expect("serialize exact reference")),
+            Some(2),
+            &expected,
+        ));
     }
 
     #[test]
@@ -6719,7 +7945,7 @@ mod unit_tests {
     fn missing_secret_configuration_fails_closed_outside_dry_run() {
         let error = select_secret_resolver_kind(&SecretProvider::HashicorpVault, false, false)
             .expect_err("non-dry-run posture must reject missing Vault configuration");
-        assert!(matches!(error, CredError::VaultNotConfigured));
+        assert!(matches!(error, CredError::LegacyVaultReferenceDenied));
 
         assert!(matches!(
             select_secret_resolver_kind(&SecretProvider::HashicorpVault, false, true),
@@ -6727,7 +7953,7 @@ mod unit_tests {
         ));
         assert!(matches!(
             select_secret_resolver_kind(&SecretProvider::AwsSecretsManager, false, false),
-            Err(CredError::SecretProviderUnavailable(_))
+            Err(CredError::LegacyVaultReferenceDenied)
         ));
         assert!(matches!(
             select_secret_resolver_kind(&SecretProvider::AwsSecretsManager, false, true),
@@ -6736,10 +7962,10 @@ mod unit_tests {
     }
 
     #[test]
-    fn explicit_valid_vault_configuration_wins_in_every_posture() {
+    fn explicit_valid_legacy_vault_configuration_is_dry_run_only() {
         assert!(matches!(
             select_secret_resolver_kind(&SecretProvider::HashicorpVault, true, false),
-            Ok(SecretResolverKind::Vault)
+            Err(CredError::LegacyVaultReferenceDenied)
         ));
         assert!(matches!(
             select_secret_resolver_kind(&SecretProvider::HashicorpVault, true, true),
@@ -6754,7 +7980,7 @@ mod unit_tests {
     #[test]
     fn secret_provider_runtime_retains_one_real_resolver_allocation() {
         let config = RyukiConfig {
-            auth_mode: AuthMode::EntraId,
+            auth_mode: AuthMode::StaticDryRun,
             secret_provider: SecretProvider::HashicorpVault,
             ..RyukiConfig::default()
         };
@@ -6767,21 +7993,26 @@ mod unit_tests {
         )
         .expect("valid retained Vault runtime");
 
-        let live = runtime
-            .resolver_for(&ExecutionMode::Live)
-            .expect("configured Vault must serve live connections");
-        let static_dry_run = runtime
+        let first = runtime
             .resolver_for(&ExecutionMode::StaticDryRun)
-            .expect("configured Vault must win in every connection posture");
+            .expect("configured legacy Vault may serve explicit local dry-run");
+        let second = runtime
+            .resolver_for(&ExecutionMode::StaticDryRun)
+            .expect("the exact legacy resolver allocation remains retained");
 
-        assert!(Arc::ptr_eq(&live, &static_dry_run));
-        assert!(runtime.retains_resolver(&live));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(runtime.retains_resolver(&first));
+        assert!(matches!(
+            runtime.resolver_for(&ExecutionMode::Live),
+            Err(CredError::LegacyVaultReferenceDenied)
+        ));
         assert!(runtime.is_bound_to_config(&config));
 
         let rendered = format!("{runtime:?}");
         assert!(rendered.contains("ApiSecretProviderRuntime"));
         assert!(rendered.contains("[RETAINED]"));
-        assert!(rendered.contains("development_resolver: None"));
+        assert!(rendered.contains("legacy_vault_resolver"));
+        assert!(rendered.contains("workload_vault_runtime: None"));
         assert!(!rendered.contains("vault.runtime.test"));
         assert!(!rendered.contains("fixture-runtime-token"));
         assert!(!rendered.contains("DO-NOT-LOG"));
@@ -6808,8 +8039,7 @@ mod unit_tests {
         assert!(dry_run_runtime.retains_resolver(&first));
         assert!(matches!(
             dry_run_runtime.resolver_for(&ExecutionMode::Live),
-            Err(CredError::SecretProviderUnavailable(provider))
-                if provider == SecretProvider::AwsSecretsManager.as_str()
+            Err(CredError::LegacyVaultReferenceDenied)
         ));
 
         let production_config = RyukiConfig {
@@ -6822,11 +8052,21 @@ mod unit_tests {
                 .expect("missing Vault remains a dependent-operation failure");
         assert!(matches!(
             production_runtime.resolver_for(&ExecutionMode::Live),
-            Err(CredError::VaultNotConfigured)
+            Err(CredError::LegacyVaultReferenceDenied)
         ));
         assert!(matches!(
             production_runtime.resolver_for(&ExecutionMode::StaticDryRun),
-            Err(CredError::VaultNotConfigured)
+            Err(CredError::LegacyVaultReferenceDenied)
+        ));
+
+        assert!(matches!(
+            ApiSecretProviderRuntime::from_parts(
+                &production_config,
+                Some("https://vault.runtime.test:8200".to_string()),
+                Some("fixture-runtime-token".to_string()),
+                false,
+            ),
+            Err(CredError::LegacyVaultReferenceDenied)
         ));
     }
 
@@ -7082,7 +8322,7 @@ mod unit_tests {
         let endpoint = VaultEndpoint::parse("https://vault.example:8200/proxy/prefix", false)
             .expect("typed HTTPS endpoint");
         let url = endpoint
-            .kv2_read_url("secret", "team/key?alternate=%2Fother")
+            .kv2_read_url("secret", "team/key?alternate=%2Fother", None)
             .expect("safe KV URL");
 
         assert_eq!(
@@ -7150,7 +8390,7 @@ mod unit_tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept Vault request");
             let request = read_vault_test_request(&mut stream).await;
-            let body = r#"{"data":{"data":{"password":"fixture-value"}}}"#;
+            let body = r#"{"data":{"data":{"password":"fixture-value"},"metadata":{"version":1,"destroyed":false,"deletion_time":""}}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -7283,7 +8523,7 @@ mod unit_tests {
             .resolve("secret/some/path")
             .await
             .expect("mock always resolves");
-        assert_eq!(material, b"mock-secret-resolved:secret/some/path".to_vec());
+        assert_eq!(material, b"mock-secret-resolved:legacy".to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -7425,10 +8665,9 @@ mod unit_tests {
             .await
             .expect_err("wrong token must be denied (403)");
 
-        assert!(missing_field.to_string().contains("nonexistent_field"));
         assert!(missing_secret.to_string().contains("404"));
         assert!(
-            ambiguous.to_string().contains("#<field>"),
+            ambiguous.to_string().contains("exact field selector"),
             "ambiguity error must explain the selector: {ambiguous}"
         );
         assert!(denied.to_string().contains("403"));
@@ -7446,6 +8685,12 @@ mod unit_tests {
             assert!(
                 !msg.contains(VAULT_TEST_TOKEN) && !msg.contains("wrong-token"),
                 "{label} error must never carry a token: {msg}"
+            );
+            assert!(
+                !msg.contains(&path_multi)
+                    && !msg.contains("nonexistent_field")
+                    && !msg.contains("ryuki-definitely-missing"),
+                "{label} error must never carry a locator or selector: {msg}"
             );
         }
 

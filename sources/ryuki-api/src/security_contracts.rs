@@ -55,12 +55,13 @@ use ryuki_core::public_ingress::{
     MAX_PUBLIC_INGRESS_REQUEST_BYTES, MAX_PUBLIC_INGRESS_RESPONSE_BYTES,
 };
 use ryuki_core::security_profile::{
-    ArtifactKind, DeploymentSecurityProfile, GuardId, MigrationAuthoritySource,
+    secret_provider_inventory_digest, ArtifactKind, DeploymentSecurityProfile,
+    ExpectedProviderBinding, ExpectedSecretProviderBinding, GuardId, MigrationAuthoritySource,
     ProviderLifecycleState, RuntimeGuardExpectedValue, SecurityProfile, StartupAdmissionContext,
-    VersionedContentReference,
+    TenancyMode, VersionedContentReference, SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
@@ -358,7 +359,7 @@ impl StartupSecurityPins {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ContentReferenceBinding {
     document_id: String,
@@ -546,9 +547,9 @@ struct SecretProviderRuntimeBindingDocument {
 /// configuration's content reference. This projection deliberately contains
 /// neither secret material nor any runtime/inventory digest that could create
 /// a D -> P -> R -> I hash cycle.
-#[derive(Clone)]
 pub(crate) struct VerifiedSecretProviderRuntimeBinding {
     reference: ContentReferenceBinding,
+    raw_bytes: Box<[u8]>,
     document: SecretProviderRuntimeBindingDocument,
 }
 
@@ -559,12 +560,65 @@ impl fmt::Debug for VerifiedSecretProviderRuntimeBinding {
             .field("document_id", &self.document.document_id)
             .field("document_version", &self.document.document_version)
             .field("content_digest", &self.reference.content_digest)
+            .field("byte_len", &self.raw_bytes.len())
             .field("provider_id", &self.document.provider_id)
             .field(
                 "provider_configuration_version",
                 &self.document.provider_configuration_version,
             )
             .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedSecretProviderRuntimeBinding {
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.document.provider_id
+    }
+
+    pub(crate) fn provider_configuration_version(&self) -> u64 {
+        self.document.provider_configuration_version
+    }
+
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.document.deployment_id
+    }
+
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.document.trust_domain_id
+    }
+
+    /// Re-hash and losslessly reparse the exact authenticated bytes retained
+    /// for the process lifetime. A matching typed document alone is not enough:
+    /// D is the digest of these exact bytes and remains a distinct input to R.
+    fn verify_integrity(&self) -> Result<(), String> {
+        self.reference.validate()?;
+        if self.raw_bytes.is_empty() || raw_digest(&self.raw_bytes) != self.reference.content_digest
+        {
+            return Err(
+                "retained secret-provider runtime-binding bytes no longer match their exact digest"
+                    .into(),
+            );
+        }
+        let exact_value = parse_json_strict(&self.raw_bytes).map_err(|error| {
+            format!("retained secret-provider runtime-binding JSON is invalid: {error}")
+        })?;
+        validate_against_schema(
+            "retained secret-provider runtime binding",
+            SECRET_PROVIDER_RUNTIME_BINDING_SCHEMA,
+            &exact_value,
+        )?;
+        let reparsed = serde_json::from_value::<SecretProviderRuntimeBindingDocument>(exact_value)
+            .map_err(|error| {
+                format!("retained secret-provider runtime binding is not losslessly typed: {error}")
+            })?;
+        reparsed.validate()?;
+        if reparsed != self.document {
+            return Err(
+                "retained secret-provider runtime-binding bytes differ from the sealed typed document"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -893,10 +947,10 @@ fn production_runtime_guard_challenge_digest(
     Ok(raw_digest(&canonical))
 }
 
-// HttpsPublicUrls and SecureCookies have live production verifiers. The
-// remaining nominal witness types and the final eight-witness aggregate stay
-// under this temporary dead-code allowance until their guard-specific
-// verifiers are implemented.
+// HttpsPublicUrls, SecureCookies, and ApprovedSecretProvider have live
+// production verifiers. The remaining five nominal witness types and the final
+// eight-witness aggregate stay under this temporary dead-code allowance until
+// their guard-specific verifiers are implemented.
 #[allow(dead_code)]
 mod runtime_admission {
     use super::*;
@@ -1528,6 +1582,402 @@ mod runtime_admission {
         verify_secure_cookie_guard_with_clock(boundary, runtime, trusted_now)
     }
 
+    /// Exact process-lifetime secret-provider authority retained after the
+    /// ApprovedSecretProvider live guard seals. Debug omits the operational
+    /// leaves, authenticated binding, and lease identity.
+    pub(super) struct VerifiedApprovedSecretProviderRuntimeHandle {
+        runtime: Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+        binding: Arc<VerifiedSecretProviderRuntimeBinding>,
+        observation: Arc<crate::secret_provider_runtime::VaultRuntimeOperationalObservation>,
+        lease: Arc<crate::secret_provider_runtime::VaultAuthenticatedLease>,
+    }
+
+    impl fmt::Debug for VerifiedApprovedSecretProviderRuntimeHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VerifiedApprovedSecretProviderRuntimeHandle")
+                .field("provider_id", &self.binding.document.provider_id)
+                .field(
+                    "provider_configuration_version",
+                    &self.binding.document.provider_configuration_version,
+                )
+                .field("runtime", &"[RETAINED]")
+                .field("binding", &"[RETAINED]")
+                .field("observation", &"[RETAINED]")
+                .field("lease", &"[RETAINED]")
+                .finish()
+        }
+    }
+
+    impl VerifiedApprovedSecretProviderRuntimeHandle {
+        pub(super) fn retains_runtime(
+            &self,
+            runtime: &Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+        ) -> bool {
+            Arc::ptr_eq(&self.runtime, runtime)
+        }
+    }
+
+    pub(super) type VerifiedApprovedSecretProviderRuntimeWitness =
+        VerifiedApprovedSecretProviderGuardWitness<VerifiedApprovedSecretProviderRuntimeHandle>;
+
+    fn approved_secret_provider_measurement_failed() -> ProductionRuntimeAdmissionError {
+        ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+            guard_id: GuardId::ApprovedSecretProvider,
+        }
+    }
+
+    fn exact_secret_provider_row(
+        provider: &ActiveProviderConfiguration,
+        binding: &Arc<VerifiedSecretProviderRuntimeBinding>,
+    ) -> Result<ExpectedProviderBinding, ProductionRuntimeAdmissionError> {
+        let measurement_failed = approved_secret_provider_measurement_failed;
+        let ActiveProviderKindConfig::SecretService {
+            configuration,
+            verified_runtime_binding: Some(retained_binding),
+        } = &provider.kind_config
+        else {
+            return Err(measurement_failed());
+        };
+        let Some(reference) = configuration.runtime_binding_ref.as_ref() else {
+            return Err(measurement_failed());
+        };
+        if provider.kind != "secret-service"
+            || provider.active_lifecycle_record_version == 0
+            || !Arc::ptr_eq(retained_binding, binding)
+            || reference != &binding.reference
+            || provider.provider_id != binding.document.provider_id
+            || provider.config_version != binding.document.provider_configuration_version
+            || provider.trust_domain_id != binding.document.trust_domain_id
+            || provider.capability_descriptor.descriptor_id
+                != binding.document.capability_descriptor_id
+            || provider.capability_descriptor.descriptor_version
+                != binding.document.capability_descriptor_version
+            || provider.capability_descriptor.adapter_kind != binding.document.adapter_kind
+            || provider.capability_descriptor.adapter_version != binding.document.adapter_version
+            || validate_digest_pin(
+                "active secret-provider configuration payload digest",
+                &provider.payload_digest,
+            )
+            .is_err()
+        {
+            return Err(measurement_failed());
+        }
+        Ok(ExpectedProviderBinding {
+            provider_id: provider.provider_id.clone(),
+            configuration_version: provider.config_version,
+            configuration_payload_digest: provider.payload_digest.clone(),
+            lifecycle_record_version: provider.active_lifecycle_record_version,
+            lifecycle_state: ProviderLifecycleState::Active,
+            capability_descriptor_id: provider.capability_descriptor.descriptor_id.clone(),
+            capability_descriptor_version: provider.capability_descriptor.descriptor_version,
+            adapter_kind: provider.capability_descriptor.adapter_kind.clone(),
+            adapter_version: provider.capability_descriptor.adapter_version.clone(),
+        })
+    }
+
+    fn runtime_observation_matches_binding(
+        binding: &VerifiedSecretProviderRuntimeBinding,
+        observation: &crate::secret_provider_runtime::VaultRuntimeOperationalObservation,
+    ) -> bool {
+        let document = &binding.document;
+        document.provider_id == observation.provider_id
+            && document.provider_configuration_version == observation.provider_configuration_version
+            && document.adapter_kind == observation.adapter_kind
+            && document.adapter_version == observation.adapter_version
+            && document.protocol_version == observation.protocol_version
+            && document.backend_compatibility_profile.profile_id
+                == observation.backend_compatibility_profile.profile_id
+            && document.backend_compatibility_profile.profile_version
+                == observation.backend_compatibility_profile.profile_version
+            && document.backend_compatibility_profile.digest_contract
+                == observation.backend_compatibility_profile.digest_contract
+            && document.backend_compatibility_profile.binding_digest
+                == observation.backend_compatibility_profile.binding_digest
+            && document.transport.endpoint_base_url_binding_digest
+                == observation.transport.endpoint_base_url_binding_digest
+            && document.transport.ca_trust_binding_digest
+                == observation.transport.ca_trust_binding_digest
+            && document.transport.https_required == observation.transport.https_required
+            && document.transport.redirects_allowed == observation.transport.redirects_allowed
+            && document.transport.ambient_proxy_allowed
+                == observation.transport.ambient_proxy_allowed
+            && document.transport.built_in_roots_allowed
+                == observation.transport.built_in_roots_allowed
+            && document.transport.connect_timeout_millis
+                == observation.transport.connect_timeout_millis
+            && document.transport.request_timeout_millis
+                == observation.transport.request_timeout_millis
+            && document.transport.response_body_max_bytes
+                == observation.transport.response_body_max_bytes
+            && document.credential_source.kind == observation.credential_source.kind
+            && document.credential_source.identity_binding_digest
+                == observation.credential_source.identity_binding_digest
+            && document.credential_source.audience_binding_digest
+                == observation.credential_source.audience_binding_digest
+            && document.credential_source.token_path_binding_digest
+                == observation.credential_source.token_path_binding_digest
+            && document
+                .credential_source
+                .provider_authentication_digest_contract
+                == observation
+                    .credential_source
+                    .provider_authentication_digest_contract
+            && document
+                .credential_source
+                .provider_authentication_binding_digest
+                == observation
+                    .credential_source
+                    .provider_authentication_binding_digest
+            && document.credential_source.static_bearer_allowed
+                == observation.credential_source.static_bearer_allowed
+            && document.credential_source.exported_bearer_allowed
+                == observation.credential_source.exported_bearer_allowed
+            && document.capability_bindings.len() == observation.capability_bindings.len()
+            && document
+                .capability_bindings
+                .iter()
+                .zip(&observation.capability_bindings)
+                .all(|(expected, measured)| {
+                    expected.capability_id == measured.capability_id
+                        && expected.semantic_version == measured.semantic_version
+                })
+            && document.retained_consumer_ids == observation.retained_consumer_ids
+            && document.ownership.single_runtime_owner == observation.ownership.single_runtime_owner
+            && document.ownership.ambient_reconfiguration_allowed
+                == observation.ownership.ambient_reconfiguration_allowed
+    }
+
+    /// Canonical R projection. D (the exact raw document digest) and P (the
+    /// active configuration payload digest inside `provider`) are independent
+    /// inputs; R can therefore never be replaced with either declaration.
+    fn secret_provider_runtime_binding_digest(
+        provider: &ExpectedProviderBinding,
+        binding: &VerifiedSecretProviderRuntimeBinding,
+        observation: &crate::secret_provider_runtime::VaultRuntimeOperationalObservation,
+    ) -> Result<String, ProductionRuntimeAdmissionError> {
+        let projection = serde_json::json!({
+            "digest_contract": SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT,
+            "provider": provider,
+            "binding_document_reference": &binding.reference,
+            "observed_runtime": {
+                "provider_id": &observation.provider_id,
+                "provider_configuration_version": observation.provider_configuration_version,
+                "adapter_kind": &observation.adapter_kind,
+                "adapter_version": &observation.adapter_version,
+                "protocol_version": &observation.protocol_version,
+                "backend_compatibility_profile": {
+                    "profile_id": &observation.backend_compatibility_profile.profile_id,
+                    "profile_version": observation.backend_compatibility_profile.profile_version,
+                    "digest_contract": &observation.backend_compatibility_profile.digest_contract,
+                    "binding_digest": &observation.backend_compatibility_profile.binding_digest,
+                },
+                "transport": {
+                    "endpoint_base_url_binding_digest": &observation.transport.endpoint_base_url_binding_digest,
+                    "ca_trust_binding_digest": &observation.transport.ca_trust_binding_digest,
+                    "https_required": observation.transport.https_required,
+                    "redirects_allowed": observation.transport.redirects_allowed,
+                    "ambient_proxy_allowed": observation.transport.ambient_proxy_allowed,
+                    "built_in_roots_allowed": observation.transport.built_in_roots_allowed,
+                    "connect_timeout_millis": observation.transport.connect_timeout_millis,
+                    "request_timeout_millis": observation.transport.request_timeout_millis,
+                    "response_body_max_bytes": observation.transport.response_body_max_bytes,
+                },
+                "credential_source": {
+                    "kind": &observation.credential_source.kind,
+                    "identity_binding_digest": &observation.credential_source.identity_binding_digest,
+                    "audience_binding_digest": &observation.credential_source.audience_binding_digest,
+                    "token_path_binding_digest": &observation.credential_source.token_path_binding_digest,
+                    "provider_authentication_digest_contract": &observation.credential_source.provider_authentication_digest_contract,
+                    "provider_authentication_binding_digest": &observation.credential_source.provider_authentication_binding_digest,
+                    "static_bearer_allowed": observation.credential_source.static_bearer_allowed,
+                    "exported_bearer_allowed": observation.credential_source.exported_bearer_allowed,
+                },
+                "capability_bindings": observation.capability_bindings.iter().map(|capability| {
+                    serde_json::json!({
+                        "capability_id": &capability.capability_id,
+                        "semantic_version": &capability.semantic_version,
+                    })
+                }).collect::<Vec<_>>(),
+                "retained_consumer_ids": &observation.retained_consumer_ids,
+                "ownership": {
+                    "single_runtime_owner": observation.ownership.single_runtime_owner,
+                    "ambient_reconfiguration_allowed": observation.ownership.ambient_reconfiguration_allowed,
+                },
+            },
+        });
+        let canonical = canonical_json_bytes(&projection)
+            .map_err(|_| approved_secret_provider_measurement_failed())?;
+        let runtime_digest = raw_digest(&canonical);
+        if runtime_digest == binding.reference.content_digest
+            || runtime_digest == provider.configuration_payload_digest
+        {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        Ok(runtime_digest)
+    }
+
+    pub(super) fn measured_approved_secret_provider_value(
+        provider: &ActiveProviderConfiguration,
+        binding: &Arc<VerifiedSecretProviderRuntimeBinding>,
+        observation: &crate::secret_provider_runtime::VaultRuntimeOperationalObservation,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        binding
+            .verify_integrity()
+            .map_err(|_| approved_secret_provider_measurement_failed())?;
+        if !runtime_observation_matches_binding(binding, observation) {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        let required_capability_ids = observation
+            .capability_bindings
+            .iter()
+            .map(|capability| capability.capability_id.clone())
+            .collect::<Vec<_>>();
+        if required_capability_ids.is_empty()
+            || !required_capability_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        if provider.capability_descriptor.advertised_capabilities != required_capability_ids {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        let provider = exact_secret_provider_row(provider, binding)?;
+        let runtime_binding_digest =
+            secret_provider_runtime_binding_digest(&provider, binding, observation)?;
+        let providers = vec![ExpectedSecretProviderBinding {
+            provider,
+            runtime_binding_digest,
+        }];
+        let provider_inventory_digest =
+            secret_provider_inventory_digest(&providers, &required_capability_ids)
+                .map_err(|_| approved_secret_provider_measurement_failed())?;
+        Ok(RuntimeGuardExpectedValue::ApprovedSecretProvider {
+            provider_inventory_digest,
+            providers,
+            required_capability_ids,
+        })
+    }
+
+    fn validate_secret_provider_runtime_handle(
+        provider: &ActiveProviderConfiguration,
+        handle: &VerifiedApprovedSecretProviderRuntimeHandle,
+    ) -> Result<RuntimeGuardExpectedValue, ProductionRuntimeAdmissionError> {
+        if !handle.runtime.is_bound_to(&handle.binding)
+            || !Arc::ptr_eq(
+                handle.runtime.operational_observation(),
+                &handle.observation,
+            )
+            || !handle.runtime.lease_is_current(&handle.lease)
+        {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        let readiness = handle.runtime.readiness_snapshot();
+        if !readiness.is_ready()
+            || readiness.generation != handle.lease.generation()
+            || readiness.workload_identity_binding_digest.as_deref()
+                != Some(
+                    handle
+                        .observation
+                        .credential_source
+                        .identity_binding_digest
+                        .as_str(),
+                )
+            || handle.runtime.witness_valid_for(&handle.lease).is_err()
+        {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        measured_approved_secret_provider_value(provider, &handle.binding, &handle.observation)
+    }
+
+    pub(super) async fn verify_approved_secret_provider_guard(
+        boundary: &VerifiedProductionBoundary,
+        provider: &ActiveProviderConfiguration,
+        binding: &Arc<VerifiedSecretProviderRuntimeBinding>,
+        runtime: &Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+    ) -> Result<VerifiedApprovedSecretProviderRuntimeWitness, ProductionRuntimeAdmissionError> {
+        let measurement_failed = approved_secret_provider_measurement_failed;
+        let observed_at_not_before = Utc::now();
+        boundary
+            .ensure_fresh(trusted_time_point(observed_at_not_before))
+            .map_err(|_| ProductionRuntimeAdmissionError::BoundaryStale)?;
+        if !runtime.is_bound_to(binding) {
+            return Err(measurement_failed());
+        }
+        let observation = Arc::clone(runtime.operational_observation());
+        let observed_value =
+            measured_approved_secret_provider_value(provider, binding, &observation)?;
+        let challenge = exact_challenge(boundary, GuardId::ApprovedSecretProvider)?;
+        if &observed_value != challenge.expected_value() {
+            return Err(ProductionRuntimeAdmissionError::ExpectedValueMismatch {
+                guard_id: GuardId::ApprovedSecretProvider,
+            });
+        }
+
+        // Only after the independently measured static runtime has matched the
+        // receipt may a projected workload credential be sent to the provider.
+        let lease = runtime
+            .authenticate()
+            .await
+            .map_err(|_| measurement_failed())?;
+        let witness_valid_for = runtime
+            .witness_valid_for(&lease)
+            .map_err(|_| measurement_failed())?
+            .min(Duration::from_secs(
+                MAX_RUNTIME_GUARD_WITNESS_LIFETIME_SECONDS as u64,
+            ));
+        if witness_valid_for.is_zero() {
+            return Err(measurement_failed());
+        }
+        let observed_at_not_after = Utc::now();
+        let valid_until = observed_at_not_after
+            .checked_add_signed(chrono::TimeDelta::from_std(witness_valid_for).map_err(|_| {
+                ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                    guard_id: GuardId::ApprovedSecretProvider,
+                }
+            })?)
+            .ok_or(ProductionRuntimeAdmissionError::InvalidObservationWindow {
+                guard_id: GuardId::ApprovedSecretProvider,
+            })?;
+        let handle = VerifiedApprovedSecretProviderRuntimeHandle {
+            runtime: Arc::clone(runtime),
+            binding: Arc::clone(binding),
+            observation,
+            lease,
+        };
+        if validate_secret_provider_runtime_handle(provider, &handle)? != observed_value {
+            return Err(measurement_failed());
+        }
+        VerifiedApprovedSecretProviderGuardWitness::from_verified_observation(
+            boundary,
+            VerifiedRuntimeGuardObservation {
+                guard_id: GuardId::ApprovedSecretProvider,
+                observed_value,
+                requirement_digest: challenge.requirement_digest().to_owned(),
+                challenge_binding_digest: challenge.challenge_binding_digest().to_owned(),
+                observed_at_not_before,
+                observed_at_not_after,
+                valid_until,
+                handle,
+            },
+            trusted_time_point(Utc::now()),
+        )
+    }
+
+    pub(super) fn recheck_approved_secret_provider_guard(
+        boundary: &VerifiedProductionBoundary,
+        provider: &ActiveProviderConfiguration,
+        witness: &VerifiedApprovedSecretProviderRuntimeWitness,
+        trusted_now: ConformanceTrustedTimeWindow,
+    ) -> Result<(), ProductionRuntimeAdmissionError> {
+        let remeasured = validate_secret_provider_runtime_handle(provider, witness.handle())?;
+        if witness.0.observed_value != remeasured {
+            return Err(approved_secret_provider_measurement_failed());
+        }
+        witness.recheck(boundary, trusted_now)
+    }
+
     /// Exactly one nominal witness for every production guard. Named fields
     /// make omission, duplication, and cross-kind substitution compile-time
     /// errors instead of collection-shape checks.
@@ -1836,6 +2286,40 @@ pub(crate) enum ConformanceState {
     Production(Box<VerifiedProductionBoundary>),
 }
 
+/// Value-free scope authority for typed production secret resolution. Every
+/// field comes from the sealed workload/profile identity; request handlers
+/// cannot substitute scope from a stored SecretRef or caller input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductionSecretResolutionAuthority {
+    deployment_id: String,
+    trust_domain_id: String,
+    workload_id: String,
+    authority_epoch: u64,
+    tenant_id: Option<String>,
+}
+
+impl ProductionSecretResolutionAuthority {
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
+    pub(crate) fn trust_domain_id(&self) -> &str {
+        &self.trust_domain_id
+    }
+
+    pub(crate) fn workload_id(&self) -> &str {
+        &self.workload_id
+    }
+
+    pub(crate) fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub(crate) fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SecurityContractContext {
     pub(crate) profile: DeploymentSecurityProfile,
@@ -1854,6 +2338,11 @@ pub(crate) struct SecurityContractContext {
     /// workload instance sealed into the production boundary.
     verified_https_public_urls_guard:
         Option<runtime_admission::VerifiedHttpsPublicUrlsRuntimeWitness>,
+    /// Live ApprovedSecretProvider witness retaining the exact authenticated
+    /// runtime, binding Arc and bytes, measured operational allocation, and
+    /// current provider lease that satisfied the receipt-bound D/P/R/I chain.
+    verified_approved_secret_provider_guard:
+        Option<runtime_admission::VerifiedApprovedSecretProviderRuntimeWitness>,
     /// Active provider id -> immutable, content-addressed configuration.
     pub(crate) active_providers: BTreeMap<String, ActiveProviderConfiguration>,
     /// Lossless, non-authoritative projection retained for independent
@@ -1883,6 +2372,103 @@ impl SecurityContractContext {
         self.profile.security_profile.is_production()
     }
 
+    fn exact_production_secret_provider(
+        &self,
+    ) -> Result<
+        (
+            &ActiveProviderConfiguration,
+            &Arc<VerifiedSecretProviderRuntimeBinding>,
+        ),
+        String,
+    > {
+        if !self.profile.security_profile.is_production() {
+            return Err(
+                "a production secret-provider runtime was requested outside production".into(),
+            );
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let mut candidates = self
+            .active_providers
+            .values()
+            .filter(|provider| provider.kind == "secret-service");
+        let provider = candidates.next().ok_or_else(|| {
+            "production startup has no active secret-service provider".to_string()
+        })?;
+        if candidates.next().is_some() {
+            return Err(
+                "production startup requires exactly one active secret-service provider".into(),
+            );
+        }
+        let binding = provider
+            .verified_secret_provider_runtime_binding()
+            .ok_or_else(|| {
+                "production secret-service provider has no exact verified runtime binding"
+                    .to_string()
+            })?;
+        binding.verify_integrity()?;
+        if binding.document.deployment_id != boundary.conformance.deployment_id()
+            || binding.document.trust_domain_id != boundary.conformance.trust_domain_id()
+            || binding.document.provider_id != provider.provider_id
+            || binding.document.provider_configuration_version != provider.config_version
+        {
+            return Err(
+                "production secret-service provider binding differs from the sealed production identity"
+                    .into(),
+            );
+        }
+        Ok((provider, binding))
+    }
+
+    /// Select the one exact production binding used to construct the runtime.
+    /// Non-production never receives production secret-provider authority.
+    pub(crate) fn verified_secret_provider_runtime_binding(
+        &self,
+    ) -> Result<Option<Arc<VerifiedSecretProviderRuntimeBinding>>, String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_approved_secret_provider_guard.is_some() {
+                return Err(
+                    "non-production startup retained approved secret-provider authority".into(),
+                );
+            }
+            return Ok(None);
+        }
+        let (_, binding) = self.exact_production_secret_provider()?;
+        Ok(Some(Arc::clone(binding)))
+    }
+
+    pub(crate) fn production_secret_resolution_authority(
+        &self,
+    ) -> Result<ProductionSecretResolutionAuthority, String> {
+        if self.profile.security_profile != SecurityProfile::Production {
+            return Err("secret-resolution authority is production-only".into());
+        }
+        if self.profile.tenancy_mode != TenancyMode::SingleTenant {
+            return Err(
+                "the current production secret resolver requires single-tenant authority".into(),
+            );
+        }
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        if self.profile.deployment_id != boundary.deployed_workload.deployment_id()
+            || boundary.deployed_workload.authority_epoch() == 0
+        {
+            return Err(
+                "production secret-resolution scope differs from the sealed workload authority"
+                    .into(),
+            );
+        }
+        Ok(ProductionSecretResolutionAuthority {
+            deployment_id: boundary.deployed_workload.deployment_id().to_owned(),
+            trust_domain_id: boundary.deployed_workload.trust_domain_id().to_owned(),
+            workload_id: boundary.deployed_workload.workload_id().to_owned(),
+            authority_epoch: boundary.deployed_workload.authority_epoch(),
+            tenant_id: None,
+        })
+    }
+
     pub(crate) fn validate_serving_checkpoint_freshness(
         &self,
         now: DateTime<Utc>,
@@ -1908,6 +2494,18 @@ impl SecurityContractContext {
                 .map_err(|error| {
                     format!("secure-cookie runtime guard freshness recheck failed: {error}")
                 })?;
+        }
+        if let Some(witness) = &self.verified_approved_secret_provider_guard {
+            let (provider, _) = self.exact_production_secret_provider()?;
+            runtime_admission::recheck_approved_secret_provider_guard(
+                boundary,
+                provider,
+                witness,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("approved-secret-provider runtime guard freshness recheck failed: {error}")
+            })?;
         }
         Ok(())
     }
@@ -1988,6 +2586,53 @@ impl SecurityContractContext {
         Ok(())
     }
 
+    /// Authenticate and seal the exact singleton secret-provider runtime only
+    /// after its independently measured static leaves satisfy the receipt. The
+    /// verifier retains the exact runtime, binding, observation, and lease.
+    pub(crate) async fn verify_approved_secret_provider_runtime_guard(
+        &mut self,
+        runtime: &Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+    ) -> Result<(), String> {
+        if !self.profile.security_profile.is_production() {
+            if self.verified_approved_secret_provider_guard.is_some() {
+                return Err(
+                    "non-production startup retained an approved secret-provider witness".into(),
+                );
+            }
+            return Ok(());
+        }
+        if self.verified_approved_secret_provider_guard.is_some() {
+            return Err(
+                "production approved-secret-provider runtime guard was verified more than once"
+                    .into(),
+            );
+        }
+        let (provider, binding) = self.exact_production_secret_provider()?;
+        let provider = provider.clone();
+        let binding = Arc::clone(binding);
+        let ConformanceState::Production(boundary) = &self.conformance_state else {
+            return Err("production startup has no sealed production-boundary proof".into());
+        };
+        let witness = runtime_admission::verify_approved_secret_provider_guard(
+            boundary, &provider, &binding, runtime,
+        )
+        .await
+        .map_err(|error| {
+            format!("approved-secret-provider runtime guard verification failed: {error}")
+        })?;
+        self.verified_approved_secret_provider_guard = Some(witness);
+        Ok(())
+    }
+
+    pub(crate) fn retains_approved_secret_provider_runtime(
+        &self,
+        runtime: &Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+    ) -> bool {
+        self.verified_approved_secret_provider_guard
+            .as_ref()
+            .is_some_and(|witness| witness.handle().retains_runtime(runtime))
+    }
+
     pub(crate) fn validate_runtime_bindings(
         &self,
         config: &RyukiConfig,
@@ -2008,6 +2653,14 @@ impl SecurityContractContext {
                 .ok_or_else(|| {
                     "production startup has no verified https-public-urls runtime guard".to_string()
                 })?;
+            let approved_secret_provider_guard = self
+                .verified_approved_secret_provider_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "production startup has no verified approved-secret-provider runtime guard"
+                        .to_string()
+                })?;
+            let (secret_provider, _) = self.exact_production_secret_provider()?;
             let trusted_now = trusted_time_point(now);
             runtime_admission::recheck_https_public_urls_guard(
                 boundary,
@@ -2025,13 +2678,22 @@ impl SecurityContractContext {
             .map_err(|error| {
                 format!("secure-cookie runtime guard freshness recheck failed: {error}")
             })?;
+            runtime_admission::recheck_approved_secret_provider_guard(
+                boundary,
+                secret_provider,
+                approved_secret_provider_guard,
+                trusted_now,
+            )
+            .map_err(|error| {
+                format!("approved-secret-provider runtime guard freshness recheck failed: {error}")
+            })?;
             let provider_applicability = format!(
                 "provider registry version {} with {} active provider applicability claims",
                 self.provider_registry_applicability.registry_version,
                 self.provider_registry_applicability.active_providers.len(),
             );
             return Err(format!(
-                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls plus the exact retained SecureCookies policy have live workload-bound witnesses; startup remains blocked until the remaining six runtime guards are verified: durable-postgresql, approved-secret-provider, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
+                "production semantic closure is verified and sealed to the pinned build and deployed workload (closure {}; {} receipt packages; {} evidence objects; workload {}; {}), and HttpsPublicUrls, the exact retained SecureCookies policy, plus the singleton ApprovedSecretProvider D/P/R/I composition have live workload-bound witnesses; startup remains blocked until the remaining five runtime guards are verified: durable-postgresql, non-development-authenticator, external-signing-key-material, mock-dependencies-disabled, first-owner-path-closed",
                 boundary.conformance.closure_digest(),
                 boundary.conformance.package_count(),
                 boundary.conformance.evidence_count(),
@@ -3140,6 +3802,7 @@ fn finalize_startup_security_contract(
         conformance_state,
         verified_secure_cookie_guard: None,
         verified_https_public_urls_guard: None,
+        verified_approved_secret_provider_guard: None,
         active_providers: prepared.active_providers,
         provider_registry_applicability: prepared.provider_registry_applicability,
     })
@@ -5586,6 +6249,7 @@ fn verify_secret_provider_runtime_binding(
 
     Ok(VerifiedSecretProviderRuntimeBinding {
         reference: reference.clone(),
+        raw_bytes: raw_bytes.clone().into_boxed_slice(),
         document,
     })
 }
@@ -10066,6 +10730,152 @@ mod tests {
                 .advertised_capabilities
                 .len()
         );
+        retained_binding
+            .verify_integrity()
+            .expect("the retained exact raw bytes must re-hash and reparse");
+    }
+
+    fn operational_observation_from_binding(
+        binding: &VerifiedSecretProviderRuntimeBinding,
+    ) -> crate::secret_provider_runtime::VaultRuntimeOperationalObservation {
+        let document = &binding.document;
+        crate::secret_provider_runtime::VaultRuntimeOperationalObservation {
+            provider_id: document.provider_id.clone(),
+            provider_configuration_version: document.provider_configuration_version,
+            adapter_kind: document.adapter_kind.clone(),
+            adapter_version: document.adapter_version.clone(),
+            protocol_version: document.protocol_version.clone(),
+            backend_compatibility_profile:
+                crate::secret_provider_runtime::VaultBackendCompatibilityObservation {
+                    profile_id: document.backend_compatibility_profile.profile_id.clone(),
+                    profile_version: document.backend_compatibility_profile.profile_version,
+                    digest_contract: document
+                        .backend_compatibility_profile
+                        .digest_contract
+                        .clone(),
+                    binding_digest: document
+                        .backend_compatibility_profile
+                        .binding_digest
+                        .clone(),
+                },
+            transport: crate::secret_provider_runtime::VaultTransportObservation {
+                endpoint_base_url_binding_digest: document
+                    .transport
+                    .endpoint_base_url_binding_digest
+                    .clone(),
+                ca_trust_binding_digest: document.transport.ca_trust_binding_digest.clone(),
+                https_required: document.transport.https_required,
+                redirects_allowed: document.transport.redirects_allowed,
+                ambient_proxy_allowed: document.transport.ambient_proxy_allowed,
+                built_in_roots_allowed: document.transport.built_in_roots_allowed,
+                connect_timeout_millis: document.transport.connect_timeout_millis,
+                request_timeout_millis: document.transport.request_timeout_millis,
+                response_body_max_bytes: document.transport.response_body_max_bytes,
+            },
+            credential_source: crate::secret_provider_runtime::VaultCredentialSourceObservation {
+                kind: document.credential_source.kind.clone(),
+                identity_binding_digest: document.credential_source.identity_binding_digest.clone(),
+                audience_binding_digest: document.credential_source.audience_binding_digest.clone(),
+                token_path_binding_digest: document
+                    .credential_source
+                    .token_path_binding_digest
+                    .clone(),
+                provider_authentication_digest_contract: document
+                    .credential_source
+                    .provider_authentication_digest_contract
+                    .clone(),
+                provider_authentication_binding_digest: document
+                    .credential_source
+                    .provider_authentication_binding_digest
+                    .clone(),
+                static_bearer_allowed: document.credential_source.static_bearer_allowed,
+                exported_bearer_allowed: document.credential_source.exported_bearer_allowed,
+            },
+            capability_bindings: document
+                .capability_bindings
+                .iter()
+                .map(
+                    |capability| crate::secret_provider_runtime::VaultCapabilityObservation {
+                        capability_id: capability.capability_id.clone(),
+                        semantic_version: capability.semantic_version.clone(),
+                    },
+                )
+                .collect(),
+            retained_consumer_ids: document.retained_consumer_ids.clone(),
+            ownership: crate::secret_provider_runtime::VaultRuntimeOwnershipObservation {
+                single_runtime_owner: document.ownership.single_runtime_owner,
+                ambient_reconfiguration_allowed: document.ownership.ambient_reconfiguration_allowed,
+            },
+        }
+    }
+
+    #[test]
+    fn approved_secret_provider_derives_distinct_d_p_r_i_from_measured_leaves() {
+        let mut fixture = ActiveFixture::build();
+        fixture.install_secret_provider_runtime_binding();
+        let prepared = prepare_startup_security_contract(&fixture.pins, fixed_now()).unwrap();
+        let provider = &prepared.active_providers["provider:repository-static-dry-run"];
+        let binding = provider
+            .verified_secret_provider_runtime_binding()
+            .expect("fixture provider has an exact runtime binding");
+        let observation = operational_observation_from_binding(binding);
+
+        let measured = measured_approved_secret_provider_value(provider, binding, &observation)
+            .expect("all independently measured runtime leaves match the binding");
+        let RuntimeGuardExpectedValue::ApprovedSecretProvider {
+            provider_inventory_digest,
+            providers,
+            required_capability_ids,
+        } = measured
+        else {
+            panic!("measurement changed guard kind");
+        };
+        assert_eq!(providers.len(), 1);
+        assert_eq!(
+            providers[0].provider.configuration_payload_digest,
+            provider.payload_digest
+        );
+        assert_ne!(
+            providers[0].runtime_binding_digest, binding.reference.content_digest,
+            "R must not be the exact-document digest D"
+        );
+        assert_ne!(
+            providers[0].runtime_binding_digest, provider.payload_digest,
+            "R must not be the active-provider payload digest P"
+        );
+        assert_eq!(
+            provider_inventory_digest,
+            secret_provider_inventory_digest(&providers, &required_capability_ids).unwrap(),
+            "I must use the existing canonical inventory contract"
+        );
+        assert_eq!(
+            required_capability_ids,
+            vec![
+                "dry-run-only".to_string(),
+                "static-human-fixture".to_string()
+            ]
+        );
+
+        let mut substituted = observation;
+        substituted.transport.endpoint_base_url_binding_digest =
+            raw_digest(b"substituted live endpoint");
+        assert_eq!(
+            measured_approved_secret_provider_value(provider, binding, &substituted).unwrap_err(),
+            ProductionRuntimeAdmissionError::GuardMeasurementFailed {
+                guard_id: GuardId::ApprovedSecretProvider,
+            }
+        );
+    }
+
+    #[test]
+    fn retained_secret_provider_binding_rejects_raw_byte_drift() {
+        let case = SecretProviderBindingCase::build();
+        let mut binding = case.verify().expect("fixture binding verifies");
+        binding.raw_bytes[0] ^= 1;
+        assert!(binding
+            .verify_integrity()
+            .unwrap_err()
+            .contains("exact digest"));
     }
 
     #[test]
@@ -10331,7 +11141,9 @@ mod tests {
         for (pointer, substituted) in [
             (
                 "/$schema",
-                json!("https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json"),
+                json!(
+                    "https://ryuki.io/schemas/security-contracts/v1/action-resource-registry.schema.json"
+                ),
             ),
             ("/contract_kind", json!("action-resource-registry")),
         ] {

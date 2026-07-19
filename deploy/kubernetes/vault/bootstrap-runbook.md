@@ -75,6 +75,107 @@ vault audit enable file file_path=/vault/audit/vault-audit.log
 
 Audit logs are sensitive operational records. Export only redacted audit evidence references through the platform evidence workflow.
 
+## Bind The Platform API Workload
+
+The direct API resolver and Vault Secrets Operator use different Kubernetes
+identities and different Vault roles. Do not point a `VaultAuth` resource at
+`platform-api`, and do not add any VSO materializer ServiceAccount to the
+`ryuki-platform-api` role.
+
+After the chart has created the `vault` namespace, the `vault` ServiceAccount,
+and ready Vault server pods, apply the Kubernetes half of the boundary:
+
+```bash
+kubectl apply -f deploy/kubernetes/vault/workload-auth.yaml
+```
+
+This creates the exact API-to-server network path and binds only
+`vault:vault` to `system:auth-delegator`. It does not configure Vault. The Vault
+network policy also requires an environment overlay that permits the server
+pods to reach the target cluster's Kubernetes API endpoint for service account
+authentication review;
+that endpoint is cluster-specific and is deliberately not guessed here.
+
+Create `ryuki-vault-client-ca` in `ryuki-platform` through the approved trust
+distribution process. It must contain exactly one key named `ca.crt` with the
+CA chain that validates `vault.vault.svc`; it must not contain a private key,
+client certificate, token, or unrelated trust roots. The API deployment mounts
+only that key, read-only, at
+`/var/run/secrets/ryuki/vault-tls/ca.crt`.
+
+Create `ryuki-secret-reference-fingerprint-keyring` in `ryuki-platform`
+through the approved secret-distribution process. The Kubernetes Secret must
+contain exactly one key named `keyring`; no second data key, annotation value,
+or committed manifest may carry the material. The `keyring` file is UTF-8 text
+with one nonempty record per line in exactly this shape:
+
+```text
+key:<id>=<base64 material>
+```
+
+`key:<id>` is the complete, unique fingerprint key identifier, and `<id>` must
+be nonempty. Whitespace, blank lines, comments, and duplicate identifiers are
+invalid. Material uses canonical padded standard Base64 and must decode to
+32–128 bytes. The API reads the file only from
+`/var/run/secrets/ryuki/secret-reference-fingerprint/keyring`; Kubernetes
+projects only the `keyring` item at mode `0440`, and only the `platform-api`
+container mounts its directory read-only under `fsGroup: 10001`. Never place
+the file content in a process environment variable.
+
+Rotate without breaking references that name the predecessor key. First add a
+fresh, independently generated successor record while retaining every key ID
+still referenced by persisted SecretRefs. Update the operator-owned Secret,
+restart the `Recreate` API Deployment so startup reads the complete overlapping
+keyring, and then admit new or rewritten references with the successor ID.
+Inventory and rewrite all predecessor references under the normal generation
+fence. Remove a predecessor only after an independent readback proves no stored
+reference names it, then update the Secret and restart the API again. A missing
+referenced key fails closed; do not bypass that failure by relabeling key IDs or
+reusing material.
+
+Operational evidence may record only the Secret name, namespace,
+`resourceVersion`, projected path/mode, approved key IDs, rotation timestamps,
+and value-free reference counts. Exclude the `keyring` payload, encoded or
+decoded material, generated command lines, process environments, pod file
+content, and Secret `data`/`stringData` from evidence, logs, tickets, chat, and
+this repository.
+
+An independently authorized Vault operator then applies the checked-in,
+value-free auth configuration, policy, and role. Run these commands from the
+repository root only after reviewing the exact three input files:
+
+```bash
+vault auth enable -path=kubernetes kubernetes
+vault write auth/kubernetes/config @deploy/kubernetes/vault/kubernetes-auth-config.json
+vault policy write ryuki-platform-api-runtime deploy/kubernetes/vault/platform-api-policy.hcl
+vault write auth/kubernetes/role/ryuki-platform-api @deploy/kubernetes/vault/platform-api-kubernetes-role.json
+```
+
+`kubernetes-auth-config.json` intentionally omits the optional reviewer jwt field and
+`kubernetes_ca_cert`: an in-cluster Vault uses its rotating local
+ServiceAccount token and local Kubernetes CA. The role accepts only a
+600-second, `vault`-audience projected JWT from
+`ryuki-platform:platform-api`, issues a ten-minute service token, caps its
+maximum and explicit maximum lifetime at fifteen minutes, and suppresses the
+Vault `default` policy. Reauthentication,
+not an unbounded periodic token, is the renewal boundary.
+
+Before deploying the API, read the effective state back and require exact
+agreement with the checked-in assets. Stop on wildcard subjects/namespaces,
+extra policies, the `default` policy, zero/unbounded TTLs, a different audience,
+or any write/list/delete/sudo capability:
+
+```bash
+vault read auth/kubernetes/config
+vault read auth/kubernetes/role/ryuki-platform-api
+vault policy read ryuki-platform-api-runtime
+```
+
+Finally, prove a login with a fresh projected `platform-api` JWT, validate that
+the returned token has only `ryuki-platform-api-runtime`, and revoke the test
+token. Never paste either JWT or Vault token into command history, logs,
+evidence, chat, or this repository.
+
 ## Evidence To Keep
 
 - Exact Helm chart version, independently approved expected digest,
@@ -85,6 +186,10 @@ Audit logs are sensitive operational records. Export only redacted audit evidenc
 - Pod readiness state and Raft peer count.
 - Audit device enabled state.
 - Storage class and PVC binding status.
+- Exact Kubernetes-auth config, role, and policy readback; redacted login
+  metadata; and a successful bounded authentication-review, login, and revocation exercise.
+- Exact `ryuki-vault-client-ca/ca.crt` digest and observed Vault server
+  certificate DNS identity, without certificate private material.
 
 ## Evidence To Exclude
 

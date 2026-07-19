@@ -23,7 +23,7 @@
       {
         "document_id": "source:ryuki-api-main",
         "document_version": 1,
-        "content_digest": "sha256:aaea3b50cf07a58ca659223f0cb83e01592f520685373658779bca0cbf3248cb",
+        "content_digest": "sha256:da5cb6e4b5168ea4969c0edb4a1655b690afedba1eea175cf73c1f17964dc258",
         "artifact_locator": "sources/ryuki-api/src/main.rs"
       },
       {
@@ -35,7 +35,7 @@
       {
         "document_id": "source:ryuki-api-scheduler",
         "document_version": 1,
-        "content_digest": "sha256:81eb10af4eeed22e97c8b12a9f665b99c06d8d565d55095413a4d927a82df17a",
+        "content_digest": "sha256:a9ad3888261a088606ff3625fef9056fef76b8d92575cf9a584b1e2e6bf29a4d",
         "artifact_locator": "sources/ryuki-api/src/scheduler.rs"
       },
       {

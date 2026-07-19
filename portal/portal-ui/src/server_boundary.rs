@@ -4002,6 +4002,149 @@ pub async fn get_evidence_compliance_contract() -> Result<EvidenceComplianceSnap
 // `same_origin_api_path()` + `safe_integration_id()` inside each server fn,
 // mirroring the request lifecycle path pattern exactly.
 
+/// Upstream-only integration row. This is deliberately distinct from the
+/// browser-visible `IntegrationSummary`: current responses expose only the
+/// locator-free `credential_configured` bit, while an N-1 `credential_ref` is
+/// consumed as presence-only compatibility input and never allocated.
+#[cfg(any(feature = "ssr", test))]
+#[derive(Deserialize)]
+struct ApiIntegrationConnection {
+    id: String,
+    vendor_type: String,
+    name: String,
+    endpoint_url: String,
+    site_scope: Option<String>,
+    credential_source: String,
+    #[serde(default)]
+    credential_configured: Option<bool>,
+    #[serde(
+        rename = "credential_ref",
+        default,
+        deserialize_with = "deserialize_legacy_credential_ref_presence"
+    )]
+    legacy_credential_ref_present: bool,
+    status: String,
+    readiness: String,
+    execution_mode: String,
+    last_test_at: Option<String>,
+    last_test_result: Option<String>,
+    created_by: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn deserialize_legacy_credential_ref_presence<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde::de::IgnoredAny>::deserialize(deserializer)?.is_some())
+}
+
+#[cfg(any(feature = "ssr", test))]
+#[derive(Deserialize)]
+struct ApiIntegrationListEnvelope {
+    connections: Vec<ApiIntegrationConnection>,
+}
+
+#[cfg(any(feature = "ssr", test))]
+#[derive(Deserialize)]
+struct ApiIntegrationConnectionEnvelope {
+    connection: ApiIntegrationConnection,
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn project_integration_connection(connection: ApiIntegrationConnection) -> IntegrationSummary {
+    IntegrationSummary {
+        id: connection.id,
+        vendor_type: connection.vendor_type,
+        name: connection.name,
+        endpoint_url: connection.endpoint_url,
+        site_scope: connection.site_scope,
+        credential_source: connection.credential_source,
+        credential_configured: connection
+            .credential_configured
+            .unwrap_or(connection.legacy_credential_ref_present),
+        status: connection.status,
+        readiness: connection.readiness,
+        execution_mode: connection.execution_mode,
+        last_test_at: connection.last_test_at,
+        last_test_result: connection.last_test_result,
+        created_by: connection.created_by,
+        created_at: connection.created_at,
+        updated_at: connection.updated_at,
+    }
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn parse_integration_list_response(
+    body: &str,
+) -> Result<Vec<IntegrationSummary>, serde_json::Error> {
+    let envelope: ApiIntegrationListEnvelope = serde_json::from_str(body)?;
+    Ok(envelope
+        .connections
+        .into_iter()
+        .map(project_integration_connection)
+        .collect())
+}
+
+/// Create and update responses use the same required `{ connection: ... }`
+/// envelope as the platform API. Missing or malformed envelopes fail closed;
+/// they can no longer fabricate an all-empty successful summary.
+#[cfg(any(feature = "ssr", test))]
+fn parse_integration_connection_response(
+    body: &str,
+) -> Result<IntegrationSummary, serde_json::Error> {
+    let envelope: ApiIntegrationConnectionEnvelope = serde_json::from_str(body)?;
+    Ok(project_integration_connection(envelope.connection))
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn integration_create_request_body(
+    payload: CreateIntegrationPayload,
+) -> Result<serde_json::Value, &'static str> {
+    if payload.credential_secret_ref.is_some() && !payload.credential_ref.is_empty() {
+        return Err("integration credential request mixed current and legacy reference fields");
+    }
+    let mut body = serde_json::json!({
+        "vendor_type": payload.vendor_type,
+        "name": payload.name,
+        "endpoint_url": payload.endpoint_url,
+        "site_scope": payload.site_scope,
+        "credential_source": payload.credential_source,
+        "inline_secret": payload.inline_secret,
+    });
+    if let Some(secret_ref) = payload.credential_secret_ref {
+        body["credential_secret_ref"] = secret_ref;
+    } else {
+        body["credential_ref"] = serde_json::Value::String(payload.credential_ref);
+    }
+    Ok(body)
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn integration_update_request_body(
+    payload: UpdateIntegrationPayload,
+) -> Result<serde_json::Value, &'static str> {
+    if payload.credential_secret_ref.is_some() && payload.credential_ref.is_some() {
+        return Err("integration credential request mixed current and legacy reference fields");
+    }
+    let mut body = serde_json::json!({
+        "vendor_type": payload.vendor_type,
+        "name": payload.name,
+        "endpoint_url": payload.endpoint_url,
+        "site_scope": payload.site_scope,
+        // Empty inline_secret = keep existing (no re-encryption, per Slice-1).
+        "inline_secret": payload.inline_secret,
+    });
+    if let Some(secret_ref) = payload.credential_secret_ref {
+        body["credential_secret_ref"] = secret_ref;
+    } else if let Some(credential_ref) = payload.credential_ref {
+        body["credential_ref"] = serde_json::Value::String(credential_ref);
+    }
+    Ok(body)
+}
+
 #[server(prefix = "/portal/api", endpoint = "integrations-list")]
 pub async fn list_integrations() -> Result<Vec<IntegrationSummary>, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -4019,82 +4162,8 @@ pub async fn list_integrations() -> Result<Vec<IntegrationSummary>, ServerFnErro
         .get(integrations_path(), session_id.as_deref())
         .await
     {
-        Ok(response) if response.is_success() => {
-            let raw: serde_json::Value = response
-                .json()
-                .map_err(|_| ServerFnError::new("integrations list response was malformed"))?;
-            let connections = raw
-                .get("connections")
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let summaries = connections
-                .into_iter()
-                .filter_map(|item| {
-                    let id = item.get("id")?.as_str()?.to_string();
-                    let vendor_type = item.get("vendor_type")?.as_str()?.to_string();
-                    let name = item.get("name")?.as_str()?.to_string();
-                    let endpoint_url = item.get("endpoint_url")?.as_str()?.to_string();
-                    let site_scope = item
-                        .get("site_scope")
-                        .and_then(|s| s.as_str())
-                        .map(str::to_string);
-                    let credential_source = item.get("credential_source")?.as_str()?.to_string();
-                    // Redact the opaque FK for db-encrypted: never expose it.
-                    let credential_ref = if credential_source == "db-encrypted" {
-                        None
-                    } else {
-                        item.get("credential_ref")
-                            .and_then(|r| r.as_str())
-                            .map(str::to_string)
-                    };
-                    let status = item.get("status")?.as_str()?.to_string();
-                    let readiness = item
-                        .get("readiness")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let execution_mode = item
-                        .get("execution_mode")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("static-dry-run")
-                        .to_string();
-                    let last_test_at = item
-                        .get("last_test_at")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string);
-                    let last_test_result = item
-                        .get("last_test_result")
-                        .and_then(|r| r.as_str())
-                        .map(str::to_string);
-                    let created_by = item
-                        .get("created_by")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let created_at = item.get("created_at")?.as_str()?.to_string();
-                    let updated_at = item.get("updated_at")?.as_str()?.to_string();
-                    Some(IntegrationSummary {
-                        id,
-                        vendor_type,
-                        name,
-                        endpoint_url,
-                        site_scope,
-                        credential_source,
-                        credential_ref,
-                        status,
-                        readiness,
-                        execution_mode,
-                        last_test_at,
-                        last_test_result,
-                        created_by,
-                        created_at,
-                        updated_at,
-                    })
-                })
-                .collect();
-            Ok(summaries)
-        }
+        Ok(response) if response.is_success() => parse_integration_list_response(&response.body)
+            .map_err(|_| ServerFnError::new("integrations list response was malformed")),
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
             "integrations list fetch failed",
@@ -4352,15 +4421,7 @@ pub async fn create_integration(
     }
     // `inline_secret` is sent in the body but NEVER logged (no Debug derive
     // on the payload struct; the custom Debug impl redacts it).
-    let body = serde_json::json!({
-        "vendor_type": payload.vendor_type,
-        "name": payload.name,
-        "endpoint_url": payload.endpoint_url,
-        "site_scope": payload.site_scope,
-        "credential_source": payload.credential_source,
-        "credential_ref": payload.credential_ref,
-        "inline_secret": payload.inline_secret,
-    });
+    let body = integration_create_request_body(payload).map_err(ServerFnError::new)?;
     let session_id = session_id_from_request().await;
     let response = upstream
         .post(integrations_path(), Some(&body), session_id.as_deref())
@@ -4372,88 +4433,8 @@ pub async fn create_integration(
             "integration create was rejected by the API",
         )));
     }
-    let raw: serde_json::Value = response
-        .json()
-        .map_err(|_| ServerFnError::new("integration create response was malformed"))?;
-    let credential_source = raw
-        .get("credential_source")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    // Redact opaque FK for db-encrypted even from the create response.
-    let credential_ref = if credential_source == "db-encrypted" {
-        None
-    } else {
-        raw.get("credential_ref")
-            .and_then(|r| r.as_str())
-            .map(str::to_string)
-    };
-    Ok(IntegrationSummary {
-        id: raw
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        vendor_type: raw
-            .get("vendor_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        name: raw
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        endpoint_url: raw
-            .get("endpoint_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        site_scope: raw
-            .get("site_scope")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        credential_source,
-        credential_ref,
-        status: raw
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        readiness: raw
-            .get("readiness")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        execution_mode: raw
-            .get("execution_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("static-dry-run")
-            .to_string(),
-        last_test_at: raw
-            .get("last_test_at")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        last_test_result: raw
-            .get("last_test_result")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        created_by: raw
-            .get("created_by")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        created_at: raw
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        updated_at: raw
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
+    parse_integration_connection_response(&response.body)
+        .map_err(|_| ServerFnError::new("integration create response was malformed"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "integration-update")]
@@ -4469,15 +4450,7 @@ pub async fn update_integration(
     if !upstream.live() {
         return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
     }
-    let body = serde_json::json!({
-        "vendor_type": payload.vendor_type,
-        "name": payload.name,
-        "endpoint_url": payload.endpoint_url,
-        "site_scope": payload.site_scope,
-        "credential_ref": payload.credential_ref,
-        // Empty inline_secret = keep existing (no re-encryption, per Slice-1).
-        "inline_secret": payload.inline_secret,
-    });
+    let body = integration_update_request_body(payload).map_err(ServerFnError::new)?;
     let session_id = session_id_from_request().await;
     let response = upstream
         .put(&path, &body, session_id.as_deref())
@@ -4489,87 +4462,8 @@ pub async fn update_integration(
             "integration update was rejected by the API",
         )));
     }
-    let raw: serde_json::Value = response
-        .json()
-        .map_err(|_| ServerFnError::new("integration update response was malformed"))?;
-    let credential_source = raw
-        .get("credential_source")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let credential_ref = if credential_source == "db-encrypted" {
-        None
-    } else {
-        raw.get("credential_ref")
-            .and_then(|r| r.as_str())
-            .map(str::to_string)
-    };
-    Ok(IntegrationSummary {
-        id: raw
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        vendor_type: raw
-            .get("vendor_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        name: raw
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        endpoint_url: raw
-            .get("endpoint_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        site_scope: raw
-            .get("site_scope")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        credential_source,
-        credential_ref,
-        status: raw
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        readiness: raw
-            .get("readiness")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        execution_mode: raw
-            .get("execution_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("static-dry-run")
-            .to_string(),
-        last_test_at: raw
-            .get("last_test_at")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        last_test_result: raw
-            .get("last_test_result")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        created_by: raw
-            .get("created_by")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        created_at: raw
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        updated_at: raw
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
+    parse_integration_connection_response(&response.body)
+        .map_err(|_| ServerFnError::new("integration update response was malformed"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "integration-delete")]
@@ -4671,6 +4565,186 @@ pub async fn test_integration(id: String) -> Result<IntegrationTestResult, Serve
 mod tests {
     use super::*;
     use crate::api::RequestListQuery;
+
+    fn integration_response_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": "integration-test",
+            "vendor_type": "test-vendor",
+            "name": "Test integration",
+            "endpoint_url": "https://example.invalid",
+            "site_scope": null,
+            "credential_source": "secret-provider-ref",
+            "credential_configured": true,
+            "status": "configured",
+            "readiness": "configured",
+            "execution_mode": "static-dry-run",
+            "last_test_at": null,
+            "last_test_result": null,
+            "created_by": "test-user",
+            "created_at": "2026-07-19T00:00:00Z",
+            "updated_at": "2026-07-19T00:00:00Z"
+        })
+    }
+
+    #[test]
+    fn integration_mutation_parser_requires_connection_envelope() {
+        let flat = integration_response_row().to_string();
+        assert!(parse_integration_connection_response(&flat).is_err());
+
+        let wrapped = serde_json::json!({
+            "source": "database",
+            "connection": integration_response_row(),
+        })
+        .to_string();
+        let summary = parse_integration_connection_response(&wrapped)
+            .expect("required connection envelope must decode");
+        assert_eq!(summary.id, "integration-test");
+        assert!(summary.credential_configured);
+    }
+
+    #[test]
+    fn integration_projection_discards_current_and_legacy_locator_fields() {
+        let mut row = integration_response_row();
+        row["credential_ref"] = serde_json::json!("legacy-locator-sentinel");
+        row["credential_secret_ref"] = serde_json::json!({
+            "opaqueLocator": "typed-locator-sentinel",
+            "field_selector": "typed-field-sentinel",
+        });
+        let wrapped = serde_json::json!({"connection": row}).to_string();
+
+        let summary = parse_integration_connection_response(&wrapped)
+            .expect("safe current response must decode");
+        let projected = serde_json::to_string(&summary).expect("summary must serialize");
+        assert!(summary.credential_configured);
+        assert!(!projected.contains("credential_ref"));
+        assert!(!projected.contains("credential_secret_ref"));
+        assert!(!projected.contains("legacy-locator-sentinel"));
+        assert!(!projected.contains("typed-locator-sentinel"));
+        assert!(!projected.contains("typed-field-sentinel"));
+    }
+
+    #[test]
+    fn integration_projection_accepts_n_minus_one_reference_as_presence_only() {
+        let mut row = integration_response_row();
+        row.as_object_mut()
+            .expect("row object")
+            .remove("credential_configured");
+        row["credential_source"] = serde_json::json!("vault");
+        row["credential_ref"] = serde_json::json!("n-minus-one-locator-sentinel");
+        let wrapped = serde_json::json!({"connection": row}).to_string();
+
+        let summary = parse_integration_connection_response(&wrapped)
+            .expect("N-1 response must remain readable");
+        assert!(summary.credential_configured);
+        let projected = serde_json::to_string(&summary).expect("summary must serialize");
+        assert!(!projected.contains("n-minus-one-locator-sentinel"));
+    }
+
+    #[test]
+    fn integration_projection_does_not_override_current_state_with_legacy_presence() {
+        let mut row = integration_response_row();
+        row["credential_configured"] = serde_json::json!(false);
+        row["credential_ref"] = serde_json::json!("stale-legacy-locator-sentinel");
+        let wrapped = serde_json::json!({"connection": row}).to_string();
+
+        let summary = parse_integration_connection_response(&wrapped)
+            .expect("current response must remain authoritative");
+        assert!(!summary.credential_configured);
+    }
+
+    #[test]
+    fn integration_list_uses_the_same_strict_locator_free_projector() {
+        let list = serde_json::json!({
+            "connections": [integration_response_row()],
+        })
+        .to_string();
+        let summaries =
+            parse_integration_list_response(&list).expect("valid list envelope must decode");
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].credential_configured);
+
+        let malformed = serde_json::json!({
+            "connections": [{"credential_source": "secret-provider-ref"}],
+        })
+        .to_string();
+        assert!(parse_integration_list_response(&malformed).is_err());
+    }
+
+    #[test]
+    fn integration_create_request_selects_exact_current_or_n_minus_one_shape() {
+        let typed = integration_create_request_body(CreateIntegrationPayload {
+            vendor_type: "test".to_string(),
+            name: "typed".to_string(),
+            endpoint_url: "https://example.invalid".to_string(),
+            site_scope: None,
+            credential_source: "secret-provider-ref".to_string(),
+            credential_secret_ref: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "opaqueLocator": "typed-locator-sentinel",
+            })),
+            credential_ref: String::new(),
+            inline_secret: String::new(),
+        })
+        .expect("typed request must be admitted");
+        assert!(typed.get("credential_secret_ref").is_some());
+        assert!(typed.get("credential_ref").is_none());
+
+        let legacy = integration_create_request_body(CreateIntegrationPayload {
+            vendor_type: "test".to_string(),
+            name: "legacy".to_string(),
+            endpoint_url: "https://example.invalid".to_string(),
+            site_scope: None,
+            credential_source: "vault".to_string(),
+            credential_secret_ref: None,
+            credential_ref: "legacy-locator-sentinel".to_string(),
+            inline_secret: String::new(),
+        })
+        .expect("N-1 request must remain admitted");
+        assert!(legacy.get("credential_secret_ref").is_none());
+        assert_eq!(legacy["credential_ref"], "legacy-locator-sentinel");
+    }
+
+    #[test]
+    fn integration_requests_reject_mixed_current_and_legacy_references() {
+        let create = CreateIntegrationPayload {
+            vendor_type: "test".to_string(),
+            name: "mixed".to_string(),
+            endpoint_url: "https://example.invalid".to_string(),
+            site_scope: None,
+            credential_source: "secret-provider-ref".to_string(),
+            credential_secret_ref: Some(serde_json::json!({"schemaVersion": 1})),
+            credential_ref: "legacy-locator-sentinel".to_string(),
+            inline_secret: String::new(),
+        };
+        assert!(integration_create_request_body(create).is_err());
+
+        let update = UpdateIntegrationPayload {
+            vendor_type: None,
+            name: None,
+            endpoint_url: None,
+            site_scope: None,
+            credential_secret_ref: Some(serde_json::json!({"schemaVersion": 1})),
+            credential_ref: Some("legacy-locator-sentinel".to_string()),
+            inline_secret: String::new(),
+        };
+        assert!(integration_update_request_body(update).is_err());
+    }
+
+    #[test]
+    fn integration_update_without_credential_input_preserves_the_binding() {
+        let body = integration_update_request_body(UpdateIntegrationPayload {
+            vendor_type: None,
+            name: Some("renamed".to_string()),
+            endpoint_url: None,
+            site_scope: None,
+            credential_secret_ref: None,
+            credential_ref: None,
+            inline_secret: String::new(),
+        })
+        .expect("noncredential update must be admitted");
+        assert!(body.get("credential_secret_ref").is_none());
+        assert!(body.get("credential_ref").is_none());
+    }
 
     #[test]
     fn reviewed_plan_approval_body_is_closed_and_exact() {

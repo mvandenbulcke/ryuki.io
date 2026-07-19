@@ -9,13 +9,15 @@
 //! names / secret-row FK, and the persisted health-check `message` is the stub's
 //! secret-free output (it names the credential SOURCE type, never the ref).
 
-use crate::integration::{parse_persisted_credential_source, PersistedCredentialSourceError};
+use crate::integration::{parse_persisted_credential_binding, PersistedCredentialSourceError};
 use ryuki_engine::integration_connections::{ExecutionMode, IntegrationConnection};
+use serde_json::Value;
 
 /// SELECT column list for `integration_connections`. Mirrors the handler's
 /// `CONN_COLUMNS` in `integration.rs`.
 const CONN_COLUMNS: &str =
     "id, vendor_type, name, endpoint_url, site_scope, credential_source, credential_ref, \
+     credential_secret_ref, credential_secret_ref_generation, \
      status, readiness, execution_mode, last_test_at, last_test_result, created_by, \
      created_at, updated_at";
 
@@ -29,6 +31,8 @@ struct IntegrationConnectionRow {
     site_scope: Option<String>,
     credential_source: String,
     credential_ref: String,
+    credential_secret_ref: Option<Value>,
+    credential_secret_ref_generation: Option<i64>,
     status: String,
     readiness: String,
     execution_mode: String,
@@ -41,7 +45,12 @@ struct IntegrationConnectionRow {
 
 impl IntegrationConnectionRow {
     fn try_into_model(self) -> Result<IntegrationConnection, PersistedCredentialSourceError> {
-        let credential_source = parse_persisted_credential_source(&self.credential_source)?;
+        let (credential_source, _) = parse_persisted_credential_binding(
+            &self.credential_source,
+            &self.credential_ref,
+            self.credential_secret_ref,
+            self.credential_secret_ref_generation,
+        )?;
         Ok(IntegrationConnection {
             id: self.id,
             vendor_type: self.vendor_type,
@@ -153,6 +162,8 @@ mod tests {
             site_scope: None,
             credential_source: credential_source.to_string(),
             credential_ref: "fixture-reference".to_string(),
+            credential_secret_ref: None,
+            credential_secret_ref_generation: None,
             status: "configured".to_string(),
             readiness: "configured".to_string(),
             execution_mode: "static-dry-run".to_string(),

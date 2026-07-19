@@ -4177,6 +4177,7 @@ fn build_slice_context(
                 "deploy/kubernetes/base/ingress.yaml",
                 "deploy/kubernetes/base/networkpolicies.yaml",
                 "deploy/kubernetes/operations/migration-job.yaml",
+                "deploy/kubernetes/vault/workload-auth.yaml",
             ];
             let mut manifests = Vec::new();
             let mut source_texts = Vec::new();
@@ -4198,6 +4199,18 @@ fn build_slice_context(
                             manifests.push(value);
                         }
                     }
+                }
+            }
+            for rel in [
+                "deploy/kubernetes/vault/kubernetes-auth-config.json",
+                "deploy/kubernetes/vault/platform-api-kubernetes-role.json",
+                "deploy/kubernetes/vault/platform-api-policy.hcl",
+            ] {
+                if let Ok(raw) = fs::read_to_string(root.join(rel)) {
+                    source_texts.push(serde_json::json!({
+                        "path": rel,
+                        "text": raw,
+                    }));
                 }
             }
             let cutover_contract_path =

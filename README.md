@@ -236,9 +236,11 @@ authorization rules.
 ## Configuration
 
 Application configuration uses environment variables with the `RYUKI_` prefix
-(nested fields use `__`, e.g. `RYUKI_SERVER__BIND_ADDRESS`). The current Vault
-compatibility adapter additionally reads Vault-native `VAULT_ADDR` and
-`VAULT_TOKEN`. See `.env.example` for the full reference.
+(nested fields use `__`, e.g. `RYUKI_SERVER__BIND_ADDRESS`). Production Vault
+resolution uses the closed Kubernetes workload-authentication configuration
+documented below. Vault-native `VAULT_ADDR` and `VAULT_TOKEN` are retained only
+for explicit local dry-run compatibility and are rejected in production. See
+`.env.example` for the full reference.
 
 | Variable | Purpose |
 |---|---|
@@ -318,10 +320,64 @@ bytes, provider and security-limit claims, and build manifest. It independently
 derives the complete implementation-plus-deployment applicability inventory,
 verifies semantic closure, and seals the result into one non-cloneable
 production-boundary proof. Startup now retains independently verified
-`HttpsPublicUrls` and exact-runtime `SecureCookies` witnesses, but still exits
-before migrations, workers, routing, or listeners until the remaining six
-receipt-bound live runtime guards and normative boundary work packages are
-implemented and verified.
+`HttpsPublicUrls`, exact-runtime `SecureCookies`, and exact retained
+`ApprovedSecretProvider` witnesses, but still exits before migrations, workers,
+routing, or listeners until the remaining five receipt-bound live runtime
+guards and normative boundary work packages are implemented and verified. The
+five outstanding guards are `durable-postgresql`,
+`non-development-authenticator`, `external-signing-key-material`,
+`mock-dependencies-disabled`, and `first-owner-path-closed`; the overall
+normative production boundary is not complete.
+
+### Production Vault Kubernetes workload authentication
+
+The production HashiCorp Vault resolver is an exact retained runtime, not the
+legacy process-token adapter. Configure all twelve non-secret values below as
+one closed group. Missing, partial, blank, non-canonical, or unknown
+`RYUKI_SECRET_PROVIDER_RUNTIME__*` fields fail startup before CA, projected-JWT,
+or provider I/O.
+
+| Variable | Required production value |
+|---|---|
+| `RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID` | Canonical provider id matching the admitted active provider, for example `provider:hashicorp-vault-primary` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION` | Canonical positive provider-configuration version |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR` | `hashicorp-vault-v1` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT` | Normalized HTTPS Vault base URL |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH` | Exactly `/var/run/secrets/ryuki/vault-tls/ca.crt` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT` | Exactly `kubernetes` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE` | Admitted Vault Kubernetes role, for example `ryuki-platform-api` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE` | Exactly `vault` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH` | Exactly `/var/run/secrets/ryuki/vault-auth/token` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE` | Exact workload namespace, for example `ryuki-platform` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME` | Exact workload ServiceAccount, for example `platform-api` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY` | Exact least-privilege policy, never `default` or `root` |
+
+The Deployment projects a 600-second, `vault`-audience ServiceAccount JWT at
+the fixed token path and mounts only the approved CA chain at the fixed CA path.
+The client uses that identity for bounded login, lookup, renewal, and KV-v2
+resolution; it does not follow redirects, use ambient proxies, or trust built-in
+roots. Readiness fails closed if the retained workload-auth lease or typed
+resolver owner is not current.
+
+Secret-reference fingerprints have a separate startup selector:
+`RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH` must equal
+`/var/run/secrets/ryuki/secret-reference-fingerprint/keyring` in production.
+Its canonical target must be a regular file inside that fixed parent directory;
+the contained symlink layout used by Kubernetes projected Secret volumes is
+accepted, while an escaping symlink fails closed. The file contains one to
+eight unique nonempty records, one per line, in the exact form
+`key:<id>=<canonical padded standard Base64>`. Key identifiers allow only ASCII
+letters, digits, `:`, `.`, `_`, `-`, and `/`; decoded material is 32–128 bytes.
+Whitespace, blank lines, comments, duplicate IDs, non-canonical Base64, and a
+file over 32 KiB fail closed. During rotation, add the successor while retaining
+every key ID referenced by stored `SecretRef` values, restart the `Recreate`
+Deployment, rewrite and independently inventory references, and remove a
+predecessor only after no stored reference names it.
+
+Production rejects any ambient `VAULT_ADDR`, `VAULT_TOKEN`,
+`RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK`, or other Vault-native token/TLS override.
+Those legacy settings and `<mount>/<path>[#<field>]` handles are local dry-run
+compatibility only; they are not an alternative production bootstrap.
 
 Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 

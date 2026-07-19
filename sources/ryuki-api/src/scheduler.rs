@@ -549,9 +549,10 @@ async fn run_job(
             // resolver), append a connection_health_checks history row, AND
             // refresh each connection's last_test_* — all on `tx`, so a failure
             // rolls back with this schedule's savepoint. `credential_status` is a
-            // DETERMINISTIC STUB value derived from credential_ref presence (the
-            // same verdict the stub implies); the live `resolve_credentials` is
-            // never called here, keeping the sweep stub-only. `detail` is kept
+            // DETERMINISTIC STUB value derived from legacy reference presence;
+            // typed references remain explicitly unverified because this job
+            // owns no fingerprint authority. The live resolver is never called
+            // here, keeping the sweep stub-only. `detail` is kept
             // aggregate-only (a count) — never per-connection ids — because it is
             // surfaced via /api/ops/scheduler/executions.
             let connections =
@@ -561,10 +562,15 @@ async fn run_job(
                 let result = ryuki_engine::integration_connections::test_connection_stub(conn);
                 // Deterministic stub verdict: the stub only inspects ref presence
                 // (it never resolves the secret), so mirror that here.
-                let credential_status = if conn.credential_ref.is_empty() {
-                    "ref-missing"
-                } else {
-                    "ref-present"
+                let credential_status = match &conn.credential_source {
+                    // This scheduler never receives the dedicated fingerprint
+                    // verifier, so a typed row can be structurally present but
+                    // cannot be called admitted or healthy here.
+                    ryuki_engine::integration_connections::CredentialSource::SecretProviderRef => {
+                        "ref-unverified"
+                    }
+                    _ if conn.credential_ref.is_empty() => "ref-missing",
+                    _ => "ref-present",
                 };
                 crate::repos::integration_connections::insert_health_check(
                     &mut **tx,

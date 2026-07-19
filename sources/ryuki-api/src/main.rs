@@ -23,6 +23,7 @@ mod oidc_callback;
 mod openapi;
 mod repos;
 mod scheduler;
+mod secret_provider_runtime;
 mod security_contracts;
 mod session_credentials;
 mod session_lookup_admission;
@@ -2024,7 +2025,13 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
 }
 
 #[derive(Debug, Clone)]
-struct RequestId(String);
+pub(crate) struct RequestId(pub(crate) String);
+
+impl RequestId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
@@ -2034,6 +2041,7 @@ static DRAINING: AtomicBool = AtomicBool::new(false);
 enum ReadinessStatus {
     Ready,
     ConfigInvalid,
+    SecretProviderUnavailable,
     DatabaseUnavailable,
     MigrationsNotApplied,
     MigrationsFailed,
@@ -2732,6 +2740,93 @@ async fn shutdown_signal(timeout_secs: u64) {
     tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
 }
 
+struct SecretProviderMaintenanceTask {
+    runtime: Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<
+        Result<(), crate::secret_provider_runtime::VaultKubernetesRuntimeError>,
+    >,
+}
+
+impl SecretProviderMaintenanceTask {
+    fn spawn(runtime: Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>) -> Self {
+        let (shutdown, mut receiver) = tokio::sync::watch::channel(false);
+        let task_runtime = Arc::clone(&runtime);
+        let join = tokio::spawn(async move {
+            loop {
+                if *receiver.borrow() {
+                    break;
+                }
+                // A poisoned runtime state can request immediate maintenance.
+                // Keep that failure mode bounded rather than spinning a core.
+                let delay = task_runtime
+                    .next_maintenance_delay()
+                    .max(Duration::from_millis(100));
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() || *receiver.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(delay) => {
+                        tokio::select! {
+                            changed = receiver.changed() => {
+                                if changed.is_err() || *receiver.borrow() {
+                                    break;
+                                }
+                            }
+                            result = task_runtime.maintenance_step() => {
+                                if let Err(error) = result {
+                                    tracing::warn!(error = %error, "secret-provider workload-auth maintenance failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            task_runtime.shutdown().await
+        });
+        Self {
+            runtime,
+            shutdown,
+            join,
+        }
+    }
+
+    async fn stop(mut self) -> Result<(), String> {
+        // Runtime shutdown invalidates the bearer synchronously before its
+        // first possible suspension point. Always signal and join/abort the
+        // maintenance owner even if shutdown itself reports an error.
+        let runtime_result =
+            match tokio::time::timeout(Duration::from_secs(15), self.runtime.shutdown()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(format!(
+                    "secret-provider workload-auth shutdown failed: {error}"
+                )),
+                Err(_) => Err("secret-provider workload-auth shutdown timed out".into()),
+            };
+        let _ = self.shutdown.send(true);
+        let join_result = match tokio::time::timeout(Duration::from_secs(5), &mut self.join).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(format!(
+                "secret-provider workload-auth shutdown failed: {error}"
+            )),
+            Ok(Err(error)) => Err(format!(
+                "secret-provider workload-auth maintenance task failed: {error}"
+            )),
+            Err(_) => {
+                self.join.abort();
+                let _ = self.join.await;
+                Err("secret-provider workload-auth maintenance shutdown timed out".into())
+            }
+        };
+        match (runtime_result, join_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
 // ─── Hidden docs-extraction flag (`ryuki-api --dump-route-meta`) ────────────
 //
 // Maintenance subcommand used by `ryuki-validator generate-api-doc`; it is
@@ -2995,10 +3090,75 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let (app_config, api_secret_provider_runtime) = config::load_config().unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
+    let production = security_contract.is_production();
+    let runtime_binding = security_contract
+        .verified_secret_provider_runtime_binding()
+        .unwrap_or_else(|error| {
+            eprintln!("secret-provider runtime binding admission failed: {error}");
+            std::process::exit(1);
+        });
+    let runtime_config =
+        secret_provider_runtime::VaultKubernetesRuntimeConfig::from_environment(production)
+            .unwrap_or_else(|error| {
+                eprintln!("secret-provider workload-auth configuration failed: {error}");
+                std::process::exit(1);
+            });
+    let fingerprint_keyring_path =
+        secret_provider_runtime::fingerprint_keyring_path_from_environment(production)
+            .unwrap_or_else(|error| {
+                eprintln!("SecretRef fingerprint keyring configuration failed: {error}");
+                std::process::exit(1);
+            });
+    let (app_config, api_secret_provider_runtime) =
+        config::load_config(production).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+    if let Some(path) = fingerprint_keyring_path.as_deref() {
+        api_secret_provider_runtime
+            .bind_reference_fingerprint_keyring_from_file(path)
+            .unwrap_or_else(|error| {
+                eprintln!("SecretRef fingerprint keyring admission failed: {error}");
+                std::process::exit(1);
+            });
+    }
+    let vault_kubernetes_runtime = match (runtime_binding, runtime_config) {
+        (Some(binding), Some(runtime_config)) => {
+            let runtime = secret_provider_runtime::VaultKubernetesRuntime::from_config(
+                runtime_config,
+                Arc::clone(&binding),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("secret-provider workload-auth runtime admission failed: {error}");
+                std::process::exit(1);
+            });
+            api_secret_provider_runtime
+                .bind_admitted_provider_identity(
+                    binding.provider_id().to_string(),
+                    binding.provider_configuration_version(),
+                    binding.deployment_id().to_string(),
+                    binding.trust_domain_id().to_string(),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("secret-provider identity binding failed: {error}");
+                    std::process::exit(1);
+                });
+            api_secret_provider_runtime
+                .bind_workload_runtime(Arc::clone(&runtime))
+                .unwrap_or_else(|error| {
+                    eprintln!("secret-provider workload runtime binding failed: {error}");
+                    std::process::exit(1);
+                });
+            Some(runtime)
+        }
+        (None, None) if !production => None,
+        _ => {
+            eprintln!(
+                "secret-provider runtime configuration and its verified binding must be present together"
+            );
+            std::process::exit(1);
+        }
+    };
     let api_cookie_runtime = cookie_runtime::ApiCookieRuntime::from_admitted_config(
         &app_config,
         security_contract.is_production(),
@@ -3029,6 +3189,21 @@ async fn main() {
             eprintln!("secure-cookie runtime guard failed: {error}");
             std::process::exit(1);
         });
+    if let Some(runtime) = &vault_kubernetes_runtime {
+        security_contract
+            .verify_approved_secret_provider_runtime_guard(runtime)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("approved-secret-provider runtime guard failed: {error}");
+                std::process::exit(1);
+            });
+        if !api_secret_provider_runtime.is_live_resolution_ready()
+            || !api_secret_provider_runtime.retains_workload_runtime(runtime)
+        {
+            eprintln!("secret-provider runtime was not retained by the typed API owner");
+            std::process::exit(1);
+        }
+    }
     security_contract
         .validate_runtime_bindings(
             &app_config,
@@ -3043,6 +3218,7 @@ async fn main() {
     let api_cookie_runtime_identity = Arc::clone(&api_cookie_runtime);
     let api_authenticator_runtime_identity = Arc::clone(&api_authenticator_runtime);
     let api_secret_provider_runtime_identity = Arc::clone(&api_secret_provider_runtime);
+    let vault_kubernetes_runtime_identity = vault_kubernetes_runtime.clone();
     config_store::init_with_security_contract(
         "platform-config.json",
         &app_config,
@@ -3050,6 +3226,7 @@ async fn main() {
         api_cookie_runtime,
         Arc::clone(&api_authenticator_runtime),
         api_secret_provider_runtime,
+        vault_kubernetes_runtime.clone(),
     );
     if !Arc::ptr_eq(
         &api_cookie_runtime_identity,
@@ -3057,6 +3234,21 @@ async fn main() {
     ) {
         eprintln!("API cookie runtime identity changed during startup retention");
         std::process::exit(1);
+    }
+    match (
+        vault_kubernetes_runtime_identity.as_ref(),
+        config_store::get_vault_kubernetes_runtime().as_ref(),
+    ) {
+        (Some(expected), Some(retained))
+            if Arc::ptr_eq(expected, retained)
+                && api_secret_provider_runtime_identity.retains_workload_runtime(retained)
+                && config_store::get_security_contract_context()
+                    .retains_approved_secret_provider_runtime(retained) => {}
+        (None, None) => {}
+        _ => {
+            eprintln!("Vault Kubernetes runtime identity changed during startup retention");
+            std::process::exit(1);
+        }
     }
     if !Arc::ptr_eq(
         &api_secret_provider_runtime_identity,
@@ -3110,7 +3302,6 @@ async fn main() {
         profile_path = %admitted_security.profile_path.display(),
         "deployment security contract admitted"
     );
-
     if app_config.auth_mode == AuthMode::Local {
         if !app_config.local_auth.users.is_empty() {
             if let Err(reason) = app_config.local_auth.human_authority() {
@@ -3638,6 +3829,10 @@ async fn main() {
             tracing::error!(error = %error, "security checkpoint freshness fence failed");
             std::process::exit(1);
         });
+    // The approved-secret-provider witness retains the exact initial lease Arc.
+    // Start rotation only after the final pre-bind witness recheck; otherwise a
+    // confirmation during lengthy startup could replace that Arc and invalidate
+    // the immutable startup witness before serving begins.
     let listener = match tokio::net::TcpListener::bind(&app_config.server.bind_address).await {
         Ok(l) => l,
         Err(e) => {
@@ -3649,15 +3844,26 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let secret_provider_maintenance_task = vault_kubernetes_runtime
+        .as_ref()
+        .map(|runtime| SecretProviderMaintenanceTask::spawn(Arc::clone(runtime)));
     tracing::info!("ryuki-api listening on {}", app_config.server.bind_address);
     // Connect info gives rate limiting a trustworthy peer address.
-    if let Err(e) = axum::serve(
+    let server_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal(app_config.server.shutdown_timeout_secs))
-    .await
-    {
+    .await;
+    let maintenance_result = match secret_provider_maintenance_task {
+        Some(task) => task.stop().await,
+        None => Ok(()),
+    };
+    if let Err(error) = maintenance_result {
+        tracing::error!(%error, "secret-provider workload-auth runtime did not stop cleanly");
+        std::process::exit(1);
+    }
+    if let Err(e) = server_result {
         tracing::error!(error = %e, "server error");
         std::process::exit(1);
     }
@@ -3758,6 +3964,17 @@ async fn readiness_check() -> ReadinessStatus {
             "readiness failed because hard config validation failed"
         );
         return ReadinessStatus::ConfigInvalid;
+    }
+
+    if crate::config_store::get_security_contract_context().is_production() {
+        let api_runtime = crate::config_store::get_api_secret_provider_runtime();
+        let Some(vault_runtime) = crate::config_store::get_vault_kubernetes_runtime() else {
+            return ReadinessStatus::SecretProviderUnavailable;
+        };
+        if !api_runtime.is_live_resolution_ready() || !vault_runtime.readiness_snapshot().is_ready()
+        {
+            return ReadinessStatus::SecretProviderUnavailable;
+        }
     }
 
     let Some(pool) = crate::database::get_db() else {
@@ -3881,6 +4098,12 @@ fn readiness_response(status: ReadinessStatus) -> Result<Json<serde_json::Value>
             "CONFIG_INVALID",
             "Configuration is invalid",
             Some("Readiness requires hard config validation to pass"),
+        )),
+        ReadinessStatus::SecretProviderUnavailable => Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SECRET_PROVIDER_UNAVAILABLE",
+            "Secret provider is unavailable",
+            Some("Readiness requires the retained workload-auth secret provider runtime"),
         )),
         ReadinessStatus::DatabaseUnavailable => Err(problem_details(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -14,6 +14,7 @@ use leptos::prelude::*;
 /// Human-readable label for a credential source key.
 pub(crate) fn credential_source_label(source: &str) -> &'static str {
     match source {
+        "secret-provider-ref" => "Secret provider",
         "vault" => "Vault",
         "db-encrypted" => "DB-encrypted",
         "env-var" => "Env-var",
@@ -24,6 +25,7 @@ pub(crate) fn credential_source_label(source: &str) -> &'static str {
 /// CSS badge class for a credential source.
 pub(crate) fn credential_source_badge_class(source: &str) -> &'static str {
     match source {
+        "secret-provider-ref" => "badge good",
         "vault" => "badge good",
         "db-encrypted" => "badge warn",
         "env-var" => "badge neutral",
@@ -60,14 +62,13 @@ pub(crate) fn credential_source_is_db_encrypted(source: &str) -> bool {
     source == "db-encrypted"
 }
 
-/// Returns `true` when `credential_ref` should be rendered in the list table.
-///
-/// `db-encrypted` connections never expose a `credential_ref` in the UI — the
-/// server fn already `None`s it before sending it to the portal, but this
-/// predicate adds a second layer of defence so the cell stays empty even if
-/// that server-side contract ever regresses.
-pub(crate) fn should_show_credential_ref(source: &str) -> bool {
-    source != "db-encrypted"
+/// Locator-free credential readiness label used by the list projection.
+pub(crate) fn credential_configuration_label(configured: bool) -> &'static str {
+    if configured {
+        "Configured"
+    } else {
+        "Not configured"
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,8 +98,10 @@ enum FormMode {
 ///   written from fetched server data. It is write-only at the browser.
 /// - On edit, `credential_source` is rendered as a read-only badge (Slice-1
 ///   HARDENING-1 forbids changing it on update).
-/// - `credential_ref` for `db-encrypted` is always `None` in `IntegrationSummary`
-///   (the server fn redacts the opaque FK before sending it to the portal).
+/// - No provider locator or complete SecretRef is present in
+///   `IntegrationSummary`; the browser receives only configured/not-configured.
+/// - Typed `secret-provider-ref` rows can edit noncredential fields only. The
+///   portal never reconstructs or prefills a runtime SecretRef.
 #[component]
 pub fn IntegrationsList() -> impl IntoView {
     let integrations_api_path = api_path_guard();
@@ -248,7 +251,7 @@ pub fn IntegrationsList() -> impl IntoView {
                                                 <th scope="col">"Name"</th>
                                                 <th scope="col">"Endpoint"</th>
                                                 <th scope="col">"Source"</th>
-                                                <th scope="col">"Ref"</th>
+                                                <th scope="col">"Credential"</th>
                                                 <th scope="col">"Status"</th>
                                                 <th scope="col">"Last test"</th>
                                                 <th scope="col">"Actions"</th>
@@ -273,20 +276,10 @@ pub fn IntegrationsList() -> impl IntoView {
                                                         &integration.status,
                                                     );
 
-                                                    // credential_ref is None for db-encrypted (server fn redacts it).
-                                                    // should_show_credential_ref provides a second layer of defence:
-                                                    // the cell renders nothing for db-encrypted even if the server
-                                                    // contract regresses and returns a non-None ref.
-                                                    let ref_display = if should_show_credential_ref(
-                                                        &integration.credential_source,
-                                                    ) {
-                                                        integration
-                                                            .credential_ref
-                                                            .clone()
-                                                            .unwrap_or_default()
-                                                    } else {
-                                                        String::new()
-                                                    };
+                                                    let credential_display =
+                                                        credential_configuration_label(
+                                                            integration.credential_configured,
+                                                        );
                                                     let last_test = integration
                                                         .last_test_at
                                                         .as_deref()
@@ -333,9 +326,8 @@ pub fn IntegrationsList() -> impl IntoView {
                                                         credential_source: integration
                                                             .credential_source
                                                             .clone(),
-                                                        credential_ref: integration
-                                                            .credential_ref
-                                                            .clone(),
+                                                        credential_configured: integration
+                                                            .credential_configured,
                                                         status: integration.status.clone(),
                                                         readiness: integration.readiness.clone(),
                                                         execution_mode: integration
@@ -379,7 +371,7 @@ pub fn IntegrationsList() -> impl IntoView {
                                                             </td>
                                                             <td class="cell-ref">
                                                                 <span class="table-note">
-                                                                    {ref_display}
+                                                                    {credential_display}
                                                                 </span>
                                                             </td>
                                                             <td>
@@ -551,8 +543,9 @@ where
 ///    `inline_secret` is empty, so the existing secret is preserved.
 /// 5. `credential_source` is read-only on edit (rendered as a badge, not a
 ///    radio). Changing source requires delete + recreate (Slice-1 HARDENING-1).
-/// 6. `credential_ref` for `db-encrypted` is never pre-filled (it is `None` in
-///    `IntegrationSummary` — the server fn redacts the opaque FK).
+/// 6. No credential locator is ever pre-filled. `IntegrationSummary` contains
+///    only a configured bit, so edit forms start every legacy locator input
+///    empty; typed SecretRef rows expose no credential input at all.
 ///
 /// ## Remount-on-mode-change invariant
 ///
@@ -608,14 +601,9 @@ where
     let (credential_source, set_credential_source) =
         signal(fixed_source.clone().unwrap_or_else(|| "vault".to_string()));
 
-    // credential_ref: pre-filled for vault/env-var; NEVER pre-filled for db-encrypted.
-    // For db-encrypted, `IntegrationSummary.credential_ref` is always `None` (server
-    // fn redacts it), so this naturally starts empty even without special casing.
-    let initial_ref = editing
-        .as_ref()
-        .and_then(|s| s.credential_ref.clone())
-        .unwrap_or_default();
-    let (credential_ref, set_credential_ref) = signal(initial_ref);
+    // Provider locators are write-only for every source. Never initialize this
+    // signal from an IntegrationSummary or any other server response.
+    let (credential_ref, set_credential_ref) = signal(String::new());
 
     // WRITE-ONLY: inline_secret is ALWAYS initialized to String::new().
     // It is NEVER written from server data. The comment below is load-bearing
@@ -684,6 +672,9 @@ where
                         Some(endpoint_url_val)
                     },
                     site_scope: site_scope_val,
+                    // Typed SecretRefs are governed outside this form. Existing
+                    // typed rows preserve their exact admitted binding.
+                    credential_secret_ref: None,
                     // credential_ref: None for db-encrypted (not shown/edited);
                     // Some(value) for vault/env-var.
                     credential_ref: if credential_source_val == "db-encrypted"
@@ -705,6 +696,9 @@ where
                     endpoint_url: endpoint_url_val,
                     site_scope: site_scope_val,
                     credential_source: credential_source_val,
+                    // The current typed SecretRef create path is API/governance
+                    // driven; this legacy portal form never mints one.
+                    credential_secret_ref: None,
                     // For db-encrypted: credential_ref is sent as empty string
                     // (the backend derives the ref from the encrypted secret).
                     credential_ref: credential_ref_val,
@@ -871,7 +865,9 @@ where
                             value=credential_ref
                             on:input=move |ev| set_credential_ref.set(event_target_value(&ev))
                         />
-                        <p class="table-note">"Non-secret Vault key path — not the secret value."</p>
+                        <p class="table-note">
+                            "Write-only provider locator. It is never shown or prefilled; leave blank on edit to keep the current binding."
+                        </p>
                     </div>
                 </Show>
 
@@ -931,7 +927,7 @@ where
                             on:input=move |ev| set_credential_ref.set(event_target_value(&ev))
                         />
                         <p class="table-note">
-                            "Key names only — not the values. Must be prefixed with "
+                            "Write-only key names — never shown or prefilled. Leave blank on edit to keep the current binding. Must be prefixed with "
                             <code>"RYUKI_INTEGRATION__"</code>
                             ". Separate multiple keys with commas."
                         </p>
@@ -970,6 +966,10 @@ mod tests {
     // T-B1: credential_source_label returns the correct human label for all sources
     #[test]
     fn credential_source_label_maps_all_sources() {
+        assert_eq!(
+            credential_source_label("secret-provider-ref"),
+            "Secret provider"
+        );
         assert_eq!(credential_source_label("vault"), "Vault");
         assert_eq!(credential_source_label("db-encrypted"), "DB-encrypted");
         assert_eq!(credential_source_label("env-var"), "Env-var");
@@ -979,6 +979,10 @@ mod tests {
     // T-B2: credential_source_badge_class returns a consistent badge class per source
     #[test]
     fn credential_source_badge_class_per_source() {
+        assert_eq!(
+            credential_source_badge_class("secret-provider-ref"),
+            "badge good"
+        );
         assert_eq!(credential_source_badge_class("vault"), "badge good");
         assert_eq!(credential_source_badge_class("db-encrypted"), "badge warn");
         assert_eq!(credential_source_badge_class("env-var"), "badge neutral");
@@ -1024,19 +1028,10 @@ mod tests {
         assert!(!credential_source_is_db_encrypted("DB-ENCRYPTED"));
     }
 
-    // T-B6: should_show_credential_ref — defense-in-depth guard for the list table.
-    // Returns false ONLY for "db-encrypted"; true for every other source including
-    // unknown values (fail-safe: show rather than silently hide for unknown sources).
+    // T-B6: the list exposes only locator-free configured/not-configured state.
     #[test]
-    fn should_show_credential_ref_is_false_only_for_db_encrypted() {
-        // db-encrypted: never show the ref in the UI
-        assert!(!should_show_credential_ref("db-encrypted"));
-        // vault and env-var: show the ref
-        assert!(should_show_credential_ref("vault"));
-        assert!(should_show_credential_ref("env-var"));
-        // Unknown / empty: fail-safe → show (so novel sources are not silently suppressed)
-        assert!(should_show_credential_ref(""));
-        assert!(should_show_credential_ref("DB-ENCRYPTED"));
-        assert!(should_show_credential_ref("other"));
+    fn credential_configuration_label_is_locator_free() {
+        assert_eq!(credential_configuration_label(true), "Configured");
+        assert_eq!(credential_configuration_label(false), "Not configured");
     }
 }

@@ -1,0 +1,51 @@
+# Kubernetes-side workload authentication boundary for direct platform-api to
+# Vault access. This file grants no Vault policy by itself. Apply the external
+# Vault auth configuration from bootstrap-runbook.md through an independently
+# authorized operator after these Kubernetes resources exist.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-vault-from-platform-api
+  namespace: vault
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: vault
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vault
+      component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ryuki-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: ryuki-infrastructure-platform
+              app.kubernetes.io/name: platform-api
+      ports:
+        - protocol: TCP
+          port: 8200
+---
+# Vault's own ServiceAccount performs TokenReview for short-lived client JWTs.
+# Bind only that exact chart-created identity to Kubernetes' delegation role;
+# platform-api and every VSO materializer identity remain unbound here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-tokenreview-auth-delegator
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: vault
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: vault

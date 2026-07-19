@@ -14,6 +14,9 @@ pub enum CredentialSource {
     Vault,
     DbEncrypted,
     EnvVar,
+    /// Provider-qualified runtime `SecretRef` persisted in the dedicated JSONB
+    /// column. `credential_ref` must be empty for this source.
+    SecretProviderRef,
 }
 
 impl CredentialSource {
@@ -22,6 +25,7 @@ impl CredentialSource {
             Self::Vault => "vault",
             Self::DbEncrypted => "db-encrypted",
             Self::EnvVar => "env-var",
+            Self::SecretProviderRef => "secret-provider-ref",
         }
     }
 
@@ -30,8 +34,9 @@ impl CredentialSource {
             "vault" => Ok(Self::Vault),
             "db-encrypted" => Ok(Self::DbEncrypted),
             "env-var" => Ok(Self::EnvVar),
+            "secret-provider-ref" => Ok(Self::SecretProviderRef),
             other => Err(format!(
-                "Invalid credential_source '{}'. Must be one of: vault, db-encrypted, env-var",
+                "Invalid credential_source '{}'. Must be one of: vault, db-encrypted, env-var, secret-provider-ref",
                 other
             )),
         }
@@ -222,7 +227,8 @@ pub fn test_connection_stub(conn: &IntegrationConnection) -> TestResult {
     // Basic URL shape check (must be http:// or https://).
     let url_ok =
         conn.endpoint_url.starts_with("http://") || conn.endpoint_url.starts_with("https://");
-    let cred_ref_present = !conn.credential_ref.is_empty();
+    let cred_ref_present = conn.credential_source == CredentialSource::SecretProviderRef
+        || !conn.credential_ref.is_empty();
     if url_ok && cred_ref_present {
         TestResult {
             status: "reachable-stub".to_string(),
@@ -267,6 +273,7 @@ mod unit_tests {
             ("vault", CredentialSource::Vault),
             ("db-encrypted", CredentialSource::DbEncrypted),
             ("env-var", CredentialSource::EnvVar),
+            ("secret-provider-ref", CredentialSource::SecretProviderRef),
         ];
         for (s, expected) in &cases {
             let parsed = CredentialSource::parse(s).unwrap();

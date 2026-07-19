@@ -146,6 +146,14 @@ fn secret_provider_disposition(provider: SecretProvider) -> BuildSelectorDisposi
             SelectorDisposition::Implemented,
             Some("secret.hashicorp-vault".into()),
         ),
+        // Catalog-only is the closed manifest representation of this unsupported,
+        // unshipped, non-production-eligible adapter. OpenBao must not inherit
+        // Vault's implementation claim; it can become implemented only after its
+        // own real, version-pinned compatibility suite exists.
+        SecretProvider::OpenBao => (
+            SelectorDisposition::CatalogOnly,
+            Some("secret.openbao".into()),
+        ),
         SecretProvider::None => (SelectorDisposition::Sentinel, None),
         SecretProvider::AwsSecretsManager
         | SecretProvider::AzureKeyVault
@@ -190,9 +198,10 @@ fn all_auth_modes() -> [AuthMode; 4] {
     ]
 }
 
-fn all_secret_providers() -> [SecretProvider; 6] {
+fn all_secret_providers() -> [SecretProvider; 7] {
     [
         SecretProvider::HashicorpVault,
+        SecretProvider::OpenBao,
         SecretProvider::AwsSecretsManager,
         SecretProvider::AzureKeyVault,
         SecretProvider::GcpSecretManager,
@@ -245,7 +254,7 @@ mod tests {
             .any(|adapter| adapter.adapter_kind == "integration.veeam-one"));
 
         let selectors = compiled_selector_dispositions();
-        assert_eq!(selectors.len(), 28);
+        assert_eq!(selectors.len(), 29);
         assert!(selectors.windows(2).all(|pair| {
             (pair[0].selector_domain.as_str(), pair[0].selector.as_str())
                 < (pair[1].selector_domain.as_str(), pair[1].selector.as_str())
@@ -259,6 +268,27 @@ mod tests {
             veeam_one.adapter_kind.as_deref(),
             Some("integration.veeam-one")
         );
+    }
+
+    #[test]
+    fn openbao_is_distinct_catalog_only_and_not_shipped() {
+        let adapters = compiled_shipped_adapters();
+        let selectors = compiled_selector_dispositions();
+        let openbao = selectors
+            .iter()
+            .find(|row| {
+                row.selector_domain == SelectorDomain::SecretProvider && row.selector == "openbao"
+            })
+            .unwrap();
+        assert_eq!(openbao.disposition, SelectorDisposition::CatalogOnly);
+        assert_eq!(openbao.adapter_kind.as_deref(), Some("secret.openbao"));
+        assert_ne!(
+            openbao.adapter_kind.as_deref(),
+            Some("secret.hashicorp-vault")
+        );
+        assert!(!adapters
+            .iter()
+            .any(|adapter| adapter.adapter_kind == "secret.openbao"));
     }
 
     #[test]

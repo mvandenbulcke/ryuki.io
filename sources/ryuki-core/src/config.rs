@@ -89,6 +89,8 @@ impl DatabaseProvider {
 pub enum SecretProvider {
     #[default]
     HashicorpVault,
+    #[serde(rename = "openbao")]
+    OpenBao,
     AwsSecretsManager,
     AzureKeyVault,
     GcpSecretManager,
@@ -100,6 +102,7 @@ impl SecretProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "hashicorp-vault" => Some(Self::HashicorpVault),
+            "openbao" => Some(Self::OpenBao),
             "aws-secrets-manager" => Some(Self::AwsSecretsManager),
             "azure-key-vault" => Some(Self::AzureKeyVault),
             "gcp-secret-manager" => Some(Self::GcpSecretManager),
@@ -112,6 +115,7 @@ impl SecretProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::HashicorpVault => "hashicorp-vault",
+            Self::OpenBao => "openbao",
             Self::AwsSecretsManager => "aws-secrets-manager",
             Self::AzureKeyVault => "azure-key-vault",
             Self::GcpSecretManager => "gcp-secret-manager",
@@ -2555,6 +2559,21 @@ mod tests {
     }
 
     #[test]
+    fn openbao_secret_provider_has_a_distinct_exact_identity() {
+        assert_eq!(
+            SecretProvider::parse("openbao"),
+            Some(SecretProvider::OpenBao)
+        );
+        assert_eq!(SecretProvider::OpenBao.as_str(), "openbao");
+        assert_eq!(
+            serde_json::to_string(&SecretProvider::OpenBao).unwrap(),
+            r#""openbao""#
+        );
+        assert_ne!(SecretProvider::OpenBao, SecretProvider::HashicorpVault);
+        assert_eq!(SecretProvider::parse("open-bao"), None);
+    }
+
+    #[test]
     fn test_documented_provider_values_deserialize() {
         assert_eq!(
             documented_provider_value::<DatabaseProvider>("cloudnativepg"),
@@ -2580,6 +2599,10 @@ mod tests {
         assert_eq!(
             documented_provider_value::<SecretProvider>("hashicorp-vault"),
             SecretProvider::HashicorpVault
+        );
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("openbao"),
+            SecretProvider::OpenBao
         );
         assert_eq!(
             documented_provider_value::<SecretProvider>("aws-secrets-manager"),

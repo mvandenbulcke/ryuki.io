@@ -5,7 +5,9 @@ use std::sync::Arc;
 ///
 /// Configuration is a security boundary: parse and validation failures must
 /// stop startup instead of silently selecting permissive development defaults.
-pub fn load_config() -> Result<
+pub fn load_config(
+    production: bool,
+) -> Result<
     (
         RyukiConfig,
         Arc<crate::integration::ApiSecretProviderRuntime>,
@@ -16,8 +18,11 @@ pub fn load_config() -> Result<
         RyukiConfig::load().map_err(|error| format!("failed to load configuration: {error}"))?;
     let mut secret_provider_runtime = None;
     let config = validate_loaded_config_with_secret_validation(config, |config| {
-        secret_provider_runtime =
-            Some(crate::integration::ApiSecretProviderRuntime::from_admitted_config(config)?);
+        secret_provider_runtime = Some(
+            crate::integration::ApiSecretProviderRuntime::from_admitted_config_for_posture(
+                config, production,
+            )?,
+        );
         Ok(())
     })?;
     let secret_provider_runtime = secret_provider_runtime

@@ -90,6 +90,7 @@ const DECLARED_MODULES: &[&str] = &[
     "runbook_execution",
     "runners",
     "scheduler",
+    "secret_material",
     "secrets_rotation",
     "self_health",
     "server_decommission",

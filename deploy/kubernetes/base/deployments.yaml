@@ -78,6 +78,17 @@ spec:
       labels: *platform-api-labels
     spec:
       serviceAccountName: platform-api
+      # The platform-api ServiceAccount never receives Kubernetes' ambient
+      # default token. Vault authentication gets one narrowly scoped,
+      # short-lived TokenRequest projection instead. The pod group owns read
+      # access to both this token and the separately projected public CA.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       # CloudNativePG creates this CA Secret for the cluster. Project only the
       # public certificate; never expose the CA private key to the API.
       volumes:
@@ -87,6 +98,36 @@ spec:
             items:
               - key: ca.crt
                 path: ca.crt
+        - name: vault-workload-token
+          projected:
+            # Decimal form of POSIX mode 0440; avoids YAML 1.1/1.2 octal drift.
+            defaultMode: 288
+            sources:
+              - serviceAccountToken:
+                  audience: vault
+                  expirationSeconds: 600
+                  path: token
+        # Operator-created trust material containing exactly `ca.crt`; no
+        # client certificate, private key, token, or other Secret key is
+        # projected into the API pod.
+        - name: vault-client-ca
+          secret:
+            secretName: ryuki-vault-client-ca
+            # Decimal form of POSIX mode 0440; avoids YAML 1.1/1.2 octal drift.
+            defaultMode: 288
+            items:
+              - key: ca.crt
+                path: ca.crt
+        # Operator-created dedicated HMAC keyring. Project exactly the one
+        # reviewed key; no provider token or unrelated Secret key is exposed.
+        - name: secret-reference-fingerprint-keyring
+          secret:
+            secretName: ryuki-secret-reference-fingerprint-keyring
+            # Decimal form of POSIX mode 0440; the pod fsGroup owns read access.
+            defaultMode: 288
+            items:
+              - key: keyring
+                path: keyring
       containers:
         - name: platform-api
           # Non-resolving skeleton reference. Every adopted render must replace
@@ -96,6 +137,15 @@ spec:
           volumeMounts:
             - name: cnpg-ca
               mountPath: /var/run/secrets/ryuki/cnpg
+              readOnly: true
+            - name: vault-workload-token
+              mountPath: /var/run/secrets/ryuki/vault-auth
+              readOnly: true
+            - name: vault-client-ca
+              mountPath: /var/run/secrets/ryuki/vault-tls
+              readOnly: true
+            - name: secret-reference-fingerprint-keyring
+              mountPath: /var/run/secrets/ryuki/secret-reference-fingerprint
               readOnly: true
           envFrom:
             - configMapRef:

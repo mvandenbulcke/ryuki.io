@@ -446,13 +446,26 @@ const SECURITY_ADMISSION_KEYS: [&str; 7] = [
     "RYUKI_EXPECTED_DEPLOYMENT_ID",
     "RYUKI_SECURITY_PROFILE",
 ];
-const PLATFORM_API_CONFIG_KEYS: [&str; 10] = [
+const PLATFORM_API_CONFIG_KEYS: [&str; 23] = [
     "RYUKI_SERVER__BIND_ADDRESS",
     "RYUKI_PLATFORM_URL",
     "RYUKI_DATABASE__REQUIRED",
     "RYUKI_MIGRATION_MODE",
     "RYUKI_DATABASE_EXPECTED_ROLE",
     "RYUKI_DATABASE_FORBIDDEN_ROLE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME",
+    "RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY",
+    "RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH",
     "RYUKI_RETENTION__DAILY_BACKUPS",
     "RYUKI_RETENTION__WEEKLY_BACKUPS",
     "RYUKI_RETENTION__MONTHLY_BACKUPS",
@@ -559,10 +572,25 @@ fn platform_api_imports_config_map_and_exact_db_secret_key() {
     assert!(env[0]["valueFrom"]["configMapKeyRef"].is_null());
 
     let pod = &api["spec"]["template"]["spec"];
-    let volumes = pod["volumes"]
-        .as_sequence()
-        .expect("platform-api must project the CNPG CA");
-    assert_eq!(volumes.len(), 1, "only the CNPG CA may be projected");
+    assert_eq!(pod["serviceAccountName"], "platform-api");
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(pod["securityContext"]["runAsUser"], 10001);
+    assert_eq!(pod["securityContext"]["runAsGroup"], 10001);
+    assert_eq!(pod["securityContext"]["fsGroup"], 10001);
+    assert_eq!(
+        pod["securityContext"]["fsGroupChangePolicy"],
+        "OnRootMismatch"
+    );
+
+    let volumes = pod["volumes"].as_sequence().expect(
+        "platform-api must project the CNPG CA, exact Vault auth inputs, and fingerprint keyring",
+    );
+    assert_eq!(
+        volumes.len(),
+        4,
+        "only the CNPG CA, Vault workload JWT, Vault client CA, and fingerprint keyring may be projected"
+    );
     assert_eq!(volumes[0]["name"], "cnpg-ca");
     assert_eq!(volumes[0]["secret"]["secretName"], "ryuki-platform-db-ca");
     assert_eq!(
@@ -571,13 +599,71 @@ fn platform_api_imports_config_map_and_exact_db_secret_key() {
     );
     assert_eq!(volumes[0]["secret"]["items"][0]["key"], "ca.crt");
     assert_eq!(volumes[0]["secret"]["items"][0]["path"], "ca.crt");
+
+    assert_eq!(volumes[1]["name"], "vault-workload-token");
+    assert_eq!(volumes[1]["projected"]["defaultMode"], 288);
+    let token_sources = volumes[1]["projected"]["sources"]
+        .as_sequence()
+        .expect("Vault workload token must have one projected source");
+    assert_eq!(token_sources.len(), 1);
+    let token_request = &token_sources[0]["serviceAccountToken"];
+    assert_eq!(token_request["audience"], "vault");
+    assert_eq!(token_request["expirationSeconds"], 600);
+    assert_eq!(token_request["path"], "token");
+
+    assert_eq!(volumes[2]["name"], "vault-client-ca");
+    assert_eq!(volumes[2]["secret"]["secretName"], "ryuki-vault-client-ca");
+    assert_eq!(volumes[2]["secret"]["defaultMode"], 288);
+    let vault_ca_items = volumes[2]["secret"]["items"]
+        .as_sequence()
+        .expect("Vault client CA projection must have one item");
+    assert_eq!(vault_ca_items.len(), 1);
+    assert_eq!(vault_ca_items[0]["key"], "ca.crt");
+    assert_eq!(vault_ca_items[0]["path"], "ca.crt");
+
+    assert_eq!(volumes[3]["name"], "secret-reference-fingerprint-keyring");
+    assert_eq!(
+        volumes[3]["secret"]["secretName"],
+        "ryuki-secret-reference-fingerprint-keyring"
+    );
+    assert_eq!(volumes[3]["secret"]["defaultMode"], 288);
+    let fingerprint_keyring_items = volumes[3]["secret"]["items"]
+        .as_sequence()
+        .expect("fingerprint keyring projection must have one item");
+    assert_eq!(fingerprint_keyring_items.len(), 1);
+    assert_eq!(fingerprint_keyring_items[0]["key"], "keyring");
+    assert_eq!(fingerprint_keyring_items[0]["path"], "keyring");
+
     let mounts = api["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
         .as_sequence()
-        .expect("platform-api CA mount");
-    assert_eq!(mounts.len(), 1, "only the CNPG CA may be mounted");
+        .expect("platform-api trust and workload-auth mounts");
+    assert_eq!(
+        mounts.len(),
+        4,
+        "only the reviewed four volumes may be mounted"
+    );
     assert_eq!(mounts[0]["name"], "cnpg-ca");
     assert_eq!(mounts[0]["mountPath"], "/var/run/secrets/ryuki/cnpg");
     assert_eq!(mounts[0]["readOnly"], true);
+    assert!(mounts[0]["subPath"].is_null());
+
+    assert_eq!(mounts[1]["name"], "vault-workload-token");
+    assert_eq!(mounts[1]["mountPath"], "/var/run/secrets/ryuki/vault-auth");
+    assert_eq!(mounts[1]["readOnly"], true);
+    assert!(mounts[1]["subPath"].is_null());
+
+    assert_eq!(mounts[2]["name"], "vault-client-ca");
+    assert_eq!(mounts[2]["mountPath"], "/var/run/secrets/ryuki/vault-tls");
+    assert_eq!(mounts[2]["readOnly"], true);
+    assert!(mounts[2]["subPath"].is_null());
+
+    assert_eq!(mounts[3]["name"], "secret-reference-fingerprint-keyring");
+    assert_eq!(
+        mounts[3]["mountPath"],
+        "/var/run/secrets/ryuki/secret-reference-fingerprint"
+    );
+    assert_eq!(mounts[3]["readOnly"], true);
+    assert!(mounts[3]["subPath"].is_null());
 }
 
 #[test]
@@ -696,6 +782,12 @@ fn platform_api_config_map_sets_database_required_and_no_secrets() {
         data.get("RYUKI_SERVER__BIND_ADDRESS")
             .and_then(|v| v.as_str()),
         Some("0.0.0.0:8080")
+    );
+    assert_eq!(
+        data.get("RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH")
+            .and_then(|v| v.as_str()),
+        Some("/var/run/secrets/ryuki/secret-reference-fingerprint/keyring"),
+        "platform-api must read the dedicated fingerprint keyring from the exact projected file"
     );
     assert!(
         !data.contains_key("RYUKI_DATABASE_URL"),

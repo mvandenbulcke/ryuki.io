@@ -23,6 +23,7 @@ struct ImmutableStartupConfig {
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
     api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
+    vault_kubernetes_runtime: Option<Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>>,
 }
 
 // Existing unit tests initialize only the application configuration. Keep
@@ -35,6 +36,7 @@ struct ImmutableStartupConfig {
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Option<Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>>,
     api_secret_provider_runtime: Option<Arc<crate::integration::ApiSecretProviderRuntime>>,
+    vault_kubernetes_runtime: Option<Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>>,
 }
 
 #[cfg(test)]
@@ -127,6 +129,7 @@ pub fn init_with_security_contract(
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
     api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
+    vault_kubernetes_runtime: Option<Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>>,
 ) {
     STARTUP_CONFIG
         .set(ImmutableStartupConfig {
@@ -135,6 +138,7 @@ pub fn init_with_security_contract(
             api_cookie_runtime,
             api_authenticator_runtime,
             api_secret_provider_runtime,
+            vault_kubernetes_runtime,
         })
         .unwrap_or_else(|_| panic!("startup config already initialized"));
     let store = ConfigStore::new(path);
@@ -151,6 +155,7 @@ pub fn init_with_security_contract(
     api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
     api_authenticator_runtime: Arc<crate::authenticator_runtime::ApiAuthenticatorRuntime>,
     api_secret_provider_runtime: Arc<crate::integration::ApiSecretProviderRuntime>,
+    vault_kubernetes_runtime: Option<Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>>,
 ) {
     TEST_STARTUP_CONFIG.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
@@ -159,6 +164,7 @@ pub fn init_with_security_contract(
             api_cookie_runtime,
             api_authenticator_runtime: Some(api_authenticator_runtime),
             api_secret_provider_runtime: Some(api_secret_provider_runtime),
+            vault_kubernetes_runtime,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -180,6 +186,7 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
             api_cookie_runtime,
             api_authenticator_runtime: None,
             api_secret_provider_runtime: None,
+            vault_kubernetes_runtime: None,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -216,6 +223,15 @@ pub fn get_api_secret_provider_runtime() -> Arc<crate::integration::ApiSecretPro
             .expect("startup config not initialized")
             .api_secret_provider_runtime,
     )
+}
+
+pub(crate) fn get_vault_kubernetes_runtime(
+) -> Option<Arc<crate::secret_provider_runtime::VaultKubernetesRuntime>> {
+    startup_config_if_initialized()
+        .expect("startup config not initialized")
+        .vault_kubernetes_runtime
+        .as_ref()
+        .map(Arc::clone)
 }
 
 #[cfg(test)]

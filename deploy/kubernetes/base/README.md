@@ -6,11 +6,11 @@ Base manifests define the portable Kubernetes skeleton for Ryuki Infrastructure 
 |---|---|
 | `namespace.yaml` | `ryuki-platform` namespace. |
 | `serviceaccounts.yaml` | One ServiceAccount per serving component, a dedicated one-shot migration identity, and four non-auto-mounted TokenRequest identities that separate database owner, backup, API runtime, and migration secret materialization. |
-| `configmap.yaml` | Non-secret runtime settings: verify-only `platform-api-config`, apply-only `platform-api-migration-config` with bounded DDL timeouts, and a fail-closed, static-dry-run `portal-ui-config` with non-resolving HTTPS placeholders. |
-| `deployments.yaml` | `portal-ui` and `platform-api` deployments with HTTP probes on port 8080, conservative resource requests/limits, non-root security contexts, digest-only non-resolving image placeholders, exact allowlisted ConfigMap-only `envFrom`, exact database/admission key references, and a CA-only CloudNativePG trust mount. |
+| `configmap.yaml` | Non-secret runtime settings: verify-only `platform-api-config`, including the fixed path to the projected SecretRef fingerprint keyring; apply-only `platform-api-migration-config` with bounded DDL timeouts; and a fail-closed, static-dry-run `portal-ui-config` with non-resolving HTTPS placeholders. |
+| `deployments.yaml` | `portal-ui` and `platform-api` deployments with HTTP probes on port 8080, conservative resource requests/limits, non-root security contexts, digest-only non-resolving image placeholders, exact allowlisted ConfigMap-only `envFrom`, exact database/admission key references, CA-only CloudNativePG and Vault trust mounts, one 600-second `vault`-audience projected API token, and the one-key SecretRef fingerprint-keyring projection. |
 | `services.yaml` | Internal ClusterIP services for `portal-ui` and `platform-api`. |
 | `ingress.yaml` | Dedicated `ryuki-platform` NGINX IngressClass placeholder for `platform.example.invalid` and same-origin `/api`. |
-| `networkpolicies.yaml` | Default-deny ingress/egress plus explicit UI/API/DNS allowances, a dedicated ingress-controller instance selector, separate API and migration-Job ↔ CNPG database paths (TCP 5432 in both directions), CNPG intra-cluster and operator allowances (5432 + 8000), and a commented Vault:8200 egress stub. Deployment-time TODOs: the CNPG instance manager additionally needs egress to the kube-apiserver (cluster-specific ipBlock, supply via overlay), and Barman backups will need egress to the object-store endpoint. |
+| `networkpolicies.yaml` | Default-deny ingress/egress plus explicit UI/API/DNS allowances, a dedicated ingress-controller instance selector, separate API and migration-Job ↔ CNPG database paths (TCP 5432 in both directions), CNPG intra-cluster and operator allowances (5432 + 8000), and the API half of the exact Vault:8200 path. `../vault/workload-auth.yaml` owns the matching Vault ingress half. Deployment-time TODOs: the CNPG instance manager and Vault authentication-review client additionally need egress to their cluster-specific kube-apiserver endpoint, and Barman backups need egress to the object-store endpoint. |
 
 ## Database configuration delivery
 
@@ -43,6 +43,25 @@ fail-closed.
 
 `platform-api` reads its non-secret settings from the `platform-api-config`
 ConfigMap and `RYUKI_DATABASE_URL` from the `ryuki-platform-api-db` Secret.
+The same ConfigMap pins the twelve value-free
+`RYUKI_SECRET_PROVIDER_RUNTIME__*` fields for the direct Vault resolver. The
+Deployment keeps `automountServiceAccountToken: false`, projects one
+600-second `vault`-audience token at
+`/var/run/secrets/ryuki/vault-auth/token`, and mounts only
+`ryuki-vault-client-ca/ca.crt` at
+`/var/run/secrets/ryuki/vault-tls/ca.crt`, both mode `0440` and read-only under
+`fsGroup: 10001`. The direct API role is `ryuki-platform-api`; it is distinct
+from every VSO `VaultAuth` and materializer ServiceAccount.
+
+Secret-reference fingerprints use an independent HMAC keyring. An authorized
+operator creates `ryuki-secret-reference-fingerprint-keyring` in
+`ryuki-platform` with exactly one Kubernetes Secret key named `keyring`. The
+Deployment projects only that key, mode `0440`, and mounts it read-only at
+`/var/run/secrets/ryuki/secret-reference-fingerprint/keyring`; the ConfigMap
+contains only that non-secret path. The keyring payload format and overlapping
+rotation procedure are defined in `../vault/bootstrap-runbook.md`. Do not add
+this material to an environment variable, manifest, log, or evidence bundle.
+
 The one-shot Job instead reads `platform-api-migration-config` and only
 `RYUKI_MIGRATION_DATABASE_URL` from the distinct
 digest-scoped `ryuki-platform-api-migrator-db-<digest-prefix>` Secret. The API

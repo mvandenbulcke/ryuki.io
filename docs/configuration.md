@@ -49,9 +49,13 @@ Startup now derives the complete implementation-plus-deployment applicability
 inventory, verifies the exact semantic receipt closure, and consumes the
 checkpoint, current SB-9 root, authenticated documents, pinned profile/build,
 and workload proof into one non-cloneable production-boundary proof. Production
-now retains verified `HttpsPublicUrls` and `SecureCookies` witnesses, but still
-exits before migrations, workers, routing, or listeners until the remaining six
-receipt-bound live runtime guards are implemented and verified.
+now retains verified `HttpsPublicUrls`, `SecureCookies`, and
+`ApprovedSecretProvider` witnesses, but still exits before migrations, workers,
+routing, or listeners until the remaining five receipt-bound live runtime
+guards are implemented and verified: `durable-postgresql`,
+`non-development-authenticator`, `external-signing-key-material`,
+`mock-dependencies-disabled`, and `first-owner-path-closed`. The overall
+normative production boundary is not complete.
 
 Production additionally requires these external checkpoint bindings:
 
@@ -172,7 +176,7 @@ Files checked into `catalog/security-contracts/v1` with lifecycle
 `implementation_only` are schema/conformance fixtures, not active deployment
 authority, and cannot start the API or migration runner. Even a valid sealed
 semantic closure, build manifest, and deployed-workload proof cannot start
-production until the remaining six receipt-bound live runtime guards are
+production until the remaining five receipt-bound live runtime guards are
 implemented and verified. The proving ground
 likewise requires a separately reviewed active
 operator bundle and evidence; the repository does not publish or infer a
@@ -266,46 +270,105 @@ providers, discovery-driven configuration, lifecycle/SCIM, WebAuthn emergency
 access, service OAuth profiles, and workload identity remain specification
 work rather than current launch claims.
 
-### Vault (current secrets resolver)
+### Vault Kubernetes workload-authenticated resolver
 
-The control plane resolves provider-credential handles through HashiCorp
-Vault when both settings below are configured. Missing configuration fails the
-dependent credential-resolution operation unless **both** the platform auth
-mode (`mock-dry-run` or `static-dry-run`) and the individual connection
-execution mode (`static-dry-run`) explicitly admit the local mock resolver. A
-live connection never selects the mock resolver. Setting only one variable,
-setting either variable blank, using an invalid transport, or configuring Vault
-variables while another `secret_provider` is selected fails process startup.
+Production HashiCorp Vault resolution uses a typed provider-qualified
+`SecretRef` and one process-lifetime workload-authenticated runtime. It does not
+use a process-wide static Vault token. Startup constructs that runtime, performs
+the initial Kubernetes authentication and provider confirmation, independently
+composes the singleton approved-provider D/P/R/I witness, and retains the exact
+runtime and typed consumer allocations. One supervised maintenance task renews
+or re-authenticates the lease through graceful HTTP drain. `/ready` fails when
+the workload runtime, lease confirmation, generation fence, or typed resolver
+owner is not current.
 
-| Variable | Description | Default |
-|---|---|---|
-| `VAULT_ADDR` | Vault server address, e.g. `https://vault.internal:8200` | Unset → fail closed outside explicit local dry-run |
-| `VAULT_TOKEN` | Vault token with read access to the secret paths | Unset → fail closed outside explicit local dry-run |
-| `RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK` | Development exception for literal loopback HTTP only | `false` |
-| `RYUKI_INTEGRATION__ENCRYPTION_KEY` | 32-byte base64/hex envelope key for persisted integration credentials | Unset; dependent encrypted operations fail |
+Configure exactly these twelve non-secret variables as one closed group. Every
+field is required in production. In development and test, either supply all
+twelve or none. Partial groups, blank or non-canonical values, and any unknown
+name beginning `RYUKI_SECRET_PROVIDER_RUNTIME__` fail before CA, projected-JWT,
+or provider I/O.
 
-Credential handles are `<mount>/<path>[#<field>]`, for example
-`secret/ryuki/vcenter#password`. A `#field` selector is required unless the
-secret has exactly one field. Values never appear in logs, errors, or
-evidence.
+| Variable | Required value |
+|---|---|
+| `RYUKI_SECRET_PROVIDER_RUNTIME__PROVIDER_ID` | Canonical `provider:` id equal to the admitted active provider, for example `provider:hashicorp-vault-primary` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__CONFIGURATION_VERSION` | Canonical positive base-10 version equal to the admitted provider configuration |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__API_FLAVOR` | Exactly `hashicorp-vault-v1`; the OpenBao identity remains separately cataloged and is not aliased to this runtime |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__ENDPOINT` | Normalized absolute HTTPS Vault base URL, without userinfo, query, fragment, escapes, or path traversal |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__CA_BUNDLE_PATH` | Exactly `/var/run/secrets/ryuki/vault-tls/ca.crt` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUTH_MOUNT` | Exactly `kubernetes` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_ROLE` | Exact admitted Vault Kubernetes role, for example `ryuki-platform-api` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__KUBERNETES_AUDIENCE` | Exactly `vault` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__PROJECTED_TOKEN_PATH` | Exactly `/var/run/secrets/ryuki/vault-auth/token` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAMESPACE` | Exact Kubernetes workload namespace, for example `ryuki-platform` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_SERVICE_ACCOUNT_NAME` | Exact Kubernetes ServiceAccount, for example `platform-api` |
+| `RYUKI_SECRET_PROVIDER_RUNTIME__EXPECTED_TOKEN_POLICY` | Exact least-privilege Vault policy; `default` and `root` are rejected |
 
-`VAULT_ADDR` must be HTTPS and may not contain credentials, query text, or a
-fragment. The client disables redirects and ambient proxies. The insecure flag
-admits only a literal loopback IP such as `127.0.0.1` or `::1` for a deliberately
-local proving ground; it never admits `localhost`, a container service name, or
-a private network merely because that network is trusted. Production uses
-authenticated TLS and workload identity or another short-lived bootstrap
-instead of a process-wide static token.
+The Kubernetes Deployment disables default ServiceAccount-token automount and
+projects one 600-second token with the singleton `vault` audience at
+`/var/run/secrets/ryuki/vault-auth/token`. It mounts only the approved Vault CA
+chain, read-only, at `/var/run/secrets/ryuki/vault-tls/ca.crt`. Both projections
+use mode `0440` under `fsGroup: 10001`. The Vault client requires HTTPS and the
+projected CA, follows no redirects, uses no ambient proxy or built-in trust
+roots, bounds connection and request time, and bounds every response before
+parsing. Login and lookup must confirm the expected namespace, ServiceAccount,
+audience, role, policy, renewable service token, and finite TTL before secret
+reads become ready.
 
-This is the current compatibility adapter. Domain credential dispatch depends
-on the provider-neutral `SecretResolver` capability, while `VAULT_TOKEN` is a
-reusable, process-wide bearer credential and the string handle remains a
-Vault-specific compatibility representation; neither is the production target.
-Production must use a typed provider-qualified secret reference and workload/
-managed identity or another explicitly approved short-lived bootstrap mechanism.
-A missing or unimplemented provider must fail readiness or the dependent
-operation instead of selecting a different adapter. See the
+#### Secret-reference fingerprint keyring
+
+The HMAC authority for value-free `SecretRef` fingerprints is deliberately
+separate from workload authentication, provider bearer material, session keys,
+and credential-encryption keys. Production requires:
+
+```text
+RYUKI_SECRET_REFERENCE_FINGERPRINT_KEYRING_PATH=/var/run/secrets/ryuki/secret-reference-fingerprint/keyring
+```
+
+The selector cannot redirect the runtime to another path. Its canonical target
+must be a regular UTF-8 file inside the fixed parent directory. This accepts
+the contained symlink layout used by Kubernetes projected Secret volumes while
+rejecting any symlink that escapes that directory. The file is nonempty and at
+most 32 KiB, containing one to eight records. Each line is at most 512 bytes
+and has exactly this form:
+
+```text
+key:<id>=<canonical padded standard Base64>
+```
+
+The complete unique key identifier starts with `key:`, is at most 256 bytes,
+has a nonempty suffix, and contains only ASCII letters, digits, `:`, `.`, `_`,
+`-`, and `/`. Material must decode to 32–128 bytes and re-encode byte-for-byte
+to the supplied canonical padded standard Base64. Whitespace, blank lines,
+comments, duplicate IDs, escaping symlinks, and extra records fail closed.
+
+Rotate with overlap: add a fresh successor record while retaining every key ID
+still named by persisted `SecretRef` values; update the operator-owned Secret;
+restart the `Recreate` API Deployment; then create or rewrite references with
+the successor. Remove a predecessor only after an independent readback proves
+that no stored reference names it, then update the Secret and restart again.
+Never relabel an existing ID or reuse its material.
+
+#### Local dry-run compatibility only
+
+`VAULT_ADDR`, `VAULT_TOKEN`, and
+`RYUKI_VAULT_ALLOW_INSECURE_LOOPBACK` belong only to the legacy local dry-run
+adapter and its `<mount>/<path>[#<field>]` handles. They are not production
+fallbacks. Production rejects their ambient presence—even an empty value—before
+reading the CA, projected JWT, or contacting Vault. It also rejects ambient
+`VAULT_TOKEN_FILE`, `VAULT_CACERT`, `VAULT_NAMESPACE`, `VAULT_SKIP_VERIFY`,
+`VAULT_CLIENT_CERT`, and `VAULT_CLIENT_KEY`.
+
+For an explicit local dry-run, `VAULT_ADDR` and `VAULT_TOKEN` remain all-or-none
+and the cleartext exception admits only an IP-literal loopback endpoint. Both
+the platform auth mode (`mock-dry-run` or `static-dry-run`) and the individual
+connection mode (`static-dry-run`) must admit mock resolution; a live connection
+never falls back to it. A missing or unimplemented provider fails readiness or
+the dependent operation instead of selecting another adapter. See the
 [secret-management provider contract](architecture/platform-security-boundary.md#pluggable-secret-management-providers).
+
+`RYUKI_INTEGRATION__ENCRYPTION_KEY` remains a separate 32-byte base64/hex
+envelope key for legacy persisted inline credentials. It is not a Vault
+workload-authentication or `SecretRef` fingerprint key.
 
 ### Platform
 

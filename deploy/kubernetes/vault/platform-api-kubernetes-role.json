@@ -1,0 +1,20 @@
+{
+  "alias_name_source": "serviceaccount_uid",
+  "audience": "vault",
+  "bound_service_account_names": [
+    "platform-api"
+  ],
+  "bound_service_account_namespaces": [
+    "ryuki-platform"
+  ],
+  "token_explicit_max_ttl": 900,
+  "token_max_ttl": 900,
+  "token_no_default_policy": true,
+  "token_num_uses": 0,
+  "token_period": 0,
+  "token_policies": [
+    "ryuki-platform-api-runtime"
+  ],
+  "token_ttl": 600,
+  "token_type": "service"
+}

@@ -26,6 +26,15 @@ The Kubernetes skeleton targets a portable runtime for early manifest validation
   certificate must contain `ryuki-platform-db-rw.ryuki-platform.svc` as a DNS
   SAN; certificate issuance and live readback remain deployment evidence.
 - External provider egress remains future explicit policy work.
+- Direct `platform-api` to Vault access is the sole provider egress currently
+  admitted: both policy halves require exact namespace and pod labels on TCP
+  8200. The API authenticates with a dedicated 600-second `vault`-audience
+  projected token and a CA-only trust mount; its ServiceAccount still disables
+  ambient token automounting.
+- Secret-reference fingerprints use a separate operator-created Kubernetes
+  Secret. Only its `keyring` key is projected into `platform-api`, mode `0440`
+  and read-only; key material is never placed in a ConfigMap or environment
+  variable.
 - Vault foundation values require HA Raft, TLS, persistent data and audit storage, retained PVCs, and no committed initialization material.
 
 ## Verification

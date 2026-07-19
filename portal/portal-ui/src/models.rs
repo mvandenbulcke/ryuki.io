@@ -1962,12 +1962,10 @@ pub struct AgentJobSummary {
 
 // ── Integration types ─────────────────────────────────────────────────────
 //
-// These types mirror the Slice-1 API shape (`/api/integrations`). The
-// `credential_ref` field in `IntegrationSummary` is `Option<String>`: for
-// `db-encrypted` connections the server fn sets it to `None` (the opaque FK
-// `is-{uuid}` is never useful to display and must not be exposed). For
-// `vault` and `env-var` connections it carries the non-secret reference (path
-// / key name) and may be shown.
+// These types mirror the portal-safe projection of `/api/integrations`.
+// Provider locators, legacy credential refs, and complete runtime SecretRef
+// objects are deliberately absent from `IntegrationSummary`: the browser only
+// needs to know whether an admitted credential binding exists.
 
 /// Portal-facing view of one vendor integration connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1977,12 +1975,13 @@ pub struct IntegrationSummary {
     pub name: String,
     pub endpoint_url: String,
     pub site_scope: Option<String>,
-    /// `"vault"` | `"db-encrypted"` | `"env-var"`
+    /// `"secret-provider-ref"` or an explicitly retained development/N-1
+    /// source (`"vault"`, `"db-encrypted"`, or `"env-var"`).
     pub credential_source: String,
-    /// Non-secret reference (vault path or env key names). Always `None`
-    /// for `db-encrypted` — the opaque FK is redacted by the server fn and
-    /// never sent to the browser.
-    pub credential_ref: Option<String>,
+    /// Locator-free readiness projection. The upstream response parser may
+    /// derive this from a legacy N-1 `credential_ref`, but it never retains or
+    /// forwards that value.
+    pub credential_configured: bool,
     pub status: String,
     pub readiness: String,
     pub execution_mode: String,
@@ -2015,9 +2014,15 @@ pub struct CreateIntegrationPayload {
     pub name: String,
     pub endpoint_url: String,
     pub site_scope: Option<String>,
-    /// `"vault"` | `"db-encrypted"` | `"env-var"`
+    /// `"secret-provider-ref"` for the current typed boundary, or an explicit
+    /// development/N-1 source (`"vault"`, `"db-encrypted"`, `"env-var"`).
     pub credential_source: String,
-    /// Vault path or env key names. Empty string for `db-encrypted`.
+    /// Current typed runtime SecretRef. This is write-only at the portal
+    /// boundary and is never copied into an `IntegrationSummary`.
+    #[serde(default)]
+    pub credential_secret_ref: Option<serde_json::Value>,
+    /// Legacy development/N-1 Vault path or env key names. Empty string for
+    /// `db-encrypted`. This remains write-only and is never projected back.
     pub credential_ref: String,
     /// Write-only. `db-encrypted` secret value. REDACTED in `Debug`.
     pub inline_secret: String,
@@ -2031,7 +2036,8 @@ impl std::fmt::Debug for CreateIntegrationPayload {
             .field("endpoint_url", &self.endpoint_url)
             .field("site_scope", &self.site_scope)
             .field("credential_source", &self.credential_source)
-            .field("credential_ref", &self.credential_ref)
+            .field("credential_secret_ref", &"[REDACTED]")
+            .field("credential_ref", &"[REDACTED]")
             .field("inline_secret", &"[REDACTED]")
             .finish()
     }
@@ -2048,7 +2054,12 @@ pub struct UpdateIntegrationPayload {
     pub name: Option<String>,
     pub endpoint_url: Option<String>,
     pub site_scope: Option<String>,
-    /// Vault path or env key names only. `None`/empty for `db-encrypted`.
+    /// Optional replacement typed runtime SecretRef. This is write-only at
+    /// the portal boundary; `None` keeps the admitted binding unchanged.
+    #[serde(default)]
+    pub credential_secret_ref: Option<serde_json::Value>,
+    /// Legacy development/N-1 Vault path or env key names only. `None` keeps
+    /// the reference unchanged. This is never projected back to the browser.
     pub credential_ref: Option<String>,
     /// Write-only. Empty = keep existing secret (no re-encryption).
     pub inline_secret: String,
@@ -2061,7 +2072,8 @@ impl std::fmt::Debug for UpdateIntegrationPayload {
             .field("name", &self.name)
             .field("endpoint_url", &self.endpoint_url)
             .field("site_scope", &self.site_scope)
-            .field("credential_ref", &self.credential_ref)
+            .field("credential_secret_ref", &"[REDACTED]")
+            .field("credential_ref", &"[REDACTED]")
             .field("inline_secret", &"[REDACTED]")
             .finish()
     }
@@ -4123,6 +4135,49 @@ mod ssr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_create_debug_redacts_current_and_legacy_secret_references() {
+        let payload = CreateIntegrationPayload {
+            vendor_type: "test".to_string(),
+            name: "test".to_string(),
+            endpoint_url: "https://example.invalid".to_string(),
+            site_scope: None,
+            credential_source: "secret-provider-ref".to_string(),
+            credential_secret_ref: Some(serde_json::json!({
+                "opaqueLocator": "typed-locator-sentinel",
+            })),
+            credential_ref: "legacy-locator-sentinel".to_string(),
+            inline_secret: "inline-secret-sentinel".to_string(),
+        };
+
+        let rendered = format!("{payload:?}");
+        assert!(!rendered.contains("typed-locator-sentinel"));
+        assert!(!rendered.contains("legacy-locator-sentinel"));
+        assert!(!rendered.contains("inline-secret-sentinel"));
+        assert_eq!(rendered.matches("[REDACTED]").count(), 3);
+    }
+
+    #[test]
+    fn integration_update_debug_redacts_current_and_legacy_secret_references() {
+        let payload = UpdateIntegrationPayload {
+            vendor_type: None,
+            name: None,
+            endpoint_url: None,
+            site_scope: None,
+            credential_secret_ref: Some(serde_json::json!({
+                "opaqueLocator": "typed-update-locator-sentinel",
+            })),
+            credential_ref: Some("legacy-update-locator-sentinel".to_string()),
+            inline_secret: "inline-update-secret-sentinel".to_string(),
+        };
+
+        let rendered = format!("{payload:?}");
+        assert!(!rendered.contains("typed-update-locator-sentinel"));
+        assert!(!rendered.contains("legacy-update-locator-sentinel"));
+        assert!(!rendered.contains("inline-update-secret-sentinel"));
+        assert_eq!(rendered.matches("[REDACTED]").count(), 3);
+    }
 
     #[test]
     fn offering_catalog_decodes_canonical_offerings_contract_envelope() {
