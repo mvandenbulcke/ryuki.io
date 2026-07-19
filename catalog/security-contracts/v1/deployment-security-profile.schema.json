@@ -360,10 +360,17 @@
     "expectedAuthenticatorBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "authenticator_kind"],
+      "required": ["provider", "authenticator_kind", "runtime_binding_digest"],
       "properties": {
         "provider": { "$ref": "#/$defs/expectedProviderBinding" },
-        "authenticator_kind": { "enum": ["oidc", "passkey", "mutual-tls", "composite"] }
+        "authenticator_kind": {
+          "description": "Exact production authenticator family. Legacy mutual-tls and composite mechanism labels are not valid profile values.",
+          "enum": ["oidc", "oidc-broker", "passkey", "oauth-service", "api-token", "workload"]
+        },
+        "runtime_binding_digest": {
+          "description": "ryuki-authenticator-runtime-binding-v1 digest of the exact non-secret initialized verifier, credential-profile, and retained-consumer projection for this provider.",
+          "$ref": "#/$defs/nonzeroDigest"
+        }
       }
     },
     "expectedCookiePolicy": {
@@ -450,7 +457,23 @@
           "properties": {
             "kind": { "const": "non-development-authenticator" },
             "authenticator_inventory_digest": { "description": "ryuki-authenticator-inventory-v1 digest of the exact initialized verifier inventory.", "$ref": "#/$defs/nonzeroDigest" },
-            "authenticators": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/expectedAuthenticatorBinding" } }
+            "authenticators": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/expectedAuthenticatorBinding" },
+              "contains": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "provider": { "$ref": "#/$defs/expectedProviderBinding" },
+                  "authenticator_kind": { "enum": ["oidc", "oidc-broker", "passkey"] },
+                  "runtime_binding_digest": { "$ref": "#/$defs/nonzeroDigest" }
+                },
+                "required": ["provider", "authenticator_kind", "runtime_binding_digest"]
+              },
+              "minContains": 1
+            }
           }
         },
         {

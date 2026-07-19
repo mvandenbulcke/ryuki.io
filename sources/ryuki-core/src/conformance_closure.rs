@@ -29,9 +29,9 @@ use crate::production_deployment_applicability::{
     ProductionDeploymentApplicabilityClaims, derive_complete_production_applicability,
 };
 use crate::security_profile::{
-    ArtifactKind, DeploymentSecurityProfile, ExpectedProviderBinding, GuardId,
-    ProductionAuthenticatorKind, RuntimeGuardExpectedValue, RuntimeGuardMode,
-    VersionedContentReference,
+    ArtifactKind, DeploymentSecurityProfile, ExpectedAuthenticatorBinding, ExpectedProviderBinding,
+    GuardId, ProductionAuthenticatorKind, RuntimeGuardExpectedValue, RuntimeGuardMode,
+    VersionedContentReference, authenticator_inventory_digest,
 };
 
 pub const DEPLOYMENT_PROFILE_CONFORMANCE_BINDING_DIGEST_CONTRACT: &str =
@@ -1025,40 +1025,74 @@ fn validate_runtime_guard_provider_bindings(
                     }
                 }
             }
-            RuntimeGuardExpectedValue::NonDevelopmentAuthenticator { authenticators, .. } => {
-                let expected_ids = authenticators
-                    .iter()
-                    .map(|authenticator| authenticator.provider.provider_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                let active_authenticator_ids = active_providers
-                    .iter()
-                    .filter(|claim| production_authenticator_provider_kind(&claim.provider_kind))
-                    .map(|claim| claim.provider_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                if expected_ids != active_authenticator_ids {
-                    return Err(invalid(
-                        "non-development-authenticator expectation is not the exact active authenticator provider inventory",
-                    ));
-                }
-                for authenticator in authenticators {
-                    let claim = exact_guard_provider_claim(
-                        "non-development-authenticator",
-                        &authenticator.provider,
-                        &claims_by_id,
-                        trust_domain_id,
-                    )?;
-                    if !provider_kind_supports_authenticator(
-                        &claim.provider_kind,
-                        authenticator.authenticator_kind,
-                    ) {
-                        return Err(invalid(format!(
-                            "non-development-authenticator {} provider kind does not match its typed authenticator kind",
-                            authenticator.provider.provider_id
-                        )));
-                    }
-                }
-            }
+            RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+                authenticator_inventory_digest,
+                authenticators,
+            } => validate_authenticator_provider_bindings(
+                authenticator_inventory_digest,
+                authenticators,
+                active_providers,
+                &claims_by_id,
+                trust_domain_id,
+            )?,
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_authenticator_provider_bindings(
+    expected_inventory_digest: &str,
+    authenticators: &[ExpectedAuthenticatorBinding],
+    active_providers: &[ActiveProviderApplicabilityClaim],
+    claims_by_id: &BTreeMap<&str, &ActiveProviderApplicabilityClaim>,
+    trust_domain_id: &str,
+) -> Result<(), ConformanceClosureError> {
+    let recomputed_inventory_digest = authenticator_inventory_digest(authenticators)
+        .map_err(|_| invalid("non-development-authenticator inventory cannot be canonicalized"))?;
+    if expected_inventory_digest != recomputed_inventory_digest {
+        return Err(invalid(
+            "non-development-authenticator inventory digest does not equal its canonical binding inventory",
+        ));
+    }
+
+    let expected_ids = authenticators
+        .iter()
+        .map(|authenticator| authenticator.provider.provider_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let active_authenticator_ids = active_providers
+        .iter()
+        .filter(|claim| production_authenticator_provider_kind(&claim.provider_kind))
+        .map(|claim| claim.provider_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_ids != active_authenticator_ids {
+        return Err(invalid(
+            "non-development-authenticator expectation is not the exact active authenticator provider inventory",
+        ));
+    }
+    if !active_providers
+        .iter()
+        .any(|claim| production_human_authenticator_provider_kind(&claim.provider_kind))
+    {
+        return Err(invalid(
+            "non-development-authenticator inventory has no active human oidc, oidc-broker, or local-webauthn provider",
+        ));
+    }
+    for authenticator in authenticators {
+        let claim = exact_guard_provider_claim(
+            "non-development-authenticator",
+            &authenticator.provider,
+            claims_by_id,
+            trust_domain_id,
+        )?;
+        if !provider_kind_supports_authenticator(
+            &claim.provider_kind,
+            authenticator.authenticator_kind,
+        ) {
+            return Err(invalid(format!(
+                "non-development-authenticator {} provider kind does not match its typed authenticator kind",
+                authenticator.provider.provider_id
+            )));
         }
     }
     Ok(())
@@ -1101,8 +1135,12 @@ fn exact_guard_provider_claim<'a>(
 fn production_authenticator_provider_kind(provider_kind: &str) -> bool {
     matches!(
         provider_kind,
-        "oidc" | "oidc-broker" | "local-webauthn" | "workload" | "oauth-service"
+        "oidc" | "oidc-broker" | "local-webauthn" | "oauth-service" | "api-token" | "workload"
     )
+}
+
+fn production_human_authenticator_provider_kind(provider_kind: &str) -> bool {
+    matches!(provider_kind, "oidc" | "oidc-broker" | "local-webauthn")
 }
 
 fn provider_kind_supports_authenticator(
@@ -1110,12 +1148,13 @@ fn provider_kind_supports_authenticator(
     authenticator_kind: ProductionAuthenticatorKind,
 ) -> bool {
     match authenticator_kind {
-        ProductionAuthenticatorKind::Oidc => matches!(provider_kind, "oidc" | "oidc-broker"),
+        ProductionAuthenticatorKind::Oidc => provider_kind == "oidc",
+        ProductionAuthenticatorKind::OidcBroker => provider_kind == "oidc-broker",
         ProductionAuthenticatorKind::Passkey => provider_kind == "local-webauthn",
-        ProductionAuthenticatorKind::MutualTls => provider_kind == "workload",
-        ProductionAuthenticatorKind::Composite => {
-            matches!(provider_kind, "oidc-broker" | "workload" | "oauth-service")
-        }
+        ProductionAuthenticatorKind::OauthService => provider_kind == "oauth-service",
+        ProductionAuthenticatorKind::ApiToken => provider_kind == "api-token",
+        ProductionAuthenticatorKind::Workload => provider_kind == "workload",
+        ProductionAuthenticatorKind::MutualTls | ProductionAuthenticatorKind::Composite => false,
     }
 }
 
@@ -4170,14 +4209,21 @@ pub mod tests {
                 }],
                 "policy_inventory_digest": "sha256:5d41f46cb07894ac33d14824daeccdc7e466577383fc0a463f9a919949a0bbc7",
             }),
-            4 => json!({
-                "kind": "non-development-authenticator",
-                "authenticator_inventory_digest": test_digest("guard-authenticator-inventory"),
-                "authenticators": [{
+            4 => {
+                let authenticators = json!([{
                     "provider": provider("provider:closure-oidc"),
                     "authenticator_kind": "oidc",
-                }],
-            }),
+                    "runtime_binding_digest": test_digest("guard-oidc-runtime-binding"),
+                }]);
+                json!({
+                    "kind": "non-development-authenticator",
+                    // Independent golden for the exact canonical positive
+                    // fixture above; never derive an authority expectation
+                    // from the rows it is meant to constrain.
+                    "authenticator_inventory_digest": "sha256:9ca77367549f69dc70b33d1cce114c5834d23527439cd47b1b6105755e31a280",
+                    "authenticators": authenticators,
+                })
+            }
             5 => json!({
                 "kind": "external-signing-key-material",
                 "signing_inventory_digest": test_digest("guard-signing-inventory"),
@@ -4210,6 +4256,18 @@ pub mod tests {
             }),
             _ => unreachable!("there are exactly eight guards"),
         }
+    }
+
+    fn refresh_authenticator_inventory_digest(profile: &mut Value) {
+        let authenticators =
+            profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
+                .clone();
+        let typed: Vec<ExpectedAuthenticatorBinding> =
+            serde_json::from_value(authenticators).unwrap();
+        profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticator_inventory_digest"] = json!(
+            authenticator_inventory_digest(&typed)
+                .expect("fixture authenticator inventory must canonicalize")
+        );
     }
 
     fn receipt_id(package_id: &str) -> String {
@@ -5261,6 +5319,141 @@ pub mod tests {
         }
     }
 
+    fn focused_authenticator_binding(
+        provider_id: &str,
+        authenticator_kind: ProductionAuthenticatorKind,
+    ) -> ExpectedAuthenticatorBinding {
+        let provider_name = provider_id
+            .strip_prefix("provider:")
+            .expect("focused fixture provider id is canonical");
+        ExpectedAuthenticatorBinding {
+            provider: ExpectedProviderBinding {
+                provider_id: provider_id.into(),
+                configuration_version: 1,
+                configuration_payload_digest: test_digest(&format!("{provider_id}-configuration")),
+                lifecycle_record_version: 1,
+                lifecycle_state: ProviderLifecycleState::Active,
+                capability_descriptor_id: format!("capability-descriptor:{provider_name}"),
+                capability_descriptor_version: 1,
+                adapter_kind: format!("auth.{provider_name}"),
+                adapter_version: "1.0.0".into(),
+            },
+            authenticator_kind,
+            runtime_binding_digest: test_digest(&format!("{provider_id}-runtime-binding")),
+        }
+    }
+
+    fn focused_authenticator_claim(
+        binding: &ExpectedAuthenticatorBinding,
+        provider_kind: &str,
+    ) -> ActiveProviderApplicabilityClaim {
+        ActiveProviderApplicabilityClaim {
+            provider_id: binding.provider.provider_id.clone(),
+            provider_kind: provider_kind.into(),
+            configuration_version: binding.provider.configuration_version,
+            configuration_payload_digest: binding.provider.configuration_payload_digest.clone(),
+            lifecycle_record_version: binding.provider.lifecycle_record_version,
+            lifecycle_state: binding.provider.lifecycle_state,
+            trust_domain_id: TRUST_DOMAIN_ID.into(),
+            descriptor_id: binding.provider.capability_descriptor_id.clone(),
+            descriptor_version: binding.provider.capability_descriptor_version,
+            adapter_kind: binding.provider.adapter_kind.clone(),
+            adapter_version: binding.provider.adapter_version.clone(),
+            advertised_capability_ids: vec!["authenticate".into()],
+            production_eligible: true,
+            mandatory_baseline_ref: ProviderMandatoryBaselineClaim {
+                document_id: format!(
+                    "provider-capability-baseline:{}",
+                    binding
+                        .provider
+                        .provider_id
+                        .strip_prefix("provider:")
+                        .unwrap()
+                ),
+                document_version: 1,
+                content_digest: test_digest(&format!("{}-baseline", binding.provider.provider_id)),
+                artifact_locator: format!(
+                    "fixtures/providers/{}-baseline.json",
+                    binding
+                        .provider
+                        .provider_id
+                        .strip_prefix("provider:")
+                        .unwrap()
+                ),
+            },
+        }
+    }
+
+    fn focused_all_authenticator_classes() -> (
+        Vec<ExpectedAuthenticatorBinding>,
+        Vec<ActiveProviderApplicabilityClaim>,
+    ) {
+        let classes = [
+            (
+                "provider:focused-api-token",
+                "api-token",
+                ProductionAuthenticatorKind::ApiToken,
+            ),
+            (
+                "provider:focused-local-webauthn",
+                "local-webauthn",
+                ProductionAuthenticatorKind::Passkey,
+            ),
+            (
+                "provider:focused-oauth-service",
+                "oauth-service",
+                ProductionAuthenticatorKind::OauthService,
+            ),
+            (
+                "provider:focused-oidc",
+                "oidc",
+                ProductionAuthenticatorKind::Oidc,
+            ),
+            (
+                "provider:focused-oidc-broker",
+                "oidc-broker",
+                ProductionAuthenticatorKind::OidcBroker,
+            ),
+            (
+                "provider:focused-workload",
+                "workload",
+                ProductionAuthenticatorKind::Workload,
+            ),
+        ];
+        let authenticators = classes
+            .iter()
+            .map(|(provider_id, _, authenticator_kind)| {
+                focused_authenticator_binding(provider_id, *authenticator_kind)
+            })
+            .collect::<Vec<_>>();
+        let claims = authenticators
+            .iter()
+            .zip(classes)
+            .map(|(binding, (_, provider_kind, _))| {
+                focused_authenticator_claim(binding, provider_kind)
+            })
+            .collect();
+        (authenticators, claims)
+    }
+
+    fn validate_focused_authenticator_inventory(
+        authenticators: &[ExpectedAuthenticatorBinding],
+        active_providers: &[ActiveProviderApplicabilityClaim],
+        inventory_digest: &str,
+    ) -> Result<(), ConformanceClosureError> {
+        let claims_by_id = active_providers
+            .iter()
+            .map(|claim| (claim.provider_id.as_str(), claim))
+            .collect::<BTreeMap<_, _>>();
+        validate_authenticator_provider_bindings(
+            inventory_digest,
+            authenticators,
+            active_providers,
+            &claims_by_id,
+            TRUST_DOMAIN_ID,
+        )
+    }
+
     fn fixture_version_context(
         profile: &DeploymentSecurityProfile,
         manifest: &ProductionBuildManifest,
@@ -5462,6 +5655,7 @@ pub mod tests {
             PublicFixtureMutation::AuthenticatorProviderKindMismatch => {
                 profile["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
                     [0]["authenticator_kind"] = json!("passkey");
+                refresh_authenticator_inventory_digest(&mut profile);
             }
             _ => {}
         }
@@ -6058,6 +6252,82 @@ pub mod tests {
         let error =
             verify_public_fixture(PublicFixtureMutation::MissingSecretCapability).unwrap_err();
         assert!(error.contains("advertising every required capability"));
+    }
+
+    #[test]
+    fn authenticator_guard_covers_all_six_provider_classes_exactly() {
+        let (authenticators, active_providers) = focused_all_authenticator_classes();
+        let inventory_digest = authenticator_inventory_digest(&authenticators).unwrap();
+
+        validate_focused_authenticator_inventory(
+            &authenticators,
+            &active_providers,
+            &inventory_digest,
+        )
+        .expect("all six exact production authenticator provider classes must close");
+
+        let mut omitted_api_token = authenticators.clone();
+        omitted_api_token.remove(0);
+        let omitted_digest = authenticator_inventory_digest(&omitted_api_token).unwrap();
+        let error = validate_focused_authenticator_inventory(
+            &omitted_api_token,
+            &active_providers,
+            &omitted_digest,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact active authenticator provider inventory")
+        );
+    }
+
+    #[test]
+    fn authenticator_guard_requires_a_human_provider_and_exact_family() {
+        let (authenticators, active_providers) = focused_all_authenticator_classes();
+        let machine_authenticators = vec![
+            authenticators[0].clone(),
+            authenticators[2].clone(),
+            authenticators[5].clone(),
+        ];
+        let machine_providers = vec![
+            active_providers[0].clone(),
+            active_providers[2].clone(),
+            active_providers[5].clone(),
+        ];
+        let machine_digest = authenticator_inventory_digest(&machine_authenticators).unwrap();
+        let error = validate_focused_authenticator_inventory(
+            &machine_authenticators,
+            &machine_providers,
+            &machine_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("has no active human"));
+
+        let mut wrong_family = authenticators.clone();
+        wrong_family[0].authenticator_kind = ProductionAuthenticatorKind::Workload;
+        let wrong_family_digest = authenticator_inventory_digest(&wrong_family).unwrap();
+        let error = validate_focused_authenticator_inventory(
+            &wrong_family,
+            &active_providers,
+            &wrong_family_digest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("typed authenticator kind"));
+    }
+
+    #[test]
+    fn authenticator_guard_rejects_inventory_digest_substitution() {
+        let (authenticators, active_providers) = focused_all_authenticator_classes();
+        let substituted = test_digest("substituted-authenticator-inventory");
+
+        let error = validate_focused_authenticator_inventory(
+            &authenticators,
+            &active_providers,
+            &substituted,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical binding inventory"));
     }
 
     #[test]

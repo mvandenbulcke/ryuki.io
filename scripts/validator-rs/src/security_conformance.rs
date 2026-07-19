@@ -5986,10 +5986,11 @@ mod tests {
             }),
             4 => json!({
                 "kind": "non-development-authenticator",
-                "authenticator_inventory_digest": digest('a'),
+                "authenticator_inventory_digest": "sha256:34f00f95d64f1aacf021b9e89eb642b3d0ff04f611592ff00097866c51f7fd7f",
                 "authenticators": [{
                     "provider": provider("provider:validator-oidc"),
-                    "authenticator_kind": "oidc"
+                    "authenticator_kind": "oidc",
+                    "runtime_binding_digest": digest('a')
                 }]
             }),
             5 => json!({
@@ -7072,6 +7073,55 @@ mod tests {
             "deployment-security-profile.schema.json",
             &schema,
             &insecure_cookie,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut missing_runtime_binding = production_deployment_profile_fixture();
+        missing_runtime_binding["runtime_guard_evidence"]["guards"][4]["expected_value"]
+            ["authenticators"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_binding_digest");
+        errors.clear();
+        validate_instance(
+            "test:authenticator-missing-runtime-binding",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &missing_runtime_binding,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut machine_only = production_deployment_profile_fixture();
+        machine_only["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
+            [0]["authenticator_kind"] = json!("workload");
+        errors.clear();
+        validate_instance(
+            "test:authenticator-without-human-provider",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &machine_only,
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+
+        let mut legacy_mechanism = production_deployment_profile_fixture();
+        let mut legacy_row = legacy_mechanism["runtime_guard_evidence"]["guards"][4]
+            ["expected_value"]["authenticators"][0]
+            .clone();
+        legacy_row["provider"]["provider_id"] = json!("provider:validator-legacy-workload");
+        legacy_row["authenticator_kind"] = json!("composite");
+        legacy_mechanism["runtime_guard_evidence"]["guards"][4]["expected_value"]["authenticators"]
+            .as_array_mut()
+            .unwrap()
+            .push(legacy_row);
+        errors.clear();
+        validate_instance(
+            "test:legacy-authenticator-mechanism-label",
+            "deployment-security-profile.schema.json",
+            &schema,
+            &legacy_mechanism,
             &mut errors,
         );
         assert!(!errors.is_empty());

@@ -3,11 +3,19 @@ use std::path::{Component, Path};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::conformance_trust::canonical_json_bytes;
 
 pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_URI: &str =
     "https://ryuki.io/schemas/security-contracts/v1/deployment-security-profile.schema.json";
 pub const DEPLOYMENT_SECURITY_PROFILE_SCHEMA_VERSION: &str = "1.0.0";
 pub const DEPLOYMENT_SECURITY_PROFILE_CONTRACT_KIND: &str = "deployment-security-profile";
+pub const AUTHENTICATOR_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-authenticator-inventory-v1";
+pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
+    "ryuki-authenticator-runtime-binding-v1";
 
 const REQUIRED_PRODUCTION_GUARDS: [GuardId; 8] = [
     GuardId::DurablePostgresql,
@@ -341,9 +349,27 @@ pub enum CookieSameSitePolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum ProductionAuthenticatorKind {
     Oidc,
+    OidcBroker,
     Passkey,
+    OauthService,
+    ApiToken,
+    Workload,
+    /// Retained in the typed parser for deterministic diagnostics in migration
+    /// tooling; the current JSON Schema does not admit this legacy mechanism.
     MutualTls,
+    /// Retained in the typed parser for deterministic diagnostics in migration
+    /// tooling; the current JSON Schema does not admit this legacy mechanism.
     Composite,
+}
+
+impl ProductionAuthenticatorKind {
+    pub const fn is_human(self) -> bool {
+        matches!(self, Self::Oidc | Self::OidcBroker | Self::Passkey)
+    }
+
+    pub const fn is_legacy_mechanism(self) -> bool {
+        matches!(self, Self::MutualTls | Self::Composite)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -365,6 +391,44 @@ pub struct ExpectedProviderBinding {
 pub struct ExpectedAuthenticatorBinding {
     pub provider: ExpectedProviderBinding,
     pub authenticator_kind: ProductionAuthenticatorKind,
+    /// Digest of the exact non-secret initialized verifier, credential-profile,
+    /// and retained-consumer projection used for this provider.
+    pub runtime_binding_digest: String,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticatorInventoryDigestError {
+    #[error("authenticator inventory could not be projected as canonical JSON")]
+    Projection,
+}
+
+#[derive(Serialize)]
+struct AuthenticatorInventoryProjection<'a> {
+    digest_contract: &'static str,
+    authenticators: &'a [ExpectedAuthenticatorBinding],
+}
+
+/// Independently encode the exact sorted non-secret authenticator binding
+/// inventory using `ryuki-canonical-json-v1`.
+pub fn authenticator_inventory_canonical_bytes(
+    authenticators: &[ExpectedAuthenticatorBinding],
+) -> Result<Vec<u8>, AuthenticatorInventoryDigestError> {
+    let projection = AuthenticatorInventoryProjection {
+        digest_contract: AUTHENTICATOR_INVENTORY_DIGEST_CONTRACT,
+        authenticators,
+    };
+    let value: Value = serde_json::to_value(projection)
+        .map_err(|_| AuthenticatorInventoryDigestError::Projection)?;
+    canonical_json_bytes(&value).map_err(|_| AuthenticatorInventoryDigestError::Projection)
+}
+
+/// Independently recompute the receipt/runtime digest for the exact sorted
+/// non-secret authenticator binding inventory.
+pub fn authenticator_inventory_digest(
+    authenticators: &[ExpectedAuthenticatorBinding],
+) -> Result<String, AuthenticatorInventoryDigestError> {
+    let canonical = authenticator_inventory_canonical_bytes(authenticators)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1252,12 +1316,12 @@ pub(crate) fn validate_runtime_guard_expected_value(
             );
         }
         RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
-            authenticator_inventory_digest,
+            authenticator_inventory_digest: expected_inventory_digest,
             authenticators,
         } => {
             validate_digest(
                 "non-development-authenticator authenticator_inventory_digest",
-                authenticator_inventory_digest,
+                expected_inventory_digest,
                 errors,
             );
             if authenticators.is_empty() {
@@ -1279,6 +1343,37 @@ pub(crate) fn validate_runtime_guard_expected_value(
                     &authenticator.provider,
                     errors,
                 );
+                validate_digest(
+                    "non-development-authenticator runtime_binding_digest",
+                    &authenticator.runtime_binding_digest,
+                    errors,
+                );
+                if authenticator.authenticator_kind.is_legacy_mechanism() {
+                    errors.push(
+                        "non-development-authenticator authenticator_kind must name an exact provider family; legacy mutual-tls and composite mechanism labels are not admissible"
+                            .into(),
+                    );
+                }
+            }
+            if !authenticators
+                .iter()
+                .any(|authenticator| authenticator.authenticator_kind.is_human())
+            {
+                errors.push(
+                    "non-development-authenticator requires at least one human oidc, oidc-broker, or passkey provider"
+                        .into(),
+                );
+            }
+            match authenticator_inventory_digest(authenticators) {
+                Ok(recomputed) if &recomputed != expected_inventory_digest => errors.push(
+                    "non-development-authenticator authenticator_inventory_digest does not equal the canonical ryuki-authenticator-inventory-v1 projection"
+                        .into(),
+                ),
+                Err(_) => errors.push(
+                    "non-development-authenticator inventory could not be canonically projected"
+                        .into(),
+                ),
+                Ok(_) => {}
             }
         }
         RuntimeGuardExpectedValue::ExternalSigningKeyMaterial {
@@ -1462,6 +1557,52 @@ mod tests {
         }
     }
 
+    fn all_authenticator_classes() -> Vec<ExpectedAuthenticatorBinding> {
+        [
+            (
+                "provider:fixture-api-token",
+                ProductionAuthenticatorKind::ApiToken,
+                'a',
+            ),
+            (
+                "provider:fixture-local-webauthn",
+                ProductionAuthenticatorKind::Passkey,
+                'b',
+            ),
+            (
+                "provider:fixture-oauth-service",
+                ProductionAuthenticatorKind::OauthService,
+                'c',
+            ),
+            (
+                "provider:fixture-oidc",
+                ProductionAuthenticatorKind::Oidc,
+                'd',
+            ),
+            (
+                "provider:fixture-oidc-broker",
+                ProductionAuthenticatorKind::OidcBroker,
+                'e',
+            ),
+            (
+                "provider:fixture-workload",
+                ProductionAuthenticatorKind::Workload,
+                'f',
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(provider_id, authenticator_kind, runtime_digest_character)| {
+                ExpectedAuthenticatorBinding {
+                    provider: expected_provider_binding(provider_id),
+                    authenticator_kind,
+                    runtime_binding_digest: fixture_digest(runtime_digest_character),
+                }
+            },
+        )
+        .collect()
+    }
+
     fn expected_guard_value(guard_id: GuardId, deployment_id: &str) -> RuntimeGuardExpectedValue {
         match guard_id {
             GuardId::DurablePostgresql => RuntimeGuardExpectedValue::DurablePostgresql {
@@ -1498,12 +1639,15 @@ mod tests {
                 policy_inventory_digest: fixture_digest('9'),
             },
             GuardId::NonDevelopmentAuthenticator => {
+                let authenticators = vec![ExpectedAuthenticatorBinding {
+                    provider: expected_provider_binding("provider:fixture-oidc"),
+                    authenticator_kind: ProductionAuthenticatorKind::Oidc,
+                    runtime_binding_digest: fixture_digest('a'),
+                }];
                 RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
-                    authenticator_inventory_digest: fixture_digest('a'),
-                    authenticators: vec![ExpectedAuthenticatorBinding {
-                        provider: expected_provider_binding("provider:fixture-oidc"),
-                        authenticator_kind: ProductionAuthenticatorKind::Oidc,
-                    }],
+                    authenticator_inventory_digest: authenticator_inventory_digest(&authenticators)
+                        .expect("fixture authenticator inventory must canonicalize"),
+                    authenticators,
                 }
             }
             GuardId::ExternalSigningKeyMaterial => {
@@ -1714,6 +1858,146 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("must equal the root deployment profile"))
         );
+    }
+
+    #[test]
+    fn authenticator_inventory_digest_has_an_independent_six_class_golden() {
+        let authenticators = all_authenticator_classes();
+        let digest = authenticator_inventory_digest(&authenticators).unwrap();
+
+        assert_eq!(
+            digest,
+            "sha256:23fb7bb3600280774c80985c20b6da77719b3b2b287ef5523247f60b38b39ac6"
+        );
+
+        let mut runtime_drift = authenticators;
+        runtime_drift[0].runtime_binding_digest = fixture_digest('9');
+        assert_ne!(
+            authenticator_inventory_digest(&runtime_drift).unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn authenticator_inventory_canonical_bytes_match_independent_golden() {
+        let authenticators = vec![ExpectedAuthenticatorBinding {
+            provider: expected_provider_binding("provider:fixture-oidc"),
+            authenticator_kind: ProductionAuthenticatorKind::Oidc,
+            runtime_binding_digest: fixture_digest('a'),
+        }];
+        let canonical = authenticator_inventory_canonical_bytes(&authenticators).unwrap();
+        let expected = concat!(
+            "{\"authenticators\":[{\"authenticator_kind\":\"oidc\",\"provider\":{",
+            "\"adapter_kind\":\"fixture.provider\",\"adapter_version\":\"1.0.0\",",
+            "\"capability_descriptor_id\":\"capability-descriptor:fixture-provider\",",
+            "\"capability_descriptor_version\":1,",
+            "\"configuration_payload_digest\":\"sha256:",
+            "1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"configuration_version\":1,\"lifecycle_record_version\":1,",
+            "\"lifecycle_state\":\"active\",\"provider_id\":\"provider:fixture-oidc\"},",
+            "\"runtime_binding_digest\":\"sha256:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],",
+            "\"digest_contract\":\"ryuki-authenticator-inventory-v1\"}"
+        );
+
+        assert_eq!(canonical, expected.as_bytes());
+        assert_eq!(
+            authenticator_inventory_digest(&authenticators).unwrap(),
+            "sha256:7d6e6f71af0b642cce32d0bb8caaf9bdf99ee6ee2ca71b6afd3a86bfdd403153"
+        );
+    }
+
+    #[test]
+    fn authenticator_guard_rejects_missing_human_legacy_labels_and_digest_drift() {
+        let mut profile = structurally_complete_production_profile();
+        let guard = profile
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::NonDevelopmentAuthenticator)
+            .unwrap();
+        let RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+            authenticator_inventory_digest,
+            authenticators,
+        } = &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+
+        authenticators[0].authenticator_kind = ProductionAuthenticatorKind::Workload;
+        *authenticator_inventory_digest =
+            super::authenticator_inventory_digest(authenticators).unwrap();
+        let errors = profile.validate_structure_at(fixed_now());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("at least one human"))
+        );
+
+        let mut legacy = structurally_complete_production_profile();
+        let guard = legacy
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::NonDevelopmentAuthenticator)
+            .unwrap();
+        let RuntimeGuardExpectedValue::NonDevelopmentAuthenticator {
+            authenticator_inventory_digest,
+            authenticators,
+        } = &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+        authenticators[0].authenticator_kind = ProductionAuthenticatorKind::Composite;
+        *authenticator_inventory_digest =
+            super::authenticator_inventory_digest(authenticators).unwrap();
+        let errors = legacy.validate_structure_at(fixed_now());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("legacy mutual-tls"))
+        );
+
+        let mut drifted = structurally_complete_production_profile();
+        let guard = drifted
+            .runtime_guard_evidence
+            .guards
+            .iter_mut()
+            .find(|guard| guard.guard_id == GuardId::NonDevelopmentAuthenticator)
+            .unwrap();
+        let RuntimeGuardExpectedValue::NonDevelopmentAuthenticator { authenticators, .. } =
+            &mut guard.expected_value
+        else {
+            unreachable!()
+        };
+        authenticators[0].runtime_binding_digest = fixture_digest('9');
+        let errors = drifted.validate_structure_at(fixed_now());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("does not equal the canonical"))
+        );
+    }
+
+    #[test]
+    fn authenticator_binding_requires_runtime_digest_but_parses_legacy_kind_for_denial() {
+        let provider =
+            serde_json::to_value(expected_provider_binding("provider:fixture-legacy")).unwrap();
+        let missing_runtime_digest = json!({
+            "provider": provider,
+            "authenticator_kind": "oidc"
+        });
+        assert!(
+            serde_json::from_value::<ExpectedAuthenticatorBinding>(missing_runtime_digest).is_err()
+        );
+
+        let legacy: ExpectedAuthenticatorBinding = serde_json::from_value(json!({
+            "provider": expected_provider_binding("provider:fixture-legacy"),
+            "authenticator_kind": "mutual-tls",
+            "runtime_binding_digest": fixture_digest('8')
+        }))
+        .expect("legacy mechanism labels remain parser-visible for deterministic denial");
+        assert!(legacy.authenticator_kind.is_legacy_mechanism());
     }
 
     #[test]
