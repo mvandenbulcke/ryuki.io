@@ -537,54 +537,9 @@
         "type": "object"
       },
       "HealthResponse": {
-        "description": "Liveness probe result. `status` is `degraded` (still 200) when the database is disconnected or hard config validation fails.",
+        "additionalProperties": false,
+        "description": "Value-free liveness result. Internal dependency and configuration details are deliberately omitted.",
         "properties": {
-          "auth_mode": {
-            "type": "string"
-          },
-          "config": {
-            "properties": {
-              "errors": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              "valid": {
-                "type": "boolean"
-              },
-              "warnings": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              }
-            },
-            "required": [
-              "valid",
-              "errors",
-              "warnings"
-            ],
-            "type": "object"
-          },
-          "database": {
-            "properties": {
-              "connected": {
-                "type": "boolean"
-              },
-              "provider": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "connected",
-              "provider"
-            ],
-            "type": "object"
-          },
-          "rate_limit_enabled": {
-            "type": "boolean"
-          },
           "status": {
             "enum": [
               "healthy",
@@ -594,11 +549,7 @@
           }
         },
         "required": [
-          "status",
-          "database",
-          "config",
-          "auth_mode",
-          "rate_limit_enabled"
+          "status"
         ],
         "type": "object"
       },
@@ -990,7 +941,7 @@
         "type": "object"
       },
       "ProblemDetails": {
-        "description": "RFC 9457-shaped error body returned by the public infra probes (`/health`, `/ready`) on failure.",
+        "description": "RFC 9457-shaped error body returned by API operations that expose a typed failure contract.",
         "properties": {
           "detail": {
             "oneOf": [
@@ -1039,11 +990,14 @@
         "type": "object"
       },
       "ReadyResponse": {
-        "additionalProperties": true,
-        "description": "Readiness probe result. Returned only on success (200); failure returns a 503 ProblemDetails instead (DRAINING, READINESS_CHECK_FAILED, CONFIG_INVALID, DATABASE_UNAVAILABLE, and related database-unusable/migration codes).",
+        "additionalProperties": false,
+        "description": "Value-free readiness result. Every internal failure maps to the same 503 `not_ready` projection.",
         "properties": {
           "status": {
-            "example": "ready",
+            "enum": [
+              "ready",
+              "not_ready"
+            ],
             "type": "string"
           }
         },
@@ -2549,22 +2503,8 @@
     },
     "/health": {
       "get": {
-        "description": "Unauthenticated. Always 200 unless `?simulate=error` is passed, which forces a 503 ProblemDetails for testing the error contract. `status` is `degraded` (still 200) when the database is disconnected or hard config validation fails.",
+        "description": "Unauthenticated, value-free liveness signal. Always returns 200 with exactly one bounded `status` field; dependency identities, configuration diagnostics, and failure reasons are not exposed.",
         "operationId": "health",
-        "parameters": [
-          {
-            "description": "Set to `error` to force a 503 ProblemDetails response.",
-            "in": "query",
-            "name": "simulate",
-            "required": false,
-            "schema": {
-              "enum": [
-                "error"
-              ],
-              "type": "string"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -2575,16 +2515,6 @@
               }
             },
             "description": "Health check result (healthy or degraded)."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Simulated failure via `?simulate=error`."
           }
         },
         "security": [],
@@ -2596,22 +2526,8 @@
     },
     "/ready": {
       "get": {
-        "description": "Unauthenticated. Returns 200 only when the server is not draining, hard config validation passes, and the database is reachable with migrations applied. `?simulate=error` forces a 503 ProblemDetails for testing the error contract.",
+        "description": "Unauthenticated. Returns 200 only when the server is not draining, hard config validation passes, and the database is reachable with migrations applied. Every internal failure maps to the same value-free 503 `not_ready` response.",
         "operationId": "ready",
-        "parameters": [
-          {
-            "description": "Set to `error` to force a 503 ProblemDetails response.",
-            "in": "query",
-            "name": "simulate",
-            "required": false,
-            "schema": {
-              "enum": [
-                "error"
-              ],
-              "type": "string"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -2627,11 +2543,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ReadyResponse"
                 }
               }
             },
-            "description": "Not ready: draining, simulated failure, invalid config, or the database is unavailable/unusable/mid-migration."
+            "description": "Server is not ready; internal failure details are intentionally omitted."
           }
         },
         "security": [],

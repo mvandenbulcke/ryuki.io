@@ -252,6 +252,7 @@ RYUKI_ENTRA_REDIRECT_URI=https://<host>/api/auth/entra/callback
 RYUKI_AUTH_MODE=entra-id
 # Inject at runtime from a secret manager; never commit the value.
 RYUKI_SESSION__CREDENTIAL_HMAC_KEY=<at-least-32-random-bytes>
+RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY=<different-at-least-32-random-bytes>
 ```
 
 ## Important Security Notes

@@ -1433,17 +1433,13 @@
 <h3 class="ep-sub">Path parameters</h3>
 <p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>simulate</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Set to <code>error</code> to exercise the documented 503 probe response.</td></tr></tbody></table>
+<p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>serde_json::Value</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>serde_json::Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>status</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Current operation or resource status.</td></tr><tr><td><code>database</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>database</code> returned in the response body.</td></tr><tr><td><code>config</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>config</code> returned in the response body.</td></tr><tr><td><code>auth_mode</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>auth_mode</code> returned in the response body.</td></tr><tr><td><code>rate_limit_enabled</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>rate_limit_enabled</code> returned in the response body.</td></tr></tbody></table>
-<p>Error responses use the platform ApiError body (error, message, optional detail).</p>
+<p class="ep-note">No successful response schema was extracted for this operation.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -1451,16 +1447,6 @@
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-s">'https://&lt;your-host&gt;/health'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"status"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"database"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"config"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"auth_mode"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"rate_limit_enabled"</span>: <span class="hl-n">null</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-metrics"><span class="method-chip m-get">GET</span><code>/metrics</code></h2>
@@ -1501,15 +1487,13 @@
 <h3 class="ep-sub">Path parameters</h3>
 <p>This operation has no path parameters.</p>
 <h3 class="ep-sub">Query parameters</h3>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>simulate</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Set to <code>error</code> to exercise the documented 503 probe response.</td></tr></tbody></table>
+<p>This operation has no query parameters.</p>
 <h3 class="ep-sub">Request headers</h3>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>traceparent</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Optional correlation input. When the second dash-separated segment has 32 characters, Ryuki reuses it as the request correlation identifier; this is not full W3C validation.</td></tr></tbody></table>
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>serde_json::Value</code></td></tr></tbody></table>
-<p>For <code>200</code>, the known response body type is <code>serde_json::Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
-<p>Error responses use the platform ApiError body (error, message, optional detail).</p>
+<p class="ep-note">No successful response schema was extracted for this operation.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -1518,7 +1502,7 @@
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-s">'https://&lt;your-host&gt;/ready'</span></code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-patching.html">&larr; Patching</a><a href="/api-protect.html">Protect &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-19 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-patching.html">&larr; Patching</a><a href="/api-protect.html">Protect &rarr;</a></nav>
 </main>
   </div>
   <footer class="site-footer">

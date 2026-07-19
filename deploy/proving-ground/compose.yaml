@@ -112,6 +112,7 @@ services:
       RYUKI_LOCAL_AUTH__SITE_AUTHORITY: global
       RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY: global
       RYUKI_SESSION__CREDENTIAL_HMAC_KEY: ${PG_SESSION_CREDENTIAL_HMAC_KEY:?set in .env}
+      RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY: ${PG_CERTIFICATE_CURSOR_HMAC_KEY:?set in .env}
       # This stack is loopback-only plain HTTP; Secure cookies would not be
       # returned by browsers. Never use this setting on a non-loopback stack.
       RYUKI_SESSION__COOKIE_SECURE: "false"

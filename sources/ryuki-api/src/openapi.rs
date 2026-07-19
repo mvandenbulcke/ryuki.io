@@ -550,8 +550,8 @@ pub fn openapi_document() -> Value {
                 },
                 "ProblemDetails": {
                     "type": "object",
-                    "description": "RFC 9457-shaped error body returned by the public infra \
-                        probes (`/health`, `/ready`) on failure.",
+                    "description": "RFC 9457-shaped error body returned by API operations \
+                        that expose a typed failure contract.",
                     "required": ["error", "message"],
                     "properties": {
                         "error": { "type": "string", "example": "DATABASE_UNAVAILABLE" },
@@ -563,43 +563,23 @@ pub fn openapi_document() -> Value {
                 },
                 "HealthResponse": {
                     "type": "object",
-                    "description": "Liveness probe result. `status` is `degraded` (still 200) \
-                        when the database is disconnected or hard config validation fails.",
-                    "required": ["status", "database", "config", "auth_mode", "rate_limit_enabled"],
+                    "description": "Value-free liveness result. Internal dependency and \
+                        configuration details are deliberately omitted.",
+                    "required": ["status"],
                     "properties": {
-                        "status": { "type": "string", "enum": ["healthy", "degraded"] },
-                        "database": {
-                            "type": "object",
-                            "required": ["connected", "provider"],
-                            "properties": {
-                                "connected": { "type": "boolean" },
-                                "provider": { "type": "string" }
-                            }
-                        },
-                        "config": {
-                            "type": "object",
-                            "required": ["valid", "errors", "warnings"],
-                            "properties": {
-                                "valid": { "type": "boolean" },
-                                "errors": { "type": "array", "items": { "type": "string" } },
-                                "warnings": { "type": "array", "items": { "type": "string" } }
-                            }
-                        },
-                        "auth_mode": { "type": "string" },
-                        "rate_limit_enabled": { "type": "boolean" }
-                    }
+                        "status": { "type": "string", "enum": ["healthy", "degraded"] }
+                    },
+                    "additionalProperties": false
                 },
                 "ReadyResponse": {
                     "type": "object",
-                    "description": "Readiness probe result. Returned only on success (200); \
-                        failure returns a 503 ProblemDetails instead (DRAINING, \
-                        READINESS_CHECK_FAILED, CONFIG_INVALID, DATABASE_UNAVAILABLE, and \
-                        related database-unusable/migration codes).",
+                    "description": "Value-free readiness result. Every internal failure maps \
+                        to the same 503 `not_ready` projection.",
                     "required": ["status"],
                     "properties": {
-                        "status": { "type": "string", "example": "ready" }
+                        "status": { "type": "string", "enum": ["ready", "not_ready"] }
                     },
-                    "additionalProperties": true
+                    "additionalProperties": false
                 },
                 "AuthStatusResponse": {
                     "type": "object",
@@ -1122,30 +1102,16 @@ pub fn openapi_document() -> Value {
             "/health": {
                 "get": {
                     "summary": "Liveness probe",
-                    "description": "Unauthenticated. Always 200 unless `?simulate=error` is \
-                        passed, which forces a 503 ProblemDetails for testing the error \
-                        contract. `status` is `degraded` (still 200) when the database is \
-                        disconnected or hard config validation fails.",
+                    "description": "Unauthenticated, value-free liveness signal. Always returns \
+                        200 with exactly one bounded `status` field; dependency identities, \
+                        configuration diagnostics, and failure reasons are not exposed.",
                     "operationId": "health",
                     "tags": ["public"],
                     "security": [],
-                    "parameters": [
-                        {
-                            "name": "simulate",
-                            "in": "query",
-                            "required": false,
-                            "description": "Set to `error` to force a 503 ProblemDetails response.",
-                            "schema": { "type": "string", "enum": ["error"] }
-                        }
-                    ],
                     "responses": {
                         "200": {
                             "description": "Health check result (healthy or degraded).",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
-                        },
-                        "503": {
-                            "description": "Simulated failure via `?simulate=error`.",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProblemDetails" } } }
                         }
                     }
                 }
@@ -1155,29 +1121,20 @@ pub fn openapi_document() -> Value {
                     "summary": "Readiness probe",
                     "description": "Unauthenticated. Returns 200 only when the server is not \
                         draining, hard config validation passes, and the database is reachable \
-                        with migrations applied. `?simulate=error` forces a 503 ProblemDetails \
-                        for testing the error contract.",
+                        with migrations applied. Every internal failure maps to the same \
+                        value-free 503 `not_ready` response.",
                     "operationId": "ready",
                     "tags": ["public"],
                     "security": [],
-                    "parameters": [
-                        {
-                            "name": "simulate",
-                            "in": "query",
-                            "required": false,
-                            "description": "Set to `error` to force a 503 ProblemDetails response.",
-                            "schema": { "type": "string", "enum": ["error"] }
-                        }
-                    ],
                     "responses": {
                         "200": {
                             "description": "Server is ready to accept traffic.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReadyResponse" } } }
                         },
                         "503": {
-                            "description": "Not ready: draining, simulated failure, invalid \
-                                config, or the database is unavailable/unusable/mid-migration.",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProblemDetails" } } }
+                            "description": "Server is not ready; internal failure details are \
+                                intentionally omitted.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReadyResponse" } } }
                         }
                     }
                 }
@@ -1444,6 +1401,43 @@ mod tests {
         assert!(
             doc["components"]["securitySchemes"]["apiSessionHeader"].is_object(),
             "components.securitySchemes.apiSessionHeader must be present"
+        );
+    }
+
+    #[test]
+    fn public_probe_contracts_are_value_free() {
+        let doc = openapi_document();
+        let schemas = &doc["components"]["schemas"];
+
+        for (schema_name, statuses) in [
+            ("HealthResponse", serde_json::json!(["healthy", "degraded"])),
+            ("ReadyResponse", serde_json::json!(["ready", "not_ready"])),
+        ] {
+            let schema = &schemas[schema_name];
+            assert_eq!(schema["required"], serde_json::json!(["status"]));
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(schema["properties"]["status"]["enum"], statuses);
+            assert_eq!(
+                schema["properties"].as_object().map(serde_json::Map::len),
+                Some(1),
+                "{schema_name} must not expose dependency or configuration details"
+            );
+        }
+
+        for path in ["/health", "/ready"] {
+            let operation = &doc["paths"][path]["get"];
+            assert!(
+                operation.get("parameters").is_none(),
+                "public probes must not expose a simulation/debug input"
+            );
+        }
+        assert!(doc["paths"]["/health"]["get"]["responses"]
+            .get("503")
+            .is_none());
+        assert_eq!(
+            doc["paths"]["/ready"]["get"]["responses"]["503"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ReadyResponse"
         );
     }
 

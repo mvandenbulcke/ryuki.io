@@ -34465,26 +34465,28 @@ fn dry_run_certificate_cursor_key() -> &'static [u8; 32] {
     })
 }
 
-/// Select the configured key in every mode when valid. Credential-free,
-/// loopback-only dry-run modes receive one process-ephemeral CSPRNG key so a
+/// Select the purpose-specific configured key in every mode when valid.
+/// Credential-free, loopback-only dry-run modes receive one process-ephemeral CSPRNG key so a
 /// continuation remains usable for this process lifetime without introducing
-/// a checked-in/default secret. Persisted authentication modes still fail
-/// closed if startup/config validation did not provide the required key.
+/// a checked-in/default secret. Persisted authentication modes and generic
+/// OIDC still fail closed if startup/config validation did not provide the
+/// required key. The session verifier key is deliberately never a substitute.
 fn certificate_cursor_hmac_key_for_config(
     config: &ryuki_core::config::RyukiConfig,
 ) -> Result<&[u8], &'static str> {
-    let configured = &config.session.credential_hmac_key;
+    let configured = &config.security.certificate_cursor_hmac_key;
     let key = configured.as_bytes();
-    if key.len() >= 32
-        && !key.iter().any(u8::is_ascii_control)
-        && configured.trim() == configured.as_str()
-    {
-        return Ok(key);
+    if !configured.is_empty() {
+        if key.len() >= 32
+            && !key.iter().any(u8::is_ascii_control)
+            && configured.trim() == configured.as_str()
+            && key != config.session.credential_hmac_key.as_bytes()
+        {
+            return Ok(key);
+        }
+        return Err("certificate cursor signing key is unavailable");
     }
-    if matches!(
-        &config.auth_mode,
-        AuthMode::MockDryRun | AuthMode::StaticDryRun
-    ) {
+    if config.auth_mode.is_credential_free() && !config.oidc.enabled {
         return Ok(dry_run_certificate_cursor_key());
     }
     Err("certificate cursor signing key is unavailable")
@@ -56588,15 +56590,43 @@ mod db_lifecycle_tests {
             dry_run_key,
             "both credential-free dry-run modes share the process-ephemeral key"
         );
+        let malformed_dry_run = ryuki_core::config::RyukiConfig {
+            security: ryuki_core::config::SecurityConfig {
+                certificate_cursor_hmac_key: "short".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            certificate_cursor_hmac_key_for_config(&malformed_dry_run).is_err(),
+            "an explicit malformed key must not silently select the development fallback"
+        );
         let mut persisted = ryuki_core::config::RyukiConfig {
             auth_mode: AuthMode::Local,
             ..Default::default()
         };
         assert!(certificate_cursor_hmac_key_for_config(&persisted).is_err());
-        persisted.session.credential_hmac_key = "k".repeat(32);
+        persisted.session.credential_hmac_key = "s".repeat(32);
+        assert!(
+            certificate_cursor_hmac_key_for_config(&persisted).is_err(),
+            "the session credential key must never substitute for the cursor key"
+        );
+        persisted.security.certificate_cursor_hmac_key = "s".repeat(32);
+        assert!(
+            certificate_cursor_hmac_key_for_config(&persisted).is_err(),
+            "one key value must not be shared across purposes"
+        );
+        persisted.security.certificate_cursor_hmac_key = "c".repeat(32);
         assert_eq!(
             certificate_cursor_hmac_key_for_config(&persisted).unwrap(),
-            persisted.session.credential_hmac_key.as_bytes()
+            persisted.security.certificate_cursor_hmac_key.as_bytes()
+        );
+
+        let mut oidc_dry_run = ryuki_core::config::RyukiConfig::default();
+        oidc_dry_run.oidc.enabled = true;
+        assert!(
+            certificate_cursor_hmac_key_for_config(&oidc_dry_run).is_err(),
+            "enabled OIDC must not inherit the credential-free dry-run key"
         );
 
         let legacy_offset = certificates_expiring(

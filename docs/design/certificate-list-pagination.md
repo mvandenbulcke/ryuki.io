@@ -22,11 +22,14 @@ The inventory cursor is an HMAC-SHA256-authenticated envelope containing its
 version, a digest of the normalized authorized site set, and the last
 `(created_at,id)` tuple. It is rejected if malformed, oversized, modified, or
 replayed under a different scope. The production signing key is the validated
-session credential HMAC key. Credential-free, loopback-only mock/static dry-run
-modes use one CSPRNG-generated process-ephemeral key, so their continuations
-remain valid until restart without relying on a default secret; persisted auth
-modes fail closed when the configured key is unavailable. Tests use a fixed
-non-production key and separately exercise the production key selector.
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY`, which must not equal the
+persisted-session verifier key. Credential-free, loopback-only mock/static
+dry-run modes use one CSPRNG-generated process-ephemeral key, so their
+continuations remain valid until restart without relying on a default secret;
+persisted auth modes and enabled generic OIDC fail closed when the configured
+key is unavailable or malformed. Rotating the dedicated key invalidates
+outstanding continuations. Tests use a fixed non-production key and separately
+exercise the production key selector.
 
 `GET /api/maintain/certificates/expiring` likewise accepts `limit` and an
 authenticated opaque cursor. It defaults to 100 rows, caps at 200, and orders

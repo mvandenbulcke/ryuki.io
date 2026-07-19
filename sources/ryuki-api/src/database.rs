@@ -1,17 +1,20 @@
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool, Row};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(not(test))]
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[cfg(not(test))]
-static POOL: OnceLock<Option<PgPool>> = OnceLock::new();
+static POOL: OnceLock<Option<Arc<PgPool>>> = OnceLock::new();
 static MIGRATION_STATUS: AtomicU8 = AtomicU8::new(MigrationStatus::NotApplied as u8);
+static PRODUCTION_DATABASE_CONSTRUCTION_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+const REQUIRED_PRODUCTION_POSTGRESQL_MAJOR_VERSION: u16 = 18;
 
 /// Compile-time migration inventory used by every startup mode. The macro
 /// embeds every migration present at build time; there is deliberately no
@@ -265,6 +268,106 @@ impl MigrationRoleContract {
     }
 }
 
+/// Receipt-derived stable roles required by the production PostgreSQL
+/// boundary. The constructor accepts already authenticated, typed expectation
+/// fields; production observation never discovers role authority from ambient
+/// environment variables.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProductionDatabaseRoles {
+    application_role: String,
+    migration_role: String,
+}
+
+impl fmt::Debug for ProductionDatabaseRoles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionDatabaseRoles")
+            .field("application_role_present", &true)
+            .field("migration_role_present", &true)
+            .finish()
+    }
+}
+
+impl ProductionDatabaseRoles {
+    pub fn new(application_role: String, migration_role: String) -> Result<Self, String> {
+        let application_role = canonical_database_role_name("application_role", application_role)?;
+        let migration_role = canonical_database_role_name("migration_role", migration_role)?;
+        if application_role == "postgres" || migration_role == "postgres" {
+            return Err("production database roles must not select the postgres superuser".into());
+        }
+        if application_role == migration_role {
+            return Err("production application_role and migration_role must differ".into());
+        }
+        Ok(Self {
+            application_role,
+            migration_role,
+        })
+    }
+
+    pub fn application_role(&self) -> &str {
+        &self.application_role
+    }
+
+    pub fn migration_role(&self) -> &str {
+        &self.migration_role
+    }
+
+    fn application_contract(&self) -> ApplicationRoleContract {
+        ApplicationRoleContract {
+            expected: self.application_role.clone(),
+            forbidden: self.migration_role.clone(),
+        }
+    }
+}
+
+/// Bounded application-pool construction values retained by the unpublished
+/// production database seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationPoolSettings {
+    max_connections: u32,
+    min_connections: u32,
+    idle_timeout_secs: u64,
+    acquire_timeout_secs: u64,
+    max_lifetime_secs: u64,
+}
+
+impl ApplicationPoolSettings {
+    pub fn new(
+        max_connections: u32,
+        min_connections: u32,
+        idle_timeout_secs: u64,
+        acquire_timeout_secs: u64,
+        max_lifetime_secs: u64,
+    ) -> Result<Self, String> {
+        if max_connections == 0 {
+            return Err("production database max_connections must be greater than zero".into());
+        }
+        if min_connections > max_connections {
+            return Err(
+                "production database min_connections must not exceed max_connections".into(),
+            );
+        }
+        for (label, value) in [
+            ("idle_timeout_secs", idle_timeout_secs),
+            ("acquire_timeout_secs", acquire_timeout_secs),
+            ("max_lifetime_secs", max_lifetime_secs),
+        ] {
+            if value == 0 {
+                return Err(format!(
+                    "production database {label} must be greater than zero"
+                ));
+            }
+        }
+        Ok(Self {
+            max_connections,
+            min_connections,
+            idle_timeout_secs,
+            acquire_timeout_secs,
+            max_lifetime_secs,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TablePolicy {
     name: &'static str,
@@ -346,6 +449,13 @@ const APPLICATION_TABLE_POLICIES: &[TablePolicy] = &[
     TablePolicy::new("firmware_exceptions", true, true, false),
     TablePolicy::new("firmware_history", true, true, true),
     TablePolicy::new("firmware_records", true, true, false),
+    TablePolicy::new("first_owner_closure_records", false, false, false),
+    TablePolicy::new(
+        "first_owner_privileged_domain_assignments",
+        false,
+        false,
+        false,
+    ),
     TablePolicy::new("gmsa_accounts", true, true, false),
     TablePolicy::new("gmsa_host_assignments", true, true, true),
     TablePolicy::new("golden_image_scheduler_population", true, true, true),
@@ -459,12 +569,379 @@ pub struct MigrationInventory {
     pub latest_version: Option<i64>,
 }
 
+/// Exact successful row retained from `public._sqlx_migrations`. Installation
+/// timestamps and execution duration are operational metadata; the normative
+/// inventory is the strictly ordered version/checksum set embedded in the
+/// running image.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PostgresqlMigrationLedgerRow {
+    version: i64,
+    checksum: Box<[u8]>,
+}
+
+impl PostgresqlMigrationLedgerRow {
+    pub fn version(&self) -> i64 {
+        self.version
+    }
+
+    pub fn checksum(&self) -> &[u8] {
+        &self.checksum
+    }
+}
+
+/// Negotiated TLS facts for the exact PostgreSQL backend session used to
+/// measure the runtime. Certificate-chain authority is deployment evidence and
+/// is intentionally not inferred from these local SQL-visible facts.
+#[derive(PartialEq, Eq)]
+pub struct PostgresqlTlsObservation {
+    protocol: String,
+    cipher: String,
+    bits: u16,
+    client_distinguished_name: Option<String>,
+    issuer_distinguished_name: Option<String>,
+}
+
+impl fmt::Debug for PostgresqlTlsObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostgresqlTlsObservation")
+            .field("tls_enabled", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresqlTlsObservation {
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    pub fn cipher(&self) -> &str {
+        &self.cipher
+    }
+
+    pub fn bits(&self) -> u16 {
+        self.bits
+    }
+
+    pub fn client_distinguished_name(&self) -> Option<&str> {
+        self.client_distinguished_name.as_deref()
+    }
+
+    pub fn issuer_distinguished_name(&self) -> Option<&str> {
+        self.issuer_distinguished_name.as_deref()
+    }
+}
+
+/// Independently measured, non-secret PostgreSQL facts retained by the local
+/// half of the DurablePostgresql witness. This deliberately omits the external
+/// durable-storage/provider attestation required to complete that guard. The
+/// cluster system identifier belongs to that signed infrastructure evidence:
+/// the least-privilege application role must not receive `pg_monitor` or
+/// `pg_control_system()` execution authority merely to inspect it locally.
+#[derive(PartialEq, Eq)]
+pub struct PostgresqlRuntimeObservation {
+    server_version_num: u32,
+    server_version: String,
+    server_major_version: u16,
+    database_name: String,
+    database_oid: u32,
+    server_address: IpAddr,
+    server_port: u16,
+    primary: bool,
+    transaction_writable: bool,
+    default_transaction_writable: bool,
+    application_role: String,
+    migration_role: String,
+    session_login_role: String,
+    tls: PostgresqlTlsObservation,
+    migration_ledger: Box<[PostgresqlMigrationLedgerRow]>,
+}
+
+impl fmt::Debug for PostgresqlRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostgresqlRuntimeObservation")
+            .field("contract", &"local-postgresql-runtime-observation-v1")
+            .field("server_major_version", &self.server_major_version)
+            .field("primary", &self.primary)
+            .field("transaction_writable", &self.transaction_writable)
+            .field(
+                "default_transaction_writable",
+                &self.default_transaction_writable,
+            )
+            .field("tls_enabled", &true)
+            .field("migration_count", &self.migration_ledger.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresqlRuntimeObservation {
+    pub fn server_version_num(&self) -> u32 {
+        self.server_version_num
+    }
+
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+
+    pub fn server_major_version(&self) -> u16 {
+        self.server_major_version
+    }
+
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    pub fn database_oid(&self) -> u32 {
+        self.database_oid
+    }
+
+    pub fn server_address(&self) -> IpAddr {
+        self.server_address
+    }
+
+    pub fn server_port(&self) -> u16 {
+        self.server_port
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.primary
+    }
+
+    pub fn is_transaction_writable(&self) -> bool {
+        self.transaction_writable
+    }
+
+    pub fn is_default_transaction_writable(&self) -> bool {
+        self.default_transaction_writable
+    }
+
+    pub fn application_role(&self) -> &str {
+        &self.application_role
+    }
+
+    pub fn migration_role(&self) -> &str {
+        &self.migration_role
+    }
+
+    pub fn session_login_role(&self) -> &str {
+        &self.session_login_role
+    }
+
+    pub fn tls(&self) -> &PostgresqlTlsObservation {
+        &self.tls
+    }
+
+    pub fn migration_ledger(&self) -> &[PostgresqlMigrationLedgerRow] {
+        &self.migration_ledger
+    }
+}
+
+struct ProductionDatabaseConnectionBinding {
+    roles: Arc<ProductionDatabaseRoles>,
+    baseline: OnceLock<PostgresqlRuntimeObservation>,
+}
+
+impl ProductionDatabaseConnectionBinding {
+    fn new(roles: Arc<ProductionDatabaseRoles>) -> Self {
+        Self {
+            roles,
+            baseline: OnceLock::new(),
+        }
+    }
+
+    fn bind_or_compare(
+        &self,
+        observation: PostgresqlRuntimeObservation,
+    ) -> Result<(), sqlx::Error> {
+        if let Some(baseline) = self.baseline.get() {
+            return if baseline == &observation {
+                Ok(())
+            } else {
+                Err(role_protocol_error(
+                    "pooled PostgreSQL connection differs from the sealed production identity",
+                ))
+            };
+        }
+        match self.baseline.set(observation) {
+            Ok(()) => Ok(()),
+            Err(observation) => {
+                if self
+                    .baseline
+                    .get()
+                    .is_some_and(|baseline| baseline == &observation)
+                {
+                    Ok(())
+                } else {
+                    Err(role_protocol_error(
+                        "concurrent PostgreSQL connections resolved to different production identities",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn require_match(
+        &self,
+        observation: &PostgresqlRuntimeObservation,
+    ) -> Result<(), PostgresqlRuntimeObservationError> {
+        if self
+            .baseline
+            .get()
+            .is_some_and(|baseline| baseline == observation)
+        {
+            Ok(())
+        } else {
+            Err(observation_contract_error(
+                "measured PostgreSQL observation does not match every pooled connection binding",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresqlRuntimeObservationError {
+    #[error("PostgreSQL runtime observation failed: {0}")]
+    Database(#[source] sqlx::Error),
+    #[error(transparent)]
+    Migration(#[from] MigrationVerificationError),
+    #[error("PostgreSQL runtime contract was not proven: {0}")]
+    Contract(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresqlRuntimePublicationError {
+    #[error("a database publication decision was already made for this process")]
+    AlreadyPublished,
+    #[error("database publication did not receive the exact admission-retained runtime handle")]
+    AdmissionHandleMismatch,
+    #[error("the globally published database is not the measured retained pool")]
+    PublishedPoolMismatch,
+}
+
+/// Cloneable only through its retained `Arc` allocations; guard authority is
+/// supplied by the separate non-cloneable nominal runtime witness.
+#[derive(Clone)]
+pub struct RetainedPostgresqlRuntime {
+    pool: Arc<PgPool>,
+    observation: Arc<PostgresqlRuntimeObservation>,
+    roles: Arc<ProductionDatabaseRoles>,
+    connection_binding: Arc<ProductionDatabaseConnectionBinding>,
+}
+
+impl fmt::Debug for RetainedPostgresqlRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedPostgresqlRuntime")
+            .field("contract", &"retained-postgresql-runtime-v1")
+            .field(
+                "server_major_version",
+                &self.observation.server_major_version,
+            )
+            .field("primary", &self.observation.primary)
+            .field(
+                "transaction_writable",
+                &self.observation.transaction_writable,
+            )
+            .field("tls_enabled", &true)
+            .field("migration_count", &self.observation.migration_ledger.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedPostgresqlRuntime {
+    pub fn pool(&self) -> &Arc<PgPool> {
+        &self.pool
+    }
+
+    pub fn observation(&self) -> &Arc<PostgresqlRuntimeObservation> {
+        &self.observation
+    }
+
+    pub fn pool_ptr_eq(&self, candidate: &Arc<PgPool>) -> bool {
+        Arc::ptr_eq(&self.pool, candidate)
+    }
+
+    pub fn observation_ptr_eq(&self, candidate: &Arc<PostgresqlRuntimeObservation>) -> bool {
+        Arc::ptr_eq(&self.observation, candidate)
+    }
+
+    pub fn same_runtime(&self, candidate: &Self) -> bool {
+        Arc::ptr_eq(&self.pool, &candidate.pool)
+            && Arc::ptr_eq(&self.observation, &candidate.observation)
+            && Arc::ptr_eq(&self.roles, &candidate.roles)
+            && Arc::ptr_eq(&self.connection_binding, &candidate.connection_binding)
+    }
+
+    pub fn is_exact_published_pool(&self) -> bool {
+        published_pool_ptr_eq(&self.pool)
+    }
+
+    /// Repeat every local SQL observation through the exact retained pool and
+    /// require value equality with the initially sealed observation.
+    pub async fn remeasure_exact(&self) -> Result<(), PostgresqlRuntimeObservationError> {
+        let current = observe_postgresql_runtime(&self.pool, &self.roles).await?;
+        self.connection_binding.require_match(&current)?;
+        if current != *self.observation {
+            return Err(PostgresqlRuntimeObservationError::Contract(
+                "live PostgreSQL facts changed after the retained observation was sealed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Owns a connected and measured pool that is not yet reachable through
+/// `get_db()`. Production startup may clone only the retained handle for guard
+/// construction; publication consumes this wrapper after all admission gates
+/// have sealed.
+pub struct UnpublishedPostgresqlRuntime {
+    retained: RetainedPostgresqlRuntime,
+}
+
+impl fmt::Debug for UnpublishedPostgresqlRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("UnpublishedPostgresqlRuntime")
+            .field(&self.retained)
+            .finish()
+    }
+}
+
+impl UnpublishedPostgresqlRuntime {
+    pub fn retained_handle(&self) -> RetainedPostgresqlRuntime {
+        self.retained.clone()
+    }
+
+    pub fn is_unpublished(&self) -> bool {
+        !database_publication_decided()
+    }
+
+    pub fn publish_after_admission(
+        self,
+        admitted_runtime: &RetainedPostgresqlRuntime,
+    ) -> Result<RetainedPostgresqlRuntime, PostgresqlRuntimePublicationError> {
+        if !self.retained.same_runtime(admitted_runtime) {
+            return Err(PostgresqlRuntimePublicationError::AdmissionHandleMismatch);
+        }
+        publish_production_pool(self.retained.pool.clone())?;
+        if !self.retained.is_exact_published_pool() {
+            return Err(PostgresqlRuntimePublicationError::PublishedPoolMismatch);
+        }
+        Ok(self.retained)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationVerificationError {
     #[error("migration metadata could not be read: {0}")]
     Metadata(#[source] sqlx::Error),
     #[error("migration {0} is partially applied")]
     Dirty(i64),
+    #[error("applied migration {0} is duplicated")]
+    DuplicateApplied(i64),
+    #[error("applied migration versions are not strictly ordered ({previous} before {current})")]
+    NotStrictlyOrdered { previous: i64, current: i64 },
     #[error("applied migration {0} is not embedded in this image")]
     UnexpectedApplied(i64),
     #[error("applied migration {0} checksum differs from this image")]
@@ -492,7 +969,7 @@ thread_local! {
     // pool permits after a few tests. A thread-local owned pool gives every
     // handler-style test a pool registered to its own runtime and drops it with
     // that test thread. Production remains process-global below.
-    static TEST_POOL: std::cell::RefCell<Option<Box<PgPool>>> = const {
+    static TEST_POOL: std::cell::RefCell<Option<Arc<PgPool>>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -517,20 +994,64 @@ impl MigrationStatus {
 
 #[cfg(not(test))]
 pub fn get_db() -> Option<&'static PgPool> {
-    POOL.get().and_then(|o| o.as_ref())
+    POOL.get().and_then(|pool| pool.as_deref())
 }
 
 #[cfg(test)]
 pub fn get_db() -> Option<&'static PgPool> {
     TEST_POOL.with(|slot| {
         let borrowed = slot.borrow();
-        let pointer = borrowed.as_deref()? as *const PgPool;
+        let pointer = Arc::as_ptr(borrowed.as_ref()?);
         drop(borrowed);
-        // SAFETY: TEST_POOL owns the Box at a stable address until the current
-        // Rust test thread exits. API tests use current-thread Tokio runtimes;
-        // references are consumed within that test. Detached work clones PgPool
-        // before spawning, so it does not retain this borrowed handle.
+        // SAFETY: TEST_POOL owns an Arc to this stable allocation until the
+        // current Rust test thread exits. API tests use current-thread Tokio
+        // runtimes; references are consumed within that test. Detached work
+        // clones PgPool before spawning, so it does not retain this borrow.
         Some(unsafe { &*pointer })
+    })
+}
+
+#[cfg(not(test))]
+fn published_pool_ptr_eq(candidate: &Arc<PgPool>) -> bool {
+    POOL.get()
+        .and_then(Option::as_ref)
+        .is_some_and(|published| Arc::ptr_eq(published, candidate))
+}
+
+#[cfg(not(test))]
+fn database_publication_decided() -> bool {
+    POOL.get().is_some()
+}
+
+#[cfg(test)]
+fn published_pool_ptr_eq(candidate: &Arc<PgPool>) -> bool {
+    TEST_POOL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, candidate))
+    })
+}
+
+#[cfg(test)]
+fn database_publication_decided() -> bool {
+    TEST_POOL.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(not(test))]
+fn publish_production_pool(pool: Arc<PgPool>) -> Result<(), PostgresqlRuntimePublicationError> {
+    POOL.set(Some(pool))
+        .map_err(|_| PostgresqlRuntimePublicationError::AlreadyPublished)
+}
+
+#[cfg(test)]
+fn publish_production_pool(pool: Arc<PgPool>) -> Result<(), PostgresqlRuntimePublicationError> {
+    TEST_POOL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return Err(PostgresqlRuntimePublicationError::AlreadyPublished);
+        }
+        *slot = Some(pool);
+        Ok(())
     })
 }
 
@@ -626,14 +1147,29 @@ fn verify_migration_inventory(
 
     let expected = expected_embedded_migrations();
     let mut seen = BTreeSet::new();
+    let mut previous = None;
     for (version, checksum) in applied {
+        if let Some(previous) = previous {
+            if *version < previous {
+                return Err(MigrationVerificationError::NotStrictlyOrdered {
+                    previous,
+                    current: *version,
+                });
+            }
+            if *version == previous {
+                return Err(MigrationVerificationError::DuplicateApplied(*version));
+            }
+        }
         let Some(expected_checksum) = expected.get(version) else {
             return Err(MigrationVerificationError::UnexpectedApplied(*version));
         };
         if checksum.as_slice() != *expected_checksum {
             return Err(MigrationVerificationError::ChecksumMismatch(*version));
         }
-        seen.insert(*version);
+        if !seen.insert(*version) {
+            return Err(MigrationVerificationError::DuplicateApplied(*version));
+        }
+        previous = Some(*version);
     }
 
     let missing: Vec<i64> = expected
@@ -688,6 +1224,307 @@ pub async fn verify_embedded_migrations(
         MigrationStatus::Failed
     });
     result
+}
+
+struct RawPostgresqlRuntimeFacts {
+    server_version_num: i32,
+    server_version: String,
+    database_name: String,
+    database_oid: i64,
+    server_address: Option<String>,
+    server_port: Option<i32>,
+    primary: bool,
+    transaction_writable: bool,
+    default_transaction_writable: bool,
+    current_role: String,
+    session_login_role: String,
+    selected_role: String,
+    tls_enabled: Option<bool>,
+    tls_protocol: Option<String>,
+    tls_cipher: Option<String>,
+    tls_bits: Option<i32>,
+    client_distinguished_name: Option<String>,
+    issuer_distinguished_name: Option<String>,
+}
+
+fn observation_contract_error(message: impl Into<String>) -> PostgresqlRuntimeObservationError {
+    PostgresqlRuntimeObservationError::Contract(message.into())
+}
+
+fn validate_optional_distinguished_name(
+    label: &str,
+    value: Option<String>,
+) -> Result<Option<String>, PostgresqlRuntimeObservationError> {
+    match value {
+        Some(value)
+            if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) =>
+        {
+            Err(observation_contract_error(format!(
+                "TLS {label} is empty, oversized, or contains control characters"
+            )))
+        }
+        value => Ok(value),
+    }
+}
+
+fn validate_postgresql_runtime_facts(
+    raw: RawPostgresqlRuntimeFacts,
+    roles: &ProductionDatabaseRoles,
+    migration_ledger: Box<[PostgresqlMigrationLedgerRow]>,
+) -> Result<PostgresqlRuntimeObservation, PostgresqlRuntimeObservationError> {
+    let server_version_num = u32::try_from(raw.server_version_num)
+        .map_err(|_| observation_contract_error("server_version_num is not positive"))?;
+    let server_major_version = u16::try_from(server_version_num / 10_000)
+        .map_err(|_| observation_contract_error("server major version is out of range"))?;
+    if server_major_version != REQUIRED_PRODUCTION_POSTGRESQL_MAJOR_VERSION {
+        return Err(observation_contract_error(format!(
+            "PostgreSQL major version must equal {REQUIRED_PRODUCTION_POSTGRESQL_MAJOR_VERSION}, observed {server_major_version}"
+        )));
+    }
+    if raw.server_version.is_empty()
+        || raw.server_version.len() > 256
+        || raw.server_version.chars().any(char::is_control)
+    {
+        return Err(observation_contract_error(
+            "server_version is empty, oversized, or contains control characters",
+        ));
+    }
+    if raw.database_name.is_empty()
+        || raw.database_name.len() > 63
+        || raw.database_name.chars().any(char::is_control)
+    {
+        return Err(observation_contract_error(
+            "current database name is empty, oversized, or contains control characters",
+        ));
+    }
+    let database_oid = u32::try_from(raw.database_oid)
+        .ok()
+        .filter(|oid| *oid != 0)
+        .ok_or_else(|| observation_contract_error("current database OID is invalid"))?;
+    let server_address = raw
+        .server_address
+        .as_deref()
+        .ok_or_else(|| observation_contract_error("TLS database session has no server address"))?
+        .parse::<IpAddr>()
+        .map_err(|_| observation_contract_error("database server address is not a canonical IP"))?;
+    let server_port = raw
+        .server_port
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| observation_contract_error("database server port is invalid"))?;
+    if !raw.primary || !raw.transaction_writable || !raw.default_transaction_writable {
+        return Err(observation_contract_error(
+            "database must be a primary with current and default transactions writable",
+        ));
+    }
+    if raw.current_role != roles.application_role
+        || raw.selected_role != roles.application_role
+        || raw.session_login_role == roles.application_role
+        || raw.session_login_role == roles.migration_role
+        || raw.session_login_role == "postgres"
+    {
+        return Err(observation_contract_error(
+            "live current/session/selected roles do not match the SET-only application role contract",
+        ));
+    }
+    canonical_database_role_name("session_login_role", raw.session_login_role.clone())
+        .map_err(observation_contract_error)?;
+    if raw.tls_enabled != Some(true) {
+        return Err(observation_contract_error(
+            "database transport is not an observed PostgreSQL TLS session",
+        ));
+    }
+    let protocol = raw
+        .tls_protocol
+        .filter(|protocol| matches!(protocol.as_str(), "TLSv1.2" | "TLSv1.3"))
+        .ok_or_else(|| observation_contract_error("database TLS protocol must be 1.2 or 1.3"))?;
+    let cipher = raw
+        .tls_cipher
+        .filter(|cipher| {
+            !cipher.is_empty() && cipher.len() <= 256 && !cipher.chars().any(char::is_control)
+        })
+        .ok_or_else(|| observation_contract_error("database TLS cipher is missing or invalid"))?;
+    let bits = raw
+        .tls_bits
+        .and_then(|bits| u16::try_from(bits).ok())
+        .filter(|bits| *bits >= 128)
+        .ok_or_else(|| {
+            observation_contract_error("database TLS cipher strength is below 128 bits")
+        })?;
+    let tls = PostgresqlTlsObservation {
+        protocol,
+        cipher,
+        bits,
+        client_distinguished_name: validate_optional_distinguished_name(
+            "client distinguished name",
+            raw.client_distinguished_name,
+        )?,
+        issuer_distinguished_name: validate_optional_distinguished_name(
+            "issuer distinguished name",
+            raw.issuer_distinguished_name,
+        )?,
+    };
+
+    Ok(PostgresqlRuntimeObservation {
+        server_version_num,
+        server_version: raw.server_version,
+        server_major_version,
+        database_name: raw.database_name,
+        database_oid,
+        server_address,
+        server_port,
+        primary: raw.primary,
+        transaction_writable: raw.transaction_writable,
+        default_transaction_writable: raw.default_transaction_writable,
+        application_role: roles.application_role.clone(),
+        migration_role: roles.migration_role.clone(),
+        session_login_role: raw.session_login_role,
+        tls,
+        migration_ledger,
+    })
+}
+
+fn validate_observed_migration_ledger(
+    rows: Vec<(i64, Vec<u8>, bool)>,
+) -> Result<Box<[PostgresqlMigrationLedgerRow]>, MigrationVerificationError> {
+    let dirty_version = rows
+        .iter()
+        .find_map(|(version, _, success)| (!success).then_some(*version));
+    let applied = rows
+        .iter()
+        .filter(|(_, _, success)| *success)
+        .map(|(version, checksum, _)| (*version, checksum.clone()))
+        .collect::<Vec<_>>();
+    verify_migration_inventory(&applied, dirty_version)?;
+    Ok(applied
+        .into_iter()
+        .map(|(version, checksum)| PostgresqlMigrationLedgerRow {
+            version,
+            checksum: checksum.into_boxed_slice(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice())
+}
+
+async fn read_postgresql_runtime_facts(
+    connection: &mut PgConnection,
+) -> Result<RawPostgresqlRuntimeFacts, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+            SELECT
+                pg_catalog.current_setting('server_version_num')::integer
+                    AS server_version_num,
+                pg_catalog.current_setting('server_version') AS server_version,
+                pg_catalog.current_database()::text AS database_name,
+                database.oid::bigint AS database_oid,
+                pg_catalog.inet_server_addr()::text AS server_address,
+                pg_catalog.inet_server_port() AS server_port,
+                NOT pg_catalog.pg_is_in_recovery() AS is_primary,
+                NOT pg_catalog.current_setting('transaction_read_only')::boolean
+                    AS transaction_writable,
+                NOT pg_catalog.current_setting('default_transaction_read_only')::boolean
+                    AS default_transaction_writable,
+                current_user::text AS current_role,
+                session_user::text AS session_login_role,
+                pg_catalog.current_setting('role') AS selected_role,
+                tls.ssl AS tls_enabled,
+                tls.version AS tls_protocol,
+                tls.cipher AS tls_cipher,
+                tls.bits AS tls_bits,
+                tls.client_dn AS client_distinguished_name,
+                tls.issuer_dn AS issuer_distinguished_name
+            FROM pg_catalog.pg_database AS database
+            LEFT JOIN pg_catalog.pg_stat_ssl AS tls
+              ON tls.pid = pg_catalog.pg_backend_pid()
+            WHERE database.datname = pg_catalog.current_database()
+            "#,
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(RawPostgresqlRuntimeFacts {
+        server_version_num: row.try_get("server_version_num")?,
+        server_version: row.try_get("server_version")?,
+        database_name: row.try_get("database_name")?,
+        database_oid: row.try_get("database_oid")?,
+        server_address: row.try_get("server_address")?,
+        server_port: row.try_get("server_port")?,
+        primary: row.try_get("is_primary")?,
+        transaction_writable: row.try_get("transaction_writable")?,
+        default_transaction_writable: row.try_get("default_transaction_writable")?,
+        current_role: row.try_get("current_role")?,
+        session_login_role: row.try_get("session_login_role")?,
+        selected_role: row.try_get("selected_role")?,
+        tls_enabled: row.try_get("tls_enabled")?,
+        tls_protocol: row.try_get("tls_protocol")?,
+        tls_cipher: row.try_get("tls_cipher")?,
+        tls_bits: row.try_get("tls_bits")?,
+        client_distinguished_name: row.try_get("client_distinguished_name")?,
+        issuer_distinguished_name: row.try_get("issuer_distinguished_name")?,
+    })
+}
+
+async fn observe_postgresql_runtime(
+    pool: &PgPool,
+    roles: &ProductionDatabaseRoles,
+) -> Result<PostgresqlRuntimeObservation, PostgresqlRuntimeObservationError> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(PostgresqlRuntimeObservationError::Database)?;
+    let mut transaction = connection
+        .begin()
+        .await
+        .map_err(PostgresqlRuntimeObservationError::Database)?;
+
+    let result = async {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(PostgresqlRuntimeObservationError::Database)?;
+        // RESET ROLE is deliberately inside the transaction. Any failure or
+        // cancellation rolls the pooled session back to its already-attested
+        // application role instead of returning a login-role session.
+        sqlx::query("RESET ROLE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(PostgresqlRuntimeObservationError::Database)?;
+        // Run the complete role/ACL proof and decisive identity/ledger reads in
+        // one repeatable-read transaction so catalog changes cannot splice a
+        // passing observation from different authority states.
+        attest_application_connection(&mut transaction, &roles.application_contract())
+            .await
+            .map_err(PostgresqlRuntimeObservationError::Database)?;
+        let raw = read_postgresql_runtime_facts(&mut transaction)
+            .await
+            .map_err(PostgresqlRuntimeObservationError::Database)?;
+        let ledger_rows: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| {
+            PostgresqlRuntimeObservationError::Migration(MigrationVerificationError::Metadata(
+                error,
+            ))
+        })?;
+        let migration_ledger = validate_observed_migration_ledger(ledger_rows)?;
+        validate_postgresql_runtime_facts(raw, roles, migration_ledger)
+    }
+    .await;
+
+    match result {
+        Ok(observation) => {
+            transaction
+                .commit()
+                .await
+                .map_err(PostgresqlRuntimeObservationError::Database)?;
+            Ok(observation)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 fn role_protocol_error(message: impl Into<String>) -> sqlx::Error {
@@ -1633,30 +2470,71 @@ async fn attest_migration_connection(
     Ok(())
 }
 
+async fn attest_and_bind_production_connection(
+    connection: &mut PgConnection,
+    binding: &ProductionDatabaseConnectionBinding,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")
+        .execute(&mut *connection)
+        .await?;
+    let result = async {
+        attest_application_connection(connection, &binding.roles.application_contract()).await?;
+        let raw = read_postgresql_runtime_facts(connection).await?;
+        let ledger_rows: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT version, checksum, success FROM public._sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+        let migration_ledger = validate_observed_migration_ledger(ledger_rows).map_err(|_| {
+            role_protocol_error(
+                "pooled connection migration ledger differs from the embedded inventory",
+            )
+        })?;
+        let observation = validate_postgresql_runtime_facts(raw, &binding.roles, migration_ledger)
+            .map_err(|_| {
+                role_protocol_error(
+                    "pooled connection failed the production PostgreSQL fact contract",
+                )
+            })?;
+        binding.bind_or_compare(observation)
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
+    }
+}
+
 async fn build_application_pool_inner(
     url: &str,
-    max_connections: u32,
-    min_connections: u32,
-    idle_timeout_secs: u64,
-    acquire_timeout_secs: u64,
-    max_lifetime_secs: u64,
+    settings: ApplicationPoolSettings,
     role_contract: Option<ApplicationRoleContract>,
+    production_connection_binding: Option<Arc<ProductionDatabaseConnectionBinding>>,
 ) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(max_connections)
-        .min_connections(min_connections)
-        .idle_timeout(Duration::from_secs(idle_timeout_secs))
-        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-        .max_lifetime(Duration::from_secs(max_lifetime_secs))
+        .max_connections(settings.max_connections)
+        .min_connections(settings.min_connections)
+        .idle_timeout(Duration::from_secs(settings.idle_timeout_secs))
+        .acquire_timeout(Duration::from_secs(settings.acquire_timeout_secs))
+        .max_lifetime(Duration::from_secs(settings.max_lifetime_secs))
         // Bound application OLTP independently from offline DDL. Migration
         // processes never use this pool.
         .after_connect(move |conn, _meta| {
             let role_contract = role_contract.clone();
+            let production_connection_binding = production_connection_binding.clone();
             Box::pin(async move {
                 use sqlx::Executor;
                 conn.execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'")
                     .await?;
-                if let Some(contract) = role_contract.as_ref() {
+                if let Some(binding) = production_connection_binding.as_ref() {
+                    attest_and_bind_production_connection(conn, binding).await?;
+                } else if let Some(contract) = role_contract.as_ref() {
                     attest_application_connection(conn, contract).await?;
                 }
                 Ok(())
@@ -1664,6 +2542,65 @@ async fn build_application_pool_inner(
         })
         .connect(url)
         .await
+}
+
+/// Connect, attest, and measure a production PostgreSQL pool without making it
+/// visible to request handlers, repositories, workers, or `get_db()`. The
+/// returned wrapper must remain unpublished until the complete production
+/// runtime admission has consumed a retained handle for this exact allocation.
+pub async fn construct_unpublished_production_database(
+    url: &str,
+    settings: ApplicationPoolSettings,
+    roles: ProductionDatabaseRoles,
+) -> Result<UnpublishedPostgresqlRuntime, PostgresqlRuntimeObservationError> {
+    if database_publication_decided() {
+        return Err(observation_contract_error(
+            "a database publication decision already exists before production observation",
+        ));
+    }
+    if PRODUCTION_DATABASE_CONSTRUCTION_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(observation_contract_error(
+            "production database construction was already claimed for this process",
+        ));
+    }
+    let roles = Arc::new(roles);
+    let connection_binding = Arc::new(ProductionDatabaseConnectionBinding::new(roles.clone()));
+    let pool = Arc::new(
+        build_application_pool_inner(url, settings, None, Some(connection_binding.clone()))
+            .await
+            .map_err(PostgresqlRuntimeObservationError::Database)?,
+    );
+    let observation = match observe_postgresql_runtime(&pool, &roles).await {
+        Ok(observation) => observation,
+        Err(error) => {
+            pool.close().await;
+            set_migration_status(MigrationStatus::Failed);
+            return Err(error);
+        }
+    };
+    if let Err(error) = connection_binding.require_match(&observation) {
+        pool.close().await;
+        set_migration_status(MigrationStatus::Failed);
+        return Err(error);
+    }
+    set_migration_status(MigrationStatus::Applied);
+    let retained = RetainedPostgresqlRuntime {
+        pool,
+        observation: Arc::new(observation),
+        roles,
+        connection_binding,
+    };
+    if !database_publication_decided() {
+        Ok(UnpublishedPostgresqlRuntime { retained })
+    } else {
+        retained.pool.close().await;
+        Err(observation_contract_error(
+            "a database publication decision raced production observation",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1677,11 +2614,14 @@ async fn build_application_pool(
 ) -> Result<PgPool, sqlx::Error> {
     build_application_pool_inner(
         url,
-        max_connections,
-        min_connections,
-        idle_timeout_secs,
-        acquire_timeout_secs,
-        max_lifetime_secs,
+        ApplicationPoolSettings {
+            max_connections,
+            min_connections,
+            idle_timeout_secs,
+            acquire_timeout_secs,
+            max_lifetime_secs,
+        },
+        None,
         None,
     )
     .await
@@ -2083,19 +3023,22 @@ async fn try_connect_with_url_inner(
     }
     let connected = build_application_pool_inner(
         url,
-        max_connections,
-        min_connections,
-        idle_timeout_secs,
-        acquire_timeout_secs,
-        max_lifetime_secs,
+        ApplicationPoolSettings {
+            max_connections,
+            min_connections,
+            idle_timeout_secs,
+            acquire_timeout_secs,
+            max_lifetime_secs,
+        },
         role_contract,
+        None,
     )
     .await;
 
     let pool = match connected {
         Ok(pool) => {
             tracing::info!("database connected");
-            Some(pool)
+            Some(Arc::new(pool))
         }
         Err(e) => {
             if database_required() {
@@ -2112,7 +3055,7 @@ async fn try_connect_with_url_inner(
     POOL.set(pool).ok();
     #[cfg(test)]
     TEST_POOL.with(|slot| {
-        *slot.borrow_mut() = pool.map(Box::new);
+        *slot.borrow_mut() = pool;
     });
 }
 
@@ -2302,6 +3245,21 @@ mod tests {
             "ryuki_app_runtime".into(),
         )
         .is_err());
+        assert!(super::ProductionDatabaseRoles::new(
+            "ryuki_app_runtime".into(),
+            "ryuki_schema_migrator".into(),
+        )
+        .is_ok());
+        assert!(super::ProductionDatabaseRoles::new(
+            "postgres".into(),
+            "ryuki_schema_migrator".into(),
+        )
+        .is_err());
+        assert!(super::ProductionDatabaseRoles::new(
+            "ryuki_app_runtime".into(),
+            "ryuki_app_runtime".into(),
+        )
+        .is_err());
 
         let policies: std::collections::BTreeMap<_, _> = super::APPLICATION_TABLE_POLICIES
             .iter()
@@ -2323,12 +3281,190 @@ mod tests {
         for name in [
             "audit_log",
             "certificate_site_authority_quarantine",
+            "first_owner_closure_records",
+            "first_owner_privileged_domain_assignments",
             "k8s_cluster_registry",
             "k8s_cluster_environment_scopes",
             "noisy_trigger_site_authority",
             "scheduler_protocol_versions",
         ] {
             assert_eq!(policies.get(name), Some(&(false, false, false)));
+        }
+    }
+
+    #[test]
+    fn production_pool_settings_are_bounded_before_connect() {
+        assert!(super::ApplicationPoolSettings::new(20, 2, 300, 30, 1_800).is_ok());
+        for settings in [
+            (0, 0, 300, 30, 1_800),
+            (2, 3, 300, 30, 1_800),
+            (2, 1, 0, 30, 1_800),
+            (2, 1, 300, 0, 1_800),
+            (2, 1, 300, 30, 0),
+        ] {
+            assert!(super::ApplicationPoolSettings::new(
+                settings.0, settings.1, settings.2, settings.3, settings.4,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn local_postgresql_fact_validation_fails_closed_without_live_io() {
+        fn valid_raw() -> super::RawPostgresqlRuntimeFacts {
+            super::RawPostgresqlRuntimeFacts {
+                server_version_num: 180_002,
+                server_version: "18.2".into(),
+                database_name: "ryuki".into(),
+                database_oid: 16_384,
+                server_address: Some("192.0.2.10".into()),
+                server_port: Some(5432),
+                primary: true,
+                transaction_writable: true,
+                default_transaction_writable: true,
+                current_role: "ryuki_app_runtime".into(),
+                session_login_role: "ryuki_login_20260719".into(),
+                selected_role: "ryuki_app_runtime".into(),
+                tls_enabled: Some(true),
+                tls_protocol: Some("TLSv1.3".into()),
+                tls_cipher: Some("TLS_AES_256_GCM_SHA384".into()),
+                tls_bits: Some(256),
+                client_distinguished_name: None,
+                issuer_distinguished_name: None,
+            }
+        }
+
+        let roles = super::ProductionDatabaseRoles::new(
+            "ryuki_app_runtime".into(),
+            "ryuki_schema_migrator".into(),
+        )
+        .unwrap();
+        assert!(super::validate_postgresql_runtime_facts(
+            valid_raw(),
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_ok());
+
+        let mut wrong_major = valid_raw();
+        wrong_major.server_version_num = 170_009;
+        assert!(super::validate_postgresql_runtime_facts(
+            wrong_major,
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_err());
+
+        let mut standby = valid_raw();
+        standby.primary = false;
+        assert!(super::validate_postgresql_runtime_facts(
+            standby,
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_err());
+
+        let mut read_only = valid_raw();
+        read_only.transaction_writable = false;
+        assert!(super::validate_postgresql_runtime_facts(
+            read_only,
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_err());
+
+        let mut plaintext = valid_raw();
+        plaintext.tls_enabled = Some(false);
+        assert!(super::validate_postgresql_runtime_facts(
+            plaintext,
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_err());
+
+        let mut wrong_role = valid_raw();
+        wrong_role.current_role = "ryuki_schema_migrator".into();
+        assert!(super::validate_postgresql_runtime_facts(
+            wrong_role,
+            &roles,
+            Vec::new().into_boxed_slice(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_postgresql_debug_is_value_free() {
+        let roles = super::ProductionDatabaseRoles::new(
+            "ryuki_app_runtime".into(),
+            "ryuki_schema_migrator".into(),
+        )
+        .unwrap();
+        let observation = std::sync::Arc::new(super::PostgresqlRuntimeObservation {
+            server_version_num: 180_002,
+            server_version: "18.2 sensitive-build-label".into(),
+            server_major_version: 18,
+            database_name: "sensitive_database".into(),
+            database_oid: 42_424,
+            server_address: "192.0.2.77".parse().unwrap(),
+            server_port: 5432,
+            primary: true,
+            transaction_writable: true,
+            default_transaction_writable: true,
+            application_role: roles.application_role.clone(),
+            migration_role: roles.migration_role.clone(),
+            session_login_role: "sensitive_ephemeral_login".into(),
+            tls: super::PostgresqlTlsObservation {
+                protocol: "TLSv1.3".into(),
+                cipher: "sensitive_cipher".into(),
+                bits: 256,
+                client_distinguished_name: Some("CN=sensitive-client".into()),
+                issuer_distinguished_name: Some("CN=sensitive-issuer".into()),
+            },
+            migration_ledger: Vec::new().into_boxed_slice(),
+        });
+        let pool = std::sync::Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgresql://placeholder@example.invalid/debug-db")
+                .unwrap(),
+        );
+        let retained = super::RetainedPostgresqlRuntime {
+            pool,
+            observation: observation.clone(),
+            roles: std::sync::Arc::new(roles.clone()),
+            connection_binding: std::sync::Arc::new(
+                super::ProductionDatabaseConnectionBinding::new(std::sync::Arc::new(roles.clone())),
+            ),
+        };
+        assert!(retained.same_runtime(&retained.clone()));
+        let foreign_pool = std::sync::Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgresql://foreign@example.invalid/debug-db")
+                .unwrap(),
+        );
+        let foreign = super::RetainedPostgresqlRuntime {
+            pool: foreign_pool,
+            observation: observation.clone(),
+            roles: retained.roles.clone(),
+            connection_binding: retained.connection_binding.clone(),
+        };
+        assert!(!retained.same_runtime(&foreign));
+        let debug = format!("{roles:?} {observation:?} {retained:?}");
+        for forbidden in [
+            "ryuki_app_runtime",
+            "ryuki_schema_migrator",
+            "sensitive_database",
+            "42424",
+            "192.0.2.77",
+            "sensitive_ephemeral_login",
+            "sensitive_cipher",
+            "sensitive-client",
+            "sensitive-issuer",
+            "placeholder",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "debug output leaked {forbidden}: {debug}"
+            );
         }
     }
 
@@ -2377,6 +3513,26 @@ mod tests {
         assert!(matches!(
             verify_migration_inventory(&unexpected, None),
             Err(MigrationVerificationError::UnexpectedApplied(i64::MAX))
+        ));
+
+        let mut duplicated: Vec<(i64, Vec<u8>)> = expected
+            .iter()
+            .map(|(version, checksum)| (*version, checksum.to_vec()))
+            .collect();
+        duplicated.insert(1, duplicated[0].clone());
+        assert!(matches!(
+            verify_migration_inventory(&duplicated, None),
+            Err(MigrationVerificationError::DuplicateApplied(_))
+        ));
+
+        let mut out_of_order: Vec<(i64, Vec<u8>)> = expected
+            .iter()
+            .map(|(version, checksum)| (*version, checksum.to_vec()))
+            .collect();
+        out_of_order.swap(0, 1);
+        assert!(matches!(
+            verify_migration_inventory(&out_of_order, None),
+            Err(MigrationVerificationError::NotStrictlyOrdered { .. })
         ));
     }
 
@@ -2491,12 +3647,15 @@ mod tests {
         .expect("valid application role fixture");
         let pool = super::build_application_pool_inner(
             &application_url,
-            1,
-            1,
-            60,
-            30,
-            300,
+            super::ApplicationPoolSettings {
+                max_connections: 1,
+                min_connections: 1,
+                idle_timeout_secs: 60,
+                acquire_timeout_secs: 30,
+                max_lifetime_secs: 300,
+            },
             Some(application_contract),
+            None,
         )
         .await
         .expect("every strict application connection must pass post-connect attestation");

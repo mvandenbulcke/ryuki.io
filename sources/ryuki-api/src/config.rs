@@ -146,6 +146,7 @@ mod startup_validation_tests {
         config.oidc.client_id = "client".into();
         config.oidc.client_secret = "x".repeat(32);
         config.session.credential_hmac_key = "x".repeat(32);
+        config.security.certificate_cursor_hmac_key = "c".repeat(32);
         config
     }
 
@@ -164,6 +165,7 @@ mod startup_validation_tests {
         .expect("placeholder local-auth config should parse");
         config.session.cookie_secure = cookie_secure;
         config.session.credential_hmac_key = "x".repeat(32);
+        config.security.certificate_cursor_hmac_key = "c".repeat(32);
         config
     }
 
@@ -279,6 +281,7 @@ mod startup_validation_tests {
         };
         entra.session.cookie_secure = false;
         entra.session.credential_hmac_key = "x".repeat(32);
+        entra.security.certificate_cursor_hmac_key = "c".repeat(32);
         let error = validate_test_config(entra).unwrap_err();
         assert!(error.contains("entra_redirect_uri"));
         assert!(error.contains("cookie_secure=false"));

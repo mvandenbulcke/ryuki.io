@@ -99,6 +99,7 @@ const PLATFORM_API_ENV_WHITELIST: &[&str] = &[
     "RYUKI_LOCAL_AUTH__ENVIRONMENT_AUTHORITY",
     "RYUKI_LOCAL_AUTH__ENVIRONMENT_SCOPE",
     "RYUKI_SESSION__CREDENTIAL_HMAC_KEY",
+    "RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY",
     "RYUKI_SESSION__COOKIE_SECURE",
 ];
 const PORTAL_UI_ENV_WHITELIST: &[&str] = &[
@@ -169,6 +170,10 @@ const PLATFORM_API_ENVIRONMENT: &[(&str, &str)] = &[
     (
         "RYUKI_SESSION__CREDENTIAL_HMAC_KEY",
         "${RYUKI_SESSION__CREDENTIAL_HMAC_KEY:?required}",
+    ),
+    (
+        "RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY",
+        "${RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY:?required}",
     ),
     ("RYUKI_SESSION__COOKIE_SECURE", "false"),
 ];
@@ -976,6 +981,18 @@ mod tests {
             errors.iter().any(|error| error
                 .contains("platform-api environment must match the reviewed local-safe profile")),
             "secret interpolation fallback must fail closed: {errors:?}"
+        );
+
+        let mut compose = reviewed_compose();
+        compose["services"]["platform-api"]["environment"]
+            ["RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY"] =
+            Value::String("${RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY:-fallback}".to_string());
+
+        let errors = value_errors(&compose);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("platform-api environment must match the reviewed local-safe profile")),
+            "cursor-key interpolation fallback must fail closed: {errors:?}"
         );
     }
 

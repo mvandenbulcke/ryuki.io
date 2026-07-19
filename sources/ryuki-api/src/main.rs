@@ -1727,7 +1727,9 @@ async fn auth_middleware(
     next: middleware::Next,
 ) -> Response {
     let method = request.method().clone();
+    let method_label = metrics_method_label(&method);
     let path = request.uri().path().to_string();
+    let route = request_route_label(&request);
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let app_config = crate::config_store::get_app_config();
     let cookie_runtime = crate::config_store::get_api_cookie_runtime();
@@ -1919,9 +1921,8 @@ async fn auth_middleware(
                 actor_requirement.unwrap_or(required)
             };
             tracing::warn!(
-                user_id = %session.user_id,
-                method = %method,
-                path = %path,
+                method = method_label,
+                route = %route,
                 required = denied_requirement,
                 "authorization denied: missing required permission"
             );
@@ -1995,8 +1996,8 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
         })
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let method = metrics_method_label(request.method());
+    let route = request_route_label(&request);
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
@@ -2004,8 +2005,8 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
     let span = tracing::info_span!(
         "request",
         request_id = %request_id,
-        method = %method,
-        path = %path,
+        method,
+        route = %route,
     );
 
     let mut response = next.run(request).instrument(span).await;
@@ -2135,6 +2136,19 @@ fn metrics_method_label(method: &Method) -> &'static str {
     }
 }
 
+/// Returns a stable, bounded-cardinality route label for request telemetry.
+///
+/// A trusted Axum route template is preferred. Requests that did not match a
+/// route collapse to a single label, so subject or resource identifiers from
+/// attacker-controlled paths never enter logs or metrics.
+fn request_route_label(request: &HttpRequest<Body>) -> String {
+    let matched_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
+    metrics_path_label(request.uri().path(), matched_path)
+}
+
 /// Produce a bounded-cardinality metrics label. A matched Axum route template
 /// comes from the trusted router definition. Unmatched attacker-controlled
 /// paths collapse into one label instead of becoming map/Prometheus keys.
@@ -2205,8 +2219,8 @@ fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -> Response {
     let start = Instant::now();
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let method = metrics_method_label(request.method());
+    let route = request_route_label(&request);
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -2218,8 +2232,8 @@ async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -
     let status = response.status();
 
     tracing::info!(
-        method = %method,
-        path = %path,
+        method,
+        route = %route,
         status = status.as_u16(),
         duration_us,
         request_id = %request_id,
@@ -2559,8 +2573,8 @@ async fn request_timeout_middleware(
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
-    let method = request.method().clone();
+    let route = request_route_label(&request);
+    let method = metrics_method_label(request.method());
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -2573,8 +2587,8 @@ async fn request_timeout_middleware(
         Err(_elapsed) => {
             tracing::warn!(
                 request_id = %request_id,
-                method = %method,
-                path = %path,
+                method,
+                route = %route,
                 timeout_secs,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "request timeout"
@@ -3183,6 +3197,21 @@ async fn main() {
             eprintln!("API authenticator runtime admission failed: {error}");
             std::process::exit(1);
         });
+    if security_contract.is_production() {
+        api_authenticator_runtime
+            .validate_production_posture()
+            .unwrap_or_else(|error| {
+                eprintln!("production authenticator posture failed: {error}");
+                std::process::exit(1);
+            });
+    }
+    let authenticator_observation_identity =
+        Arc::clone(api_authenticator_runtime.operational_observation());
+    let entra_bearer_validator_identity = api_authenticator_runtime.entra_bearer_validator();
+    let oidc_callback_dependencies_identity =
+        api_authenticator_runtime.oidc_callback_dependencies();
+    let entra_sso_dependencies_identity = api_authenticator_runtime.entra_sso_dependencies();
+    let local_login_throttle_identity = api_authenticator_runtime.local_login_throttle();
     security_contract
         .verify_secure_cookie_runtime_guard(&api_cookie_runtime)
         .unwrap_or_else(|error| {
@@ -3263,6 +3292,16 @@ async fn main() {
         &config_store::get_api_authenticator_runtime(),
     ) || !api_authenticator_runtime_identity
         .retains_cookie_runtime(&config_store::get_api_cookie_runtime())
+        || !api_authenticator_runtime_identity
+            .retains_operational_observation(&authenticator_observation_identity)
+        || !api_authenticator_runtime_identity
+            .retains_entra_bearer_validator(&entra_bearer_validator_identity)
+        || !api_authenticator_runtime_identity
+            .retains_oidc_callback_dependencies(&oidc_callback_dependencies_identity)
+        || !api_authenticator_runtime_identity
+            .retains_entra_sso_dependencies(&entra_sso_dependencies_identity)
+        || !api_authenticator_runtime_identity
+            .retains_local_login_throttle(&local_login_throttle_identity)
     {
         eprintln!("API authenticator runtime identity changed during startup retention");
         std::process::exit(1);
@@ -3677,7 +3716,7 @@ async fn main() {
     // The exact human-authenticator allocations were built and retained before
     // the general production runtime-binding fence. Router consumers receive
     // only Arc clones originating from that immutable owner.
-    let local_login_throttle = api_authenticator_runtime.local_login_throttle();
+    let local_login_throttle = local_login_throttle_identity;
 
     let cors_origins: Vec<_> = app_config
         .cors
@@ -3758,16 +3797,12 @@ async fn main() {
         .merge(human_gated_app)
         .fallback(not_found)
         .layer(Extension(local_login_throttle.clone()))
-        .layer(Extension(
-            api_authenticator_runtime.oidc_callback_dependencies(),
-        ))
+        .layer(Extension(oidc_callback_dependencies_identity))
         // EntraSsoDeps: built once at startup. The handlers gate on
         // auth_mode == entra-id (and on a complete tenant/client/redirect-uri
         // config) before touching the exchanger/validator, so a non-Entra
         // deployment never dereferences these network deps.
-        .layer(Extension(
-            api_authenticator_runtime.entra_sso_dependencies(),
-        ))
+        .layer(Extension(entra_sso_dependencies_identity))
         .layer(middleware::from_fn_with_state(
             GlobalConcurrencyAdmission::new(app_config.server.max_concurrent_connections),
             global_concurrency_middleware,
@@ -3869,89 +3904,31 @@ async fn main() {
     }
 }
 
-async fn health(
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, ProblemDetails> {
-    tracing::info!(
-        simulate = %params.get("simulate").unwrap_or(&String::new()),
-        "health check requested"
-    );
-
-    if params.get("simulate") == Some(&"error".to_string()) {
-        return Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "HEALTH_CHECK_FAILED",
-            "Platform health check failed",
-            Some("Simulated error for testing ProblemDetails contract"),
-        ));
-    }
+async fn health() -> (StatusCode, Json<serde_json::Value>) {
     let db_connected = crate::database::get_db().is_some();
     let app_config = crate::config_store::get_app_config();
-    let validation_errors = app_config.validate();
-    let validation_warnings = app_config.validation_warnings();
+    let config_valid = app_config.validate().is_empty();
 
-    let status = if db_connected && validation_errors.is_empty() {
-        "healthy"
-    } else {
-        "degraded"
-    };
-    tracing::info!(
-        status,
-        db_connected,
-        config_valid = validation_errors.is_empty(),
-        config_errors = validation_errors.len(),
-        config_warnings = validation_warnings.len(),
-        auth_mode = %app_config.auth_mode.as_str(),
-        rate_limit_enabled = app_config.rate_limit.enabled,
-        "health check result"
-    );
+    let healthy = db_connected && config_valid;
+    let status = if healthy { "healthy" } else { "degraded" };
+    tracing::info!(status, "health check result");
 
-    Ok(Json(serde_json::json!({
-        "status": status,
-        "database": {
-            "connected": db_connected,
-            "provider": app_config.database_provider.as_str(),
-        },
-        "config": {
-            "valid": validation_errors.is_empty(),
-            "errors": validation_errors,
-            "warnings": validation_warnings,
-        },
-        "auth_mode": app_config.auth_mode.as_str(),
-        "rate_limit_enabled": app_config.rate_limit.enabled,
-    })))
+    public_health_response(healthy)
 }
 
-async fn ready(
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, ProblemDetails> {
-    tracing::info!(
-        simulate = %params.get("simulate").unwrap_or(&String::new()),
-        "readiness check requested"
-    );
-
-    if params.get("simulate") == Some(&"error".to_string()) {
-        return Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "READINESS_CHECK_FAILED",
-            "Platform readiness check failed",
-            Some("Simulated error for testing ProblemDetails contract"),
-        ));
-    }
-
+async fn ready() -> (StatusCode, Json<serde_json::Value>) {
     if is_draining() {
-        return Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DRAINING",
-            "Server is draining and not accepting traffic",
-            Some("Shutdown in progress"),
-        ));
+        return public_readiness_response(false);
     }
 
     let readiness_status = readiness_check().await;
     let result = readiness_response(readiness_status);
-    let status = if result.is_ok() { "ready" } else { "not_ready" };
-    tracing::info!(status, ?readiness_status, "readiness check result");
+    let status = if readiness_status == ReadinessStatus::Ready {
+        "ready"
+    } else {
+        "not_ready"
+    };
+    tracing::info!(status, "readiness check result");
     result
 }
 
@@ -4084,52 +4061,28 @@ fn readiness_status_for_pool_state(
     }
 }
 
-fn readiness_response(status: ReadinessStatus) -> Result<Json<serde_json::Value>, ProblemDetails> {
-    match status {
-        ReadinessStatus::Ready => Ok(Json(serde_json::json!({
-            "status": "ready",
-            "database": {
-                "connected": true,
-                "migrations": "applied",
-            },
-        }))),
-        ReadinessStatus::ConfigInvalid => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "CONFIG_INVALID",
-            "Configuration is invalid",
-            Some("Readiness requires hard config validation to pass"),
-        )),
-        ReadinessStatus::SecretProviderUnavailable => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SECRET_PROVIDER_UNAVAILABLE",
-            "Secret provider is unavailable",
-            Some("Readiness requires the retained workload-auth secret provider runtime"),
-        )),
-        ReadinessStatus::DatabaseUnavailable => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DATABASE_UNAVAILABLE",
-            "Database is unavailable",
-            Some("Readiness requires an active database connection"),
-        )),
-        ReadinessStatus::MigrationsNotApplied => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DATABASE_MIGRATIONS_NOT_APPLIED",
-            "Database migrations are not applied",
-            Some("Readiness requires completed database migrations"),
-        )),
-        ReadinessStatus::MigrationsFailed => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DATABASE_MIGRATIONS_FAILED",
-            "Database migrations failed",
-            Some("Readiness requires successful database migrations"),
-        )),
-        ReadinessStatus::DatabaseUnusable => Err(problem_details(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DATABASE_UNUSABLE",
-            "Database is unusable",
-            Some("Database readiness probe failed"),
-        )),
-    }
+fn readiness_response(status: ReadinessStatus) -> (StatusCode, Json<serde_json::Value>) {
+    public_readiness_response(status == ReadinessStatus::Ready)
+}
+
+fn public_health_response(healthy: bool) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if healthy { "healthy" } else { "degraded" };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": status })),
+    )
+}
+
+/// Projects every internal readiness result onto the same bounded public
+/// contract. Dependency identities and failure reasons remain available only
+/// through the authenticated operational diagnostics endpoint.
+fn public_readiness_response(ready: bool) -> (StatusCode, Json<serde_json::Value>) {
+    let (http_status, status) = if ready {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
+    };
+    (http_status, Json(serde_json::json!({ "status": status })))
 }
 
 async fn validation_run(
@@ -6017,15 +5970,18 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_labels_use_route_templates_and_collapse_unknown_paths() {
+    fn test_observability_route_labels_use_templates_and_collapse_subject_paths() {
         assert_eq!(
-            metrics_path_label("/api/requests/attacker-value", Some("/api/requests/{id}")),
+            metrics_path_label(
+                "/api/requests/alice@example.test",
+                Some("/api/requests/{id}")
+            ),
             "/api/requests/{id}"
         );
         for path in [
-            "/random-a/value",
-            "/random-b/another-value",
-            "/api-does-not-exist/123",
+            "/random-a/alice@example.test",
+            "/random-b/principal-123",
+            "/api-does-not-exist/550e8400-e29b-41d4-a716-446655440000",
         ] {
             assert_eq!(metrics_path_label(path, None), "/__unmatched__");
         }
@@ -6309,22 +6265,42 @@ mod tests {
     }
 
     #[test]
-    fn test_readiness_response_with_db_is_ready() {
-        let Json(body) =
-            readiness_response(ReadinessStatus::Ready).expect("ready response should succeed");
-        assert_eq!(body["status"], "ready");
-        assert_eq!(body["database"]["connected"], true);
-        assert_eq!(body["database"]["migrations"], "applied");
+    fn test_public_health_response_is_stable_and_value_free() {
+        for (healthy, expected_status) in [(true, "healthy"), (false, "degraded")] {
+            let (status, Json(body)) = public_health_response(healthy);
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, serde_json::json!({ "status": expected_status }));
+        }
     }
 
     #[test]
-    fn test_readiness_response_without_db_is_service_unavailable() {
-        let Err((status, Json(body))) = readiness_response(ReadinessStatus::DatabaseUnavailable)
-        else {
-            panic!("readiness should fail when database is unavailable");
-        };
+    fn test_readiness_response_with_db_is_ready_and_value_free() {
+        let (status, Json(body)) = readiness_response(ReadinessStatus::Ready);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "status": "ready" }));
+    }
+
+    #[test]
+    fn test_all_readiness_failures_have_one_stable_value_free_projection() {
+        for internal_status in [
+            ReadinessStatus::ConfigInvalid,
+            ReadinessStatus::SecretProviderUnavailable,
+            ReadinessStatus::DatabaseUnavailable,
+            ReadinessStatus::MigrationsNotApplied,
+            ReadinessStatus::MigrationsFailed,
+            ReadinessStatus::DatabaseUnusable,
+        ] {
+            let (status, Json(body)) = readiness_response(internal_status);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, serde_json::json!({ "status": "not_ready" }));
+        }
+    }
+
+    #[test]
+    fn test_public_readiness_response_without_db_is_service_unavailable() {
+        let (status, Json(body)) = readiness_response(ReadinessStatus::DatabaseUnavailable);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "DATABASE_UNAVAILABLE");
+        assert_eq!(body, serde_json::json!({ "status": "not_ready" }));
     }
 
     #[tokio::test]
@@ -6387,62 +6363,6 @@ mod tests {
             Some(ReadinessStatus::DatabaseUnusable),
             "a fresh dependency failure remains authoritative without another DB probe"
         );
-    }
-
-    #[test]
-    fn test_readiness_response_for_invalid_config_is_safe_503() {
-        let Err((status, Json(body))) = readiness_response(ReadinessStatus::ConfigInvalid) else {
-            panic!("readiness should fail when config is invalid");
-        };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "CONFIG_INVALID");
-        assert_eq!(body.message, "Configuration is invalid");
-        assert_eq!(
-            body.detail,
-            Some("Readiness requires hard config validation to pass".into())
-        );
-    }
-
-    #[test]
-    fn test_readiness_response_for_migrations_not_applied_is_safe_503() {
-        let Err((status, Json(body))) = readiness_response(ReadinessStatus::MigrationsNotApplied)
-        else {
-            panic!("readiness should fail when migrations are not applied");
-        };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "DATABASE_MIGRATIONS_NOT_APPLIED");
-        assert_eq!(body.message, "Database migrations are not applied");
-        assert_eq!(
-            body.detail,
-            Some("Readiness requires completed database migrations".into())
-        );
-    }
-
-    #[test]
-    fn test_readiness_response_for_failed_migrations_is_safe_503() {
-        let Err((status, Json(body))) = readiness_response(ReadinessStatus::MigrationsFailed)
-        else {
-            panic!("readiness should fail when migrations failed");
-        };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "DATABASE_MIGRATIONS_FAILED");
-        assert_eq!(body.message, "Database migrations failed");
-        assert_eq!(
-            body.detail,
-            Some("Readiness requires successful database migrations".into())
-        );
-    }
-
-    #[test]
-    fn test_readiness_response_for_unusable_database_is_safe_503() {
-        let Err((status, Json(body))) = readiness_response(ReadinessStatus::DatabaseUnusable)
-        else {
-            panic!("readiness should fail when database probe fails");
-        };
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.error, "DATABASE_UNUSABLE");
-        assert_eq!(body.message, "Database is unusable");
-        assert_eq!(body.detail, Some("Database readiness probe failed".into()));
     }
 
     #[test]

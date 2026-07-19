@@ -287,8 +287,11 @@ job fence and omitted for an idle heartbeat.</td></tr></tbody></table>
 <p>JSON structure: <code>ResultBody</code>.</p>
 <table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>job_result</code></td><td><code>object (JobResult)</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>job_result</code> in the JSON request body.</td></tr><tr><td><code>evidence</code></td><td><code>array&lt;integer&gt;</code></td><td><span class="req req-optional">Optional</span></td><td>Raw evidence bytes (the payload whose SHA-256 is <code>evidence_digest</code>).
 May be empty for modes that produce no evidence (e.g. OfflineDryRun
-without a plan artifact), but the digest must still match.</td></tr><tr><td><code>evidence_json</code></td><td><code>JSON value</code></td><td><span class="req req-optional">Optional</span></td><td>Optional structured evidence parsed from the evidence bytes.
-Stored as JSONB for query convenience; never trusted for authz.</td></tr></tbody></table>
+without a plan artifact), but the digest must still match.</td></tr><tr><td><code>evidence_json</code></td><td><code>JSON value</code></td><td><span class="req req-optional">Optional</span></td><td>Optional structured evidence convenience field. It is independently
+untrusted, even when the raw evidence bytes are signed. Successful
+LivePlan ingestion ignores it; a <code>Planned</code> result instead retains its
+validated signed safe-projection bytes for review. Other outcomes/modes
+may store the convenience field for query purposes.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>serde_json::Value</code></td></tr></tbody></table>
 <p>For <code>200</code>, the known response body type is <code>serde_json::Value</code>. Its field schema is unavailable, so no JSON shape is inferred.</p>
@@ -304,7 +307,7 @@ Stored as JSONB for query convenience; never trusted for authz.</td></tr></tbody
   <span class="hl-cmd">--data</span> <span class="hl-s">'{"job_result":{}}'</span> \
   <span class="hl-s">'https://&lt;your-host&gt;/api/agents/&lt;agent_id&gt;/jobs/&lt;job_id&gt;/result'</span></code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-19 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-admin.html">&larr; Admin</a><a href="/api-analytics.html">Analytics &rarr;</a></nav>
 </main>
   </div>
   <footer class="site-footer">

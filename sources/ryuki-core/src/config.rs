@@ -743,7 +743,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SecurityConfig {
     #[serde(default = "default_csp_directive")]
     pub content_security_policy: String,
@@ -751,6 +751,24 @@ pub struct SecurityConfig {
     pub hsts_enabled: bool,
     #[serde(default = "default_hsts_max_age")]
     pub hsts_max_age_secs: u64,
+    /// Purpose-specific HMAC key for certificate pagination cursors. This key
+    /// must never be shared with session credentials or another signing
+    /// purpose, and is accepted from configuration input but never serialized
+    /// or printed.
+    #[serde(default, skip_serializing)]
+    pub certificate_cursor_hmac_key: String,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecurityConfig")
+            .field("content_security_policy", &self.content_security_policy)
+            .field("hsts_enabled", &self.hsts_enabled)
+            .field("hsts_max_age_secs", &self.hsts_max_age_secs)
+            .field("certificate_cursor_hmac_key", &"[redacted]")
+            .finish()
+    }
 }
 
 fn default_csp_directive() -> String {
@@ -772,6 +790,7 @@ impl Default for SecurityConfig {
             content_security_policy: default_csp_directive(),
             hsts_enabled: default_hsts_enabled(),
             hsts_max_age_secs: default_hsts_max_age(),
+            certificate_cursor_hmac_key: String::new(),
         }
     }
 }
@@ -2174,6 +2193,43 @@ impl RyukiConfig {
             }
         }
 
+        let certificate_cursor_key = self.security.certificate_cursor_hmac_key.as_str();
+        let certificate_cursor_key_required =
+            !self.auth_mode.is_credential_free() || self.oidc.enabled;
+        if certificate_cursor_key_required && certificate_cursor_key.is_empty() {
+            errors.push(
+                "security.certificate_cursor_hmac_key is required outside credential-free dry-run authentication"
+                    .into(),
+            );
+        } else if !certificate_cursor_key.is_empty() {
+            if certificate_cursor_key.len() < 32 {
+                errors.push(
+                    "security.certificate_cursor_hmac_key must contain at least 32 bytes of key material"
+                        .into(),
+                );
+            }
+            if certificate_cursor_key.trim() != certificate_cursor_key
+                || certificate_cursor_key
+                    .as_bytes()
+                    .iter()
+                    .any(u8::is_ascii_control)
+            {
+                errors.push(
+                    "security.certificate_cursor_hmac_key must not contain surrounding whitespace or control characters"
+                        .into(),
+                );
+            }
+        }
+        if !certificate_cursor_key.is_empty()
+            && !verifier_key.is_empty()
+            && certificate_cursor_key.as_bytes() == verifier_key.as_bytes()
+        {
+            errors.push(
+                "security.certificate_cursor_hmac_key must use key material distinct from session.credential_hmac_key"
+                    .into(),
+            );
+        }
+
         if self.retention.daily_backups == 0 {
             errors.push("retention.daily_backups must be greater than 0".into());
         }
@@ -3131,6 +3187,7 @@ mod tests {
         // Mirrors the nested key that RYUKI_LOCAL_AUTH__USERS produces via
         // Env::prefixed("RYUKI_").split("__").
         let session_key = "k".repeat(32);
+        let cursor_key = "c".repeat(32);
         let config: RyukiConfig = Figment::new()
             .merge(figment::providers::Serialized::defaults(
                 RyukiConfig::default(),
@@ -3138,12 +3195,18 @@ mod tests {
             .merge(Toml::string(&format!(
                 "auth_mode = \"local\"\n[local_auth]\nusers = \"{PLACEHOLDER_USERS}\"\n\
                  site_authority = \"global\"\nenvironment_authority = \"global\"\n\
-                 [session]\ncredential_hmac_key = \"{session_key}\""
+                 [session]\ncredential_hmac_key = \"{session_key}\"\n\
+                 [security]\ncertificate_cursor_hmac_key = \"{cursor_key}\""
             )))
             .extract()
             .expect("config with local_auth.users should parse");
         assert_eq!(config.auth_mode, AuthMode::Local);
         assert_eq!(config.local_auth.users.len(), 2);
+        assert_eq!(
+            config.security.certificate_cursor_hmac_key.as_str(),
+            cursor_key.as_str(),
+            "the nested security key must map like RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY"
+        );
         assert!(config.validate().is_empty());
     }
 
@@ -3235,6 +3298,7 @@ mod tests {
 
         config.local_auth = populated_local_auth();
         config.session.credential_hmac_key = "k".repeat(32);
+        config.security.certificate_cursor_hmac_key = "c".repeat(32);
         assert!(config.validate().is_empty());
     }
 
@@ -3253,6 +3317,7 @@ mod tests {
         );
 
         local.session.credential_hmac_key = "k".repeat(32);
+        local.security.certificate_cursor_hmac_key = "c".repeat(32);
         assert!(local.validate().is_empty());
 
         let entra = RyukiConfig {
@@ -3281,6 +3346,51 @@ mod tests {
         assert!(debug.contains("[redacted]"));
         assert!(!json.contains("credential_hmac_key"));
         assert!(!json.contains(&session.credential_hmac_key));
+    }
+
+    #[test]
+    fn test_certificate_cursor_key_is_required_redacted_and_purpose_separated() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            local_auth: populated_local_auth(),
+            ..Default::default()
+        };
+        config.session.credential_hmac_key = "s".repeat(32);
+        assert!(
+            config.validate().iter().any(|error| {
+                error.contains("security.certificate_cursor_hmac_key is required")
+            })
+        );
+
+        config.security.certificate_cursor_hmac_key = "s".repeat(32);
+        assert!(config.validate().iter().any(|error| {
+            error.contains("must use key material distinct from session.credential_hmac_key")
+        }));
+
+        config.security.certificate_cursor_hmac_key = "c".repeat(32);
+        assert!(config.validate().is_empty());
+
+        let debug = format!("{:?}", config.security);
+        let json = serde_json::to_string(&config.security).unwrap();
+        assert!(!debug.contains(&config.security.certificate_cursor_hmac_key));
+        assert!(debug.contains("[redacted]"));
+        assert!(!json.contains("certificate_cursor_hmac_key"));
+        assert!(!json.contains(&config.security.certificate_cursor_hmac_key));
+    }
+
+    #[test]
+    fn test_certificate_cursor_key_rejects_short_or_malformed_material() {
+        let mut config = RyukiConfig::default();
+        config.security.certificate_cursor_hmac_key = "c".repeat(31);
+        assert!(config.validate().iter().any(|error| {
+            error.contains("security.certificate_cursor_hmac_key must contain at least 32 bytes")
+        }));
+
+        config.security.certificate_cursor_hmac_key = format!("{}\n", "c".repeat(32));
+        assert!(config.validate().iter().any(|error| {
+            error.contains("security.certificate_cursor_hmac_key")
+                && error.contains("control characters")
+        }));
     }
 
     #[test]
@@ -3390,9 +3500,11 @@ mod tests {
         config.oidc.token_endpoint = "https://login.example.com/token".into();
         config.oidc.jwks_uri = "https://login.example.com/.well-known/jwks.json".into();
         config.oidc.client_secret = "s3cr3t".into();
+        config.session.credential_hmac_key = "s".repeat(32);
+        config.security.certificate_cursor_hmac_key = "c".repeat(32);
         let errors = config.validate();
         assert!(
-            !errors.iter().any(|e| e.contains("oidc.")),
+            errors.is_empty(),
             "fully-populated oidc config should not produce validation errors; got: {errors:?}"
         );
     }

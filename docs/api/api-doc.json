@@ -4405,7 +4405,7 @@
                 "name": "evidence_json",
                 "type": "serde_json::Value",
                 "optional": true,
-                "doc": "Optional structured evidence parsed from the evidence bytes.\nStored as JSONB for query convenience; never trusted for authz."
+                "doc": "Optional structured evidence convenience field. It is independently\nuntrusted, even when the raw evidence bytes are signed. Successful\nLivePlan ingestion ignores it; a `Planned` result instead retains its\nvalidated signed safe-projection bytes for review. Other outcomes/modes\nmay store the convenience field for query purposes."
               }
             ]
           },
@@ -7284,32 +7284,9 @@
             {
               "status": 200,
               "description": "OK",
-              "body_state": "json",
-              "body": {
-                "type": "Value",
-                "fields": [
-                  {
-                    "name": "authorize_url",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "binding",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  }
-                ]
-              },
-              "headers": [
-                {
-                  "name": "Set-Cookie",
-                  "type": "string",
-                  "required": false,
-                  "description": "Authentication/session cookie emitted on the successful branch that establishes or clears browser state."
-                }
-              ]
+              "body_state": "unknown",
+              "body": null,
+              "headers": []
             }
           ],
           "response_notes": null
@@ -7771,12 +7748,6 @@
                   "type": "string",
                   "required": true,
                   "description": "Redirect target selected by the authentication flow."
-                },
-                {
-                  "name": "Set-Cookie",
-                  "type": "string",
-                  "required": false,
-                  "description": "Authentication/session cookie emitted on the successful branch that establishes or clears browser state."
                 }
               ]
             }
@@ -7809,12 +7780,6 @@
                   "type": "string",
                   "required": true,
                   "description": "Redirect target selected by the authentication flow."
-                },
-                {
-                  "name": "Set-Cookie",
-                  "type": "string",
-                  "required": false,
-                  "description": "Authentication/session cookie emitted on the successful branch that establishes or clears browser state."
                 }
               ]
             }
@@ -25236,6 +25201,12 @@
                 "doc": "For Vault: a vault path. For EnvVar: comma-separated key names.\nFor DbEncrypted: omit or leave empty — `inline_secret` is used instead."
               },
               {
+                "name": "credential_secret_ref",
+                "type": "SecretRef",
+                "optional": true,
+                "doc": "Provider-qualified, value-free reference. Write-only; never projected."
+              },
+              {
                 "name": "inline_secret",
                 "type": "String",
                 "optional": true,
@@ -28694,6 +28665,12 @@
               {
                 "name": "credential_ref",
                 "type": "String",
+                "optional": true,
+                "doc": null
+              },
+              {
+                "name": "credential_secret_ref",
+                "type": "SecretRef",
                 "optional": true,
                 "doc": null
               },
@@ -52608,62 +52585,13 @@
           "summary": "Health.",
           "description": null,
           "path_params": [],
-          "query_params_state": "known",
-          "query_params": [
-            {
-              "name": "simulate",
-              "type": "String",
-              "optional": true,
-              "doc": "Set to `error` to exercise the documented 503 probe response."
-            }
-          ],
+          "query_params_state": "none",
+          "query_params": null,
           "request_headers": [],
           "request_body_state": "none",
           "request_body": null,
-          "success_responses": [
-            {
-              "status": 200,
-              "description": "OK",
-              "body_state": "json",
-              "body": {
-                "type": "serde_json::Value",
-                "fields": [
-                  {
-                    "name": "status",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "database",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "config",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "auth_mode",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  },
-                  {
-                    "name": "rate_limit_enabled",
-                    "type": "Value",
-                    "optional": false,
-                    "doc": null
-                  }
-                ]
-              },
-              "headers": []
-            }
-          ],
-          "response_notes": "Error responses use the platform ApiError body (error, message, optional detail)."
+          "success_responses": [],
+          "response_notes": null
         },
         {
           "method": "GET",
@@ -52712,31 +52640,13 @@
           "summary": "Ready.",
           "description": null,
           "path_params": [],
-          "query_params_state": "known",
-          "query_params": [
-            {
-              "name": "simulate",
-              "type": "String",
-              "optional": true,
-              "doc": "Set to `error` to exercise the documented 503 probe response."
-            }
-          ],
+          "query_params_state": "none",
+          "query_params": null,
           "request_headers": [],
           "request_body_state": "none",
           "request_body": null,
-          "success_responses": [
-            {
-              "status": 200,
-              "description": "OK",
-              "body_state": "json",
-              "body": {
-                "type": "serde_json::Value",
-                "fields": null
-              },
-              "headers": []
-            }
-          ],
-          "response_notes": "Error responses use the platform ApiError body (error, message, optional detail)."
+          "success_responses": [],
+          "response_notes": null
         }
       ]
     },

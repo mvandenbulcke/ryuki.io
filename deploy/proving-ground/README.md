@@ -32,10 +32,12 @@ cd deploy/proving-ground
 install -m 600 env.example .env
 ```
 
-Replace the database, Vault, local-account, session-verifier, revision, and
-image-ID placeholders in the gitignored `.env`. Generate
+Replace the database, Vault, local-account, session-verifier, cursor-MAC,
+revision, and image-ID placeholders in the gitignored `.env`. Generate
 `PG_SESSION_CREDENTIAL_HMAC_KEY` with at least 32 random bytes; it is a
-dedicated verifier key, not a user password. Replace both executable
+dedicated verifier key, not a user password. Generate a separate at-least-32-
+byte `PG_CERTIFICATE_CURSOR_HMAC_KEY` for certificate pagination; the two key
+values must not match. Replace both executable
 placeholders with absolute, already-canonical regular-file paths and record the
 exact Terraform and `ansible-playbook` core versions. The files and every
 parent directory must be owned by root or the agent user and must not be

@@ -195,7 +195,8 @@ that projection exists, the runtime settings are:
    `RYUKI_ENTRA_CLIENT_ID` into the API process (Compose may read them from the
    gitignored `.env`; direct Cargo runs do not)
 3. Inject a random, at-least-32-byte
-   `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` at runtime
+   `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` and a distinct random, at-least-32-byte
+   `RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` at runtime
 4. For browser SSO, also set the exact registered
    `RYUKI_ENTRA_REDIRECT_URI`; omit it only for deliberate bearer-only use
 5. Restart the API and require `/ready`

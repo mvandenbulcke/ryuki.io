@@ -14,11 +14,12 @@ Compose file for local container bootstrap of the Ryuki Infrastructure Platform.
 
 Compose uses the gitignored root `.env` only as interpolation input. It forwards
 the local users, explicit site/environment authority modes and scopes, and
-`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` to `platform-api`; unrelated `.env`
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY` and the distinct
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` to `platform-api`; unrelated `.env`
 settings are not attached to the container. The static validator attests these
 forwarding descriptors, not the ignored values themselves. API startup
 validates the local-user syntax, explicit authority shape, and session key
-length.
+length, and rejects missing, short, malformed, or reused cursor-key material.
 
 The API image fixes `RYUKI_SECURITY_CONTRACT_ROOT=/app/security-contract` and
 Compose requires the profile path, exact raw-byte profile digest, expected

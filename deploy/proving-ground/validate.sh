@@ -405,6 +405,8 @@ LOCAL_USERS="$(compose_env_value PG_LOCAL_USERS "$ENV_FILE")" || \
   fail "PG_LOCAL_USERS is missing"
 SESSION_CREDENTIAL_HMAC_KEY="$(compose_env_value PG_SESSION_CREDENTIAL_HMAC_KEY "$ENV_FILE")" || \
   fail "PG_SESSION_CREDENTIAL_HMAC_KEY is missing"
+CERTIFICATE_CURSOR_HMAC_KEY="$(compose_env_value PG_CERTIFICATE_CURSOR_HMAC_KEY "$ENV_FILE")" || \
+  fail "PG_CERTIFICATE_CURSOR_HMAC_KEY is missing"
 ACCEPTANCE_REVISION="$(compose_env_value PG_ACCEPTANCE_REVISION "$ENV_FILE")" || \
   fail "PG_ACCEPTANCE_REVISION is missing"
 PLATFORM_API_IMAGE_ID="$(compose_env_value PG_PLATFORM_API_IMAGE_ID "$ENV_FILE")" || \
@@ -453,6 +455,10 @@ if [[ "$ENV_FILE" != "$HERE/env.example" ]]; then
     fail "replace the PG_VAULT_TOKEN placeholder"
   [[ "${#SESSION_CREDENTIAL_HMAC_KEY}" -ge 32 ]] || \
     fail "PG_SESSION_CREDENTIAL_HMAC_KEY must contain at least 32 bytes"
+  [[ "${#CERTIFICATE_CURSOR_HMAC_KEY}" -ge 32 ]] || \
+    fail "PG_CERTIFICATE_CURSOR_HMAC_KEY must contain at least 32 bytes"
+  [[ "$CERTIFICATE_CURSOR_HMAC_KEY" != "$SESSION_CREDENTIAL_HMAC_KEY" ]] || \
+    fail "PG_CERTIFICATE_CURSOR_HMAC_KEY must differ from PG_SESSION_CREDENTIAL_HMAC_KEY"
   is_commit_sha "$ACCEPTANCE_REVISION" || \
     fail "PG_ACCEPTANCE_REVISION must be one full lowercase commit SHA"
   is_image_id "$PLATFORM_API_IMAGE_ID" || \
@@ -589,11 +595,13 @@ command -v docker >/dev/null 2>&1 || fail "docker is required for Compose valida
 if [[ "$ENV_FILE" == "$HERE/env.example" ]]; then
   printf -v PG_DB_PASSWORD '%s' 'local-placeholder'
   printf -v PG_SESSION_CREDENTIAL_HMAC_KEY '%032d' 0
+  printf -v PG_CERTIFICATE_CURSOR_HMAC_KEY '%032d' 1
   printf -v PG_ACCEPTANCE_REVISION '%040d' 0
 else
   PG_ACCEPTANCE_REVISION="$ACCEPTANCE_REVISION"
 fi
-export PG_DB_PASSWORD PG_SESSION_CREDENTIAL_HMAC_KEY PG_ACCEPTANCE_REVISION
+export PG_DB_PASSWORD PG_SESSION_CREDENTIAL_HMAC_KEY PG_CERTIFICATE_CURSOR_HMAC_KEY
+export PG_ACCEPTANCE_REVISION
 export PG_DEPLOYMENT_SECURITY_PROFILE_PATH
 export PG_DEPLOYMENT_SECURITY_PROFILE_DIGEST PG_EXPECTED_DEPLOYMENT_ID
 export PG_CONFORMANCE_TRUST_ROOT_REGISTRY_PATH

@@ -70,12 +70,8 @@
 <h3 class="ep-sub">Request body</h3>
 <p>This operation does not accept a request body.</p>
 <h3 class="ep-sub">Response</h3>
-<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td><code>Value</code></td></tr></tbody></table>
-<h4><code>200</code> response body</h4>
-<p>Structure: <code>Value</code>.</p>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>authorize_url</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>authorize_url</code> returned in the response body.</td></tr><tr><td><code>binding</code></td><td><code>JSON value</code></td><td><span class="req req-required">Required</span></td><td>Value of <code>binding</code> returned in the response body.</td></tr></tbody></table>
-<h4><code>200</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>200</code></td><td>OK</td><td>Response body schema unavailable</td></tr></tbody></table>
+<p class="ep-note">For <code>200</code>, the response body could not be resolved from the route contract. It is not documented as bodyless.</p>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -83,13 +79,6 @@
 <pre><code class="lang-bash"><span class="hl-cmd">curl</span> <span class="hl-f">--silent</span> <span class="hl-f">--show-error</span> <span class="hl-f">--globoff</span> \
   <span class="hl-cmd">--request</span> GET \
   <span class="hl-s">'https://&lt;your-host&gt;/api/auth/entra/authorize-url'</span></code></pre>
-<h4>Schematic response body</h4>
-<p class="ep-note">Illustrative shape generated from the extracted field types, not a recorded live response. Values are placeholders; <code>null</code> marks a field whose type could not be resolved.</p>
-<p>Success status: <code>200</code></p>
-<pre><code class="lang-json">{
-  <span class="hl-k">"authorize_url"</span>: <span class="hl-n">null</span>,
-  <span class="hl-k">"binding"</span>: <span class="hl-n">null</span>
-}</code></pre>
 </section>
 <section class="ep-operation">
 <h2 class="ep-h" id="get-api-auth-entra-callback"><span class="method-chip m-get">GET</span><code>/api/auth/entra/callback</code></h2>
@@ -376,7 +365,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>302</code></td><td>Found</td><td>No response body</td></tr></tbody></table>
 <h4><code>302</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Cache-Control</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>The handler directly marks this response <code>no-store</code>, preventing persistence or idempotency replay of the returned value.</td></tr><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -405,7 +394,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
 <h3 class="ep-sub">Response</h3>
 <table><thead><tr><th>Status</th><th>Description</th><th>Body</th></tr></thead><tbody><tr><td><code>302</code></td><td>Found</td><td>No response body</td></tr></tbody></table>
 <h4><code>302</code> response headers</h4>
-<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr><tr><td><code>Set-Cookie</code></td><td><code>string</code></td><td><span class="req req-optional">Optional</span></td><td>Authentication/session cookie emitted on the successful branch that establishes or clears browser state.</td></tr></tbody></table>
+<table><thead><tr><th>Name</th><th>Type</th><th>Requirement</th><th>Description</th></tr></thead><tbody><tr><td><code>Location</code></td><td><code>string</code></td><td><span class="req req-required">Required</span></td><td>Redirect target selected by the authentication flow.</td></tr></tbody></table>
 <h3 class="ep-sub">Errors</h3>
 <p>JSON failures use one of the platform error envelopes and include the request correlation metadata when routing reaches the API middleware. See <a href="/using-the-api.html#errors">Errors</a> for the exact shapes, authentication failures, retry guidance, and transport-level exceptions.</p>
 <h3 class="ep-sub">Examples</h3>
@@ -506,7 +495,7 @@ but is never forwarded to the browser.</td></tr></tbody></table>
   <span class="hl-k">"instance"</span>: <span class="hl-n">null</span>
 }</code></pre>
 </section>
-<div class="page-meta">Last updated 2026-07-16 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-audit.html">&larr; Audit</a><a href="/api-boundary.html">Boundary &rarr;</a></nav>
+<div class="page-meta">Last updated 2026-07-19 · Generated from the API route registrations.</div><nav class="foot-nav"><a href="/api-audit.html">&larr; Audit</a><a href="/api-boundary.html">Boundary &rarr;</a></nav>
 </main>
   </div>
   <footer class="site-footer">

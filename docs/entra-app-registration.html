@@ -300,7 +300,8 @@ areas" href="/api-reference.html">API Reference</a></li></ul><p class="sb-empty"
 <span class="hl-v">RYUKI_ENTRA_REDIRECT_URI</span>=https://&lt;host&gt;/api/auth/entra/callback
 <span class="hl-v">RYUKI_AUTH_MODE</span>=entra-id
 <span class="hl-c"># Inject at runtime from a secret manager; never commit the value.</span>
-<span class="hl-v">RYUKI_SESSION__CREDENTIAL_HMAC_KEY</span>=&lt;at-least-32-random-bytes&gt;</code></pre>
+<span class="hl-v">RYUKI_SESSION__CREDENTIAL_HMAC_KEY</span>=&lt;at-least-32-random-bytes&gt;
+<span class="hl-v">RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY</span>=&lt;different-at-least-32-random-bytes&gt;</code></pre>
 <h2 id="important-security-notes">Important Security Notes</h2>
 <ul>
 <li><strong>Do NOT commit</strong> the app registration manifest with real GUIDs, tenant IDs, or client IDs.</li>

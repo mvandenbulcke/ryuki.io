@@ -243,7 +243,9 @@ crash-loops visibly instead of silently serving from in-memory stores.
 The base intentionally does not select an API authenticator. Mock/static
 authority is invalid on the pod's non-loopback listener, so a deployment
 overlay must select and fully configure Local, Entra, or generic OIDC and must
-inject the session-verifier key through a Secret. The portal base remains
+inject both `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` and the distinct
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` through explicitly selected
+Secret keys. The portal base remains
 `static-dry-run`. A live overlay must replace both HTTPS placeholders with the
 exact externally reachable same-origin ingress, set `live-provider`, and add
 the corresponding dedicated-controller TLS egress path. The base never weakens

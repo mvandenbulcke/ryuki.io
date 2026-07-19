@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Component, Path};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -19,6 +20,19 @@ pub const SECRET_PROVIDER_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
 pub const AUTHENTICATOR_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-authenticator-inventory-v1";
 pub const AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT: &str =
     "ryuki-authenticator-runtime-binding-v1";
+pub const POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT: &str =
+    "ryuki-postgresql-database-identity-v1";
+pub const POSTGRESQL_STORAGE_BINDING_DIGEST_CONTRACT: &str = "ryuki-postgresql-storage-binding-v1";
+pub const POSTGRESQL_MIGRATION_INVENTORY_DIGEST_CONTRACT: &str =
+    "ryuki-postgresql-migration-inventory-v1";
+pub const EXTERNAL_SIGNING_KEY_IDENTITY_DIGEST_CONTRACT: &str =
+    "ryuki-external-signing-key-identity-v1";
+pub const EXTERNAL_SIGNING_INVENTORY_DIGEST_CONTRACT: &str = "ryuki-external-signing-inventory-v1";
+pub const PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT: &str =
+    "ryuki-production-dependency-inventory-v1";
+pub const FIRST_OWNER_AUTHORITY_NAMESPACE_DIGEST_CONTRACT: &str =
+    "ryuki-first-owner-authority-namespace-v1";
+pub const FIRST_OWNER_CLOSURE_RECORD_DIGEST_CONTRACT: &str = "ryuki-first-owner-closure-record-v1";
 
 const REQUIRED_PRODUCTION_GUARDS: [GuardId; 8] = [
     GuardId::DurablePostgresql,
@@ -390,6 +404,134 @@ pub struct ExpectedProviderBinding {
     pub adapter_version: String,
 }
 
+/// Exact non-secret identity measured from the retained PostgreSQL connection.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresqlDatabaseIdentity {
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub database_provider: ProductionDatabaseProvider,
+    pub database_name: String,
+    pub database_oid: u32,
+    /// Decimal output of PostgreSQL's cluster system-identifier observation.
+    pub cluster_system_identifier: String,
+    pub server_address: String,
+    pub server_port: u16,
+    pub tls_enabled: bool,
+    pub tls_protocol: String,
+    pub tls_cipher_suite: String,
+    pub tls_cipher_bits: u16,
+    pub server_major_version: u16,
+    pub primary: bool,
+    pub writable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum PostgresqlStoragePurpose {
+    Data,
+    Wal,
+}
+
+/// One durable provider-volume binding. Provider object identifiers are
+/// represented only by one-way digests; raw cluster, PVC, PV, and volume
+/// handles are deliberately excluded from the deployment profile.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresqlStorageBinding {
+    pub purpose: PostgresqlStoragePurpose,
+    pub provider_cluster_uid_digest: String,
+    pub persistent_volume_claim_uid_digest: String,
+    pub persistent_volume_uid_digest: String,
+    pub csi_driver: String,
+    pub volume_handle_digest: String,
+    pub storage_class: String,
+}
+
+/// One exact applied SQLx migration, sorted by monotonically increasing
+/// migration version. The checksum digest hashes the checksum bytes read from
+/// the live migration ledger; it is not supplied by a deployment operator.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresqlMigrationInventoryRow {
+    pub version: u64,
+    pub checksum_digest: String,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeGuardDigestError {
+    #[error("runtime-guard digest projection is not canonical: {0}")]
+    InvalidProjection(&'static str),
+    #[error("runtime-guard digest projection could not be encoded as canonical JSON")]
+    Projection,
+}
+
+#[derive(Serialize)]
+struct PostgresqlDatabaseIdentityProjection<'a> {
+    digest_contract: &'static str,
+    database_identity: &'a PostgresqlDatabaseIdentity,
+}
+
+#[derive(Serialize)]
+struct PostgresqlStorageBindingProjection<'a> {
+    digest_contract: &'static str,
+    storage_bindings: &'a [PostgresqlStorageBinding],
+}
+
+#[derive(Serialize)]
+struct PostgresqlMigrationInventoryProjection<'a> {
+    digest_contract: &'static str,
+    migrations: &'a [PostgresqlMigrationInventoryRow],
+}
+
+pub fn postgresql_database_identity_canonical_bytes(
+    identity: &PostgresqlDatabaseIdentity,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_postgresql_database_identity_projection(identity)?;
+    canonical_projection_bytes(PostgresqlDatabaseIdentityProjection {
+        digest_contract: POSTGRESQL_DATABASE_IDENTITY_DIGEST_CONTRACT,
+        database_identity: identity,
+    })
+}
+
+pub fn postgresql_database_identity_digest(
+    identity: &PostgresqlDatabaseIdentity,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(postgresql_database_identity_canonical_bytes(identity)?)
+}
+
+pub fn postgresql_storage_binding_canonical_bytes(
+    bindings: &[PostgresqlStorageBinding],
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_postgresql_storage_binding_projection(bindings)?;
+    canonical_projection_bytes(PostgresqlStorageBindingProjection {
+        digest_contract: POSTGRESQL_STORAGE_BINDING_DIGEST_CONTRACT,
+        storage_bindings: bindings,
+    })
+}
+
+pub fn postgresql_storage_binding_digest(
+    bindings: &[PostgresqlStorageBinding],
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(postgresql_storage_binding_canonical_bytes(bindings)?)
+}
+
+pub fn postgresql_migration_inventory_canonical_bytes(
+    migrations: &[PostgresqlMigrationInventoryRow],
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_postgresql_migration_inventory_projection(migrations)?;
+    canonical_projection_bytes(PostgresqlMigrationInventoryProjection {
+        digest_contract: POSTGRESQL_MIGRATION_INVENTORY_DIGEST_CONTRACT,
+        migrations,
+    })
+}
+
+pub fn postgresql_migration_inventory_digest(
+    migrations: &[PostgresqlMigrationInventoryRow],
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(postgresql_migration_inventory_canonical_bytes(migrations)?)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedSecretProviderBinding {
@@ -446,6 +588,113 @@ pub struct ExpectedAuthenticatorBinding {
     /// Digest of the exact non-secret initialized verifier, credential-profile,
     /// and retained-consumer projection used for this provider.
     pub runtime_binding_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorKeySourceKind {
+    JwtJwks,
+    AuthenticatedIntrospection,
+    Passkey,
+    KeyedDigest,
+    WorkloadTrustBundle,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorCredentialCarrier {
+    AuthorizationBearer,
+    HostCookie,
+    OauthCallback,
+    PasskeyAssertion,
+    ApiToken,
+    MutualTls,
+    WorkloadAssertion,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatorProofBinding {
+    Bearer,
+    Dpop,
+    MutualTls,
+    Passkey,
+    KeyedToken,
+    WorkloadAssertion,
+}
+
+/// Immutable verifier leaves measured from the exact initialized verifier.
+/// Key bytes and remote tokens are excluded; the key-source digest covers only
+/// the canonical non-secret public-key, trust-bundle, or opaque-key metadata.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorVerifierRuntimeProjection {
+    pub verifier_id: String,
+    pub verifier_version: u64,
+    pub canonical_issuer: String,
+    pub audience_ids: Vec<String>,
+    pub accepted_algorithm_ids: Vec<String>,
+    pub key_source_kind: AuthenticatorKeySourceKind,
+    pub key_source_binding_digest: String,
+    pub expiration_required: bool,
+    pub issued_at_required: bool,
+    pub nonce_required: bool,
+    pub replay_protection_enabled: bool,
+    pub maximum_clock_skew_seconds: u32,
+    pub redirects_allowed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorCredentialProfileRuntimeProjection {
+    pub profile_id: String,
+    pub profile_version: u64,
+    pub token_profile: String,
+    pub carrier: AuthenticatorCredentialCarrier,
+    pub proof_binding: AuthenticatorProofBinding,
+    pub interactive: bool,
+    pub emits_human_principal: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorRuntimeOwnership {
+    pub single_runtime_owner: bool,
+    pub ambient_reconfiguration_allowed: bool,
+}
+
+/// Closed R projection for one retained authenticator allocation.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatorRuntimeBindingProjection {
+    pub provider: ExpectedProviderBinding,
+    pub authenticator_kind: ProductionAuthenticatorKind,
+    pub verifier: AuthenticatorVerifierRuntimeProjection,
+    pub credential_profile: AuthenticatorCredentialProfileRuntimeProjection,
+    pub retained_consumer_ids: Vec<String>,
+    pub ownership: AuthenticatorRuntimeOwnership,
+}
+
+#[derive(Serialize)]
+struct AuthenticatorRuntimeBindingDigestProjection<'a> {
+    digest_contract: &'static str,
+    runtime_binding: &'a AuthenticatorRuntimeBindingProjection,
+}
+
+pub fn authenticator_runtime_binding_canonical_bytes(
+    binding: &AuthenticatorRuntimeBindingProjection,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_authenticator_runtime_binding_projection(binding)?;
+    canonical_projection_bytes(AuthenticatorRuntimeBindingDigestProjection {
+        digest_contract: AUTHENTICATOR_RUNTIME_BINDING_DIGEST_CONTRACT,
+        runtime_binding: binding,
+    })
+}
+
+pub fn authenticator_runtime_binding_digest(
+    binding: &AuthenticatorRuntimeBindingProjection,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(authenticator_runtime_binding_canonical_bytes(binding)?)
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +767,594 @@ pub enum ExternalKeyCustodyKind {
     SecretProvider,
     Kms,
     Hsm,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalSigningKeyDisposition {
+    Active,
+    VerifyOnly,
+}
+
+/// Non-secret identity of one exact external key version. A public-key digest
+/// is used for asymmetric keys and a provider-authenticated opaque-metadata
+/// digest for symmetric keys; raw key material is never serializable here.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSigningKeyIdentity {
+    pub provider: ExpectedProviderBinding,
+    pub provider_runtime_binding_digest: String,
+    pub deployment_id: String,
+    pub trust_domain_id: String,
+    pub protocol_version: String,
+    pub purpose_id: String,
+    pub algorithm: SigningAlgorithm,
+    pub custody_kind: ExternalKeyCustodyKind,
+    pub key_id: String,
+    pub key_version: u64,
+    pub public_or_opaque_metadata_digest: String,
+    pub disposition: ExternalSigningKeyDisposition,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedExternalSigningKeyVersion {
+    pub key_identity_digest: String,
+    pub identity: ExternalSigningKeyIdentity,
+}
+
+/// Complete runtime keyring for one signing purpose. The signed profile keeps
+/// its stable summary shape; the live verifier constructs this additive
+/// projection independently and compares its aggregate and active-key digests
+/// with that summary.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSigningPurposeBinding {
+    pub purpose_id: String,
+    pub algorithm: SigningAlgorithm,
+    pub custody_kind: ExternalKeyCustodyKind,
+    pub active_key_version: u64,
+    pub keys: Vec<ExpectedExternalSigningKeyVersion>,
+}
+
+#[derive(Serialize)]
+struct ExternalSigningKeyIdentityProjection<'a> {
+    digest_contract: &'static str,
+    key_identity: &'a ExternalSigningKeyIdentity,
+}
+
+#[derive(Serialize)]
+struct ExternalSigningInventoryProjection<'a> {
+    digest_contract: &'static str,
+    purposes: &'a [ExternalSigningPurposeBinding],
+}
+
+pub fn external_signing_key_identity_canonical_bytes(
+    identity: &ExternalSigningKeyIdentity,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_external_signing_key_identity_projection(identity)?;
+    canonical_projection_bytes(ExternalSigningKeyIdentityProjection {
+        digest_contract: EXTERNAL_SIGNING_KEY_IDENTITY_DIGEST_CONTRACT,
+        key_identity: identity,
+    })
+}
+
+pub fn external_signing_key_identity_digest(
+    identity: &ExternalSigningKeyIdentity,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(external_signing_key_identity_canonical_bytes(identity)?)
+}
+
+pub fn external_signing_inventory_canonical_bytes(
+    purposes: &[ExternalSigningPurposeBinding],
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_external_signing_inventory_projection(purposes)?;
+    canonical_projection_bytes(ExternalSigningInventoryProjection {
+        digest_contract: EXTERNAL_SIGNING_INVENTORY_DIGEST_CONTRACT,
+        purposes,
+    })
+}
+
+pub fn external_signing_inventory_digest(
+    purposes: &[ExternalSigningPurposeBinding],
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(external_signing_inventory_canonical_bytes(purposes)?)
+}
+
+pub fn external_signing_active_key_identity_digest(
+    purpose: &ExternalSigningPurposeBinding,
+) -> Result<String, RuntimeGuardDigestError> {
+    validate_external_signing_inventory_projection(std::slice::from_ref(purpose))?;
+    purpose
+        .keys
+        .iter()
+        .find(|key| key.identity.disposition == ExternalSigningKeyDisposition::Active)
+        .map(|key| key.key_identity_digest.clone())
+        .ok_or(RuntimeGuardDigestError::InvalidProjection(
+            "external signing active-key selection",
+        ))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionDependencyPosture {
+    Production,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionDependencyAuthorityMode {
+    Live,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedProductionDependencyBinding {
+    pub component_id: String,
+    pub implementation_id: String,
+    pub implementation_version: String,
+    pub production_posture: ProductionDependencyPosture,
+    pub authority_mode: ProductionDependencyAuthorityMode,
+    pub fallback_allowed: bool,
+    pub component_binding_digest: String,
+}
+
+#[derive(Serialize)]
+struct ProductionDependencyInventoryProjection<'a> {
+    digest_contract: &'static str,
+    dependencies: &'a [ExpectedProductionDependencyBinding],
+}
+
+pub fn production_dependency_inventory_canonical_bytes(
+    dependencies: &[ExpectedProductionDependencyBinding],
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_production_dependency_inventory_projection(dependencies)?;
+    canonical_projection_bytes(ProductionDependencyInventoryProjection {
+        digest_contract: PRODUCTION_DEPENDENCY_INVENTORY_DIGEST_CONTRACT,
+        dependencies,
+    })
+}
+
+pub fn production_dependency_inventory_digest(
+    dependencies: &[ExpectedProductionDependencyBinding],
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(production_dependency_inventory_canonical_bytes(
+        dependencies,
+    )?)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FirstOwnerAuthorityNamespace {
+    pub state_contract_version: u64,
+    pub deployment_id: String,
+    pub trust_domain_ids: Vec<String>,
+    pub tenancy_mode: TenancyMode,
+    pub tenant_id: Option<String>,
+    pub authority_id: String,
+    pub authority_key_id: String,
+    pub authority_public_key_fingerprint: String,
+    pub authority_epoch: u64,
+    pub namespace_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirstOwnerClosureStatus {
+    Closed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FirstOwnerClosureRecord {
+    pub state_contract_version: u64,
+    pub deployment_id: String,
+    pub authority_namespace_digest: String,
+    pub status: FirstOwnerClosureStatus,
+    pub closure_event_id: String,
+    pub authority_sequence: u64,
+    pub first_owner_principal_id: String,
+    pub claim_request_digest: String,
+    pub capability_id: String,
+    pub capability_expires_at: String,
+    pub closed_at_not_before: String,
+    pub closed_at_not_after: String,
+    pub closure_certificate_digest: String,
+}
+
+#[derive(Serialize)]
+struct FirstOwnerAuthorityNamespaceProjection<'a> {
+    digest_contract: &'static str,
+    authority_namespace: &'a FirstOwnerAuthorityNamespace,
+}
+
+#[derive(Serialize)]
+struct FirstOwnerClosureRecordProjection<'a> {
+    digest_contract: &'static str,
+    closure_record: &'a FirstOwnerClosureRecord,
+}
+
+pub fn first_owner_authority_namespace_canonical_bytes(
+    namespace: &FirstOwnerAuthorityNamespace,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_first_owner_authority_namespace_projection(namespace)?;
+    canonical_projection_bytes(FirstOwnerAuthorityNamespaceProjection {
+        digest_contract: FIRST_OWNER_AUTHORITY_NAMESPACE_DIGEST_CONTRACT,
+        authority_namespace: namespace,
+    })
+}
+
+pub fn first_owner_authority_namespace_digest(
+    namespace: &FirstOwnerAuthorityNamespace,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(first_owner_authority_namespace_canonical_bytes(namespace)?)
+}
+
+pub fn first_owner_closure_record_canonical_bytes(
+    record: &FirstOwnerClosureRecord,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    validate_first_owner_closure_record_projection(record)?;
+    canonical_projection_bytes(FirstOwnerClosureRecordProjection {
+        digest_contract: FIRST_OWNER_CLOSURE_RECORD_DIGEST_CONTRACT,
+        closure_record: record,
+    })
+}
+
+pub fn first_owner_closure_record_digest(
+    record: &FirstOwnerClosureRecord,
+) -> Result<String, RuntimeGuardDigestError> {
+    digest_canonical_bytes(first_owner_closure_record_canonical_bytes(record)?)
+}
+
+fn canonical_projection_bytes(
+    projection: impl Serialize,
+) -> Result<Vec<u8>, RuntimeGuardDigestError> {
+    let value =
+        serde_json::to_value(projection).map_err(|_| RuntimeGuardDigestError::Projection)?;
+    canonical_json_bytes(&value).map_err(|_| RuntimeGuardDigestError::Projection)
+}
+
+fn digest_canonical_bytes(bytes: Vec<u8>) -> Result<String, RuntimeGuardDigestError> {
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && hex.bytes().any(|byte| byte != b'0')
+}
+
+fn valid_canonical_runtime_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=255).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+}
+
+fn strictly_sorted_unique_strings(values: &[String]) -> bool {
+    !values.is_empty() && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn valid_sorted_runtime_identifiers(values: &[String]) -> bool {
+    strictly_sorted_unique_strings(values)
+        && values
+            .iter()
+            .all(|value| valid_canonical_runtime_identifier(value))
+}
+
+fn valid_provider_projection(provider: &ExpectedProviderBinding) -> bool {
+    let mut errors = Vec::new();
+    validate_provider_binding("runtime-guard provider", provider, &mut errors);
+    errors.is_empty()
+}
+
+fn validate_postgresql_database_identity_projection(
+    identity: &PostgresqlDatabaseIdentity,
+) -> Result<(), RuntimeGuardDigestError> {
+    let system_identifier_is_canonical = identity
+        .cluster_system_identifier
+        .parse::<u64>()
+        .is_ok_and(|identifier| identifier > 0)
+        && !identity.cluster_system_identifier.starts_with('0');
+    if !valid_canonical_scoped_id(&identity.deployment_id, "deployment:")
+        || !valid_canonical_scoped_id(&identity.trust_domain_id, "trust-domain:")
+        || !valid_postgresql_identifier(&identity.database_name)
+        || identity.database_name == "postgres"
+        || identity.database_oid == 0
+        || !system_identifier_is_canonical
+        || !identity
+            .server_address
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.to_string() == identity.server_address)
+        || identity.server_port == 0
+        || !identity.tls_enabled
+        || !valid_canonical_runtime_identifier(&identity.tls_protocol)
+        || !valid_canonical_runtime_identifier(&identity.tls_cipher_suite)
+        || identity.tls_cipher_bits < 128
+        || identity.server_major_version != 18
+        || !identity.primary
+        || !identity.writable
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "postgresql database identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_postgresql_storage_binding_projection(
+    bindings: &[PostgresqlStorageBinding],
+) -> Result<(), RuntimeGuardDigestError> {
+    if bindings.is_empty()
+        || !bindings
+            .windows(2)
+            .all(|pair| pair[0].purpose < pair[1].purpose)
+        || bindings.iter().any(|binding| {
+            !valid_sha256_digest(&binding.provider_cluster_uid_digest)
+                || !valid_sha256_digest(&binding.persistent_volume_claim_uid_digest)
+                || !valid_sha256_digest(&binding.persistent_volume_uid_digest)
+                || !valid_canonical_runtime_identifier(&binding.csi_driver)
+                || !valid_sha256_digest(&binding.volume_handle_digest)
+                || !valid_canonical_runtime_identifier(&binding.storage_class)
+        })
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "postgresql storage bindings",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_postgresql_migration_inventory_projection(
+    migrations: &[PostgresqlMigrationInventoryRow],
+) -> Result<(), RuntimeGuardDigestError> {
+    if migrations.is_empty()
+        || !migrations
+            .windows(2)
+            .all(|pair| pair[0].version < pair[1].version)
+        || migrations.iter().any(|migration| {
+            migration.version == 0 || !valid_sha256_digest(&migration.checksum_digest)
+        })
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "postgresql migration inventory",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authenticator_runtime_binding_projection(
+    binding: &AuthenticatorRuntimeBindingProjection,
+) -> Result<(), RuntimeGuardDigestError> {
+    let verifier = &binding.verifier;
+    let profile = &binding.credential_profile;
+    let issuer_is_canonical = !verifier.canonical_issuer.is_empty()
+        && verifier.canonical_issuer.len() <= 2048
+        && verifier.canonical_issuer.trim() == verifier.canonical_issuer
+        && !verifier.canonical_issuer.chars().any(char::is_whitespace);
+    if !valid_provider_projection(&binding.provider)
+        || binding.authenticator_kind.is_legacy_mechanism()
+        || !valid_canonical_scoped_id(&verifier.verifier_id, "authenticator-verifier:")
+        || verifier.verifier_version == 0
+        || !issuer_is_canonical
+        || !valid_sorted_runtime_identifiers(&verifier.audience_ids)
+        || !valid_sorted_runtime_identifiers(&verifier.accepted_algorithm_ids)
+        || !valid_sha256_digest(&verifier.key_source_binding_digest)
+        || !verifier.expiration_required
+        || !verifier.replay_protection_enabled
+        || verifier.maximum_clock_skew_seconds > 300
+        || verifier.redirects_allowed
+        || !valid_canonical_scoped_id(&profile.profile_id, "credential-profile:")
+        || profile.profile_version == 0
+        || !valid_canonical_runtime_identifier(&profile.token_profile)
+        || profile.emits_human_principal != binding.authenticator_kind.is_human()
+        || !valid_sorted_runtime_identifiers(&binding.retained_consumer_ids)
+        || !binding
+            .retained_consumer_ids
+            .iter()
+            .all(|consumer| consumer.starts_with("runtime-consumer:"))
+        || !binding.ownership.single_runtime_owner
+        || binding.ownership.ambient_reconfiguration_allowed
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "authenticator runtime binding",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_signing_key_identity_projection(
+    identity: &ExternalSigningKeyIdentity,
+) -> Result<(), RuntimeGuardDigestError> {
+    if !valid_provider_projection(&identity.provider)
+        || !valid_sha256_digest(&identity.provider_runtime_binding_digest)
+        || !valid_canonical_scoped_id(&identity.deployment_id, "deployment:")
+        || !valid_canonical_scoped_id(&identity.trust_domain_id, "trust-domain:")
+        || !valid_canonical_runtime_identifier(&identity.protocol_version)
+        || !valid_canonical_scoped_id(&identity.purpose_id, "signing-purpose:")
+        || !valid_canonical_scoped_id(&identity.key_id, "signing-key:")
+        || identity.key_version == 0
+        || !valid_sha256_digest(&identity.public_or_opaque_metadata_digest)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "external signing key identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_signing_inventory_projection(
+    purposes: &[ExternalSigningPurposeBinding],
+) -> Result<(), RuntimeGuardDigestError> {
+    if purposes.is_empty()
+        || !purposes
+            .windows(2)
+            .all(|pair| pair[0].purpose_id < pair[1].purpose_id)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "external signing purpose inventory",
+        ));
+    }
+    for purpose in purposes {
+        if !valid_canonical_scoped_id(&purpose.purpose_id, "signing-purpose:")
+            || purpose.active_key_version == 0
+            || purpose.keys.is_empty()
+            || !purpose
+                .keys
+                .windows(2)
+                .all(|pair| pair[0].identity.key_version < pair[1].identity.key_version)
+            || purpose
+                .keys
+                .iter()
+                .map(|key| &key.identity.key_id)
+                .collect::<HashSet<_>>()
+                .len()
+                != purpose.keys.len()
+        {
+            return Err(RuntimeGuardDigestError::InvalidProjection(
+                "external signing purpose key versions",
+            ));
+        }
+        let mut active_digest = None;
+        for key in &purpose.keys {
+            validate_external_signing_key_identity_projection(&key.identity)?;
+            let recomputed = external_signing_key_identity_digest(&key.identity)?;
+            if key.key_identity_digest != recomputed
+                || key.identity.purpose_id != purpose.purpose_id
+                || key.identity.algorithm != purpose.algorithm
+                || key.identity.custody_kind != purpose.custody_kind
+            {
+                return Err(RuntimeGuardDigestError::InvalidProjection(
+                    "external signing key cross-binding",
+                ));
+            }
+            if key.identity.disposition == ExternalSigningKeyDisposition::Active {
+                if active_digest.is_some() || key.identity.key_version != purpose.active_key_version
+                {
+                    return Err(RuntimeGuardDigestError::InvalidProjection(
+                        "external signing active-key selection",
+                    ));
+                }
+                active_digest = Some(recomputed);
+            }
+        }
+        if active_digest.is_none() {
+            return Err(RuntimeGuardDigestError::InvalidProjection(
+                "external signing active-key selection",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_production_dependency_inventory_projection(
+    dependencies: &[ExpectedProductionDependencyBinding],
+) -> Result<(), RuntimeGuardDigestError> {
+    if dependencies.is_empty()
+        || !dependencies
+            .windows(2)
+            .all(|pair| pair[0].component_id < pair[1].component_id)
+        || dependencies.iter().any(|dependency| {
+            !valid_canonical_scoped_id(&dependency.component_id, "runtime-component:")
+                || !valid_canonical_scoped_id(
+                    &dependency.implementation_id,
+                    "runtime-implementation:",
+                )
+                || !valid_canonical_runtime_identifier(&dependency.implementation_version)
+                || dependency.fallback_allowed
+                || !valid_sha256_digest(&dependency.component_binding_digest)
+        })
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "production dependency inventory",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_first_owner_authority_namespace_projection(
+    namespace: &FirstOwnerAuthorityNamespace,
+) -> Result<(), RuntimeGuardDigestError> {
+    let tenant_binding_is_valid = match namespace.tenancy_mode {
+        TenancyMode::SingleTenant => namespace.tenant_id.is_none(),
+        TenancyMode::MultiTenant => namespace
+            .tenant_id
+            .as_deref()
+            .is_some_and(|tenant| valid_canonical_scoped_id(tenant, "tenant:")),
+    };
+    if namespace.state_contract_version == 0
+        || namespace.state_contract_version > i64::MAX as u64
+        || !valid_canonical_scoped_id(&namespace.deployment_id, "deployment:")
+        || !strictly_sorted_unique_strings(&namespace.trust_domain_ids)
+        || !namespace
+            .trust_domain_ids
+            .iter()
+            .all(|trust_domain| valid_canonical_scoped_id(trust_domain, "trust-domain:"))
+        || !tenant_binding_is_valid
+        || !valid_canonical_runtime_identifier(&namespace.authority_id)
+        || !valid_canonical_runtime_identifier(&namespace.authority_key_id)
+        || !valid_sha256_digest(&namespace.authority_public_key_fingerprint)
+        || namespace.authority_epoch == 0
+        || namespace.authority_epoch > i64::MAX as u64
+        || !valid_canonical_runtime_identifier(&namespace.namespace_id)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "first-owner authority namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_first_owner_closure_record_projection(
+    record: &FirstOwnerClosureRecord,
+) -> Result<(), RuntimeGuardDigestError> {
+    let canonical_timestamp = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            // The durable PostgreSQL closure record stores an exact textual
+            // preimage alongside TIMESTAMPTZ. Seconds-only UTC avoids precision
+            // loss and keeps Rust and SQL acceptance domains identical.
+            .filter(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true) == value)
+    };
+    let capability_expires_at = canonical_timestamp(&record.capability_expires_at);
+    let closed_at_not_before = canonical_timestamp(&record.closed_at_not_before);
+    let closed_at_not_after = canonical_timestamp(&record.closed_at_not_after);
+    let valid_window = capability_expires_at
+        .zip(closed_at_not_before)
+        .zip(closed_at_not_after)
+        .is_some_and(|((expires, not_before), not_after)| {
+            not_before <= not_after && not_after < expires
+        });
+    if record.state_contract_version == 0
+        || record.state_contract_version > i64::MAX as u64
+        || !valid_canonical_scoped_id(&record.deployment_id, "deployment:")
+        || !valid_sha256_digest(&record.authority_namespace_digest)
+        || !valid_canonical_runtime_identifier(&record.closure_event_id)
+        || record.authority_sequence == 0
+        || record.authority_sequence > i64::MAX as u64
+        || !valid_canonical_runtime_identifier(&record.first_owner_principal_id)
+        || !valid_sha256_digest(&record.claim_request_digest)
+        || !valid_canonical_runtime_identifier(&record.capability_id)
+        || !valid_window
+        || !valid_sha256_digest(&record.closure_certificate_digest)
+    {
+        return Err(RuntimeGuardDigestError::InvalidProjection(
+            "first-owner closure record",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1620,6 +2457,11 @@ mod tests {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
 
+    fn assert_independent_canonical_golden(actual: Vec<u8>, expected: Value) {
+        let expected = canonical_json_bytes(&expected).expect("golden JSON must canonicalize");
+        assert_eq!(actual, expected);
+    }
+
     fn expected_provider_binding(provider_id: &str) -> ExpectedProviderBinding {
         ExpectedProviderBinding {
             provider_id: provider_id.into(),
@@ -1647,6 +2489,55 @@ mod tests {
             },
         )
         .collect()
+    }
+
+    fn authenticator_runtime_binding(
+        provider_id: &str,
+        authenticator_kind: ProductionAuthenticatorKind,
+    ) -> AuthenticatorRuntimeBindingProjection {
+        let provider = expected_provider_binding(provider_id);
+        AuthenticatorRuntimeBindingProjection {
+            provider,
+            authenticator_kind,
+            verifier: AuthenticatorVerifierRuntimeProjection {
+                verifier_id: format!(
+                    "authenticator-verifier:{}",
+                    provider_id.strip_prefix("provider:").unwrap()
+                ),
+                verifier_version: 1,
+                canonical_issuer: format!(
+                    "https://identity.example.test/{}",
+                    provider_id.strip_prefix("provider:").unwrap()
+                ),
+                audience_ids: vec!["ryuki-api".into()],
+                accepted_algorithm_ids: vec!["rs256".into()],
+                key_source_kind: AuthenticatorKeySourceKind::JwtJwks,
+                key_source_binding_digest: fixture_digest('7'),
+                expiration_required: true,
+                issued_at_required: true,
+                nonce_required: authenticator_kind.is_human(),
+                replay_protection_enabled: true,
+                maximum_clock_skew_seconds: 60,
+                redirects_allowed: false,
+            },
+            credential_profile: AuthenticatorCredentialProfileRuntimeProjection {
+                profile_id: format!(
+                    "credential-profile:{}",
+                    provider_id.strip_prefix("provider:").unwrap()
+                ),
+                profile_version: 1,
+                token_profile: "jwt-access-token".into(),
+                carrier: AuthenticatorCredentialCarrier::AuthorizationBearer,
+                proof_binding: AuthenticatorProofBinding::Bearer,
+                interactive: authenticator_kind.is_human(),
+                emits_human_principal: authenticator_kind.is_human(),
+            },
+            retained_consumer_ids: vec!["runtime-consumer:api-admission".into()],
+            ownership: AuthenticatorRuntimeOwnership {
+                single_runtime_owner: true,
+                ambient_reconfiguration_allowed: false,
+            },
+        }
     }
 
     fn all_authenticator_classes() -> Vec<ExpectedAuthenticatorBinding> {
@@ -1693,6 +2584,158 @@ mod tests {
             },
         )
         .collect()
+    }
+
+    fn postgresql_database_identity(deployment_id: &str) -> PostgresqlDatabaseIdentity {
+        PostgresqlDatabaseIdentity {
+            deployment_id: deployment_id.into(),
+            trust_domain_id: "trust-domain:fixture".into(),
+            database_provider: ProductionDatabaseProvider::CloudNativePg,
+            database_name: "ryuki".into(),
+            database_oid: 16_384,
+            cluster_system_identifier: "7482247594438774091".into(),
+            server_address: "192.0.2.10".into(),
+            server_port: 5432,
+            tls_enabled: true,
+            tls_protocol: "tlsv1.3".into(),
+            tls_cipher_suite: "tls_aes_256_gcm_sha384".into(),
+            tls_cipher_bits: 256,
+            server_major_version: 18,
+            primary: true,
+            writable: true,
+        }
+    }
+
+    fn postgresql_storage_bindings() -> Vec<PostgresqlStorageBinding> {
+        vec![
+            PostgresqlStorageBinding {
+                purpose: PostgresqlStoragePurpose::Data,
+                provider_cluster_uid_digest: fixture_digest('2'),
+                persistent_volume_claim_uid_digest: fixture_digest('3'),
+                persistent_volume_uid_digest: fixture_digest('4'),
+                csi_driver: "storage.csi.example.test".into(),
+                volume_handle_digest: fixture_digest('5'),
+                storage_class: "encrypted-rwo".into(),
+            },
+            PostgresqlStorageBinding {
+                purpose: PostgresqlStoragePurpose::Wal,
+                provider_cluster_uid_digest: fixture_digest('2'),
+                persistent_volume_claim_uid_digest: fixture_digest('6'),
+                persistent_volume_uid_digest: fixture_digest('7'),
+                csi_driver: "storage.csi.example.test".into(),
+                volume_handle_digest: fixture_digest('8'),
+                storage_class: "encrypted-rwo".into(),
+            },
+        ]
+    }
+
+    fn postgresql_migrations() -> Vec<PostgresqlMigrationInventoryRow> {
+        vec![
+            PostgresqlMigrationInventoryRow {
+                version: 181,
+                checksum_digest: fixture_digest('9'),
+            },
+            PostgresqlMigrationInventoryRow {
+                version: 182,
+                checksum_digest: fixture_digest('a'),
+            },
+        ]
+    }
+
+    fn external_signing_purpose_binding(
+        purpose_id: &str,
+        algorithm: SigningAlgorithm,
+        custody_kind: ExternalKeyCustodyKind,
+        metadata_digest_character: char,
+    ) -> ExternalSigningPurposeBinding {
+        let identity = ExternalSigningKeyIdentity {
+            provider: expected_provider_binding("provider:fixture-key-custodian"),
+            provider_runtime_binding_digest: fixture_digest('b'),
+            deployment_id: "deployment:fixture".into(),
+            trust_domain_id: "trust-domain:fixture".into(),
+            protocol_version: "1.0.0".into(),
+            purpose_id: purpose_id.into(),
+            algorithm,
+            custody_kind,
+            key_id: format!(
+                "signing-key:{}-v1",
+                purpose_id.strip_prefix("signing-purpose:").unwrap()
+            ),
+            key_version: 1,
+            public_or_opaque_metadata_digest: fixture_digest(metadata_digest_character),
+            disposition: ExternalSigningKeyDisposition::Active,
+        };
+        let key_identity_digest = external_signing_key_identity_digest(&identity)
+            .expect("fixture signing identity must canonicalize");
+        ExternalSigningPurposeBinding {
+            purpose_id: purpose_id.into(),
+            algorithm,
+            custody_kind,
+            active_key_version: 1,
+            keys: vec![ExpectedExternalSigningKeyVersion {
+                key_identity_digest,
+                identity,
+            }],
+        }
+    }
+
+    fn production_dependencies() -> Vec<ExpectedProductionDependencyBinding> {
+        vec![
+            ExpectedProductionDependencyBinding {
+                component_id: "runtime-component:database".into(),
+                implementation_id: "runtime-implementation:postgresql".into(),
+                implementation_version: "18.0.0".into(),
+                production_posture: ProductionDependencyPosture::Production,
+                authority_mode: ProductionDependencyAuthorityMode::Live,
+                fallback_allowed: false,
+                component_binding_digest: fixture_digest('c'),
+            },
+            ExpectedProductionDependencyBinding {
+                component_id: "runtime-component:secret-provider".into(),
+                implementation_id: "runtime-implementation:openbao".into(),
+                implementation_version: "2.3.0".into(),
+                production_posture: ProductionDependencyPosture::Production,
+                authority_mode: ProductionDependencyAuthorityMode::Live,
+                fallback_allowed: false,
+                component_binding_digest: fixture_digest('d'),
+            },
+        ]
+    }
+
+    fn first_owner_authority_namespace(deployment_id: &str) -> FirstOwnerAuthorityNamespace {
+        FirstOwnerAuthorityNamespace {
+            state_contract_version: 1,
+            deployment_id: deployment_id.into(),
+            trust_domain_ids: vec!["trust-domain:fixture".into()],
+            tenancy_mode: TenancyMode::SingleTenant,
+            tenant_id: None,
+            authority_id: "first-owner-authority:fixture".into(),
+            authority_key_id: "first-owner-authority-key:fixture".into(),
+            authority_public_key_fingerprint: fixture_digest('e'),
+            authority_epoch: 1,
+            namespace_id: "first-owner-namespace:fixture".into(),
+        }
+    }
+
+    fn first_owner_closure_record(
+        deployment_id: &str,
+        authority_namespace_digest: &str,
+    ) -> FirstOwnerClosureRecord {
+        FirstOwnerClosureRecord {
+            state_contract_version: 1,
+            deployment_id: deployment_id.into(),
+            authority_namespace_digest: authority_namespace_digest.into(),
+            status: FirstOwnerClosureStatus::Closed,
+            closure_event_id: "first-owner-closure-event:fixture".into(),
+            authority_sequence: 1,
+            first_owner_principal_id: "principal:fixture-owner".into(),
+            claim_request_digest: fixture_digest('f'),
+            capability_id: "first-owner-capability:fixture".into(),
+            capability_expires_at: "2026-07-16T01:00:00Z".into(),
+            closed_at_not_before: "2026-07-16T00:00:00Z".into(),
+            closed_at_not_after: "2026-07-16T00:00:01Z".into(),
+            closure_certificate_digest: fixture_digest('1'),
+        }
     }
 
     fn expected_guard_value(guard_id: GuardId, deployment_id: &str) -> RuntimeGuardExpectedValue {
@@ -1982,6 +3025,381 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("must equal the root deployment profile"))
         );
+    }
+
+    #[test]
+    fn postgresql_digest_contracts_match_independent_goldens_and_reject_drifted_order() {
+        let identity = postgresql_database_identity("deployment:fixture");
+        assert_independent_canonical_golden(
+            postgresql_database_identity_canonical_bytes(&identity).unwrap(),
+            json!({
+                "digest_contract": "ryuki-postgresql-database-identity-v1",
+                "database_identity": {
+                    "deployment_id": "deployment:fixture",
+                    "trust_domain_id": "trust-domain:fixture",
+                    "database_provider": "cloudnativepg",
+                    "database_name": "ryuki",
+                    "database_oid": 16384,
+                    "cluster_system_identifier": "7482247594438774091",
+                    "server_address": "192.0.2.10",
+                    "server_port": 5432,
+                    "tls_enabled": true,
+                    "tls_protocol": "tlsv1.3",
+                    "tls_cipher_suite": "tls_aes_256_gcm_sha384",
+                    "tls_cipher_bits": 256,
+                    "server_major_version": 18,
+                    "primary": true,
+                    "writable": true
+                }
+            }),
+        );
+        let identity_digest = postgresql_database_identity_digest(&identity).unwrap();
+        let mut drifted_identity = identity.clone();
+        drifted_identity.database_name = "ryuki_shadow".into();
+        assert_ne!(
+            postgresql_database_identity_digest(&drifted_identity).unwrap(),
+            identity_digest
+        );
+
+        let bindings = postgresql_storage_bindings();
+        assert_independent_canonical_golden(
+            postgresql_storage_binding_canonical_bytes(&bindings).unwrap(),
+            json!({
+                "digest_contract": "ryuki-postgresql-storage-binding-v1",
+                "storage_bindings": [
+                    {
+                        "purpose": "data",
+                        "provider_cluster_uid_digest": fixture_digest('2'),
+                        "persistent_volume_claim_uid_digest": fixture_digest('3'),
+                        "persistent_volume_uid_digest": fixture_digest('4'),
+                        "csi_driver": "storage.csi.example.test",
+                        "volume_handle_digest": fixture_digest('5'),
+                        "storage_class": "encrypted-rwo"
+                    },
+                    {
+                        "purpose": "wal",
+                        "provider_cluster_uid_digest": fixture_digest('2'),
+                        "persistent_volume_claim_uid_digest": fixture_digest('6'),
+                        "persistent_volume_uid_digest": fixture_digest('7'),
+                        "csi_driver": "storage.csi.example.test",
+                        "volume_handle_digest": fixture_digest('8'),
+                        "storage_class": "encrypted-rwo"
+                    }
+                ]
+            }),
+        );
+        let binding_digest = postgresql_storage_binding_digest(&bindings).unwrap();
+        let mut drifted_bindings = bindings.clone();
+        drifted_bindings[0].volume_handle_digest = fixture_digest('f');
+        assert_ne!(
+            postgresql_storage_binding_digest(&drifted_bindings).unwrap(),
+            binding_digest
+        );
+        drifted_bindings.swap(0, 1);
+        assert!(postgresql_storage_binding_digest(&drifted_bindings).is_err());
+
+        let migrations = postgresql_migrations();
+        assert_independent_canonical_golden(
+            postgresql_migration_inventory_canonical_bytes(&migrations).unwrap(),
+            json!({
+                "digest_contract": "ryuki-postgresql-migration-inventory-v1",
+                "migrations": [
+                    {"version": 181, "checksum_digest": fixture_digest('9')},
+                    {"version": 182, "checksum_digest": fixture_digest('a')}
+                ]
+            }),
+        );
+        let migration_digest = postgresql_migration_inventory_digest(&migrations).unwrap();
+        let mut drifted_migrations = migrations.clone();
+        drifted_migrations[0].checksum_digest = fixture_digest('b');
+        assert_ne!(
+            postgresql_migration_inventory_digest(&drifted_migrations).unwrap(),
+            migration_digest
+        );
+        drifted_migrations.swap(0, 1);
+        assert!(postgresql_migration_inventory_digest(&drifted_migrations).is_err());
+    }
+
+    #[test]
+    fn authenticator_runtime_binding_has_an_independent_golden_and_leaf_drift() {
+        let binding = authenticator_runtime_binding(
+            "provider:fixture-oidc",
+            ProductionAuthenticatorKind::Oidc,
+        );
+        assert_independent_canonical_golden(
+            authenticator_runtime_binding_canonical_bytes(&binding).unwrap(),
+            json!({
+                "digest_contract": "ryuki-authenticator-runtime-binding-v1",
+                "runtime_binding": {
+                    "provider": {
+                        "provider_id": "provider:fixture-oidc",
+                        "configuration_version": 1,
+                        "configuration_payload_digest": fixture_digest('1'),
+                        "lifecycle_record_version": 1,
+                        "lifecycle_state": "active",
+                        "capability_descriptor_id": "capability-descriptor:fixture-provider",
+                        "capability_descriptor_version": 1,
+                        "adapter_kind": "fixture.provider",
+                        "adapter_version": "1.0.0"
+                    },
+                    "authenticator_kind": "oidc",
+                    "verifier": {
+                        "verifier_id": "authenticator-verifier:fixture-oidc",
+                        "verifier_version": 1,
+                        "canonical_issuer": "https://identity.example.test/fixture-oidc",
+                        "audience_ids": ["ryuki-api"],
+                        "accepted_algorithm_ids": ["rs256"],
+                        "key_source_kind": "jwt-jwks",
+                        "key_source_binding_digest": fixture_digest('7'),
+                        "expiration_required": true,
+                        "issued_at_required": true,
+                        "nonce_required": true,
+                        "replay_protection_enabled": true,
+                        "maximum_clock_skew_seconds": 60,
+                        "redirects_allowed": false
+                    },
+                    "credential_profile": {
+                        "profile_id": "credential-profile:fixture-oidc",
+                        "profile_version": 1,
+                        "token_profile": "jwt-access-token",
+                        "carrier": "authorization-bearer",
+                        "proof_binding": "bearer",
+                        "interactive": true,
+                        "emits_human_principal": true
+                    },
+                    "retained_consumer_ids": ["runtime-consumer:api-admission"],
+                    "ownership": {
+                        "single_runtime_owner": true,
+                        "ambient_reconfiguration_allowed": false
+                    }
+                }
+            }),
+        );
+        let digest = authenticator_runtime_binding_digest(&binding).unwrap();
+        let mut drifted = binding.clone();
+        drifted.verifier.maximum_clock_skew_seconds = 61;
+        assert_ne!(
+            authenticator_runtime_binding_digest(&drifted).unwrap(),
+            digest
+        );
+
+        let mut reordered = binding.clone();
+        reordered.retained_consumer_ids = vec![
+            "runtime-consumer:zeta".into(),
+            "runtime-consumer:alpha".into(),
+        ];
+        assert!(authenticator_runtime_binding_digest(&reordered).is_err());
+
+        let mut raw = serde_json::to_value(binding).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("fallback".into(), json!(true));
+        assert!(serde_json::from_value::<AuthenticatorRuntimeBindingProjection>(raw).is_err());
+    }
+
+    #[test]
+    fn external_signing_contracts_bind_key_identity_keyring_and_active_selection() {
+        let purpose = external_signing_purpose_binding(
+            "signing-purpose:control-plane-grants",
+            SigningAlgorithm::Ed25519,
+            ExternalKeyCustodyKind::Kms,
+            'c',
+        );
+        let identity = &purpose.keys[0].identity;
+        let expected_identity = json!({
+            "provider": {
+                "provider_id": "provider:fixture-key-custodian",
+                "configuration_version": 1,
+                "configuration_payload_digest": fixture_digest('1'),
+                "lifecycle_record_version": 1,
+                "lifecycle_state": "active",
+                "capability_descriptor_id": "capability-descriptor:fixture-provider",
+                "capability_descriptor_version": 1,
+                "adapter_kind": "fixture.provider",
+                "adapter_version": "1.0.0"
+            },
+            "provider_runtime_binding_digest": fixture_digest('b'),
+            "deployment_id": "deployment:fixture",
+            "trust_domain_id": "trust-domain:fixture",
+            "protocol_version": "1.0.0",
+            "purpose_id": "signing-purpose:control-plane-grants",
+            "algorithm": "ed25519",
+            "custody_kind": "kms",
+            "key_id": "signing-key:control-plane-grants-v1",
+            "key_version": 1,
+            "public_or_opaque_metadata_digest": fixture_digest('c'),
+            "disposition": "active"
+        });
+        assert_independent_canonical_golden(
+            external_signing_key_identity_canonical_bytes(identity).unwrap(),
+            json!({
+                "digest_contract": "ryuki-external-signing-key-identity-v1",
+                "key_identity": expected_identity.clone()
+            }),
+        );
+        assert_independent_canonical_golden(
+            external_signing_inventory_canonical_bytes(std::slice::from_ref(&purpose)).unwrap(),
+            json!({
+                "digest_contract": "ryuki-external-signing-inventory-v1",
+                "purposes": [{
+                    "purpose_id": "signing-purpose:control-plane-grants",
+                    "algorithm": "ed25519",
+                    "custody_kind": "kms",
+                    "active_key_version": 1,
+                    "keys": [{
+                        "key_identity_digest": purpose.keys[0].key_identity_digest.clone(),
+                        "identity": expected_identity
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(
+            external_signing_active_key_identity_digest(&purpose).unwrap(),
+            purpose.keys[0].key_identity_digest.clone()
+        );
+
+        let original_inventory_digest =
+            external_signing_inventory_digest(std::slice::from_ref(&purpose)).unwrap();
+        let mut drifted = purpose.clone();
+        drifted.keys[0].identity.public_or_opaque_metadata_digest = fixture_digest('d');
+        assert!(
+            external_signing_inventory_digest(std::slice::from_ref(&drifted)).is_err(),
+            "a copied key-identity digest cannot authorize changed leaves"
+        );
+        drifted.keys[0].key_identity_digest =
+            external_signing_key_identity_digest(&drifted.keys[0].identity).unwrap();
+        assert_ne!(
+            external_signing_inventory_digest(std::slice::from_ref(&drifted)).unwrap(),
+            original_inventory_digest
+        );
+
+        let mut purposes = vec![
+            purpose,
+            external_signing_purpose_binding(
+                "signing-purpose:session-credentials",
+                SigningAlgorithm::HmacSha256,
+                ExternalKeyCustodyKind::Hsm,
+                'd',
+            ),
+        ];
+        purposes.swap(0, 1);
+        assert!(external_signing_inventory_digest(&purposes).is_err());
+    }
+
+    #[test]
+    fn dependency_inventory_has_an_independent_golden_and_rejects_fallback_or_order_drift() {
+        let dependencies = production_dependencies();
+        assert_independent_canonical_golden(
+            production_dependency_inventory_canonical_bytes(&dependencies).unwrap(),
+            json!({
+                "digest_contract": "ryuki-production-dependency-inventory-v1",
+                "dependencies": [
+                    {
+                        "component_id": "runtime-component:database",
+                        "implementation_id": "runtime-implementation:postgresql",
+                        "implementation_version": "18.0.0",
+                        "production_posture": "production",
+                        "authority_mode": "live",
+                        "fallback_allowed": false,
+                        "component_binding_digest": fixture_digest('c')
+                    },
+                    {
+                        "component_id": "runtime-component:secret-provider",
+                        "implementation_id": "runtime-implementation:openbao",
+                        "implementation_version": "2.3.0",
+                        "production_posture": "production",
+                        "authority_mode": "live",
+                        "fallback_allowed": false,
+                        "component_binding_digest": fixture_digest('d')
+                    }
+                ]
+            }),
+        );
+        let digest = production_dependency_inventory_digest(&dependencies).unwrap();
+        let mut drifted = dependencies.clone();
+        drifted[0].component_binding_digest = fixture_digest('e');
+        assert_ne!(
+            production_dependency_inventory_digest(&drifted).unwrap(),
+            digest
+        );
+        drifted[0].fallback_allowed = true;
+        assert!(production_dependency_inventory_digest(&drifted).is_err());
+
+        let mut reordered = dependencies;
+        reordered.swap(0, 1);
+        assert!(production_dependency_inventory_digest(&reordered).is_err());
+    }
+
+    #[test]
+    fn first_owner_contracts_bind_namespace_and_immutable_closure_leaves() {
+        let namespace = first_owner_authority_namespace("deployment:fixture");
+        assert_independent_canonical_golden(
+            first_owner_authority_namespace_canonical_bytes(&namespace).unwrap(),
+            json!({
+                "digest_contract": "ryuki-first-owner-authority-namespace-v1",
+                "authority_namespace": {
+                    "state_contract_version": 1,
+                    "deployment_id": "deployment:fixture",
+                    "trust_domain_ids": ["trust-domain:fixture"],
+                    "tenancy_mode": "single_tenant",
+                    "tenant_id": null,
+                    "authority_id": "first-owner-authority:fixture",
+                    "authority_key_id": "first-owner-authority-key:fixture",
+                    "authority_public_key_fingerprint": fixture_digest('e'),
+                    "authority_epoch": 1,
+                    "namespace_id": "first-owner-namespace:fixture"
+                }
+            }),
+        );
+        let namespace_digest = first_owner_authority_namespace_digest(&namespace).unwrap();
+        let closure = first_owner_closure_record("deployment:fixture", &namespace_digest);
+        assert_independent_canonical_golden(
+            first_owner_closure_record_canonical_bytes(&closure).unwrap(),
+            json!({
+                "digest_contract": "ryuki-first-owner-closure-record-v1",
+                "closure_record": {
+                    "state_contract_version": 1,
+                    "deployment_id": "deployment:fixture",
+                    "authority_namespace_digest": namespace_digest,
+                    "status": "closed",
+                    "closure_event_id": "first-owner-closure-event:fixture",
+                    "authority_sequence": 1,
+                    "first_owner_principal_id": "principal:fixture-owner",
+                    "claim_request_digest": fixture_digest('f'),
+                    "capability_id": "first-owner-capability:fixture",
+                    "capability_expires_at": "2026-07-16T01:00:00Z",
+                    "closed_at_not_before": "2026-07-16T00:00:00Z",
+                    "closed_at_not_after": "2026-07-16T00:00:01Z",
+                    "closure_certificate_digest": fixture_digest('1')
+                }
+            }),
+        );
+        let closure_digest = first_owner_closure_record_digest(&closure).unwrap();
+        let mut drifted_closure = closure.clone();
+        drifted_closure.claim_request_digest = fixture_digest('2');
+        assert_ne!(
+            first_owner_closure_record_digest(&drifted_closure).unwrap(),
+            closure_digest
+        );
+        drifted_closure.closed_at_not_after = "2026-07-16T02:00:00Z".into();
+        assert!(first_owner_closure_record_digest(&drifted_closure).is_err());
+
+        let mut fractional_timestamp = closure.clone();
+        fractional_timestamp.closed_at_not_after = "2026-07-16T00:00:01.001Z".into();
+        assert!(first_owner_closure_record_digest(&fractional_timestamp).is_err());
+
+        let mut oversized_sequence = closure;
+        oversized_sequence.authority_sequence = (i64::MAX as u64) + 1;
+        assert!(first_owner_closure_record_digest(&oversized_sequence).is_err());
+
+        let mut oversized_namespace = namespace.clone();
+        oversized_namespace.authority_epoch = (i64::MAX as u64) + 1;
+        assert!(first_owner_authority_namespace_digest(&oversized_namespace).is_err());
+
+        let mut unsorted_namespace = namespace;
+        unsorted_namespace.trust_domain_ids =
+            vec!["trust-domain:zeta".into(), "trust-domain:alpha".into()];
+        assert!(first_owner_authority_namespace_digest(&unsorted_namespace).is_err());
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ryuki_core::config::{AuthMode, RyukiConfig};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::contracts::LocalLoginThrottle;
 use crate::cookie_runtime::ApiCookieRuntime;
@@ -25,6 +27,307 @@ const DISABLED_OIDC_JWKS_ENDPOINT: &str = "https://disabled.invalid/jwks";
 const DISABLED_OIDC_ISSUER: &str = "https://disabled.invalid/issuer";
 const DISABLED_OIDC_AUDIENCE: &str = "disabled";
 const OIDC_CLOCK_SKEW_SECONDS: u64 = 60;
+const AUTHENTICATOR_LEAF_DIGEST_CONTRACT: &[u8] = b"ryuki-authenticator-runtime-leaf-binding-v1";
+
+const ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] = b"entra-issuer-authority-binding";
+const ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"entra-audience-client-binding";
+const GENERIC_OIDC_ISSUER_AUTHORITY_BINDING_DOMAIN: &[u8] =
+    b"generic-oidc-issuer-authority-binding";
+const GENERIC_OIDC_AUDIENCE_CLIENT_BINDING_DOMAIN: &[u8] = b"generic-oidc-audience-client-binding";
+
+/// Closed classification of the authentication mode owned by this runtime.
+///
+/// Only `EntraOidc` describes a currently implemented production posture.
+/// The other variants remain observable so development keeps working, but
+/// cannot be confused with a production authenticator during admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductionAuthenticatorPosture {
+    EntraOidc,
+    CredentialFreeMockDryRun,
+    CredentialFreeStaticDryRun,
+    PasswordLocal,
+}
+
+/// Current process-local consumers of the authenticator owner.
+///
+/// This list is intentionally closed to implementations that exist in this
+/// binary. Broker, passkey, service-principal, API-token, and workload
+/// authenticators must not appear until they have their own runtime owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthenticatorRuntimeConsumer {
+    EntraBearerRequestAdmission,
+    EntraBrowserSso,
+    GenericOidcBrowserCallback,
+    LocalPasswordLogin,
+    CredentialFreeRequestAdmission,
+}
+
+/// The client-authentication mechanism actually used by the generic browser
+/// callback. Only presence is retained; credential material is never copied
+/// into the observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenericOidcClientAuthentication {
+    Disabled,
+    ClientSecretPost { credential_present: bool },
+}
+
+/// Closed verifier algorithm policy implemented by both current OIDC paths.
+/// A free-form algorithm label would let a future caller claim policy that the
+/// retained validators do not actually enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthenticatorSignatureAlgorithm {
+    Rs256,
+}
+
+/// Independently measured, non-secret leaves of the exact retained runtime.
+///
+/// The binding digests are computed here from admitted configuration using
+/// distinct domains. They are neither caller-supplied expected values nor an
+/// aggregate authenticator-inventory digest. Raw issuer, authority, tenant,
+/// client, object, token, and credential values are not retained.
+#[derive(PartialEq, Eq)]
+pub(crate) struct AuthenticatorRuntimeObservation {
+    posture: ProductionAuthenticatorPosture,
+    consumers: Box<[AuthenticatorRuntimeConsumer]>,
+    entra_issuer_authority_binding_digest: Option<String>,
+    entra_audience_client_binding_digest: Option<String>,
+    entra_signature_algorithm: Option<AuthenticatorSignatureAlgorithm>,
+    entra_jwks_ttl_seconds: u64,
+    entra_validation_leeway_seconds: u64,
+    generic_oidc_enabled: bool,
+    generic_oidc_issuer_authority_binding_digest: Option<String>,
+    generic_oidc_audience_client_binding_digest: Option<String>,
+    generic_oidc_signature_algorithm: Option<AuthenticatorSignatureAlgorithm>,
+    generic_oidc_validation_leeway_seconds: Option<u64>,
+    generic_oidc_client_authentication: GenericOidcClientAuthentication,
+}
+
+impl fmt::Debug for AuthenticatorRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatorRuntimeObservation")
+            .field("posture", &self.posture)
+            .field("consumers", &self.consumers)
+            .field("identity_bindings", &"[REDACTED]")
+            .field("verifier_policy", &"[RETAINED]")
+            .finish()
+    }
+}
+
+impl AuthenticatorRuntimeObservation {
+    fn measure(config: &RyukiConfig) -> Result<Self, String> {
+        let posture = match &config.auth_mode {
+            AuthMode::EntraId => ProductionAuthenticatorPosture::EntraOidc,
+            AuthMode::MockDryRun => ProductionAuthenticatorPosture::CredentialFreeMockDryRun,
+            AuthMode::StaticDryRun => ProductionAuthenticatorPosture::CredentialFreeStaticDryRun,
+            AuthMode::Local => ProductionAuthenticatorPosture::PasswordLocal,
+        };
+
+        let mut consumers = match posture {
+            ProductionAuthenticatorPosture::EntraOidc => {
+                let mut consumers = vec![AuthenticatorRuntimeConsumer::EntraBearerRequestAdmission];
+                if !config.entra_tenant_id.is_empty()
+                    && !config.entra_client_id.is_empty()
+                    && !config.entra_redirect_uri.is_empty()
+                {
+                    consumers.push(AuthenticatorRuntimeConsumer::EntraBrowserSso);
+                }
+                consumers
+            }
+            ProductionAuthenticatorPosture::CredentialFreeMockDryRun
+            | ProductionAuthenticatorPosture::CredentialFreeStaticDryRun => {
+                vec![AuthenticatorRuntimeConsumer::CredentialFreeRequestAdmission]
+            }
+            ProductionAuthenticatorPosture::PasswordLocal => {
+                vec![AuthenticatorRuntimeConsumer::LocalPasswordLogin]
+            }
+        };
+        if config.oidc.enabled {
+            consumers.push(AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback);
+        }
+
+        let (entra_issuer_authority_binding_digest, entra_audience_client_binding_digest) =
+            if posture == ProductionAuthenticatorPosture::EntraOidc {
+                let issuer = normalized_entra_issuer(config)?;
+                let api_audience = format!("api://{}", config.entra_client_id);
+                (
+                    Some(leaf_binding_digest(
+                        ENTRA_ISSUER_AUTHORITY_BINDING_DOMAIN,
+                        &[issuer.as_bytes()],
+                    )),
+                    Some(leaf_binding_digest(
+                        ENTRA_AUDIENCE_CLIENT_BINDING_DOMAIN,
+                        &[config.entra_client_id.as_bytes(), api_audience.as_bytes()],
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+
+        let (
+            generic_oidc_issuer_authority_binding_digest,
+            generic_oidc_audience_client_binding_digest,
+            generic_oidc_validation_leeway_seconds,
+            generic_oidc_client_authentication,
+        ) = if config.oidc.enabled {
+            let issuer = validated_exact_identity_url(&config.oidc.issuer, "generic OIDC issuer")?;
+            (
+                Some(leaf_binding_digest(
+                    GENERIC_OIDC_ISSUER_AUTHORITY_BINDING_DOMAIN,
+                    &[issuer.as_bytes()],
+                )),
+                Some(leaf_binding_digest(
+                    GENERIC_OIDC_AUDIENCE_CLIENT_BINDING_DOMAIN,
+                    &[config.oidc.client_id.as_bytes()],
+                )),
+                Some(OIDC_CLOCK_SKEW_SECONDS),
+                GenericOidcClientAuthentication::ClientSecretPost {
+                    credential_present: !config.oidc.client_secret.is_empty(),
+                },
+            )
+        } else {
+            (None, None, None, GenericOidcClientAuthentication::Disabled)
+        };
+
+        Ok(Self {
+            posture,
+            consumers: consumers.into_boxed_slice(),
+            entra_issuer_authority_binding_digest,
+            entra_audience_client_binding_digest,
+            entra_signature_algorithm: (posture == ProductionAuthenticatorPosture::EntraOidc)
+                .then_some(AuthenticatorSignatureAlgorithm::Rs256),
+            entra_jwks_ttl_seconds: config.entra_jwks_ttl_secs,
+            entra_validation_leeway_seconds: config.entra_leeway_secs,
+            generic_oidc_enabled: config.oidc.enabled,
+            generic_oidc_issuer_authority_binding_digest,
+            generic_oidc_audience_client_binding_digest,
+            generic_oidc_signature_algorithm: config
+                .oidc
+                .enabled
+                .then_some(AuthenticatorSignatureAlgorithm::Rs256),
+            generic_oidc_validation_leeway_seconds,
+            generic_oidc_client_authentication,
+        })
+    }
+
+    pub(crate) fn posture(&self) -> ProductionAuthenticatorPosture {
+        self.posture
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consumers(&self) -> &[AuthenticatorRuntimeConsumer] {
+        &self.consumers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_issuer_authority_binding_digest(&self) -> Option<&str> {
+        self.entra_issuer_authority_binding_digest.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_audience_client_binding_digest(&self) -> Option<&str> {
+        self.entra_audience_client_binding_digest.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_signature_algorithm(&self) -> Option<AuthenticatorSignatureAlgorithm> {
+        self.entra_signature_algorithm
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_jwks_ttl_seconds(&self) -> u64 {
+        self.entra_jwks_ttl_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entra_validation_leeway_seconds(&self) -> u64 {
+        self.entra_validation_leeway_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_enabled(&self) -> bool {
+        self.generic_oidc_enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_issuer_authority_binding_digest(&self) -> Option<&str> {
+        self.generic_oidc_issuer_authority_binding_digest.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_audience_client_binding_digest(&self) -> Option<&str> {
+        self.generic_oidc_audience_client_binding_digest.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_signature_algorithm(
+        &self,
+    ) -> Option<AuthenticatorSignatureAlgorithm> {
+        self.generic_oidc_signature_algorithm
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_validation_leeway_seconds(&self) -> Option<u64> {
+        self.generic_oidc_validation_leeway_seconds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_oidc_client_authentication(&self) -> GenericOidcClientAuthentication {
+        self.generic_oidc_client_authentication
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthenticatorRuntimePostureError {
+    #[error("credential-free authentication cannot satisfy production admission")]
+    CredentialFree,
+    #[error("password-based local authentication cannot satisfy production admission")]
+    PasswordLocal,
+}
+
+fn normalized_identity_url(raw: &str, label: &'static str) -> Result<String, String> {
+    crate::oidc_callback::parse_identity_endpoint(raw)
+        .map(|url| url.to_string())
+        .map_err(|reason| format!("{label} is invalid: {reason}"))
+}
+
+fn validated_exact_identity_url(raw: &str, label: &'static str) -> Result<String, String> {
+    crate::oidc_callback::parse_identity_endpoint(raw)
+        .map(|_| raw.to_owned())
+        .map_err(|reason| format!("{label} is invalid: {reason}"))
+}
+
+fn normalized_entra_issuer(config: &RyukiConfig) -> Result<String, String> {
+    let mut authority = crate::oidc_callback::parse_identity_endpoint(&config.entra_authority)
+        .map_err(|reason| format!("Entra authority is invalid: {reason}"))?;
+    if authority.query().is_some() {
+        return Err("Entra authority must not contain a query".to_string());
+    }
+    let mut path = authority
+        .path_segments_mut()
+        .map_err(|_| "Entra authority cannot be used as a URL base".to_string())?;
+    path.pop_if_empty();
+    path.push(&config.entra_tenant_id);
+    path.push("v2.0");
+    drop(path);
+    Ok(authority.to_string())
+}
+
+fn leaf_binding_digest(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, AUTHENTICATOR_LEAF_DIGEST_CONTRACT);
+    update_length_prefixed(&mut digest, domain);
+    for field in fields {
+        update_length_prefixed(&mut digest, field);
+    }
+    let digest = digest.finalize();
+    format!("sha256:{digest:x}")
+}
+
+fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
 
 /// One non-cloneable owner for the exact authenticator objects used by the API.
 ///
@@ -34,6 +337,7 @@ const OIDC_CLOCK_SKEW_SECONDS: u64 = 60;
 pub(crate) struct ApiAuthenticatorRuntime {
     auth_mode: AuthMode,
     generic_oidc_enabled: bool,
+    operational_observation: Arc<AuthenticatorRuntimeObservation>,
     api_cookie_runtime: Arc<ApiCookieRuntime>,
     entra_bearer_validator: Arc<EntraTokenValidator>,
     oidc_callback_dependencies: Arc<OidcCallbackDeps>,
@@ -52,6 +356,7 @@ impl ApiAuthenticatorRuntime {
         api_cookie_runtime
             .validate_config_binding(config, production_profile)
             .map_err(|error| error.to_string())?;
+        let operational_observation = Arc::new(AuthenticatorRuntimeObservation::measure(config)?);
 
         let entra_bearer_validator = Arc::new(EntraTokenValidator::from_app_config(
             &config.entra_tenant_id,
@@ -62,18 +367,26 @@ impl ApiAuthenticatorRuntime {
         ));
 
         let (token_endpoint, jwks_endpoint, issuer, audience) = if config.oidc.enabled {
+            // The issuer claim is an exact protocol identifier. Parse it to
+            // enforce the endpoint policy, but retain the configured spelling:
+            // `Url::to_string()` adds a trailing slash to a bare origin and
+            // would make otherwise-valid `iss` claims fail exact comparison.
+            let issuer = validated_exact_identity_url(&config.oidc.issuer, "generic OIDC issuer")?;
             (
-                config.oidc.token_endpoint.as_str(),
-                config.oidc.jwks_uri.as_str(),
-                config.oidc.issuer.as_str(),
-                config.oidc.client_id.as_str(),
+                normalized_identity_url(
+                    &config.oidc.token_endpoint,
+                    "generic OIDC token endpoint",
+                )?,
+                normalized_identity_url(&config.oidc.jwks_uri, "generic OIDC JWKS endpoint")?,
+                issuer,
+                config.oidc.client_id.clone(),
             )
         } else {
             (
-                DISABLED_OIDC_TOKEN_ENDPOINT,
-                DISABLED_OIDC_JWKS_ENDPOINT,
-                DISABLED_OIDC_ISSUER,
-                DISABLED_OIDC_AUDIENCE,
+                DISABLED_OIDC_TOKEN_ENDPOINT.to_string(),
+                DISABLED_OIDC_JWKS_ENDPOINT.to_string(),
+                DISABLED_OIDC_ISSUER.to_string(),
+                DISABLED_OIDC_AUDIENCE.to_string(),
             )
         };
         let exchanger: Arc<dyn TokenExchanger + Send + Sync> =
@@ -92,6 +405,7 @@ impl ApiAuthenticatorRuntime {
         Ok(Arc::new(Self {
             auth_mode: config.auth_mode.clone(),
             generic_oidc_enabled: config.oidc.enabled,
+            operational_observation,
             api_cookie_runtime,
             entra_bearer_validator,
             oidc_callback_dependencies,
@@ -102,6 +416,31 @@ impl ApiAuthenticatorRuntime {
 
     pub(crate) fn auth_mode(&self) -> &AuthMode {
         &self.auth_mode
+    }
+
+    /// Exact non-secret operational leaves measured by the private
+    /// constructor. Callers can retain this Arc but cannot forge an
+    /// observation through a public constructor.
+    pub(crate) fn operational_observation(&self) -> &Arc<AuthenticatorRuntimeObservation> {
+        &self.operational_observation
+    }
+
+    /// Reject every currently implemented development or password posture.
+    /// A generic OIDC callback cannot launder a rejected base mode because
+    /// admission is determined by the closed `auth_mode` posture first.
+    pub(crate) fn validate_production_posture(
+        &self,
+    ) -> Result<&AuthenticatorRuntimeObservation, AuthenticatorRuntimePostureError> {
+        match self.operational_observation.posture() {
+            ProductionAuthenticatorPosture::EntraOidc => Ok(&self.operational_observation),
+            ProductionAuthenticatorPosture::CredentialFreeMockDryRun
+            | ProductionAuthenticatorPosture::CredentialFreeStaticDryRun => {
+                Err(AuthenticatorRuntimePostureError::CredentialFree)
+            }
+            ProductionAuthenticatorPosture::PasswordLocal => {
+                Err(AuthenticatorRuntimePostureError::PasswordLocal)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -128,6 +467,35 @@ impl ApiAuthenticatorRuntime {
     pub(crate) fn retains_cookie_runtime(&self, runtime: &Arc<ApiCookieRuntime>) -> bool {
         Arc::ptr_eq(&self.api_cookie_runtime, runtime)
     }
+
+    pub(crate) fn retains_operational_observation(
+        &self,
+        observation: &Arc<AuthenticatorRuntimeObservation>,
+    ) -> bool {
+        Arc::ptr_eq(&self.operational_observation, observation)
+    }
+
+    pub(crate) fn retains_entra_bearer_validator(
+        &self,
+        validator: &Arc<EntraTokenValidator>,
+    ) -> bool {
+        Arc::ptr_eq(&self.entra_bearer_validator, validator)
+    }
+
+    pub(crate) fn retains_oidc_callback_dependencies(
+        &self,
+        dependencies: &Arc<OidcCallbackDeps>,
+    ) -> bool {
+        Arc::ptr_eq(&self.oidc_callback_dependencies, dependencies)
+    }
+
+    pub(crate) fn retains_entra_sso_dependencies(&self, dependencies: &Arc<EntraSsoDeps>) -> bool {
+        Arc::ptr_eq(&self.entra_sso_dependencies, dependencies)
+    }
+
+    pub(crate) fn retains_local_login_throttle(&self, throttle: &Arc<LocalLoginThrottle>) -> bool {
+        Arc::ptr_eq(&self.local_login_throttle, throttle)
+    }
 }
 
 impl fmt::Debug for ApiAuthenticatorRuntime {
@@ -136,6 +504,7 @@ impl fmt::Debug for ApiAuthenticatorRuntime {
             .debug_struct("ApiAuthenticatorRuntime")
             .field("auth_mode", &self.auth_mode.as_str())
             .field("generic_oidc_enabled", &self.generic_oidc_enabled)
+            .field("operational_observation", &"[RETAINED]")
             .field("api_cookie_runtime", &"[RETAINED]")
             .field("entra_bearer_validator", &"[RETAINED]")
             .field("oidc_callback_dependencies", &"[RETAINED]")
@@ -149,7 +518,9 @@ impl fmt::Debug for ApiAuthenticatorRuntime {
 mod tests {
     use super::*;
 
-    fn runtime(config: &RyukiConfig) -> (Arc<ApiCookieRuntime>, Arc<ApiAuthenticatorRuntime>) {
+    fn build_runtime(
+        config: &RyukiConfig,
+    ) -> (Arc<ApiCookieRuntime>, Arc<ApiAuthenticatorRuntime>) {
         let cookie_runtime = ApiCookieRuntime::from_admitted_config(config, false)
             .expect("test config must construct cookie runtime");
         let authenticator_runtime = ApiAuthenticatorRuntime::from_admitted_config(
@@ -164,9 +535,19 @@ mod tests {
     #[test]
     fn retains_exact_cookie_and_authenticator_allocations() {
         let config = RyukiConfig::default();
-        let (cookie_runtime, runtime) = runtime(&config);
+        let (cookie_runtime, runtime) = build_runtime(&config);
+        let observation = Arc::clone(runtime.operational_observation());
+        let entra_bearer_validator = runtime.entra_bearer_validator();
+        let oidc_callback_dependencies = runtime.oidc_callback_dependencies();
+        let entra_sso_dependencies = runtime.entra_sso_dependencies();
+        let local_login_throttle = runtime.local_login_throttle();
 
         assert!(runtime.retains_cookie_runtime(&cookie_runtime));
+        assert!(runtime.retains_operational_observation(&observation));
+        assert!(runtime.retains_entra_bearer_validator(&entra_bearer_validator));
+        assert!(runtime.retains_oidc_callback_dependencies(&oidc_callback_dependencies));
+        assert!(runtime.retains_entra_sso_dependencies(&entra_sso_dependencies));
+        assert!(runtime.retains_local_login_throttle(&local_login_throttle));
         assert!(Arc::ptr_eq(
             &runtime.api_cookie_runtime(),
             &runtime.api_cookie_runtime()
@@ -187,6 +568,15 @@ mod tests {
             &runtime.local_login_throttle(),
             &runtime.local_login_throttle()
         ));
+
+        let (other_cookie_runtime, other_runtime) = build_runtime(&config);
+        assert!(!runtime.retains_cookie_runtime(&other_cookie_runtime));
+        assert!(!runtime.retains_operational_observation(other_runtime.operational_observation()));
+        assert!(!runtime.retains_entra_bearer_validator(&other_runtime.entra_bearer_validator()));
+        assert!(!runtime
+            .retains_oidc_callback_dependencies(&other_runtime.oidc_callback_dependencies()));
+        assert!(!runtime.retains_entra_sso_dependencies(&other_runtime.entra_sso_dependencies()));
+        assert!(!runtime.retains_local_login_throttle(&other_runtime.local_login_throttle()));
     }
 
     #[test]
@@ -194,10 +584,32 @@ mod tests {
         let config = RyukiConfig::default();
         assert!(!config.oidc.enabled);
 
-        let (_, runtime) = runtime(&config);
+        let (_, runtime) = build_runtime(&config);
 
         assert!(!runtime.generic_oidc_enabled);
         assert_eq!(runtime.auth_mode(), &config.auth_mode);
+        let observation = runtime.operational_observation();
+        assert_eq!(
+            observation.posture(),
+            ProductionAuthenticatorPosture::CredentialFreeMockDryRun
+        );
+        assert_eq!(
+            observation.consumers(),
+            &[AuthenticatorRuntimeConsumer::CredentialFreeRequestAdmission]
+        );
+        assert_eq!(
+            observation.generic_oidc_client_authentication(),
+            GenericOidcClientAuthentication::Disabled
+        );
+        assert!(!observation.generic_oidc_enabled());
+        assert!(observation
+            .generic_oidc_issuer_authority_binding_digest()
+            .is_none());
+        assert!(observation
+            .generic_oidc_audience_client_binding_digest()
+            .is_none());
+        assert_eq!(observation.generic_oidc_validation_leeway_seconds(), None);
+        assert_eq!(observation.generic_oidc_signature_algorithm(), None);
     }
 
     #[test]
@@ -209,19 +621,247 @@ mod tests {
         config.oidc.issuer = "https://identity.example.test".to_string();
         config.oidc.client_id = "runtime-test-client".to_string();
 
-        let (_, runtime) = runtime(&config);
+        let (_, runtime) = build_runtime(&config);
 
         assert!(runtime.generic_oidc_enabled);
         assert!(Arc::ptr_eq(
             &runtime.oidc_callback_dependencies(),
             &runtime.oidc_callback_dependencies()
         ));
+        let observation = runtime.operational_observation();
+        assert!(observation.generic_oidc_enabled());
+        assert!(observation
+            .generic_oidc_issuer_authority_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert!(observation
+            .generic_oidc_audience_client_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert_eq!(
+            observation.generic_oidc_validation_leeway_seconds(),
+            Some(OIDC_CLOCK_SKEW_SECONDS)
+        );
+        assert_eq!(
+            observation.generic_oidc_signature_algorithm(),
+            Some(AuthenticatorSignatureAlgorithm::Rs256)
+        );
+        assert_eq!(
+            observation.generic_oidc_client_authentication(),
+            GenericOidcClientAuthentication::ClientSecretPost {
+                credential_present: false,
+            }
+        );
+        assert!(observation
+            .consumers()
+            .contains(&AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback));
+        assert_eq!(
+            validated_exact_identity_url("https://identity.example.test", "generic OIDC issuer")
+                .unwrap(),
+            "https://identity.example.test"
+        );
+
+        let mut slash_variant = config;
+        slash_variant.oidc.issuer = "https://identity.example.test/".to_string();
+        let (_, slash_runtime) = build_runtime(&slash_variant);
+        assert_ne!(
+            observation.generic_oidc_issuer_authority_binding_digest(),
+            slash_runtime
+                .operational_observation()
+                .generic_oidc_issuer_authority_binding_digest(),
+            "exact issuer spellings must remain distinct verifier bindings"
+        );
+    }
+
+    #[test]
+    fn production_posture_rejects_credential_free_and_password_local_modes() {
+        for mode in [AuthMode::MockDryRun, AuthMode::StaticDryRun] {
+            let config = RyukiConfig {
+                auth_mode: mode,
+                ..RyukiConfig::default()
+            };
+            let (_, runtime) = build_runtime(&config);
+            assert_eq!(
+                runtime.validate_production_posture(),
+                Err(AuthenticatorRuntimePostureError::CredentialFree)
+            );
+        }
+
+        let config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            ..RyukiConfig::default()
+        };
+        let (_, runtime) = build_runtime(&config);
+        assert_eq!(
+            runtime.validate_production_posture(),
+            Err(AuthenticatorRuntimePostureError::PasswordLocal)
+        );
+        assert_eq!(
+            runtime.operational_observation().consumers(),
+            &[AuthenticatorRuntimeConsumer::LocalPasswordLogin]
+        );
+    }
+
+    #[test]
+    fn entra_oidc_is_the_only_current_production_posture() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_tenant_id = "tenant-posture-fixture".to_string();
+        config.entra_client_id = "client-posture-fixture".to_string();
+        config.entra_redirect_uri = "https://portal.example.test/entra/callback".to_string();
+
+        let (_, runtime) = build_runtime(&config);
+        let observation = runtime
+            .validate_production_posture()
+            .expect("Entra OIDC must be the current production posture");
+
+        assert_eq!(
+            observation.posture(),
+            ProductionAuthenticatorPosture::EntraOidc
+        );
+        assert_eq!(
+            observation.consumers(),
+            &[
+                AuthenticatorRuntimeConsumer::EntraBearerRequestAdmission,
+                AuthenticatorRuntimeConsumer::EntraBrowserSso,
+            ]
+        );
+        assert!(observation
+            .entra_issuer_authority_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert!(observation
+            .entra_audience_client_binding_digest()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+        assert_eq!(
+            observation.entra_signature_algorithm(),
+            Some(AuthenticatorSignatureAlgorithm::Rs256)
+        );
+        assert_eq!(
+            observation.entra_jwks_ttl_seconds(),
+            config.entra_jwks_ttl_secs
+        );
+        assert_eq!(
+            observation.entra_validation_leeway_seconds(),
+            config.entra_leeway_secs
+        );
+    }
+
+    #[test]
+    fn generic_oidc_cannot_launder_password_local_into_production() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            ..RyukiConfig::default()
+        };
+        config.oidc.enabled = true;
+        config.oidc.token_endpoint = "https://identity.example.test/token".to_string();
+        config.oidc.jwks_uri = "https://identity.example.test/jwks".to_string();
+        config.oidc.issuer = "https://identity.example.test/issuer".to_string();
+        config.oidc.client_id = "local-sidecar-client".to_string();
+
+        let (_, runtime) = build_runtime(&config);
+
+        assert_eq!(
+            runtime.validate_production_posture(),
+            Err(AuthenticatorRuntimePostureError::PasswordLocal)
+        );
+        assert_eq!(
+            runtime.operational_observation().consumers(),
+            &[
+                AuthenticatorRuntimeConsumer::LocalPasswordLogin,
+                AuthenticatorRuntimeConsumer::GenericOidcBrowserCallback,
+            ]
+        );
+    }
+
+    #[test]
+    fn observation_digests_identity_leaves_and_never_retains_raw_values() {
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            ..RyukiConfig::default()
+        };
+        config.entra_authority = "https://entra-authority.example.test".to_string();
+        config.entra_tenant_id = "tenant-observation-fixture".to_string();
+        config.entra_client_id = "entra-client-observation-fixture".to_string();
+        config.entra_redirect_uri = "https://portal.example.test/entra/callback".to_string();
+        config.oidc.enabled = true;
+        config.oidc.issuer = "https://generic-issuer.example.test/issuer".to_string();
+        config.oidc.token_endpoint = "https://generic-issuer.example.test/token".to_string();
+        config.oidc.jwks_uri = "https://generic-issuer.example.test/jwks".to_string();
+        config.oidc.client_id = "generic-client-observation-fixture".to_string();
+        config.oidc.client_secret = "synthetic-observation-credential".to_string(); // secret-scan-allow: synthetic non-credential used only for a non-leak assertion
+
+        let (_, runtime) = build_runtime(&config);
+        let rendered = format!("{:?}", runtime.operational_observation());
+
+        for raw in [
+            config.entra_authority.as_str(),
+            config.entra_tenant_id.as_str(),
+            config.entra_client_id.as_str(),
+            config.oidc.issuer.as_str(),
+            config.oidc.client_id.as_str(),
+            config.oidc.client_secret.as_str(),
+        ] {
+            assert!(
+                !rendered.contains(raw),
+                "observation leaked raw identity material"
+            );
+        }
+        assert_eq!(
+            runtime
+                .operational_observation()
+                .generic_oidc_client_authentication(),
+            GenericOidcClientAuthentication::ClientSecretPost {
+                credential_present: true,
+            }
+        );
+
+        let mut changed_client = config.clone();
+        changed_client.entra_client_id = "different-entra-client-fixture".to_string();
+        changed_client.entra_jwks_ttl_secs += 1;
+        changed_client.entra_leeway_secs += 1;
+        let (_, changed_runtime) = build_runtime(&changed_client);
+        assert_eq!(
+            runtime
+                .operational_observation()
+                .entra_issuer_authority_binding_digest(),
+            changed_runtime
+                .operational_observation()
+                .entra_issuer_authority_binding_digest()
+        );
+        assert_ne!(
+            runtime
+                .operational_observation()
+                .entra_audience_client_binding_digest(),
+            changed_runtime
+                .operational_observation()
+                .entra_audience_client_binding_digest()
+        );
+        assert_ne!(
+            runtime.operational_observation().entra_jwks_ttl_seconds(),
+            changed_runtime
+                .operational_observation()
+                .entra_jwks_ttl_seconds()
+        );
+        assert_ne!(
+            runtime
+                .operational_observation()
+                .entra_validation_leeway_seconds(),
+            changed_runtime
+                .operational_observation()
+                .entra_validation_leeway_seconds()
+        );
+        assert_eq!(
+            changed_runtime
+                .operational_observation()
+                .entra_signature_algorithm(),
+            Some(AuthenticatorSignatureAlgorithm::Rs256)
+        );
     }
 
     #[test]
     fn debug_output_redacts_every_retained_handle() {
         let config = RyukiConfig::default();
-        let (_, runtime) = runtime(&config);
+        let (_, runtime) = build_runtime(&config);
 
         let rendered = format!("{runtime:?}");
 

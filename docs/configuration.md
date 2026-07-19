@@ -229,7 +229,9 @@ an SPA redirect: the server exchanges the authorization code and establishes
 the browser session. Every Entra-mode launch also requires the runtime-only
 `RYUKI_SESSION__CREDENTIAL_HMAC_KEY`, even when it initially uses only bearer
 tokens, so browser sessions cannot later start with an unverifiable credential
-store. An empty redirect URI keeps the browser button disabled.
+store. It also requires the separate
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY`; the two values must not match.
+An empty redirect URI keeps the browser button disabled.
 
 Startup rejects a zero or greater-than-one-day Entra JWKS TTL so a successful
 generation has a meaningful but bounded retirement deadline. It also rejects
@@ -263,9 +265,9 @@ absolute expiry; a failed refresh never revives an expired key. Persisted OIDC
 and Entra browser sessions use `RYUKI_SESSION__COOKIE_MAX_AGE_SECS` as their
 server-side maximum as well as their cookie lifetime.
 
-Enabling this flow also requires PostgreSQL and the persisted-session verifier
-key. It is the implemented bridge toward the
-normative registry, but it is not yet the multi-issuer registry: simultaneous
+Enabling this flow also requires PostgreSQL, the persisted-session verifier
+key, and the distinct certificate-pagination cursor key. It is the implemented
+bridge toward the normative registry, but it is not yet the multi-issuer registry: simultaneous
 providers, discovery-driven configuration, lifecycle/SCIM, WebAuthn emergency
 access, service OAuth profiles, and workload identity remain specification
 work rather than current launch claims.
@@ -464,11 +466,27 @@ Most operational settings are grouped under typed nested structs. Use double und
 | `rate_limit` | `RYUKI_RATE_LIMIT__ENABLED` | Global and per-path request limits. |
 | `logging` | `RYUKI_LOGGING__LEVEL` | Console log level and format. |
 | `log_extended` | `RYUKI_LOG_EXTENDED__FILE_PATH` | Optional file logging and retention. |
-| `security` | `RYUKI_SECURITY__CONTENT_SECURITY_POLICY` | CSP and optional HSTS settings. |
+| `security` | `RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` | CSP, optional HSTS, and the dedicated certificate-pagination cursor MAC key. |
 | `smtp` | `RYUKI_SMTP__ENABLED` | Email notification transport. |
 | `session` | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Dedicated persisted-session verifier key plus cookie security settings. |
 | `retention` | `RYUKI_RETENTION__DAILY_BACKUPS` | Backup retention windows. |
 | `maintenance_window` | `RYUKI_MAINTENANCE_WINDOW__ENABLED` | Scheduled maintenance window metadata. |
+
+### Certificate-pagination cursor key
+
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` is required before the listener
+binds for Local and Entra authentication, and whenever generic OIDC is enabled.
+Supply at least 32 random bytes through the selected secret manager or an
+equivalent runtime-only injection. The value is excluded from serialized
+configuration and redacted from `Debug` output. It must be distinct from
+`RYUKI_SESSION__CREDENTIAL_HMAC_KEY`; startup rejects key reuse across these
+purposes. Rotation invalidates outstanding certificate inventory and expiry
+continuations, so clients must restart pagination with no cursor.
+
+Only explicit credential-free `mock-dry-run` and `static-dry-run` modes may omit
+this setting. Those modes are already restricted to literal loopback listeners
+and origins, and use one process-ephemeral CSPRNG key; their cursors do not
+survive a restart. Enabling generic OIDC disables that development fallback.
 
 ### Persisted-session verifier key
 
@@ -478,7 +496,10 @@ whenever Local, Entra, or generic OIDC sessions can be minted. Supply at least
 runtime-only secret injection; do not put the value in a committed TOML, JSON,
 Compose, or Kubernetes manifest. The API stores only an HMAC-SHA256 verifier of
 each 256-bit `rys_...` session token. The administrative session UUID is
-unrelated metadata and cannot authenticate.
+unrelated metadata and cannot authenticate. The verifier key must not equal
+`RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY`; startup rejects shared key
+material so session verification and cursor authentication remain separate
+cryptographic purposes.
 
 `RYUKI_SESSION__FEDERATED_AUTHORITY_MAX_STALENESS_SECS` bounds how long a
 persisted non-local session may authorize without a fresh validated assertion

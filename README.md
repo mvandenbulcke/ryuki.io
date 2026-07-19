@@ -289,6 +289,7 @@ for explicit local dry-run compatibility and are rejected in production. See
 | `RYUKI_PORTAL_PUBLIC_ORIGIN` | Exact browser origin admitted by the portal (required) |
 | `RYUKI_PORTAL_ALLOW_INSECURE_LOOPBACK` | Explicitly permit HTTP only for a loopback portal/API origin |
 | `RYUKI_SESSION__CREDENTIAL_HMAC_KEY` | Runtime-only verifier key required for local, Entra, and OIDC sessions |
+| `RYUKI_SECURITY__CERTIFICATE_CURSOR_HMAC_KEY` | Distinct runtime-only certificate-pagination cursor key required outside explicit credential-free dry-run modes and for OIDC |
 
 The trust-root path and digest select the candidate registry head. Every registry
 after version 1 must reference the exact raw bytes of version N-1, and startup
