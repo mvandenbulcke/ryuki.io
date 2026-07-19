@@ -1383,6 +1383,10 @@ struct PreparedSecurityContract {
 }
 
 impl SecurityContractContext {
+    pub(crate) fn is_production(&self) -> bool {
+        self.profile.security_profile.is_production()
+    }
+
     pub(crate) fn validate_serving_checkpoint_freshness(
         &self,
         now: DateTime<Utc>,

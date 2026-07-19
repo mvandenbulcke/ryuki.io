@@ -8,6 +8,7 @@ mod build_identity;
 mod config;
 mod config_store;
 mod contracts;
+mod cookie_runtime;
 pub mod cp_identity;
 pub mod database;
 mod entra_auth;
@@ -1751,13 +1752,6 @@ fn find_unknown_local_auth_role(
     None
 }
 
-fn bind_address_is_loopback(bind_address: &str) -> bool {
-    bind_address
-        .parse::<std::net::SocketAddr>()
-        .map(|addr| addr.ip().is_loopback())
-        .unwrap_or(false)
-}
-
 /// Resolves the session, enforces the 401 verified-auth gates (unsafe + read),
 /// then the RBAC gate, before handing off to the handler.
 ///
@@ -3025,6 +3019,20 @@ async fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     });
+    let api_cookie_runtime = cookie_runtime::ApiCookieRuntime::from_admitted_config(
+        &app_config,
+        security_contract.is_production(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("API cookie runtime admission failed: {error}");
+        std::process::exit(1);
+    });
+    api_cookie_runtime
+        .validate_config_binding(&app_config, security_contract.is_production())
+        .unwrap_or_else(|error| {
+            eprintln!("API cookie runtime binding failed: {error}");
+            std::process::exit(1);
+        });
     security_contract
         .validate_runtime_bindings(
             &app_config,
@@ -3036,11 +3044,20 @@ async fn main() {
             std::process::exit(1);
         });
     START_TIME.set(Instant::now()).ok();
+    let api_cookie_runtime_identity = Arc::clone(&api_cookie_runtime);
     config_store::init_with_security_contract(
         "platform-config.json",
         &app_config,
         security_contract,
+        api_cookie_runtime,
     );
+    if !Arc::ptr_eq(
+        &api_cookie_runtime_identity,
+        &config_store::get_api_cookie_runtime(),
+    ) {
+        eprintln!("API cookie runtime identity changed during startup retention");
+        std::process::exit(1);
+    }
     let session_lookup_admission =
         crate::session_lookup_admission::initialize_global(app_config.server.pool_max_connections);
 
@@ -3095,15 +3112,6 @@ async fn main() {
             );
             std::process::exit(1);
         }
-    }
-    if !app_config.session.cookie_secure
-        && !bind_address_is_loopback(&app_config.server.bind_address)
-    {
-        tracing::warn!(
-            bind_address = %app_config.server.bind_address,
-            public_origin = %app_config.platform_url,
-            "insecure loopback cookie mode uses a non-loopback internal listener; ensure the public endpoint remains loopback-only"
-        );
     }
     // Database verification, migration, and reconciliation are authority-
     // bearing startup operations. Do not begin them under an expired external
@@ -5637,14 +5645,6 @@ mod tests {
         ));
         // An unrelated mutation is not self-service.
         assert!(!is_self_service_mutation(&Method::POST, "/api/requests"));
-    }
-
-    #[test]
-    fn test_bind_address_is_loopback() {
-        assert!(bind_address_is_loopback("127.0.0.1:8081"));
-        assert!(bind_address_is_loopback("[::1]:8081"));
-        assert!(!bind_address_is_loopback("0.0.0.0:8080"));
-        assert!(!bind_address_is_loopback("not-an-address"));
     }
 
     #[test]

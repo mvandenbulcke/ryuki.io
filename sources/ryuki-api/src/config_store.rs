@@ -1,6 +1,7 @@
 use ryuki_core::config::RyukiConfig;
 use ryuki_core::types::PlatformConfig;
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -19,6 +20,7 @@ static STARTUP_CONFIG: OnceLock<ImmutableStartupConfig> = OnceLock::new();
 struct ImmutableStartupConfig {
     app_config: RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
+    api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
 }
 
 // Existing unit tests initialize only the application configuration. Keep
@@ -28,6 +30,7 @@ struct ImmutableStartupConfig {
 struct ImmutableStartupConfig {
     app_config: RyukiConfig,
     security_contract: Option<crate::security_contracts::SecurityContractContext>,
+    api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
 }
 
 #[cfg(test)]
@@ -117,11 +120,13 @@ pub fn init_with_security_contract(
     path: &str,
     app_cfg: &RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
+    api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
 ) {
     STARTUP_CONFIG
         .set(ImmutableStartupConfig {
             app_config: app_cfg.clone(),
             security_contract,
+            api_cookie_runtime,
         })
         .unwrap_or_else(|_| panic!("startup config already initialized"));
     let store = ConfigStore::new(path);
@@ -135,11 +140,13 @@ pub fn init_with_security_contract(
     path: &str,
     app_cfg: &RyukiConfig,
     security_contract: crate::security_contracts::SecurityContractContext,
+    api_cookie_runtime: Arc<crate::cookie_runtime::ApiCookieRuntime>,
 ) {
     TEST_STARTUP_CONFIG.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
             app_config: app_cfg.clone(),
             security_contract: Some(security_contract),
+            api_cookie_runtime,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -151,10 +158,14 @@ pub fn init_with_security_contract(
 /// admission. Production initialization cannot omit the security contract.
 #[cfg(test)]
 pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
+    let api_cookie_runtime =
+        crate::cookie_runtime::ApiCookieRuntime::from_admitted_config(app_cfg, false)
+            .expect("test config must construct an API cookie runtime");
     TEST_STARTUP_CONFIG.with(|slot| {
         *slot.borrow_mut() = Some(Box::leak(Box::new(ImmutableStartupConfig {
             app_config: app_cfg.clone(),
             security_contract: None,
+            api_cookie_runtime,
         })));
     });
     TEST_STORE.with(|slot| {
@@ -164,6 +175,14 @@ pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
 
 pub fn get_app_config() -> &'static RyukiConfig {
     app_config_if_initialized().expect("app config not initialized")
+}
+
+pub fn get_api_cookie_runtime() -> Arc<crate::cookie_runtime::ApiCookieRuntime> {
+    Arc::clone(
+        &startup_config_if_initialized()
+            .expect("startup config not initialized")
+            .api_cookie_runtime,
+    )
 }
 
 #[cfg(not(test))]
